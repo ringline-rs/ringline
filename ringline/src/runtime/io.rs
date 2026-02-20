@@ -96,15 +96,15 @@ fn try_with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R) -> Option<
 /// Returns `Err` if called outside the ringline async executor or if the
 /// standalone task slab is full.
 pub fn spawn(future: impl Future<Output = ()> + 'static) -> io::Result<TaskId> {
-    try_with_state(|_driver, executor| {
-        match executor.standalone_slab.spawn(Box::pin(future)) {
+    try_with_state(
+        |_driver, executor| match executor.standalone_slab.spawn(Box::pin(future)) {
             Some(idx) => {
                 executor.ready_queue.push_back(idx | STANDALONE_BIT);
                 Ok(TaskId(idx))
             }
             None => Err(io::Error::other("standalone task slab exhausted")),
-        }
-    })
+        },
+    )
     .unwrap_or_else(|| Err(io::Error::other("called outside executor")))
 }
 
@@ -1552,11 +1552,7 @@ impl UdpCtx {
     ///
     /// Copies `data` into the send pool and submits a `sendmsg` SQE.
     /// Only one send can be in-flight per UDP socket at a time.
-    pub fn send_to(
-        &self,
-        peer: SocketAddr,
-        data: &[u8],
-    ) -> Result<(), crate::error::UdpSendError> {
+    pub fn send_to(&self, peer: SocketAddr, data: &[u8]) -> Result<(), crate::error::UdpSendError> {
         with_state(|driver, _executor| driver.udp_send_to(self.udp_index, peer, data))
     }
 }

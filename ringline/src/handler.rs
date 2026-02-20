@@ -414,7 +414,10 @@ impl<'a> DriverCtx<'a> {
         }
 
         // Fill sockaddr_storage for the connect SQE.
-        let addrlen = crate::driver::socket_addr_to_sockaddr(addr, &mut self.connect_addrs[conn_index as usize]);
+        let addrlen = crate::driver::socket_addr_to_sockaddr(
+            addr,
+            &mut self.connect_addrs[conn_index as usize],
+        );
 
         // Submit the async connect.
         if let Err(e) = self.ring.submit_connect(
@@ -527,7 +530,10 @@ impl<'a> DriverCtx<'a> {
         tls_table.create_client(conn_index, sni);
 
         // Fill sockaddr_storage for the connect SQE.
-        let addrlen = crate::driver::socket_addr_to_sockaddr(addr, &mut self.connect_addrs[conn_index as usize]);
+        let addrlen = crate::driver::socket_addr_to_sockaddr(
+            addr,
+            &mut self.connect_addrs[conn_index as usize],
+        );
 
         // Submit the async connect.
         if let Err(e) = self.ring.submit_connect(
@@ -1888,4 +1894,3 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         self.chain
     }
 }
-

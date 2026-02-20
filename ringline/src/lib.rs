@@ -48,8 +48,8 @@ pub(crate) mod async_event_loop;
 pub(crate) mod buffer;
 pub(crate) mod chain;
 pub(crate) mod completion;
-pub(crate) mod counter;
 pub(crate) mod connection;
+pub(crate) mod counter;
 pub mod direct_io;
 pub(crate) mod driver;
 pub(crate) mod metrics;
@@ -89,8 +89,6 @@ pub use runtime::handler::AsyncEventHandler;
 pub use runtime::io::AsyncSendBuilder;
 /// Async connection context with send/recv futures.
 pub use runtime::io::ConnCtx;
-/// Result of a parse closure: consumed bytes or need more data.
-pub use runtime::io::ParseResult;
 /// Future that completes when a connect finishes.
 pub use runtime::io::ConnectFuture;
 /// A monotonic clock deadline for absolute timers.
@@ -99,6 +97,8 @@ pub use runtime::io::Deadline;
 pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
+/// Result of a parse closure: consumed bytes or need more data.
+pub use runtime::io::ParseResult;
 /// Future that resolves when recv data is available (sink, accumulator, or close).
 pub use runtime::io::RecvReadyFuture;
 /// Future that completes when a send finishes.

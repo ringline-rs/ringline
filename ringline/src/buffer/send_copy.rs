@@ -7,9 +7,9 @@ pub struct SendCopyPool {
     slot_size: u32,
     count: u16,
     free_list: Vec<u16>,
-    slot_offset: Vec<u32>,    // current byte offset within slot (advances on partial send)
+    slot_offset: Vec<u32>, // current byte offset within slot (advances on partial send)
     slot_remaining: Vec<u32>, // bytes remaining to send
-    in_use: Vec<bool>,        // double-free protection
+    in_use: Vec<bool>,     // double-free protection
 }
 
 impl SendCopyPool {

@@ -1,3 +1,4 @@
+#![allow(clippy::manual_async_fn)]
 //! Integration tests: direct I/O via ringline's `O_DIRECT` support.
 //!
 //! These tests exercise the full io_uring submission path for
@@ -14,9 +15,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ringline::{
-    AsyncEventHandler, Config, ConnCtx, DirectIoConfig, RinglineBuilder,
-};
+use ringline::{AsyncEventHandler, Config, ConnCtx, DirectIoConfig, RinglineBuilder};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 

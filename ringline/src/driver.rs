@@ -81,7 +81,11 @@ pub(crate) fn socket_addr_to_sockaddr(
 ) -> u32 {
     // Zero the storage to avoid uninitialised padding bytes.
     unsafe {
-        std::ptr::write_bytes(storage as *mut _ as *mut u8, 0, std::mem::size_of::<libc::sockaddr_storage>());
+        std::ptr::write_bytes(
+            storage as *mut _ as *mut u8,
+            0,
+            std::mem::size_of::<libc::sockaddr_storage>(),
+        );
     }
     match addr {
         SocketAddr::V4(v4) => {

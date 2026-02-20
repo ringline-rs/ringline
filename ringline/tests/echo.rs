@@ -1,3 +1,4 @@
+#![allow(clippy::manual_async_fn)]
 //! Integration tests: echo server using real TCP connections.
 //!
 //! Each test launches a ringline server, connects via std TCP, sends data,
@@ -478,7 +479,8 @@ impl AsyncEventHandler for SpawnTestHandler {
             // Spawn a standalone task that increments the counter.
             ringline::spawn(async {
                 SPAWN_COUNTER.fetch_add(1, Ordering::SeqCst);
-            }).unwrap();
+            })
+            .unwrap();
 
             // Echo one message to signal readiness.
             conn.with_data(|data| {
@@ -544,7 +546,8 @@ impl AsyncEventHandler for SleepEchoHandler {
                         ringline::spawn(async move {
                             ringline::sleep(Duration::from_millis(50)).await;
                             let _ = conn2.send_nowait(&data_copy);
-                        }).unwrap();
+                        })
+                        .unwrap();
                         ParseResult::Consumed(len)
                     })
                     .await;
@@ -603,7 +606,8 @@ impl AsyncEventHandler for TimeoutTestHandler {
                     // Timeout wrapping an immediate future should succeed.
                     let conn2 = conn;
                     ringline::spawn(async move {
-                        let result = ringline::timeout(Duration::from_secs(10), async { 42u32 }).await;
+                        let result =
+                            ringline::timeout(Duration::from_secs(10), async { 42u32 }).await;
                         match result {
                             Ok(42) => {
                                 let _ = conn2.send_nowait(b"OK");
@@ -612,7 +616,8 @@ impl AsyncEventHandler for TimeoutTestHandler {
                                 let _ = conn2.send_nowait(b"FAIL");
                             }
                         }
-                    }).unwrap();
+                    })
+                    .unwrap();
                 } else if msg == "test-timeout-expire" {
                     // Timeout wrapping a long sleep should expire.
                     let conn2 = conn;
@@ -630,7 +635,8 @@ impl AsyncEventHandler for TimeoutTestHandler {
                                 let _ = conn2.send_nowait(b"FAIL");
                             }
                         }
-                    }).unwrap();
+                    })
+                    .unwrap();
                 }
                 ParseResult::Consumed(data.len())
             })
@@ -863,7 +869,9 @@ impl AsyncEventHandler for ConnectRefusedHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
             // Wait for trigger byte from client before connecting.
-            client.with_data(|data| ParseResult::Consumed(data.len())).await;
+            client
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
 
             let port = CONNECT_REFUSED_PORT.load(Ordering::SeqCst);
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -1653,7 +1661,9 @@ struct TrySpawnHandler;
 impl AsyncEventHandler for TrySpawnHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return; // probe connection from wait_for_server
             }
@@ -1745,7 +1755,9 @@ struct CancelTaskHandler;
 impl AsyncEventHandler for CancelTaskHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return; // probe connection from wait_for_server
             }
@@ -1753,7 +1765,8 @@ impl AsyncEventHandler for CancelTaskHandler {
             // Spawn a long-running task.
             let task_id = ringline::spawn(async {
                 ringline::sleep(Duration::from_secs(60)).await;
-            }).unwrap();
+            })
+            .unwrap();
 
             // Cancel it immediately.
             task_id.cancel();
@@ -1838,7 +1851,9 @@ struct CancelCompletedHandler;
 impl AsyncEventHandler for CancelCompletedHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return; // probe connection from wait_for_server
             }
@@ -2004,7 +2019,9 @@ struct SendAwaitHandler;
 impl AsyncEventHandler for SendAwaitHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return;
             }
@@ -2097,7 +2114,9 @@ struct SendChainAwaitHandler;
 impl AsyncEventHandler for SendChainAwaitHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return;
             }
@@ -2193,7 +2212,9 @@ struct TrySleepHandler;
 impl AsyncEventHandler for TrySleepHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return;
             }
@@ -2280,18 +2301,23 @@ struct TryTimeoutHandler;
 impl AsyncEventHandler for TryTimeoutHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return;
             }
 
             let exhausted = {
                 // Allocate all timer slots (config has timer_slots = 2).
-                let _t1 = ringline::try_timeout(Duration::from_secs(60), std::future::pending::<()>());
-                let _t2 = ringline::try_timeout(Duration::from_secs(60), std::future::pending::<()>());
+                let _t1 =
+                    ringline::try_timeout(Duration::from_secs(60), std::future::pending::<()>());
+                let _t2 =
+                    ringline::try_timeout(Duration::from_secs(60), std::future::pending::<()>());
 
                 // Third attempt should fail with TimerExhausted.
-                ringline::try_timeout(Duration::from_secs(60), std::future::pending::<()>()).is_err()
+                ringline::try_timeout(Duration::from_secs(60), std::future::pending::<()>())
+                    .is_err()
                 // _t1, _t2 dropped here — timer slots released.
             };
 
@@ -2373,7 +2399,9 @@ struct JoinHandler;
 impl AsyncEventHandler for JoinHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return;
             }
@@ -2463,7 +2491,9 @@ struct Join3Handler;
 impl AsyncEventHandler for Join3Handler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return;
             }
@@ -2480,7 +2510,9 @@ impl AsyncEventHandler for Join3Handler {
             };
             let fut_c = async {
                 // This will wait for new data from the client.
-                let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+                let n = conn
+                    .with_data(|data| ParseResult::Consumed(data.len()))
+                    .await;
                 n as u32
             };
 
@@ -2565,7 +2597,9 @@ struct SleepUntilHandler;
 impl AsyncEventHandler for SleepUntilHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return;
             }
@@ -2644,13 +2678,16 @@ struct TimeoutAtHandler;
 impl AsyncEventHandler for TimeoutAtHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return;
             }
 
             let deadline = ringline::Deadline::after(Duration::from_millis(20));
-            let result = ringline::timeout_at(deadline, ringline::sleep(Duration::from_secs(10))).await;
+            let result =
+                ringline::timeout_at(deadline, ringline::sleep(Duration::from_secs(10))).await;
 
             let msg = match result {
                 Err(_elapsed) => "TIMEOUT_AT_EXPIRED",
@@ -2716,7 +2753,6 @@ fn async_timeout_at_expires() {
 
 // ── UDP ───────────────────────────────────────────────────────────
 
-
 /// Async handler that echoes UDP datagrams via UdpCtx.
 struct UdpEchoAsync;
 
@@ -2724,7 +2760,9 @@ impl AsyncEventHandler for UdpEchoAsync {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
             loop {
-                let n = conn.with_data(|data| ParseResult::Consumed(data.len())).await;
+                let n = conn
+                    .with_data(|data| ParseResult::Consumed(data.len()))
+                    .await;
                 if n == 0 {
                     break;
                 }
@@ -2801,7 +2839,9 @@ impl AsyncEventHandler for StandaloneConnectHandler {
             .expect("backend addr not set");
         async move {
             // Wait for trigger from client.
-            let n = client.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = client
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return;
             }
@@ -2845,7 +2885,8 @@ impl AsyncEventHandler for StandaloneConnectHandler {
 
                 // Report to client.
                 let _ = client.send_nowait(&echo);
-            }).unwrap();
+            })
+            .unwrap();
 
             // Keep connection alive so standalone task can send.
             ringline::sleep(Duration::from_secs(5)).await;
@@ -3032,7 +3073,9 @@ static STANDALONE_REFUSED_PORT: AtomicU32 = AtomicU32::new(0);
 impl AsyncEventHandler for StandaloneConnectRefusedHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
-            let n = client.with_data(|data| ParseResult::Consumed(data.len())).await;
+            let n = client
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
             if n == 0 {
                 return;
             }
@@ -3050,7 +3093,8 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
                 };
 
                 let _ = client.send_nowait(result.as_bytes());
-            }).unwrap();
+            })
+            .unwrap();
 
             ringline::sleep(Duration::from_secs(5)).await;
         }

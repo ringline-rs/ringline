@@ -10,7 +10,10 @@ impl AsyncEventHandler for TlsEcho {
     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
         let worker_id = self.worker_id;
         async move {
-            eprintln!("[worker {worker_id}] TLS connection accepted {}", conn.index());
+            eprintln!(
+                "[worker {worker_id}] TLS connection accepted {}",
+                conn.index()
+            );
             loop {
                 let consumed = conn
                     .with_data(|data| {
@@ -25,7 +28,10 @@ impl AsyncEventHandler for TlsEcho {
                     break;
                 }
             }
-            eprintln!("[worker {worker_id}] TLS connection {} closed", conn.index());
+            eprintln!(
+                "[worker {worker_id}] TLS connection {} closed",
+                conn.index()
+            );
         }
     }
 

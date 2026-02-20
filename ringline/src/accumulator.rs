@@ -31,7 +31,11 @@ impl RecvAccumulator {
         if n == 0 {
             return;
         }
-        debug_assert!(n <= self.buf.len(), "consume({n}) exceeds buffer length {}", self.buf.len());
+        debug_assert!(
+            n <= self.buf.len(),
+            "consume({n}) exceeds buffer length {}",
+            self.buf.len()
+        );
         let n = n.min(self.buf.len());
         self.buf.advance(n);
     }

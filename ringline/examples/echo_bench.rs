@@ -1,3 +1,4 @@
+#![allow(clippy::manual_async_fn)]
 //! Benchmark for the async AsyncEventHandler echo server.
 //! Measures throughput (ops/sec), per-operation latency histograms
 //! (p50/p90/p99/p999/max), and CPU usage across a matrix of connection
