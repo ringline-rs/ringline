@@ -33,7 +33,7 @@ pub use sharded::{ShardedClient, ShardedConfig};
 use std::io;
 
 use bytes::Bytes;
-use protocol_resp::{Request, Value};
+use resp_proto::{Request, Value};
 use ringline::{ConnCtx, ParseResult};
 
 // ── Error ───────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ pub enum Error {
 
     /// RESP protocol parse error.
     #[error("protocol error: {0}")]
-    Protocol(#[from] protocol_resp::ParseError),
+    Protocol(#[from] resp_proto::ParseError),
 
     /// I/O error during send.
     #[error("io error: {0}")]
@@ -123,7 +123,7 @@ impl Client {
     /// separate iovecs) and read the response.
     async fn execute_set(
         &self,
-        set_req: &protocol_resp::SetRequest<'_>,
+        set_req: &resp_proto::SetRequest<'_>,
         value: &[u8],
     ) -> Result<Value, Error> {
         let (prefix, suffix) = set_req.encode_parts();
@@ -185,7 +185,7 @@ impl Client {
     }
 
     /// Encode a `SetRequest` into a `Vec<u8>`.
-    pub(crate) fn encode_set_request(req: &protocol_resp::SetRequest<'_>) -> Vec<u8> {
+    pub(crate) fn encode_set_request(req: &resp_proto::SetRequest<'_>) -> Vec<u8> {
         let len = req.encoded_len();
         let mut buf = vec![0u8; len];
         req.encode(&mut buf);

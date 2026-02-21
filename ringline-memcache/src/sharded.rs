@@ -32,10 +32,10 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use protocol_memcache::Response as McResponse;
+use memcache_proto::Response as McResponse;
 
 use crate::{Client, Error, GetValue, Value, check_error, encode_add, encode_request, encode_set};
-use protocol_memcache::Request as McRequest;
+use memcache_proto::Request as McRequest;
 
 /// Configuration for a ketama-sharded client.
 pub struct ShardedConfig {
@@ -205,7 +205,7 @@ impl ShardedClient {
     /// Get the value of a key. Returns `None` on cache miss.
     pub async fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Value>, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&protocol_memcache::Request::get(key));
+        let encoded = encode_request(&memcache_proto::Request::get(key));
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponse::Values(mut values) => {

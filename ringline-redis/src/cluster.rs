@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use protocol_resp::{RedirectKind, Request, SlotMap, Value, hash_slot, parse_redirect};
+use resp_proto::{RedirectKind, Request, SlotMap, Value, hash_slot, parse_redirect};
 
 use crate::{Client, Error, parse_bytes_array};
 
@@ -1202,7 +1202,7 @@ impl ClusterClient {
 
 #[cfg(test)]
 mod tests {
-    use protocol_resp::hash_slot;
+    use resp_proto::hash_slot;
 
     use super::*;
 

@@ -31,7 +31,7 @@ pub use sharded::{ShardedClient, ShardedConfig};
 use std::io;
 
 use bytes::Bytes;
-use protocol_memcache::{Request as McRequest, Response as McResponse};
+use memcache_proto::{Request as McRequest, Response as McResponse};
 use ringline::{ConnCtx, ParseResult};
 
 // -- Error -------------------------------------------------------------------
@@ -53,7 +53,7 @@ pub enum Error {
 
     /// Memcache protocol parse error.
     #[error("protocol error: {0}")]
-    Protocol(#[from] protocol_memcache::ParseError),
+    Protocol(#[from] memcache_proto::ParseError),
 
     /// I/O error during send.
     #[error("io error: {0}")]

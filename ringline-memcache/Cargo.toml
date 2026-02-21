@@ -8,5 +8,5 @@ license.workspace = true
 bytes = { workspace = true }
 ketama = { workspace = true }
 ringline = { workspace = true }
-protocol-memcache = { workspace = true }
+memcache-proto = { workspace = true }
 thiserror = { workspace = true }

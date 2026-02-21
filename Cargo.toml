@@ -2,8 +2,6 @@
 resolver = "2"
 members = [
     "ringline",
-    "protocol-resp",
-    "protocol-memcache",
     "ketama",
     "ringline-redis",
     "ringline-memcache",
@@ -20,8 +18,8 @@ repository = "https://github.com/brayniac/ringline"
 [workspace.dependencies]
 # Internal crates
 ringline = { path = "ringline", features = ["tls"] }
-protocol-resp = { path = "protocol-resp" }
-protocol-memcache = { path = "protocol-memcache" }
+resp-proto = "0.0.1"
+memcache-proto = "0.0.1"
 ketama = { path = "ketama" }
 
 # External dependencies

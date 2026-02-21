@@ -35,7 +35,7 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
-use protocol_resp::{Request, Value};
+use resp_proto::{Request, Value};
 
 use crate::{Client, Error, parse_bytes_array};
 
