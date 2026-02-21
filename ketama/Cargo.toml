@@ -1,0 +1,5 @@
+[package]
+name = "ketama"
+version = "0.3.8"
+edition.workspace = true
+license.workspace = true

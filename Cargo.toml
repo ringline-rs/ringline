@@ -1,9 +1,36 @@
 [workspace]
 resolver = "2"
-members = ["ringline"]
+members = [
+    "ringline",
+    "protocol-resp",
+    "protocol-memcache",
+    "ketama",
+    "ringline-redis",
+    "ringline-memcache",
+    "ringline-quic",
+]
 
 [workspace.package]
 authors = ["Brian Martin <brayniac@gmail.com>"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/brayniac/ringline"
+
+[workspace.dependencies]
+# Internal crates
+ringline = { path = "ringline", features = ["tls"] }
+protocol-resp = { path = "protocol-resp" }
+protocol-memcache = { path = "protocol-memcache" }
+ketama = { path = "ketama" }
+
+# External dependencies
+bytes = "1.11.1"
+itoa = "1.0"
+memchr = "2.7"
+ryu = "1.0"
+thiserror = "2"
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
+rustls = { version = "0.23", default-features = false }
+slab = "0.4"
+rcgen = "0.13"
+rustls-pki-types = "1"
