@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "ringline",
-    "ketama",
     "ringline-redis",
     "ringline-memcache",
     "ringline-quic",
@@ -20,7 +19,7 @@ repository = "https://github.com/brayniac/ringline"
 ringline = { path = "ringline", features = ["tls"] }
 resp-proto = "0.0.1"
 memcache-proto = "0.0.1"
-ketama = { path = "ketama" }
+ketama = "0.0.1"
 
 # External dependencies
 bytes = "1.11.1"
