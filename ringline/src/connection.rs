@@ -3,6 +3,9 @@
 pub enum RecvMode {
     /// Multishot recv armed with provided buffer ring.
     Multi,
+    /// Multishot recvmsg armed with provided buffer ring (with cmsg for timestamps).
+    #[cfg(feature = "timestamps")]
+    MsgMulti,
     /// Connection is closing, no recv armed.
     Closed,
     /// Outbound connect SQE in-flight, no recv armed yet.
@@ -26,6 +29,10 @@ pub struct ConnectionState {
     pub peer_addr: Option<std::net::SocketAddr>,
     /// Whether a connect timeout SQE is armed for this connection.
     pub connect_timeout_armed: bool,
+    /// Most recent kernel RX timestamp (nanoseconds since epoch, CLOCK_REALTIME).
+    /// Set when a `RecvMsgMulti` completion delivers a `SCM_TIMESTAMPING` cmsg.
+    #[cfg(feature = "timestamps")]
+    pub recv_timestamp_ns: u64,
 }
 
 impl Default for ConnectionState {
@@ -44,6 +51,8 @@ impl ConnectionState {
             established: false,
             peer_addr: None,
             connect_timeout_armed: false,
+            #[cfg(feature = "timestamps")]
+            recv_timestamp_ns: 0,
         }
     }
 
@@ -67,6 +76,10 @@ impl ConnectionState {
         self.established = false;
         self.peer_addr = None;
         self.connect_timeout_armed = false;
+        #[cfg(feature = "timestamps")]
+        {
+            self.recv_timestamp_ns = 0;
+        }
         self.generation = self.generation.wrapping_add(1);
     }
 }

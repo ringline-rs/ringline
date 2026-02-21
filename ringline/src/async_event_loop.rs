@@ -254,6 +254,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
             OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
             OpTag::DirectIo => self.handle_direct_io(ud, result),
+            #[cfg(feature = "timestamps")]
+            OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
     }
 
@@ -396,6 +398,165 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Handle a RecvMsgMulti CQE (multishot recvmsg with SO_TIMESTAMPING).
+    ///
+    /// The provided buffer contains an `io_uring_recvmsg_out` header followed by
+    /// name (0 bytes for TCP), control data (cmsg with SCM_TIMESTAMPING), and
+    /// the TCP payload.
+    #[cfg(feature = "timestamps")]
+    fn handle_recv_msg_multi_ts(&mut self, ud: UserData, result: i32, flags: u32) {
+        let conn_index = ud.conn_index();
+        let has_more = cqueue::more(flags);
+
+        if self.driver.connections.get(conn_index).is_none() {
+            return;
+        }
+
+        if result <= 0 {
+            if result == 0 {
+                self.executor.wake_recv(conn_index);
+                self.driver.close_connection(conn_index);
+                return;
+            }
+            let errno = -result;
+            if errno == libc::ENOBUFS {
+                metrics::BUFFER_RING_EMPTY.increment();
+                if !has_more {
+                    let msghdr_ptr =
+                        &*self.driver.recvmsg_msghdr as *const libc::msghdr;
+                    let _ = self
+                        .driver
+                        .ring
+                        .submit_multishot_recvmsg(conn_index, msghdr_ptr);
+                }
+            } else if errno == libc::ECANCELED {
+                return;
+            } else if !has_more {
+                self.executor.wake_recv(conn_index);
+                self.driver.close_connection(conn_index);
+            }
+            return;
+        }
+
+        let bid = match cqueue::buffer_select(flags) {
+            Some(bid) => bid,
+            None => return,
+        };
+
+        let buf_len = result as u32;
+        let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
+        let buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len as usize) };
+
+        self.driver.pending_replenish.push(bid);
+
+        // Parse the io_uring_recvmsg_out header to extract control data + payload.
+        let msg_out = match io_uring::types::RecvMsgOut::parse(buf, &self.driver.recvmsg_msghdr) {
+            Ok(out) => out,
+            Err(()) => {
+                // Parse failed — treat as regular data (shouldn't happen).
+                return;
+            }
+        };
+
+        let payload = msg_out.payload_data();
+        if payload.is_empty() {
+            // EOF via recvmsg.
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+            return;
+        }
+
+        metrics::BYTES_RECEIVED.add(payload.len() as u64);
+
+        // Extract SCM_TIMESTAMPING from control data.
+        let control = msg_out.control_data();
+        if let Some(ts_ns) = Self::parse_scm_timestamp(control) {
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.recv_timestamp_ns = ts_ns;
+            }
+        }
+
+        // Route payload through accumulator (same as plaintext RecvMulti path).
+        if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
+            let remaining_cap = sink.cap - sink.pos;
+            let to_sink = payload.len().min(remaining_cap);
+            if to_sink > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        payload.as_ptr(),
+                        sink.ptr.add(sink.pos),
+                        to_sink,
+                    );
+                }
+                sink.pos += to_sink;
+            }
+            if to_sink < payload.len() {
+                self.driver
+                    .accumulators
+                    .append(conn_index, &payload[to_sink..]);
+            }
+        } else {
+            self.driver.accumulators.append(conn_index, payload);
+        }
+        self.executor.wake_recv(conn_index);
+
+        if !has_more
+            && let Some(conn) = self.driver.connections.get(conn_index)
+            && matches!(conn.recv_mode, RecvMode::MsgMulti)
+        {
+            let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
+            let _ = self
+                .driver
+                .ring
+                .submit_multishot_recvmsg(conn_index, msghdr_ptr);
+        }
+    }
+
+    /// Parse SCM_TIMESTAMPING from cmsg control data.
+    /// Returns the software RX timestamp as nanoseconds since epoch, or None.
+    #[cfg(feature = "timestamps")]
+    fn parse_scm_timestamp(control: &[u8]) -> Option<u64> {
+        // cmsg layout: cmsghdr { cmsg_len (usize), cmsg_level (i32), cmsg_type (i32) }
+        // followed by payload data, then padding to align next cmsghdr.
+        let hdr_size = std::mem::size_of::<libc::cmsghdr>();
+        let align = std::mem::align_of::<libc::cmsghdr>();
+        let mut offset = 0usize;
+
+        while offset + hdr_size <= control.len() {
+            let hdr_ptr = control[offset..].as_ptr() as *const libc::cmsghdr;
+            let hdr = unsafe { &*hdr_ptr };
+
+            if hdr.cmsg_len < hdr_size {
+                break;
+            }
+
+            let data_offset = offset + hdr_size;
+            let data_len = hdr.cmsg_len - hdr_size;
+
+            if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SO_TIMESTAMPING {
+                // Payload is 3 × struct timespec: [software, hw_transformed, hw_raw].
+                // We want the software timestamp (index 0).
+                let ts_size = std::mem::size_of::<libc::timespec>();
+                if data_len >= ts_size && data_offset + ts_size <= control.len() {
+                    let ts_ptr = control[data_offset..].as_ptr() as *const libc::timespec;
+                    let ts = unsafe { &*ts_ptr };
+                    if ts.tv_sec != 0 || ts.tv_nsec != 0 {
+                        return Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64);
+                    }
+                }
+            }
+
+            // Advance to next cmsg (aligned).
+            let next = offset + ((hdr.cmsg_len + align - 1) & !(align - 1));
+            if next <= offset {
+                break;
+            }
+            offset = next;
+        }
+
+        None
+    }
+
     fn handle_eventfd_read(&mut self) {
         // Drain accept channel (server mode only).
         {
@@ -439,7 +600,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
 
                 self.driver.accumulators.reset(conn_index);
-                let _ = self.driver.ring.submit_multishot_recv(conn_index);
+                self.arm_recv(conn_index);
 
                 // TLS path: defer accept until handshake completes.
                 #[cfg(feature = "tls")]
@@ -729,16 +890,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.recv_mode = RecvMode::Multi;
             }
-            let _ = self.driver.ring.submit_multishot_recv(conn_index);
+            self.arm_recv(conn_index);
             return;
         }
 
         // Plaintext path
         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-            cs.recv_mode = RecvMode::Multi;
             cs.established = true;
         }
-        let _ = self.driver.ring.submit_multishot_recv(conn_index);
+        self.arm_recv(conn_index);
 
         self.executor.wake_connect(conn_index, Ok(()));
     }
@@ -954,6 +1114,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Wake the async task waiting for this Direct I/O completion.
         self.executor.wake_disk_io(slab_idx as u32, result);
+    }
+
+    /// Arm the appropriate multishot recv for a connection.
+    ///
+    /// When the `timestamps` feature is enabled and configured, uses
+    /// `RecvMsgMulti` (multishot recvmsg) to receive cmsg ancillary data
+    /// containing kernel timestamps. Otherwise, uses `RecvMulti` (plain
+    /// multishot recv).
+    fn arm_recv(&mut self, conn_index: u32) {
+        #[cfg(feature = "timestamps")]
+        if self.driver.timestamps {
+            let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
+            let _ = self
+                .driver
+                .ring
+                .submit_multishot_recvmsg(conn_index, msghdr_ptr);
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.recv_mode = RecvMode::MsgMulti;
+            }
+            return;
+        }
+        let _ = self.driver.ring.submit_multishot_recv(conn_index);
     }
 
     /// Spawn an async task for a newly accepted connection.

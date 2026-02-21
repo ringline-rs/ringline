@@ -144,6 +144,13 @@ pub(crate) struct Driver {
     pub(crate) cqe_batch: Vec<(u64, i32, u32, [u64; 2])>,
     /// Whether to set TCP_NODELAY on connections.
     pub(crate) tcp_nodelay: bool,
+    /// Whether SO_TIMESTAMPING is enabled for connections.
+    #[cfg(feature = "timestamps")]
+    pub(crate) timestamps: bool,
+    /// Pinned msghdr template for RecvMsgMulti with SO_TIMESTAMPING.
+    /// Used as the SQE template and for parsing CQE buffers via RecvMsgOut.
+    #[cfg(feature = "timestamps")]
+    pub(crate) recvmsg_msghdr: Box<libc::msghdr>,
     /// Per-connection send chain tracking for IOSQE_IO_LINK chains.
     pub(crate) chain_table: SendChainTable,
     /// Maximum SQEs per chain (0 = disabled).
@@ -288,6 +295,17 @@ impl Driver {
             connect_timespecs,
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),
             tcp_nodelay: config.tcp_nodelay,
+            #[cfg(feature = "timestamps")]
+            timestamps: config.timestamps,
+            #[cfg(feature = "timestamps")]
+            recvmsg_msghdr: {
+                let mut hdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+                // TCP: no source address needed.
+                hdr.msg_namelen = 0;
+                // Room for SCM_TIMESTAMPING cmsg: cmsghdr(16) + 3×timespec(48) = 64 bytes.
+                hdr.msg_controllen = 64;
+                hdr
+            },
             chain_table: SendChainTable::new(config.max_connections),
             max_chain_length: config.max_chain_length,
             send_queues,
@@ -354,6 +372,10 @@ impl Driver {
             shutdown_requested: &mut self.shutdown_local,
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
+            #[cfg(feature = "timestamps")]
+            timestamps: self.timestamps,
+            #[cfg(feature = "timestamps")]
+            recvmsg_msghdr: &*self.recvmsg_msghdr as *const libc::msghdr,
             connect_timespecs: &mut self.connect_timespecs,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,

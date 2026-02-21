@@ -98,6 +98,25 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a multishot recvmsg with provided buffer ring for a connection.
+    /// Used when SO_TIMESTAMPING is enabled to receive cmsg ancillary data
+    /// (kernel timestamps) alongside TCP payload.
+    #[cfg(feature = "timestamps")]
+    pub fn submit_multishot_recvmsg(
+        &mut self,
+        conn_index: u32,
+        msghdr: *const libc::msghdr,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::RecvMsgMultiTs, conn_index, 0);
+        let entry = opcode::RecvMsgMulti::new(Fixed(conn_index), msghdr, self.bgid)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit a multishot recv with provided buffer ring for a connection.
     pub fn submit_multishot_recv(&mut self, conn_index: u32) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvMulti, conn_index, 0);

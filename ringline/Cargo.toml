@@ -12,6 +12,7 @@ categories = ["asynchronous", "network-programming"]
 
 [features]
 tls = ["rustls"]
+timestamps = []
 
 [dependencies]
 bytes = "1"

@@ -29,6 +29,9 @@ pub enum OpTag {
     NvmeCmd = 15,
     /// Direct I/O command (read, write, fsync via O_DIRECT + IORING_OP_READ/WRITE).
     DirectIo = 16,
+    /// Multishot recvmsg for TCP connections with SO_TIMESTAMPING.
+    #[cfg(feature = "timestamps")]
+    RecvMsgMultiTs = 17,
 }
 
 impl OpTag {
@@ -51,6 +54,8 @@ impl OpTag {
             14 => Some(OpTag::SendMsgUdp),
             15 => Some(OpTag::NvmeCmd),
             16 => Some(OpTag::DirectIo),
+            #[cfg(feature = "timestamps")]
+            17 => Some(OpTag::RecvMsgMultiTs),
             _ => None,
         }
     }

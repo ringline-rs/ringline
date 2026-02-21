@@ -169,6 +169,8 @@ impl RinglineBuilder {
                 worker_eventfds: worker_eventfds.clone(),
                 shutdown_flag: shutdown_flag.clone(),
                 tcp_nodelay: self.config.tcp_nodelay,
+                #[cfg(feature = "timestamps")]
+                timestamps: self.config.timestamps,
             };
 
             let acceptor_closed = closed.clone();

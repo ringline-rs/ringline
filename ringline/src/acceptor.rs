@@ -18,6 +18,9 @@ pub struct AcceptorConfig {
     pub shutdown_flag: Arc<AtomicBool>,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub tcp_nodelay: bool,
+    /// Whether to set SO_TIMESTAMPING on accepted connections.
+    #[cfg(feature = "timestamps")]
+    pub timestamps: bool,
 }
 
 /// Run the acceptor loop. Terminates when all channels disconnect.
@@ -73,6 +76,22 @@ pub fn run_acceptor(config: AcceptorConfig) {
                     libc::IPPROTO_TCP,
                     libc::TCP_NODELAY,
                     &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        // Set SO_TIMESTAMPING for kernel-level RX timestamps.
+        #[cfg(feature = "timestamps")]
+        if config.timestamps {
+            let flags: libc::c_int =
+                (libc::SOF_TIMESTAMPING_SOFTWARE | libc::SOF_TIMESTAMPING_RX_SOFTWARE) as libc::c_int;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_TIMESTAMPING,
+                    &flags as *const _ as *const libc::c_void,
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );
             }

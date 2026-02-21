@@ -606,6 +606,25 @@ impl ConnCtx {
         })
     }
 
+    // ── Timestamps ─────────────────────────────────────────────────
+
+    /// Returns the most recent kernel RX software timestamp as nanoseconds
+    /// since epoch (`CLOCK_REALTIME`), or 0 if no timestamp has been received.
+    ///
+    /// Updated each time a `RecvMsgMulti` completion delivers an
+    /// `SCM_TIMESTAMPING` cmsg. Only available when the `timestamps` feature
+    /// is enabled and `Config::timestamps(true)` is set.
+    #[cfg(feature = "timestamps")]
+    pub fn recv_timestamp(&self) -> u64 {
+        with_state(|driver, _| {
+            driver
+                .connections
+                .get(self.conn_index)
+                .map(|cs| cs.recv_timestamp_ns)
+                .unwrap_or(0)
+        })
+    }
+
     // ── Close / metadata ─────────────────────────────────────────────
 
     /// Close this connection.

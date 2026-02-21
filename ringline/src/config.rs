@@ -72,6 +72,11 @@ pub struct Config {
     pub tls_client: Option<TlsClientConfig>,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
     pub tcp_nodelay: bool,
+    /// Enable SO_TIMESTAMPING for kernel-level receive timestamps.
+    /// When enabled, connections use `RecvMsgMulti` instead of `RecvMulti`
+    /// to receive ancillary data containing kernel RX timestamps.
+    #[cfg(feature = "timestamps")]
+    pub timestamps: bool,
     /// Maximum number of SQEs per IOSQE_IO_LINK chain. 0 disables chaining.
     /// When disabled, sends exceeding MAX_IOVECS fall back to sequential
     /// round-trips (one SQE at a time via on_send_complete).
@@ -119,6 +124,8 @@ impl Default for Config {
             #[cfg(feature = "tls")]
             tls_client: None,
             tcp_nodelay: true,
+            #[cfg(feature = "timestamps")]
+            timestamps: false,
             max_chain_length: 16,
             standalone_task_capacity: 256,
             timer_slots: 256,
@@ -355,6 +362,15 @@ impl ConfigBuilder {
     /// Set the deadline-based flush interval in microseconds. 0 = disabled.
     pub fn flush_interval_us(mut self, us: u64) -> Self {
         self.config.flush_interval_us = us;
+        self
+    }
+
+    // ── Timestamp settings ────────────────────────────────────────────
+
+    /// Enable SO_TIMESTAMPING for kernel-level receive timestamps.
+    #[cfg(feature = "timestamps")]
+    pub fn timestamps(mut self, enable: bool) -> Self {
+        self.config.timestamps = enable;
         self
     }
 

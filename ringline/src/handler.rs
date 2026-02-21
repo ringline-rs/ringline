@@ -82,6 +82,13 @@ pub struct DriverCtx<'a> {
     pub(crate) connect_addrs: &'a mut Vec<libc::sockaddr_storage>,
     /// Whether to set TCP_NODELAY on outbound connections.
     pub(crate) tcp_nodelay: bool,
+    /// Whether SO_TIMESTAMPING is enabled.
+    #[cfg(feature = "timestamps")]
+    pub(crate) timestamps: bool,
+    /// Pointer to the per-worker RecvMsgMulti msghdr template.
+    #[cfg(feature = "timestamps")]
+    #[allow(dead_code)]
+    pub(crate) recvmsg_msghdr: *const libc::msghdr,
     /// Pre-allocated timespec storage for connect timeouts.
     pub(crate) connect_timespecs: &'a mut Vec<io_uring::types::Timespec>,
     /// Per-connection send chain tracking.
@@ -401,6 +408,22 @@ impl<'a> DriverCtx<'a> {
             }
         }
 
+        // Set SO_TIMESTAMPING for kernel-level RX timestamps.
+        #[cfg(feature = "timestamps")]
+        if self.timestamps {
+            let flags: libc::c_int =
+                (libc::SOF_TIMESTAMPING_SOFTWARE | libc::SOF_TIMESTAMPING_RX_SOFTWARE) as libc::c_int;
+            unsafe {
+                libc::setsockopt(
+                    raw_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_TIMESTAMPING,
+                    &flags as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
         // Register in the direct file table, then close the original fd.
         if let Err(e) = self.ring.register_files_update(conn_index, &[raw_fd]) {
             unsafe {
@@ -509,6 +532,22 @@ impl<'a> DriverCtx<'a> {
             }
         }
 
+        // Set SO_TIMESTAMPING for kernel-level RX timestamps.
+        #[cfg(feature = "timestamps")]
+        if self.timestamps {
+            let flags: libc::c_int =
+                (libc::SOF_TIMESTAMPING_SOFTWARE | libc::SOF_TIMESTAMPING_RX_SOFTWARE) as libc::c_int;
+            unsafe {
+                libc::setsockopt(
+                    raw_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_TIMESTAMPING,
+                    &flags as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
         // Register in the direct file table, then close the original fd.
         if let Err(e) = self.ring.register_files_update(conn_index, &[raw_fd]) {
             unsafe {
@@ -580,6 +619,8 @@ impl<'a> DriverCtx<'a> {
         let target_tag = match cs.recv_mode {
             crate::connection::RecvMode::Connecting => crate::completion::OpTag::Connect,
             crate::connection::RecvMode::Multi => crate::completion::OpTag::RecvMulti,
+            #[cfg(feature = "timestamps")]
+            crate::connection::RecvMode::MsgMulti => crate::completion::OpTag::RecvMsgMultiTs,
             crate::connection::RecvMode::Closed => {
                 return Ok(()); // nothing to cancel
             }
