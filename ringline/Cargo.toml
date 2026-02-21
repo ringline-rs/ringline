@@ -1,6 +1,6 @@
 [package]
 name = "ringline"
-version = "0.0.2"
+version = "0.0.3-alpha.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
