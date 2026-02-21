@@ -33,6 +33,7 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use memcache_proto::Response as McResponse;
+use ringline::ConnCtx;
 
 use crate::{Client, Error, GetValue, Value, check_error, encode_add, encode_request, encode_set};
 use memcache_proto::Request as McRequest;
@@ -50,7 +51,7 @@ pub struct ShardedConfig {
 }
 
 enum ShardConn {
-    Connected(Client),
+    Connected(ConnCtx),
     Disconnected,
 }
 
@@ -108,9 +109,9 @@ impl ShardedClient {
     pub async fn connect_all(&mut self) -> Result<(), Error> {
         let opts = self.connect_opts();
         for shard in &mut self.shards {
-            for conn in &mut shard.conns {
-                let client = do_connect(shard.addr, &opts).await?;
-                *conn = ShardConn::Connected(client);
+            for slot in &mut shard.conns {
+                let conn = do_connect(shard.addr, &opts).await?;
+                *slot = ShardConn::Connected(conn);
             }
         }
         Ok(())
@@ -119,11 +120,11 @@ impl ShardedClient {
     /// Close all connections on all shards.
     pub fn close_all(&mut self) {
         for shard in &mut self.shards {
-            for conn in &mut shard.conns {
-                if let ShardConn::Connected(client) = conn {
-                    client.conn().close();
+            for slot in &mut shard.conns {
+                if let ShardConn::Connected(c) = slot {
+                    c.close();
                 }
-                *conn = ShardConn::Disconnected;
+                *slot = ShardConn::Disconnected;
             }
         }
     }
@@ -144,7 +145,8 @@ impl ShardedClient {
     pub async fn shard_client(&mut self, index: usize) -> Result<Client, Error> {
         let opts = self.connect_opts();
         let shard = &mut self.shards[index];
-        get_client(shard, &opts).await
+        let conn = get_conn(shard, &opts).await?;
+        Ok(Client::new(conn))
     }
 
     // -- Core routing --------------------------------------------------------
@@ -158,7 +160,7 @@ impl ShardedClient {
 
         for attempt in 0..size {
             let idx = (shard.next + attempt) % size;
-            let client = match &shard.conns[idx] {
+            let conn = match &shard.conns[idx] {
                 ShardConn::Connected(c) => *c,
                 ShardConn::Disconnected => match do_connect(shard.addr, &opts).await {
                     Ok(c) => {
@@ -169,8 +171,8 @@ impl ShardedClient {
                 },
             };
 
-            client.conn().send(encoded)?;
-            match client.read_response().await {
+            conn.send(encoded)?;
+            match Client::new(conn).read_response().await {
                 Ok(response) => {
                     shard.next = (idx + 1) % size;
                     check_error(&response)?;
@@ -413,8 +415,8 @@ impl ShardedClient {
     pub async fn flush_all(&mut self) -> Result<(), Error> {
         let opts = self.connect_opts();
         for shard in &mut self.shards {
-            let client = get_client(shard, &opts).await?;
-            client.flush_all().await?;
+            let conn = get_conn(shard, &opts).await?;
+            Client::new(conn).flush_all().await?;
         }
         Ok(())
     }
@@ -423,8 +425,8 @@ impl ShardedClient {
     pub async fn version(&mut self) -> Result<String, Error> {
         let opts = self.connect_opts();
         for shard in &mut self.shards {
-            if let Ok(client) = get_client(shard, &opts).await {
-                return client.version().await;
+            if let Ok(conn) = get_conn(shard, &opts).await {
+                return Client::new(conn).version().await;
             }
         }
         Err(Error::AllConnectionsFailed)
@@ -438,8 +440,8 @@ struct ConnectOpts {
     tls_server_name: Option<String>,
 }
 
-/// Get a client from a shard, lazily reconnecting if needed.
-async fn get_client(shard: &mut Shard, opts: &ConnectOpts) -> Result<Client, Error> {
+/// Get a ConnCtx from a shard, lazily reconnecting if needed.
+async fn get_conn(shard: &mut Shard, opts: &ConnectOpts) -> Result<ConnCtx, Error> {
     let size = shard.conns.len();
     for _ in 0..size {
         let idx = shard.next;
@@ -448,9 +450,9 @@ async fn get_client(shard: &mut Shard, opts: &ConnectOpts) -> Result<Client, Err
         match &shard.conns[idx] {
             ShardConn::Connected(c) => return Ok(*c),
             ShardConn::Disconnected => {
-                if let Ok(client) = do_connect(shard.addr, opts).await {
-                    shard.conns[idx] = ShardConn::Connected(client);
-                    return Ok(client);
+                if let Ok(conn) = do_connect(shard.addr, opts).await {
+                    shard.conns[idx] = ShardConn::Connected(conn);
+                    return Ok(conn);
                 }
             }
         }
@@ -458,7 +460,7 @@ async fn get_client(shard: &mut Shard, opts: &ConnectOpts) -> Result<Client, Err
     Err(Error::AllConnectionsFailed)
 }
 
-async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<Client, Error> {
+async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<ConnCtx, Error> {
     let conn = if let Some(ref sni) = opts.tls_server_name {
         let fut = if opts.connect_timeout_ms > 0 {
             ringline::connect_tls_with_timeout(addr, sni, opts.connect_timeout_ms)?
@@ -475,7 +477,7 @@ async fn do_connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<Client, Erro
         fut.await?
     };
 
-    Ok(Client::new(conn))
+    Ok(conn)
 }
 
 #[cfg(test)]

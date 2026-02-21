@@ -127,8 +127,8 @@ impl Pool {
     ///
     /// Matches by [`ConnCtx::token()`] and sets the slot to disconnected.
     /// The next [`client()`](Pool::client) call will lazily reconnect.
-    pub fn mark_disconnected(&mut self, client: Client) {
-        let token = client.conn().token();
+    pub fn mark_disconnected(&mut self, conn: ConnCtx) {
+        let token = conn.token();
         for slot in &mut self.slots {
             if let Slot::Connected(conn) = slot
                 && conn.token() == token

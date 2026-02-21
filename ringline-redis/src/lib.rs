@@ -15,7 +15,7 @@
 //! use ringline_redis::Client;
 //!
 //! async fn example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-//!     let client = Client::new(conn);
+//!     let mut client = Client::new(conn);
 //!     client.set("hello", "world").await?;
 //!     let val = client.get("hello").await?;
 //!     assert_eq!(val.as_deref(), Some(&b"world"[..]));
@@ -24,15 +24,14 @@
 //! ```
 
 pub mod cluster;
-pub mod instrumented;
 pub mod pool;
 pub mod sharded;
 pub use cluster::{ClusterClient, ClusterConfig};
-pub use instrumented::{ClientBuilder, CommandResult, CommandType, InstrumentedClient};
 pub use pool::{Pool, PoolConfig};
 pub use sharded::{ShardedClient, ShardedConfig};
 
 use std::io;
+use std::time::Instant;
 
 use bytes::Bytes;
 use resp_proto::{Request, Value};
@@ -72,27 +71,275 @@ pub enum Error {
     TooManyRedirects,
 }
 
+// ── Command types ───────────────────────────────────────────────────────
+
+/// The type of Redis command that completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandType {
+    Get,
+    Set,
+    Del,
+    Ping,
+    Other,
+}
+
+/// Result metadata for a completed command, passed to the `on_result` callback.
+#[derive(Debug, Clone)]
+pub struct CommandResult {
+    /// The command type.
+    pub command: CommandType,
+    /// Latency in nanoseconds (send → response parsed).
+    pub latency_ns: u64,
+    /// For GET: `Some(true)` = hit, `Some(false)` = miss. `None` for others.
+    pub hit: Option<bool>,
+    /// Whether the command succeeded (no Redis error).
+    pub success: bool,
+    /// Time-to-first-byte in nanoseconds (not available in sequential mode).
+    pub ttfb_ns: Option<u64>,
+}
+
+// ── ClientMetrics ───────────────────────────────────────────────────────
+
+/// Built-in histogram-based metrics, available when the `metrics` feature is
+/// enabled. Not registered globally — the caller decides how to expose them.
+#[cfg(feature = "metrics")]
+pub struct ClientMetrics {
+    /// Overall request latency histogram.
+    pub latency: histogram::Histogram,
+    /// GET latency histogram.
+    pub get_latency: histogram::Histogram,
+    /// SET latency histogram.
+    pub set_latency: histogram::Histogram,
+    /// DEL latency histogram.
+    pub del_latency: histogram::Histogram,
+    /// Total requests completed.
+    pub requests: u64,
+    /// Total errors.
+    pub errors: u64,
+    /// Total GET hits.
+    pub hits: u64,
+    /// Total GET misses.
+    pub misses: u64,
+}
+
+#[cfg(feature = "metrics")]
+impl ClientMetrics {
+    fn new() -> Self {
+        Self {
+            latency: histogram::Histogram::new(7, 64).unwrap(),
+            get_latency: histogram::Histogram::new(7, 64).unwrap(),
+            set_latency: histogram::Histogram::new(7, 64).unwrap(),
+            del_latency: histogram::Histogram::new(7, 64).unwrap(),
+            requests: 0,
+            errors: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn record(&mut self, result: &CommandResult) {
+        self.requests += 1;
+        let _ = self.latency.increment(result.latency_ns);
+
+        if !result.success {
+            self.errors += 1;
+        }
+
+        match result.command {
+            CommandType::Get => {
+                let _ = self.get_latency.increment(result.latency_ns);
+                match result.hit {
+                    Some(true) => self.hits += 1,
+                    Some(false) => self.misses += 1,
+                    None => {}
+                }
+            }
+            CommandType::Set => {
+                let _ = self.set_latency.increment(result.latency_ns);
+            }
+            CommandType::Del => {
+                let _ = self.del_latency.increment(result.latency_ns);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── ClientBuilder ───────────────────────────────────────────────────────
+
+/// Builder for creating a [`Client`] with per-request callbacks and metrics.
+pub struct ClientBuilder {
+    conn: ConnCtx,
+    on_result: Option<Box<dyn Fn(&CommandResult)>>,
+    #[cfg(feature = "timestamps")]
+    use_kernel_ts: bool,
+    #[cfg(feature = "metrics")]
+    with_metrics: bool,
+}
+
+impl ClientBuilder {
+    pub(crate) fn new(conn: ConnCtx) -> Self {
+        Self {
+            conn,
+            on_result: None,
+            #[cfg(feature = "timestamps")]
+            use_kernel_ts: false,
+            #[cfg(feature = "metrics")]
+            with_metrics: false,
+        }
+    }
+
+    /// Register a callback invoked after each command completes.
+    pub fn on_result<F: Fn(&CommandResult) + 'static>(mut self, f: F) -> Self {
+        self.on_result = Some(Box::new(f));
+        self
+    }
+
+    /// Enable kernel SO_TIMESTAMPING for latency measurement (requires `timestamps` feature).
+    #[cfg(feature = "timestamps")]
+    pub fn kernel_timestamps(mut self, enabled: bool) -> Self {
+        self.use_kernel_ts = enabled;
+        self
+    }
+
+    /// Enable built-in histogram tracking (requires `metrics` feature).
+    #[cfg(feature = "metrics")]
+    pub fn with_metrics(mut self) -> Self {
+        self.with_metrics = true;
+        self
+    }
+
+    /// Build the client.
+    pub fn build(self) -> Client {
+        Client {
+            conn: self.conn,
+            on_result: self.on_result,
+            #[cfg(feature = "timestamps")]
+            use_kernel_ts: self.use_kernel_ts,
+            #[cfg(feature = "metrics")]
+            metrics: if self.with_metrics {
+                Some(ClientMetrics::new())
+            } else {
+                None
+            },
+        }
+    }
+}
+
 // ── Client ──────────────────────────────────────────────────────────────
 
 /// A ringline-native RESP client wrapping a single connection.
 ///
-/// `Client` is `Copy` because `ConnCtx` is `Copy`. There is no pooling,
-/// sharding, or channel overhead — commands go directly over the connection.
-#[derive(Clone, Copy)]
+/// `Client::new(conn)` creates a zero-overhead client with no callbacks or
+/// metrics. Use `Client::builder(conn)` to configure per-request callbacks,
+/// kernel timestamps, and built-in histogram tracking.
 pub struct Client {
     conn: ConnCtx,
+    on_result: Option<Box<dyn Fn(&CommandResult)>>,
+    #[cfg(feature = "timestamps")]
+    use_kernel_ts: bool,
+    #[cfg(feature = "metrics")]
+    metrics: Option<ClientMetrics>,
 }
 
 impl Client {
     /// Create a new client wrapping an established connection.
+    ///
+    /// No callbacks, no metrics, no kernel timestamps — zero overhead.
     pub fn new(conn: ConnCtx) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            on_result: None,
+            #[cfg(feature = "timestamps")]
+            use_kernel_ts: false,
+            #[cfg(feature = "metrics")]
+            metrics: None,
+        }
+    }
+
+    /// Create a builder for a client with per-request callbacks.
+    pub fn builder(conn: ConnCtx) -> ClientBuilder {
+        ClientBuilder::new(conn)
     }
 
     /// Returns the underlying connection context.
     pub fn conn(&self) -> ConnCtx {
         self.conn
     }
+
+    /// Returns a reference to the built-in metrics, if enabled.
+    #[cfg(feature = "metrics")]
+    pub fn metrics(&self) -> Option<&ClientMetrics> {
+        self.metrics.as_ref()
+    }
+
+    /// Returns a mutable reference to the built-in metrics, if enabled.
+    #[cfg(feature = "metrics")]
+    pub fn metrics_mut(&mut self) -> Option<&mut ClientMetrics> {
+        self.metrics.as_mut()
+    }
+
+    // ── Timing helpers (private) ────────────────────────────────────────
+
+    #[inline]
+    fn is_instrumented(&self) -> bool {
+        if self.on_result.is_some() {
+            return true;
+        }
+        #[cfg(feature = "metrics")]
+        if self.metrics.is_some() {
+            return true;
+        }
+        false
+    }
+
+    #[cfg(feature = "timestamps")]
+    #[inline]
+    fn send_timestamp(&self) -> u64 {
+        if self.use_kernel_ts {
+            now_realtime_ns()
+        } else {
+            0
+        }
+    }
+
+    #[cfg(not(feature = "timestamps"))]
+    #[inline]
+    fn send_timestamp(&self) -> u64 {
+        0
+    }
+
+    #[cfg(feature = "timestamps")]
+    #[inline]
+    fn finish_timing(&self, send_ts: u64, start: Instant) -> u64 {
+        if self.use_kernel_ts {
+            let recv_ts = self.conn.recv_timestamp();
+            if recv_ts > 0 && recv_ts > send_ts {
+                return recv_ts - send_ts;
+            }
+        }
+        start.elapsed().as_nanos() as u64
+    }
+
+    #[cfg(not(feature = "timestamps"))]
+    #[inline]
+    fn finish_timing(&self, _send_ts: u64, start: Instant) -> u64 {
+        start.elapsed().as_nanos() as u64
+    }
+
+    /// Record a command result: invoke callback and update metrics.
+    #[inline]
+    fn record(&mut self, result: &CommandResult) {
+        if let Some(ref cb) = self.on_result {
+            cb(result);
+        }
+        #[cfg(feature = "metrics")]
+        if let Some(ref mut m) = self.metrics {
+            m.record(result);
+        }
+    }
+
+    // ── Internal protocol methods (pub(crate), &self) ───────────────────
 
     /// Read and parse a single RESP value from the connection.
     ///
@@ -194,47 +441,103 @@ impl Client {
         buf
     }
 
-    // ── String commands ─────────────────────────────────────────────────
+    // ── Instrumented String commands ────────────────────────────────────
 
     /// Get the value of a key.
-    pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
+    pub async fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
-        self.execute_bulk(&Self::encode_request(&Request::get(key)))
-            .await
+        if !self.is_instrumented() {
+            return self.execute_bulk(&Self::encode_request(&Request::get(key))).await;
+        }
+        let send_ts = self.send_timestamp();
+        let start = Instant::now();
+        let result = self.execute_bulk(&Self::encode_request(&Request::get(key))).await;
+        let latency_ns = self.finish_timing(send_ts, start);
+        let (success, hit) = match &result {
+            Ok(Some(_)) => (true, Some(true)),
+            Ok(None) => (true, Some(false)),
+            Err(_) => (false, None),
+        };
+        self.record(&CommandResult {
+            command: CommandType::Get,
+            latency_ns,
+            hit,
+            success,
+            ttfb_ns: None,
+        });
+        result
     }
 
     /// Set a key-value pair.
-    pub async fn set(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<(), Error> {
+    pub async fn set(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let resp = self.execute_set(&Request::set(key, value), value).await?;
-        match resp {
-            Value::SimpleString(_) | Value::Null => Ok(()),
-            _ => Err(Error::UnexpectedResponse),
+        if !self.is_instrumented() {
+            let resp = self.execute_set(&Request::set(key, value), value).await?;
+            return match resp {
+                Value::SimpleString(_) | Value::Null => Ok(()),
+                _ => Err(Error::UnexpectedResponse),
+            };
         }
+        let send_ts = self.send_timestamp();
+        let start = Instant::now();
+        let result = self.execute_set(&Request::set(key, value), value).await;
+        let latency_ns = self.finish_timing(send_ts, start);
+        let success = result.is_ok();
+        let final_result = match result {
+            Ok(Value::SimpleString(_) | Value::Null) => Ok(()),
+            Ok(_) => Err(Error::UnexpectedResponse),
+            Err(e) => Err(e),
+        };
+        self.record(&CommandResult {
+            command: CommandType::Set,
+            latency_ns,
+            hit: None,
+            success,
+            ttfb_ns: None,
+        });
+        final_result
     }
 
     /// Set a key-value pair with TTL in seconds.
     pub async fn set_ex(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
         ttl_secs: u64,
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let resp = self
-            .execute_set(&Request::set(key, value).ex(ttl_secs), value)
-            .await?;
-        match resp {
-            Value::SimpleString(_) => Ok(()),
-            _ => Err(Error::UnexpectedResponse),
+        if !self.is_instrumented() {
+            let resp = self.execute_set(&Request::set(key, value).ex(ttl_secs), value).await?;
+            return match resp {
+                Value::SimpleString(_) => Ok(()),
+                _ => Err(Error::UnexpectedResponse),
+            };
         }
+        let send_ts = self.send_timestamp();
+        let start = Instant::now();
+        let result = self.execute_set(&Request::set(key, value).ex(ttl_secs), value).await;
+        let latency_ns = self.finish_timing(send_ts, start);
+        let success = result.is_ok();
+        let final_result = match result {
+            Ok(Value::SimpleString(_)) => Ok(()),
+            Ok(_) => Err(Error::UnexpectedResponse),
+            Err(e) => Err(e),
+        };
+        self.record(&CommandResult {
+            command: CommandType::Set,
+            latency_ns,
+            hit: None,
+            success,
+            ttfb_ns: None,
+        });
+        final_result
     }
 
     /// Set a key-value pair with TTL in milliseconds.
     pub async fn set_px(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
         ttl_ms: u64,
@@ -252,7 +555,7 @@ impl Client {
 
     /// Set a key only if it does not already exist. Returns true if the key was set.
     pub async fn set_nx(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Result<bool, Error> {
@@ -269,15 +572,33 @@ impl Client {
     }
 
     /// Delete a key. Returns the number of keys deleted.
-    pub async fn del(&self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
+    pub async fn del(&mut self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
         let key = key.as_ref();
-        self.execute_int(&Self::encode_request(&Request::del(key)))
+        if !self.is_instrumented() {
+            return self
+                .execute_int(&Self::encode_request(&Request::del(key)))
+                .await
+                .map(|n| n as u64);
+        }
+        let send_ts = self.send_timestamp();
+        let start = Instant::now();
+        let result = self
+            .execute_int(&Self::encode_request(&Request::del(key)))
             .await
-            .map(|n| n as u64)
+            .map(|n| n as u64);
+        let latency_ns = self.finish_timing(send_ts, start);
+        self.record(&CommandResult {
+            command: CommandType::Del,
+            latency_ns,
+            hit: None,
+            success: result.is_ok(),
+            ttfb_ns: None,
+        });
+        result
     }
 
     /// Get values for multiple keys.
-    pub async fn mget(&self, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>, Error> {
+    pub async fn mget(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>, Error> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -301,21 +622,21 @@ impl Client {
     }
 
     /// Increment the integer value of a key by 1.
-    pub async fn incr(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+    pub async fn incr(&mut self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
         let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"INCR").arg(key)))
             .await
     }
 
     /// Decrement the integer value of a key by 1.
-    pub async fn decr(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+    pub async fn decr(&mut self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
         let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"DECR").arg(key)))
             .await
     }
 
     /// Increment the integer value of a key by a given amount.
-    pub async fn incrby(&self, key: impl AsRef<[u8]>, delta: i64) -> Result<i64, Error> {
+    pub async fn incrby(&mut self, key: impl AsRef<[u8]>, delta: i64) -> Result<i64, Error> {
         let key = key.as_ref();
         let delta_str = delta.to_string();
         self.execute_int(&Self::encode_request(
@@ -325,7 +646,7 @@ impl Client {
     }
 
     /// Decrement the integer value of a key by a given amount.
-    pub async fn decrby(&self, key: impl AsRef<[u8]>, delta: i64) -> Result<i64, Error> {
+    pub async fn decrby(&mut self, key: impl AsRef<[u8]>, delta: i64) -> Result<i64, Error> {
         let key = key.as_ref();
         let delta_str = delta.to_string();
         self.execute_int(&Self::encode_request(
@@ -336,7 +657,7 @@ impl Client {
 
     /// Append a value to a key. Returns the length of the string after the append.
     pub async fn append(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Result<i64, Error> {
@@ -351,7 +672,7 @@ impl Client {
     // ── Key commands ────────────────────────────────────────────────────
 
     /// Check if a key exists.
-    pub async fn exists(&self, key: impl AsRef<[u8]>) -> Result<bool, Error> {
+    pub async fn exists(&mut self, key: impl AsRef<[u8]>) -> Result<bool, Error> {
         let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"EXISTS").arg(key)))
             .await
@@ -359,7 +680,7 @@ impl Client {
     }
 
     /// Set a timeout on a key in seconds.
-    pub async fn expire(&self, key: impl AsRef<[u8]>, seconds: u64) -> Result<bool, Error> {
+    pub async fn expire(&mut self, key: impl AsRef<[u8]>, seconds: u64) -> Result<bool, Error> {
         let key = key.as_ref();
         let secs_str = seconds.to_string();
         self.execute_int(&Self::encode_request(
@@ -370,21 +691,21 @@ impl Client {
     }
 
     /// Get the TTL of a key in seconds.
-    pub async fn ttl(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+    pub async fn ttl(&mut self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
         let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"TTL").arg(key)))
             .await
     }
 
     /// Get the TTL of a key in milliseconds.
-    pub async fn pttl(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+    pub async fn pttl(&mut self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
         let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"PTTL").arg(key)))
             .await
     }
 
     /// Remove the existing timeout on a key.
-    pub async fn persist(&self, key: impl AsRef<[u8]>) -> Result<bool, Error> {
+    pub async fn persist(&mut self, key: impl AsRef<[u8]>) -> Result<bool, Error> {
         let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"PERSIST").arg(key)))
             .await
@@ -392,7 +713,7 @@ impl Client {
     }
 
     /// Get the type of a key.
-    pub async fn key_type(&self, key: impl AsRef<[u8]>) -> Result<String, Error> {
+    pub async fn key_type(&mut self, key: impl AsRef<[u8]>) -> Result<String, Error> {
         let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::cmd(b"TYPE").arg(key)))
@@ -405,7 +726,7 @@ impl Client {
 
     /// Rename a key.
     pub async fn rename(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         new_key: impl AsRef<[u8]>,
     ) -> Result<(), Error> {
@@ -418,7 +739,7 @@ impl Client {
     }
 
     /// Delete keys without blocking. Returns the number of keys removed.
-    pub async fn unlink(&self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
+    pub async fn unlink(&mut self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
         let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"UNLINK").arg(key)))
             .await
@@ -429,7 +750,7 @@ impl Client {
 
     /// Set a field in a hash. Returns true if the field is new.
     pub async fn hset(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         field: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
@@ -446,7 +767,7 @@ impl Client {
 
     /// Get the value of a hash field.
     pub async fn hget(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         field: impl AsRef<[u8]>,
     ) -> Result<Option<Bytes>, Error> {
@@ -459,7 +780,7 @@ impl Client {
     }
 
     /// Get all fields and values in a hash.
-    pub async fn hgetall(&self, key: impl AsRef<[u8]>) -> Result<Vec<(Bytes, Bytes)>, Error> {
+    pub async fn hgetall(&mut self, key: impl AsRef<[u8]>) -> Result<Vec<(Bytes, Bytes)>, Error> {
         let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::cmd(b"HGETALL").arg(key)))
@@ -485,7 +806,7 @@ impl Client {
 
     /// Get values for multiple hash fields.
     pub async fn hmget(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         fields: &[&[u8]],
     ) -> Result<Vec<Option<Bytes>>, Error> {
@@ -512,7 +833,7 @@ impl Client {
     }
 
     /// Delete fields from a hash. Returns the number of fields removed.
-    pub async fn hdel(&self, key: impl AsRef<[u8]>, fields: &[&[u8]]) -> Result<i64, Error> {
+    pub async fn hdel(&mut self, key: impl AsRef<[u8]>, fields: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"HDEL").arg(key);
         for field in fields {
@@ -523,7 +844,7 @@ impl Client {
 
     /// Check if a field exists in a hash.
     pub async fn hexists(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         field: impl AsRef<[u8]>,
     ) -> Result<bool, Error> {
@@ -537,14 +858,14 @@ impl Client {
     }
 
     /// Get the number of fields in a hash.
-    pub async fn hlen(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+    pub async fn hlen(&mut self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
         let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"HLEN").arg(key)))
             .await
     }
 
     /// Get all field names in a hash.
-    pub async fn hkeys(&self, key: impl AsRef<[u8]>) -> Result<Vec<Bytes>, Error> {
+    pub async fn hkeys(&mut self, key: impl AsRef<[u8]>) -> Result<Vec<Bytes>, Error> {
         let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::cmd(b"HKEYS").arg(key)))
@@ -553,7 +874,7 @@ impl Client {
     }
 
     /// Get all values in a hash.
-    pub async fn hvals(&self, key: impl AsRef<[u8]>) -> Result<Vec<Bytes>, Error> {
+    pub async fn hvals(&mut self, key: impl AsRef<[u8]>) -> Result<Vec<Bytes>, Error> {
         let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::cmd(b"HVALS").arg(key)))
@@ -563,7 +884,7 @@ impl Client {
 
     /// Increment the integer value of a hash field.
     pub async fn hincrby(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         field: impl AsRef<[u8]>,
         delta: i64,
@@ -582,7 +903,7 @@ impl Client {
 
     /// Set a hash field only if it does not exist.
     pub async fn hsetnx(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         field: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
@@ -600,7 +921,7 @@ impl Client {
     // ── List commands ───────────────────────────────────────────────────
 
     /// Push values to the head of a list. Returns the list length.
-    pub async fn lpush(&self, key: impl AsRef<[u8]>, values: &[&[u8]]) -> Result<i64, Error> {
+    pub async fn lpush(&mut self, key: impl AsRef<[u8]>, values: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"LPUSH").arg(key);
         for v in values {
@@ -610,7 +931,7 @@ impl Client {
     }
 
     /// Push values to the tail of a list. Returns the list length.
-    pub async fn rpush(&self, key: impl AsRef<[u8]>, values: &[&[u8]]) -> Result<i64, Error> {
+    pub async fn rpush(&mut self, key: impl AsRef<[u8]>, values: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"RPUSH").arg(key);
         for v in values {
@@ -620,28 +941,28 @@ impl Client {
     }
 
     /// Remove and return the first element of a list.
-    pub async fn lpop(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
+    pub async fn lpop(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
         self.execute_bulk(&Self::encode_request(&Request::cmd(b"LPOP").arg(key)))
             .await
     }
 
     /// Remove and return the last element of a list.
-    pub async fn rpop(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
+    pub async fn rpop(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
         self.execute_bulk(&Self::encode_request(&Request::cmd(b"RPOP").arg(key)))
             .await
     }
 
     /// Get the length of a list.
-    pub async fn llen(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+    pub async fn llen(&mut self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
         let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"LLEN").arg(key)))
             .await
     }
 
     /// Get an element from a list by index.
-    pub async fn lindex(&self, key: impl AsRef<[u8]>, index: i64) -> Result<Option<Bytes>, Error> {
+    pub async fn lindex(&mut self, key: impl AsRef<[u8]>, index: i64) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
         let idx_str = index.to_string();
         self.execute_bulk(&Self::encode_request(
@@ -652,7 +973,7 @@ impl Client {
 
     /// Get a range of elements from a list.
     pub async fn lrange(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         start: i64,
         stop: i64,
@@ -672,7 +993,7 @@ impl Client {
     }
 
     /// Trim a list to a specified range.
-    pub async fn ltrim(&self, key: impl AsRef<[u8]>, start: i64, stop: i64) -> Result<(), Error> {
+    pub async fn ltrim(&mut self, key: impl AsRef<[u8]>, start: i64, stop: i64) -> Result<(), Error> {
         let key = key.as_ref();
         let start_str = start.to_string();
         let stop_str = stop.to_string();
@@ -687,7 +1008,7 @@ impl Client {
 
     /// Set the value of an element by index.
     pub async fn lset(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         index: i64,
         value: impl AsRef<[u8]>,
@@ -706,7 +1027,7 @@ impl Client {
 
     /// Push a value to the head of a list only if the list exists. Returns the list length.
     pub async fn lpushx(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Result<i64, Error> {
@@ -720,7 +1041,7 @@ impl Client {
 
     /// Push a value to the tail of a list only if the list exists. Returns the list length.
     pub async fn rpushx(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Result<i64, Error> {
@@ -735,7 +1056,7 @@ impl Client {
     // ── Set commands ────────────────────────────────────────────────────
 
     /// Add members to a set. Returns the number of members added.
-    pub async fn sadd(&self, key: impl AsRef<[u8]>, members: &[&[u8]]) -> Result<i64, Error> {
+    pub async fn sadd(&mut self, key: impl AsRef<[u8]>, members: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"SADD").arg(key);
         for m in members {
@@ -745,7 +1066,7 @@ impl Client {
     }
 
     /// Remove members from a set. Returns the number of members removed.
-    pub async fn srem(&self, key: impl AsRef<[u8]>, members: &[&[u8]]) -> Result<i64, Error> {
+    pub async fn srem(&mut self, key: impl AsRef<[u8]>, members: &[&[u8]]) -> Result<i64, Error> {
         let key = key.as_ref();
         let mut req = Request::cmd(b"SREM").arg(key);
         for m in members {
@@ -755,7 +1076,7 @@ impl Client {
     }
 
     /// Get all members of a set.
-    pub async fn smembers(&self, key: impl AsRef<[u8]>) -> Result<Vec<Bytes>, Error> {
+    pub async fn smembers(&mut self, key: impl AsRef<[u8]>) -> Result<Vec<Bytes>, Error> {
         let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::cmd(b"SMEMBERS").arg(key)))
@@ -764,7 +1085,7 @@ impl Client {
     }
 
     /// Get the number of members in a set.
-    pub async fn scard(&self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
+    pub async fn scard(&mut self, key: impl AsRef<[u8]>) -> Result<i64, Error> {
         let key = key.as_ref();
         self.execute_int(&Self::encode_request(&Request::cmd(b"SCARD").arg(key)))
             .await
@@ -772,7 +1093,7 @@ impl Client {
 
     /// Check if a member exists in a set.
     pub async fn sismember(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         member: impl AsRef<[u8]>,
     ) -> Result<bool, Error> {
@@ -787,7 +1108,7 @@ impl Client {
 
     /// Check if multiple members exist in a set.
     pub async fn smismember(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         members: &[&[u8]],
     ) -> Result<Vec<bool>, Error> {
@@ -813,7 +1134,7 @@ impl Client {
     }
 
     /// Remove and return a random member from a set.
-    pub async fn spop(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
+    pub async fn spop(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
         self.execute_bulk(&Self::encode_request(&Request::cmd(b"SPOP").arg(key)))
             .await
@@ -821,7 +1142,7 @@ impl Client {
 
     /// Get random members from a set.
     pub async fn srandmember(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         count: i64,
     ) -> Result<Vec<Bytes>, Error> {
@@ -840,7 +1161,7 @@ impl Client {
     // ── Auth commands ────────────────────────────────────────────────────
 
     /// Authenticate with a password (`AUTH password`).
-    pub async fn auth(&self, password: impl AsRef<[u8]>) -> Result<(), Error> {
+    pub async fn auth(&mut self, password: impl AsRef<[u8]>) -> Result<(), Error> {
         let password = password.as_ref();
         self.execute_ok(&Self::encode_request(&Request::cmd(b"AUTH").arg(password)))
             .await
@@ -850,7 +1171,7 @@ impl Client {
     ///
     /// Requires Redis 6.0+ with ACL support.
     pub async fn auth_username(
-        &self,
+        &mut self,
         username: impl AsRef<[u8]>,
         password: impl AsRef<[u8]>,
     ) -> Result<(), Error> {
@@ -864,7 +1185,7 @@ impl Client {
 
     /// Send AUTH if credentials are provided. Used internally after connect.
     pub(crate) async fn maybe_auth(
-        &self,
+        &mut self,
         password: Option<&str>,
         username: Option<&str>,
     ) -> Result<(), Error> {
@@ -881,36 +1202,56 @@ impl Client {
     // ── Server commands ─────────────────────────────────────────────────
 
     /// Ping the server.
-    pub async fn ping(&self) -> Result<(), Error> {
-        let value = self
-            .execute(&Self::encode_request(&Request::ping()))
-            .await?;
-        match value {
-            Value::SimpleString(_) => Ok(()),
-            _ => Err(Error::UnexpectedResponse),
+    pub async fn ping(&mut self) -> Result<(), Error> {
+        if !self.is_instrumented() {
+            let value = self
+                .execute(&Self::encode_request(&Request::ping()))
+                .await?;
+            return match value {
+                Value::SimpleString(_) => Ok(()),
+                _ => Err(Error::UnexpectedResponse),
+            };
         }
+        let send_ts = self.send_timestamp();
+        let start = Instant::now();
+        let result = self.execute(&Self::encode_request(&Request::ping())).await;
+        let latency_ns = self.finish_timing(send_ts, start);
+        let success = result.is_ok();
+        let final_result = match result {
+            Ok(Value::SimpleString(_)) => Ok(()),
+            Ok(_) => Err(Error::UnexpectedResponse),
+            Err(e) => Err(e),
+        };
+        self.record(&CommandResult {
+            command: CommandType::Ping,
+            latency_ns,
+            hit: None,
+            success,
+            ttfb_ns: None,
+        });
+        final_result
     }
 
     /// Delete all keys in the current database.
-    pub async fn flushdb(&self) -> Result<(), Error> {
+    pub async fn flushdb(&mut self) -> Result<(), Error> {
         self.execute_ok(&Self::encode_request(&Request::flushdb()))
             .await
     }
 
     /// Delete all keys in all databases.
-    pub async fn flushall(&self) -> Result<(), Error> {
+    pub async fn flushall(&mut self) -> Result<(), Error> {
         self.execute_ok(&Self::encode_request(&Request::flushall()))
             .await
     }
 
     /// Get the number of keys in the current database.
-    pub async fn dbsize(&self) -> Result<i64, Error> {
+    pub async fn dbsize(&mut self) -> Result<i64, Error> {
         self.execute_int(&Self::encode_request(&Request::cmd(b"DBSIZE")))
             .await
     }
 
     /// Get configuration parameter values.
-    pub async fn config_get(&self, key: impl AsRef<[u8]>) -> Result<Vec<(Bytes, Bytes)>, Error> {
+    pub async fn config_get(&mut self, key: impl AsRef<[u8]>) -> Result<Vec<(Bytes, Bytes)>, Error> {
         let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::config_get(key)))
@@ -936,7 +1277,7 @@ impl Client {
 
     /// Set a configuration parameter.
     pub async fn config_set(
-        &self,
+        &mut self,
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Result<(), Error> {
@@ -949,7 +1290,7 @@ impl Client {
     // ── Custom command ──────────────────────────────────────────────────
 
     /// Execute a custom command. Returns the raw RESP Value.
-    pub async fn cmd(&self, request: &Request<'_>) -> Result<Value, Error> {
+    pub async fn cmd(&mut self, request: &Request<'_>) -> Result<Value, Error> {
         self.execute(&Self::encode_request(request)).await
     }
 
@@ -960,64 +1301,128 @@ impl Client {
         Pipeline::new(self.conn)
     }
 
-    // ── Builder ─────────────────────────────────────────────────────────
-
-    /// Create a builder for an instrumented client with per-request callbacks.
-    pub fn builder(conn: ConnCtx) -> ClientBuilder {
-        ClientBuilder::new(conn)
-    }
-
     // ── Zero-copy SET ───────────────────────────────────────────────────
 
     /// SET with zero-copy value via SendGuard. The guard pins value memory
     /// until the kernel completes the send.
-    pub async fn set_with_guard<G: SendGuard>(&self, key: &[u8], guard: G) -> Result<(), Error> {
+    pub async fn set_with_guard<G: SendGuard>(&mut self, key: &[u8], guard: G) -> Result<(), Error> {
+        if !self.is_instrumented() {
+            let (_, value_len) = guard.as_ptr_len();
+            let prefix = encode_set_guard_prefix(key, value_len as usize, None);
+            self.conn.send_parts().build(move |b| {
+                b.copy(&prefix)
+                    .guard(GuardBox::new(guard))
+                    .copy(b"\r\n")
+                    .submit()
+            })?;
+            let resp = self.read_value().await?;
+            if let Value::Error(ref msg) = resp {
+                return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+            }
+            return match resp {
+                Value::SimpleString(_) | Value::Null => Ok(()),
+                _ => Err(Error::UnexpectedResponse),
+            };
+        }
         let (_, value_len) = guard.as_ptr_len();
         let prefix = encode_set_guard_prefix(key, value_len as usize, None);
-
+        let send_ts = self.send_timestamp();
+        let start = Instant::now();
         self.conn.send_parts().build(move |b| {
             b.copy(&prefix)
                 .guard(GuardBox::new(guard))
                 .copy(b"\r\n")
                 .submit()
         })?;
-
         let resp = self.read_value().await?;
-        if let Value::Error(ref msg) = resp {
-            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
-        }
-        match resp {
-            Value::SimpleString(_) | Value::Null => Ok(()),
-            _ => Err(Error::UnexpectedResponse),
-        }
+        let latency_ns = self.finish_timing(send_ts, start);
+        let result = if let Value::Error(ref msg) = resp {
+            Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()))
+        } else {
+            match resp {
+                Value::SimpleString(_) | Value::Null => Ok(()),
+                _ => Err(Error::UnexpectedResponse),
+            }
+        };
+        self.record(&CommandResult {
+            command: CommandType::Set,
+            latency_ns,
+            hit: None,
+            success: result.is_ok(),
+            ttfb_ns: None,
+        });
+        result
     }
 
     /// SET with TTL (EX) and zero-copy value via SendGuard.
     pub async fn set_ex_with_guard<G: SendGuard>(
-        &self,
+        &mut self,
         key: &[u8],
         guard: G,
         ttl_secs: u64,
     ) -> Result<(), Error> {
+        if !self.is_instrumented() {
+            let (_, value_len) = guard.as_ptr_len();
+            let (prefix, suffix) = encode_set_guard_prefix_ex(key, value_len as usize, ttl_secs);
+            self.conn.send_parts().build(move |b| {
+                b.copy(&prefix)
+                    .guard(GuardBox::new(guard))
+                    .copy(&suffix)
+                    .submit()
+            })?;
+            let resp = self.read_value().await?;
+            if let Value::Error(ref msg) = resp {
+                return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+            }
+            return match resp {
+                Value::SimpleString(_) => Ok(()),
+                _ => Err(Error::UnexpectedResponse),
+            };
+        }
         let (_, value_len) = guard.as_ptr_len();
         let (prefix, suffix) = encode_set_guard_prefix_ex(key, value_len as usize, ttl_secs);
-
+        let send_ts = self.send_timestamp();
+        let start = Instant::now();
         self.conn.send_parts().build(move |b| {
             b.copy(&prefix)
                 .guard(GuardBox::new(guard))
                 .copy(&suffix)
                 .submit()
         })?;
-
         let resp = self.read_value().await?;
-        if let Value::Error(ref msg) = resp {
-            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
-        }
-        match resp {
-            Value::SimpleString(_) => Ok(()),
-            _ => Err(Error::UnexpectedResponse),
-        }
+        let latency_ns = self.finish_timing(send_ts, start);
+        let result = if let Value::Error(ref msg) = resp {
+            Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()))
+        } else {
+            match resp {
+                Value::SimpleString(_) => Ok(()),
+                _ => Err(Error::UnexpectedResponse),
+            }
+        };
+        self.record(&CommandResult {
+            command: CommandType::Set,
+            latency_ns,
+            hit: None,
+            success: result.is_ok(),
+            ttfb_ns: None,
+        });
+        result
     }
+}
+
+// ── Timestamp helper ────────────────────────────────────────────────────
+
+/// Get the current time as nanoseconds since epoch using CLOCK_REALTIME.
+#[cfg(feature = "timestamps")]
+fn now_realtime_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+    }
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 // ── Zero-copy SET encoding helpers ──────────────────────────────────────
@@ -1073,7 +1478,7 @@ fn encode_set_guard_prefix_ex(key: &[u8], value_len: usize, ttl_secs: u64) -> (V
 /// # use ringline::ConnCtx;
 /// # use ringline_redis::Client;
 /// # async fn example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
-/// let client = Client::new(conn);
+/// let mut client = Client::new(conn);
 /// let results = client.pipeline()
 ///     .set(b"k1", b"v1")
 ///     .set(b"k2", b"v2")

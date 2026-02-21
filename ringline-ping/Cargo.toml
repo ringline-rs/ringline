@@ -7,9 +7,11 @@ license.workspace = true
 [features]
 default = ["metrics"]
 metrics = ["dep:histogram"]
+timestamps = ["ringline/timestamps", "dep:libc"]
 
 [dependencies]
 histogram = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 ringline = { workspace = true }
 ping-proto = { workspace = true }
 thiserror = { workspace = true }
