@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-02-21
+
+### Added
+- `ringline-redis` — Redis client with RESP protocol, sharded pools, and Redis Cluster support
+- `ringline-memcache` — Memcache client with binary protocol and ketama-based sharded pools
+- `ringline-quic` — QUIC transport layer
+- `ringline-h3` — HTTP/3 framing layer (QPACK, Huffman, QUIC frame codec)
+- Instrumented client wrappers for Redis and Memcache with per-request latency callbacks and optional histogram metrics
+- Zero-copy SET operations via `SendGuard` for both Redis and Memcache clients
+- `direct_io_write` and `nvme_write` async free functions
+
+### Changed
+- Replaced local `resp-proto`, `memcache-proto`, and `ketama` crates with published crates.io dependencies
+
+### Fixed
+- Added `workflow_call` trigger to CI for reusable workflow support
+- Resolved clippy `type_complexity` warnings in instrumented clients
+
 ## [0.0.1] - 2026-02-21
 
 ### Added
