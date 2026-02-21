@@ -1,7 +1,8 @@
-//! Integration tests: QUIC echo server using ringline's AsyncEventHandler + QuicEndpoint.
+//! Integration tests: HTTP/3 server using ringline + ringline-quic + ringline-h3.
 //!
-//! Each test launches a ringline server with UDP, connects a QUIC client (driven
-//! by quinn-proto directly), sends data, and verifies echoed responses.
+//! Each test launches a ringline server with an H3 AsyncEventHandler, connects a
+//! QUIC client (driven by quinn-proto directly), sends HTTP/3 frames,
+//! and verifies responses.
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -14,8 +15,10 @@ use quinn_proto::{
     ServerConfig,
 };
 use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder, UdpCtx, select, sleep};
-use ringline_quic::{QuicConfig, QuicEndpoint, QuicEvent};
+use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
+use ringline_quic::{QuicConfig, QuicEndpoint};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use std::future::Future;
 
 // ── TLS cert generation ──────────────────────────────────────────────
 
@@ -31,7 +34,6 @@ fn server_crypto(
     key: PrivateKeyDer<'static>,
 ) -> Arc<ServerConfig> {
     let mut sc = ServerConfig::with_single_cert(certs, key).unwrap();
-    // Allow enough concurrent streams for tests.
     let transport = Arc::get_mut(&mut sc.transport).unwrap();
     transport.max_concurrent_bidi_streams(64u32.into());
     transport.max_concurrent_uni_streams(64u32.into());
@@ -73,7 +75,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn wait_for_server(addr: &str) {
+fn wait_for_server(addr: SocketAddr) {
     for _ in 0..200 {
         if std::net::TcpStream::connect(addr).is_ok() {
             return;
@@ -83,97 +85,108 @@ fn wait_for_server(addr: &str) {
     panic!("server did not start on {addr}");
 }
 
-// Serialize tests — SERVER_CONFIG can only hold one test's state at a time.
 static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-// ── QUIC Echo Server (AsyncEventHandler) ─────────────────────────────
+// ── H3 Echo Server (AsyncEventHandler) ──────────────────────────────
 
-/// Config sent to the server handler via OnceLock.
 static SERVER_CONFIG: std::sync::OnceLock<std::sync::Mutex<Option<QuicConfig>>> =
     std::sync::OnceLock::new();
 
-struct QuicEchoServer;
+struct H3Server;
 
-#[allow(clippy::manual_async_fn)]
-impl AsyncEventHandler for QuicEchoServer {
-    fn on_accept(&self, _conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
-        async move {}
+impl AsyncEventHandler for H3Server {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async {}
     }
 
-    fn create_for_worker(_worker_id: usize) -> Self {
-        QuicEchoServer
-    }
-
-    fn on_udp_bind(
-        &self,
-        udp: UdpCtx,
-    ) -> Option<Pin<Box<dyn std::future::Future<Output = ()> + 'static>>> {
-        let config = SERVER_CONFIG
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let quic_config = SERVER_CONFIG
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap()
-            .take()?;
+            .take();
 
-        // We don't know the local_addr at this point; use a placeholder.
+        let quic_config = quic_config?;
+
         let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let mut quic = QuicEndpoint::new(config, local_addr);
-        let mut read_buf = vec![0u8; 65536];
+        let mut quic = QuicEndpoint::new(quic_config, local_addr);
+        let mut h3 = H3Connection::new(Settings::default());
 
         Some(Box::pin(async move {
             loop {
-                // Use select to drive both recv and a timer for QUIC timers.
                 match select(udp.recv_from(), sleep(Duration::from_millis(10))).await {
                     ringline::Either::Left((data, peer)) => {
                         quic.handle_datagram(Instant::now(), &data, peer);
                     }
-                    ringline::Either::Right(()) => {
-                        // Timer expired — drive QUIC timers.
-                    }
+                    ringline::Either::Right(()) => {}
                 }
 
                 quic.drive_timers(Instant::now());
 
-                // Process events.
+                // Feed QUIC events to H3.
                 while let Some(event) = quic.poll_event() {
+                    let _ = h3.handle_quic_event(&mut quic, &event);
+                }
+
+                // Process H3 events: echo back responses.
+                while let Some(event) = h3.poll_event() {
                     match event {
-                        QuicEvent::StreamReadable { conn, stream } => loop {
-                            let (n, fin) = match quic.stream_recv(conn, stream, &mut read_buf) {
-                                Ok(r) => r,
-                                Err(_) => break,
-                            };
-                            if n > 0 {
-                                let _ = quic.stream_send(conn, stream, &read_buf[..n]);
+                        H3Event::Request {
+                            stream_id,
+                            headers,
+                            end_stream,
+                        } => {
+                            let method = headers.iter().find(|h| h.name == b":method");
+                            let is_get = method.is_some_and(|m| m.value == b"GET");
+
+                            if is_get || end_stream {
+                                let response_headers = vec![HeaderField::new(b":status", b"200")];
+                                let _ = h3.send_response(
+                                    &mut quic,
+                                    stream_id,
+                                    &response_headers,
+                                    false,
+                                );
+                                let _ = h3.send_data(&mut quic, stream_id, b"hello", true);
                             }
-                            if fin {
-                                let _ = quic.stream_finish(conn, stream);
-                                break;
+                        }
+                        H3Event::Data {
+                            stream_id,
+                            data,
+                            end_stream,
+                        } => {
+                            if end_stream {
+                                let response_headers = vec![HeaderField::new(b":status", b"200")];
+                                let _ = h3.send_response(
+                                    &mut quic,
+                                    stream_id,
+                                    &response_headers,
+                                    false,
+                                );
+                                let _ = h3.send_data(&mut quic, stream_id, &data, true);
                             }
-                            if n == 0 {
-                                break;
-                            }
-                        },
-                        QuicEvent::NewConnection(_)
-                        | QuicEvent::Connected(_)
-                        | QuicEvent::StreamOpened { .. }
-                        | QuicEvent::StreamWritable { .. }
-                        | QuicEvent::StreamFinished { .. }
-                        | QuicEvent::ConnectionClosed { .. } => {}
+                        }
+                        H3Event::GoAway { .. } | H3Event::Error(_) => {}
                     }
                 }
 
-                // Flush outgoing packets.
+                // Flush outgoing QUIC packets.
                 while let Some((dest, data)) = quic.poll_send() {
                     let _ = udp.send_to(dest, &data);
                 }
             }
         }))
     }
+
+    fn create_for_worker(_worker_id: usize) -> Self {
+        H3Server
+    }
 }
 
-// ── Test Client ─────────────────────────────────────────────────────
+// ── Test Client (drives quinn-proto + HTTP/3 frames) ────────────────
 
-/// A blocking QUIC test client that drives quinn-proto over a std UdpSocket.
-struct QuicTestClient {
+struct H3TestClient {
     endpoint: Endpoint,
     socket: UdpSocket,
     conn_handle: ConnectionHandle,
@@ -182,7 +195,7 @@ struct QuicTestClient {
     recv_buf: Vec<u8>,
 }
 
-impl QuicTestClient {
+impl H3TestClient {
     fn connect(server_addr: SocketAddr, client_config: ClientConfig) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         socket
@@ -192,12 +205,11 @@ impl QuicTestClient {
 
         let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
 
-        // Initiate connection.
         let (conn_handle, conn) = endpoint
             .connect(Instant::now(), client_config, server_addr, "localhost")
             .unwrap();
 
-        let mut client = QuicTestClient {
+        let mut client = H3TestClient {
             endpoint,
             socket,
             conn_handle,
@@ -206,13 +218,25 @@ impl QuicTestClient {
             recv_buf: vec![0u8; 65536],
         };
 
-        // Send initial handshake packets.
         client.flush_transmits();
-
-        // Drive handshake to completion.
         client.drive_until_connected();
 
+        // After connection established, open our control stream and send SETTINGS.
+        client.send_control_settings();
+
         client
+    }
+
+    fn send_control_settings(&mut self) {
+        let control_stream = self.conn.streams().open(Dir::Uni).expect("open uni");
+        let mut buf = Vec::new();
+        // Stream type: control (0x00)
+        ringline_h3::frame::encode_varint(&mut buf, 0x00);
+        // SETTINGS frame with defaults (empty payload).
+        ringline_h3::Frame::Settings(Settings::default()).encode(&mut buf);
+        self.conn.send_stream(control_stream).write(&buf).unwrap();
+        // Do NOT finish the control stream — RFC 9114 requires it stays open.
+        self.flush_transmits();
     }
 
     fn flush_transmits(&mut self) {
@@ -278,7 +302,6 @@ impl QuicTestClient {
         loop {
             assert!(Instant::now() < deadline, "QUIC handshake timed out");
 
-            // Handle timeouts.
             if let Some(timeout) = self.conn.poll_timeout()
                 && timeout <= Instant::now()
             {
@@ -286,7 +309,6 @@ impl QuicTestClient {
                 self.flush_transmits();
             }
 
-            // Check for Connected event.
             while let Some(event) = self.conn.poll() {
                 if matches!(event, Event::Connected) {
                     return;
@@ -297,32 +319,46 @@ impl QuicTestClient {
         }
     }
 
-    fn open_bi(&mut self) -> quinn_proto::StreamId {
-        self.conn
-            .streams()
-            .open(Dir::Bi)
-            .expect("stream limit reached")
-    }
+    /// Send an HTTP/3 request (HEADERS frame + optional DATA + FIN).
+    fn send_request(
+        &mut self,
+        headers: &[HeaderField],
+        body: Option<&[u8]>,
+    ) -> quinn_proto::StreamId {
+        let stream = self.conn.streams().open(Dir::Bi).expect("stream limit");
 
-    fn send_data(&mut self, stream: quinn_proto::StreamId, data: &[u8]) {
-        let written = self.conn.send_stream(stream).write(data).unwrap();
-        assert_eq!(written, data.len(), "partial write");
-        self.flush_transmits();
-    }
+        // Encode and send HEADERS frame.
+        let mut frame_buf = Vec::new();
+        let mut encoded_headers = Vec::new();
+        ringline_h3::qpack::encode(headers, &mut encoded_headers);
+        ringline_h3::Frame::Headers {
+            encoded: encoded_headers,
+        }
+        .encode(&mut frame_buf);
 
-    fn finish_stream(&mut self, stream: quinn_proto::StreamId) {
+        // Encode DATA frame if body present.
+        if let Some(body) = body {
+            ringline_h3::Frame::Data {
+                payload: body.to_vec(),
+            }
+            .encode(&mut frame_buf);
+        }
+
+        self.conn.send_stream(stream).write(&frame_buf).unwrap();
         self.conn.send_stream(stream).finish().unwrap();
         self.flush_transmits();
+        stream
     }
 
-    fn recv_all(&mut self, stream: quinn_proto::StreamId, expected_len: usize) -> Vec<u8> {
-        let mut result = Vec::new();
+    /// Receive the HTTP/3 response (HEADERS + DATA) from a stream.
+    fn recv_response(&mut self, stream: quinn_proto::StreamId) -> (Vec<HeaderField>, Vec<u8>) {
+        let mut raw = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
 
-        while result.len() < expected_len {
+        // Read all data from the stream until FIN.
+        loop {
             assert!(Instant::now() < deadline, "recv timed out");
 
-            // Handle timeouts.
             if let Some(timeout) = self.conn.poll_timeout()
                 && timeout <= Instant::now()
             {
@@ -330,39 +366,57 @@ impl QuicTestClient {
                 self.flush_transmits();
             }
 
-            // Try reading.
+            let mut got_fin = false;
             match self.conn.recv_stream(stream).read(true) {
-                Ok(mut chunks) => {
-                    loop {
-                        match chunks.next(65536) {
-                            Ok(Some(chunk)) => result.extend_from_slice(&chunk.bytes),
-                            Ok(None) => {
-                                let _ = chunks.finalize();
-                                return result;
-                            }
-                            Err(quinn_proto::ReadError::Blocked) => break,
-                            Err(e) => panic!("read error: {e}"),
+                Ok(mut chunks) => loop {
+                    match chunks.next(65536) {
+                        Ok(Some(chunk)) => raw.extend_from_slice(&chunk.bytes),
+                        Ok(None) => {
+                            let _ = chunks.finalize();
+                            got_fin = true;
+                            break;
                         }
+                        Err(quinn_proto::ReadError::Blocked) => break,
+                        Err(e) => panic!("read error: {e}"),
                     }
-                    let _ = chunks.finalize();
-                }
-                Err(quinn_proto::ReadableError::ClosedStream) => {
-                    // Stream not ready yet; recv more data.
-                }
+                },
+                Err(quinn_proto::ReadableError::ClosedStream) => {}
                 Err(e) => panic!("readable error: {e}"),
             }
 
-            // Flush any pending transmits (ACKs, etc).
+            if got_fin {
+                break;
+            }
+
             self.flush_transmits();
-
-            // Drain events.
             while let Some(_event) = self.conn.poll() {}
-
-            // Recv more data from the server.
             self.recv_and_process();
         }
 
-        result
+        // Parse HTTP/3 frames from the raw data.
+        let mut headers = Vec::new();
+        let mut body = Vec::new();
+        let mut offset = 0;
+
+        while offset < raw.len() {
+            match ringline_h3::frame::decode_frame(&raw[offset..]).unwrap() {
+                Some((frame, consumed)) => {
+                    offset += consumed;
+                    match frame {
+                        ringline_h3::Frame::Headers { encoded } => {
+                            headers = ringline_h3::qpack::decode(&encoded).unwrap();
+                        }
+                        ringline_h3::Frame::Data { payload } => {
+                            body.extend_from_slice(&payload);
+                        }
+                        _ => {}
+                    }
+                }
+                None => break,
+            }
+        }
+
+        (headers, body)
     }
 
     fn close(mut self) {
@@ -378,15 +432,13 @@ impl QuicTestClient {
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[test]
-fn quic_echo() {
+fn h3_request_response() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);
     let client_cfg = client_crypto(&certs);
 
     let quic_config = QuicConfig::server(server_cfg);
-
-    // Store config for server handler.
     SERVER_CONFIG
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
@@ -401,20 +453,33 @@ fn quic_echo() {
     let (shutdown, handles) = RinglineBuilder::new(test_config())
         .bind(tcp_addr)
         .bind_udp(udp_addr)
-        .launch::<QuicEchoServer>()
+        .launch::<H3Server>()
         .expect("launch failed");
 
-    wait_for_server(&tcp_addr.to_string());
+    wait_for_server(tcp_addr);
     std::thread::sleep(Duration::from_millis(50));
 
-    // Connect and echo.
-    let mut client = QuicTestClient::connect(udp_addr, client_cfg);
-    let stream = client.open_bi();
-    client.send_data(stream, b"hello QUIC");
-    client.finish_stream(stream);
+    let mut client = H3TestClient::connect(udp_addr, client_cfg);
 
-    let response = client.recv_all(stream, 10);
-    assert_eq!(&response, b"hello QUIC", "echo mismatch");
+    // Send GET request.
+    let request_headers = vec![
+        HeaderField::new(b":method", b"GET"),
+        HeaderField::new(b":path", b"/"),
+        HeaderField::new(b":scheme", b"https"),
+        HeaderField::new(b":authority", b"localhost"),
+    ];
+    let stream = client.send_request(&request_headers, None);
+
+    // Receive response.
+    let (resp_headers, resp_body) = client.recv_response(stream);
+
+    // Verify.
+    let status = resp_headers
+        .iter()
+        .find(|h| h.name == b":status")
+        .expect("no :status header");
+    assert_eq!(status.value, b"200");
+    assert_eq!(resp_body, b"hello");
 
     client.close();
     shutdown.shutdown();
@@ -424,14 +489,13 @@ fn quic_echo() {
 }
 
 #[test]
-fn quic_multi_stream() {
+fn h3_request_with_body() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);
     let client_cfg = client_crypto(&certs);
 
     let quic_config = QuicConfig::server(server_cfg);
-
     SERVER_CONFIG
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
@@ -446,89 +510,92 @@ fn quic_multi_stream() {
     let (shutdown, handles) = RinglineBuilder::new(test_config())
         .bind(tcp_addr)
         .bind_udp(udp_addr)
-        .launch::<QuicEchoServer>()
+        .launch::<H3Server>()
         .expect("launch failed");
 
-    wait_for_server(&tcp_addr.to_string());
+    wait_for_server(tcp_addr);
     std::thread::sleep(Duration::from_millis(50));
 
-    let mut client = QuicTestClient::connect(udp_addr, client_cfg);
+    let mut client = H3TestClient::connect(udp_addr, client_cfg);
 
-    let messages = [b"stream-one".as_ref(), b"stream-two", b"stream-three"];
+    // Send POST request with body.
+    let request_headers = vec![
+        HeaderField::new(b":method", b"POST"),
+        HeaderField::new(b":path", b"/echo"),
+        HeaderField::new(b":scheme", b"https"),
+        HeaderField::new(b":authority", b"localhost"),
+    ];
+    let stream = client.send_request(&request_headers, Some(b"request body"));
+
+    let (resp_headers, resp_body) = client.recv_response(stream);
+
+    let status = resp_headers
+        .iter()
+        .find(|h| h.name == b":status")
+        .expect("no :status header");
+    assert_eq!(status.value, b"200");
+    assert_eq!(resp_body, b"request body");
+
+    client.close();
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn h3_multiple_requests() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    let (certs, key) = generate_self_signed();
+    let server_cfg = server_crypto(certs.clone(), key);
+    let client_cfg = client_crypto(&certs);
+
+    let quic_config = QuicConfig::server(server_cfg);
+    SERVER_CONFIG
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .replace(quic_config);
+
+    let udp_port = free_port();
+    let udp_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+    let tcp_port = free_port();
+    let tcp_addr: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(tcp_addr)
+        .bind_udp(udp_addr)
+        .launch::<H3Server>()
+        .expect("launch failed");
+
+    wait_for_server(tcp_addr);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut client = H3TestClient::connect(udp_addr, client_cfg);
+
+    // Send 3 GET requests on separate streams.
     let mut streams = Vec::new();
-
-    for msg in &messages {
-        let stream = client.open_bi();
-        client.send_data(stream, msg);
-        client.finish_stream(stream);
-        streams.push((stream, msg.len()));
+    for i in 0..3 {
+        let request_headers = vec![
+            HeaderField::new(b":method", b"GET"),
+            HeaderField::new(":path", format!("/{i}")),
+            HeaderField::new(b":scheme", b"https"),
+            HeaderField::new(b":authority", b"localhost"),
+        ];
+        let stream = client.send_request(&request_headers, None);
+        streams.push(stream);
     }
 
-    for (i, (stream, len)) in streams.iter().enumerate() {
-        let response = client.recv_all(*stream, *len);
-        assert_eq!(&response, messages[i], "echo mismatch on stream {i}");
+    // Receive all responses.
+    for stream in &streams {
+        let (resp_headers, resp_body) = client.recv_response(*stream);
+        let status = resp_headers
+            .iter()
+            .find(|h| h.name == b":status")
+            .expect("no :status header");
+        assert_eq!(status.value, b"200");
+        assert_eq!(resp_body, b"hello");
     }
-
-    client.close();
-    shutdown.shutdown();
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
-}
-
-#[test]
-fn quic_large_message() {
-    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
-    let (certs, key) = generate_self_signed();
-    let server_cfg = server_crypto(certs.clone(), key);
-    let client_cfg = client_crypto(&certs);
-
-    let quic_config = QuicConfig::server(server_cfg);
-
-    SERVER_CONFIG
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .unwrap()
-        .replace(quic_config);
-
-    let udp_port = free_port();
-    let udp_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
-    let tcp_port = free_port();
-    let tcp_addr: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
-
-    let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(tcp_addr)
-        .bind_udp(udp_addr)
-        .launch::<QuicEchoServer>()
-        .expect("launch failed");
-
-    wait_for_server(&tcp_addr.to_string());
-    std::thread::sleep(Duration::from_millis(50));
-
-    // 64KB payload.
-    let payload: Vec<u8> = (0u8..=255).cycle().take(65536).collect();
-
-    let mut client = QuicTestClient::connect(udp_addr, client_cfg);
-    let stream = client.open_bi();
-
-    // Send in chunks (quinn flow control may limit per-write).
-    let mut offset = 0;
-    while offset < payload.len() {
-        let n = client
-            .conn
-            .send_stream(stream)
-            .write(&payload[offset..])
-            .unwrap();
-        offset += n;
-        client.flush_transmits();
-        // Process any incoming ACKs to open flow control window.
-        client.recv_and_process();
-    }
-    client.finish_stream(stream);
-
-    let response = client.recv_all(stream, payload.len());
-    assert_eq!(response.len(), payload.len(), "length mismatch");
-    assert_eq!(response, payload, "data mismatch");
 
     client.close();
     shutdown.shutdown();

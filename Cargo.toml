@@ -8,6 +8,7 @@ members = [
     "ringline-redis",
     "ringline-memcache",
     "ringline-quic",
+    "ringline-h3",
 ]
 
 [workspace.package]
@@ -34,3 +35,4 @@ rustls = { version = "0.23", default-features = false }
 slab = "0.4"
 rcgen = "0.13"
 rustls-pki-types = "1"
+webpki-roots = "0.26"

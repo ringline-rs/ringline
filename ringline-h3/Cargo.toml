@@ -1,0 +1,17 @@
+[package]
+name = "ringline-h3"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bytes = { workspace = true }
+ringline-quic = { path = "../ringline-quic" }
+
+[dev-dependencies]
+ringline = { workspace = true }
+quinn-proto = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true, features = ["std", "ring"] }
+rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }
