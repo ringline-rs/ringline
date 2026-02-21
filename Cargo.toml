@@ -23,6 +23,7 @@ ketama = "0.0.1"
 
 # External dependencies
 bytes = "1.11.1"
+histogram = "0.11"
 itoa = "1.0"
 memchr = "2.7"
 ryu = "1.0"

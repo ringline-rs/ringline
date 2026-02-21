@@ -23,8 +23,10 @@
 //! }
 //! ```
 
+pub mod instrumented;
 pub mod pool;
 pub mod sharded;
+pub use instrumented::{ClientBuilder, CommandResult, CommandType, InstrumentedClient};
 pub use pool::{Pool, PoolConfig};
 pub use sharded::{ShardedClient, ShardedConfig};
 
@@ -32,7 +34,7 @@ use std::io;
 
 use bytes::Bytes;
 use memcache_proto::{Request as McRequest, Response as McResponse};
-use ringline::{ConnCtx, ParseResult};
+use ringline::{ConnCtx, GuardBox, ParseResult, SendGuard};
 
 // -- Error -------------------------------------------------------------------
 
@@ -360,6 +362,56 @@ impl Client {
             _ => Err(Error::UnexpectedResponse),
         }
     }
+    // -- Builder ---------------------------------------------------------------
+
+    /// Create a builder for an instrumented client with per-request callbacks.
+    pub fn builder(conn: ConnCtx) -> ClientBuilder {
+        ClientBuilder::new(conn)
+    }
+
+    // -- Zero-copy SET -------------------------------------------------------
+
+    /// SET with zero-copy value via SendGuard. The guard pins value memory
+    /// until the kernel completes the send.
+    pub async fn set_with_guard<G: SendGuard>(
+        &self,
+        key: &[u8],
+        guard: G,
+        flags: u32,
+        exptime: u32,
+    ) -> Result<(), Error> {
+        let (_, value_len) = guard.as_ptr_len();
+        let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime);
+
+        self.conn.send_parts().build(move |b| {
+            b.copy(&prefix)
+                .guard(GuardBox::new(guard))
+                .copy(b"\r\n")
+                .submit()
+        })?;
+
+        let response = self.read_response().await?;
+        check_error(&response)?;
+        match response {
+            McResponse::Stored => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+}
+
+// -- Zero-copy SET encoding helpers ------------------------------------------
+
+/// Encode memcache text SET prefix for guard-based sends.
+///
+/// Returns: `set {key} {flags} {exptime} {valuelen}\r\n`
+/// The caller must append value bytes (via guard) + `\r\n` suffix.
+fn encode_set_guard_prefix(key: &[u8], value_len: usize, flags: u32, exptime: u32) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(32 + key.len());
+    buf.extend_from_slice(b"set ");
+    buf.extend_from_slice(key);
+    write!(buf, " {} {} {}\r\n", flags, exptime, value_len).unwrap();
+    buf
 }
 
 // -- Encoding helpers --------------------------------------------------------

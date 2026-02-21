@@ -24,9 +24,11 @@
 //! ```
 
 pub mod cluster;
+pub mod instrumented;
 pub mod pool;
 pub mod sharded;
 pub use cluster::{ClusterClient, ClusterConfig};
+pub use instrumented::{ClientBuilder, CommandResult, CommandType, InstrumentedClient};
 pub use pool::{Pool, PoolConfig};
 pub use sharded::{ShardedClient, ShardedConfig};
 
@@ -34,7 +36,7 @@ use std::io;
 
 use bytes::Bytes;
 use resp_proto::{Request, Value};
-use ringline::{ConnCtx, ParseResult};
+use ringline::{ConnCtx, GuardBox, ParseResult, SendGuard};
 
 // ── Error ───────────────────────────────────────────────────────────────
 
@@ -957,6 +959,106 @@ impl Client {
     pub fn pipeline(&self) -> Pipeline {
         Pipeline::new(self.conn)
     }
+
+    // ── Builder ─────────────────────────────────────────────────────────
+
+    /// Create a builder for an instrumented client with per-request callbacks.
+    pub fn builder(conn: ConnCtx) -> ClientBuilder {
+        ClientBuilder::new(conn)
+    }
+
+    // ── Zero-copy SET ───────────────────────────────────────────────────
+
+    /// SET with zero-copy value via SendGuard. The guard pins value memory
+    /// until the kernel completes the send.
+    pub async fn set_with_guard<G: SendGuard>(&self, key: &[u8], guard: G) -> Result<(), Error> {
+        let (_, value_len) = guard.as_ptr_len();
+        let prefix = encode_set_guard_prefix(key, value_len as usize, None);
+
+        self.conn.send_parts().build(move |b| {
+            b.copy(&prefix)
+                .guard(GuardBox::new(guard))
+                .copy(b"\r\n")
+                .submit()
+        })?;
+
+        let resp = self.read_value().await?;
+        if let Value::Error(ref msg) = resp {
+            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+        }
+        match resp {
+            Value::SimpleString(_) | Value::Null => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// SET with TTL (EX) and zero-copy value via SendGuard.
+    pub async fn set_ex_with_guard<G: SendGuard>(
+        &self,
+        key: &[u8],
+        guard: G,
+        ttl_secs: u64,
+    ) -> Result<(), Error> {
+        let (_, value_len) = guard.as_ptr_len();
+        let (prefix, suffix) = encode_set_guard_prefix_ex(key, value_len as usize, ttl_secs);
+
+        self.conn.send_parts().build(move |b| {
+            b.copy(&prefix)
+                .guard(GuardBox::new(guard))
+                .copy(&suffix)
+                .submit()
+        })?;
+
+        let resp = self.read_value().await?;
+        if let Value::Error(ref msg) = resp {
+            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+        }
+        match resp {
+            Value::SimpleString(_) => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+}
+
+// ── Zero-copy SET encoding helpers ──────────────────────────────────────
+
+/// Encode RESP SET prefix for guard-based sends.
+///
+/// Returns the prefix bytes: `*3\r\n$3\r\nSET\r\n${keylen}\r\n{key}\r\n${valuelen}\r\n`
+/// (or `*5\r\n...` when `noreply` args are needed).
+/// The caller must append value bytes (via guard) + `\r\n` suffix.
+fn encode_set_guard_prefix(key: &[u8], value_len: usize, _options: Option<()>) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(32 + key.len());
+    buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n");
+    write!(buf, "${}\r\n", key.len()).unwrap();
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(b"\r\n");
+    write!(buf, "${}\r\n", value_len).unwrap();
+    buf
+}
+
+/// Encode RESP SET EX prefix + suffix for guard-based sends.
+///
+/// Returns `(prefix, suffix)` where:
+/// - prefix: `*5\r\n$3\r\nSET\r\n${keylen}\r\n{key}\r\n${valuelen}\r\n`
+/// - suffix: `\r\n$2\r\nEX\r\n${ttllen}\r\n{ttl}\r\n`
+fn encode_set_guard_prefix_ex(key: &[u8], value_len: usize, ttl_secs: u64) -> (Vec<u8>, Vec<u8>) {
+    use std::io::Write;
+    let ttl_str = ttl_secs.to_string();
+
+    let mut prefix = Vec::with_capacity(32 + key.len());
+    prefix.extend_from_slice(b"*5\r\n$3\r\nSET\r\n");
+    write!(prefix, "${}\r\n", key.len()).unwrap();
+    prefix.extend_from_slice(key);
+    prefix.extend_from_slice(b"\r\n");
+    write!(prefix, "${}\r\n", value_len).unwrap();
+
+    let mut suffix = Vec::with_capacity(32);
+    suffix.extend_from_slice(b"\r\n$2\r\nEX\r\n");
+    write!(suffix, "${}\r\n{}\r\n", ttl_str.len(), ttl_str).unwrap();
+
+    (prefix, suffix)
 }
 
 // ── Pipeline ────────────────────────────────────────────────────────────

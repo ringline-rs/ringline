@@ -4,8 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["metrics"]
+metrics = ["dep:histogram"]
+
 [dependencies]
 bytes = { workspace = true }
+histogram = { workspace = true, optional = true }
 ketama = { workspace = true }
 ringline = { workspace = true }
 resp-proto = { workspace = true }
