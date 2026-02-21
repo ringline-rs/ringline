@@ -127,8 +127,12 @@ pub use runtime::io::connect_tls_with_timeout;
 pub use runtime::io::connect_with_timeout;
 /// Submit a Direct I/O read and return a future for the result.
 pub use runtime::io::direct_io_read;
+/// Submit a Direct I/O write and return a future for the result.
+pub use runtime::io::direct_io_write;
 /// Submit an NVMe read and return a future for the result.
 pub use runtime::io::nvme_read;
+/// Submit an NVMe write and return a future for the result.
+pub use runtime::io::nvme_write;
 /// Open a Direct I/O file from any async task.
 pub use runtime::io::open_direct_io_file;
 /// Open an NVMe device from any async task.
