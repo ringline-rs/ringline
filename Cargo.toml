@@ -6,6 +6,7 @@ members = [
     "ringline-memcache",
     "ringline-quic",
     "ringline-h3",
+    "ringline-ping",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ repository = "https://github.com/brayniac/ringline"
 ringline = { path = "ringline", features = ["tls"] }
 resp-proto = "0.0.1"
 memcache-proto = "0.0.1"
+ping-proto = "0.0.1"
 ketama = "0.0.1"
 
 # External dependencies
