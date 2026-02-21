@@ -7,6 +7,9 @@ use ringline::{ConnCtx, SendGuard};
 
 use crate::{Client, Error, Value};
 
+/// Callback type for per-command result notifications.
+type ResultCallback = Box<dyn Fn(&CommandResult)>;
+
 // ── Types ───────────────────────────────────────────────────────────────
 
 /// The type of Memcache command that completed.
@@ -94,7 +97,7 @@ impl ClientMetrics {
 
 pub struct ClientBuilder {
     conn: ConnCtx,
-    on_result: Option<Box<dyn Fn(&CommandResult)>>,
+    on_result: Option<ResultCallback>,
     #[cfg(feature = "metrics")]
     with_metrics: bool,
 }
@@ -143,7 +146,7 @@ impl ClientBuilder {
 /// an optional callback after each command.
 pub struct InstrumentedClient {
     client: Client,
-    on_result: Option<Box<dyn Fn(&CommandResult)>>,
+    on_result: Option<ResultCallback>,
     #[cfg(feature = "metrics")]
     metrics: Option<ClientMetrics>,
 }
@@ -228,7 +231,10 @@ impl InstrumentedClient {
         exptime: u32,
     ) -> Result<(), Error> {
         let start = Instant::now();
-        let result = self.client.set_with_options(key, value, flags, exptime).await;
+        let result = self
+            .client
+            .set_with_options(key, value, flags, exptime)
+            .await;
         let latency_ns = start.elapsed().as_nanos() as u64;
         self.record(&CommandResult {
             command: CommandType::Set,
