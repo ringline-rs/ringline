@@ -55,16 +55,11 @@ jobs:
   audit:
     name: Audit
     runs-on: ubuntu-latest
-    permissions:
-      checks: write
-      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo generate-lockfile
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
 
   test:
     name: Test

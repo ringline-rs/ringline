@@ -9,7 +9,6 @@ env:
   CARGO_TERM_COLOR: always
 
 permissions:
-  checks: write
   contents: write
 
 jobs:
