@@ -6,6 +6,7 @@ members = [
     "ringline-memcache",
     "ringline-quic",
     "ringline-h3",
+    "ringline-h2",
     "ringline-ping",
     "ringline-momento",
 ]
