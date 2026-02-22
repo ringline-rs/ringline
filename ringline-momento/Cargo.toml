@@ -1,0 +1,20 @@
+[package]
+name = "ringline-momento"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["metrics"]
+metrics = ["dep:histogram"]
+timestamps = ["ringline/timestamps", "dep:libc"]
+
+[dependencies]
+bytes = { workspace = true }
+histogram = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+ringline = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serial_test = "3"
