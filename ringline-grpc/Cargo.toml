@@ -1,0 +1,18 @@
+[package]
+name = "ringline-grpc"
+version = "0.1.0"
+edition = "2024"
+description = "Sans-IO gRPC client framing layer"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ringline-h2 = { path = "../ringline-h2" }
+
+[dev-dependencies]
+ringline = { workspace = true }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+rcgen = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }

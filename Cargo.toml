@@ -9,6 +9,7 @@ members = [
     "ringline-h2",
     "ringline-ping",
     "ringline-momento",
+    "ringline-grpc",
 ]
 
 [workspace.package]
