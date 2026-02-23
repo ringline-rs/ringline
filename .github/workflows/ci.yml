@@ -87,3 +87,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all --release
+
+  integration-clients:
+    name: Integration (public servers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ringline-h2 --test public_servers -- --ignored --nocapture
+      - run: cargo test -p ringline-h3 --test public_servers -- --ignored --nocapture
