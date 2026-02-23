@@ -79,18 +79,24 @@ pub enum CompletedOp {
         id: RequestId,
         key: Bytes,
         result: Result<Option<Bytes>, Error>,
+        /// Latency in nanoseconds (send → response parsed).
+        latency_ns: u64,
     },
     /// Set operation completed.
     Set {
         id: RequestId,
         key: Bytes,
         result: Result<(), Error>,
+        /// Latency in nanoseconds (send → response parsed).
+        latency_ns: u64,
     },
     /// Delete operation completed.
     Delete {
         id: RequestId,
         key: Bytes,
         result: Result<(), Error>,
+        /// Latency in nanoseconds (send → response parsed).
+        latency_ns: u64,
     },
 }
 
@@ -446,8 +452,9 @@ impl Client {
         let dr =
             dispatch_result.ok_or_else(|| Error::Protocol("failed to decode response".into()))?;
 
+        let latency_ns = self.finish_timing(dr.send_ts, dr.start);
+
         if self.is_instrumented() {
-            let latency_ns = self.finish_timing(dr.send_ts, dr.start);
             self.record(&CommandResult {
                 command: dr.cmd_type,
                 latency_ns,
@@ -455,7 +462,13 @@ impl Client {
             });
         }
 
-        Ok(dr.op)
+        let mut op = dr.op;
+        match &mut op {
+            CompletedOp::Get { latency_ns: l, .. }
+            | CompletedOp::Set { latency_ns: l, .. }
+            | CompletedOp::Delete { latency_ns: l, .. } => *l = latency_ns,
+        }
+        Ok(op)
     }
 
     // ── Sequential convenience API ──────────────────────────────────────
@@ -677,6 +690,7 @@ fn dispatch_response(
                     id,
                     key: op.key,
                     result,
+                    latency_ns: 0, // filled in by recv()
                 },
                 cmd_type: CommandType::Get,
                 success,
@@ -699,6 +713,7 @@ fn dispatch_response(
                     id,
                     key: op.key,
                     result,
+                    latency_ns: 0, // filled in by recv()
                 },
                 cmd_type: CommandType::Set,
                 success,
@@ -723,6 +738,7 @@ fn dispatch_response(
                     id,
                     key: op.key,
                     result,
+                    latency_ns: 0, // filled in by recv()
                 },
                 cmd_type: CommandType::Delete,
                 success,
