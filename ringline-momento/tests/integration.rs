@@ -47,7 +47,12 @@ fn pre_resolve_credential() -> (Credential, SocketAddr) {
     let addr_str = format!("{host}:{port}");
     let addr: SocketAddr = addr_str
         .to_socket_addrs()
-        .unwrap_or_else(|e| panic!("failed to resolve {addr_str}: {e}"))
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to resolve {addr_str}: {e}\n\
+                 hint: set MOMENTO_ENDPOINT to the correct cache endpoint"
+            )
+        })
         .next()
         .unwrap_or_else(|| panic!("no addresses found for {addr_str}"));
 

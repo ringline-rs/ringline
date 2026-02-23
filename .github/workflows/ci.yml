@@ -113,4 +113,5 @@ jobs:
       - run: cargo test -p ringline-momento --test integration -- --ignored --nocapture
         env:
           MOMENTO_AUTH_TOKEN: ${{ secrets.MOMENTO_AUTH_TOKEN }}
+          MOMENTO_ENDPOINT: ${{ secrets.MOMENTO_ENDPOINT }}
           MOMENTO_CACHE_NAME: ${{ secrets.MOMENTO_CACHE_NAME }}
