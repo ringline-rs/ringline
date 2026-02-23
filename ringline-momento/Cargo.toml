@@ -17,4 +17,6 @@ ringline = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+rustls = { workspace = true }
 serial_test = "3"
+webpki-roots = { workspace = true }

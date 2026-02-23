@@ -14,7 +14,9 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::OnceLock;
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
+use std::sync::Arc;
+
+use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder, TlsClientConfig};
 use ringline_momento::{Client, Credential};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -22,6 +24,14 @@ use ringline_momento::{Client, Credential};
 static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn test_config() -> Config {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_client = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+
     let mut config = Config::default();
     config.worker.threads = 1;
     config.worker.pin_to_core = false;
@@ -30,6 +40,9 @@ fn test_config() -> Config {
     config.recv_buffer.buffer_size = 4096;
     config.max_connections = 64;
     config.send_copy_count = 64;
+    config.tls_client = Some(TlsClientConfig {
+        client_config: tls_client,
+    });
     config
 }
 
