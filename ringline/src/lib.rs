@@ -56,7 +56,6 @@ pub(crate) mod metrics;
 pub mod nvme;
 pub(crate) mod ring;
 pub(crate) mod runtime;
-#[cfg(feature = "tls")]
 pub(crate) mod tls;
 pub(crate) mod worker;
 
@@ -118,10 +117,8 @@ pub use runtime::io::WithDataFuture;
 /// Initiate an outbound TCP connection from any async task.
 pub use runtime::io::connect;
 /// Initiate an outbound TLS connection from any async task.
-#[cfg(feature = "tls")]
 pub use runtime::io::connect_tls;
 /// Initiate an outbound TLS connection with a timeout from any async task.
-#[cfg(feature = "tls")]
 pub use runtime::io::connect_tls_with_timeout;
 /// Initiate an outbound TCP connection with a timeout from any async task.
 pub use runtime::io::connect_with_timeout;
@@ -221,14 +218,11 @@ pub use worker::RinglineBuilder;
 /// Handle for triggering graceful shutdown.
 pub use worker::ShutdownHandle;
 
-// ── Re-exports: TLS (feature-gated) ────────────────────────────────────
+// ── Re-exports: TLS ─────────────────────────────────────────────────────
 
 /// Client-side TLS configuration.
-#[cfg(feature = "tls")]
 pub use config::TlsClientConfig;
 /// Server-side TLS configuration.
-#[cfg(feature = "tls")]
 pub use config::TlsConfig;
 /// TLS session info (protocol version, cipher suite, etc.).
-#[cfg(feature = "tls")]
 pub use tls::TlsInfo;

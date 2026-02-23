@@ -241,7 +241,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Close => self.handle_close(ud),
             OpTag::Shutdown => {}
             OpTag::EventFdRead => self.handle_eventfd_read(),
-            #[cfg(feature = "tls")]
             OpTag::TlsSend => self.handle_tls_send(ud, result),
             OpTag::Connect => self.handle_connect(ud, result),
             OpTag::Timeout => self.handle_timeout(ud, result),
@@ -303,17 +302,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.pending_replenish.push(bid);
 
         // TLS path
-        #[cfg(feature = "tls")]
         let is_tls_conn = self
             .driver
             .tls_table
             .as_ref()
             .is_some_and(|t| t.has(conn_index));
-        #[cfg(not(feature = "tls"))]
-        let is_tls_conn = false;
 
         if is_tls_conn {
-            #[cfg(feature = "tls")]
             {
                 let tls_table = self.driver.tls_table.as_mut().unwrap();
                 let result = crate::tls::feed_tls_recv(
@@ -603,7 +598,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.arm_recv(conn_index);
 
                 // TLS path: defer accept until handshake completes.
-                #[cfg(feature = "tls")]
                 if let Some(ref mut tls_table) = self.driver.tls_table
                     && tls_table.has_server_config()
                 {
@@ -830,7 +824,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
 
-            #[cfg(feature = "tls")]
             if let Some(ref mut tls_table) = self.driver.tls_table {
                 tls_table.remove(conn_index);
             }
@@ -877,7 +870,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.accumulators.reset(conn_index);
 
         // TLS client path
-        #[cfg(feature = "tls")]
         if let Some(ref mut tls_table) = self.driver.tls_table
             && tls_table.get_mut(conn_index).is_some()
         {
@@ -925,7 +917,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .ring
             .submit_async_cancel(connect_ud.raw(), conn_index);
 
-        #[cfg(feature = "tls")]
         if let Some(ref mut tls_table) = self.driver.tls_table {
             tls_table.remove(conn_index);
         }
@@ -946,7 +937,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .map(|c| c.established)
             .unwrap_or(false);
 
-        #[cfg(feature = "tls")]
         if let Some(ref mut tls_table) = self.driver.tls_table {
             tls_table.remove(conn_index);
         }
@@ -961,7 +951,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.connections.release(conn_index);
     }
 
-    #[cfg(feature = "tls")]
     fn handle_tls_send(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
         let pool_slot = ud.payload() as u16;

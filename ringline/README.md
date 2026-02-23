@@ -132,7 +132,7 @@ cargo run --release --example echo_bench
 cargo run --example connect_echo
 
 # TLS echo server
-cargo run --example echo_tls_server --features tls
+cargo run --example echo_tls_server
 ```
 
 ## License

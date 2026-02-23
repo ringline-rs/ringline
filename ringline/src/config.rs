@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use crate::buffer::fixed::MemoryRegion;
 
 /// TLS configuration. Pass a pre-built rustls ServerConfig.
-#[cfg(feature = "tls")]
 #[derive(Clone)]
 pub struct TlsConfig {
     /// Pre-built rustls ServerConfig. User loads certs/keys and configures ALPN etc.
@@ -11,7 +10,6 @@ pub struct TlsConfig {
 }
 
 /// TLS client configuration for outbound connections.
-#[cfg(feature = "tls")]
 #[derive(Clone)]
 pub struct TlsClientConfig {
     /// Pre-built rustls ClientConfig. User configures root certs, ALPN, etc.
@@ -65,10 +63,8 @@ pub struct Config {
     /// Default: 1000 (1ms).
     pub tick_timeout_us: u64,
     /// Optional TLS configuration. When set, all accepted connections use TLS.
-    #[cfg(feature = "tls")]
     pub tls: Option<TlsConfig>,
     /// Optional TLS client configuration for outbound `connect_tls()` calls.
-    #[cfg(feature = "tls")]
     pub tls_client: Option<TlsClientConfig>,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
     pub tcp_nodelay: bool,
@@ -119,9 +115,7 @@ impl Default for Config {
             send_slab_slots: 512,
             flush_interval_us: 100,
             tick_timeout_us: 1000,
-            #[cfg(feature = "tls")]
             tls: None,
-            #[cfg(feature = "tls")]
             tls_client: None,
             tcp_nodelay: true,
             #[cfg(feature = "timestamps")]
@@ -405,14 +399,12 @@ impl ConfigBuilder {
     }
 
     /// Set TLS server configuration.
-    #[cfg(feature = "tls")]
     pub fn tls(mut self, config: TlsConfig) -> Self {
         self.config.tls = Some(config);
         self
     }
 
     /// Set TLS client configuration for outbound connections.
-    #[cfg(feature = "tls")]
     pub fn tls_client(mut self, config: TlsClientConfig) -> Self {
         self.config.tls_client = Some(config);
         self

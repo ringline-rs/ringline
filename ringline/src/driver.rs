@@ -130,9 +130,7 @@ pub(crate) struct Driver {
     pub(crate) flush_interval: Option<Duration>,
     pub(crate) shutdown_flag: Arc<AtomicBool>,
     pub(crate) shutdown_local: bool,
-    #[cfg(feature = "tls")]
     pub(crate) tls_table: Option<crate::tls::TlsTable>,
-    #[cfg(feature = "tls")]
     pub(crate) tls_scratch: Vec<u8>,
     /// Pre-allocated sockaddr storage for outbound connect SQEs.
     pub(crate) connect_addrs: Vec<libc::sockaddr_storage>,
@@ -228,7 +226,6 @@ impl Driver {
             Some(Duration::from_micros(config.flush_interval_us))
         };
 
-        #[cfg(feature = "tls")]
         let tls_table = {
             let has_server = config.tls.is_some();
             let has_client = config.tls_client.is_some();
@@ -245,7 +242,6 @@ impl Driver {
                 None
             }
         };
-        #[cfg(feature = "tls")]
         let tls_scratch = vec![0u8; 16384];
 
         let mut connect_addrs = Vec::with_capacity(config.max_connections as usize);
@@ -287,9 +283,7 @@ impl Driver {
             flush_interval,
             shutdown_flag,
             shutdown_local: false,
-            #[cfg(feature = "tls")]
             tls_table,
-            #[cfg(feature = "tls")]
             tls_scratch,
             connect_addrs,
             connect_timespecs,
@@ -364,7 +358,6 @@ impl Driver {
             fixed_buffers: &mut self.fixed_buffers,
             send_copy_pool: &mut self.send_copy_pool,
             send_slab: &mut self.send_slab,
-            #[cfg(feature = "tls")]
             tls_table: match self.tls_table {
                 Some(ref mut t) => t as *mut crate::tls::TlsTable,
                 None => std::ptr::null_mut(),
@@ -719,13 +712,11 @@ impl Driver {
                     }
                     OpTag::Close => {
                         let conn_index = ud.conn_index();
-                        #[cfg(feature = "tls")]
                         if let Some(ref mut tls_table) = self.tls_table {
                             tls_table.remove(conn_index);
                         }
                         self.connections.release(conn_index);
                     }
-                    #[cfg(feature = "tls")]
                     OpTag::TlsSend => {
                         let pool_slot = ud.payload() as u16;
                         self.send_copy_pool.release(pool_slot);

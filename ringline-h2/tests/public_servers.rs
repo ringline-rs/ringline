@@ -64,32 +64,22 @@ impl H2Client {
     }
 
     fn flush_tls(&mut self) {
-        loop {
-            let mut buf = Vec::new();
-            match self.tls_conn.write_tls(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    self.tcp.write_all(&buf).unwrap();
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => panic!("write_tls error: {e}"),
-            }
+        while self.tls_conn.wants_write() {
+            self.tls_conn.write_tls(&mut self.tcp).unwrap();
         }
     }
 
     fn read_tls(&mut self) -> bool {
-        let mut buf = [0u8; 8192];
-        match self.tcp.read(&mut buf) {
-            Ok(0) => false,
-            Ok(n) => {
-                self.tls_conn.read_tls(&mut &buf[..n]).unwrap();
-                self.tls_conn.process_new_packets().unwrap();
-                true
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => false,
+        match self.tls_conn.read_tls(&mut self.tcp) {
+            Ok(0) => return false,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return false,
             Err(e) => panic!("tcp read error: {e}"),
         }
+        self.tls_conn.process_new_packets().unwrap();
+        self.flush_tls();
+        true
     }
 
     fn drive_tls(&mut self) {

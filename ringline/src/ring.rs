@@ -168,7 +168,6 @@ impl Ring {
 
     /// Submit a TLS-internal send (handshake, alert). Uses OpTag::TlsSend
     /// so the CQE handler releases the pool slot without calling on_send_complete.
-    #[cfg(feature = "tls")]
     pub fn submit_tls_send(
         &mut self,
         conn_index: u32,
@@ -188,7 +187,6 @@ impl Ring {
 
     /// Submit a TLS-internal send with IOSQE_IO_LINK. Used for close_notify
     /// so the subsequent Close SQE is chained and only runs after the send completes.
-    #[cfg(feature = "tls")]
     pub fn submit_tls_send_linked(
         &mut self,
         conn_index: u32,

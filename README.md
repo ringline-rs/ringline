@@ -109,7 +109,7 @@ Each worker thread owns:
 ## Additional Features
 
 - **Outbound connections** — `connect()` and `connect_with_timeout()` for client-initiated TCP
-- **TLS** — optional rustls integration via `--features tls` (server and client)
+- **TLS** — built-in rustls integration (server and client)
 - **UDP** — `on_udp_bind()` handler with `UdpCtx` for datagram protocols
 - **Timers** — `sleep()`, `timeout()`, `sleep_until()`, `timeout_at()` with fallible variants
 - **Standalone tasks** — `spawn()` for tasks not tied to a connection
@@ -143,7 +143,7 @@ cargo run --release --example echo_bench
 cargo run --example connect_echo
 
 # TLS echo server
-cargo run --example echo_tls_server --features tls
+cargo run --example echo_tls_server
 ```
 
 ## License

@@ -75,8 +75,7 @@ pub struct DriverCtx<'a> {
     // borrow; (3) no mutable alias exists while DriverCtx holds this pointer
     // since DriverCtx borrows the other Driver fields mutably via split borrows.
     // Null when plaintext (TLS feature disabled or no TLS config).
-    #[cfg(feature = "tls")]
-    pub(crate) tls_table: *mut crate::tls::TlsTable,
+        pub(crate) tls_table: *mut crate::tls::TlsTable,
     pub(crate) shutdown_requested: &'a mut bool,
     /// Pre-allocated sockaddr storage for outbound connect SQEs.
     pub(crate) connect_addrs: &'a mut Vec<libc::sockaddr_storage>,
@@ -138,7 +137,6 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Get TLS session information for a connection.
-    #[cfg(feature = "tls")]
     pub fn tls_info(&self, conn: ConnToken) -> Option<crate::tls::TlsInfo> {
         let cs = self.connections.get(conn.index)?;
         if cs.generation != conn.generation {
@@ -164,7 +162,6 @@ impl<'a> DriverCtx<'a> {
             ));
         }
 
-        #[cfg(feature = "tls")]
         if !self.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.tls_table };
             if tls_table.get_mut(conn.index).is_some() {
@@ -284,7 +281,6 @@ impl<'a> DriverCtx<'a> {
             state.in_flight = false;
 
             // Graceful TLS shutdown: send close_notify before closing.
-            #[cfg(feature = "tls")]
             if !self.tls_table.is_null() {
                 let tls_table = unsafe { &mut *self.tls_table };
                 tls_table.send_close_notify(conn.index, self.ring, self.send_copy_pool);
@@ -471,7 +467,6 @@ impl<'a> DriverCtx<'a> {
 
     /// Initiate an outbound TLS connection. Returns immediately with a `ConnToken`.
     /// The `on_connect` callback fires when both TCP + TLS handshakes complete (or fail).
-    #[cfg(feature = "tls")]
     pub fn connect_tls(
         &mut self,
         addr: SocketAddr,
@@ -590,7 +585,6 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Initiate an outbound TLS connection with a timeout.
-    #[cfg(feature = "tls")]
     pub fn connect_tls_with_timeout(
         &mut self,
         addr: SocketAddr,
@@ -1245,7 +1239,6 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         }
 
         // TLS path: gather all data, encrypt, copy-send. Drop guards immediately.
-        #[cfg(feature = "tls")]
         if !self.ctx.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.ctx.tls_table };
             if tls_table.get_mut(self.conn.index).is_some() {
@@ -1263,7 +1256,6 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     }
 
     /// TLS fallback: gather all data into a contiguous buffer, encrypt, copy-send.
-    #[cfg(feature = "tls")]
     fn submit_tls(mut self, tls_table: &mut crate::tls::TlsTable) -> io::Result<()> {
         let mut plaintext = Vec::with_capacity(self.total_len as usize);
         for i in 0..self.part_count as usize {

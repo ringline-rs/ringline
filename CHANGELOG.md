@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Scatter-gather sends via `send_parts()` builder
 - `ConfigBuilder` with builder pattern and `build()` validation
 - `RinglineBuilder` for launching workers with optional TCP listener
-- Optional TLS via rustls (`--features tls`)
+- TLS via rustls (always enabled)
 - NVMe passthrough via io_uring
 - Direct I/O (O_DIRECT) file reads via io_uring
 - `select()` / `select3()` and `join()` / `join3()` combinators

@@ -6,18 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Build
-cargo build                          # default (no TLS)
-cargo build --features tls           # with TLS support
-cargo build --examples               # all examples (echo_tls_server requires --features tls)
+cargo build                          # includes TLS (rustls)
+cargo build --examples               # all examples
 
 # Lint
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features tls -- -D warnings
 
 # Test
 cargo test --all                     # all tests (76 unit + 42 integration + doctests)
-cargo test --all --features tls      # with TLS
 cargo test --all --release           # release mode
 cargo test -p ringline -- <name>     # single test by name
 
@@ -28,7 +25,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo run --example echo_async_server
 cargo run --example connect_echo
 cargo run --release --example echo_bench
-cargo run --example echo_tls_server --features tls
+cargo run --example echo_tls_server
 ```
 
 ## Architecture

@@ -9,7 +9,6 @@ pub enum OpTag {
     Shutdown = 5,
     EventFdRead = 6,
     /// TLS-internal send (handshake, alert). Releases pool slot, no user callback.
-    #[cfg(feature = "tls")]
     TlsSend = 7,
     /// Outbound TCP connect.
     Connect = 8,
@@ -43,7 +42,6 @@ impl OpTag {
             4 => Some(OpTag::Close),
             5 => Some(OpTag::Shutdown),
             6 => Some(OpTag::EventFdRead),
-            #[cfg(feature = "tls")]
             7 => Some(OpTag::TlsSend),
             8 => Some(OpTag::Connect),
             9 => Some(OpTag::Timeout),

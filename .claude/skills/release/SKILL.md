@@ -42,7 +42,6 @@ Example: `/release minor`
    ```bash
    cargo fmt --all -- --check
    cargo clippy --all-targets -- -D warnings
-   cargo clippy --all-targets --features tls -- -D warnings
    cargo test --all
    ```
    If checks fail, stop and report the errors.

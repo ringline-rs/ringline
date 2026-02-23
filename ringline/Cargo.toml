@@ -11,7 +11,6 @@ keywords = ["io-uring", "async", "networking", "linux", "event-loop"]
 categories = ["asynchronous", "network-programming"]
 
 [features]
-tls = ["rustls"]
 timestamps = []
 
 [dependencies]
@@ -22,8 +21,4 @@ libc = "0.2"
 metriken = "0.7"
 pin-project-lite = "0.2"
 thiserror = "2"
-rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring"] }
-
-[[example]]
-name = "echo_tls_server"
-required-features = ["tls"]
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }

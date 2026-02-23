@@ -191,7 +191,6 @@ pub fn connect_with_timeout(addr: SocketAddr, timeout_ms: u64) -> io::Result<Con
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
-#[cfg(feature = "tls")]
 pub fn connect_tls(addr: SocketAddr, server_name: &str) -> io::Result<ConnectFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
@@ -217,7 +216,6 @@ pub fn connect_tls(addr: SocketAddr, server_name: &str) -> io::Result<ConnectFut
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
-#[cfg(feature = "tls")]
 pub fn connect_tls_with_timeout(
     addr: SocketAddr,
     server_name: &str,
@@ -557,7 +555,6 @@ impl ConnCtx {
     // ── TLS ──────────────────────────────────────────────────────────
 
     /// Query TLS session info for this connection.
-    #[cfg(feature = "tls")]
     pub fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         with_state(|driver, _| {
             let ctx = driver.make_ctx();
@@ -566,7 +563,6 @@ impl ConnCtx {
     }
 
     /// Initiate an outbound TLS connection and await the result.
-    #[cfg(feature = "tls")]
     pub fn connect_tls(&self, addr: SocketAddr, server_name: &str) -> io::Result<ConnectFuture> {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
@@ -584,7 +580,6 @@ impl ConnCtx {
     }
 
     /// Initiate an outbound TLS connection with a timeout and await the result.
-    #[cfg(feature = "tls")]
     pub fn connect_tls_with_timeout(
         &self,
         addr: SocketAddr,
