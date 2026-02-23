@@ -10,6 +10,7 @@
 //!   cargo test -p ringline-momento --test integration -- --ignored --nocapture
 
 use std::future::Future;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::OnceLock;
 
@@ -36,9 +37,38 @@ fn cache_name() -> String {
     std::env::var("MOMENTO_CACHE_NAME").unwrap_or_else(|_| "test-cache".to_string())
 }
 
+/// Pre-resolve DNS and build a credential with the resolved IP address.
+/// DNS resolution uses blocking `getaddrinfo` which must happen outside
+/// the io_uring event loop.
+fn pre_resolve_credential() -> (Credential, SocketAddr) {
+    let original = Credential::from_env().expect("failed to build credential from env");
+    let host = original.host();
+    let port = original.port();
+    let addr_str = format!("{host}:{port}");
+    let addr: SocketAddr = addr_str
+        .to_socket_addrs()
+        .unwrap_or_else(|e| panic!("failed to resolve {addr_str}: {e}"))
+        .next()
+        .unwrap_or_else(|| panic!("no addresses found for {addr_str}"));
+
+    // Build a credential that uses the resolved IP so Client::connect
+    // inside the runtime won't need DNS resolution. Set the original
+    // hostname as the SNI host for TLS.
+    let tls_host = original.tls_host().to_string();
+    let resolved =
+        Credential::with_endpoint(original.token(), format!("{addr}")).with_sni_host(tls_host);
+    (resolved, addr)
+}
+
+/// Stored pre-resolved credential for use inside the runtime.
+static RESOLVED_CREDENTIAL: OnceLock<Credential> = OnceLock::new();
+
+/// Connect to Momento using a pre-resolved credential (no DNS inside the runtime).
 async fn connect_momento() -> Result<Client, String> {
-    let credential = Credential::from_env().map_err(|e| format!("credential: {e}"))?;
-    Client::connect_with_timeout(&credential, 10_000)
+    let credential = RESOLVED_CREDENTIAL
+        .get()
+        .expect("credential not pre-resolved");
+    Client::connect_with_timeout(credential, 10_000)
         .await
         .map_err(|e| format!("connect: {e}"))
 }
@@ -51,6 +81,10 @@ macro_rules! run_momento_test {
         {
             panic!("MOMENTO_API_KEY or MOMENTO_AUTH_TOKEN must be set");
         }
+
+        // Pre-resolve DNS on the main thread before entering the runtime.
+        let (resolved, _addr) = pre_resolve_credential();
+        RESOLVED_CREDENTIAL.set(resolved).ok();
 
         struct Handler;
 
