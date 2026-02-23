@@ -28,7 +28,7 @@ impl Credential {
 
         // Try to extract endpoint from token
         let endpoint = Self::extract_endpoint(&token)
-            .unwrap_or_else(|| "cache.cell-us-east-1-1.prod.a.momentohq.com".to_string());
+            .unwrap_or_else(|| "cache.cell-4-us-east-1-1.prod.a.momentohq.com".to_string());
 
         Ok(Self {
             token,
@@ -78,7 +78,7 @@ impl Credential {
 
         // Check for region-based endpoint
         if let Ok(region) = std::env::var("MOMENTO_REGION") {
-            let endpoint = format!("cache.cell-{}-1.prod.a.momentohq.com", region);
+            let endpoint = format!("cache.cell-4-{}-1.prod.a.momentohq.com", region);
             return Ok(Self {
                 token,
                 endpoint,
