@@ -417,8 +417,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if errno == libc::ENOBUFS {
                 metrics::BUFFER_RING_EMPTY.increment();
                 if !has_more {
-                    let msghdr_ptr =
-                        &*self.driver.recvmsg_msghdr as *const libc::msghdr;
+                    let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
                     let _ = self
                         .driver
                         .ring

@@ -148,8 +148,7 @@ impl AsyncEventHandler for GrpcEchoServer {
                                     ..
                                 } => {
                                     // Decode headers to verify gRPC request.
-                                    let _headers =
-                                        decoder.decode(&encoded).unwrap_or_default();
+                                    let _headers = decoder.decode(&encoded).unwrap_or_default();
                                 }
                                 Frame::Data {
                                     stream_id,
@@ -159,11 +158,9 @@ impl AsyncEventHandler for GrpcEchoServer {
                                     // Extract the gRPC message from the length-prefixed frame.
                                     let grpc_payload = if payload.len() >= 5 {
                                         let len = u32::from_be_bytes([
-                                            payload[1],
-                                            payload[2],
-                                            payload[3],
-                                            payload[4],
-                                        ]) as usize;
+                                            payload[1], payload[2], payload[3], payload[4],
+                                        ])
+                                            as usize;
                                         payload[5..5 + len].to_vec()
                                     } else {
                                         Vec::new()
@@ -176,10 +173,7 @@ impl AsyncEventHandler for GrpcEchoServer {
                                     encoder.encode(
                                         &[
                                             HeaderField::new(b":status", b"200"),
-                                            HeaderField::new(
-                                                b"content-type",
-                                                b"application/grpc",
-                                            ),
+                                            HeaderField::new(b"content-type", b"application/grpc"),
                                         ],
                                         &mut encoded_resp,
                                     );

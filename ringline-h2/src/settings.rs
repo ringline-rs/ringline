@@ -92,9 +92,7 @@ impl Settings {
                 SETTINGS_HEADER_TABLE_SIZE => settings.header_table_size = value,
                 SETTINGS_ENABLE_PUSH => {
                     if value > 1 {
-                        return Err(H2Error::ProtocolError(
-                            "ENABLE_PUSH must be 0 or 1".into(),
-                        ));
+                        return Err(H2Error::ProtocolError("ENABLE_PUSH must be 0 or 1".into()));
                     }
                     settings.enable_push = value == 1;
                 }
@@ -109,9 +107,7 @@ impl Settings {
                 }
                 SETTINGS_MAX_FRAME_SIZE => {
                     if !(16384..=16_777_215).contains(&value) {
-                        return Err(H2Error::ProtocolError(
-                            "MAX_FRAME_SIZE out of range".into(),
-                        ));
+                        return Err(H2Error::ProtocolError("MAX_FRAME_SIZE out of range".into()));
                     }
                     settings.max_frame_size = value;
                 }

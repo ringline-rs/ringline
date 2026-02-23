@@ -50,8 +50,8 @@
 
 pub mod connection;
 pub mod error;
-pub mod frame;
 pub mod flowcontrol;
+pub mod frame;
 pub mod hpack;
 mod huffman;
 pub mod settings;

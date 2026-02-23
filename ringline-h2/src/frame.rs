@@ -56,20 +56,14 @@ pub enum Frame {
         priority: Option<Priority>,
     },
     /// PRIORITY frame (type 0x2): stream dependency and weight.
-    Priority {
-        stream_id: u32,
-        priority: Priority,
-    },
+    Priority { stream_id: u32, priority: Priority },
     /// RST_STREAM frame (type 0x3): abnormal stream termination.
     RstStream {
         stream_id: u32,
         error_code: ErrorCode,
     },
     /// SETTINGS frame (type 0x4): configuration parameters.
-    Settings {
-        ack: bool,
-        settings: Settings,
-    },
+    Settings { ack: bool, settings: Settings },
     /// PUSH_PROMISE frame (type 0x5): server push (not used for client-only).
     PushPromise {
         stream_id: u32,
@@ -78,10 +72,7 @@ pub enum Frame {
         end_headers: bool,
     },
     /// PING frame (type 0x6): connection liveness check.
-    Ping {
-        ack: bool,
-        opaque_data: [u8; 8],
-    },
+    Ping { ack: bool, opaque_data: [u8; 8] },
     /// GOAWAY frame (type 0x7): graceful shutdown.
     GoAway {
         last_stream_id: u32,
@@ -89,10 +80,7 @@ pub enum Frame {
         debug_data: Vec<u8>,
     },
     /// WINDOW_UPDATE frame (type 0x8): flow control window increment.
-    WindowUpdate {
-        stream_id: u32,
-        increment: u32,
-    },
+    WindowUpdate { stream_id: u32, increment: u32 },
     /// CONTINUATION frame (type 0x9): header block continuation.
     Continuation {
         stream_id: u32,
@@ -155,8 +143,10 @@ pub fn decode_frame_header(buf: &[u8]) -> Option<FrameHeader> {
     let length = (u32::from(buf[0]) << 16) | (u32::from(buf[1]) << 8) | u32::from(buf[2]);
     let frame_type = buf[3];
     let flags = buf[4];
-    let stream_id =
-        (u32::from(buf[5]) << 24) | (u32::from(buf[6]) << 16) | (u32::from(buf[7]) << 8) | u32::from(buf[8]);
+    let stream_id = (u32::from(buf[5]) << 24)
+        | (u32::from(buf[6]) << 16)
+        | (u32::from(buf[7]) << 8)
+        | u32::from(buf[8]);
     let stream_id = stream_id & 0x7fff_ffff; // clear reserved bit
     Some(FrameHeader {
         length,
@@ -199,13 +189,7 @@ impl Frame {
                 if let Some(pri) = priority {
                     flags |= FLAG_PRIORITY;
                     payload_len += 5; // 4 bytes dependency + 1 byte weight
-                    encode_frame_header(
-                        buf,
-                        payload_len,
-                        FRAME_HEADERS,
-                        flags,
-                        *stream_id,
-                    );
+                    encode_frame_header(buf, payload_len, FRAME_HEADERS, flags, *stream_id);
                     let dep = if pri.exclusive {
                         pri.dependency | 0x8000_0000
                     } else {
@@ -217,13 +201,7 @@ impl Frame {
                     buf.push(dep as u8);
                     buf.push(pri.weight);
                 } else {
-                    encode_frame_header(
-                        buf,
-                        payload_len,
-                        FRAME_HEADERS,
-                        flags,
-                        *stream_id,
-                    );
+                    encode_frame_header(buf, payload_len, FRAME_HEADERS, flags, *stream_id);
                 }
                 buf.extend_from_slice(encoded);
             }
@@ -260,13 +238,7 @@ impl Frame {
                     encode_frame_header(buf, 0, FRAME_SETTINGS, flags, 0);
                 } else {
                     let payload = settings.encode_to_vec();
-                    encode_frame_header(
-                        buf,
-                        payload.len() as u32,
-                        FRAME_SETTINGS,
-                        flags,
-                        0,
-                    );
+                    encode_frame_header(buf, payload.len() as u32, FRAME_SETTINGS, flags, 0);
                     buf.extend_from_slice(&payload);
                 }
             }
@@ -276,11 +248,7 @@ impl Frame {
                 encoded,
                 end_headers,
             } => {
-                let flags = if *end_headers {
-                    FLAG_END_HEADERS
-                } else {
-                    0
-                };
+                let flags = if *end_headers { FLAG_END_HEADERS } else { 0 };
                 let payload_len = 4 + encoded.len() as u32;
                 encode_frame_header(buf, payload_len, FRAME_PUSH_PROMISE, flags, *stream_id);
                 let psid = *promised_stream_id & 0x7fff_ffff;
@@ -330,11 +298,7 @@ impl Frame {
                 encoded,
                 end_headers,
             } => {
-                let flags = if *end_headers {
-                    FLAG_END_HEADERS
-                } else {
-                    0
-                };
+                let flags = if *end_headers { FLAG_END_HEADERS } else { 0 };
                 encode_frame_header(
                     buf,
                     encoded.len() as u32,
@@ -350,13 +314,7 @@ impl Frame {
                 stream_id,
                 payload,
             } => {
-                encode_frame_header(
-                    buf,
-                    payload.len() as u32,
-                    *frame_type,
-                    *flags,
-                    *stream_id,
-                );
+                encode_frame_header(buf, payload.len() as u32, *frame_type, *flags, *stream_id);
                 buf.extend_from_slice(payload);
             }
         }
@@ -393,9 +351,7 @@ pub fn decode_frame(buf: &[u8], max_frame_size: u32) -> Result<Option<(Frame, us
     let frame = match header.frame_type {
         FRAME_DATA => {
             if stream_id == 0 {
-                return Err(H2Error::ProtocolError(
-                    "DATA on stream 0".into(),
-                ));
+                return Err(H2Error::ProtocolError("DATA on stream 0".into()));
             }
             let (payload_data, _pad) = strip_padding(payload, flags)?;
             Frame::Data {
@@ -406,9 +362,7 @@ pub fn decode_frame(buf: &[u8], max_frame_size: u32) -> Result<Option<(Frame, us
         }
         FRAME_HEADERS => {
             if stream_id == 0 {
-                return Err(H2Error::ProtocolError(
-                    "HEADERS on stream 0".into(),
-                ));
+                return Err(H2Error::ProtocolError("HEADERS on stream 0".into()));
             }
             let (data, _pad) = strip_padding(payload, flags)?;
             let (priority, header_block) = if flags & FLAG_PRIORITY != 0 {
@@ -443,9 +397,7 @@ pub fn decode_frame(buf: &[u8], max_frame_size: u32) -> Result<Option<(Frame, us
         }
         FRAME_PRIORITY => {
             if stream_id == 0 {
-                return Err(H2Error::ProtocolError(
-                    "PRIORITY on stream 0".into(),
-                ));
+                return Err(H2Error::ProtocolError("PRIORITY on stream 0".into()));
             }
             if payload.len() != 5 {
                 return Err(H2Error::FrameSizeError);
@@ -465,9 +417,7 @@ pub fn decode_frame(buf: &[u8], max_frame_size: u32) -> Result<Option<(Frame, us
         }
         FRAME_RST_STREAM => {
             if stream_id == 0 {
-                return Err(H2Error::ProtocolError(
-                    "RST_STREAM on stream 0".into(),
-                ));
+                return Err(H2Error::ProtocolError("RST_STREAM on stream 0".into()));
             }
             if payload.len() != 4 {
                 return Err(H2Error::FrameSizeError);
@@ -483,9 +433,7 @@ pub fn decode_frame(buf: &[u8], max_frame_size: u32) -> Result<Option<(Frame, us
         }
         FRAME_SETTINGS => {
             if stream_id != 0 {
-                return Err(H2Error::ProtocolError(
-                    "SETTINGS on non-zero stream".into(),
-                ));
+                return Err(H2Error::ProtocolError("SETTINGS on non-zero stream".into()));
             }
             let ack = flags & FLAG_ACK != 0;
             if ack {
@@ -509,9 +457,7 @@ pub fn decode_frame(buf: &[u8], max_frame_size: u32) -> Result<Option<(Frame, us
         }
         FRAME_PUSH_PROMISE => {
             if stream_id == 0 {
-                return Err(H2Error::ProtocolError(
-                    "PUSH_PROMISE on stream 0".into(),
-                ));
+                return Err(H2Error::ProtocolError("PUSH_PROMISE on stream 0".into()));
             }
             let (data, _pad) = strip_padding(payload, flags)?;
             if data.len() < 4 {
@@ -531,9 +477,7 @@ pub fn decode_frame(buf: &[u8], max_frame_size: u32) -> Result<Option<(Frame, us
         }
         FRAME_PING => {
             if stream_id != 0 {
-                return Err(H2Error::ProtocolError(
-                    "PING on non-zero stream".into(),
-                ));
+                return Err(H2Error::ProtocolError("PING on non-zero stream".into()));
             }
             if payload.len() != 8 {
                 return Err(H2Error::FrameSizeError);
@@ -547,9 +491,7 @@ pub fn decode_frame(buf: &[u8], max_frame_size: u32) -> Result<Option<(Frame, us
         }
         FRAME_GOAWAY => {
             if stream_id != 0 {
-                return Err(H2Error::ProtocolError(
-                    "GOAWAY on non-zero stream".into(),
-                ));
+                return Err(H2Error::ProtocolError("GOAWAY on non-zero stream".into()));
             }
             if payload.len() < 8 {
                 return Err(H2Error::FrameSizeError);
@@ -590,9 +532,7 @@ pub fn decode_frame(buf: &[u8], max_frame_size: u32) -> Result<Option<(Frame, us
         }
         FRAME_CONTINUATION => {
             if stream_id == 0 {
-                return Err(H2Error::ProtocolError(
-                    "CONTINUATION on stream 0".into(),
-                ));
+                return Err(H2Error::ProtocolError("CONTINUATION on stream 0".into()));
             }
             Frame::Continuation {
                 stream_id,

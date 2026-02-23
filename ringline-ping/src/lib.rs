@@ -108,10 +108,12 @@ impl ClientMetrics {
 
 // ── ClientBuilder ───────────────────────────────────────────────────────
 
+type ResultCallback = Box<dyn Fn(&CommandResult)>;
+
 /// Builder for creating a [`Client`] with per-request callbacks and metrics.
 pub struct ClientBuilder {
     conn: ConnCtx,
-    on_result: Option<Box<dyn Fn(&CommandResult)>>,
+    on_result: Option<ResultCallback>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -176,7 +178,7 @@ impl ClientBuilder {
 /// kernel timestamps, and built-in histogram tracking.
 pub struct Client {
     conn: ConnCtx,
-    on_result: Option<Box<dyn Fn(&CommandResult)>>,
+    on_result: Option<ResultCallback>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]

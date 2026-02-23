@@ -160,8 +160,7 @@ impl AsyncEventHandler for H2Server {
                                         .iter()
                                         .find(|h| h.name == b":method")
                                         .map(|h| h.value.clone());
-                                    let is_get =
-                                        method.as_deref() == Some(b"GET");
+                                    let is_get = method.as_deref() == Some(b"GET");
 
                                     if is_get || end_stream {
                                         // Send response: 200 OK + "hello".
@@ -308,9 +307,7 @@ impl H2TestClient {
         match self.tcp.read(&mut buf) {
             Ok(0) => false,
             Ok(n) => {
-                self.tls_conn
-                    .read_tls(&mut &buf[..n])
-                    .unwrap();
+                self.tls_conn.read_tls(&mut &buf[..n]).unwrap();
                 self.tls_conn.process_new_packets().unwrap();
                 true
             }
@@ -377,11 +374,7 @@ impl H2TestClient {
         }
     }
 
-    fn send_request(
-        &mut self,
-        headers: &[HeaderField],
-        body: Option<&[u8]>,
-    ) -> u32 {
+    fn send_request(&mut self, headers: &[HeaderField], body: Option<&[u8]>) -> u32 {
         let end_stream = body.is_none();
         let stream_id = self.h2.send_request(headers, end_stream).unwrap();
 

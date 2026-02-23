@@ -167,10 +167,12 @@ impl ClientMetrics {
 
 // ── ClientBuilder ───────────────────────────────────────────────────────
 
+type ResultCallback = Box<dyn Fn(&CommandResult)>;
+
 /// Builder for creating a [`Client`] with per-request callbacks and metrics.
 pub struct ClientBuilder {
     conn: ConnCtx,
-    on_result: Option<Box<dyn Fn(&CommandResult)>>,
+    on_result: Option<ResultCallback>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -235,7 +237,7 @@ impl ClientBuilder {
 /// kernel timestamps, and built-in histogram tracking.
 pub struct Client {
     conn: ConnCtx,
-    on_result: Option<Box<dyn Fn(&CommandResult)>>,
+    on_result: Option<ResultCallback>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -447,11 +449,15 @@ impl Client {
     pub async fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
         if !self.is_instrumented() {
-            return self.execute_bulk(&Self::encode_request(&Request::get(key))).await;
+            return self
+                .execute_bulk(&Self::encode_request(&Request::get(key)))
+                .await;
         }
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let result = self.execute_bulk(&Self::encode_request(&Request::get(key))).await;
+        let result = self
+            .execute_bulk(&Self::encode_request(&Request::get(key)))
+            .await;
         let latency_ns = self.finish_timing(send_ts, start);
         let (success, hit) = match &result {
             Ok(Some(_)) => (true, Some(true)),
@@ -469,7 +475,11 @@ impl Client {
     }
 
     /// Set a key-value pair.
-    pub async fn set(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<(), Error> {
+    pub async fn set(
+        &mut self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
         if !self.is_instrumented() {
@@ -509,7 +519,9 @@ impl Client {
         let key = key.as_ref();
         let value = value.as_ref();
         if !self.is_instrumented() {
-            let resp = self.execute_set(&Request::set(key, value).ex(ttl_secs), value).await?;
+            let resp = self
+                .execute_set(&Request::set(key, value).ex(ttl_secs), value)
+                .await?;
             return match resp {
                 Value::SimpleString(_) => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
@@ -517,7 +529,9 @@ impl Client {
         }
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let result = self.execute_set(&Request::set(key, value).ex(ttl_secs), value).await;
+        let result = self
+            .execute_set(&Request::set(key, value).ex(ttl_secs), value)
+            .await;
         let latency_ns = self.finish_timing(send_ts, start);
         let success = result.is_ok();
         let final_result = match result {
@@ -962,7 +976,11 @@ impl Client {
     }
 
     /// Get an element from a list by index.
-    pub async fn lindex(&mut self, key: impl AsRef<[u8]>, index: i64) -> Result<Option<Bytes>, Error> {
+    pub async fn lindex(
+        &mut self,
+        key: impl AsRef<[u8]>,
+        index: i64,
+    ) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
         let idx_str = index.to_string();
         self.execute_bulk(&Self::encode_request(
@@ -993,7 +1011,12 @@ impl Client {
     }
 
     /// Trim a list to a specified range.
-    pub async fn ltrim(&mut self, key: impl AsRef<[u8]>, start: i64, stop: i64) -> Result<(), Error> {
+    pub async fn ltrim(
+        &mut self,
+        key: impl AsRef<[u8]>,
+        start: i64,
+        stop: i64,
+    ) -> Result<(), Error> {
         let key = key.as_ref();
         let start_str = start.to_string();
         let stop_str = stop.to_string();
@@ -1251,7 +1274,10 @@ impl Client {
     }
 
     /// Get configuration parameter values.
-    pub async fn config_get(&mut self, key: impl AsRef<[u8]>) -> Result<Vec<(Bytes, Bytes)>, Error> {
+    pub async fn config_get(
+        &mut self,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Vec<(Bytes, Bytes)>, Error> {
         let key = key.as_ref();
         let value = self
             .execute(&Self::encode_request(&Request::config_get(key)))
@@ -1305,7 +1331,11 @@ impl Client {
 
     /// SET with zero-copy value via SendGuard. The guard pins value memory
     /// until the kernel completes the send.
-    pub async fn set_with_guard<G: SendGuard>(&mut self, key: &[u8], guard: G) -> Result<(), Error> {
+    pub async fn set_with_guard<G: SendGuard>(
+        &mut self,
+        key: &[u8],
+        guard: G,
+    ) -> Result<(), Error> {
         if !self.is_instrumented() {
             let (_, value_len) = guard.as_ptr_len();
             let prefix = encode_set_guard_prefix(key, value_len as usize, None);

@@ -77,67 +77,67 @@ pub(crate) fn decode_prefix_int(buf: &[u8], prefix_bits: u8) -> Option<(u64, usi
 
 /// HPACK static table entries: (name, value). 61 entries indexed 1..61.
 const STATIC_TABLE: &[(&[u8], &[u8])] = &[
-    (b":authority", b""),                  // 1
-    (b":method", b"GET"),                  // 2
-    (b":method", b"POST"),                 // 3
-    (b":path", b"/"),                      // 4
-    (b":path", b"/index.html"),            // 5
-    (b":scheme", b"http"),                 // 6
-    (b":scheme", b"https"),                // 7
-    (b":status", b"200"),                  // 8
-    (b":status", b"204"),                  // 9
-    (b":status", b"206"),                  // 10
-    (b":status", b"304"),                  // 11
-    (b":status", b"400"),                  // 12
-    (b":status", b"404"),                  // 13
-    (b":status", b"500"),                  // 14
-    (b"accept-charset", b""),              // 15
+    (b":authority", b""),                   // 1
+    (b":method", b"GET"),                   // 2
+    (b":method", b"POST"),                  // 3
+    (b":path", b"/"),                       // 4
+    (b":path", b"/index.html"),             // 5
+    (b":scheme", b"http"),                  // 6
+    (b":scheme", b"https"),                 // 7
+    (b":status", b"200"),                   // 8
+    (b":status", b"204"),                   // 9
+    (b":status", b"206"),                   // 10
+    (b":status", b"304"),                   // 11
+    (b":status", b"400"),                   // 12
+    (b":status", b"404"),                   // 13
+    (b":status", b"500"),                   // 14
+    (b"accept-charset", b""),               // 15
     (b"accept-encoding", b"gzip, deflate"), // 16
-    (b"accept-language", b""),             // 17
-    (b"accept-ranges", b""),               // 18
-    (b"accept", b""),                      // 19
-    (b"access-control-allow-origin", b""), // 20
-    (b"age", b""),                         // 21
-    (b"allow", b""),                       // 22
-    (b"authorization", b""),               // 23
-    (b"cache-control", b""),               // 24
-    (b"content-disposition", b""),         // 25
-    (b"content-encoding", b""),            // 26
-    (b"content-language", b""),            // 27
-    (b"content-length", b""),              // 28
-    (b"content-location", b""),            // 29
-    (b"content-range", b""),               // 30
-    (b"content-type", b""),                // 31
-    (b"cookie", b""),                      // 32
-    (b"date", b""),                        // 33
-    (b"etag", b""),                        // 34
-    (b"expect", b""),                      // 35
-    (b"expires", b""),                     // 36
-    (b"from", b""),                        // 37
-    (b"host", b""),                        // 38
-    (b"if-match", b""),                    // 39
-    (b"if-modified-since", b""),           // 40
-    (b"if-none-match", b""),               // 41
-    (b"if-range", b""),                    // 42
-    (b"if-unmodified-since", b""),         // 43
-    (b"last-modified", b""),               // 44
-    (b"link", b""),                        // 45
-    (b"location", b""),                    // 46
-    (b"max-forwards", b""),                // 47
-    (b"proxy-authenticate", b""),          // 48
-    (b"proxy-authorization", b""),         // 49
-    (b"range", b""),                       // 50
-    (b"referer", b""),                     // 51
-    (b"refresh", b""),                     // 52
-    (b"retry-after", b""),                 // 53
-    (b"server", b""),                      // 54
-    (b"set-cookie", b""),                  // 55
-    (b"strict-transport-security", b""),   // 56
-    (b"transfer-encoding", b""),           // 57
-    (b"user-agent", b""),                  // 58
-    (b"vary", b""),                        // 59
-    (b"via", b""),                         // 60
-    (b"www-authenticate", b""),            // 61
+    (b"accept-language", b""),              // 17
+    (b"accept-ranges", b""),                // 18
+    (b"accept", b""),                       // 19
+    (b"access-control-allow-origin", b""),  // 20
+    (b"age", b""),                          // 21
+    (b"allow", b""),                        // 22
+    (b"authorization", b""),                // 23
+    (b"cache-control", b""),                // 24
+    (b"content-disposition", b""),          // 25
+    (b"content-encoding", b""),             // 26
+    (b"content-language", b""),             // 27
+    (b"content-length", b""),               // 28
+    (b"content-location", b""),             // 29
+    (b"content-range", b""),                // 30
+    (b"content-type", b""),                 // 31
+    (b"cookie", b""),                       // 32
+    (b"date", b""),                         // 33
+    (b"etag", b""),                         // 34
+    (b"expect", b""),                       // 35
+    (b"expires", b""),                      // 36
+    (b"from", b""),                         // 37
+    (b"host", b""),                         // 38
+    (b"if-match", b""),                     // 39
+    (b"if-modified-since", b""),            // 40
+    (b"if-none-match", b""),                // 41
+    (b"if-range", b""),                     // 42
+    (b"if-unmodified-since", b""),          // 43
+    (b"last-modified", b""),                // 44
+    (b"link", b""),                         // 45
+    (b"location", b""),                     // 46
+    (b"max-forwards", b""),                 // 47
+    (b"proxy-authenticate", b""),           // 48
+    (b"proxy-authorization", b""),          // 49
+    (b"range", b""),                        // 50
+    (b"referer", b""),                      // 51
+    (b"refresh", b""),                      // 52
+    (b"retry-after", b""),                  // 53
+    (b"server", b""),                       // 54
+    (b"set-cookie", b""),                   // 55
+    (b"strict-transport-security", b""),    // 56
+    (b"transfer-encoding", b""),            // 57
+    (b"user-agent", b""),                   // 58
+    (b"vary", b""),                         // 59
+    (b"via", b""),                          // 60
+    (b"www-authenticate", b""),             // 61
 ];
 
 /// Find a static table entry matching both name and value.
@@ -307,7 +307,10 @@ impl Encoder {
         }
 
         // 2. Check for exact match in dynamic table.
-        if let Some(index) = self.dynamic_table.find_name_value(&header.name, &header.value) {
+        if let Some(index) = self
+            .dynamic_table
+            .find_name_value(&header.name, &header.value)
+        {
             encode_prefix_int(buf, index as u64, 7, 0x80);
             return;
         }
@@ -622,9 +625,10 @@ mod tests {
         let mut encoder = Encoder::new(64);
         let mut decoder = Decoder::new(64);
 
-        let headers = vec![
-            HeaderField::new(b"x-long-header-name", b"a-somewhat-long-value"),
-        ];
+        let headers = vec![HeaderField::new(
+            b"x-long-header-name",
+            b"a-somewhat-long-value",
+        )];
         let mut buf = Vec::new();
         encoder.encode(&headers, &mut buf);
         let decoded = decoder.decode(&buf).unwrap();
@@ -652,10 +656,7 @@ mod tests {
 
         let mut buf = Vec::new();
         encoder.set_max_table_size(256, &mut buf);
-        encoder.encode(
-            &[HeaderField::new(b":method", b"GET")],
-            &mut buf,
-        );
+        encoder.encode(&[HeaderField::new(b":method", b"GET")], &mut buf);
         let decoded = decoder.decode(&buf).unwrap();
         assert_eq!(decoded, vec![HeaderField::new(b":method", b"GET")]);
     }

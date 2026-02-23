@@ -232,10 +232,7 @@ impl H2Connection {
         match stream.state {
             StreamState::Open | StreamState::HalfClosedRemote => {}
             _ => {
-                return Err(H2Error::StreamError(
-                    stream_id,
-                    ErrorCode::StreamClosed,
-                ));
+                return Err(H2Error::StreamError(stream_id, ErrorCode::StreamClosed));
             }
         }
 
@@ -313,9 +310,8 @@ impl H2Connection {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    self.events.push_back(H2Event::Error(H2Error::ProtocolError(
-                        format!("{e}"),
-                    )));
+                    self.events
+                        .push_back(H2Event::Error(H2Error::ProtocolError(format!("{e}"))));
                     break;
                 }
             }
@@ -332,9 +328,7 @@ impl H2Connection {
                     // OK, process below.
                 }
                 _ => {
-                    return Err(H2Error::ProtocolError(
-                        "expected CONTINUATION frame".into(),
-                    ));
+                    return Err(H2Error::ProtocolError("expected CONTINUATION frame".into()));
                 }
             }
         }
@@ -516,7 +510,9 @@ impl H2Connection {
                 stream.receiving_headers = false;
                 std::mem::take(&mut stream.header_buf)
             };
-            let end_stream = self.streams.get(&stream_id)
+            let end_stream = self
+                .streams
+                .get(&stream_id)
                 .map(|s| s.headers_end_stream)
                 .unwrap_or(false);
             self.decode_and_emit_headers(stream_id, &full_block, end_stream)?;
@@ -539,8 +535,8 @@ impl H2Connection {
         };
 
         // Determine if this is a response or trailers.
-        let is_initial_response = stream.state == StreamState::Open
-            || stream.state == StreamState::HalfClosedLocal;
+        let is_initial_response =
+            stream.state == StreamState::Open || stream.state == StreamState::HalfClosedLocal;
 
         if end_stream {
             stream.state = match stream.state {
@@ -559,10 +555,8 @@ impl H2Connection {
                 end_stream,
             });
         } else {
-            self.events.push_back(H2Event::Trailers {
-                stream_id,
-                headers,
-            });
+            self.events
+                .push_back(H2Event::Trailers { stream_id, headers });
         }
 
         Ok(())
@@ -610,11 +604,7 @@ impl H2Connection {
         Ok(())
     }
 
-    fn handle_window_update(
-        &mut self,
-        stream_id: u32,
-        increment: u32,
-    ) -> Result<(), H2Error> {
+    fn handle_window_update(&mut self, stream_id: u32, increment: u32) -> Result<(), H2Error> {
         if stream_id == 0 {
             self.conn_send_window.increase(increment)?;
         } else if let Some(stream) = self.streams.get_mut(&stream_id) {
@@ -647,8 +637,7 @@ impl H2Connection {
             && stream.state != StreamState::HalfClosedRemote
             && stream.recv_window.window() < WINDOW_UPDATE_THRESHOLD
         {
-            let increment =
-                (self.initial_recv_window - stream.recv_window.window()) as u32;
+            let increment = (self.initial_recv_window - stream.recv_window.window()) as u32;
             if increment > 0 {
                 let frame = Frame::WindowUpdate {
                     stream_id,
@@ -823,9 +812,7 @@ mod tests {
 
         assert_eq!(conn.state, ConnState::Closing);
         match conn.poll_event().unwrap() {
-            H2Event::GoAway {
-                error_code, ..
-            } => assert_eq!(error_code, ErrorCode::NoError),
+            H2Event::GoAway { error_code, .. } => assert_eq!(error_code, ErrorCode::NoError),
             e => panic!("expected GoAway, got {e:?}"),
         }
     }

@@ -75,7 +75,7 @@ pub struct DriverCtx<'a> {
     // borrow; (3) no mutable alias exists while DriverCtx holds this pointer
     // since DriverCtx borrows the other Driver fields mutably via split borrows.
     // Null when plaintext (TLS feature disabled or no TLS config).
-        pub(crate) tls_table: *mut crate::tls::TlsTable,
+    pub(crate) tls_table: *mut crate::tls::TlsTable,
     pub(crate) shutdown_requested: &'a mut bool,
     /// Pre-allocated sockaddr storage for outbound connect SQEs.
     pub(crate) connect_addrs: &'a mut Vec<libc::sockaddr_storage>,
@@ -407,8 +407,9 @@ impl<'a> DriverCtx<'a> {
         // Set SO_TIMESTAMPING for kernel-level RX timestamps.
         #[cfg(feature = "timestamps")]
         if self.timestamps {
-            let flags: libc::c_int =
-                (libc::SOF_TIMESTAMPING_SOFTWARE | libc::SOF_TIMESTAMPING_RX_SOFTWARE) as libc::c_int;
+            let flags: libc::c_int = (libc::SOF_TIMESTAMPING_SOFTWARE
+                | libc::SOF_TIMESTAMPING_RX_SOFTWARE)
+                as libc::c_int;
             unsafe {
                 libc::setsockopt(
                     raw_fd,
@@ -530,8 +531,9 @@ impl<'a> DriverCtx<'a> {
         // Set SO_TIMESTAMPING for kernel-level RX timestamps.
         #[cfg(feature = "timestamps")]
         if self.timestamps {
-            let flags: libc::c_int =
-                (libc::SOF_TIMESTAMPING_SOFTWARE | libc::SOF_TIMESTAMPING_RX_SOFTWARE) as libc::c_int;
+            let flags: libc::c_int = (libc::SOF_TIMESTAMPING_SOFTWARE
+                | libc::SOF_TIMESTAMPING_RX_SOFTWARE)
+                as libc::c_int;
             unsafe {
                 libc::setsockopt(
                     raw_fd,

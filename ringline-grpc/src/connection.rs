@@ -23,10 +23,7 @@ pub enum GrpcEvent {
         metadata: Vec<HeaderField>,
     },
     /// A complete gRPC message (length-prefix stripped).
-    Message {
-        stream_id: u32,
-        data: Vec<u8>,
-    },
+    Message { stream_id: u32, data: Vec<u8> },
     /// Stream completed with a gRPC status (from trailers).
     Status {
         stream_id: u32,
@@ -184,9 +181,7 @@ impl GrpcConnection {
                     end_stream,
                 } => {
                     // Ensure we have a buffer even for server-push scenarios.
-                    self.buffers
-                        .entry(stream_id)
-                        .or_default();
+                    self.buffers.entry(stream_id).or_default();
 
                     self.events.push(GrpcEvent::Response {
                         stream_id,
@@ -219,10 +214,7 @@ impl GrpcConnection {
                         self.emit_status_from_cleanup(stream_id, &[]);
                     }
                 }
-                H2Event::Trailers {
-                    stream_id,
-                    headers,
-                } => {
+                H2Event::Trailers { stream_id, headers } => {
                     // Drain any remaining buffered messages.
                     if let Some(buf) = self.buffers.get_mut(&stream_id) {
                         while let Some(payload) = buf.try_decode() {

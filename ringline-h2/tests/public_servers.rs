@@ -34,8 +34,7 @@ struct H2Client {
 impl H2Client {
     fn connect(addr: SocketAddr, server_name: &str) -> Self {
         let tcp = TcpStream::connect(addr).unwrap();
-        tcp.set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         tcp.set_nodelay(true).unwrap();
 
         let tls_config = h2_client_config();
