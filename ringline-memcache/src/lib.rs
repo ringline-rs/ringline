@@ -35,6 +35,9 @@ use bytes::Bytes;
 use memcache_proto::{Request as McRequest, Response as McResponse};
 use ringline::{ConnCtx, GuardBox, ParseResult, SendGuard};
 
+/// Callback type invoked after each command completes.
+type ResultCallback = Box<dyn Fn(&CommandResult)>;
+
 // -- Error -------------------------------------------------------------------
 
 /// Errors returned by the ringline Memcache client.
@@ -187,7 +190,7 @@ impl ClientMetrics {
 /// Builder for creating a [`Client`] with per-request callbacks and metrics.
 pub struct ClientBuilder {
     conn: ConnCtx,
-    on_result: Option<Box<dyn Fn(&CommandResult)>>,
+    on_result: Option<ResultCallback>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -252,7 +255,7 @@ impl ClientBuilder {
 /// kernel timestamps, and built-in histogram tracking.
 pub struct Client {
     conn: ConnCtx,
-    on_result: Option<Box<dyn Fn(&CommandResult)>>,
+    on_result: Option<ResultCallback>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]

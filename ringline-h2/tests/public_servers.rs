@@ -34,7 +34,7 @@ struct H2Client {
 impl H2Client {
     fn connect(addr: SocketAddr, server_name: &str) -> Self {
         let tcp = TcpStream::connect(addr).unwrap();
-        tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        tcp.set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         tcp.set_nodelay(true).unwrap();
 
@@ -93,7 +93,7 @@ impl H2Client {
     }
 
     fn drive_tls(&mut self) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -108,7 +108,7 @@ impl H2Client {
     }
 
     fn drive_until_ready(&mut self) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -152,7 +152,7 @@ impl H2Client {
     }
 
     fn recv_response(&mut self, stream_id: u32) -> (u16, Vec<HeaderField>, Vec<u8>) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut resp_headers = Vec::new();
         let mut resp_body = Vec::new();
         let mut got_end = false;

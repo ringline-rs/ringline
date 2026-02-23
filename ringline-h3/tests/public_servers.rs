@@ -45,7 +45,7 @@ impl QuicClient {
     fn connect(server_addr: SocketAddr, server_name: &str) -> Self {
         let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
         socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(15)))
             .unwrap();
         socket.set_nonblocking(false).unwrap();
 
@@ -129,7 +129,7 @@ impl QuicClient {
     }
 
     fn drive_until_connected(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
                 Instant::now() < deadline,
@@ -196,7 +196,7 @@ impl QuicClient {
         stream: quinn_proto::StreamId,
     ) -> (u16, Vec<ringline_h3::HeaderField>, Vec<u8>) {
         let mut raw = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
 
         loop {
             assert!(
