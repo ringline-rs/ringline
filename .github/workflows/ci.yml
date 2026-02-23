@@ -77,3 +77,40 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p ringline-h2 --test public_servers -- --ignored --nocapture
       - run: cargo test -p ringline-h3 --test public_servers -- --ignored --nocapture
+
+  integration-services:
+    name: Integration (Redis + Memcache)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      memcached:
+        image: memcached:1.6
+        ports:
+          - 11211:11211
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ringline-redis --test integration -- --ignored --nocapture
+      - run: cargo test -p ringline-memcache --test integration -- --ignored --nocapture
+
+  integration-momento:
+    name: Integration (Momento)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ringline-momento --test integration -- --ignored --nocapture
+        env:
+          MOMENTO_AUTH_TOKEN: ${{ secrets.MOMENTO_AUTH_TOKEN }}
+          MOMENTO_CACHE_NAME: ${{ secrets.MOMENTO_CACHE_NAME }}
