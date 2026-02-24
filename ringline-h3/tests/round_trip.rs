@@ -167,7 +167,7 @@ impl AsyncEventHandler for H3Server {
                                 let _ = h3.send_data(&mut quic, stream_id, &data, true);
                             }
                         }
-                        H3Event::GoAway { .. } | H3Event::Error(_) => {}
+                        H3Event::Response { .. } | H3Event::GoAway { .. } | H3Event::Error(_) => {}
                     }
                 }
 

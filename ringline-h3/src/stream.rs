@@ -21,13 +21,16 @@ pub(crate) struct RequestStream {
     pub state: StreamState,
     /// Accumulates partial frame data between reads.
     pub recv_buf: Vec<u8>,
+    /// Whether this stream was opened by us (client request) or the peer (server request).
+    pub client_initiated: bool,
 }
 
 impl RequestStream {
-    pub fn new() -> Self {
+    pub fn new(client_initiated: bool) -> Self {
         Self {
             state: StreamState::WaitingHeaders,
             recv_buf: Vec::new(),
+            client_initiated,
         }
     }
 }

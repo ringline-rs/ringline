@@ -1,7 +1,7 @@
 //! HTTP/3 connection state machine.
 //!
 //! `H3Connection` sits on top of a `QuicEndpoint`, processing QUIC events
-//! and producing HTTP-level events. Server-side only for Phase 1.
+//! and producing HTTP-level events. Supports both client and server roles.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -23,6 +23,12 @@ const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
 pub enum H3Event {
     /// Received a complete request (headers, and optionally end of stream).
     Request {
+        stream_id: StreamId,
+        headers: Vec<HeaderField>,
+        end_stream: bool,
+    },
+    /// Received response headers on a client-initiated stream.
+    Response {
         stream_id: StreamId,
         headers: Vec<HeaderField>,
         end_stream: bool,
@@ -52,7 +58,7 @@ enum H3State {
     Closed,
 }
 
-/// Server-side HTTP/3 connection.
+/// HTTP/3 connection (client and server).
 ///
 /// Processes QUIC events from a `QuicEndpoint` and produces HTTP/3 events.
 /// The application calls `handle_quic_event()` to feed events, then
@@ -90,7 +96,7 @@ pub struct H3Connection {
 }
 
 impl H3Connection {
-    /// Create a new server-side HTTP/3 connection.
+    /// Create a new HTTP/3 connection.
     pub fn new(settings: Settings) -> Self {
         Self {
             state: H3State::Initializing,
@@ -132,6 +138,73 @@ impl H3Connection {
         Ok(())
     }
 
+    /// Initialize the HTTP/3 connection for an outbound QUIC connection.
+    ///
+    /// Opens our control unidirectional stream and sends the SETTINGS frame.
+    /// This is the client-side counterpart of [`accept()`](Self::accept).
+    pub fn initiate(&mut self, quic: &mut QuicEndpoint, conn: QuicConnId) -> Result<(), H3Error> {
+        self.conn_id = Some(conn);
+
+        // Open our control uni stream.
+        let stream = quic
+            .open_uni(conn)?
+            .ok_or_else(|| H3Error::Internal("cannot open control stream".into()))?;
+        self.our_control_stream = Some(stream);
+
+        // Send stream type (control = 0x00) + SETTINGS frame.
+        let mut buf = Vec::new();
+        frame::encode_varint(&mut buf, STREAM_TYPE_CONTROL);
+        Frame::Settings(self.local_settings.clone()).encode(&mut buf);
+        quic.stream_send(conn, stream, &buf)?;
+
+        self.settings_sent = true;
+        Ok(())
+    }
+
+    /// Send a request on a new bidirectional stream (client-side).
+    ///
+    /// Opens a new bidi stream, encodes the HEADERS frame, and optionally
+    /// finishes the send side if `end_stream` is true. Returns the stream ID
+    /// for subsequent `send_data()` calls.
+    pub fn send_request(
+        &mut self,
+        quic: &mut QuicEndpoint,
+        headers: &[HeaderField],
+        end_stream: bool,
+    ) -> Result<StreamId, H3Error> {
+        let conn = self
+            .conn_id
+            .ok_or(H3Error::Internal("no connection".into()))?;
+
+        let stream_id = quic
+            .open_bi(conn)?
+            .ok_or_else(|| H3Error::Internal("cannot open bidi stream".into()))?;
+
+        let mut encoded_headers = Vec::new();
+        qpack::encode(headers, &mut encoded_headers);
+
+        let mut buf = Vec::new();
+        Frame::Headers {
+            encoded: encoded_headers,
+        }
+        .encode(&mut buf);
+
+        quic.stream_send(conn, stream_id, &buf)?;
+
+        let state = if end_stream {
+            quic.stream_finish(conn, stream_id)?;
+            StreamState::HalfClosedLocal
+        } else {
+            StreamState::Open
+        };
+
+        let mut rs = RequestStream::new(true);
+        rs.state = state;
+        self.request_streams.insert(u64::from(stream_id), rs);
+
+        Ok(stream_id)
+    }
+
     /// Process a QUIC event and update HTTP/3 state.
     ///
     /// After calling this, drain events with `poll_event()`.
@@ -144,11 +217,14 @@ impl H3Connection {
             QuicEvent::NewConnection(conn) => {
                 self.accept(quic, *conn)?;
             }
+            QuicEvent::Connected(conn) => {
+                self.initiate(quic, *conn)?;
+            }
             QuicEvent::StreamOpened { conn, stream, bidi } => {
                 if *bidi {
-                    // New bidirectional stream = new HTTP request.
+                    // New bidirectional stream from peer = new HTTP request.
                     self.request_streams
-                        .insert(u64::from(*stream), RequestStream::new());
+                        .insert(u64::from(*stream), RequestStream::new(false));
                     // Proactively try to read — data may have arrived in the
                     // same QUIC packet that opened the stream, in which case
                     // quinn-proto won't fire a separate StreamReadable event.
@@ -165,7 +241,7 @@ impl H3Connection {
             QuicEvent::ConnectionClosed { .. } => {
                 self.state = H3State::Closed;
             }
-            // StreamWritable, StreamFinished, Connected — not relevant for server.
+            // StreamWritable, StreamFinished — not yet handled.
             _ => {}
         }
         Ok(())
@@ -491,6 +567,11 @@ impl H3Connection {
                             let headers = qpack::decode(&encoded)?;
                             let at_end = fin_received && offset == recv_buf.len();
 
+                            let client_initiated = self
+                                .request_streams
+                                .get(&u64::from(stream))
+                                .is_some_and(|rs| rs.client_initiated);
+
                             // Update stream state.
                             if let Some(rs) = self.request_streams.get_mut(&u64::from(stream)) {
                                 rs.state = if at_end {
@@ -500,11 +581,19 @@ impl H3Connection {
                                 };
                             }
 
-                            self.events.push_back(H3Event::Request {
-                                stream_id: stream,
-                                headers,
-                                end_stream: at_end,
-                            });
+                            if client_initiated {
+                                self.events.push_back(H3Event::Response {
+                                    stream_id: stream,
+                                    headers,
+                                    end_stream: at_end,
+                                });
+                            } else {
+                                self.events.push_back(H3Event::Request {
+                                    stream_id: stream,
+                                    headers,
+                                    end_stream: at_end,
+                                });
+                            }
                         }
                         Frame::Data { payload } => {
                             let at_end = fin_received && offset == recv_buf.len();

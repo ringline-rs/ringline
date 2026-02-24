@@ -24,7 +24,7 @@
 //!   └─────────────┘
 //! ```
 //!
-//! # Example
+//! # Server Example
 //!
 //! ```rust,ignore
 //! use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
@@ -40,6 +40,38 @@
 //!             let response = vec![HeaderField::new(b":status", b"200")];
 //!             h3.send_response(&mut quic, stream_id, &response, false)?;
 //!             h3.send_data(&mut quic, stream_id, b"hello", true)?;
+//!         }
+//!         _ => {}
+//!     }
+//! }
+//! ```
+//!
+//! # Client Example
+//!
+//! ```rust,ignore
+//! use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
+//!
+//! let mut h3 = H3Connection::new(Settings::default());
+//!
+//! // After QuicEvent::Connected, handle_quic_event() calls initiate() automatically.
+//! h3.handle_quic_event(&mut quic, &event)?;
+//!
+//! // Send a GET request:
+//! let headers = vec![
+//!     HeaderField::new(b":method", b"GET"),
+//!     HeaderField::new(b":path", b"/"),
+//!     HeaderField::new(b":scheme", b"https"),
+//! ];
+//! let stream_id = h3.send_request(&mut quic, &headers, true)?;
+//!
+//! // Later, after receiving QUIC events:
+//! while let Some(h3_event) = h3.poll_event() {
+//!     match h3_event {
+//!         H3Event::Response { stream_id, headers, end_stream } => {
+//!             // Process response headers
+//!         }
+//!         H3Event::Data { stream_id, data, end_stream } => {
+//!             // Process response body
 //!         }
 //!         _ => {}
 //!     }
