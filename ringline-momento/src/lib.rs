@@ -33,11 +33,12 @@
 //!
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
-//! | **Recv (values)** | **1** | `with_data()` + protobuf decode. `Bytes::copy_from_slice()` for each extracted field. |
-//! | **Send (requests)** | **3-4** | Layered protobuf encoding: each `encode()` layer allocates a new `Vec<u8>` and copies the previous level. Then `send_nowait()` copies into the send pool. |
+//! | **Recv (values)** | **0** | `with_bytes()` + `CacheResponse::decode_bytes()`. Values are `Bytes::slice()` references into the accumulator — zero allocation, O(1) refcount. |
+//! | **Send (requests)** | **1** | Single-pass `encode_into()` writes all protobuf nesting levels directly into one buffer. Then `send_nowait()` copies into the send pool. |
 //!
 //! All Momento connections use TLS, which adds encryption copies on the send
-//! path.
+//! path regardless of the encoding strategy. `SendGuard` (zero-copy send)
+//! cannot help here since TLS must read plaintext and write ciphertext.
 
 pub mod credential;
 pub mod error;
@@ -57,7 +58,7 @@ use ringline::{ConnCtx, ParseResult};
 
 use crate::proto::{
     CacheCommand, CacheResponse, CacheResponseResult, StatusCode, UnaryCommand,
-    decode_length_delimited_message,
+    decode_length_delimited_message_bytes,
 };
 
 // ── Request tracking ────────────────────────────────────────────────────
@@ -430,16 +431,19 @@ impl Client {
 
     /// Await the next completed operation. Reads from the connection,
     /// decodes the response, and correlates by message_id.
+    ///
+    /// Uses zero-copy parsing via `with_bytes()`: response values are
+    /// `Bytes::slice()` references into the accumulator buffer.
     pub async fn recv(&mut self) -> Result<CompletedOp, Error> {
         let pending = &mut self.pending;
         let mut dispatch_result: Option<DispatchResult> = None;
 
         let n = self
             .conn
-            .with_data(|data| {
-                match decode_length_delimited_message(data) {
+            .with_bytes(|bytes| {
+                match decode_length_delimited_message_bytes(&bytes) {
                     Some((consumed, msg_bytes)) => {
-                        if let Some(response) = CacheResponse::decode(msg_bytes) {
+                        if let Some(response) = CacheResponse::decode_bytes(msg_bytes) {
                             dispatch_result = dispatch_response(response, pending);
                         }
                         ParseResult::Consumed(consumed)
@@ -513,8 +517,8 @@ impl Client {
 
     fn send_command(&mut self, cmd: &CacheCommand) -> Result<(), Error> {
         self.send_buf.clear();
-        let encoded = cmd.encode_length_delimited();
-        self.conn.send_nowait(&encoded)?;
+        cmd.encode_length_delimited_into(&mut self.send_buf);
+        self.conn.send_nowait(&self.send_buf)?;
         Ok(())
     }
 
@@ -527,37 +531,40 @@ impl Client {
             },
         );
 
-        let encoded = cmd.encode_length_delimited();
-        self.conn.send_nowait(&encoded)?;
+        self.send_buf.clear();
+        cmd.encode_length_delimited_into(&mut self.send_buf);
+        self.conn.send_nowait(&self.send_buf)?;
 
         // Wait for auth response
         let mut auth_result: Option<Result<(), Error>> = None;
 
         let n = self
             .conn
-            .with_data(|data| match decode_length_delimited_message(data) {
-                Some((consumed, msg_bytes)) => {
-                    if let Some(response) = CacheResponse::decode(msg_bytes)
-                        && response.message_id == message_id
-                    {
-                        match response.result {
-                            CacheResponseResult::Authenticate => {
-                                auth_result = Some(Ok(()));
-                            }
-                            CacheResponseResult::Error(err) => {
-                                auth_result = Some(Err(Error::AuthFailed(err.message)));
-                            }
-                            _ => {
-                                auth_result = Some(Err(Error::Protocol(
-                                    "unexpected auth response type".into(),
-                                )));
+            .with_bytes(
+                |bytes| match decode_length_delimited_message_bytes(&bytes) {
+                    Some((consumed, msg_bytes)) => {
+                        if let Some(response) = CacheResponse::decode_bytes(msg_bytes)
+                            && response.message_id == message_id
+                        {
+                            match response.result {
+                                CacheResponseResult::Authenticate => {
+                                    auth_result = Some(Ok(()));
+                                }
+                                CacheResponseResult::Error(err) => {
+                                    auth_result = Some(Err(Error::AuthFailed(err.message)));
+                                }
+                                _ => {
+                                    auth_result = Some(Err(Error::Protocol(
+                                        "unexpected auth response type".into(),
+                                    )));
+                                }
                             }
                         }
+                        ParseResult::Consumed(consumed)
                     }
-                    ParseResult::Consumed(consumed)
-                }
-                None => ParseResult::Consumed(0),
-            })
+                    None => ParseResult::Consumed(0),
+                },
+            )
             .await;
 
         if n == 0 {

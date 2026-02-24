@@ -160,10 +160,10 @@ The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parse
 
 | Path | Copies | Mechanism |
 |------|--------|-----------|
-| **Recv (values)** | **1** | Uses `with_data()`. Protobuf decoder calls `Bytes::copy_from_slice()` for each extracted field (key, value). |
-| **Send (requests)** | **many** | Hand-rolled protobuf encoder nests multiple `encode()` layers, each allocating a new `Vec<u8>` and copying the previous level into it. A SET goes through: `encode_inner()` → `encode()` (wraps in Unary) → `encode_length_delimited()` (adds varint prefix). Each layer copies the entire payload. Then `send_nowait()` copies into pool. |
+| **Recv (values)** | **0** | Uses `with_bytes()` + `CacheResponse::decode_bytes()`. Values are `Bytes::slice()` into the accumulator — no allocation, O(1) refcount. |
+| **Send (requests)** | **1** | Single-pass `encode_into()` writes all protobuf nesting levels directly into one reusable buffer. Then `send_nowait()` copies into pool. |
 
-**Summary**: Recv is 1 copy per field. Send has the most copies of any client due to layered protobuf encoding — the value bytes are copied ~3-4 times through encoding layers before reaching the pool. No `SendGuard` support currently.
+**Summary**: Recv is fully zero-copy (refcounted slices), matching redis/memcache. Send uses single-pass encoding into a reusable buffer — 1 copy into the send pool. Note: all Momento connections use TLS, which adds encryption copies on the send path regardless (`SendGuard` cannot help since TLS must read plaintext and write ciphertext).
 
 #### ringline-ping
 

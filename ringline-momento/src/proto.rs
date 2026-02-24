@@ -86,6 +86,36 @@ pub fn encode_message(field_number: u32, message: &[u8], buf: &mut Vec<u8>) {
     buf.extend_from_slice(message);
 }
 
+/// Compute the encoded size of a varint.
+pub fn varint_size(mut value: u64) -> usize {
+    let mut size = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        size += 1;
+    }
+    size
+}
+
+/// Compute the encoded size of a field tag.
+fn tag_size(field_number: u32) -> usize {
+    varint_size(((field_number as u64) << 3) | (WIRE_TYPE_LEN as u64))
+}
+
+/// Compute the encoded size of a bytes/string field (tag + length varint + data).
+fn field_size_bytes(field_number: u32, data: &[u8]) -> usize {
+    tag_size(field_number) + varint_size(data.len() as u64) + data.len()
+}
+
+/// Compute the encoded size of a string field.
+fn field_size_string(field_number: u32, s: &str) -> usize {
+    field_size_bytes(field_number, s.as_bytes())
+}
+
+/// Compute the encoded size of a uint64 field (tag + varint value).
+fn field_size_uint64(field_number: u32, value: u64) -> usize {
+    varint_size(((field_number as u64) << 3) | (WIRE_TYPE_VARINT as u64)) + varint_size(value)
+}
+
 /// Decode a length-delimited field, returning the bytes.
 pub fn decode_length_delimited<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
     let len = decode_varint(buf)? as usize;
@@ -212,11 +242,23 @@ pub struct CommandError {
 impl CommandError {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(32);
-        encode_uint64(1, self.code as u64, &mut buf);
-        if !self.message.is_empty() {
-            encode_string(2, &self.message, &mut buf);
-        }
+        self.encode_into(&mut buf);
         buf
+    }
+
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
+        encode_uint64(1, self.code as u64, buf);
+        if !self.message.is_empty() {
+            encode_string(2, &self.message, buf);
+        }
+    }
+
+    pub fn encoded_size(&self) -> usize {
+        let mut size = field_size_uint64(1, self.code as u64);
+        if !self.message.is_empty() {
+            size += field_size_string(2, &self.message);
+        }
+        size
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
@@ -263,16 +305,15 @@ pub enum UnaryCommand {
 }
 
 impl UnaryCommand {
-    /// Encode the inner command (without the Unary wrapper).
-    fn encode_inner(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(128);
+    /// Encode the inner command fields (without the Unary wrapper) into `buf`.
+    fn encode_inner_into(&self, buf: &mut Vec<u8>) {
         match self {
             UnaryCommand::Authenticate { auth_token } => {
-                encode_string(1, auth_token, &mut buf);
+                encode_string(1, auth_token, buf);
             }
             UnaryCommand::Get { namespace, key } => {
-                encode_string(1, namespace, &mut buf);
-                encode_bytes(2, key, &mut buf);
+                encode_string(1, namespace, buf);
+                encode_bytes(2, key, buf);
             }
             UnaryCommand::Set {
                 namespace,
@@ -280,31 +321,72 @@ impl UnaryCommand {
                 value,
                 ttl_millis,
             } => {
-                encode_string(1, namespace, &mut buf);
-                encode_bytes(2, key, &mut buf);
-                encode_bytes(3, value, &mut buf);
-                encode_uint64(4, *ttl_millis, &mut buf);
+                encode_string(1, namespace, buf);
+                encode_bytes(2, key, buf);
+                encode_bytes(3, value, buf);
+                encode_uint64(4, *ttl_millis, buf);
             }
             UnaryCommand::Delete { namespace, key } => {
-                encode_string(1, namespace, &mut buf);
-                encode_bytes(2, key, &mut buf);
+                encode_string(1, namespace, buf);
+                encode_bytes(2, key, buf);
             }
         }
-        buf
+    }
+
+    /// Compute the encoded size of the inner command fields (without tags or length prefixes).
+    fn inner_encoded_size(&self) -> usize {
+        match self {
+            UnaryCommand::Authenticate { auth_token } => field_size_string(1, auth_token),
+            UnaryCommand::Get { namespace, key } => {
+                field_size_string(1, namespace) + field_size_bytes(2, key)
+            }
+            UnaryCommand::Set {
+                namespace,
+                key,
+                value,
+                ttl_millis,
+            } => {
+                field_size_string(1, namespace)
+                    + field_size_bytes(2, key)
+                    + field_size_bytes(3, value)
+                    + field_size_uint64(4, *ttl_millis)
+            }
+            UnaryCommand::Delete { namespace, key } => {
+                field_size_string(1, namespace) + field_size_bytes(2, key)
+            }
+        }
+    }
+
+    /// The protobuf field number for this command variant within the Unary message.
+    fn field_number(&self) -> u32 {
+        match self {
+            UnaryCommand::Authenticate { .. } => 1,
+            UnaryCommand::Get { .. } => 2,
+            UnaryCommand::Set { .. } => 3,
+            UnaryCommand::Delete { .. } => 4,
+        }
     }
 
     /// Encode as a Unary message with the command in the appropriate field.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        let inner = self.encode_inner();
-        let field_number = match self {
-            UnaryCommand::Authenticate { .. } => 1,
-            UnaryCommand::Get { .. } => 2,
-            UnaryCommand::Set { .. } => 3,
-            UnaryCommand::Delete { .. } => 4,
-        };
-        encode_message(field_number, &inner, &mut buf);
+        self.encode_into(&mut buf);
         buf
+    }
+
+    /// Compute the total encoded size of the Unary message (tag + length prefix + inner).
+    pub fn encoded_size(&self) -> usize {
+        let inner_size = self.inner_encoded_size();
+        tag_size(self.field_number()) + varint_size(inner_size as u64) + inner_size
+    }
+
+    /// Encode as a Unary message directly into `buf` (single-pass, no intermediate allocations).
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
+        let inner_size = self.inner_encoded_size();
+        // Unary wrapper: tag + length prefix + inner fields
+        encode_tag(self.field_number(), WIRE_TYPE_LEN, buf);
+        encode_varint(inner_size as u64, buf);
+        self.encode_inner_into(buf);
     }
 
     /// Decode a Unary message.
@@ -463,29 +545,52 @@ impl CacheCommand {
     /// Encode the command to bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-
-        // Field 2: message_id (per official proto)
-        encode_uint64(2, self.message_id, &mut buf);
-
-        // Field 3: control_code (per official proto)
-        encode_uint64(3, self.control_code as u64, &mut buf);
-
-        // Field 10: unary command (per official proto)
-        if let Some(ref cmd) = self.command {
-            let unary = cmd.encode();
-            encode_message(10, &unary, &mut buf);
-        }
-
+        self.encode_into(&mut buf);
         buf
     }
 
-    /// Encode with length prefix for protosocket wire format.
+    /// Encode directly into `buf` (single-pass, no intermediate allocations).
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
+        // Field 2: message_id (per official proto)
+        encode_uint64(2, self.message_id, buf);
+
+        // Field 3: control_code (per official proto)
+        encode_uint64(3, self.control_code as u64, buf);
+
+        // Field 10: unary command (per official proto)
+        if let Some(ref cmd) = self.command {
+            // Write the field 10 tag + length prefix, then encode inner fields directly.
+            let unary_size = cmd.encoded_size();
+            encode_tag(10, WIRE_TYPE_LEN, buf);
+            encode_varint(unary_size as u64, buf);
+            cmd.encode_into(buf);
+        }
+    }
+
+    /// Compute the encoded size of the command (without length-delimited prefix).
+    fn encoded_size(&self) -> usize {
+        let mut size =
+            field_size_uint64(2, self.message_id) + field_size_uint64(3, self.control_code as u64);
+        if let Some(ref cmd) = self.command {
+            let unary_size = cmd.encoded_size();
+            size += tag_size(10) + varint_size(unary_size as u64) + unary_size;
+        }
+        size
+    }
+
+    /// Encode with length prefix for protosocket wire format (single allocation).
     pub fn encode_length_delimited(&self) -> Vec<u8> {
-        let inner = self.encode();
-        let mut buf = Vec::with_capacity(inner.len() + 5);
-        encode_varint(inner.len() as u64, &mut buf);
-        buf.extend_from_slice(&inner);
+        let msg_size = self.encoded_size();
+        let mut buf = Vec::with_capacity(varint_size(msg_size as u64) + msg_size);
+        self.encode_length_delimited_into(&mut buf);
         buf
+    }
+
+    /// Encode with length prefix directly into `buf` (zero intermediate allocations).
+    pub fn encode_length_delimited_into(&self, buf: &mut Vec<u8>) {
+        let msg_size = self.encoded_size();
+        encode_varint(msg_size as u64, buf);
+        self.encode_into(buf);
     }
 
     /// Decode a command from bytes.
@@ -595,51 +700,89 @@ impl CacheResponse {
     /// Encode the response to bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
+        self.encode_into(&mut buf);
+        buf
+    }
 
+    /// Encode directly into `buf` (single-pass, no intermediate allocations).
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
         // Field 1: message_id
-        encode_uint64(1, self.message_id, &mut buf);
+        encode_uint64(1, self.message_id, buf);
 
         // Field 2: control_code
-        encode_uint64(2, self.control_code as u64, &mut buf);
+        encode_uint64(2, self.control_code as u64, buf);
 
         // Response kind (per official proto field numbers)
         match &self.result {
             CacheResponseResult::Error(err) => {
-                // Field 9: error
-                let inner = err.encode();
-                encode_message(9, &inner, &mut buf);
+                // Field 9: error — encode inline
+                let inner_size = err.encoded_size();
+                encode_tag(9, WIRE_TYPE_LEN, buf);
+                encode_varint(inner_size as u64, buf);
+                err.encode_into(buf);
             }
             CacheResponseResult::Authenticate => {
                 // Field 10: authenticate response (empty)
-                encode_message(10, &[], &mut buf);
+                encode_message(10, &[], buf);
             }
             CacheResponseResult::Get { value } => {
-                // Field 11: get response
-                let mut inner = Vec::new();
+                // Field 11: get response — encode inline
+                let inner_size = match value {
+                    Some(v) => field_size_bytes(1, v),
+                    None => 0,
+                };
+                encode_tag(11, WIRE_TYPE_LEN, buf);
+                encode_varint(inner_size as u64, buf);
                 if let Some(v) = value {
-                    encode_bytes(1, v, &mut inner);
+                    encode_bytes(1, v, buf);
                 }
-                encode_message(11, &inner, &mut buf);
             }
             CacheResponseResult::Set => {
                 // Field 12: set response (empty)
-                encode_message(12, &[], &mut buf);
+                encode_message(12, &[], buf);
             }
             CacheResponseResult::Delete => {
                 // Field 13: delete response (empty)
-                encode_message(13, &[], &mut buf);
+                encode_message(13, &[], buf);
             }
         }
-
-        buf
     }
 
-    /// Encode with length prefix for protosocket wire format.
+    /// Compute the encoded size of the response (without length-delimited prefix).
+    fn encoded_size(&self) -> usize {
+        let mut size =
+            field_size_uint64(1, self.message_id) + field_size_uint64(2, self.control_code as u64);
+        match &self.result {
+            CacheResponseResult::Error(err) => {
+                let inner = err.encoded_size();
+                size += tag_size(9) + varint_size(inner as u64) + inner;
+            }
+            CacheResponseResult::Authenticate => {
+                size += tag_size(10) + varint_size(0);
+            }
+            CacheResponseResult::Get { value } => {
+                let inner = match value {
+                    Some(v) => field_size_bytes(1, v),
+                    None => 0,
+                };
+                size += tag_size(11) + varint_size(inner as u64) + inner;
+            }
+            CacheResponseResult::Set => {
+                size += tag_size(12) + varint_size(0);
+            }
+            CacheResponseResult::Delete => {
+                size += tag_size(13) + varint_size(0);
+            }
+        }
+        size
+    }
+
+    /// Encode with length prefix for protosocket wire format (single allocation).
     pub fn encode_length_delimited(&self) -> Vec<u8> {
-        let inner = self.encode();
-        let mut buf = Vec::with_capacity(inner.len() + 5);
-        encode_varint(inner.len() as u64, &mut buf);
-        buf.extend_from_slice(&inner);
+        let msg_size = self.encoded_size();
+        let mut buf = Vec::with_capacity(varint_size(msg_size as u64) + msg_size);
+        encode_varint(msg_size as u64, &mut buf);
+        self.encode_into(&mut buf);
         buf
     }
 
@@ -739,6 +882,155 @@ pub fn decode_length_delimited_message(buf: &[u8]) -> Option<(usize, &[u8])> {
 
     let message = &cursor[..len];
     Some((header_len + len, message))
+}
+
+// ============================================================================
+// Zero-copy Bytes-aware decoders
+// ============================================================================
+//
+// These decode functions work with `Bytes` handles, returning `Bytes::slice()`
+// sub-references instead of copying. Used by the recv path to avoid copies when
+// extracting values from the accumulator.
+
+/// Decode a length-delimited field from a `Bytes` handle, returning a zero-copy slice.
+///
+/// Advances `offset` past the consumed bytes. Returns `None` if incomplete.
+fn decode_length_delimited_bytes(data: &Bytes, offset: &mut usize) -> Option<Bytes> {
+    let buf = &data[*offset..];
+    let mut cursor = buf;
+    let len = decode_varint(&mut cursor)? as usize;
+    let header_len = buf.len() - cursor.len();
+    if cursor.len() < len {
+        return None;
+    }
+    let start = *offset + header_len;
+    *offset = start + len;
+    Some(data.slice(start..start + len))
+}
+
+/// Skip a field in a `Bytes` buffer by advancing `offset`.
+fn skip_field_bytes(wire_type: u8, data: &[u8], offset: &mut usize) -> Option<()> {
+    let buf = &data[*offset..];
+    let mut cursor = buf;
+    skip_field(wire_type, &mut cursor)?;
+    *offset += buf.len() - cursor.len();
+    Some(())
+}
+
+/// Decode a varint from a `Bytes` buffer, advancing `offset`.
+fn decode_varint_bytes(data: &[u8], offset: &mut usize) -> Option<u64> {
+    let buf = &data[*offset..];
+    let mut cursor = buf;
+    let value = decode_varint(&mut cursor)?;
+    *offset += buf.len() - cursor.len();
+    Some(value)
+}
+
+/// Decode a tag from a `Bytes` buffer, advancing `offset`.
+fn decode_tag_bytes(data: &[u8], offset: &mut usize) -> Option<(u32, u8)> {
+    let buf = &data[*offset..];
+    let mut cursor = buf;
+    let tag = decode_tag(&mut cursor)?;
+    *offset += buf.len() - cursor.len();
+    Some(tag)
+}
+
+impl CacheResponse {
+    /// Decode a response from a `Bytes` handle using zero-copy slicing.
+    ///
+    /// Extracted values (e.g., GET response bodies) are `Bytes::slice()` references
+    /// into the original buffer — no allocation or memcpy.
+    pub fn decode_bytes(data: Bytes) -> Option<Self> {
+        let mut offset = 0;
+        let mut message_id = 0u64;
+        let mut control_code = ControlCode::Normal;
+        let mut result = None;
+
+        while offset < data.len() {
+            let (field_number, wire_type) = decode_tag_bytes(&data, &mut offset)?;
+            match field_number {
+                1 if wire_type == WIRE_TYPE_VARINT => {
+                    message_id = decode_varint_bytes(&data, &mut offset)?;
+                }
+                2 if wire_type == WIRE_TYPE_VARINT => {
+                    control_code =
+                        ControlCode::from_u32(decode_varint_bytes(&data, &mut offset)? as u32);
+                }
+                9 if wire_type == WIRE_TYPE_LEN => {
+                    let inner = decode_length_delimited_bytes(&data, &mut offset)?;
+                    let err = CommandError::decode(&inner)?;
+                    result = Some(CacheResponseResult::Error(err));
+                }
+                10 if wire_type == WIRE_TYPE_LEN => {
+                    let _inner = decode_length_delimited_bytes(&data, &mut offset)?;
+                    result = Some(CacheResponseResult::Authenticate);
+                }
+                11 if wire_type == WIRE_TYPE_LEN => {
+                    // GET response — decode inline with zero-copy value extraction
+                    let inner = decode_length_delimited_bytes(&data, &mut offset)?;
+                    result = Some(Self::decode_get_response_bytes(inner));
+                }
+                12 if wire_type == WIRE_TYPE_LEN => {
+                    let _inner = decode_length_delimited_bytes(&data, &mut offset)?;
+                    result = Some(CacheResponseResult::Set);
+                }
+                13 if wire_type == WIRE_TYPE_LEN => {
+                    let _inner = decode_length_delimited_bytes(&data, &mut offset)?;
+                    result = Some(CacheResponseResult::Delete);
+                }
+                _ => skip_field_bytes(wire_type, &data, &mut offset)?,
+            }
+        }
+
+        Some(Self {
+            message_id,
+            control_code,
+            result: result.unwrap_or(CacheResponseResult::Error(CommandError {
+                code: StatusCode::Internal,
+                message: "missing response".to_string(),
+            })),
+        })
+    }
+
+    /// Decode a GET response from a `Bytes` handle — zero-copy value extraction.
+    fn decode_get_response_bytes(data: Bytes) -> CacheResponseResult {
+        let mut offset = 0;
+        let mut value = None;
+
+        while offset < data.len() {
+            if let Some((field_number, wire_type)) = decode_tag_bytes(&data, &mut offset) {
+                match field_number {
+                    1 if wire_type == WIRE_TYPE_LEN => {
+                        value = decode_length_delimited_bytes(&data, &mut offset);
+                    }
+                    _ => {
+                        if skip_field_bytes(wire_type, &data, &mut offset).is_none() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        CacheResponseResult::Get { value }
+    }
+}
+
+/// Decode a length-delimited message from a `Bytes` handle.
+/// Returns (bytes_consumed, message_bytes) or None if incomplete.
+pub fn decode_length_delimited_message_bytes(buf: &Bytes) -> Option<(usize, Bytes)> {
+    let mut offset = 0;
+    let len = decode_varint_bytes(buf, &mut offset)? as usize;
+
+    // Check if we have enough data
+    if buf.len() - offset < len {
+        return None;
+    }
+
+    let message = buf.slice(offset..offset + len);
+    Some((offset + len, message))
 }
 
 #[cfg(test)]
