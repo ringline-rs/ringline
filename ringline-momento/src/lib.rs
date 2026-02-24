@@ -34,7 +34,7 @@
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
 //! | **Recv (values)** | **0** | `with_bytes()` + `CacheResponse::decode_bytes()`. Values are `Bytes::slice()` references into the accumulator — zero allocation, O(1) refcount. |
-//! | **Send (requests)** | **1** | Single-pass `encode_into()` writes all protobuf nesting levels directly into one buffer. Then `send_nowait()` copies into the send pool. |
+//! | **Send (requests)** | **1** | Single-pass `encode_into()` writes all protobuf nesting levels directly into one buffer. Then `send_nowait()` copies into the send pool. Namespace is O(1) clone when pre-set via `set_namespace()` / `ClientBuilder::namespace()`. |
 //!
 //! All Momento connections use TLS, which adds encryption copies on the send
 //! path regardless of the encoding strategy. `SendGuard` (zero-copy send)
@@ -176,6 +176,7 @@ impl ClientMetrics {
 pub struct ClientBuilder {
     conn: ConnCtx,
     on_result: Option<ResultCallback>,
+    namespace: Bytes,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -187,11 +188,19 @@ impl ClientBuilder {
         Self {
             conn,
             on_result: None,
+            namespace: Bytes::new(),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             with_metrics: false,
         }
+    }
+
+    /// Pre-set the cache namespace. When set, `fire_*` methods use an O(1)
+    /// refcount clone instead of allocating a new `Bytes` per request.
+    pub fn namespace(mut self, ns: impl AsRef<[u8]>) -> Self {
+        self.namespace = Bytes::copy_from_slice(ns.as_ref());
+        self
     }
 
     /// Register a callback invoked after each command completes.
@@ -222,6 +231,7 @@ impl ClientBuilder {
             pending: HashMap::new(),
             send_buf: Vec::with_capacity(4096),
             on_result: self.on_result,
+            namespace: self.namespace,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
             #[cfg(feature = "metrics")]
@@ -247,6 +257,7 @@ pub struct Client {
     pending: HashMap<u64, PendingOp>,
     send_buf: Vec<u8>,
     on_result: Option<ResultCallback>,
+    namespace: Bytes,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -269,6 +280,7 @@ impl Client {
             pending: HashMap::new(),
             send_buf: Vec::with_capacity(4096),
             on_result: None,
+            namespace: Bytes::new(),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -297,6 +309,7 @@ impl Client {
             pending: HashMap::new(),
             send_buf: Vec::with_capacity(4096),
             on_result: None,
+            namespace: Bytes::new(),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -331,6 +344,12 @@ impl Client {
         self.metrics.as_mut()
     }
 
+    /// Pre-set the cache namespace. When set, `fire_*` methods use an O(1)
+    /// refcount clone instead of allocating a new `Bytes` per request.
+    pub fn set_namespace(&mut self, ns: impl AsRef<[u8]>) {
+        self.namespace = Bytes::copy_from_slice(ns.as_ref());
+    }
+
     /// Number of in-flight requests.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
@@ -341,11 +360,13 @@ impl Client {
     /// Fire a GET request. Returns immediately with a RequestId.
     pub fn fire_get(&mut self, cache: &str, key: &[u8]) -> Result<RequestId, Error> {
         let message_id = self.next_id();
+        let ns = self.namespace_for(cache);
+        let key = Bytes::copy_from_slice(key);
         let cmd = CacheCommand::new(
             message_id,
             UnaryCommand::Get {
-                namespace: cache.to_string(),
-                key: Bytes::copy_from_slice(key),
+                namespace: ns,
+                key: key.clone(),
             },
         );
 
@@ -356,7 +377,7 @@ impl Client {
             message_id,
             PendingOp {
                 kind: PendingOpKind::Get,
-                key: Bytes::copy_from_slice(key),
+                key,
                 send_ts,
                 start,
             },
@@ -374,11 +395,13 @@ impl Client {
         ttl_ms: u64,
     ) -> Result<RequestId, Error> {
         let message_id = self.next_id();
+        let ns = self.namespace_for(cache);
+        let key = Bytes::copy_from_slice(key);
         let cmd = CacheCommand::new(
             message_id,
             UnaryCommand::Set {
-                namespace: cache.to_string(),
-                key: Bytes::copy_from_slice(key),
+                namespace: ns,
+                key: key.clone(),
                 value: Bytes::copy_from_slice(value),
                 ttl_millis: ttl_ms,
             },
@@ -391,7 +414,7 @@ impl Client {
             message_id,
             PendingOp {
                 kind: PendingOpKind::Set,
-                key: Bytes::copy_from_slice(key),
+                key,
                 send_ts,
                 start,
             },
@@ -403,11 +426,13 @@ impl Client {
     /// Fire a DELETE request. Returns immediately with a RequestId.
     pub fn fire_delete(&mut self, cache: &str, key: &[u8]) -> Result<RequestId, Error> {
         let message_id = self.next_id();
+        let ns = self.namespace_for(cache);
+        let key = Bytes::copy_from_slice(key);
         let cmd = CacheCommand::new(
             message_id,
             UnaryCommand::Delete {
-                namespace: cache.to_string(),
-                key: Bytes::copy_from_slice(key),
+                namespace: ns,
+                key: key.clone(),
             },
         );
 
@@ -418,7 +443,7 @@ impl Client {
             message_id,
             PendingOp {
                 kind: PendingOpKind::Delete,
-                key: Bytes::copy_from_slice(key),
+                key,
                 send_ts,
                 start,
             },
@@ -508,6 +533,16 @@ impl Client {
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
+
+    /// Return the namespace `Bytes` — O(1) clone if pre-set, otherwise allocates.
+    #[inline]
+    fn namespace_for(&self, cache: &str) -> Bytes {
+        if self.namespace.is_empty() {
+            Bytes::copy_from_slice(cache.as_bytes())
+        } else {
+            self.namespace.clone()
+        }
+    }
 
     fn next_id(&mut self) -> u64 {
         let id = self.next_message_id;

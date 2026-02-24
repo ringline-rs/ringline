@@ -289,17 +289,17 @@ pub enum UnaryCommand {
         auth_token: String,
     },
     Get {
-        namespace: String,
+        namespace: Bytes,
         key: Bytes,
     },
     Set {
-        namespace: String,
+        namespace: Bytes,
         key: Bytes,
         value: Bytes,
         ttl_millis: u64,
     },
     Delete {
-        namespace: String,
+        namespace: Bytes,
         key: Bytes,
     },
 }
@@ -312,7 +312,7 @@ impl UnaryCommand {
                 encode_string(1, auth_token, buf);
             }
             UnaryCommand::Get { namespace, key } => {
-                encode_string(1, namespace, buf);
+                encode_bytes(1, namespace, buf);
                 encode_bytes(2, key, buf);
             }
             UnaryCommand::Set {
@@ -321,13 +321,13 @@ impl UnaryCommand {
                 value,
                 ttl_millis,
             } => {
-                encode_string(1, namespace, buf);
+                encode_bytes(1, namespace, buf);
                 encode_bytes(2, key, buf);
                 encode_bytes(3, value, buf);
                 encode_uint64(4, *ttl_millis, buf);
             }
             UnaryCommand::Delete { namespace, key } => {
-                encode_string(1, namespace, buf);
+                encode_bytes(1, namespace, buf);
                 encode_bytes(2, key, buf);
             }
         }
@@ -338,7 +338,7 @@ impl UnaryCommand {
         match self {
             UnaryCommand::Authenticate { auth_token } => field_size_string(1, auth_token),
             UnaryCommand::Get { namespace, key } => {
-                field_size_string(1, namespace) + field_size_bytes(2, key)
+                field_size_bytes(1, namespace) + field_size_bytes(2, key)
             }
             UnaryCommand::Set {
                 namespace,
@@ -346,13 +346,13 @@ impl UnaryCommand {
                 value,
                 ttl_millis,
             } => {
-                field_size_string(1, namespace)
+                field_size_bytes(1, namespace)
                     + field_size_bytes(2, key)
                     + field_size_bytes(3, value)
                     + field_size_uint64(4, *ttl_millis)
             }
             UnaryCommand::Delete { namespace, key } => {
-                field_size_string(1, namespace) + field_size_bytes(2, key)
+                field_size_bytes(1, namespace) + field_size_bytes(2, key)
             }
         }
     }
@@ -433,7 +433,7 @@ impl UnaryCommand {
 
     fn decode_get(data: &[u8]) -> Option<Self> {
         let mut buf = data;
-        let mut namespace = String::new();
+        let mut namespace = Bytes::new();
         let mut key = Bytes::new();
 
         while !buf.is_empty() {
@@ -441,7 +441,7 @@ impl UnaryCommand {
             match field_number {
                 1 => {
                     let bytes = decode_length_delimited(&mut buf)?;
-                    namespace = String::from_utf8_lossy(bytes).into_owned();
+                    namespace = Bytes::copy_from_slice(bytes);
                 }
                 2 => {
                     let bytes = decode_length_delimited(&mut buf)?;
@@ -456,7 +456,7 @@ impl UnaryCommand {
 
     fn decode_set(data: &[u8]) -> Option<Self> {
         let mut buf = data;
-        let mut namespace = String::new();
+        let mut namespace = Bytes::new();
         let mut key = Bytes::new();
         let mut value = Bytes::new();
         let mut ttl_millis = 0u64;
@@ -466,7 +466,7 @@ impl UnaryCommand {
             match field_number {
                 1 => {
                     let bytes = decode_length_delimited(&mut buf)?;
-                    namespace = String::from_utf8_lossy(bytes).into_owned();
+                    namespace = Bytes::copy_from_slice(bytes);
                 }
                 2 => {
                     let bytes = decode_length_delimited(&mut buf)?;
@@ -493,7 +493,7 @@ impl UnaryCommand {
 
     fn decode_delete(data: &[u8]) -> Option<Self> {
         let mut buf = data;
-        let mut namespace = String::new();
+        let mut namespace = Bytes::new();
         let mut key = Bytes::new();
 
         while !buf.is_empty() {
@@ -501,7 +501,7 @@ impl UnaryCommand {
             match field_number {
                 1 => {
                     let bytes = decode_length_delimited(&mut buf)?;
-                    namespace = String::from_utf8_lossy(bytes).into_owned();
+                    namespace = Bytes::copy_from_slice(bytes);
                 }
                 2 => {
                     let bytes = decode_length_delimited(&mut buf)?;
@@ -1285,14 +1285,14 @@ mod tests {
     #[test]
     fn test_unary_command_get_roundtrip() {
         let cmd = UnaryCommand::Get {
-            namespace: "my-cache".to_string(),
+            namespace: Bytes::from_static(b"my-cache"),
             key: Bytes::from_static(b"my-key"),
         };
         let encoded = cmd.encode();
         let decoded = UnaryCommand::decode(&encoded).unwrap();
         match decoded {
             UnaryCommand::Get { namespace, key } => {
-                assert_eq!(namespace, "my-cache");
+                assert_eq!(namespace.as_ref(), b"my-cache");
                 assert_eq!(key.as_ref(), b"my-key");
             }
             _ => panic!("expected Get"),
@@ -1302,7 +1302,7 @@ mod tests {
     #[test]
     fn test_unary_command_set_roundtrip() {
         let cmd = UnaryCommand::Set {
-            namespace: "cache".to_string(),
+            namespace: Bytes::from_static(b"cache"),
             key: Bytes::from_static(b"key"),
             value: Bytes::from_static(b"value"),
             ttl_millis: 60000,
@@ -1316,7 +1316,7 @@ mod tests {
                 value,
                 ttl_millis,
             } => {
-                assert_eq!(namespace, "cache");
+                assert_eq!(namespace.as_ref(), b"cache");
                 assert_eq!(key.as_ref(), b"key");
                 assert_eq!(value.as_ref(), b"value");
                 assert_eq!(ttl_millis, 60000);
@@ -1328,14 +1328,14 @@ mod tests {
     #[test]
     fn test_unary_command_delete_roundtrip() {
         let cmd = UnaryCommand::Delete {
-            namespace: "cache".to_string(),
+            namespace: Bytes::from_static(b"cache"),
             key: Bytes::from_static(b"delete-me"),
         };
         let encoded = cmd.encode();
         let decoded = UnaryCommand::decode(&encoded).unwrap();
         match decoded {
             UnaryCommand::Delete { namespace, key } => {
-                assert_eq!(namespace, "cache");
+                assert_eq!(namespace.as_ref(), b"cache");
                 assert_eq!(key.as_ref(), b"delete-me");
             }
             _ => panic!("expected Delete"),
@@ -1349,7 +1349,7 @@ mod tests {
         let cmd = CacheCommand::new(
             42,
             UnaryCommand::Get {
-                namespace: "test".to_string(),
+                namespace: Bytes::from_static(b"test"),
                 key: Bytes::from_static(b"key"),
             },
         );
