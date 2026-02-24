@@ -15,6 +15,13 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Copy Semantics
+//!
+//! | Path | Copies | Mechanism |
+//! |------|--------|-----------|
+//! | **Recv** | **0** | `with_data()` pattern-matches `PONG\r\n` -- no value extraction. |
+//! | **Send** | 1 | 6-byte `PING\r\n` copied into the send pool. |
 
 pub mod pool;
 pub use pool::{Pool, PoolConfig};

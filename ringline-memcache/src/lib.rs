@@ -1,9 +1,9 @@
 //! ringline-native Memcache client for use inside the ringline async runtime.
 //!
 //! This client wraps a [`ringline::ConnCtx`] and provides typed Memcache command
-//! methods that use `with_data()` + `Response::parse()` for incremental
-//! parsing. It is designed for single-threaded, single-connection use within
-//! ringline's `AsyncEventHandler::on_start()` or connection tasks.
+//! methods that use `with_bytes()` + `ResponseBytes::parse()` for zero-copy
+//! incremental parsing. It is designed for single-threaded, single-connection
+//! use within ringline's `AsyncEventHandler::on_start()` or connection tasks.
 //!
 //! All key and value parameters accept `impl AsRef<[u8]>`, so you can pass
 //! `&str`, `String`, `&[u8]`, `Vec<u8>`, `Bytes`, etc.
@@ -22,6 +22,17 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Copy Semantics
+//!
+//! | Path | Copies | Mechanism |
+//! |------|--------|-----------|
+//! | **Recv (values)** | **0** | `with_bytes()` + `ResponseBytes::parse()`. Keys and values are `Bytes::slice()` references into the accumulator -- zero allocation, O(1) refcount. |
+//! | **Send (commands)** | 1 | `encode_request()` serializes into `Vec<u8>`, then `conn.send()` copies into the send pool. |
+//! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`]: prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
+//!
+//! TLS connections add encryption copies on the send path regardless of
+//! `SendGuard` usage.
 
 pub mod pool;
 pub mod sharded;
@@ -32,7 +43,7 @@ use std::io;
 use std::time::Instant;
 
 use bytes::Bytes;
-use memcache_proto::{Request as McRequest, Response as McResponse};
+use memcache_proto::{Request as McRequest, ResponseBytes as McResponseBytes};
 use ringline::{ConnCtx, GuardBox, ParseResult, SendGuard};
 
 /// Callback type invoked after each command completes.
@@ -360,11 +371,15 @@ impl Client {
     // ── Internal I/O (unchanged) ────────────────────────────────────────
 
     /// Read and parse a single Memcache response from the connection.
-    pub(crate) async fn read_response(&self) -> Result<McResponse, Error> {
-        let mut result: Option<Result<McResponse, Error>> = None;
+    ///
+    /// Uses zero-copy parsing via `with_bytes` + `ResponseBytes::parse`:
+    /// value data are `Bytes::slice()` references into the accumulator's
+    /// buffer rather than freshly allocated `Vec<u8>`.
+    pub(crate) async fn read_response(&self) -> Result<McResponseBytes, Error> {
+        let mut result: Option<Result<McResponseBytes, Error>> = None;
         let n = self
             .conn
-            .with_data(|data| match McResponse::parse(data) {
+            .with_bytes(|bytes| match McResponseBytes::parse(bytes) {
                 Ok((response, consumed)) => {
                     result = Some(Ok(response));
                     ParseResult::Consumed(consumed)
@@ -384,10 +399,10 @@ impl Client {
 
     /// Send an encoded command and read the response, converting error
     /// responses into `Error::Memcache`.
-    async fn execute(&self, encoded: &[u8]) -> Result<McResponse, Error> {
+    async fn execute(&self, encoded: &[u8]) -> Result<McResponseBytes, Error> {
         self.conn.send(encoded)?;
         let response = self.read_response().await?;
-        check_error(&response)?;
+        check_error_bytes(&response)?;
         Ok(response)
     }
 
@@ -401,13 +416,13 @@ impl Client {
         if !self.is_instrumented() {
             let response = self.execute(&encoded).await?;
             return match response {
-                McResponse::Values(mut values) => {
+                McResponseBytes::Values(mut values) => {
                     if values.is_empty() {
                         Ok(None)
                     } else {
                         let v = values.swap_remove(0);
                         Ok(Some(Value {
-                            data: Bytes::from(v.data),
+                            data: v.data,
                             flags: v.flags,
                         }))
                     }
@@ -422,13 +437,13 @@ impl Client {
         let latency_ns = self.finish_timing(send_ts, start);
 
         let result = match response {
-            Ok(McResponse::Values(mut values)) => {
+            Ok(McResponseBytes::Values(mut values)) => {
                 if values.is_empty() {
                     Ok(None)
                 } else {
                     let v = values.swap_remove(0);
                     Ok(Some(Value {
-                        data: Bytes::from(v.data),
+                        data: v.data,
                         flags: v.flags,
                     }))
                 }
@@ -460,11 +475,11 @@ impl Client {
         let encoded = encode_request(&McRequest::gets(keys));
         let response = self.execute(&encoded).await?;
         match response {
-            McResponse::Values(values) => Ok(values
+            McResponseBytes::Values(values) => Ok(values
                 .into_iter()
                 .map(|v| GetValue {
-                    key: Bytes::from(v.key),
-                    data: Bytes::from(v.data),
+                    key: v.key,
+                    data: v.data,
                     flags: v.flags,
                     cas: v.cas,
                 })
@@ -497,7 +512,7 @@ impl Client {
         if !self.is_instrumented() {
             let response = self.execute(&encoded).await?;
             return match response {
-                McResponse::Stored => Ok(()),
+                McResponseBytes::Stored => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
             };
         }
@@ -508,7 +523,7 @@ impl Client {
         let latency_ns = self.finish_timing(send_ts, start);
 
         let result = match response {
-            Ok(McResponse::Stored) => Ok(()),
+            Ok(McResponseBytes::Stored) => Ok(()),
             Ok(_) => Err(Error::UnexpectedResponse),
             Err(e) => Err(e),
         };
@@ -534,8 +549,8 @@ impl Client {
         let encoded = encode_add(key, value);
         let response = self.execute(&encoded).await?;
         match response {
-            McResponse::Stored => Ok(true),
-            McResponse::NotStored => Ok(false),
+            McResponseBytes::Stored => Ok(true),
+            McResponseBytes::NotStored => Ok(false),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -557,8 +572,8 @@ impl Client {
         });
         let response = self.execute(&encoded).await?;
         match response {
-            McResponse::Stored => Ok(true),
-            McResponse::NotStored => Ok(false),
+            McResponseBytes::Stored => Ok(true),
+            McResponseBytes::NotStored => Ok(false),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -570,8 +585,8 @@ impl Client {
         let encoded = encode_request(&McRequest::incr(key, delta));
         let response = self.execute(&encoded).await?;
         match response {
-            McResponse::Numeric(val) => Ok(Some(val)),
-            McResponse::NotFound => Ok(None),
+            McResponseBytes::Numeric(val) => Ok(Some(val)),
+            McResponseBytes::NotFound => Ok(None),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -583,8 +598,8 @@ impl Client {
         let encoded = encode_request(&McRequest::decr(key, delta));
         let response = self.execute(&encoded).await?;
         match response {
-            McResponse::Numeric(val) => Ok(Some(val)),
-            McResponse::NotFound => Ok(None),
+            McResponseBytes::Numeric(val) => Ok(Some(val)),
+            McResponseBytes::NotFound => Ok(None),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -601,8 +616,8 @@ impl Client {
         let encoded = encode_request(&McRequest::append(key, value));
         let response = self.execute(&encoded).await?;
         match response {
-            McResponse::Stored => Ok(true),
-            McResponse::NotStored => Ok(false),
+            McResponseBytes::Stored => Ok(true),
+            McResponseBytes::NotStored => Ok(false),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -619,8 +634,8 @@ impl Client {
         let encoded = encode_request(&McRequest::prepend(key, value));
         let response = self.execute(&encoded).await?;
         match response {
-            McResponse::Stored => Ok(true),
-            McResponse::NotStored => Ok(false),
+            McResponseBytes::Stored => Ok(true),
+            McResponseBytes::NotStored => Ok(false),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -639,9 +654,9 @@ impl Client {
         let encoded = encode_request(&McRequest::cas(key, value, cas_unique));
         let response = self.execute(&encoded).await?;
         match response {
-            McResponse::Stored => Ok(true),
-            McResponse::Exists => Ok(false),
-            McResponse::NotFound => Err(Error::Memcache("NOT_FOUND".into())),
+            McResponseBytes::Stored => Ok(true),
+            McResponseBytes::Exists => Ok(false),
+            McResponseBytes::NotFound => Err(Error::Memcache("NOT_FOUND".into())),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -654,8 +669,8 @@ impl Client {
         if !self.is_instrumented() {
             let response = self.execute(&encoded).await?;
             return match response {
-                McResponse::Deleted => Ok(true),
-                McResponse::NotFound => Ok(false),
+                McResponseBytes::Deleted => Ok(true),
+                McResponseBytes::NotFound => Ok(false),
                 _ => Err(Error::UnexpectedResponse),
             };
         }
@@ -666,8 +681,8 @@ impl Client {
         let latency_ns = self.finish_timing(send_ts, start);
 
         let result = match response {
-            Ok(McResponse::Deleted) => Ok(true),
-            Ok(McResponse::NotFound) => Ok(false),
+            Ok(McResponseBytes::Deleted) => Ok(true),
+            Ok(McResponseBytes::NotFound) => Ok(false),
             Ok(_) => Err(Error::UnexpectedResponse),
             Err(e) => Err(e),
         };
@@ -686,7 +701,7 @@ impl Client {
         let encoded = encode_request(&McRequest::flush_all());
         let response = self.execute(&encoded).await?;
         match response {
-            McResponse::Ok => Ok(()),
+            McResponseBytes::Ok => Ok(()),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -696,7 +711,7 @@ impl Client {
         let encoded = encode_request(&McRequest::version());
         let response = self.execute(&encoded).await?;
         match response {
-            McResponse::Version(v) => Ok(String::from_utf8_lossy(&v).into_owned()),
+            McResponseBytes::Version(v) => Ok(String::from_utf8_lossy(&v).into_owned()),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -724,9 +739,9 @@ impl Client {
             })?;
 
             let response = self.read_response().await?;
-            check_error(&response)?;
+            check_error_bytes(&response)?;
             return match response {
-                McResponse::Stored => Ok(()),
+                McResponseBytes::Stored => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
             };
         }
@@ -749,9 +764,9 @@ impl Client {
 
         let result = match response {
             Ok(ref r) => {
-                check_error(r)?;
+                check_error_bytes(r)?;
                 match r {
-                    McResponse::Stored => Ok(()),
+                    McResponseBytes::Stored => Ok(()),
                     _ => Err(Error::UnexpectedResponse),
                 }
             }
@@ -829,15 +844,15 @@ pub(crate) fn encode_add(key: &[u8], value: &[u8]) -> Vec<u8> {
     })
 }
 
-/// Check a response for error variants and return an appropriate `Error`.
-pub(crate) fn check_error(response: &McResponse) -> Result<(), Error> {
+/// Check a `ResponseBytes` for error variants and return an appropriate `Error`.
+pub(crate) fn check_error_bytes(response: &McResponseBytes) -> Result<(), Error> {
     match response {
-        McResponse::Error => Err(Error::Memcache("ERROR".into())),
-        McResponse::ClientError(msg) => Err(Error::Memcache(format!(
+        McResponseBytes::Error => Err(Error::Memcache("ERROR".into())),
+        McResponseBytes::ClientError(msg) => Err(Error::Memcache(format!(
             "CLIENT_ERROR {}",
             String::from_utf8_lossy(msg)
         ))),
-        McResponse::ServerError(msg) => Err(Error::Memcache(format!(
+        McResponseBytes::ServerError(msg) => Err(Error::Memcache(format!(
             "SERVER_ERROR {}",
             String::from_utf8_lossy(msg)
         ))),

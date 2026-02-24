@@ -28,6 +28,16 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Copy Semantics
+//!
+//! | Path | Copies | Mechanism |
+//! |------|--------|-----------|
+//! | **Recv (values)** | **1** | `with_data()` + protobuf decode. `Bytes::copy_from_slice()` for each extracted field. |
+//! | **Send (requests)** | **3-4** | Layered protobuf encoding: each `encode()` layer allocates a new `Vec<u8>` and copies the previous level. Then `send_nowait()` copies into the send pool. |
+//!
+//! All Momento connections use TLS, which adds encryption copies on the send
+//! path.
 
 pub mod credential;
 pub mod error;

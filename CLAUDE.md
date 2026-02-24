@@ -14,9 +14,10 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 
 # Test
-cargo test --all                     # all tests (76 unit + 42 integration + doctests)
+cargo test --all                     # all workspace crates
 cargo test --all --release           # release mode
 cargo test -p ringline -- <name>     # single test by name
+cargo test -p ringline-redis         # single crate
 
 # Docs
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
@@ -27,6 +28,21 @@ cargo run --example connect_echo
 cargo run --release --example echo_bench
 cargo run --example echo_tls_server
 ```
+
+## Workspace Structure
+
+This is a Cargo workspace. The core runtime is in `ringline/`; protocol client crates build on top of it:
+
+- **ringline** — core io_uring runtime, executor, connection management, TLS, timers, UDP, NVMe
+- **ringline-redis** — RESP protocol client wrapping `ConnCtx`
+- **ringline-memcache** — Memcache protocol client wrapping `ConnCtx`
+- **ringline-ping** — Simple PING/PONG client
+- **ringline-momento** — Multiplexed Momento cache client (protobuf over TLS)
+- **ringline-h2** — Sans-IO HTTP/2 client framing (HPACK, streams)
+- **ringline-h3** — HTTP/3 framing on top of `ringline-quic` (QPACK, control streams)
+- **ringline-quic** — QUIC layer wrapping `quinn-proto` sans-IO state machine
+- **ringline-grpc** — gRPC client framing on top of `ringline-h2`
+- **ketama** — Consistent hash ring (MD5-based, twemproxy-compatible)
 
 ## Architecture
 
@@ -86,6 +102,87 @@ Bits 63..56: OpTag (8 bits) — operation type (RecvMulti, Send, Connect, Timer,
 Bits 55..32: ConnIndex (24 bits)
 Bits 31..0:  Payload (32 bits) — buffer id, slab slot, timer slot, etc.
 ```
+
+## Copy Semantics
+
+Ringline aims to minimize data copies on the hot path. Understanding where copies happen is critical for performance work.
+
+### Core Runtime Copy Counts
+
+**Receive path** (kernel → user):
+
+| Step | What happens | Copies |
+|------|-------------|--------|
+| Kernel → ProvidedBufRing | DMA into ring-provided buffer | 0 |
+| ProvidedBufRing → RecvAccumulator | `BytesMut::extend_from_slice()` | 1 |
+| Accumulator → `with_data()` callback | Borrowed `&[u8]` into accumulator | 0 |
+| Accumulator → `with_bytes()` callback | `BytesMut::freeze()` → `Bytes` (O(1)), slicing via `Bytes::slice()` is O(1) refcount | 0 |
+
+The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parser must copy any values it wants to keep. `with_bytes(|Bytes|)` provides a refcounted handle — the parser can return `Bytes::slice()` sub-references with zero copies.
+
+**Send path** (user → kernel):
+
+| Method | What happens | Copies |
+|--------|-------------|--------|
+| `send()` / `send_nowait()` | User data → `SendCopyPool` slot | 1 |
+| `send_parts()` with `.copy()` only | All copy parts gathered into one `SendCopyPool` slot | 1 |
+| `send_parts()` with `.guard()` only | Guard memory used in-place via `SendMsgZc` iovec | 0 |
+| `send_parts()` mixed `.copy()` + `.guard()` | Copy parts → pool; guard parts zero-copy via iovec | 1 (copy parts only) |
+| Any send with TLS | Gather → encrypt → pool (TLS prevents zero-copy send) | 3 |
+
+**Zero-copy sends**: `SendGuard` keeps user memory alive until the kernel posts a ZC notification CQE confirming the DMA completed. Guards are stored in `InFlightSendSlab` entries and dropped only after all notifications arrive.
+
+### Per-Client Copy Analysis
+
+#### ringline-redis
+
+| Path | Copies | Mechanism |
+|------|--------|-----------|
+| **Recv (values)** | **0** | Uses `with_bytes()` + `Value::parse_bytes()`. Bulk strings are `Bytes::slice()` into the accumulator — no allocation, O(1) refcount. Returned `Bytes` stays valid after accumulator advances. |
+| **Send (commands)** | 1 | `encode_request()` serializes RESP into `Vec<u8>`, then `conn.send()` copies into pool. |
+| **Send (SET value, standard)** | 1 | `send_parts().copy(&prefix).copy(value).copy(&suffix)` — all parts gathered into one pool slot. |
+| **Send (SET value, guard)** | 1 (metadata only) | `set_with_guard()` / `set_ex_with_guard()`: prefix+suffix copied to pool, value stays in-place via `SendGuard`. Value is zero-copy. |
+| **Pipeline** | 1 | All commands accumulated into one `Vec<u8>`, single `conn.send()` to pool. |
+
+**Summary**: Recv is fully zero-copy (refcounted slices). Send always copies the command envelope (key names, RESP framing) into the pool. For large values, `set_with_guard()` avoids copying the value itself.
+
+#### ringline-memcache
+
+| Path | Copies | Mechanism |
+|------|--------|-----------|
+| **Recv (values)** | **0** | Uses `with_bytes()` + `ResponseBytes::parse()`. Keys and values are `Bytes::slice()` into the accumulator — no allocation, O(1) refcount. |
+| **Send (commands)** | 1 | `encode_request()` → `Vec<u8>`, then `conn.send()` copies to pool. |
+| **Send (SET value, guard)** | 1 (metadata only) | `set_with_guard()`: prefix+suffix to pool, value zero-copy via `SendGuard`. |
+
+**Summary**: Recv is fully zero-copy (refcounted slices), matching redis. Send always copies the command envelope (key names, memcache framing) into the pool. For large values, `set_with_guard()` avoids copying the value itself.
+
+#### ringline-momento
+
+| Path | Copies | Mechanism |
+|------|--------|-----------|
+| **Recv (values)** | **1** | Uses `with_data()`. Protobuf decoder calls `Bytes::copy_from_slice()` for each extracted field (key, value). |
+| **Send (requests)** | **many** | Hand-rolled protobuf encoder nests multiple `encode()` layers, each allocating a new `Vec<u8>` and copying the previous level into it. A SET goes through: `encode_inner()` → `encode()` (wraps in Unary) → `encode_length_delimited()` (adds varint prefix). Each layer copies the entire payload. Then `send_nowait()` copies into pool. |
+
+**Summary**: Recv is 1 copy per field. Send has the most copies of any client due to layered protobuf encoding — the value bytes are copied ~3-4 times through encoding layers before reaching the pool. No `SendGuard` support currently.
+
+#### ringline-ping
+
+| Path | Copies | Mechanism |
+|------|--------|-----------|
+| **Recv** | **0** (parse only) | Uses `with_data()`. Parser just pattern-matches `PONG\r\n` — no value extraction needed. |
+| **Send** | 1 | 6-byte `PING\r\n` encoded to stack, `conn.send()` copies to pool. |
+
+**Summary**: Minimal — 1 copy send, zero-copy recv. Trivial protocol with no payload.
+
+### Copy Semantics Design Principles
+
+1. **Recv buffer ownership**: The kernel writes into `ProvidedBufRing` (zero-copy DMA), then data is appended to the per-connection `RecvAccumulator` (1 mandatory copy). After that, `with_bytes()` enables zero-copy parsing via `Bytes::slice()`. `with_data()` requires the parser to copy out any data it needs to keep.
+
+2. **Send buffer ownership**: Ringline must own all memory referenced by SQEs (the io_uring submission must outlive the syscall). `SendCopyPool` provides pre-allocated slots for this. `SendGuard` is the escape hatch for zero-copy — it pins user memory and holds it alive until the kernel confirms completion.
+
+3. **TLS negates zero-copy sends**: Encryption requires reading plaintext and writing ciphertext, so TLS connections always copy through the encryption layer regardless of `SendGuard` usage.
+
+4. **Client choice of `with_data` vs `with_bytes`**: This is the single biggest design decision for recv-side copy count. `with_bytes` enables true zero-copy parsing but requires the protocol parser to work with `Bytes` (refcounted slices). `with_data` is simpler but forces a copy.
 
 ## Code Conventions
 

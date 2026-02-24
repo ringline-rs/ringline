@@ -31,11 +31,12 @@
 
 use std::net::SocketAddr;
 
-use bytes::Bytes;
-use memcache_proto::Response as McResponse;
+use memcache_proto::ResponseBytes as McResponseBytes;
 use ringline::ConnCtx;
 
-use crate::{Client, Error, GetValue, Value, check_error, encode_add, encode_request, encode_set};
+use crate::{
+    Client, Error, GetValue, Value, check_error_bytes, encode_add, encode_request, encode_set,
+};
 use memcache_proto::Request as McRequest;
 
 /// Configuration for a ketama-sharded client.
@@ -152,7 +153,11 @@ impl ShardedClient {
     // -- Core routing --------------------------------------------------------
 
     /// Route an encoded command to the shard owning `key`.
-    async fn route_command(&mut self, key: &[u8], encoded: &[u8]) -> Result<McResponse, Error> {
+    async fn route_command(
+        &mut self,
+        key: &[u8],
+        encoded: &[u8],
+    ) -> Result<McResponseBytes, Error> {
         let opts = self.connect_opts();
         let shard_idx = self.ring.route(key);
         let shard = &mut self.shards[shard_idx];
@@ -175,7 +180,7 @@ impl ShardedClient {
             match Client::new(conn).read_response().await {
                 Ok(response) => {
                     shard.next = (idx + 1) % size;
-                    check_error(&response)?;
+                    check_error_bytes(&response)?;
                     return Ok(response);
                 }
                 Err(Error::ConnectionClosed) => {
@@ -210,13 +215,13 @@ impl ShardedClient {
         let encoded = encode_request(&memcache_proto::Request::get(key));
         let response = self.route_command(key, &encoded).await?;
         match response {
-            McResponse::Values(mut values) => {
+            McResponseBytes::Values(mut values) => {
                 if values.is_empty() {
                     Ok(None)
                 } else {
                     let v = values.swap_remove(0);
                     Ok(Some(Value {
-                        data: Bytes::from(v.data),
+                        data: v.data,
                         flags: v.flags,
                     }))
                 }
@@ -235,11 +240,11 @@ impl ShardedClient {
         let encoded = encode_request(&McRequest::gets(keys));
         let response = self.route_command(keys[0], &encoded).await?;
         match response {
-            McResponse::Values(values) => Ok(values
+            McResponseBytes::Values(values) => Ok(values
                 .into_iter()
                 .map(|v| GetValue {
-                    key: Bytes::from(v.key),
-                    data: Bytes::from(v.data),
+                    key: v.key,
+                    data: v.data,
                     flags: v.flags,
                     cas: v.cas,
                 })
@@ -270,7 +275,7 @@ impl ShardedClient {
         let encoded = encode_set(key, value, flags, exptime);
         let response = self.route_command(key, &encoded).await?;
         match response {
-            McResponse::Stored => Ok(()),
+            McResponseBytes::Stored => Ok(()),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -287,8 +292,8 @@ impl ShardedClient {
         let encoded = encode_add(key, value);
         let response = self.route_command(key, &encoded).await?;
         match response {
-            McResponse::Stored => Ok(true),
-            McResponse::NotStored => Ok(false),
+            McResponseBytes::Stored => Ok(true),
+            McResponseBytes::NotStored => Ok(false),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -310,8 +315,8 @@ impl ShardedClient {
         });
         let response = self.route_command(key, &encoded).await?;
         match response {
-            McResponse::Stored => Ok(true),
-            McResponse::NotStored => Ok(false),
+            McResponseBytes::Stored => Ok(true),
+            McResponseBytes::NotStored => Ok(false),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -323,8 +328,8 @@ impl ShardedClient {
         let encoded = encode_request(&McRequest::incr(key, delta));
         let response = self.route_command(key, &encoded).await?;
         match response {
-            McResponse::Numeric(val) => Ok(Some(val)),
-            McResponse::NotFound => Ok(None),
+            McResponseBytes::Numeric(val) => Ok(Some(val)),
+            McResponseBytes::NotFound => Ok(None),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -336,8 +341,8 @@ impl ShardedClient {
         let encoded = encode_request(&McRequest::decr(key, delta));
         let response = self.route_command(key, &encoded).await?;
         match response {
-            McResponse::Numeric(val) => Ok(Some(val)),
-            McResponse::NotFound => Ok(None),
+            McResponseBytes::Numeric(val) => Ok(Some(val)),
+            McResponseBytes::NotFound => Ok(None),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -354,8 +359,8 @@ impl ShardedClient {
         let encoded = encode_request(&McRequest::append(key, value));
         let response = self.route_command(key, &encoded).await?;
         match response {
-            McResponse::Stored => Ok(true),
-            McResponse::NotStored => Ok(false),
+            McResponseBytes::Stored => Ok(true),
+            McResponseBytes::NotStored => Ok(false),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -372,8 +377,8 @@ impl ShardedClient {
         let encoded = encode_request(&McRequest::prepend(key, value));
         let response = self.route_command(key, &encoded).await?;
         match response {
-            McResponse::Stored => Ok(true),
-            McResponse::NotStored => Ok(false),
+            McResponseBytes::Stored => Ok(true),
+            McResponseBytes::NotStored => Ok(false),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -392,9 +397,9 @@ impl ShardedClient {
         let encoded = encode_request(&McRequest::cas(key, value, cas_unique));
         let response = self.route_command(key, &encoded).await?;
         match response {
-            McResponse::Stored => Ok(true),
-            McResponse::Exists => Ok(false),
-            McResponse::NotFound => Err(Error::Memcache("NOT_FOUND".into())),
+            McResponseBytes::Stored => Ok(true),
+            McResponseBytes::Exists => Ok(false),
+            McResponseBytes::NotFound => Err(Error::Memcache("NOT_FOUND".into())),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -405,8 +410,8 @@ impl ShardedClient {
         let encoded = encode_request(&McRequest::delete(key));
         let response = self.route_command(key, &encoded).await?;
         match response {
-            McResponse::Deleted => Ok(true),
-            McResponse::NotFound => Ok(false),
+            McResponseBytes::Deleted => Ok(true),
+            McResponseBytes::NotFound => Ok(false),
             _ => Err(Error::UnexpectedResponse),
         }
     }

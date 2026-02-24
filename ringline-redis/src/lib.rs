@@ -1,9 +1,10 @@
 //! ringline-native RESP client for use inside the ringline async runtime.
 //!
 //! This client wraps a [`ringline::ConnCtx`] and provides typed Redis command
-//! methods that use `with_data()` + `Value::parse()` for incremental RESP
-//! parsing. It is designed for single-threaded, single-connection use within
-//! ringline's `AsyncEventHandler::on_start()` or connection tasks.
+//! methods that use `with_bytes()` + `Value::parse_bytes()` for zero-copy
+//! incremental RESP parsing. It is designed for single-threaded,
+//! single-connection use within ringline's `AsyncEventHandler::on_start()` or
+//! connection tasks.
 //!
 //! All key and value parameters accept `impl AsRef<[u8]>`, so you can pass
 //! `&str`, `String`, `&[u8]`, `Vec<u8>`, `Bytes`, etc.
@@ -22,6 +23,19 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Copy Semantics
+//!
+//! | Path | Copies | Mechanism |
+//! |------|--------|-----------|
+//! | **Recv (values)** | **0** | `with_bytes()` + `Value::parse_bytes()`. Bulk strings are `Bytes::slice()` references into the accumulator -- zero allocation, O(1) refcount. |
+//! | **Send (commands)** | 1 | `encode_request()` serializes RESP into `Vec<u8>`, then `conn.send()` copies into the send pool. |
+//! | **Send (SET value, standard)** | 1 | All parts gathered into one send-pool slot via `send_parts().copy()`. |
+//! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`] / [`Client::set_ex_with_guard`]: RESP prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
+//! | **Pipeline** | 1 | All commands accumulated into one `Vec<u8>`, single `conn.send()` to pool. |
+//!
+//! TLS connections add encryption copies on the send path regardless of
+//! `SendGuard` usage.
 
 pub mod cluster;
 pub mod pool;

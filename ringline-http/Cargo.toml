@@ -1,0 +1,14 @@
+[package]
+name = "ringline-http"
+version = "0.1.0"
+edition = "2024"
+description = "Async HTTP/1.1 and HTTP/2 client for the ringline io_uring runtime"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+ringline = { workspace = true }
+ringline-h2 = { path = "../ringline-h2" }
+thiserror = { workspace = true }
