@@ -41,8 +41,8 @@ This is a Cargo workspace. The core runtime is in `ringline/`; protocol client c
 - **ringline-h2** — Sans-IO HTTP/2 client framing (HPACK, streams)
 - **ringline-h3** — HTTP/3 framing on top of `ringline-quic` (QPACK, control streams)
 - **ringline-quic** — QUIC layer wrapping `quinn-proto` sans-IO state machine
+- **ringline-http** — Async HTTP/1.1 and HTTP/2 client on top of `ringline-h2`
 - **ringline-grpc** — gRPC client framing on top of `ringline-h2`
-- **ketama** — Consistent hash ring (MD5-based, twemproxy-compatible)
 
 ## Architecture
 
