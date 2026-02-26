@@ -184,6 +184,44 @@ The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parse
 
 4. **Client choice of `with_data` vs `with_bytes`**: This is the single biggest design decision for recv-side copy count. `with_bytes` enables true zero-copy parsing but requires the protocol parser to work with `Bytes` (refcounted slices). `with_data` is simpler but forces a copy.
 
+## Fire/Recv Pipelining API
+
+The protocol client crates (`ringline-redis`, `ringline-memcache`, `ringline-momento`) support a fire/recv pattern for pipelined request-response without blocking on each individual response. This enables higher throughput by overlapping network round trips.
+
+### Pattern
+
+```rust
+// Fire multiple requests (non-blocking, synchronous sends)
+client.fire_get(b"key1", 1)?;
+client.fire_set(b"key2", b"val", 2)?;
+client.fire_del(b"key3", 3)?;
+
+// Recv responses in order (async, blocks until each arrives)
+let op1 = client.recv().await?;  // CompletedOp::Get { result, user_data: 1 }
+let op2 = client.recv().await?;  // CompletedOp::Set { result, user_data: 2 }
+let op3 = client.recv().await?;  // CompletedOp::Del { result, user_data: 3 }
+```
+
+### Implementation
+
+Each client has a `VecDeque<PendingOp>` that tracks in-flight requests. `fire_*()` methods encode and send the request via `send_nowait()`, then push a `PendingOp` with the operation kind, timing state, and caller-provided `user_data: u64`. `recv()` pops the next pending op, reads the response, records metrics, and returns a `CompletedOp` enum with the typed result and `user_data`.
+
+### Available Methods
+
+**ringline-redis**: `fire_get`, `fire_set`, `fire_set_with_guard`, `fire_set_ex`, `fire_set_ex_with_guard`, `fire_del`, `recv() -> CompletedOp`
+
+**ringline-memcache**: `fire_get`, `fire_set`, `fire_set_with_guard`, `fire_delete`, `recv() -> CompletedOp`
+
+**ringline-momento**: `fire_get`, `fire_set`, `fire_delete`, `recv() -> CompletedOp`
+
+### Design Notes
+
+- `user_data: u64` lets callers correlate responses without tracking send order themselves.
+- `recv()` returns `Err(Error::NoPending)` if called with no in-flight requests (no panic).
+- Timing (`Instant::now()`) is skipped when no callbacks or metrics are configured — zero overhead in the uninstrumented path.
+- Responses must be consumed in FIFO order (matching the protocol's response ordering guarantee).
+- This is distinct from `Pipeline` (redis batch API) which accumulates commands into a single buffer and sends them atomically. Fire/recv sends each command individually.
+
 ## Code Conventions
 
 - `*_waiters: Vec<bool>` — tracks which tasks await I/O completion per connection index
