@@ -44,6 +44,7 @@ pub use cluster::{ClusterClient, ClusterConfig};
 pub use pool::{Pool, PoolConfig};
 pub use sharded::{ShardedClient, ShardedConfig};
 
+use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
 
@@ -83,6 +84,10 @@ pub enum Error {
     /// Too many MOVED/ASK redirects for a single command.
     #[error("too many redirects")]
     TooManyRedirects,
+
+    /// `recv()` called with no pending fire operations.
+    #[error("no pending operations")]
+    NoPending,
 }
 
 // ── Command types ───────────────────────────────────────────────────────
@@ -179,6 +184,40 @@ impl ClientMetrics {
     }
 }
 
+// ── Pending operation state ─────────────────────────────────────────────
+
+enum PendingOpKind {
+    Get,
+    Set,
+    Del,
+}
+
+struct PendingOp {
+    kind: PendingOpKind,
+    send_ts: u64,
+    start: Option<Instant>,
+    user_data: u64,
+}
+
+/// A completed fire/recv operation with its result.
+pub enum CompletedOp {
+    /// GET completed.
+    Get {
+        result: Result<Option<Bytes>, Error>,
+        user_data: u64,
+    },
+    /// SET completed.
+    Set {
+        result: Result<(), Error>,
+        user_data: u64,
+    },
+    /// DEL completed.
+    Del {
+        result: Result<u64, Error>,
+        user_data: u64,
+    },
+}
+
 // ── ClientBuilder ───────────────────────────────────────────────────────
 
 type ResultCallback = Box<dyn Fn(&CommandResult)>;
@@ -230,6 +269,7 @@ impl ClientBuilder {
         Client {
             conn: self.conn,
             on_result: self.on_result,
+            pending: VecDeque::new(),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
             #[cfg(feature = "metrics")]
@@ -252,6 +292,7 @@ impl ClientBuilder {
 pub struct Client {
     conn: ConnCtx,
     on_result: Option<ResultCallback>,
+    pending: VecDeque<PendingOp>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -266,6 +307,7 @@ impl Client {
         Self {
             conn,
             on_result: None,
+            pending: VecDeque::new(),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -353,6 +395,225 @@ impl Client {
         if let Some(ref mut m) = self.metrics {
             m.record(result);
         }
+    }
+
+    // ── Fire/recv pipelining API ─────────────────────────────────────────
+
+    #[inline]
+    fn timing_start(&self) -> (u64, Option<Instant>) {
+        if self.is_instrumented() {
+            (self.send_timestamp(), Some(Instant::now()))
+        } else {
+            (0, None)
+        }
+    }
+
+    /// Number of in-flight requests.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Fire a GET request without waiting for the response.
+    pub fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
+        let encoded = Self::encode_request(&Request::get(key));
+        self.conn.send_nowait(&encoded)?;
+        let (send_ts, start) = self.timing_start();
+        self.pending.push_back(PendingOp {
+            kind: PendingOpKind::Get,
+            send_ts,
+            start,
+            user_data,
+        });
+        Ok(())
+    }
+
+    /// Fire a SET request (with copy) without waiting for the response.
+    pub fn fire_set(&mut self, key: &[u8], value: &[u8], user_data: u64) -> Result<(), Error> {
+        let set_req = Request::set(key, value);
+        let (prefix, suffix) = set_req.encode_parts();
+        self.conn
+            .send_parts()
+            .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())?;
+        let (send_ts, start) = self.timing_start();
+        self.pending.push_back(PendingOp {
+            kind: PendingOpKind::Set,
+            send_ts,
+            start,
+            user_data,
+        });
+        Ok(())
+    }
+
+    /// Fire a SET request with zero-copy value via SendGuard.
+    pub fn fire_set_with_guard<G: SendGuard>(
+        &mut self,
+        key: &[u8],
+        guard: G,
+        user_data: u64,
+    ) -> Result<(), Error> {
+        let (_, value_len) = guard.as_ptr_len();
+        let prefix = encode_set_guard_prefix(key, value_len as usize, None);
+        self.conn.send_parts().build(move |b| {
+            b.copy(&prefix)
+                .guard(GuardBox::new(guard))
+                .copy(b"\r\n")
+                .submit()
+        })?;
+        let (send_ts, start) = self.timing_start();
+        self.pending.push_back(PendingOp {
+            kind: PendingOpKind::Set,
+            send_ts,
+            start,
+            user_data,
+        });
+        Ok(())
+    }
+
+    /// Fire a SET EX request (with copy) without waiting for the response.
+    pub fn fire_set_ex(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl_secs: u64,
+        user_data: u64,
+    ) -> Result<(), Error> {
+        let set_req = Request::set(key, value).ex(ttl_secs);
+        let (prefix, suffix) = set_req.encode_parts();
+        self.conn
+            .send_parts()
+            .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())?;
+        let (send_ts, start) = self.timing_start();
+        self.pending.push_back(PendingOp {
+            kind: PendingOpKind::Set,
+            send_ts,
+            start,
+            user_data,
+        });
+        Ok(())
+    }
+
+    /// Fire a SET EX request with zero-copy value via SendGuard.
+    pub fn fire_set_ex_with_guard<G: SendGuard>(
+        &mut self,
+        key: &[u8],
+        guard: G,
+        ttl_secs: u64,
+        user_data: u64,
+    ) -> Result<(), Error> {
+        let (_, value_len) = guard.as_ptr_len();
+        let (prefix, suffix) = encode_set_guard_prefix_ex(key, value_len as usize, ttl_secs);
+        self.conn.send_parts().build(move |b| {
+            b.copy(&prefix)
+                .guard(GuardBox::new(guard))
+                .copy(&suffix)
+                .submit()
+        })?;
+        let (send_ts, start) = self.timing_start();
+        self.pending.push_back(PendingOp {
+            kind: PendingOpKind::Set,
+            send_ts,
+            start,
+            user_data,
+        });
+        Ok(())
+    }
+
+    /// Fire a DEL request without waiting for the response.
+    pub fn fire_del(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
+        let encoded = Self::encode_request(&Request::del(key));
+        self.conn.send_nowait(&encoded)?;
+        let (send_ts, start) = self.timing_start();
+        self.pending.push_back(PendingOp {
+            kind: PendingOpKind::Del,
+            send_ts,
+            start,
+            user_data,
+        });
+        Ok(())
+    }
+
+    /// Receive the next completed operation from the pipeline.
+    ///
+    /// Returns `Err(Error::NoPending)` if there are no in-flight requests.
+    pub async fn recv(&mut self) -> Result<CompletedOp, Error> {
+        let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
+
+        let resp = self.read_value().await?;
+        let latency_ns = match pending.start {
+            Some(start) => self.finish_timing(pending.send_ts, start),
+            None => 0,
+        };
+
+        let op = match pending.kind {
+            PendingOpKind::Get => {
+                let result = match resp {
+                    Value::BulkString(data) => Ok(Some(data)),
+                    Value::Null => Ok(None),
+                    Value::Error(msg) => {
+                        Err(Error::Redis(String::from_utf8_lossy(&msg).into_owned()))
+                    }
+                    _ => Err(Error::UnexpectedResponse),
+                };
+                let (success, hit) = match &result {
+                    Ok(Some(_)) => (true, Some(true)),
+                    Ok(None) => (true, Some(false)),
+                    Err(_) => (false, None),
+                };
+                self.record(&CommandResult {
+                    command: CommandType::Get,
+                    latency_ns,
+                    hit,
+                    success,
+                    ttfb_ns: None,
+                });
+                CompletedOp::Get {
+                    result,
+                    user_data: pending.user_data,
+                }
+            }
+            PendingOpKind::Set => {
+                let result = match resp {
+                    Value::SimpleString(_) | Value::Null => Ok(()),
+                    Value::Error(msg) => {
+                        Err(Error::Redis(String::from_utf8_lossy(&msg).into_owned()))
+                    }
+                    _ => Err(Error::UnexpectedResponse),
+                };
+                self.record(&CommandResult {
+                    command: CommandType::Set,
+                    latency_ns,
+                    hit: None,
+                    success: result.is_ok(),
+                    ttfb_ns: None,
+                });
+                CompletedOp::Set {
+                    result,
+                    user_data: pending.user_data,
+                }
+            }
+            PendingOpKind::Del => {
+                let result = match resp {
+                    Value::Integer(n) => Ok(n as u64),
+                    Value::Error(msg) => {
+                        Err(Error::Redis(String::from_utf8_lossy(&msg).into_owned()))
+                    }
+                    _ => Err(Error::UnexpectedResponse),
+                };
+                self.record(&CommandResult {
+                    command: CommandType::Del,
+                    latency_ns,
+                    hit: None,
+                    success: result.is_ok(),
+                    ttfb_ns: None,
+                });
+                CompletedOp::Del {
+                    result,
+                    user_data: pending.user_data,
+                }
+            }
+        };
+
+        Ok(op)
     }
 
     // ── Internal protocol methods (pub(crate), &self) ───────────────────
