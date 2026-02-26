@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use ringline::{ConnCtx, ParseResult};
 use ringline_h2::hpack::HeaderField;
 use ringline_h2::settings::Settings;
@@ -22,6 +22,10 @@ struct PendingStream {
     headers: Vec<(String, String)>,
     body: BytesMut,
     done: bool,
+    /// When true, DATA payloads are pushed to `chunks` instead of `body`.
+    streaming: bool,
+    /// Buffered chunks for streaming responses.
+    chunks: VecDeque<Bytes>,
 }
 
 impl PendingStream {
@@ -31,6 +35,8 @@ impl PendingStream {
             headers: Vec::new(),
             body: BytesMut::new(),
             done: false,
+            streaming: false,
+            chunks: VecDeque::new(),
         }
     }
 
@@ -283,7 +289,11 @@ impl H2AsyncConn {
                             end_stream,
                         } => {
                             if let Some(ps) = pending.get_mut(&stream_id) {
-                                ps.body.extend_from_slice(&payload);
+                                if ps.streaming {
+                                    ps.chunks.push_back(Bytes::from(payload));
+                                } else {
+                                    ps.body.extend_from_slice(&payload);
+                                }
                                 if end_stream {
                                     ps.done = true;
                                 }
@@ -328,10 +338,10 @@ impl H2AsyncConn {
             return Err(HttpError::ConnectionClosed);
         }
 
-        // Move completed streams to the completed queue.
+        // Move completed non-streaming streams to the completed queue.
         let done_ids: Vec<u32> = pending
             .iter()
-            .filter(|(_, ps)| ps.done)
+            .filter(|(_, ps)| ps.done && !ps.streaming)
             .map(|(id, _)| *id)
             .collect();
         for id in done_ids {
@@ -346,6 +356,46 @@ impl H2AsyncConn {
         Ok(())
     }
 
+    // ── Streaming API ──────────────────────────────────────────────────
+
+    /// Send a request and return a streaming response after headers arrive.
+    ///
+    /// The caller must drain the body via [`H2StreamingResponse::next_chunk()`]
+    /// before issuing further requests on this connection.
+    pub async fn send_request_streaming(
+        &mut self,
+        method: &str,
+        path: &str,
+        host: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<H2StreamingResponse<'_>, HttpError> {
+        let stream_id = self.fire_request(method, path, host, extra_headers, body)?;
+
+        // Mark the stream as streaming.
+        if let Some(ps) = self.pending_streams.get_mut(&stream_id) {
+            ps.streaming = true;
+        }
+
+        // Pump until headers arrive for this stream.
+        loop {
+            if let Some(ps) = self.pending_streams.get(&stream_id) {
+                if ps.status.is_some() {
+                    break;
+                }
+            } else {
+                return Err(HttpError::Protocol("stream vanished".into()));
+            }
+
+            self.pump_once().await?;
+        }
+
+        Ok(H2StreamingResponse {
+            conn: self,
+            stream_id,
+        })
+    }
+
     /// Drain `h2.take_pending_send()` to `conn.send_nowait()`.
     fn flush_pending_send(&mut self) -> Result<(), HttpError> {
         let pending = self.h2.take_pending_send();
@@ -353,5 +403,72 @@ impl H2AsyncConn {
             self.conn.send_nowait(&pending)?;
         }
         Ok(())
+    }
+}
+
+/// Streaming HTTP/2 response. Borrows the connection exclusively.
+///
+/// Body chunks are yielded one at a time via [`next_chunk()`](Self::next_chunk).
+/// When all chunks have been consumed (returns `Ok(None)`), the stream is
+/// cleaned up automatically. The stream is also cleaned up on drop.
+pub struct H2StreamingResponse<'a> {
+    conn: &'a mut H2AsyncConn,
+    stream_id: u32,
+}
+
+impl<'a> H2StreamingResponse<'a> {
+    /// HTTP status code.
+    pub fn status(&self) -> u16 {
+        self.conn
+            .pending_streams
+            .get(&self.stream_id)
+            .and_then(|ps| ps.status)
+            .unwrap_or(0)
+    }
+
+    /// Response headers as (name, value) pairs.
+    pub fn headers(&self) -> &[(String, String)] {
+        self.conn
+            .pending_streams
+            .get(&self.stream_id)
+            .map(|ps| ps.headers.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Get the first header value matching `name` (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let lower = name.to_ascii_lowercase();
+        self.headers()
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == lower)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Yield the next body chunk, or `None` when the body is complete.
+    pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, HttpError> {
+        loop {
+            if let Some(ps) = self.conn.pending_streams.get_mut(&self.stream_id) {
+                // Return a buffered chunk if available.
+                if let Some(chunk) = ps.chunks.pop_front() {
+                    return Ok(Some(chunk));
+                }
+                // No more chunks and stream is done.
+                if ps.done {
+                    self.conn.pending_streams.remove(&self.stream_id);
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
+
+            // Pump to get more data.
+            self.conn.pump_once().await?;
+        }
+    }
+}
+
+impl Drop for H2StreamingResponse<'_> {
+    fn drop(&mut self) {
+        self.conn.pending_streams.remove(&self.stream_id);
     }
 }

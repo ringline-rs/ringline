@@ -7,6 +7,7 @@ use crate::h1_conn::H1Conn;
 use crate::h2_conn::H2AsyncConn;
 use crate::request::RequestBuilder;
 use crate::response::Response;
+use crate::streaming::StreamingResponse;
 
 enum ConnectionInner {
     H2(Box<H2AsyncConn>),
@@ -102,6 +103,30 @@ impl HttpClient {
                     .await
             }
             ConnectionInner::H1(h1) => h1.send_request(method, path, extra_headers, body).await,
+        }
+    }
+
+    /// Send a request and return a streaming response after headers arrive.
+    pub(crate) async fn send_request_streaming(
+        &mut self,
+        method: &str,
+        path: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<StreamingResponse<'_>, HttpError> {
+        match &mut self.inner {
+            ConnectionInner::H2(h2) => {
+                let stream = h2
+                    .send_request_streaming(method, path, &self.host, extra_headers, body)
+                    .await?;
+                Ok(StreamingResponse::H2(stream))
+            }
+            ConnectionInner::H1(h1) => {
+                let stream = h1
+                    .send_request_streaming(method, path, extra_headers, body)
+                    .await?;
+                Ok(StreamingResponse::H1(stream))
+            }
         }
     }
 }

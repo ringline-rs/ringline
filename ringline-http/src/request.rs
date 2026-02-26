@@ -4,6 +4,7 @@ use crate::body::Body;
 use crate::client::HttpClient;
 use crate::error::HttpError;
 use crate::response::Response;
+use crate::streaming::StreamingResponse;
 
 /// Builder for an HTTP request.
 pub struct RequestBuilder<'a> {
@@ -52,6 +53,27 @@ impl<'a> RequestBuilder<'a> {
 
         self.client
             .send_request(&self.method, &self.path, &extra, body_bytes)
+            .await
+    }
+
+    /// Send the request and return a streaming response.
+    ///
+    /// Returns as soon as headers are received. Body chunks are yielded
+    /// incrementally via [`StreamingResponse::next_chunk()`].
+    pub async fn send_streaming(self) -> Result<StreamingResponse<'a>, HttpError> {
+        let extra: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let body_bytes = match &self.body {
+            Body::Empty => None,
+            Body::Bytes(b) => Some(b.as_ref()),
+        };
+
+        self.client
+            .send_request_streaming(&self.method, &self.path, &extra, body_bytes)
             .await
     }
 }

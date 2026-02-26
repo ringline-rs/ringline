@@ -72,11 +72,13 @@ pub mod h2_conn;
 pub mod pool;
 pub mod request;
 pub mod response;
+pub mod streaming;
 
 pub use client::HttpClient;
 pub use error::HttpError;
-pub use h1_conn::H1Conn;
-pub use h2_conn::H2AsyncConn;
+pub use h1_conn::{H1Conn, H1StreamingResponse};
+pub use h2_conn::{H2AsyncConn, H2StreamingResponse};
 pub use pool::{Pool, PoolConfig, Protocol};
 pub use request::RequestBuilder;
 pub use response::Response;
+pub use streaming::StreamingResponse;

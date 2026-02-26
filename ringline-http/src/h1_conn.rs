@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use ringline::{ConnCtx, ParseResult};
 
 use crate::error::HttpError;
@@ -54,6 +54,122 @@ impl H1Conn {
         extra_headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Result<Response, HttpError> {
+        let hdr = self
+            .send_and_parse_headers(method, path, extra_headers, body)
+            .await?;
+
+        let mut body_buf = hdr.body_leftover;
+
+        // Phase 2: Read body.
+        if let Some(cl) = hdr.content_length {
+            // Content-Length body.
+            while body_buf.len() < cl {
+                let target_len = cl;
+                let n = self
+                    .conn
+                    .with_data(|data| {
+                        body_buf.extend_from_slice(data);
+                        if body_buf.len() >= target_len {
+                            ParseResult::Consumed(data.len())
+                        } else {
+                            // Consume what we got, need more.
+                            ParseResult::Consumed(data.len())
+                        }
+                    })
+                    .await;
+
+                if n == 0 {
+                    break;
+                }
+            }
+            body_buf.truncate(cl);
+        } else if hdr.chunked {
+            // Chunked transfer encoding.
+            let mut decoded = BytesMut::new();
+            let mut leftover = body_buf.to_vec();
+            body_buf.clear();
+
+            loop {
+                match decode_chunk(&leftover) {
+                    ChunkResult::Complete {
+                        data,
+                        consumed,
+                        is_last,
+                    } => {
+                        decoded.extend_from_slice(data);
+                        leftover = leftover[consumed..].to_vec();
+                        if is_last {
+                            break;
+                        }
+                    }
+                    ChunkResult::NeedMore => {
+                        // Read more data.
+                        let n = self
+                            .conn
+                            .with_data(|data| {
+                                leftover.extend_from_slice(data);
+                                ParseResult::Consumed(data.len())
+                            })
+                            .await;
+
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            body_buf = decoded;
+        }
+        // else: no body (e.g. HEAD response, 204, 304)
+
+        Ok(Response::new(hdr.status, hdr.headers, body_buf.freeze()))
+    }
+
+    /// Send a request and return a streaming response after headers arrive.
+    ///
+    /// The caller must drain the body via [`H1StreamingResponse::next_chunk()`]
+    /// before issuing further requests on this connection.
+    pub async fn send_request_streaming(
+        &mut self,
+        method: &str,
+        path: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<H1StreamingResponse<'_>, HttpError> {
+        let hdr = self
+            .send_and_parse_headers(method, path, extra_headers, body)
+            .await?;
+
+        let state = if let Some(cl) = hdr.content_length {
+            H1StreamState::ContentLength {
+                remaining: cl.saturating_sub(hdr.body_leftover.len()),
+                leftover: hdr.body_leftover,
+            }
+        } else if hdr.chunked {
+            H1StreamState::Chunked {
+                leftover: hdr.body_leftover.to_vec(),
+            }
+        } else {
+            H1StreamState::Done
+        };
+
+        Ok(H1StreamingResponse {
+            conn: &mut self.conn,
+            status: hdr.status,
+            headers: hdr.headers,
+            state,
+        })
+    }
+
+    /// Serialize the request, send it, and parse response headers.
+    async fn send_and_parse_headers(
+        &mut self,
+        method: &str,
+        path: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<H1HeaderResult, HttpError> {
         // Serialize the request.
         let mut req = Vec::with_capacity(256);
         req.extend_from_slice(method.as_bytes());
@@ -89,21 +205,18 @@ impl H1Conn {
 
         self.conn.send_nowait(&req)?;
 
-        // Parse the response.
+        // Parse response headers.
         let mut status: u16 = 0;
         let mut headers: Vec<(String, String)> = Vec::new();
         let mut content_length: Option<usize> = None;
         let mut chunked = false;
         let mut headers_done = false;
-        let mut body_buf = BytesMut::new();
-        let mut header_consumed: usize = 0;
+        let mut body_leftover = BytesMut::new();
 
-        // Phase 1: Read headers.
         while !headers_done {
             let n = self
                 .conn
                 .with_data(|data| {
-                    // Look for \r\n\r\n to find end of headers.
                     if let Some(end) = find_header_end(data) {
                         let header_bytes = &data[..end];
                         if let Some(parsed) = parse_response_headers(header_bytes) {
@@ -112,17 +225,16 @@ impl H1Conn {
                             content_length = parsed.content_length;
                             chunked = parsed.chunked;
                             headers_done = true;
-                            header_consumed = end + 4; // +4 for \r\n\r\n
+                            let header_consumed = end + 4;
 
-                            // There may be body bytes after the headers.
                             let remaining = &data[header_consumed..];
                             if !remaining.is_empty() {
-                                body_buf.extend_from_slice(remaining);
+                                body_leftover.extend_from_slice(remaining);
                             }
                         }
                         ParseResult::Consumed(data.len())
                     } else {
-                        ParseResult::Consumed(0) // need more data
+                        ParseResult::Consumed(0)
                     }
                 })
                 .await;
@@ -132,72 +244,141 @@ impl H1Conn {
             }
         }
 
-        // Phase 2: Read body.
-        if let Some(cl) = content_length {
-            // Content-Length body.
-            while body_buf.len() < cl {
-                let target_len = cl;
-                let n = self
-                    .conn
-                    .with_data(|data| {
-                        body_buf.extend_from_slice(data);
-                        if body_buf.len() >= target_len {
-                            ParseResult::Consumed(data.len())
-                        } else {
-                            // Consume what we got, need more.
-                            ParseResult::Consumed(data.len())
-                        }
-                    })
-                    .await;
+        Ok(H1HeaderResult {
+            status,
+            headers,
+            content_length,
+            chunked,
+            body_leftover,
+        })
+    }
+}
 
-                if n == 0 {
-                    break;
+/// Result of parsing HTTP/1.1 response headers.
+struct H1HeaderResult {
+    status: u16,
+    headers: Vec<(String, String)>,
+    content_length: Option<usize>,
+    chunked: bool,
+    body_leftover: BytesMut,
+}
+
+/// Internal state for H1 streaming body reads.
+enum H1StreamState {
+    ContentLength {
+        remaining: usize,
+        leftover: BytesMut,
+    },
+    Chunked {
+        leftover: Vec<u8>,
+    },
+    Done,
+}
+
+/// Streaming HTTP/1.1 response. Borrows the connection exclusively.
+///
+/// Body chunks are yielded one at a time via [`next_chunk()`](Self::next_chunk).
+pub struct H1StreamingResponse<'a> {
+    conn: &'a mut ConnCtx,
+    status: u16,
+    headers: Vec<(String, String)>,
+    state: H1StreamState,
+}
+
+impl<'a> H1StreamingResponse<'a> {
+    /// HTTP status code.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Response headers as (name, value) pairs.
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    /// Get the first header value matching `name` (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let lower = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == lower)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Yield the next body chunk, or `None` when the body is complete.
+    pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, HttpError> {
+        loop {
+            match &mut self.state {
+                H1StreamState::ContentLength {
+                    remaining,
+                    leftover,
+                } => {
+                    // Yield leftover first.
+                    if !leftover.is_empty() {
+                        let chunk = leftover.split().freeze();
+                        *remaining = remaining.saturating_sub(chunk.len());
+                        return Ok(Some(chunk));
+                    }
+                    if *remaining == 0 {
+                        self.state = H1StreamState::Done;
+                        return Ok(None);
+                    }
+                    // Read more from wire.
+                    let rem = *remaining;
+                    let mut got = BytesMut::new();
+                    let n = self
+                        .conn
+                        .with_data(|data| {
+                            let take = data.len().min(rem);
+                            got.extend_from_slice(&data[..take]);
+                            ParseResult::Consumed(take)
+                        })
+                        .await;
+                    if n == 0 {
+                        self.state = H1StreamState::Done;
+                        return Err(HttpError::ConnectionClosed);
+                    }
+                    *remaining -= got.len();
+                    return Ok(Some(got.freeze()));
                 }
-            }
-            body_buf.truncate(cl);
-        } else if chunked {
-            // Chunked transfer encoding.
-            let mut decoded = BytesMut::new();
-            let mut leftover = body_buf.to_vec();
-            body_buf.clear();
-
-            loop {
-                match decode_chunk(&leftover) {
-                    ChunkResult::Complete {
-                        data,
-                        consumed,
-                        is_last,
-                    } => {
-                        decoded.extend_from_slice(data);
-                        leftover = leftover[consumed..].to_vec();
-                        if is_last {
-                            break;
+                H1StreamState::Chunked { leftover } => {
+                    match decode_chunk(leftover) {
+                        ChunkResult::Complete {
+                            data,
+                            consumed,
+                            is_last,
+                        } => {
+                            let chunk = Bytes::copy_from_slice(data);
+                            *leftover = leftover[consumed..].to_vec();
+                            if is_last {
+                                self.state = H1StreamState::Done;
+                                if chunk.is_empty() {
+                                    return Ok(None);
+                                }
+                                return Ok(Some(chunk));
+                            }
+                            return Ok(Some(chunk));
+                        }
+                        ChunkResult::NeedMore => {
+                            // Read more data.
+                            let n = self
+                                .conn
+                                .with_data(|data| {
+                                    leftover.extend_from_slice(data);
+                                    ParseResult::Consumed(data.len())
+                                })
+                                .await;
+                            if n == 0 {
+                                self.state = H1StreamState::Done;
+                                return Err(HttpError::ConnectionClosed);
+                            }
+                            // Loop back to try decoding again.
                         }
                     }
-                    ChunkResult::NeedMore => {
-                        // Read more data.
-                        let mut got_data = false;
-                        let n = self
-                            .conn
-                            .with_data(|data| {
-                                leftover.extend_from_slice(data);
-                                got_data = true;
-                                ParseResult::Consumed(data.len())
-                            })
-                            .await;
-
-                        if n == 0 {
-                            break;
-                        }
-                    }
                 }
+                H1StreamState::Done => return Ok(None),
             }
-
-            body_buf = decoded;
         }
-        // else: no body (e.g. HEAD response, 204, 304)
-
-        Ok(Response::new(status, headers, body_buf.freeze()))
     }
 }
 
