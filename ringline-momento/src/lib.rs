@@ -133,7 +133,7 @@ struct PendingOp {
     kind: PendingOpKind,
     key: Bytes,
     send_ts: u64,
-    start: Instant,
+    start: Option<Instant>,
 }
 
 // ── ClientMetrics ───────────────────────────────────────────────────────
@@ -460,6 +460,10 @@ impl Client {
     /// Uses zero-copy parsing via `with_bytes()`: response values are
     /// `Bytes::slice()` references into the accumulator buffer.
     pub async fn recv(&mut self) -> Result<CompletedOp, Error> {
+        if self.pending.is_empty() {
+            return Err(Error::NoPending);
+        }
+
         let pending = &mut self.pending;
         let mut dispatch_result: Option<DispatchResult> = None;
 
@@ -636,11 +640,11 @@ impl Client {
     }
 
     #[inline]
-    fn timing_start(&self) -> (u64, Instant) {
+    fn timing_start(&self) -> (u64, Option<Instant>) {
         if self.is_instrumented() {
-            (self.send_timestamp(), Instant::now())
+            (self.send_timestamp(), Some(Instant::now()))
         } else {
-            (0, Instant::now())
+            (0, None)
         }
     }
 
@@ -662,20 +666,20 @@ impl Client {
 
     #[cfg(feature = "timestamps")]
     #[inline]
-    fn finish_timing(&self, send_ts: u64, start: Instant) -> u64 {
+    fn finish_timing(&self, send_ts: u64, start: Option<Instant>) -> u64 {
         if self.use_kernel_ts {
             let recv_ts = self.conn.recv_timestamp();
             if recv_ts > 0 && recv_ts > send_ts {
                 return recv_ts - send_ts;
             }
         }
-        start.elapsed().as_nanos() as u64
+        start.map_or(0, |s| s.elapsed().as_nanos() as u64)
     }
 
     #[cfg(not(feature = "timestamps"))]
     #[inline]
-    fn finish_timing(&self, _send_ts: u64, start: Instant) -> u64 {
-        start.elapsed().as_nanos() as u64
+    fn finish_timing(&self, _send_ts: u64, start: Option<Instant>) -> u64 {
+        start.map_or(0, |s| s.elapsed().as_nanos() as u64)
     }
 
     fn record(&mut self, result: &CommandResult) {
@@ -697,7 +701,7 @@ struct DispatchResult {
     cmd_type: CommandType,
     success: bool,
     send_ts: u64,
-    start: Instant,
+    start: Option<Instant>,
 }
 
 /// Dispatch a decoded CacheResponse to the appropriate pending operation.
