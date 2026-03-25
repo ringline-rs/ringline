@@ -17,14 +17,15 @@ use ringline::{AsyncEventHandler, Config, ConnCtx, TlsClientConfig};
 
 static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn test_config() -> Config {
+fn test_config(alpn: &[&[u8]]) -> Config {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls_client = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    if !alpn.is_empty() {
+        tls.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    }
 
     let mut config = Config::default();
     config.worker.threads = 1;
@@ -35,7 +36,7 @@ fn test_config() -> Config {
     config.max_connections = 64;
     config.send_copy_count = 64;
     config.tls_client = Some(TlsClientConfig {
-        client_config: tls_client,
+        client_config: Arc::new(tls),
     });
     config
 }
@@ -112,7 +113,7 @@ fn h2_google() {
         }
     }
 
-    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config())
+    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
         .launch::<H2GoogleHandler>()
         .expect("launch failed");
 
@@ -183,7 +184,7 @@ fn h2_cloudflare() {
         }
     }
 
-    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config())
+    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
         .launch::<H2CloudflareHandler>()
         .expect("launch failed");
 
@@ -270,7 +271,7 @@ fn h2_multiplexed() {
         }
     }
 
-    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config())
+    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
         .launch::<H2MultiplexHandler>()
         .expect("launch failed");
 
@@ -345,7 +346,7 @@ fn h1_google() {
         }
     }
 
-    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config())
+    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[]))
         .launch::<H1GoogleHandler>()
         .expect("launch failed");
 
@@ -425,7 +426,7 @@ fn h2_streaming() {
         }
     }
 
-    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config())
+    let (_shutdown, handles) = ringline::RinglineBuilder::new(test_config(&[b"h2"]))
         .launch::<H2StreamingHandler>()
         .expect("launch failed");
 
