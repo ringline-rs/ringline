@@ -297,6 +297,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set SQPOLL idle timeout in milliseconds (default: 1000).
+    pub fn sqpoll_idle_ms(mut self, ms: u32) -> Self {
+        self.config.sqpoll_idle_ms = ms;
+        self
+    }
+
     /// Pin SQPOLL kernel thread to a specific CPU core.
     pub fn sqpoll_cpu(mut self, cpu: u32) -> Self {
         self.config.sqpoll_cpu = Some(cpu);
