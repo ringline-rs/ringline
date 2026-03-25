@@ -316,6 +316,7 @@ impl H2AsyncConn {
                             }
                         }
                         H2Event::Error(_) => {}
+                        H2Event::PingAcknowledged { .. } => {}
                     }
                 }
 

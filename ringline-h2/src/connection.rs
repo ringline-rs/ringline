@@ -49,6 +49,8 @@ pub enum H2Event {
         error_code: ErrorCode,
         debug_data: Vec<u8>,
     },
+    /// Peer acknowledged our PING.
+    PingAcknowledged { opaque_data: [u8; 8] },
     /// Peer acknowledged our SETTINGS.
     SettingsAcknowledged,
     /// Connection-level error.
@@ -373,7 +375,10 @@ impl H2Connection {
                 });
             }
             Frame::Ping { ack, opaque_data } => {
-                if !ack {
+                if ack {
+                    self.events
+                        .push_back(H2Event::PingAcknowledged { opaque_data });
+                } else {
                     // Respond with PING ACK.
                     let pong = Frame::Ping {
                         ack: true,
@@ -789,6 +794,40 @@ mod tests {
                 assert_eq!(opaque_data, [1, 2, 3, 4, 5, 6, 7, 8]);
             }
             _ => panic!("expected Ping ACK"),
+        }
+    }
+
+    #[test]
+    fn ping_ack_event() {
+        let mut conn = H2Connection::new(Settings::client_default());
+        let _ = conn.take_pending_send();
+
+        // Server sends SETTINGS.
+        let server_settings = make_settings_frame(&Settings::default(), false);
+        conn.recv(&server_settings).unwrap();
+        let _ = conn.take_pending_send();
+        // Drain SettingsAcknowledged event.
+        while conn.poll_event().is_some() {}
+
+        // Client sends PING.
+        conn.send_ping();
+        let _ = conn.take_pending_send();
+
+        // Server responds with PING ACK.
+        let ping_ack = Frame::Ping {
+            ack: true,
+            opaque_data: [0; 8],
+        };
+        let mut buf = Vec::new();
+        ping_ack.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+
+        // Should emit PingAcknowledged event.
+        match conn.poll_event() {
+            Some(H2Event::PingAcknowledged { opaque_data }) => {
+                assert_eq!(opaque_data, [0; 8]);
+            }
+            other => panic!("expected PingAcknowledged, got {other:?}"),
         }
     }
 
