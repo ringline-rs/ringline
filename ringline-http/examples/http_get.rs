@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 
 use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder, TlsClientConfig};
 
+#[derive(Debug)]
 struct Target {
     addr: std::net::SocketAddr,
     host: String,
