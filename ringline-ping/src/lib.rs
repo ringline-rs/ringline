@@ -302,7 +302,7 @@ impl Client {
                 Err(ping_proto::ParseError::Incomplete) => ParseResult::Consumed(0),
                 Err(e) => {
                     result = Some(Err(Error::Protocol(e)));
-                    ParseResult::Consumed(0)
+                    ParseResult::Consumed(data.len())
                 }
             })
             .await;
