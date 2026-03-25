@@ -352,9 +352,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     crate::tls::TlsRecvResult::Ok => {
                         self.executor.wake_recv(conn_index);
                     }
-                    crate::tls::TlsRecvResult::Error(_) | crate::tls::TlsRecvResult::Closed => {
+                    crate::tls::TlsRecvResult::Error(e) => {
+                        // Wake connect waiter if handshake hasn't completed yet.
+                        let established = self
+                            .driver
+                            .connections
+                            .get(conn_index)
+                            .map(|c| c.established)
+                            .unwrap_or(false);
+                        if !established {
+                            let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, e);
+                            self.executor.wake_connect(conn_index, Err(err));
+                        }
+                        self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
-                        self.executor.remove_connection(conn_index);
+                    }
+                    crate::tls::TlsRecvResult::Closed => {
+                        self.executor.wake_recv(conn_index);
+                        self.driver.close_connection(conn_index);
                     }
                 }
             }
