@@ -3,7 +3,7 @@
 //! `GrpcConnection` wraps an `H2Connection` and adds gRPC message framing,
 //! header conventions, and status extraction from trailers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use ringline_h2::hpack::HeaderField;
 use ringline_h2::settings::Settings;
@@ -48,7 +48,7 @@ pub struct GrpcConnection {
     /// Per-stream message reassembly buffers.
     buffers: HashMap<u32, MessageBuffer>,
     /// Pending gRPC events.
-    events: Vec<GrpcEvent>,
+    events: VecDeque<GrpcEvent>,
 }
 
 impl GrpcConnection {
@@ -58,7 +58,7 @@ impl GrpcConnection {
             h2: H2Connection::new(settings),
             ready: false,
             buffers: HashMap::new(),
-            events: Vec::new(),
+            events: VecDeque::new(),
         }
     }
 
@@ -71,11 +71,7 @@ impl GrpcConnection {
 
     /// Poll the next gRPC event, if any.
     pub fn poll_event(&mut self) -> Option<GrpcEvent> {
-        if self.events.is_empty() {
-            None
-        } else {
-            Some(self.events.remove(0))
-        }
+        self.events.pop_front()
     }
 
     /// Take all pending bytes to send to the transport.
@@ -173,7 +169,7 @@ impl GrpcConnection {
             match h2_event {
                 H2Event::SettingsAcknowledged => {
                     self.ready = true;
-                    self.events.push(GrpcEvent::Ready);
+                    self.events.push_back(GrpcEvent::Ready);
                 }
                 H2Event::Response {
                     stream_id,
@@ -183,7 +179,7 @@ impl GrpcConnection {
                     // Ensure we have a buffer even for server-push scenarios.
                     self.buffers.entry(stream_id).or_default();
 
-                    self.events.push(GrpcEvent::Response {
+                    self.events.push_back(GrpcEvent::Response {
                         stream_id,
                         metadata: headers,
                     });
@@ -203,7 +199,7 @@ impl GrpcConnection {
                     if let Some(buf) = self.buffers.get_mut(&stream_id) {
                         buf.push(&data);
                         while let Some(payload) = buf.try_decode() {
-                            self.events.push(GrpcEvent::Message {
+                            self.events.push_back(GrpcEvent::Message {
                                 stream_id,
                                 data: payload,
                             });
@@ -218,7 +214,7 @@ impl GrpcConnection {
                     // Drain any remaining buffered messages.
                     if let Some(buf) = self.buffers.get_mut(&stream_id) {
                         while let Some(payload) = buf.try_decode() {
-                            self.events.push(GrpcEvent::Message {
+                            self.events.push_back(GrpcEvent::Message {
                                 stream_id,
                                 data: payload,
                             });
@@ -233,7 +229,7 @@ impl GrpcConnection {
                         .filter(|h| h.name != b"grpc-status" && h.name != b"grpc-message")
                         .collect();
 
-                    self.events.push(GrpcEvent::Status {
+                    self.events.push_back(GrpcEvent::Status {
                         stream_id,
                         status,
                         message,
@@ -246,7 +242,7 @@ impl GrpcConnection {
                     error_code,
                 } => {
                     self.buffers.remove(&stream_id);
-                    self.events.push(GrpcEvent::Status {
+                    self.events.push_back(GrpcEvent::Status {
                         stream_id,
                         status: GrpcStatus::Internal,
                         message: format!("stream reset: {error_code:?}"),
@@ -258,14 +254,14 @@ impl GrpcConnection {
                     error_code,
                     debug_data,
                 } => {
-                    self.events.push(GrpcEvent::GoAway {
+                    self.events.push_back(GrpcEvent::GoAway {
                         last_stream_id,
                         error_code,
                         debug_data,
                     });
                 }
                 H2Event::Error(e) => {
-                    self.events.push(GrpcEvent::Error(GrpcError::H2(e)));
+                    self.events.push_back(GrpcEvent::Error(GrpcError::H2(e)));
                 }
             }
         }
@@ -276,7 +272,7 @@ impl GrpcConnection {
     fn emit_status_from_cleanup(&mut self, stream_id: u32, _headers: &[HeaderField]) {
         self.buffers.remove(&stream_id);
         // No trailers means we assume OK (server closed without error).
-        self.events.push(GrpcEvent::Status {
+        self.events.push_back(GrpcEvent::Status {
             stream_id,
             status: GrpcStatus::Ok,
             message: String::new(),
