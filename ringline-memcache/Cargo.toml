@@ -2,7 +2,10 @@
 name = "ringline-memcache"
 version = "0.1.1"
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Memcache client for the ringline io_uring runtime"
 
 [features]
 default = ["metrics"]

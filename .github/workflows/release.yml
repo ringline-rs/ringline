@@ -25,20 +25,63 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Verify version matches tag
+      - name: Verify tag matches ringline version
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
           CARGO_VERSION=$(grep '^version = ' ringline/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           if [ "$TAG" != "$CARGO_VERSION" ]; then
-            echo "ERROR: Tag v$TAG does not match Cargo.toml version $CARGO_VERSION"
+            echo "ERROR: Tag v$TAG does not match ringline/Cargo.toml version $CARGO_VERSION"
             exit 1
           fi
-          echo "Publishing ringline v$CARGO_VERSION"
+          echo "Release tag: v$TAG"
 
-      - name: Publish
-        run: cargo publish -p ringline
+      - name: Publish workspace crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Publish in dependency order. Skip crates already published at
+          # their current version (allows re-running without failure).
+          publish_if_needed() {
+            local crate="$1"
+            local version
+            version=$(cargo metadata --no-deps --format-version 1 \
+              | jq -r ".packages[] | select(.name == \"$crate\") | .version")
+
+            # Check if this version is already on crates.io.
+            local published
+            published=$(curl -s "https://crates.io/api/v1/crates/$crate/$version" \
+              | jq -r '.version.num // empty')
+
+            if [ "$published" = "$version" ]; then
+              echo "  $crate v$version — already published, skipping"
+            else
+              echo "  $crate v$version — publishing..."
+              cargo publish -p "$crate"
+              # Brief pause to let the crates.io index update before
+              # dependents try to resolve.
+              sleep 15
+            fi
+          }
+
+          echo "=== Publishing workspace crates ==="
+
+          # Tier 0: core runtime (no workspace deps)
+          publish_if_needed ringline
+
+          # Tier 1: crates that depend only on ringline or external crates
+          publish_if_needed ringline-h2
+          publish_if_needed ringline-quic
+          publish_if_needed ringline-redis
+          publish_if_needed ringline-memcache
+          publish_if_needed ringline-momento
+          publish_if_needed ringline-ping
+
+          # Tier 2: crates that depend on other workspace crates
+          publish_if_needed ringline-h3
+          publish_if_needed ringline-grpc
+          publish_if_needed ringline-http
+
+          echo "=== Done ==="
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
