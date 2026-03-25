@@ -32,6 +32,10 @@ pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] io::Error),
 
+    /// `recv()` was called with no in-flight requests.
+    #[error("no pending requests")]
+    NoPending,
+
     /// All connections in the pool are down and reconnection failed.
     #[error("all connections failed")]
     AllConnectionsFailed,
