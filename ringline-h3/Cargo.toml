@@ -2,11 +2,14 @@
 name = "ringline-h3"
 version = "0.1.1"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sans-IO HTTP/3 client framing layer"
 
 [dependencies]
 bytes = { workspace = true }
-ringline-quic = { path = "../ringline-quic" }
+ringline-quic = { path = "../ringline-quic", version = "0.1.1" }
 
 [dev-dependencies]
 ringline = { workspace = true }

@@ -2,7 +2,10 @@
 name = "ringline-momento"
 version = "0.1.0"
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Momento cache client for the ringline io_uring runtime"
 
 [features]
 default = ["metrics"]

@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 bytes = { workspace = true }
 ringline = { workspace = true }
-ringline-h2 = { path = "../ringline-h2" }
+ringline-h2 = { path = "../ringline-h2", version = "0.1.0" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

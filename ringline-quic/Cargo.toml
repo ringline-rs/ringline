@@ -2,7 +2,10 @@
 name = "ringline-quic"
 version = "0.1.1"
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "QUIC transport layer wrapping quinn-proto for ringline"
 
 [dependencies]
 bytes = { workspace = true }

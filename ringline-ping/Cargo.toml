@@ -2,7 +2,10 @@
 name = "ringline-ping"
 version = "0.1.0"
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "PING/PONG client for the ringline io_uring runtime"
 
 [features]
 default = ["metrics"]
