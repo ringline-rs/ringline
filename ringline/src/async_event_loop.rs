@@ -982,6 +982,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         self.driver.send_copy_pool.release(pool_slot);
+
+        // On error, close the connection so the owning task unblocks.
+        // The last ciphertext chunk uses OpTag::Send which wakes the send
+        // waiter, but if an intermediate chunk fails the connection is
+        // broken — close it so handle_close cleans up.
+        if result < 0 {
+            self.driver.close_connection(conn_index);
+        }
     }
 
     fn fire_chain_complete(&mut self, conn_index: u32) {
