@@ -24,7 +24,6 @@ impl RegionId {
 /// The iovec array contains only user-registered regions (no library-managed send buffers).
 pub struct FixedBufferRegistry {
     iovecs: Vec<libc::iovec>,
-    #[allow(dead_code)]
     region_count: u16,
 }
 
@@ -50,13 +49,11 @@ impl FixedBufferRegistry {
     }
 
     /// Total number of registered iovecs.
-    #[allow(dead_code)]
     pub fn total_count(&self) -> usize {
         self.iovecs.len()
     }
 
     /// Get the RegionId for a user-registered region by its index (0-based).
-    #[allow(dead_code)]
     pub fn region_id(&self, region_index: u16) -> Option<RegionId> {
         if region_index < self.region_count {
             Some(RegionId(region_index))

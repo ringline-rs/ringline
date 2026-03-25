@@ -86,7 +86,6 @@ pub struct DriverCtx<'a> {
     pub(crate) timestamps: bool,
     /// Pointer to the per-worker RecvMsgMulti msghdr template.
     #[cfg(feature = "timestamps")]
-    #[allow(dead_code)]
     pub(crate) recvmsg_msghdr: *const libc::msghdr,
     /// Pre-allocated timespec storage for connect timeouts.
     pub(crate) connect_timespecs: &'a mut Vec<io_uring::types::Timespec>,
@@ -1468,40 +1467,6 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 slab_idx,
                 total_len,
             })
-        }
-    }
-
-    /// Build the SQE entry without pushing to the ring.
-    /// Used by SendChainBuilder to collect multiple SQEs.
-    #[allow(dead_code)]
-    pub(crate) fn build_entry(mut self) -> io::Result<BuiltSend> {
-        if let Some(e) = self.error.take() {
-            return Err(e);
-        }
-        if self.part_count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "empty send builder",
-            ));
-        }
-
-        // Validate connection + generation.
-        let conn_state = self
-            .ctx
-            .connections
-            .get(self.conn.index)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
-        if conn_state.generation != self.conn.generation {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "stale connection",
-            ));
-        }
-
-        if self.guard_count == 0 {
-            self.build_copy_only()
-        } else {
-            self.build_with_guards()
         }
     }
 

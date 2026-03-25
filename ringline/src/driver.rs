@@ -20,7 +20,6 @@ use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 use crate::ring::Ring;
 
 /// Per-worker UDP socket state.
-#[allow(dead_code)]
 pub(crate) struct UdpSocketState {
     /// Fixed file table index for this socket.
     pub fd_index: u32,

@@ -136,12 +136,6 @@ impl ConnectionTable {
         self.slots.get_mut(idx as usize).filter(|s| s.active)
     }
 
-    /// Get a mutable reference without checking active status (for internal use).
-    #[allow(dead_code)]
-    pub fn get_mut_unchecked(&mut self, idx: u32) -> &mut ConnectionState {
-        &mut self.slots[idx as usize]
-    }
-
     /// Number of active connections.
     pub fn active_count(&self) -> usize {
         self.slots.len().saturating_sub(self.free_list.len())

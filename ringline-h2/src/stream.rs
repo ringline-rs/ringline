@@ -4,9 +4,9 @@ use crate::flowcontrol::FlowControl;
 
 /// State of an HTTP/2 stream (RFC 7540 Section 5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum StreamState {
     /// Stream created but no frames sent.
+    #[allow(dead_code)]
     Idle,
     /// HEADERS sent, waiting for response (client-side).
     Open,

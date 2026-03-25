@@ -6,7 +6,6 @@ use std::sync::atomic::AtomicBool;
 use crossbeam_channel::Sender;
 
 /// Configuration for the centralized acceptor thread.
-#[allow(dead_code)]
 pub struct AcceptorConfig {
     /// The listening socket fd.
     pub listen_fd: RawFd,
