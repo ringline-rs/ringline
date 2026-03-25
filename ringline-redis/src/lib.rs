@@ -627,15 +627,18 @@ impl Client {
         let mut result: Option<Result<Value, Error>> = None;
         let n = self
             .conn
-            .with_bytes(|bytes| match Value::parse_bytes(bytes) {
-                Ok((value, consumed)) => {
-                    result = Some(Ok(value));
-                    ParseResult::Consumed(consumed)
-                }
-                Err(e) if e.is_incomplete() => ParseResult::Consumed(0),
-                Err(e) => {
-                    result = Some(Err(Error::Protocol(e)));
-                    ParseResult::Consumed(0)
+            .with_bytes(|bytes| {
+                let len = bytes.len();
+                match Value::parse_bytes(bytes) {
+                    Ok((value, consumed)) => {
+                        result = Some(Ok(value));
+                        ParseResult::Consumed(consumed)
+                    }
+                    Err(e) if e.is_incomplete() => ParseResult::Consumed(0),
+                    Err(e) => {
+                        result = Some(Err(Error::Protocol(e)));
+                        ParseResult::Consumed(len)
+                    }
                 }
             })
             .await;
