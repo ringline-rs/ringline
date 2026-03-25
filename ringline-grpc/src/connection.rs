@@ -263,6 +263,7 @@ impl GrpcConnection {
                 H2Event::Error(e) => {
                     self.events.push_back(GrpcEvent::Error(GrpcError::H2(e)));
                 }
+                H2Event::PingAcknowledged { .. } => {}
             }
         }
     }
