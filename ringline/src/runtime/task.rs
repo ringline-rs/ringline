@@ -101,7 +101,7 @@ impl TaskSlab {
     }
 
     /// Check if a task exists for the given connection index.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn has_task(&self, conn_index: u32) -> bool {
         let idx = conn_index as usize;
         idx < self.tasks.len() && !matches!(self.tasks[idx], TaskSlot::Empty)
@@ -187,7 +187,7 @@ impl StandaloneTaskSlab {
     }
 
     /// Check if a task exists at the given index.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn has_task(&self, task_idx: u32) -> bool {
         let idx = task_idx as usize;
         idx < self.tasks.len() && !matches!(self.tasks[idx], TaskSlot::Empty)

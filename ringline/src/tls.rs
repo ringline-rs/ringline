@@ -230,7 +230,7 @@ pub enum TlsRecvResult {
     /// TLS handshake just completed — caller should fire on_accept.
     HandshakeJustCompleted,
     /// TLS error occurred.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // variant matched; inner value reserved for future error reporting
     Error(rustls::Error),
     /// Peer sent close_notify or connection is cleanly closed.
     Closed,

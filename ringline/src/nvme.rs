@@ -18,8 +18,6 @@ pub const NVME_CMD_READ: u8 = 0x02;
 
 /// NVMe uring_cmd sub-opcodes passed as `cmd_op` to `IORING_OP_URING_CMD`.
 pub const NVME_URING_CMD_IO: u32 = 0;
-#[allow(dead_code)]
-pub const NVME_URING_CMD_IO_VEC: u32 = 1;
 
 /// NVMe command structure for io_uring passthrough.
 ///
@@ -308,7 +306,7 @@ impl NvmeCmdSlab {
         device_index
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn device_index(&self, idx: u16) -> u16 {
         self.entries[idx as usize].device_index
     }
