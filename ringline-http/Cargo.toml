@@ -12,3 +12,7 @@ bytes = { workspace = true }
 ringline = { workspace = true }
 ringline-h2 = { path = "../ringline-h2" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+rustls = { workspace = true }
+webpki-roots = { workspace = true }

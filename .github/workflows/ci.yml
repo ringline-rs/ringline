@@ -77,6 +77,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p ringline-h2 --test public_servers -- --ignored --nocapture
       - run: cargo test -p ringline-h3 --test public_servers -- --ignored --nocapture
+      - run: cargo test -p ringline-http --test public_servers -- --ignored --nocapture
 
   integration-services:
     name: Integration (Redis + Memcache)
