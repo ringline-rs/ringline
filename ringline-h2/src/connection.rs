@@ -241,10 +241,19 @@ impl H2Connection {
             }
         }
 
-        // Check flow control.
-        if !data.is_empty() {
-            self.conn_send_window.consume(data.len() as u32)?;
-            stream.send_window.consume(data.len() as u32)?;
+        // Check both flow control windows have capacity before consuming
+        // either. This prevents leaking one window if the other check fails.
+        let len = data.len() as u32;
+        if len > 0 {
+            if stream.send_window.window() < i64::from(len) {
+                return Err(H2Error::FlowControlError);
+            }
+            if self.conn_send_window.window() < i64::from(len) {
+                return Err(H2Error::FlowControlError);
+            }
+            // Both checks passed — consume is infallible now.
+            let _ = stream.send_window.consume(len);
+            let _ = self.conn_send_window.consume(len);
         }
 
         let frame = Frame::Data {
