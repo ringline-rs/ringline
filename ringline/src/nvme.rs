@@ -407,7 +407,8 @@ mod tests {
     fn to_bytes_roundtrip() {
         let cmd = NvmeUringCmd::read(1, 42, 1, 0x1234, 512);
         let bytes = cmd.to_bytes();
-        let recovered: NvmeUringCmd = unsafe { std::ptr::read(bytes.as_ptr() as *const _) };
+        let recovered: NvmeUringCmd =
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const _) };
         assert_eq!(recovered.opcode, NVME_CMD_READ);
         assert_eq!(recovered.nsid, 1);
         assert_eq!(recovered.cdw10, 42);
