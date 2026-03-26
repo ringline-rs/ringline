@@ -98,6 +98,13 @@ impl Ring {
         Ok(())
     }
 
+    /// Unregister the provided buffer ring from the kernel.
+    /// Must be called before the ring memory is munmap'd.
+    pub fn unregister_buf_ring(&self, bgid: u16) -> io::Result<()> {
+        self.ring.submitter().unregister_buf_ring(bgid)?;
+        Ok(())
+    }
+
     /// Submit a multishot recvmsg with provided buffer ring for a connection.
     /// Used when SO_TIMESTAMPING is enabled to receive cmsg ancillary data
     /// (kernel timestamps) alongside TCP payload.
