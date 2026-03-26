@@ -992,6 +992,18 @@ impl Future for SendFuture {
     }
 }
 
+impl Drop for SendFuture {
+    fn drop(&mut self) {
+        let ptr = CURRENT_DRIVER.with(|c| c.get());
+        if ptr.is_null() {
+            return;
+        }
+        let state = unsafe { &mut *ptr };
+        let executor = unsafe { &mut *state.executor };
+        executor.send_waiters[self.conn_index as usize] = false;
+    }
+}
+
 // ── ConnectFuture ────────────────────────────────────────────────────
 
 /// Future that awaits an outbound TCP connection. The connect SQE was submitted
@@ -1018,6 +1030,18 @@ impl Future for ConnectFuture {
                 }
             }
         })
+    }
+}
+
+impl Drop for ConnectFuture {
+    fn drop(&mut self) {
+        let ptr = CURRENT_DRIVER.with(|c| c.get());
+        if ptr.is_null() {
+            return;
+        }
+        let state = unsafe { &mut *ptr };
+        let executor = unsafe { &mut *state.executor };
+        executor.connect_waiters[self.conn_index as usize] = false;
     }
 }
 
