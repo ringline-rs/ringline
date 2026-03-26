@@ -887,12 +887,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if let Some(ref mut tls_table) = self.driver.tls_table
             && tls_table.get_mut(conn_index).is_some()
         {
-            crate::tls::flush_tls_output(
+            if !crate::tls::flush_tls_output(
                 tls_table,
                 &mut self.driver.ring,
                 &mut self.driver.send_copy_pool,
                 conn_index,
-            );
+            ) {
+                let err = std::io::Error::other("send pool exhausted during TLS flush");
+                self.executor.wake_connect(conn_index, Err(err));
+                self.driver.close_connection(conn_index);
+                return;
+            }
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.recv_mode = RecvMode::Multi;
             }

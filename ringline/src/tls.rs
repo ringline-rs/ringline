@@ -294,14 +294,18 @@ pub fn feed_tls_recv(
     }
 
     // Flush any TLS output (handshake messages, alerts, etc.).
-    if tls_conn.conn.wants_write() {
-        flush_tls_output_inner(
+    if tls_conn.conn.wants_write()
+        && !flush_tls_output_inner(
             tls_conn,
             &mut tls_table.write_buf,
             ring,
             send_copy_pool,
             conn_index,
-        );
+        )
+    {
+        return TlsRecvResult::Error(rustls::Error::General(
+            "send pool exhausted during TLS output flush".into(),
+        ));
     }
 
     // Check if handshake just completed.
@@ -319,43 +323,52 @@ pub fn feed_tls_recv(
 }
 
 /// Flush pending TLS output to the network. Public entry point takes `&mut TlsTable`.
+/// Returns `false` if pool exhaustion prevented flushing all output.
 pub fn flush_tls_output(
     tls_table: &mut TlsTable,
     ring: &mut Ring,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
-) {
+) -> bool {
     let (conn_slot, write_buf) = borrow_conn_and_buf(tls_table, conn_index);
     if let Some(tls_conn) = conn_slot {
-        flush_tls_output_inner(tls_conn, write_buf, ring, send_copy_pool, conn_index);
+        flush_tls_output_inner(tls_conn, write_buf, ring, send_copy_pool, conn_index)
+    } else {
+        true
     }
 }
 
 /// Inner flush: takes disjoint borrows of TlsConn and the shared write_buf.
+/// Returns `true` if all output was flushed, `false` if pool exhaustion
+/// prevented sending some chunks (the connection should be considered broken).
 fn flush_tls_output_inner(
     tls_conn: &mut TlsConn,
     write_buf: &mut Vec<u8>,
     ring: &mut Ring,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
-) {
+) -> bool {
     write_buf.clear();
     if tls_conn.conn.write_tls(write_buf).is_err() {
-        return;
+        return false;
     }
 
     if write_buf.is_empty() {
-        return;
+        return true;
     }
 
     let slot_size = send_copy_pool.slot_size() as usize;
 
     // Chunk ciphertext into pool-sized pieces and submit as TlsSend.
     for chunk in write_buf.chunks(slot_size) {
-        if let Some((slot, ptr, len)) = send_copy_pool.copy_in(chunk) {
-            let _ = ring.submit_tls_send(conn_index, ptr, len, slot);
+        match send_copy_pool.copy_in(chunk) {
+            Some((slot, ptr, len)) => {
+                let _ = ring.submit_tls_send(conn_index, ptr, len, slot);
+            }
+            None => return false,
         }
     }
+    true
 }
 
 /// Flush close_notify ciphertext using linked SQEs (IOSQE_IO_LINK).
@@ -380,8 +393,15 @@ fn flush_close_notify_linked(
     let slot_size = send_copy_pool.slot_size() as usize;
 
     for chunk in write_buf.chunks(slot_size) {
-        if let Some((slot, ptr, len)) = send_copy_pool.copy_in(chunk) {
-            let _ = ring.submit_tls_send_linked(conn_index, ptr, len, slot);
+        match send_copy_pool.copy_in(chunk) {
+            Some((slot, ptr, len)) => {
+                let _ = ring.submit_tls_send_linked(conn_index, ptr, len, slot);
+            }
+            None => {
+                // Pool exhausted — skip remaining close_notify chunks.
+                // The connection will be closed without a complete alert.
+                return;
+            }
         }
     }
 }
