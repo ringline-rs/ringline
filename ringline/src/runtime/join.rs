@@ -39,24 +39,23 @@ impl<F: Future> Future for MaybeDone<F> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.as_mut().project();
-        match this {
-            MaybeDoneProj::Pending { future } => {
-                let output = match future.poll(cx) {
-                    Poll::Ready(o) => o,
-                    Poll::Pending => return Poll::Pending,
-                };
-                // Transition to Done — we need to write through the pin.
-                // Safety: we are replacing Pending{future} with Done{output},
-                // and the future is consumed by poll returning Ready.
-                unsafe {
-                    let slot = Pin::into_inner_unchecked(self);
-                    *slot = MaybeDone::Done { output };
-                }
-                Poll::Ready(())
-            }
-            MaybeDoneProj::Done { .. } | MaybeDoneProj::Gone { .. } => Poll::Ready(()),
+        // Poll the future if pending, collecting the output.
+        let output = match self.as_mut().project() {
+            MaybeDoneProj::Pending { future } => match future.poll(cx) {
+                Poll::Ready(o) => o,
+                Poll::Pending => return Poll::Pending,
+            },
+            MaybeDoneProj::Done { .. } | MaybeDoneProj::Gone { .. } => return Poll::Ready(()),
+        };
+        // The projected Pin<&mut F> from the match above is now dropped,
+        // so we can safely overwrite the enum variant.
+        // Safety: we are replacing Pending{future} with Done{output},
+        // and the future is consumed by poll returning Ready.
+        unsafe {
+            let slot = Pin::into_inner_unchecked(self);
+            *slot = MaybeDone::Done { output };
         }
+        Poll::Ready(())
     }
 }
 
