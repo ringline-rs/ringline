@@ -1094,10 +1094,14 @@ impl Future for SleepFuture {
 
             // First poll — allocate slot, fill timespec, submit SQE.
             let waker_id = CURRENT_TASK_ID.with(|c| c.get());
-            let (slot, generation) = executor
-                .timer_pool
-                .allocate(waker_id)
-                .expect("timer slot pool exhausted");
+            let (slot, generation) = match executor.timer_pool.allocate(waker_id) {
+                Some(pair) => pair,
+                None => {
+                    // Pool exhausted — complete immediately rather than panic.
+                    // Callers needing explicit error handling should use try_sleep().
+                    return Poll::Ready(());
+                }
+            };
 
             let is_absolute = self.absolute.is_some();
             if let Some(deadline) = self.absolute {
