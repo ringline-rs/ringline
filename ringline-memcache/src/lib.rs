@@ -508,7 +508,16 @@ impl Client {
     pub async fn recv(&mut self) -> Result<CompletedOp, Error> {
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
 
-        let response = self.read_response().await?;
+        let response = match self.read_response().await {
+            Ok(v) => v,
+            Err(e) => {
+                // Connection is broken — clear remaining pending ops so
+                // subsequent recv() calls return NoPending instead of
+                // reading stale/misaligned responses.
+                self.pending.clear();
+                return Err(e);
+            }
+        };
         let latency_ns = match pending.start {
             Some(start) => self.finish_timing(pending.send_ts, start),
             None => 0,
