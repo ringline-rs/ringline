@@ -760,7 +760,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        self.driver.send_slab.inc_pending_notifs(slab_idx);
+        // Only increment pending notifications for successful sends — the kernel
+        // sends a ZC notification CQE only when result > 0. On error (result <= 0),
+        // no notification arrives, so incrementing would permanently leak the slab slot.
+        if result > 0 {
+            self.driver.send_slab.inc_pending_notifs(slab_idx);
+        }
 
         if result > 0
             && let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32)
