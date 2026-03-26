@@ -3251,3 +3251,160 @@ fn async_peer_close_delivers_eof() {
     let result = PEER_CLOSE_RESULT.get().expect("handler did not set result");
     assert_eq!(result, "OK", "expected EOF after peer close, got: {result}");
 }
+
+// ── Send pool exhaustion ────────────────────────────────────────────
+
+/// Handler that fires many send_nowait calls to exhaust the send pool.
+struct PoolExhaustionHandler;
+
+static POOL_EXHAUSTION_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for PoolExhaustionHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Read one message to know the client is connected.
+            conn.with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+
+            // Fire many send_nowait calls rapidly. With a tiny pool, this
+            // should eventually return Err (pool exhausted).
+            let mut got_error = false;
+            let payload = [0xABu8; 512];
+            for _ in 0..1000 {
+                if let Err(_e) = conn.send_nowait(&payload) {
+                    got_error = true;
+                    break;
+                }
+            }
+
+            if got_error {
+                POOL_EXHAUSTION_RESULT.set("OK".to_string()).ok();
+            } else {
+                POOL_EXHAUSTION_RESULT.set("NO_ERROR".to_string()).ok();
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        PoolExhaustionHandler
+    }
+}
+
+#[test]
+fn async_send_pool_exhaustion() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut config = test_config();
+    // Very small send pool to trigger exhaustion quickly.
+    config.send_copy_count = 4;
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<PoolExhaustionHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    // Connect and send a trigger message. Don't read — let the server's
+    // sends queue up and exhaust the pool.
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+    stream.flush().unwrap();
+
+    // Wait for the handler to complete.
+    std::thread::sleep(Duration::from_millis(500));
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+
+    let result = POOL_EXHAUSTION_RESULT
+        .get()
+        .expect("handler did not set result");
+    assert_eq!(
+        result, "OK",
+        "expected pool exhaustion error, got: {result}"
+    );
+}
+
+// ── Scatter-gather send_parts test ──────────────────────────────────
+
+/// Handler that uses send_parts with multiple copy segments.
+struct SendPartsHandler;
+
+impl AsyncEventHandler for SendPartsHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            // Build a scatter-gather send with 3 copy parts.
+            let part1 = b"SCATTER";
+            let part2 = b"-";
+            let part3 = b"GATHER";
+            match conn
+                .send_parts()
+                .build(|b| b.copy(part1).copy(part2).copy(part3).submit())
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                }
+            }
+            ringline::sleep(Duration::from_secs(5)).await;
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        SendPartsHandler
+    }
+}
+
+#[test]
+fn async_send_parts_scatter_gather() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<SendPartsHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    // Send trigger, then read the scatter-gather response.
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+    stream.flush().unwrap();
+
+    let expected = b"SCATTER-GATHER";
+    let mut buf = vec![0u8; expected.len()];
+    let mut total = 0;
+    while total < expected.len() {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+    assert_eq!(
+        &buf[..total],
+        expected,
+        "expected scatter-gather response, got: {}",
+        String::from_utf8_lossy(&buf[..total])
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
