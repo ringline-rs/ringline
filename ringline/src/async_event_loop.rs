@@ -1090,7 +1090,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.udp_sockets[idx].send_in_flight = false;
         }
 
-        let _ = result;
+        if result < 0 {
+            metrics::UDP_SEND_ERRORS.increment();
+        }
     }
 
     fn handle_nvme_cmd(&mut self, ud: UserData, result: i32) {
