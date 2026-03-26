@@ -113,6 +113,10 @@ impl H2AsyncConn {
     }
 
     /// Returns the underlying connection context.
+    pub fn close(&self) {
+        self.conn.close();
+    }
+
     pub fn conn(&self) -> ConnCtx {
         self.conn
     }

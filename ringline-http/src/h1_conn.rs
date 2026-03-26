@@ -42,6 +42,10 @@ impl H1Conn {
     }
 
     /// Returns the host name.
+    pub fn close(&self) {
+        self.conn.close();
+    }
+
     pub fn host(&self) -> &str {
         &self.host
     }

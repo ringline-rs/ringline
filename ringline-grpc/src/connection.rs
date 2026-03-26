@@ -269,14 +269,15 @@ impl GrpcConnection {
     }
 
     /// Emit a status event when the stream ends without explicit trailers
-    /// (e.g., end_stream on a DATA or HEADERS frame).
+    /// (e.g., end_stream on a DATA frame). Per the gRPC spec, every
+    /// stream must end with a HEADERS frame carrying trailers — missing
+    /// trailers indicates a malformed response.
     fn emit_status_from_cleanup(&mut self, stream_id: u32, _headers: &[HeaderField]) {
         self.buffers.remove(&stream_id);
-        // No trailers means we assume OK (server closed without error).
         self.events.push_back(GrpcEvent::Status {
             stream_id,
-            status: GrpcStatus::Ok,
-            message: String::new(),
+            status: GrpcStatus::Internal,
+            message: "stream ended without trailers".into(),
             metadata: Vec::new(),
         });
     }

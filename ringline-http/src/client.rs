@@ -129,4 +129,12 @@ impl HttpClient {
             }
         }
     }
+
+    /// Close the underlying connection.
+    pub fn close(&self) {
+        match &self.inner {
+            ConnectionInner::H2(h2) => h2.close(),
+            ConnectionInner::H1(h1) => h1.close(),
+        }
+    }
 }
