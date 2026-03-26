@@ -160,6 +160,8 @@ pub(crate) struct Driver {
     pub(crate) tick_timeout_ts: Option<io_uring::types::Timespec>,
     /// Whether a tick timeout SQE is currently in-flight.
     pub(crate) tick_timeout_armed: bool,
+    /// Whether the eventfd read SQE is currently armed.
+    pub(crate) eventfd_armed: bool,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
     /// NVMe device tracking table. `None` when NVMe is not configured.
@@ -313,6 +315,7 @@ impl Driver {
                 None
             },
             tick_timeout_armed: false,
+            eventfd_armed: false,
             udp_sockets,
             nvme_devices: config
                 .nvme

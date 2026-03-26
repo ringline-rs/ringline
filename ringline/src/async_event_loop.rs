@@ -53,6 +53,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver
             .ring
             .submit_eventfd_read(self.driver.eventfd, self.driver.eventfd_buf.as_mut_ptr())?;
+        self.driver.eventfd_armed = true;
 
         // Kick the eventfd so the first submit_and_wait(1) returns immediately.
         let kick: u64 = 1;
@@ -84,6 +85,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         loop {
+            // Retry eventfd re-arm if a previous attempt failed (SQ was full).
+            if !self.driver.eventfd_armed && !self.driver.shutdown_flag.load(Ordering::Relaxed) {
+                self.driver.eventfd_armed = self
+                    .driver
+                    .ring
+                    .submit_eventfd_read(self.driver.eventfd, self.driver.eventfd_buf.as_mut_ptr())
+                    .is_ok();
+            }
+
             // Arm a tick timeout before blocking.
             if !self.driver.tick_timeout_armed
                 && let Some(ref ts) = self.driver.tick_timeout_ts
@@ -646,12 +656,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.handler.on_notify(&mut ctx);
         }
 
-        // Re-arm eventfd read.
+        // Re-arm eventfd read. Track whether the re-arm succeeded so the
+        // event loop can retry on the next tick if the SQ was full.
         if !self.driver.shutdown_flag.load(Ordering::Relaxed) {
-            let _ = self
+            self.driver.eventfd_armed = self
                 .driver
                 .ring
-                .submit_eventfd_read(self.driver.eventfd, self.driver.eventfd_buf.as_mut_ptr());
+                .submit_eventfd_read(self.driver.eventfd, self.driver.eventfd_buf.as_mut_ptr())
+                .is_ok();
         }
     }
 
