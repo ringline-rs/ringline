@@ -729,7 +729,12 @@ impl Driver {
             }
         }
 
-        // 3. Close the eventfd.
+        // 3. Unregister the provided buffer ring before Driver is dropped
+        // (which munmaps the ring memory). Without this, the kernel holds a
+        // dangling pointer to the freed mmap region.
+        let _ = self.ring.unregister_buf_ring(self.provided_bufs.bgid());
+
+        // 4. Close the eventfd.
         unsafe {
             libc::close(self.eventfd);
         }
