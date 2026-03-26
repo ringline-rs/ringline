@@ -60,6 +60,11 @@ pub fn run_acceptor(config: AcceptorConfig) {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
+                Some(libc::ECONNABORTED) | Some(libc::ECONNRESET) | Some(libc::EPERM) => {
+                    // Connection reset before accept completed, or blocked by
+                    // firewall — retry immediately.
+                    continue;
+                }
                 _ => {
                     // Fatal accept error or listen fd closed.
                     return;
