@@ -22,3 +22,8 @@ metriken = "0.7"
 pin-project-lite = "0.2"
 thiserror = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { workspace = true }
