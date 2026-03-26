@@ -3408,3 +3408,125 @@ fn async_send_parts_scatter_gather() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── Outbound connect EOF delivery ───────────────────────────────────
+
+static OUTBOUND_EOF_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+static OUTBOUND_EOF_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Client that connects outbound to a std TCP server, sends data, reads
+/// echo, then waits for EOF. Exercises the outbound plaintext recv_mode fix.
+struct OutboundEofClient;
+
+impl AsyncEventHandler for OutboundEofClient {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let server_addr = *OUTBOUND_EOF_ADDR.get().expect("addr not set");
+        Some(Box::pin(async move {
+            let conn = match ringline::connect(server_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        OUTBOUND_EOF_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
+                        ringline::request_shutdown().ok();
+                        return;
+                    }
+                },
+                Err(e) => {
+                    OUTBOUND_EOF_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    ringline::request_shutdown().ok();
+                    return;
+                }
+            };
+
+            // Send data and read echo, with a timeout.
+            let _ = conn.send_nowait(b"hello");
+            let mut echoed = Vec::new();
+            let echo_fut = conn.with_data(|data| {
+                echoed.extend_from_slice(data);
+                ParseResult::Consumed(data.len())
+            });
+            let n = match ringline::timeout(Duration::from_secs(5), echo_fut).await {
+                Ok(n) => n,
+                Err(_) => {
+                    OUTBOUND_EOF_RESULT.set("ECHO_TIMEOUT".to_string()).ok();
+                    ringline::request_shutdown().ok();
+                    return;
+                }
+            };
+            if n == 0 || echoed != b"hello" {
+                OUTBOUND_EOF_RESULT
+                    .set(format!(
+                        "ECHO_FAIL:n={n},data={}",
+                        String::from_utf8_lossy(&echoed)
+                    ))
+                    .ok();
+                ringline::request_shutdown().ok();
+                return;
+            }
+
+            // Now wait for EOF — the std server thread closes after echoing.
+            let eof_fut = conn.with_data(|data| ParseResult::Consumed(data.len()));
+            match ringline::timeout(Duration::from_secs(5), eof_fut).await {
+                Ok(0) => {
+                    OUTBOUND_EOF_RESULT.set("OK".to_string()).ok();
+                }
+                Ok(n) => {
+                    OUTBOUND_EOF_RESULT.set(format!("UNEXPECTED:{n}")).ok();
+                }
+                Err(_) => {
+                    OUTBOUND_EOF_RESULT.set("TIMEOUT".to_string()).ok();
+                }
+            }
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        OutboundEofClient
+    }
+}
+
+#[test]
+fn async_outbound_connect_receives_eof() {
+    let port = free_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // Start a simple std TCP echo-once server in a thread.
+    let listener = std::net::TcpListener::bind(addr).unwrap();
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).unwrap();
+        stream.write_all(&buf[..n]).unwrap();
+        stream.flush().unwrap();
+        // Close — this sends FIN to the client.
+        drop(stream);
+    });
+
+    OUTBOUND_EOF_ADDR.set(addr).ok();
+
+    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+        .launch::<OutboundEofClient>()
+        .expect("client launch failed");
+
+    for h in c_handles {
+        h.join().unwrap().unwrap();
+    }
+
+    server_thread.join().unwrap();
+
+    let result = OUTBOUND_EOF_RESULT
+        .get()
+        .expect("on_start did not set result");
+    assert_eq!(
+        result, "OK",
+        "expected EOF on outbound connect, got: {result}"
+    );
+}

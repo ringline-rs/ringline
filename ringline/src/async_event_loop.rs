@@ -919,6 +919,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Plaintext path
         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
             cs.established = true;
+            cs.recv_mode = RecvMode::Multi;
         }
         self.arm_recv(conn_index);
 
