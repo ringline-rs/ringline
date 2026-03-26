@@ -212,6 +212,7 @@ impl H1Conn {
         let mut chunked = false;
         let mut headers_done = false;
         let mut body_leftover = BytesMut::new();
+        let mut parse_error = false;
 
         while !headers_done {
             let n = self
@@ -231,6 +232,8 @@ impl H1Conn {
                             if !remaining.is_empty() {
                                 body_leftover.extend_from_slice(remaining);
                             }
+                        } else {
+                            parse_error = true;
                         }
                         ParseResult::Consumed(data.len())
                     } else {
@@ -241,6 +244,9 @@ impl H1Conn {
 
             if n == 0 {
                 return Err(HttpError::ConnectionClosed);
+            }
+            if parse_error {
+                return Err(HttpError::Parse);
             }
         }
 
