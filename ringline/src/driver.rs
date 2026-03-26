@@ -651,7 +651,7 @@ impl Driver {
         //    indefinitely (the tick timeout from the main loop is not armed here).
         let shutdown_ts = io_uring::types::Timespec::new().nsec(100_000_000); // 100ms
         for _ in 0..100 {
-            if self.connections.active_count() == 0 {
+            if self.connections.active_count() == 0 && !self.send_slab.has_in_flight() {
                 break;
             }
             let ud = UserData::encode(OpTag::TickTimeout, 0, 0);

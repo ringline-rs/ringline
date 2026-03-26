@@ -207,6 +207,11 @@ impl InFlightSendSlab {
     pub fn free_count(&self) -> usize {
         self.free_list.len()
     }
+
+    /// Whether any slab entries are still in use (awaiting ZC notifications).
+    pub fn has_in_flight(&self) -> bool {
+        self.free_list.len() < self.entries.len()
+    }
 }
 
 #[cfg(test)]

@@ -43,6 +43,7 @@ pub mod pool {
 pub mod udp {
     pub const DATAGRAMS_RECEIVED: usize = 0;
     pub const DATAGRAMS_SENT: usize = 1;
+    pub const SEND_ERRORS: usize = 2;
 }
 
 // ── Connection lifecycle ─────────────────────────────────────────
@@ -117,3 +118,9 @@ pub static UDP_DATAGRAMS_RECEIVED: Counter = Counter::new(&UDP, udp::DATAGRAMS_R
     description = "Total UDP datagrams sent"
 )]
 pub static UDP_DATAGRAMS_SENT: Counter = Counter::new(&UDP, udp::DATAGRAMS_SENT);
+
+#[metric(
+    name = "ringline/udp/send_errors",
+    description = "Total UDP send errors"
+)]
+pub static UDP_SEND_ERRORS: Counter = Counter::new(&UDP, udp::SEND_ERRORS);
