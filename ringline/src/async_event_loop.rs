@@ -128,22 +128,31 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Poll all tasks in the ready queue (both connection and standalone tasks).
     fn poll_ready_tasks(&mut self) {
-        // Set thread-local driver pointer once for the entire batch.
-        let mut driver_state = DriverState {
-            driver: &mut self.driver as *mut Driver,
-            executor: &mut self.executor as *mut Executor,
-        };
+        // Form raw pointers once and access driver/executor exclusively through
+        // them for the duration of this method. This avoids Stacked Borrows
+        // violations: accessing self.driver or self.executor directly after
+        // forming these pointers would invalidate them, but futures dereference
+        // them via with_state() during poll.
+        let driver = &mut self.driver as *mut Driver;
+        let executor = &mut self.executor as *mut Executor;
+
+        let mut driver_state = DriverState { driver, executor };
         set_driver_state(&mut driver_state);
 
+        // Safety: we have exclusive access to driver/executor via self, and
+        // only access them through these raw pointers until clear_driver_state.
+        let driver = unsafe { &mut *driver };
+        let executor = unsafe { &mut *executor };
+
         let mut i = 0;
-        while i < self.executor.ready_queue.len() {
-            let raw_id = self.executor.ready_queue[i];
+        while i < executor.ready_queue.len() {
+            let raw_id = executor.ready_queue[i];
             i += 1;
 
             if raw_id & STANDALONE_BIT != 0 {
                 // Standalone task.
                 let task_idx = raw_id & !STANDALONE_BIT;
-                if let Some(mut fut) = self.executor.standalone_slab.take_ready(task_idx) {
+                if let Some(mut fut) = executor.standalone_slab.take_ready(task_idx) {
                     let waker = standalone_waker(task_idx);
                     let mut cx = Context::from_waker(&waker);
 
@@ -151,17 +160,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     match fut.as_mut().poll(&mut cx) {
                         std::task::Poll::Ready(()) => {
                             // Standalone task completed — just remove it.
-                            self.executor.standalone_slab.remove(task_idx);
+                            executor.standalone_slab.remove(task_idx);
                         }
                         std::task::Poll::Pending => {
-                            self.executor.standalone_slab.park(task_idx, fut);
+                            executor.standalone_slab.park(task_idx, fut);
                         }
                     }
                 }
             } else {
                 // Connection task.
                 let conn_index = raw_id;
-                if let Some(mut fut) = self.executor.task_slab.take_ready(conn_index) {
+                if let Some(mut fut) = executor.task_slab.take_ready(conn_index) {
                     let waker = conn_waker(conn_index);
                     let mut cx = Context::from_waker(&waker);
 
@@ -169,11 +178,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     match fut.as_mut().poll(&mut cx) {
                         std::task::Poll::Ready(()) => {
                             // Task completed — connection handler is done.
-                            self.driver.close_connection(conn_index);
-                            self.executor.remove_connection(conn_index);
+                            driver.close_connection(conn_index);
+                            executor.remove_connection(conn_index);
                         }
                         std::task::Poll::Pending => {
-                            self.executor.task_slab.park(conn_index, fut);
+                            executor.task_slab.park(conn_index, fut);
                         }
                     }
                 }
@@ -183,10 +192,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         clear_driver_state();
 
         // Clear processed entries.
-        self.executor.ready_queue.clear();
+        executor.ready_queue.clear();
 
         // Drain any wakeups that happened during polling.
-        self.executor.collect_wakeups();
+        executor.collect_wakeups();
     }
 
     fn drain_completions(&mut self) {
