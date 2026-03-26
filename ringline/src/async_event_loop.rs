@@ -541,8 +541,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let mut offset = 0usize;
 
         while offset + hdr_size <= control.len() {
+            // Safety: read_unaligned handles the case where control is not
+            // aligned to cmsghdr's alignment requirement.
             let hdr_ptr = control[offset..].as_ptr() as *const libc::cmsghdr;
-            let hdr = unsafe { &*hdr_ptr };
+            let hdr = unsafe { std::ptr::read_unaligned(hdr_ptr) };
 
             if hdr.cmsg_len < hdr_size {
                 break;
@@ -557,7 +559,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let ts_size = std::mem::size_of::<libc::timespec>();
                 if data_len >= ts_size && data_offset + ts_size <= control.len() {
                     let ts_ptr = control[data_offset..].as_ptr() as *const libc::timespec;
-                    let ts = unsafe { &*ts_ptr };
+                    let ts = unsafe { std::ptr::read_unaligned(ts_ptr) };
                     if ts.tv_sec != 0 || ts.tv_nsec != 0 {
                         return Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64);
                     }
