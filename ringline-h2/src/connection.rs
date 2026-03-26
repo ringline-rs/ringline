@@ -159,6 +159,9 @@ impl H2Connection {
 
     /// Feed received bytes from the transport.
     pub fn recv(&mut self, data: &[u8]) -> Result<(), H2Error> {
+        if matches!(self.state, ConnState::Closing | ConnState::Closed) {
+            return Ok(());
+        }
         self.recv_buf.extend_from_slice(data);
         self.process_recv_buf()
     }
@@ -312,6 +315,8 @@ impl H2Connection {
                 }
                 Ok(None) => break,
                 Err(e) => {
+                    self.recv_buf.clear();
+                    self.state = ConnState::Closing;
                     self.events
                         .push_back(H2Event::Error(H2Error::ProtocolError(format!("{e}"))));
                     break;
