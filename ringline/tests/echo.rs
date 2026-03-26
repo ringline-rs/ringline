@@ -454,7 +454,18 @@ fn async_request_shutdown_exits_cleanly() {
     wait_for_server(&addr);
 
     // Send a message — the handler will request shutdown after echoing.
-    let _response = echo_round_trip(&addr, b"trigger-shutdown");
+    // The response may arrive or the connection may reset (race between
+    // the queued send and shutdown closing the socket), so tolerate both.
+    {
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = stream.write_all(b"trigger-shutdown");
+        let _ = stream.flush();
+        let mut buf = [0u8; 64];
+        let _ = stream.read(&mut buf);
+    }
 
     // Workers should exit on their own (request_shutdown triggers it).
     for h in handles {
