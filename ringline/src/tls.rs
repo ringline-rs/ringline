@@ -153,31 +153,35 @@ impl TlsTable {
     }
 
     /// Create a new TLS server connection at the given index.
-    pub fn create(&mut self, conn_index: u32) {
+    pub fn create(&mut self, conn_index: u32) -> Result<(), rustls::Error> {
         let server_config = self
             .server_config
             .as_ref()
             .expect("create() called without server_config");
-        let conn = ServerConnection::new(server_config.clone())
-            .expect("rustls ServerConnection::new failed");
+        let conn = ServerConnection::new(server_config.clone())?;
         self.conns[conn_index as usize] = Some(TlsConn {
             conn: TlsConnKind::Server(conn),
             handshake_complete: false,
         });
+        Ok(())
     }
 
     /// Create a new TLS client connection at the given index.
-    pub fn create_client(&mut self, conn_index: u32, server_name: ServerName<'static>) {
+    pub fn create_client(
+        &mut self,
+        conn_index: u32,
+        server_name: ServerName<'static>,
+    ) -> Result<(), rustls::Error> {
         let client_config = self
             .client_config
             .as_ref()
             .expect("create_client() called without client_config");
-        let conn = ClientConnection::new(client_config.clone(), server_name)
-            .expect("rustls ClientConnection::new failed");
+        let conn = ClientConnection::new(client_config.clone(), server_name)?;
         self.conns[conn_index as usize] = Some(TlsConn {
             conn: TlsConnKind::Client(conn),
             handshake_complete: false,
         });
+        Ok(())
     }
 
     /// Get a mutable reference to the TLS connection at the given index.
