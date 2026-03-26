@@ -3173,3 +3173,81 @@ fn async_standalone_connect_refused() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── Peer close delivers EOF to accepted connection ──────────────────
+
+/// Server that accepts a connection, reads one message, echoes it, then
+/// waits for the client to disconnect. Verifies with_data returns 0 (EOF).
+struct PeerCloseHandler;
+
+static PEER_CLOSE_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+impl AsyncEventHandler for PeerCloseHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Read until EOF. Each chunk is echoed back.
+            loop {
+                let n = conn
+                    .with_data(|data| {
+                        let _ = conn.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    // EOF — peer closed the connection. This is the success case.
+                    PEER_CLOSE_RESULT.set("OK".to_string()).ok();
+                    return;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        PeerCloseHandler
+    }
+}
+
+#[test]
+fn async_peer_close_delivers_eof() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<PeerCloseHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    // Connect with std TCP, send data, read echo, then close.
+    {
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"hello").unwrap();
+        stream.flush().unwrap();
+
+        let mut buf = [0u8; 5];
+        let mut total = 0;
+        while total < 5 {
+            match stream.read(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("read error: {e}"),
+            }
+        }
+        assert_eq!(&buf[..total], b"hello");
+        // stream drops here, closing the TCP connection
+    }
+
+    // Give the server time to process the close.
+    std::thread::sleep(Duration::from_millis(200));
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+
+    let result = PEER_CLOSE_RESULT.get().expect("handler did not set result");
+    assert_eq!(result, "OK", "expected EOF after peer close, got: {result}");
+}
