@@ -563,7 +563,13 @@ impl<'a> DriverCtx<'a> {
             self.connections.release(conn_index);
             crate::error::Error::RingSetup(format!("invalid server name: {e}"))
         })?;
-        tls_table.create_client(conn_index, sni);
+        if let Err(e) = tls_table.create_client(conn_index, sni) {
+            let _ = self.ring.register_files_update(conn_index, &[-1]);
+            self.connections.release(conn_index);
+            return Err(crate::error::Error::RingSetup(format!(
+                "TLS client setup failed: {e}"
+            )));
+        }
 
         // Fill sockaddr_storage for the connect SQE.
         let addrlen = crate::driver::socket_addr_to_sockaddr(

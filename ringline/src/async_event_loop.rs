@@ -636,7 +636,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if let Some(ref mut tls_table) = self.driver.tls_table
                     && tls_table.has_server_config()
                 {
-                    tls_table.create(conn_index);
+                    if tls_table.create(conn_index).is_err() {
+                        self.driver.close_connection(conn_index);
+                    }
                     continue;
                 }
 
