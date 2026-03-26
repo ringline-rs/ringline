@@ -576,4 +576,16 @@ mod tests {
             ChunkResult::Complete { .. } => panic!("expected NeedMore"),
         }
     }
+
+    #[test]
+    fn parse_malformed_status_line_returns_none() {
+        // Missing status code.
+        assert!(parse_response_headers(b"HTTP/1.1 \r\n").is_none());
+        // Completely garbled.
+        assert!(parse_response_headers(b"NOT-HTTP\r\n").is_none());
+        // Empty.
+        assert!(parse_response_headers(b"").is_none());
+        // Just the version with no space.
+        assert!(parse_response_headers(b"HTTP/1.1\r\n").is_none());
+    }
 }

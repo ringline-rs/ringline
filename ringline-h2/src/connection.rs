@@ -929,4 +929,46 @@ mod tests {
         let send = conn.take_pending_send();
         assert!(!send.is_empty(), "expected WINDOW_UPDATE frames");
     }
+
+    #[test]
+    fn decode_error_emits_single_event_and_transitions_to_closing() {
+        let mut conn = H2Connection::new(Settings::client_default());
+        let _ = conn.take_pending_send();
+
+        // Complete settings exchange so we're in Ready state.
+        let server_settings = make_settings_frame(&Settings::default(), false);
+        conn.recv(&server_settings).unwrap();
+        let _ = conn.take_pending_send();
+        while conn.poll_event().is_some() {}
+
+        // Feed a SETTINGS frame with invalid length (must be multiple of 6).
+        let bad_settings = [
+            0x00, 0x00, 0x05, // length = 5 (not multiple of 6)
+            0x04, // type = SETTINGS
+            0x00, // flags
+            0x00, 0x00, 0x00, 0x00, // stream id 0
+            0x00, 0x01, 0x02, 0x03, 0x04, // 5 bytes (invalid)
+        ];
+        conn.recv(&bad_settings).unwrap();
+
+        // Should have exactly one error event.
+        let event = conn.poll_event();
+        assert!(
+            matches!(event, Some(H2Event::Error(_))),
+            "expected Error event, got {event:?}"
+        );
+
+        // No more events.
+        assert!(conn.poll_event().is_none(), "expected no more events");
+
+        // State should be Closing.
+        assert_eq!(conn.state, ConnState::Closing);
+
+        // Feeding more data should not produce additional error events.
+        conn.recv(&bad_settings).unwrap();
+        assert!(
+            conn.poll_event().is_none(),
+            "expected no events after Closing"
+        );
+    }
 }

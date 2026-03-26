@@ -262,3 +262,113 @@ fn ping_pool() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── Parse error test ────────────────────────────────────────────────────
+
+/// Server that responds with garbage instead of PONG\r\n.
+struct BadPingServer;
+
+impl AsyncEventHandler for BadPingServer {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| {
+                    if data.len() < 6 {
+                        return ParseResult::NeedMore;
+                    }
+                    // Respond with malformed data instead of PONG\r\n.
+                    let _ = conn.send_nowait(b"GARBAGE_NOT_A_PONG\r\n");
+                    ParseResult::Consumed(data.len())
+                })
+                .await;
+            if n > 0 {
+                // Keep connection open briefly so client can read the bad response.
+                ringline::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BadPingServer
+    }
+}
+
+static BAD_SERVER_ADDR: OnceLock<SocketAddr> = OnceLock::new();
+static BAD_RESULT: OnceLock<String> = OnceLock::new();
+
+struct BadPingClientHandler;
+
+impl AsyncEventHandler for BadPingClientHandler {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let server_addr = *BAD_SERVER_ADDR.get().expect("bad server addr not set");
+        Some(Box::pin(async move {
+            let conn = match ringline::connect(server_addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        BAD_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
+                        ringline::request_shutdown().ok();
+                        return;
+                    }
+                },
+                Err(e) => {
+                    BAD_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    ringline::request_shutdown().ok();
+                    return;
+                }
+            };
+
+            let mut client = ringline_ping::Client::new(conn);
+            match client.ping().await {
+                Ok(()) => {
+                    BAD_RESULT.set("UNEXPECTED_OK".to_string()).ok();
+                }
+                Err(_e) => {
+                    BAD_RESULT.set("ERROR".to_string()).ok();
+                }
+            }
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BadPingClientHandler
+    }
+}
+
+#[test]
+fn parse_error_returns_error_not_hang() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<BadPingServer>()
+        .expect("server launch failed");
+    wait_for_server(&addr);
+
+    BAD_SERVER_ADDR.set(addr.parse().unwrap()).ok();
+
+    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+        .launch::<BadPingClientHandler>()
+        .expect("client launch failed");
+
+    for h in c_handles {
+        h.join().unwrap().unwrap();
+    }
+
+    let result = BAD_RESULT.get().expect("on_start did not set result");
+    assert_eq!(result, "ERROR", "expected parse error, got: {result}");
+
+    s_shutdown.shutdown();
+    for h in s_handles {
+        h.join().unwrap().unwrap();
+    }
+}
