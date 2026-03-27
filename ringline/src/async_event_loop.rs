@@ -182,6 +182,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     if result.is_err() {
                         self.driver.send_copy_pool.release(pool_slot);
                         self.driver.drain_conn_send_queue(conn_index);
+                        let err = io::Error::other("SQ full during partial copy send resubmission");
+                        self.executor.wake_send(conn_index, Err(err));
                         self.driver.close_connection(conn_index);
                     }
                 }
@@ -1914,6 +1916,68 @@ mod tests {
         assert!(
             el.driver.send_copy_pool.in_use(slot),
             "pool slot released prematurely on partial send"
+        );
+    }
+
+    #[test]
+    fn handle_send_error_wakes_send_waiter_with_error() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Set up send waiter.
+        el.executor.send_waiters[conn_index as usize] = true;
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        let data = b"hello";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+
+        // Simulate send error (ECONNRESET).
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), -104, 0);
+
+        // Send waiter should be cleared.
+        assert!(
+            !el.executor.send_waiters[conn_index as usize],
+            "send waiter not cleared on error"
+        );
+        // Result should be stored (so SendFuture can retrieve it).
+        assert!(
+            el.executor.io_results[conn_index as usize].is_some(),
+            "send error result not stored"
+        );
+    }
+
+    #[test]
+    fn handle_send_msg_zc_error_wakes_send_waiter() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Set up send waiter.
+        el.executor.send_waiters[conn_index as usize] = true;
+
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [None, None, None, None];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+
+        // Simulate ZC send error (ECONNRESET).
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(ud.raw(), -104, 0);
+
+        // Send waiter should be cleared.
+        assert!(
+            !el.executor.send_waiters[conn_index as usize],
+            "send waiter not cleared on ZC error"
+        );
+        assert!(
+            el.executor.io_results[conn_index as usize].is_some(),
+            "ZC send error result not stored"
         );
     }
 }
