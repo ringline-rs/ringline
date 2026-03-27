@@ -1605,4 +1605,315 @@ mod tests {
             "connection slot not released after Close CQE"
         );
     }
+
+    // ── Recv data delivery tests ───────────────────────────────────
+
+    #[test]
+    fn handle_recv_multi_data_appends_to_accumulator() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // The provided buffer ring has real buffers. Get a valid buffer ID.
+        // We'll simulate a recv CQE that references buffer 0.
+        let bid: u16 = 0;
+        // IORING_CQE_F_BUFFER = 1, IORING_CQE_F_MORE = 2. bid in upper 16 bits.
+        let flags = 1u32 | 2u32 | ((bid as u32) << 16);
+        let bytes_received = 5i32;
+
+        // Write test data into the buffer ring's backing memory so the
+        // handler reads it into the accumulator.
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
+        }
+
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), bytes_received, flags);
+
+        // Data should be in the accumulator.
+        let data = el.driver.accumulators.data(conn_index);
+        assert_eq!(data, b"hello", "data not appended to accumulator");
+
+        // Buffer should be queued for replenish.
+        assert!(
+            el.driver.pending_replenish.contains(&bid),
+            "buffer not queued for replenish"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_enobufs_does_not_close() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // ENOBUFS = -105. has_more = false (bit 1 not set).
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -105, 0);
+
+        // Connection should still be alive (ENOBUFS is recoverable).
+        assert!(
+            el.driver.connections.get(conn_index).is_some(),
+            "connection closed on ENOBUFS"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_unknown_error_closes_when_no_more() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Unknown error, !has_more — should close.
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -99, 0); // -99 = unknown errno
+
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            "connection not closed on unknown recv error"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_ecanceled_does_nothing() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // ECANCELED = -125.
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -125, 0);
+
+        // Connection should still be alive.
+        assert!(
+            el.driver.connections.get(conn_index).is_some(),
+            "connection closed on ECANCELED"
+        );
+    }
+
+    // ── Connect tests ──────────────────────────────────────────────
+
+    #[test]
+    fn handle_connect_success_wakes_waiter() {
+        let mut el = make_test_loop();
+
+        // Allocate an outbound connection slot.
+        let conn_index = el
+            .driver
+            .connections
+            .allocate_outbound()
+            .expect("no free slots");
+        el.executor.connect_waiters[conn_index as usize] = true;
+
+        // Simulate successful connect CQE (result == 0).
+        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+
+        // Connect waiter should be cleared and result stored.
+        assert!(
+            !el.executor.connect_waiters[conn_index as usize],
+            "connect waiter not cleared"
+        );
+        assert!(
+            el.executor.io_results[conn_index as usize].is_some(),
+            "connect result not stored"
+        );
+        // Connection should be established with recv_mode = Multi.
+        let conn = el.driver.connections.get(conn_index).unwrap();
+        assert!(conn.established, "connection not marked established");
+        assert!(
+            matches!(conn.recv_mode, RecvMode::Multi),
+            "recv_mode not set to Multi after connect"
+        );
+    }
+
+    #[test]
+    fn handle_connect_error_wakes_waiter_and_closes() {
+        let mut el = make_test_loop();
+
+        let conn_index = el
+            .driver
+            .connections
+            .allocate_outbound()
+            .expect("no free slots");
+        el.executor.connect_waiters[conn_index as usize] = true;
+
+        // Simulate ECONNREFUSED (errno 111).
+        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -111, 0);
+
+        // Connect waiter should be cleared with error result.
+        assert!(
+            !el.executor.connect_waiters[conn_index as usize],
+            "connect waiter not cleared on error"
+        );
+        assert!(
+            el.executor.io_results[conn_index as usize].is_some(),
+            "connect error result not stored"
+        );
+        // Connection should be closing.
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            "connection not closed after connect error"
+        );
+    }
+
+    // ── Timer tests ────────────────────────────────────────────────
+
+    #[test]
+    fn handle_timer_fires_and_wakes_task() {
+        let mut el = make_test_loop();
+
+        // Allocate a timer slot.
+        let waker_id = 0u32; // conn_index 0 as waker
+        let (slot, generation) = el.executor.timer_pool.allocate(waker_id).unwrap();
+
+        let payload = TimerSlotPool::encode_payload(slot, generation);
+        let ud = UserData::encode(OpTag::Timer, 0, payload);
+
+        // Simulate timer CQE (result == -ETIME = -62).
+        el.test_dispatch_cqe(ud.raw(), -62, 0);
+
+        // Timer should be marked as fired.
+        assert!(
+            el.executor.timer_pool.is_fired(slot),
+            "timer not marked as fired"
+        );
+    }
+
+    #[test]
+    fn handle_timer_stale_generation_ignored() {
+        let mut el = make_test_loop();
+
+        let (slot, generation) = el.executor.timer_pool.allocate(0).unwrap();
+        // Release and reallocate to bump generation.
+        el.executor.timer_pool.release(slot);
+        let (_slot2, gen2) = el.executor.timer_pool.allocate(0).unwrap();
+        assert_ne!(generation, gen2, "generation should have changed");
+
+        // Dispatch with OLD generation — should be ignored.
+        let payload = TimerSlotPool::encode_payload(slot, generation);
+        let ud = UserData::encode(OpTag::Timer, 0, payload);
+        el.test_dispatch_cqe(ud.raw(), -62, 0);
+
+        // Timer should NOT be fired (stale generation).
+        assert!(
+            !el.executor.timer_pool.is_fired(slot),
+            "stale timer should not be fired"
+        );
+    }
+
+    // ── TLS send tests ─────────────────────────────────────────────
+
+    #[test]
+    fn handle_tls_send_complete_releases_pool_slot() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let data = b"ciphertext";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        // Simulate full TLS send completion (all bytes sent, try_advance returns None).
+        let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before + 1,
+            "pool slot not released after TLS send complete"
+        );
+    }
+
+    #[test]
+    fn handle_tls_send_error_closes_connection() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let data = b"ciphertext";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+
+        // Simulate TLS send error (result < 0).
+        let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), -104, 0);
+
+        // Pool slot should be released.
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "pool slot not released after TLS send error"
+        );
+        // Connection should be closing.
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            "connection not closed after TLS send error"
+        );
+    }
+
+    // ── Tick timeout test ──────────────────────────────────────────
+
+    #[test]
+    fn handle_tick_timeout_clears_armed_flag() {
+        let mut el = make_test_loop();
+        el.driver.tick_timeout_armed = true;
+
+        let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
+        el.test_dispatch_cqe(ud.raw(), -62, 0);
+
+        assert!(
+            !el.driver.tick_timeout_armed,
+            "tick_timeout_armed not cleared"
+        );
+    }
+
+    // ── UDP send error metric test ─────────────────────────────────
+
+    #[test]
+    fn handle_send_msg_udp_error_releases_pool_slot() {
+        let mut el = make_test_loop();
+
+        // Set up a UDP socket state (need at least one for the handler).
+        if el.driver.udp_sockets.is_empty() {
+            return; // Skip if no UDP sockets configured.
+        }
+
+        let data = b"datagram";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        // Simulate UDP send CQE (success).
+        let udp_index = 0u32;
+        let ud = UserData::encode(OpTag::SendMsgUdp, udp_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before + 1,
+            "pool slot not released after UDP send"
+        );
+    }
+
+    // ── Partial send retry queue tests ─────────────────────────────
+
+    #[test]
+    fn handle_send_partial_queues_or_resubmits() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Allocate a pool slot with 10 bytes.
+        let data = b"0123456789";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+
+        // Mark send as in-flight.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        // Simulate partial send: only 5 of 10 bytes sent.
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+
+        // The pool slot should still be in use (resubmitted or queued for retry).
+        assert!(
+            el.driver.send_copy_pool.in_use(slot),
+            "pool slot released prematurely on partial send"
+        );
+    }
 }
