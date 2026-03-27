@@ -785,6 +785,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let conn_index = ud.conn_index();
         let pool_slot = ud.payload() as u16;
 
+        // Guard against stale CQE for an already-released pool slot
+        // (e.g., Close CQE processed before this Send CQE in the same batch).
+        if !self.driver.send_copy_pool.in_use(pool_slot) {
+            return;
+        }
+
         // Chain path.
         if self.driver.chain_table.is_active(conn_index) {
             self.driver.send_copy_pool.release(pool_slot);
@@ -1347,6 +1353,44 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     #[cfg(test)]
     pub(crate) fn test_dispatch_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
         self.dispatch_cqe(user_data_raw, result, flags);
+    }
+
+    /// Test-only: submit a NOP with injected result through the real io_uring
+    /// pipeline, then drain and dispatch all completions.
+    ///
+    /// This exercises the full submit_and_wait → drain_completions → dispatch_cqe
+    /// path, unlike test_dispatch_cqe which bypasses SQE submission.
+    ///
+    /// Requires kernel 6.6+ for IORING_NOP_INJECT_RESULT.
+    #[cfg(test)]
+    pub(crate) fn inject_and_dispatch(&mut self, user_data_raw: u64, result: i32) {
+        self.driver
+            .ring
+            .submit_nop_inject(user_data_raw, result)
+            .expect("submit_nop_inject failed — kernel 6.6+ required");
+        self.driver
+            .ring
+            .submit_and_wait(1)
+            .expect("submit_and_wait failed");
+        self.drain_completions();
+    }
+
+    /// Test-only: inject multiple NOPs and dispatch them all in one batch.
+    /// This tests batch CQE processing where one handler's side effects
+    /// affect subsequent handlers in the same drain_completions() call.
+    #[cfg(test)]
+    pub(crate) fn inject_batch_and_dispatch(&mut self, cqes: &[(u64, i32)]) {
+        for &(user_data_raw, result) in cqes {
+            self.driver
+                .ring
+                .submit_nop_inject(user_data_raw, result)
+                .expect("submit_nop_inject failed");
+        }
+        self.driver
+            .ring
+            .submit_and_wait(cqes.len() as u32)
+            .expect("submit_and_wait failed");
+        self.drain_completions();
     }
 }
 
@@ -2040,5 +2084,452 @@ mod tests {
             !el.executor.disk_io_waiters.contains_key(&seq),
             "disk_io_waiter not cleared on DiskIoFuture drop"
         );
+    }
+
+    // ── NOP error injection tests (real io_uring pipeline) ─────────
+    //
+    // These tests use IORING_NOP_INJECT_RESULT to send CQEs through
+    // the full submit_and_wait → drain_completions → dispatch_cqe path.
+    // Requires kernel 6.6+.
+
+    #[test]
+    fn nop_inject_send_complete() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let data = b"hello";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        el.inject_and_dispatch(ud.raw(), data.len() as i32);
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before + 1,
+            "pool slot not released via NOP inject path"
+        );
+    }
+
+    #[test]
+    fn nop_inject_send_error_releases_and_wakes() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.executor.send_waiters[conn_index as usize] = true;
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        let data = b"hello";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+
+        // Inject ECONNRESET through real io_uring.
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        el.inject_and_dispatch(ud.raw(), -104);
+
+        // Pool slot released, waiter woken with error.
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "pool slot not released on injected send error"
+        );
+        assert!(
+            !el.executor.send_waiters[conn_index as usize],
+            "send waiter not cleared on injected error"
+        );
+        assert!(
+            el.executor.io_results[conn_index as usize].is_some(),
+            "error result not stored"
+        );
+    }
+
+    #[test]
+    fn nop_inject_recv_eof_closes_connection() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.inject_and_dispatch(ud.raw(), 0);
+
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            "connection not closed on injected recv EOF"
+        );
+    }
+
+    #[test]
+    fn nop_inject_zc_send_error_no_slab_leak() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [None, None, None, None];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+
+        // Inject ZC send error through real pipeline.
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        el.inject_and_dispatch(ud.raw(), -104);
+
+        // Slab should be releasable (no notification expected on error).
+        assert!(
+            !el.driver.send_slab.in_use(slab_idx) || el.driver.send_slab.should_release(slab_idx),
+            "slab entry leaked on injected ZC error"
+        );
+    }
+
+    #[test]
+    fn nop_inject_timer_fires() {
+        let mut el = make_test_loop();
+
+        let waker_id = 0u32;
+        let (slot, generation) = el.executor.timer_pool.allocate(waker_id).unwrap();
+
+        let payload = TimerSlotPool::encode_payload(slot, generation);
+        let ud = UserData::encode(OpTag::Timer, 0, payload);
+
+        // Inject timer expiry through real pipeline.
+        el.inject_and_dispatch(ud.raw(), -62); // -ETIME
+
+        assert!(
+            el.executor.timer_pool.is_fired(slot),
+            "timer not fired via NOP inject"
+        );
+    }
+
+    #[test]
+    fn nop_inject_send_wakes_waiter() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.executor.send_waiters[conn_index as usize] = true;
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        let data = b"hello";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        el.inject_and_dispatch(ud.raw(), data.len() as i32);
+
+        assert!(!el.executor.send_waiters[conn_index as usize]);
+        assert!(el.executor.io_results[conn_index as usize].is_some());
+    }
+
+    #[test]
+    fn nop_inject_zc_notif_releases_slab() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [None, None, None, None];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+        let free_before = el.driver.send_slab.free_count();
+
+        // Set up as if operation CQE already processed.
+        el.driver.send_slab.inc_pending_notifs(slab_idx);
+        el.driver.send_slab.mark_awaiting_notifications(slab_idx);
+
+        // Inject notification CQE (IORING_CQE_F_NOTIF = 8).
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        // NOP inject only sets result, not flags. The notif flag is in CQE flags.
+        // We can't inject CQE flags via NOP — use synthetic for this.
+        // Fall back to test_dispatch_cqe for the notif path.
+        el.test_dispatch_cqe(ud.raw(), 0, 8); // IORING_CQE_F_NOTIF
+
+        assert_eq!(el.driver.send_slab.free_count(), free_before + 1);
+    }
+
+    #[test]
+    fn nop_inject_zc_result_zero() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [None, None, None, None];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        el.inject_and_dispatch(ud.raw(), 0);
+
+        assert!(
+            !el.driver.send_slab.in_use(slab_idx) || el.driver.send_slab.should_release(slab_idx),
+        );
+    }
+
+    #[test]
+    fn nop_inject_recv_enobufs() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // ENOBUFS = -105.
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.inject_and_dispatch(ud.raw(), -105);
+
+        assert!(
+            el.driver.connections.get(conn_index).is_some(),
+            "connection closed on ENOBUFS"
+        );
+    }
+
+    #[test]
+    fn nop_inject_recv_unknown_error_closes() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.inject_and_dispatch(ud.raw(), -99);
+
+        let conn = el.driver.connections.get(conn_index);
+        assert!(conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),);
+    }
+
+    #[test]
+    fn nop_inject_recv_ecanceled() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.inject_and_dispatch(ud.raw(), -125); // ECANCELED
+
+        assert!(el.driver.connections.get(conn_index).is_some());
+    }
+
+    #[test]
+    fn nop_inject_connect_success() {
+        let mut el = make_test_loop();
+        let conn_index = el
+            .driver
+            .connections
+            .allocate_outbound()
+            .expect("no free slots");
+        el.executor.connect_waiters[conn_index as usize] = true;
+
+        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        el.inject_and_dispatch(ud.raw(), 0);
+
+        assert!(!el.executor.connect_waiters[conn_index as usize]);
+        assert!(el.executor.io_results[conn_index as usize].is_some());
+        let conn = el.driver.connections.get(conn_index).unwrap();
+        assert!(conn.established);
+        assert!(matches!(conn.recv_mode, RecvMode::Multi));
+    }
+
+    #[test]
+    fn nop_inject_connect_error() {
+        let mut el = make_test_loop();
+        let conn_index = el
+            .driver
+            .connections
+            .allocate_outbound()
+            .expect("no free slots");
+        el.executor.connect_waiters[conn_index as usize] = true;
+
+        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        el.inject_and_dispatch(ud.raw(), -111); // ECONNREFUSED
+
+        assert!(!el.executor.connect_waiters[conn_index as usize]);
+        assert!(el.executor.io_results[conn_index as usize].is_some());
+    }
+
+    #[test]
+    fn nop_inject_timer_stale_generation() {
+        let mut el = make_test_loop();
+        let (slot, generation) = el.executor.timer_pool.allocate(0).unwrap();
+        el.executor.timer_pool.release(slot);
+        let (_slot2, _gen2) = el.executor.timer_pool.allocate(0).unwrap();
+
+        let payload = TimerSlotPool::encode_payload(slot, generation);
+        let ud = UserData::encode(OpTag::Timer, 0, payload);
+        el.inject_and_dispatch(ud.raw(), -62);
+
+        assert!(!el.executor.timer_pool.is_fired(slot));
+    }
+
+    #[test]
+    fn nop_inject_tls_send_complete() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let data = b"ciphertext";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
+        el.inject_and_dispatch(ud.raw(), data.len() as i32);
+
+        assert_eq!(el.driver.send_copy_pool.free_count(), free_before + 1);
+    }
+
+    #[test]
+    fn nop_inject_tls_send_error_closes() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let data = b"ciphertext";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+
+        let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
+        el.inject_and_dispatch(ud.raw(), -104);
+
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+        let conn = el.driver.connections.get(conn_index);
+        assert!(conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed));
+    }
+
+    #[test]
+    fn nop_inject_tick_timeout() {
+        let mut el = make_test_loop();
+        el.driver.tick_timeout_armed = true;
+
+        let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
+        el.inject_and_dispatch(ud.raw(), -62);
+
+        assert!(!el.driver.tick_timeout_armed);
+    }
+
+    #[test]
+    fn nop_inject_close_releases_slot() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        el.driver.close_connection(conn_index);
+
+        let ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.inject_and_dispatch(ud.raw(), 0);
+
+        assert!(el.driver.connections.get(conn_index).is_none());
+    }
+
+    // ── Batch interaction tests (multi-CQE in one drain) ───────────
+    //
+    // These test cross-CQE interactions where one handler's side effects
+    // affect subsequent handlers in the same drain_completions() call.
+
+    #[test]
+    fn batch_send_error_then_recv_on_same_conn() {
+        // A send error and recv EOF arrive in the same batch for the
+        // same connection. Both handlers should process without panic.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.executor.send_waiters[conn_index as usize] = true;
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+
+        let send_ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+
+        el.inject_batch_and_dispatch(&[
+            (send_ud.raw(), -104), // send error
+            (recv_ud.raw(), 0),    // recv EOF
+        ]);
+
+        // Both should have processed. Pool slot released, connection closing.
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+        let conn = el.driver.connections.get(conn_index);
+        assert!(conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed));
+    }
+
+    #[test]
+    fn batch_recv_eof_then_stale_send_cqe() {
+        // Recv EOF closes the connection (sets recv_mode=Closed, submits
+        // Close SQE), then a stale send CQE arrives for the same
+        // conn_index in the same batch. The send handler should not
+        // panic on the closing connection.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+
+        // Recv EOF + stale send in the same batch.
+        // The EOF handler calls close_connection internally.
+        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        let send_ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+
+        el.inject_batch_and_dispatch(&[
+            (recv_ud.raw(), 0), // EOF → close_connection
+            (send_ud.raw(), 4), // stale send "completes" (4 bytes = b"data")
+        ]);
+
+        // Connection should be closing. Pool slot should be released
+        // cleanly (no panic).
+        let conn = el.driver.connections.get(conn_index);
+        assert!(conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed));
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+    }
+
+    #[test]
+    fn batch_two_sends_on_same_conn() {
+        // Two send completions arrive in the same batch. The first should
+        // release its pool slot and advance the queue. The second should
+        // also release cleanly.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        let (slot1, _p, _l) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
+        let (slot2, _p, _l) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        let ud1 = UserData::encode(OpTag::Send, conn_index, slot1 as u32);
+        let ud2 = UserData::encode(OpTag::Send, conn_index, slot2 as u32);
+
+        el.inject_batch_and_dispatch(&[(ud1.raw(), 3), (ud2.raw(), 3)]);
+
+        // Both pool slots should be released.
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before + 2,
+            "both pool slots should be released"
+        );
+    }
+
+    #[test]
+    fn batch_multiple_connections_interleaved() {
+        // CQEs for different connections arrive interleaved in one batch.
+        let mut el = make_test_loop();
+        let c1 = accept_connection(&mut el);
+        let c2 = accept_connection(&mut el);
+        el.executor.send_waiters[c1 as usize] = true;
+        el.executor.send_waiters[c2 as usize] = true;
+        el.driver.send_queues[c1 as usize].in_flight = true;
+        el.driver.send_queues[c2 as usize].in_flight = true;
+
+        let (s1, _p, _l) = el.driver.send_copy_pool.copy_in(b"hello").unwrap();
+        let (s2, _p, _l) = el.driver.send_copy_pool.copy_in(b"world").unwrap();
+
+        let ud1 = UserData::encode(OpTag::Send, c1, s1 as u32);
+        let ud2 = UserData::encode(OpTag::Send, c2, s2 as u32);
+
+        el.inject_batch_and_dispatch(&[
+            (ud1.raw(), 5),    // c1 send complete
+            (ud2.raw(), -104), // c2 send error
+        ]);
+
+        // c1: success result stored.
+        assert!(el.executor.io_results[c1 as usize].is_some());
+        // c2: error result stored.
+        assert!(el.executor.io_results[c2 as usize].is_some());
+        // Both pool slots released.
+        assert!(!el.driver.send_copy_pool.in_use(s1));
+        assert!(!el.driver.send_copy_pool.in_use(s2));
     }
 }

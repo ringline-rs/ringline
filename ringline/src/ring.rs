@@ -380,6 +380,30 @@ impl Ring {
     /// The 64-byte `Entry` is automatically converted to `Entry128` (zero-padded)
     /// for the Big SQE ring.
     ///
+    /// Submit a NOP with injected result for error injection testing.
+    ///
+    /// The kernel will post a CQE with the given `user_data` and `result`,
+    /// allowing tests to simulate any CQE (send error, recv EOF, etc.)
+    /// through the real submit_and_wait → dispatch_cqe pipeline.
+    ///
+    /// Requires kernel 6.6+ (IORING_NOP_INJECT_RESULT support).
+    #[cfg(test)]
+    pub(crate) fn submit_nop_inject(&mut self, user_data: u64, result: i32) -> io::Result<()> {
+        let mut entry = opcode::Nop::new().build().user_data(user_data);
+        // The high-level Entry doesn't expose nop_flags or len fields.
+        // Use raw pointer arithmetic to patch the SQE in-place.
+        // SQE layout (64 bytes): opcode(1) flags(1) ioprio(2) fd(4) off(8) addr(8)
+        //                         len(4@24) rw_flags/nop_flags(4@28) user_data(8) ...
+        let ptr = &mut entry as *mut squeue::Entry as *mut u8;
+        unsafe {
+            // len is at byte offset 24 in the SQE
+            std::ptr::write_unaligned(ptr.add(24) as *mut u32, result as u32);
+            // nop_flags (union with rw_flags) is at byte offset 28
+            std::ptr::write_unaligned(ptr.add(28) as *mut u32, 1); // IORING_NOP_INJECT_RESULT
+        }
+        unsafe { self.push_sqe(entry) }
+    }
+
     /// # Safety
     /// The SQE must reference valid memory for the lifetime of the operation.
     pub(crate) unsafe fn push_sqe(&mut self, entry: squeue::Entry) -> io::Result<()> {
