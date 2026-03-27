@@ -162,6 +162,8 @@ pub(crate) struct Driver {
     pub(crate) tick_timeout_armed: bool,
     /// Whether the eventfd read SQE is currently armed.
     pub(crate) eventfd_armed: bool,
+    /// Pending ZC send retries: (conn_index, slab_idx). Drained each tick.
+    pub(crate) pending_zc_retries: Vec<(u32, u16)>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
     /// NVMe device tracking table. `None` when NVMe is not configured.
@@ -316,6 +318,7 @@ impl Driver {
             },
             tick_timeout_armed: false,
             eventfd_armed: false,
+            pending_zc_retries: Vec::new(),
             udp_sockets,
             nvme_devices: config
                 .nvme
