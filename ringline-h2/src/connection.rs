@@ -436,6 +436,21 @@ impl H2Connection {
                     error_code,
                     debug_data,
                 });
+                // Per RFC 7540 Section 6.8: streams with IDs > last_stream_id
+                // were never processed. Reset them so waiting callers get notified.
+                let to_reset: Vec<u32> = self
+                    .streams
+                    .keys()
+                    .filter(|&&id| id > last_stream_id)
+                    .copied()
+                    .collect();
+                for id in to_reset {
+                    self.streams.remove(&id);
+                    self.events.push_back(H2Event::StreamReset {
+                        stream_id: id,
+                        error_code: ErrorCode::RefusedStream,
+                    });
+                }
             }
             Frame::WindowUpdate {
                 stream_id,
@@ -1005,6 +1020,56 @@ mod tests {
         assert!(
             conn.poll_event().is_none(),
             "expected no events after Closing"
+        );
+    }
+
+    #[test]
+    fn goaway_resets_streams_above_last_stream_id() {
+        let mut conn = H2Connection::new(Settings::client_default());
+        let _ = conn.take_pending_send();
+
+        // Settings exchange.
+        let server_settings = make_settings_frame(&Settings::default(), false);
+        conn.recv(&server_settings).unwrap();
+        let _ = conn.take_pending_send();
+        while conn.poll_event().is_some() {}
+
+        // Open 3 streams: 1, 3, 5.
+        let headers = vec![HeaderField::new(b":method", b"GET")];
+        let s1 = conn.send_request(&headers, true).unwrap();
+        let s3 = conn.send_request(&headers, true).unwrap();
+        let s5 = conn.send_request(&headers, true).unwrap();
+        let _ = conn.take_pending_send();
+        assert_eq!(s1, 1);
+        assert_eq!(s3, 3);
+        assert_eq!(s5, 5);
+
+        // Server sends GOAWAY with last_stream_id = 1.
+        let goaway = Frame::GoAway {
+            last_stream_id: 1,
+            error_code: ErrorCode::NoError,
+            debug_data: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        goaway.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+
+        // Should get GoAway event + StreamReset for streams 3 and 5.
+        let mut got_goaway = false;
+        let mut reset_ids = Vec::new();
+        while let Some(event) = conn.poll_event() {
+            match event {
+                H2Event::GoAway { .. } => got_goaway = true,
+                H2Event::StreamReset { stream_id, .. } => reset_ids.push(stream_id),
+                _ => {}
+            }
+        }
+        assert!(got_goaway, "expected GoAway event");
+        reset_ids.sort();
+        assert_eq!(
+            reset_ids,
+            vec![3, 5],
+            "expected streams 3 and 5 to be reset"
         );
     }
 
