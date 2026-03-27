@@ -1314,4 +1314,295 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.executor.task_slab.spawn(conn_index, future);
         self.executor.ready_queue.push_back(conn_index);
     }
+
+    /// Test-only: expose dispatch_cqe for synthetic CQE testing.
+    #[cfg(test)]
+    pub(crate) fn test_dispatch_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
+        self.dispatch_cqe(user_data_raw, result, flags);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::completion::{OpTag, UserData};
+    use crate::config::Config;
+    use crate::runtime::io::ConnCtx;
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    /// Minimal handler for testing — does nothing.
+    struct NoopHandler;
+
+    impl AsyncEventHandler for NoopHandler {
+        #[allow(clippy::manual_async_fn)]
+        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+            async {}
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            NoopHandler
+        }
+    }
+
+    fn test_config() -> Config {
+        let mut config = Config::default();
+        config.worker.threads = 1;
+        config.worker.pin_to_core = false;
+        config.sq_entries = 32;
+        config.recv_buffer.ring_size = 16;
+        config.recv_buffer.buffer_size = 4096;
+        config.max_connections = 16;
+        config.send_copy_count = 16;
+        config.send_slab_slots = 8;
+        config
+    }
+
+    /// Create a test event loop. Requires Linux with io_uring support.
+    fn make_test_loop() -> AsyncEventLoop<NoopHandler> {
+        let config = test_config();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(eventfd >= 0, "eventfd creation failed");
+        AsyncEventLoop::new(&config, NoopHandler, None, eventfd, shutdown)
+            .expect("failed to create test event loop")
+    }
+
+    /// Simulate an accepted plaintext connection at the given index.
+    /// Returns the conn_index that was allocated.
+    fn accept_connection(el: &mut AsyncEventLoop<NoopHandler>) -> u32 {
+        let conn_index = el.driver.connections.allocate().expect("no free slots");
+        el.driver.accumulators.reset(conn_index);
+        // arm_recv needs to submit an SQE — skip in test since we inject CQEs directly.
+        // Just set recv_mode = Multi so the handlers work correctly.
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_mode = RecvMode::Multi;
+            cs.established = true;
+        }
+        conn_index
+    }
+
+    // ── Send path tests ────────────────────────────────────────────
+
+    #[test]
+    fn handle_send_complete_releases_pool_slot() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Allocate a pool slot (simulating send_nowait).
+        let data = b"hello";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        // Simulate send CQE: all bytes sent.
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
+
+        // Pool slot should be released.
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before + 1,
+            "pool slot not released after send complete"
+        );
+    }
+
+    #[test]
+    fn handle_send_error_releases_pool_slot() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let data = b"hello";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        // Simulate send error (ECONNRESET = -104).
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), -104, 0);
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before + 1,
+            "pool slot not released after send error"
+        );
+    }
+
+    #[test]
+    fn handle_send_wakes_send_waiter() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Set up a send waiter.
+        el.executor.send_waiters[conn_index as usize] = true;
+
+        let data = b"hello";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
+
+        // Waiter should be cleared and result stored.
+        assert!(
+            !el.executor.send_waiters[conn_index as usize],
+            "send waiter not cleared"
+        );
+        assert!(
+            el.executor.io_results[conn_index as usize].is_some(),
+            "send result not stored"
+        );
+    }
+
+    // ── ZC send path tests ─────────────────────────────────────────
+
+    #[test]
+    fn handle_send_msg_zc_notif_releases_slab() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Allocate a slab entry.
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [None, None, None, None];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+        let free_before = el.driver.send_slab.free_count();
+
+        // Simulate successful operation CQE (result > 0, not partial).
+        el.driver.send_slab.inc_pending_notifs(slab_idx);
+        el.driver.send_slab.mark_awaiting_notifications(slab_idx);
+
+        // Simulate notification CQE.
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        let notif_flags = 8u32; // IORING_CQE_F_NOTIF
+        el.test_dispatch_cqe(ud.raw(), 0, notif_flags);
+
+        assert_eq!(
+            el.driver.send_slab.free_count(),
+            free_before + 1,
+            "slab entry not released after notification"
+        );
+    }
+
+    #[test]
+    fn handle_send_msg_zc_error_does_not_increment_notifs() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [None, None, None, None];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+
+        // Simulate error CQE (result < 0).
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(ud.raw(), -104, 0);
+
+        // Slab should be released (not leaked waiting for notification).
+        assert!(
+            el.driver.send_slab.should_release(slab_idx) || !el.driver.send_slab.in_use(slab_idx),
+            "slab entry leaked after ZC send error"
+        );
+    }
+
+    #[test]
+    fn handle_send_msg_zc_result_zero_does_not_leak_slab() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [None, None, None, None];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+
+        // Simulate result == 0 CQE (no bytes sent, no notification expected).
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+
+        // Slab should be releasable (pending_notifs == 0).
+        assert!(
+            !el.driver.send_slab.in_use(slab_idx) || el.driver.send_slab.should_release(slab_idx),
+            "slab entry leaked on result == 0"
+        );
+    }
+
+    // ── Recv path tests ────────────────────────────────────────────
+
+    #[test]
+    fn handle_recv_multi_eof_closes_connection() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Simulate EOF CQE (result == 0).
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+
+        // Connection should be marked as closing.
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            "connection not closed after recv EOF"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_stale_connection_replenishes_buffer() {
+        let mut el = make_test_loop();
+
+        // Don't allocate a connection — simulate stale CQE for conn_index 0.
+        let replenish_before = el.driver.pending_replenish.len();
+
+        // Simulate recv CQE with result > 0 and a buffer ID in flags.
+        // IORING_CQE_F_BUFFER = 1 << 0, buffer ID in upper 16 bits of flags.
+        let bid: u16 = 5;
+        let flags = (1u32) | ((bid as u32) << 16); // CQE_F_BUFFER | bid
+        let ud = UserData::encode(OpTag::RecvMulti, 0, 0);
+        el.test_dispatch_cqe(ud.raw(), 100, flags);
+
+        // Buffer should be replenished despite stale connection.
+        assert_eq!(
+            el.driver.pending_replenish.len(),
+            replenish_before + 1,
+            "buffer not replenished on stale connection CQE"
+        );
+        assert_eq!(el.driver.pending_replenish[0], bid);
+    }
+
+    // ── Close path tests ───────────────────────────────────────────
+
+    #[test]
+    fn handle_close_releases_connection_slot() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        assert!(el.driver.connections.get(conn_index).is_some());
+
+        // Close the connection (sets recv_mode = Closed, submits Close SQE).
+        el.driver.close_connection(conn_index);
+
+        // Simulate Close CQE.
+        let ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+
+        // Connection slot should be released.
+        assert!(
+            el.driver.connections.get(conn_index).is_none(),
+            "connection slot not released after Close CQE"
+        );
+    }
 }
