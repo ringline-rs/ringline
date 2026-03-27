@@ -1450,7 +1450,7 @@ impl<F: Future> Future for TimeoutFuture<F> {
 /// The io_uring SQE was submitted before this future was created.
 /// On completion, the CQE handler stores the result and wakes the task.
 pub struct DiskIoFuture {
-    seq: u32,
+    pub(crate) seq: u32,
 }
 
 impl Future for DiskIoFuture {
@@ -1471,6 +1471,18 @@ impl Future for DiskIoFuture {
                 }
             }
         })
+    }
+}
+
+impl Drop for DiskIoFuture {
+    fn drop(&mut self) {
+        let ptr = CURRENT_DRIVER.with(|c| c.get());
+        if ptr.is_null() {
+            return;
+        }
+        let state = unsafe { &mut *ptr };
+        let executor = unsafe { &mut *state.executor };
+        executor.disk_io_waiters.remove(&self.seq);
     }
 }
 
