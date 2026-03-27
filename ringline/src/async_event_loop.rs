@@ -124,6 +124,37 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.pending_replenish.clear();
             }
 
+            // Retry any ZC send resubmissions that failed on the previous tick
+            // (SQ was full). The SQ has been flushed by submit_and_wait above.
+            if !self.driver.pending_zc_retries.is_empty() {
+                let retries: Vec<_> = self.driver.pending_zc_retries.drain(..).collect();
+                for (conn_index, slab_idx) in retries {
+                    if !self.driver.send_slab.in_use(slab_idx) {
+                        continue; // connection was closed in the meantime
+                    }
+                    let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+                    if self
+                        .driver
+                        .ring
+                        .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
+                        .is_err()
+                    {
+                        // Still failing — close the connection as last resort.
+                        self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+                        if self.driver.send_slab.should_release(slab_idx) {
+                            let pool_slot = self.driver.send_slab.release(slab_idx);
+                            if pool_slot != u16::MAX {
+                                self.driver.send_copy_pool.release(pool_slot);
+                            }
+                        }
+                        self.driver.drain_conn_send_queue(conn_index);
+                        let err = io::Error::other("SQ full during partial ZC send resubmission");
+                        self.executor.wake_send(conn_index, Err(err));
+                        self.driver.close_connection(conn_index);
+                    }
+                }
+            }
+
             // Drain waker-based ready queue (from wakers fired during poll).
             self.executor.collect_wakeups();
 
@@ -781,17 +812,27 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.send_slab.inc_pending_notifs(slab_idx);
         }
 
-        if result > 0
-            && let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32)
-            && self
-                .driver
-                .ring
-                .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
-                .is_ok()
-        {
-            return;
+        #[allow(clippy::collapsible_if)]
+        if result > 0 {
+            if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
+                // Partial send — resubmit the remainder.
+                if self
+                    .driver
+                    .ring
+                    .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
+                    .is_ok()
+                {
+                    return;
+                }
+                // Resubmission failed (SQ full) — queue for retry on the
+                // next event loop tick. The slab entry retains all iovec
+                // state from try_advance, so we can resubmit later.
+                self.driver.pending_zc_retries.push((conn_index, slab_idx));
+                return;
+            }
         }
 
+        // Send complete (all bytes sent) or error (result <= 0).
         self.driver.send_slab.mark_awaiting_notifications(slab_idx);
 
         let total_len = self.driver.send_slab.total_len(slab_idx);

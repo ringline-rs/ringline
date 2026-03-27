@@ -138,6 +138,11 @@ impl InFlightSendSlab {
         Some(&entry.msghdr as *const libc::msghdr)
     }
 
+    /// Get the msghdr pointer for a slab entry (for resubmission retries).
+    pub fn msghdr_ptr(&self, idx: u16) -> *const libc::msghdr {
+        &self.entries[idx as usize].msghdr as *const libc::msghdr
+    }
+
     /// Increment pending notification count for an entry.
     pub fn inc_pending_notifs(&mut self, idx: u16) {
         self.entries[idx as usize].pending_notifs += 1;
