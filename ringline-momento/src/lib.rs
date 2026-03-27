@@ -483,11 +483,19 @@ impl Client {
             .await;
 
         if n == 0 {
+            // Connection broken — clear pending so subsequent recv() returns
+            // NoPending instead of reading stale/misaligned responses.
+            self.pending.clear();
             return Err(Error::ConnectionClosed);
         }
 
-        let dr =
-            dispatch_result.ok_or_else(|| Error::Protocol("failed to decode response".into()))?;
+        let dr = match dispatch_result {
+            Some(dr) => dr,
+            None => {
+                self.pending.clear();
+                return Err(Error::Protocol("failed to decode response".into()));
+            }
+        };
 
         if self.is_instrumented() {
             let latency_ns = self.finish_timing(dr.send_ts, dr.start);
