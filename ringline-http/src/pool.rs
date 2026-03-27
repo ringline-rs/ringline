@@ -106,9 +106,12 @@ impl Pool {
         Err(HttpError::AllConnectionsFailed)
     }
 
-    /// Mark a slot as disconnected by index.
+    /// Mark a slot as disconnected by index, closing the underlying connection.
     pub fn mark_disconnected(&mut self, idx: usize) {
         if idx < self.slots.len() {
+            if let Slot::Connected(client) = &self.slots[idx] {
+                client.close();
+            }
             self.slots[idx] = Slot::Disconnected;
         }
     }
@@ -116,6 +119,9 @@ impl Pool {
     /// Close all connections.
     pub fn close_all(&mut self) {
         for slot in &mut self.slots {
+            if let Slot::Connected(client) = slot {
+                client.close();
+            }
             *slot = Slot::Disconnected;
         }
     }

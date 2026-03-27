@@ -193,6 +193,18 @@ impl H2Connection {
             return Err(H2Error::ConnectionError(ErrorCode::RefusedStream));
         }
 
+        // Enforce MAX_CONCURRENT_STREAMS from the server's SETTINGS.
+        if let Some(max) = self.remote_settings.max_concurrent_streams {
+            let active = self
+                .streams
+                .values()
+                .filter(|s| !matches!(s.state, StreamState::Closed))
+                .count() as u32;
+            if active >= max {
+                return Err(H2Error::ConnectionError(ErrorCode::RefusedStream));
+            }
+        }
+
         let stream_id = self.next_stream_id;
         self.next_stream_id += 2;
 
