@@ -282,17 +282,41 @@ fn decode_string_literal(buf: &[u8]) -> Result<(Vec<u8>, usize), H2Error> {
 /// HPACK encoder with dynamic table.
 pub struct Encoder {
     dynamic_table: DynamicTable,
+    /// Pending table size update to emit at the start of the next header block.
+    pending_table_size_update: Option<usize>,
 }
 
 impl Encoder {
     pub fn new(max_table_size: usize) -> Self {
-        Self {
+        Encoder {
             dynamic_table: DynamicTable::new(max_table_size),
+            pending_table_size_update: None,
         }
+    }
+
+    /// Queue a table size update to be emitted at the start of the next
+    /// header block (per RFC 7541 Section 6.3).
+    pub fn set_max_table_size(&mut self, new_size: usize, buf: &mut Vec<u8>) {
+        self.dynamic_table.set_max_size(new_size);
+        // Dynamic table size update (RFC 7541 Section 6.3):
+        // pattern 001xxxxx, 5-bit prefix.
+        encode_prefix_int(buf, new_size as u64, 5, 0x20);
+    }
+
+    /// Update the encoder's maximum table size from a SETTINGS change.
+    /// The size update will be emitted at the start of the next `encode()` call.
+    pub fn update_max_table_size(&mut self, new_size: usize) {
+        self.pending_table_size_update = Some(new_size);
     }
 
     /// Encode a list of headers into an HPACK header block.
     pub fn encode(&mut self, headers: &[HeaderField], buf: &mut Vec<u8>) {
+        // Emit pending table size update at the start of the header block
+        // (RFC 7541 Section 4.2).
+        if let Some(new_size) = self.pending_table_size_update.take() {
+            self.dynamic_table.set_max_size(new_size);
+            encode_prefix_int(buf, new_size as u64, 5, 0x20);
+        }
         for header in headers {
             self.encode_header(header, buf);
         }
@@ -339,14 +363,6 @@ impl Encoder {
         encode_string_literal(buf, &header.name);
         encode_string_literal(buf, &header.value);
         self.dynamic_table.insert(header.clone());
-    }
-
-    /// Signal a dynamic table size update to the decoder.
-    pub fn set_max_table_size(&mut self, new_size: usize, buf: &mut Vec<u8>) {
-        self.dynamic_table.set_max_size(new_size);
-        // Dynamic table size update (RFC 7541 Section 6.3):
-        // pattern 001xxxxx, 5-bit prefix.
-        encode_prefix_int(buf, new_size as u64, 5, 0x20);
     }
 }
 

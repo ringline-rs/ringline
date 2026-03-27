@@ -463,9 +463,12 @@ impl H2Connection {
 
         self.remote_settings = settings;
 
-        // Update HPACK decoder max table size.
-        self.decoder
-            .set_max_table_size(self.remote_settings.header_table_size as usize);
+        // Update HPACK encoder max table size from remote settings.
+        // The remote peer's HEADER_TABLE_SIZE limits what our encoder can reference
+        // (RFC 7541 Section 6.3). The size update is emitted at the start of the
+        // next header block.
+        self.encoder
+            .update_max_table_size(self.remote_settings.header_table_size as usize);
 
         // Adjust send windows on all open streams (RFC 7540 Section 6.9.2).
         if delta != 0 {
