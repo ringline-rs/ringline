@@ -305,7 +305,10 @@ impl ClusterClient {
                 Err(e) => return Err(e),
             };
 
-            conn.send(encoded)?;
+            if let Err(e) = conn.send(encoded) {
+                self.mark_disconnected(&target_addr);
+                return Err(Error::Io(e));
+            }
             let value = match Client::new(conn).read_value().await {
                 Ok(v) => v,
                 Err(Error::ConnectionClosed) => {
