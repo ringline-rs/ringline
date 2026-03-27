@@ -374,6 +374,31 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
+    /// Regression test for Z1: when no notification is expected (result == 0),
+    /// mark_awaiting with pending_notifs == 0 should make should_release return true.
+    #[test]
+    fn zero_notifs_mark_awaiting_releases_immediately() {
+        let mut slab = InFlightSendSlab::new(4);
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
+
+        // Simulate result == 0: no inc_pending_notifs, just mark_awaiting.
+        slab.mark_awaiting_notifications(idx);
+
+        // should_release should be true (pending_notifs == 0 && awaiting == true).
+        assert!(
+            slab.should_release(idx),
+            "slab entry should be releasable when no notifications are pending"
+        );
+
+        slab.release(idx);
+        assert_eq!(slab.free_count(), 4);
+    }
+
     #[test]
     fn exhaust_slab() {
         let mut slab = InFlightSendSlab::new(1);
