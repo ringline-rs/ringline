@@ -179,16 +179,27 @@ impl GrpcConnection {
                     // Ensure we have a buffer even for server-push scenarios.
                     self.buffers.entry(stream_id).or_default();
 
-                    self.events.push_back(GrpcEvent::Response {
-                        stream_id,
-                        metadata: headers,
-                    });
-
-                    // If end_stream with response headers, check for trailers-only.
                     if end_stream {
-                        // This is a trailers-only response — extract status inline.
-                        // We already emitted Response; the caller can check Status.
-                        self.emit_status_from_cleanup(stream_id, &[]);
+                        // Trailers-only response: HEADERS with END_STREAM carries
+                        // grpc-status in the same frame (gRPC spec Section 2).
+                        let status = extract_grpc_status(&headers);
+                        let message = extract_grpc_message(&headers);
+                        self.events.push_back(GrpcEvent::Response {
+                            stream_id,
+                            metadata: headers.clone(),
+                        });
+                        self.buffers.remove(&stream_id);
+                        self.events.push_back(GrpcEvent::Status {
+                            stream_id,
+                            status,
+                            message,
+                            metadata: headers,
+                        });
+                    } else {
+                        self.events.push_back(GrpcEvent::Response {
+                            stream_id,
+                            metadata: headers,
+                        });
                     }
                 }
                 H2Event::Data {
@@ -329,5 +340,71 @@ mod tests {
         let headers = vec![];
         assert_eq!(extract_grpc_status(&headers), GrpcStatus::Ok);
         assert_eq!(extract_grpc_message(&headers), "");
+    }
+
+    #[test]
+    fn trailers_only_response_extracts_grpc_status() {
+        use ringline_h2::hpack::Encoder;
+        use ringline_h2::{Frame, Settings};
+
+        let mut grpc = GrpcConnection::new(Settings::client_default());
+        let _ = grpc.take_pending_send();
+
+        // Settings exchange.
+        let settings = {
+            let f = Frame::Settings {
+                ack: false,
+                settings: Settings::default(),
+            };
+            let mut buf = Vec::new();
+            f.encode(&mut buf);
+            buf
+        };
+        grpc.recv(&settings).unwrap();
+        let _ = grpc.take_pending_send();
+        // Drain SettingsAcknowledged event.
+        while grpc.poll_event().is_some() {}
+
+        // Send a request.
+        let stream_id = grpc.start_request("test.Service", "Method", &[]).unwrap();
+        let _ = grpc.take_pending_send();
+
+        // Server sends trailers-only response: HEADERS with END_STREAM,
+        // carrying :status, grpc-status, and grpc-message.
+        let mut enc = Encoder::new(4096);
+        let mut encoded = Vec::new();
+        enc.encode(
+            &[
+                HeaderField::new(b":status", b"200"),
+                HeaderField::new(b"grpc-status", b"5"),
+                HeaderField::new(b"grpc-message", b"not found"),
+            ],
+            &mut encoded,
+        );
+        let frame = Frame::Headers {
+            stream_id,
+            encoded,
+            end_stream: true,
+            end_headers: true,
+            priority: None,
+        };
+        let mut resp_buf = Vec::new();
+        frame.encode(&mut resp_buf);
+        grpc.recv(&resp_buf).unwrap();
+
+        // Should get Response event followed by Status with NotFound.
+        match grpc.poll_event() {
+            Some(GrpcEvent::Response { .. }) => {}
+            other => panic!("expected Response, got {other:?}"),
+        }
+        match grpc.poll_event() {
+            Some(GrpcEvent::Status {
+                status, message, ..
+            }) => {
+                assert_eq!(status, GrpcStatus::NotFound, "wrong grpc-status");
+                assert_eq!(message, "not found", "wrong grpc-message");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 }
