@@ -1980,4 +1980,39 @@ mod tests {
             "ZC send error result not stored"
         );
     }
+
+    // ── DiskIoFuture Drop test ─────────────────────────────────────
+
+    #[test]
+    fn disk_io_future_drop_clears_waiter() {
+        let mut el = make_test_loop();
+
+        // Insert a disk_io_waiter entry manually.
+        let seq = 42u32;
+        let task_id = 0u32;
+        el.executor.disk_io_waiters.insert(seq, task_id);
+        assert!(el.executor.disk_io_waiters.contains_key(&seq));
+
+        // Set up thread-local so DiskIoFuture::drop can access executor.
+        let driver_ptr = &mut el.driver as *mut Driver;
+        let executor_ptr = &mut el.executor as *mut Executor;
+        let mut driver_state = DriverState {
+            driver: driver_ptr,
+            executor: executor_ptr,
+        };
+        set_driver_state(&mut driver_state);
+
+        // Create and immediately drop a DiskIoFuture.
+        {
+            let _fut = crate::runtime::io::DiskIoFuture { seq };
+        }
+
+        clear_driver_state();
+
+        // Waiter should be cleaned up.
+        assert!(
+            !el.executor.disk_io_waiters.contains_key(&seq),
+            "disk_io_waiter not cleared on DiskIoFuture drop"
+        );
+    }
 }
