@@ -128,9 +128,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // (SQ was full). The SQ has been flushed by submit_and_wait above.
             if !self.driver.pending_zc_retries.is_empty() {
                 let retries: Vec<_> = self.driver.pending_zc_retries.drain(..).collect();
-                for (conn_index, slab_idx) in retries {
+                for (conn_index, generation, slab_idx) in retries {
                     if !self.driver.send_slab.in_use(slab_idx) {
-                        continue; // connection was closed in the meantime
+                        continue; // slab was released in the meantime
+                    }
+                    // Verify the connection hasn't been reused (generation check).
+                    if self.driver.connections.get(conn_index).is_none()
+                        || self.driver.connections.generation(conn_index) != generation
+                    {
+                        // Connection closed or reused — release the slab.
+                        self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+                        if self.driver.send_slab.should_release(slab_idx) {
+                            let pool_slot = self.driver.send_slab.release(slab_idx);
+                            if pool_slot != u16::MAX {
+                                self.driver.send_copy_pool.release(pool_slot);
+                            }
+                        }
+                        continue;
                     }
                     let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
                     if self
@@ -158,8 +172,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Retry any copy send resubmissions that failed (SQ was full).
             if !self.driver.pending_copy_retries.is_empty() {
                 let retries: Vec<_> = self.driver.pending_copy_retries.drain(..).collect();
-                for (conn_index, pool_slot) in retries {
+                for (conn_index, generation, pool_slot) in retries {
                     if !self.driver.send_copy_pool.in_use(pool_slot) {
+                        continue;
+                    }
+                    // Verify the connection hasn't been reused (generation check).
+                    if self.driver.connections.get(conn_index).is_none()
+                        || self.driver.connections.generation(conn_index) != generation
+                    {
+                        self.driver.send_copy_pool.release(pool_slot);
                         continue;
                     }
                     let (ptr, remaining) =
@@ -787,9 +808,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .is_err()
                 {
                     // SQ full — queue for retry on next tick.
+                    let generation = self.driver.connections.generation(conn_index);
                     self.driver
                         .pending_copy_retries
-                        .push((conn_index, pool_slot));
+                        .push((conn_index, generation, pool_slot));
                 }
                 return;
             }
@@ -898,7 +920,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // Resubmission failed (SQ full) — queue for retry on the
                 // next event loop tick. The slab entry retains all iovec
                 // state from try_advance, so we can resubmit later.
-                self.driver.pending_zc_retries.push((conn_index, slab_idx));
+                let generation = self.driver.connections.generation(conn_index);
+                self.driver
+                    .pending_zc_retries
+                    .push((conn_index, generation, slab_idx));
                 return;
             }
         }
@@ -1131,9 +1156,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 // SQ full — queue for retry on next tick. Use copy retry
                 // since TLS sends use SendCopyPool slots.
+                let generation = self.driver.connections.generation(conn_index);
                 self.driver
                     .pending_copy_retries
-                    .push((conn_index, pool_slot));
+                    .push((conn_index, generation, pool_slot));
             }
             return;
         }
