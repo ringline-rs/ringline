@@ -155,6 +155,38 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
 
+            // Retry any copy send resubmissions that failed (SQ was full).
+            if !self.driver.pending_copy_retries.is_empty() {
+                let retries: Vec<_> = self.driver.pending_copy_retries.drain(..).collect();
+                for (conn_index, pool_slot) in retries {
+                    if !self.driver.send_copy_pool.in_use(pool_slot) {
+                        continue;
+                    }
+                    let (ptr, remaining) =
+                        self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
+                    // Determine opcode: TLS connections use TlsSend, others use Send.
+                    let is_tls = self
+                        .driver
+                        .tls_table
+                        .as_ref()
+                        .is_some_and(|t| t.has(conn_index));
+                    let result = if is_tls {
+                        self.driver
+                            .ring
+                            .submit_tls_send(conn_index, ptr, remaining, pool_slot)
+                    } else {
+                        self.driver
+                            .ring
+                            .submit_send_copied(conn_index, ptr, remaining, pool_slot)
+                    };
+                    if result.is_err() {
+                        self.driver.send_copy_pool.release(pool_slot);
+                        self.driver.drain_conn_send_queue(conn_index);
+                        self.driver.close_connection(conn_index);
+                    }
+                }
+            }
+
             // Drain waker-based ready queue (from wakers fired during poll).
             self.executor.collect_wakeups();
 
@@ -720,10 +752,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
             {
-                let _ = self
+                if self
                     .driver
                     .ring
-                    .submit_send_copied(conn_index, ptr, remaining, pool_slot);
+                    .submit_send_copied(conn_index, ptr, remaining, pool_slot)
+                    .is_err()
+                {
+                    // SQ full — queue for retry on next tick.
+                    self.driver
+                        .pending_copy_retries
+                        .push((conn_index, pool_slot));
+                }
                 return;
             }
             let total = self.driver.send_copy_pool.original_len(pool_slot);
@@ -1056,10 +1095,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
         {
-            let _ = self
+            if self
                 .driver
                 .ring
-                .submit_tls_send(conn_index, ptr, remaining, pool_slot);
+                .submit_tls_send(conn_index, ptr, remaining, pool_slot)
+                .is_err()
+            {
+                // SQ full — queue for retry on next tick. Use copy retry
+                // since TLS sends use SendCopyPool slots.
+                self.driver
+                    .pending_copy_retries
+                    .push((conn_index, pool_slot));
+            }
             return;
         }
         self.driver.send_copy_pool.release(pool_slot);

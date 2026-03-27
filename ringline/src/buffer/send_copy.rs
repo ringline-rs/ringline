@@ -107,6 +107,22 @@ impl SendCopyPool {
         Some((ptr, new_remaining))
     }
 
+    /// Whether a slot is currently in use (allocated but not yet released).
+    pub fn in_use(&self, slot: u16) -> bool {
+        self.in_use.get(slot as usize).copied().unwrap_or(false)
+    }
+
+    /// Get the current pointer and remaining length for a slot (for resubmission retries).
+    pub fn current_ptr_remaining(&self, slot: u16) -> (*const u8, u32) {
+        let i = slot as usize;
+        let base = i * self.slot_size as usize;
+        let ptr = self
+            .backing
+            .as_ptr()
+            .wrapping_add(base + self.slot_offset[i] as usize);
+        (ptr, self.slot_remaining[i])
+    }
+
     /// Get the original total length for a slot: offset + remaining.
     /// Valid between `copy_in` and `release`.
     pub fn original_len(&self, slot: u16) -> u32 {
