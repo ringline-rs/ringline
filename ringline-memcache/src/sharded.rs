@@ -176,7 +176,11 @@ impl ShardedClient {
                 },
             };
 
-            conn.send(encoded)?;
+            if let Err(e) = conn.send(encoded) {
+                shard.conns[idx] = ShardConn::Disconnected;
+                conn.close();
+                return Err(Error::Io(e));
+            }
             match Client::new(conn).read_response().await {
                 Ok(response) => {
                     shard.next = (idx + 1) % size;

@@ -183,7 +183,11 @@ impl ShardedClient {
                 },
             };
 
-            conn.send(encoded)?;
+            if let Err(e) = conn.send(encoded) {
+                shard.conns[idx] = ShardConn::Disconnected;
+                conn.close();
+                return Err(Error::Io(e));
+            }
             match Client::new(conn).read_value().await {
                 Ok(value) => {
                     // Advance round-robin past the connection we used.
