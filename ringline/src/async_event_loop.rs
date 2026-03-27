@@ -345,6 +345,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let has_more = cqueue::more(flags);
 
         if self.driver.connections.get(conn_index).is_none() {
+            // Connection already released — but if result > 0, the kernel
+            // consumed a provided buffer that must be replenished.
+            if result > 0
+                && let Some(bid) = cqueue::buffer_select(flags)
+            {
+                self.driver.pending_replenish.push(bid);
+            }
             return;
         }
 
@@ -373,7 +380,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let bid = match cqueue::buffer_select(flags) {
             Some(bid) => bid,
-            None => return,
+            None => {
+                // No buffer selected despite result > 0 — should not happen.
+                // Close the connection to prevent a silent hang (no recv armed).
+                if !has_more {
+                    self.executor.wake_recv(conn_index);
+                    self.driver.close_connection(conn_index);
+                }
+                return;
+            }
         };
 
         let bytes_received = result as u32;
@@ -501,6 +516,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let has_more = cqueue::more(flags);
 
         if self.driver.connections.get(conn_index).is_none() {
+            if result > 0
+                && let Some(bid) = cqueue::buffer_select(flags)
+            {
+                self.driver.pending_replenish.push(bid);
+            }
             return;
         }
 
@@ -531,7 +551,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let bid = match cqueue::buffer_select(flags) {
             Some(bid) => bid,
-            None => return,
+            None => {
+                if !has_more {
+                    self.executor.wake_recv(conn_index);
+                    self.driver.close_connection(conn_index);
+                }
+                return;
+            }
         };
 
         let buf_len = result as u32;
