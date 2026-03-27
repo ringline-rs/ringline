@@ -777,11 +777,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if ps != u16::MAX {
                     self.driver.send_copy_pool.release(ps);
                 }
-            } else if result >= 0 {
+            } else if result > 0 {
+                // Kernel sends a ZC notification only when result > 0.
+                // result == 0 means no bytes sent — no notification will arrive.
                 self.driver.send_slab.inc_pending_notifs(slab_idx);
                 self.driver.send_slab.mark_awaiting_notifications(slab_idx);
                 self.driver.chain_table.inc_zc_notif(conn_index);
             } else {
+                // result == 0 or result < 0 (excluding ECANCELED above):
+                // release immediately — no ZC notification coming.
                 let ps = self.driver.send_slab.release(slab_idx);
                 if ps != u16::MAX {
                     self.driver.send_copy_pool.release(ps);

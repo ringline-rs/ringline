@@ -1603,41 +1603,43 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
     /// All SQEs are linked with IO_LINK except the last. Registers chain
     /// state in the SendChainTable for CQE tracking.
     pub fn finish(mut self) -> io::Result<()> {
-        self.finished = true;
-
         if let Some(e) = self.error.take() {
-            self.release_all();
+            // finished stays false — Drop will call release_all().
             return Err(e);
         }
 
         let count = self.built.len();
         if count == 0 {
+            self.finished = true;
             return Ok(());
         }
 
         let total_bytes = self.total_bytes;
         let conn_index = self.conn.index;
 
+        // Clone the SQE entries for submission, keeping self.built intact.
+        // On failure, Drop will call release_all() on the original entries.
         if count == 1 {
-            // Single SQE — no IO_LINK needed, but register chain state for
-            // consistent CQE handling.
-            let built = self.built.pop().unwrap();
-            self.ctx.chain_table.start(conn_index, 1, total_bytes);
+            let entry = self.built[0].entry.clone();
             unsafe {
-                self.ctx.ring.push_sqe(built.entry)?;
+                self.ctx.ring.push_sqe(entry)?;
             }
+            self.ctx.chain_table.start(conn_index, 1, total_bytes);
         } else {
-            // Multiple SQEs — push as linked chain.
             let mut entries: Vec<io_uring::squeue::Entry> =
-                self.built.drain(..).map(|b| b.entry).collect();
-            self.ctx
-                .chain_table
-                .start(conn_index, count as u16, total_bytes);
+                self.built.iter().map(|b| b.entry.clone()).collect();
             unsafe {
                 self.ctx.ring.push_sqe_chain(&mut entries)?;
             }
+            self.ctx
+                .chain_table
+                .start(conn_index, count as u16, total_bytes);
         }
 
+        // Submission succeeded — resources now owned by kernel/CQE handlers.
+        self.built.clear();
+
+        self.finished = true;
         Ok(())
     }
 
