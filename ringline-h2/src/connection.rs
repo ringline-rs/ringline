@@ -268,12 +268,24 @@ impl H2Connection {
             let _ = self.conn_send_window.consume(len);
         }
 
-        let frame = Frame::Data {
-            stream_id,
-            payload: data.to_vec(),
-            end_stream,
+        // Split data into frames respecting the remote peer's MAX_FRAME_SIZE.
+        let max_frame = self.remote_settings.max_frame_size as usize;
+        let chunks: Vec<&[u8]> = if data.is_empty() {
+            vec![&[]]
+        } else {
+            data.chunks(max_frame).collect()
         };
-        frame.encode(&mut self.send_buf);
+        let last_idx = chunks.len() - 1;
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_last_chunk = i == last_idx;
+            let frame = Frame::Data {
+                stream_id,
+                payload: chunk.to_vec(),
+                end_stream: end_stream && is_last_chunk,
+            };
+            frame.encode(&mut self.send_buf);
+        }
 
         if end_stream {
             let stream = self.streams.get_mut(&stream_id).unwrap();
@@ -993,6 +1005,65 @@ mod tests {
         assert!(
             conn.poll_event().is_none(),
             "expected no events after Closing"
+        );
+    }
+
+    #[test]
+    fn send_data_splits_large_payload_into_multiple_frames() {
+        let mut conn = H2Connection::new(Settings::client_default());
+        let _ = conn.take_pending_send();
+
+        // Server sends SETTINGS with max_frame_size = 16384 (default).
+        let server_settings = make_settings_frame(&Settings::default(), false);
+        conn.recv(&server_settings).unwrap();
+        let _ = conn.take_pending_send();
+
+        // Open a stream.
+        let headers = vec![
+            HeaderField::new(b":method", b"POST"),
+            HeaderField::new(b":path", b"/upload"),
+            HeaderField::new(b":scheme", b"https"),
+            HeaderField::new(b":authority", b"example.com"),
+        ];
+        let stream_id = conn.send_request(&headers, false).unwrap();
+        let _ = conn.take_pending_send();
+
+        // Send data larger than max_frame_size (16384).
+        let large_data = vec![0xABu8; 40000];
+        conn.send_data(stream_id, &large_data, true).unwrap();
+
+        let send = conn.take_pending_send();
+
+        // Should have produced multiple DATA frames.
+        // Parse frame headers to count them.
+        let mut offset = 0;
+        let mut frame_count = 0;
+        let mut total_payload = 0;
+        let mut last_end_stream = false;
+
+        while offset + 9 <= send.len() {
+            let header = frame::decode_frame_header(&send[offset..]).unwrap();
+            assert_eq!(header.frame_type, frame::FRAME_DATA);
+            assert_eq!(header.stream_id, stream_id);
+            assert!(
+                header.length <= 16384,
+                "frame payload {} exceeds max_frame_size 16384",
+                header.length
+            );
+            total_payload += header.length as usize;
+            last_end_stream = header.flags & frame::FLAG_END_STREAM != 0;
+            offset += 9 + header.length as usize;
+            frame_count += 1;
+        }
+
+        assert!(
+            frame_count >= 3,
+            "expected at least 3 frames for 40000 bytes, got {frame_count}"
+        );
+        assert_eq!(total_payload, 40000, "total payload mismatch");
+        assert!(
+            last_end_stream,
+            "END_STREAM should be set only on the last frame"
         );
     }
 }
