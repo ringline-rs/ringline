@@ -482,12 +482,27 @@ fn decode_chunk(data: &[u8]) -> ChunkResult<'_> {
     };
 
     if size == 0 {
-        // Last chunk.
-        return ChunkResult::Complete {
-            data: &[],
-            consumed: crlf + 2, // size line + \r\n
-            is_last: true,
-        };
+        // Last chunk: 0\r\n followed by optional trailer headers and
+        // a final \r\n. Scan past any trailers to find the empty line.
+        let after_zero = crlf + 2;
+        let mut pos = after_zero;
+        loop {
+            match find_crlf(&data[pos..]) {
+                Some(0) => {
+                    // Empty line — end of trailer section.
+                    return ChunkResult::Complete {
+                        data: &[],
+                        consumed: pos + 2,
+                        is_last: true,
+                    };
+                }
+                Some(next_crlf) => {
+                    // Trailer header line — skip it.
+                    pos += next_crlf + 2;
+                }
+                None => return ChunkResult::NeedMore,
+            }
+        }
     }
 
     let chunk_start = crlf + 2;
@@ -562,11 +577,60 @@ mod tests {
     }
 
     #[test]
-    fn decode_chunk_last() {
+    fn decode_chunk_last_with_empty_trailers() {
+        // Terminal chunk: "0\r\n\r\n" (no trailers, just the empty line).
+        let data = b"0\r\n\r\n";
+        match decode_chunk(data) {
+            ChunkResult::Complete {
+                is_last, consumed, ..
+            } => {
+                assert!(is_last);
+                assert_eq!(consumed, 5, "should consume 0\\r\\n\\r\\n");
+            }
+            ChunkResult::NeedMore => panic!("expected Complete"),
+        }
+    }
+
+    #[test]
+    fn decode_chunk_last_needs_trailing_crlf() {
+        // Just "0\r\n" without the trailing \r\n — need more data.
         let data = b"0\r\n";
         match decode_chunk(data) {
-            ChunkResult::Complete { is_last, .. } => {
+            ChunkResult::NeedMore => {}
+            ChunkResult::Complete { .. } => panic!("expected NeedMore"),
+        }
+    }
+
+    #[test]
+    fn decode_chunk_last_with_trailers() {
+        // Terminal chunk with trailer headers.
+        let data = b"0\r\nTrailer: value\r\n\r\n";
+        match decode_chunk(data) {
+            ChunkResult::Complete {
+                is_last, consumed, ..
+            } => {
                 assert!(is_last);
+                assert_eq!(
+                    consumed,
+                    data.len(),
+                    "should consume entire trailer section"
+                );
+            }
+            ChunkResult::NeedMore => panic!("expected Complete"),
+        }
+    }
+
+    #[test]
+    fn decode_chunk_last_does_not_consume_next_response() {
+        // Terminal chunk followed by the start of the next response.
+        let data = b"0\r\n\r\nHTTP/1.1 200 OK\r\n";
+        match decode_chunk(data) {
+            ChunkResult::Complete {
+                is_last, consumed, ..
+            } => {
+                assert!(is_last);
+                assert_eq!(consumed, 5, "should only consume 0\\r\\n\\r\\n");
+                assert_eq!(&data[consumed..], b"HTTP/1.1 200 OK\r\n");
             }
             ChunkResult::NeedMore => panic!("expected Complete"),
         }
