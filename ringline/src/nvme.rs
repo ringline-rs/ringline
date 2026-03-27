@@ -95,9 +95,9 @@ impl NvmeUringCmd {
             addr: buf_addr,
             metadata_len: 0,
             data_len: buf_len,
-            cdw10: lba as u32,              // SLBA low
-            cdw11: (lba >> 32) as u32,      // SLBA high
-            cdw12: (num_blocks - 1) as u32, // NLB (0-based)
+            cdw10: lba as u32,         // SLBA low
+            cdw11: (lba >> 32) as u32, // SLBA high
+            cdw12: num_blocks.checked_sub(1).expect("num_blocks must be >= 1") as u32, // NLB (0-based)
             cdw13: 0,
             cdw14: 0,
             cdw15: 0,
@@ -128,7 +128,7 @@ impl NvmeUringCmd {
             data_len: buf_len,
             cdw10: lba as u32,
             cdw11: (lba >> 32) as u32,
-            cdw12: (num_blocks - 1) as u32,
+            cdw12: num_blocks.checked_sub(1).expect("num_blocks must be >= 1") as u32,
             cdw13: 0,
             cdw14: 0,
             cdw15: 0,
@@ -446,5 +446,29 @@ mod tests {
         let dev = slab.release(a);
         assert_eq!(dev, 0);
         assert!(!slab.in_use(a));
+    }
+
+    #[test]
+    #[should_panic(expected = "num_blocks must be >= 1")]
+    fn read_zero_blocks_panics() {
+        NvmeUringCmd::read(1, 0, 0, 0x1234, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "num_blocks must be >= 1")]
+    fn write_zero_blocks_panics() {
+        NvmeUringCmd::write(1, 0, 0, 0x1234, 0);
+    }
+
+    #[test]
+    fn read_one_block_has_nlb_zero() {
+        let cmd = NvmeUringCmd::read(1, 42, 1, 0x1234, 512);
+        assert_eq!(cmd.cdw12, 0, "NLB for 1 block should be 0 (0-based)");
+    }
+
+    #[test]
+    fn write_max_blocks_has_correct_nlb() {
+        let cmd = NvmeUringCmd::write(1, 0, u16::MAX, 0x1234, 512);
+        assert_eq!(cmd.cdw12, (u16::MAX - 1) as u32);
     }
 }

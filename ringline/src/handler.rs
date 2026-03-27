@@ -734,6 +734,9 @@ impl<'a> DriverCtx<'a> {
         buf_addr: u64,
         buf_len: u32,
     ) -> io::Result<u32> {
+        if num_blocks == 0 {
+            return Err(io::Error::other("num_blocks must be >= 1"));
+        }
         let (fd_index, nsid) = self.validate_nvme_device(device)?;
 
         let slab = self
@@ -789,6 +792,9 @@ impl<'a> DriverCtx<'a> {
         buf_addr: u64,
         buf_len: u32,
     ) -> io::Result<u32> {
+        if num_blocks == 0 {
+            return Err(io::Error::other("num_blocks must be >= 1"));
+        }
         let (fd_index, nsid) = self.validate_nvme_device(device)?;
 
         let slab = self
