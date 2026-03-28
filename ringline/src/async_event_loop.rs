@@ -1375,6 +1375,80 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.drain_completions();
     }
 
+    /// Test-only: directly drain pending retry queues (without running
+    /// the full event loop). This tests the retry mechanism in isolation.
+    #[cfg(test)]
+    pub(crate) fn drain_retries(&mut self) {
+        // Copy retry drain — mirrors the logic in run().
+        if !self.driver.pending_copy_retries.is_empty() {
+            let retries: Vec<_> = self.driver.pending_copy_retries.drain(..).collect();
+            for (conn_index, generation, pool_slot) in retries {
+                if !self.driver.send_copy_pool.in_use(pool_slot) {
+                    continue;
+                }
+                if self.driver.connections.get(conn_index).is_none()
+                    || self.driver.connections.generation(conn_index) != generation
+                {
+                    self.driver.send_copy_pool.release(pool_slot);
+                    continue;
+                }
+                let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
+                let result = self
+                    .driver
+                    .ring
+                    .submit_send_copied(conn_index, ptr, remaining, pool_slot);
+                if result.is_err() {
+                    self.driver.send_copy_pool.release(pool_slot);
+                    self.driver.drain_conn_send_queue(conn_index);
+                    let err = io::Error::other("SQ full during partial copy send resubmission");
+                    self.executor.wake_send(conn_index, Err(err));
+                    self.driver.close_connection(conn_index);
+                }
+            }
+        }
+
+        // ZC retry drain.
+        if !self.driver.pending_zc_retries.is_empty() {
+            let retries: Vec<_> = self.driver.pending_zc_retries.drain(..).collect();
+            for (conn_index, generation, slab_idx) in retries {
+                if !self.driver.send_slab.in_use(slab_idx) {
+                    continue;
+                }
+                if self.driver.connections.get(conn_index).is_none()
+                    || self.driver.connections.generation(conn_index) != generation
+                {
+                    self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+                    if self.driver.send_slab.should_release(slab_idx) {
+                        let pool_slot = self.driver.send_slab.release(slab_idx);
+                        if pool_slot != u16::MAX {
+                            self.driver.send_copy_pool.release(pool_slot);
+                        }
+                    }
+                    continue;
+                }
+                let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+                if self
+                    .driver
+                    .ring
+                    .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
+                    .is_err()
+                {
+                    self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+                    if self.driver.send_slab.should_release(slab_idx) {
+                        let pool_slot = self.driver.send_slab.release(slab_idx);
+                        if pool_slot != u16::MAX {
+                            self.driver.send_copy_pool.release(pool_slot);
+                        }
+                    }
+                    self.driver.drain_conn_send_queue(conn_index);
+                    let err = io::Error::other("SQ full during partial ZC send resubmission");
+                    self.executor.wake_send(conn_index, Err(err));
+                    self.driver.close_connection(conn_index);
+                }
+            }
+        }
+    }
+
     /// Test-only: inject multiple NOPs and dispatch them all in one batch.
     /// This tests batch CQE processing where one handler's side effects
     /// affect subsequent handlers in the same drain_completions() call.
@@ -2531,5 +2605,126 @@ mod tests {
         // Both pool slots released.
         assert!(!el.driver.send_copy_pool.in_use(s1));
         assert!(!el.driver.send_copy_pool.in_use(s2));
+    }
+
+    // ── Retry drain tests ──────────────────────────────────────────
+    //
+    // Test the pending retry mechanism by manually populating the
+    // retry queues and draining them.
+
+    #[test]
+    fn retry_drain_copy_send_releases_on_closed_connection() {
+        // Queue a copy retry for a connection that has since been closed.
+        // The retry drain should release the pool slot and skip.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let data = b"retry-data";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let generation = el.driver.connections.generation(conn_index);
+
+        // Queue the retry.
+        el.driver
+            .pending_copy_retries
+            .push((conn_index, generation, slot));
+
+        // Close the connection before the retry fires.
+        el.driver.close_connection(conn_index);
+        // Simulate the Close CQE to fully release the slot.
+        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.inject_and_dispatch(close_ud.raw(), 0);
+
+        // Now drain retries — the connection is gone.
+        el.drain_retries();
+
+        // Retry queue should be empty.
+        assert!(el.driver.pending_copy_retries.is_empty());
+        // Pool slot should be released (not leaked).
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "pool slot leaked on retry with closed connection"
+        );
+    }
+
+    #[test]
+    fn retry_drain_copy_send_with_reused_connection() {
+        // Queue a copy retry, then close and reuse the connection slot.
+        // The generation check should prevent resubmission to the new connection.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let old_generation = el.driver.connections.generation(conn_index);
+
+        let data = b"retry-data";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+
+        // Queue the retry with the old generation.
+        el.driver
+            .pending_copy_retries
+            .push((conn_index, old_generation, slot));
+
+        // Close the connection.
+        el.driver.close_connection(conn_index);
+        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.inject_and_dispatch(close_ud.raw(), 0);
+
+        // Reuse the slot with a new connection.
+        let new_conn_index = accept_connection(&mut el);
+        assert_eq!(
+            new_conn_index, conn_index,
+            "expected slot reuse for generation test"
+        );
+        let new_generation = el.driver.connections.generation(conn_index);
+        assert_ne!(old_generation, new_generation);
+
+        // Drain retries — should detect generation mismatch.
+        el.drain_retries();
+
+        // Pool slot should be released (not resubmitted to new connection).
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "pool slot should be released on generation mismatch"
+        );
+        // New connection should be unaffected.
+        assert!(el.driver.connections.get(new_conn_index).is_some());
+    }
+
+    #[test]
+    fn retry_drain_zc_send_releases_on_closed_connection() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [None, None, None, None];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+
+        // Simulate: operation CQE already incremented pending_notifs.
+        el.driver.send_slab.inc_pending_notifs(slab_idx);
+
+        // Queue the ZC retry.
+        el.driver
+            .pending_zc_retries
+            .push((conn_index, generation, slab_idx));
+
+        // Close the connection.
+        el.driver.close_connection(conn_index);
+        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.inject_and_dispatch(close_ud.raw(), 0);
+
+        // Drain retries — connection is gone.
+        el.drain_retries();
+
+        assert!(el.driver.pending_zc_retries.is_empty());
+        // Slab should be marked for release (awaiting_notifications set,
+        // and pending_notifs is still 1 — will be released when the
+        // notification CQE arrives).
+        // The key assertion: no panic, no hang, retry was handled.
     }
 }
