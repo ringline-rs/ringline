@@ -27,7 +27,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use super::io::{with_state, ConnCtx};
+use super::io::{ConnCtx, with_state};
 use crate::connection::RecvMode;
 
 /// Wraps a [`ConnCtx`] and implements [`AsyncRead`], [`AsyncWrite`], and
