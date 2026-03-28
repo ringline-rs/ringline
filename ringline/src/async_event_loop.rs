@@ -2980,4 +2980,190 @@ mod tests {
         // The key assertion: no panic during processing, and the slot
         // is cleanly released.
     }
+
+    // ── Property-based tests (proptest) ────────────────────────────
+    //
+    // Generate random sequences of CQE events and verify resource
+    // invariants hold: no pool leaks, no slab leaks, no panics.
+
+    mod proptest_cqe {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Random CQE action on a connection with an allocated pool slot.
+        #[derive(Debug, Clone)]
+        enum SendAction {
+            /// Send completes successfully (all bytes).
+            Ok,
+            /// Send fails with an error.
+            Error,
+            /// Send completes with 0 bytes.
+            Zero,
+        }
+
+        /// Random CQE action for ZC sends.
+        #[derive(Debug, Clone)]
+        enum ZcAction {
+            /// ZC send succeeds, notification follows.
+            OkThenNotif,
+            /// ZC send fails with error.
+            Error,
+            /// ZC send result == 0.
+            Zero,
+        }
+
+        /// Random recv CQE result.
+        #[derive(Debug, Clone)]
+        enum RecvAction {
+            /// EOF (result == 0).
+            Eof,
+            /// Error (unknown errno).
+            Error,
+            /// ENOBUFS — buffer ring exhausted.
+            Enobufs,
+            /// ECANCELED.
+            Ecanceled,
+        }
+
+        fn send_action_strategy() -> impl Strategy<Value = SendAction> {
+            prop_oneof![
+                Just(SendAction::Ok),
+                Just(SendAction::Error),
+                Just(SendAction::Zero),
+            ]
+        }
+
+        fn zc_action_strategy() -> impl Strategy<Value = ZcAction> {
+            prop_oneof![
+                Just(ZcAction::OkThenNotif),
+                Just(ZcAction::Error),
+                Just(ZcAction::Zero),
+            ]
+        }
+
+        fn recv_action_strategy() -> impl Strategy<Value = RecvAction> {
+            prop_oneof![
+                Just(RecvAction::Eof),
+                Just(RecvAction::Error),
+                Just(RecvAction::Enobufs),
+                Just(RecvAction::Ecanceled),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(200))]
+
+            #[test]
+            fn send_sequence_no_pool_leak(actions in proptest::collection::vec(send_action_strategy(), 1..8)) {
+                let mut el = make_test_loop();
+                let conn_index = accept_connection(&mut el);
+                el.driver.send_queues[conn_index as usize].in_flight = true;
+
+                let initial_free = el.driver.send_copy_pool.free_count();
+
+                for action in &actions {
+                    let data = b"test";
+                    let (slot, _, _) = match el.driver.send_copy_pool.copy_in(data) {
+                        Some(s) => s,
+                        None => break, // pool exhausted — stop sequence
+                    };
+
+                    let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+                    let result = match action {
+                        SendAction::Ok => data.len() as i32,
+                        SendAction::Error => -104, // ECONNRESET
+                        SendAction::Zero => 0,
+                    };
+                    el.test_dispatch_cqe(ud.raw(), result, 0);
+                }
+
+                // All pool slots should be released (no leaks).
+                prop_assert_eq!(
+                    el.driver.send_copy_pool.free_count(),
+                    initial_free,
+                    "pool slot leak detected"
+                );
+            }
+
+            #[test]
+            fn zc_sequence_no_slab_leak(actions in proptest::collection::vec(zc_action_strategy(), 1..6)) {
+                let mut el = make_test_loop();
+                let conn_index = accept_connection(&mut el);
+
+                let initial_slab_free = el.driver.send_slab.free_count();
+                let _initial_pool_free = el.driver.send_copy_pool.free_count();
+
+                for action in &actions {
+                    let iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 100 }];
+                    let guards = [None, None, None, None];
+                    let (slab_idx, _) = match el.driver.send_slab.allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100) {
+                        Some(s) => s,
+                        None => break,
+                    };
+
+                    let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+
+                    match action {
+                        ZcAction::OkThenNotif => {
+                            // Operation CQE with success.
+                            el.test_dispatch_cqe(ud.raw(), 100, 0);
+                            // Notification CQE.
+                            el.test_dispatch_cqe(ud.raw(), 0, 8); // IORING_CQE_F_NOTIF
+                        }
+                        ZcAction::Error => {
+                            el.test_dispatch_cqe(ud.raw(), -104, 0);
+                            // Error path: mark_awaiting + should_release.
+                            // May need explicit release if should_release is true.
+                            if el.driver.send_slab.in_use(slab_idx) && el.driver.send_slab.should_release(slab_idx) {
+                                el.driver.send_slab.release(slab_idx);
+                            }
+                        }
+                        ZcAction::Zero => {
+                            el.test_dispatch_cqe(ud.raw(), 0, 0);
+                            if el.driver.send_slab.in_use(slab_idx) && el.driver.send_slab.should_release(slab_idx) {
+                                el.driver.send_slab.release(slab_idx);
+                            }
+                        }
+                    }
+                }
+
+                // All slab entries should be released.
+                prop_assert_eq!(
+                    el.driver.send_slab.free_count(),
+                    initial_slab_free,
+                    "slab entry leak detected"
+                );
+            }
+
+            #[test]
+            fn recv_sequence_no_panic(actions in proptest::collection::vec(recv_action_strategy(), 1..10)) {
+                let mut el = make_test_loop();
+                let conn_index = accept_connection(&mut el);
+
+                for action in &actions {
+                    // Skip if connection already closed.
+                    if el.driver.connections.get(conn_index).is_none()
+                        || matches!(
+                            el.driver.connections.get(conn_index).unwrap().recv_mode,
+                            RecvMode::Closed
+                        )
+                    {
+                        break;
+                    }
+
+                    let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+                    let result = match action {
+                        RecvAction::Eof => 0,
+                        RecvAction::Error => -99,
+                        RecvAction::Enobufs => -105,
+                        RecvAction::Ecanceled => -125,
+                    };
+                    el.test_dispatch_cqe(ud.raw(), result, 0);
+                }
+
+                // No assertion needed — the property is "no panic".
+                // If we get here, the sequence was handled cleanly.
+            }
+        }
+    }
 }
