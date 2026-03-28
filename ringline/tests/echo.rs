@@ -3589,3 +3589,64 @@ fn buffer_ring_exhaustion_recovers() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── Connect timeout test ────────────────────────────────────────────
+
+static TIMEOUT_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+struct ConnectTimeoutClient;
+
+impl AsyncEventHandler for ConnectTimeoutClient {
+    fn on_accept(&self, _conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn std::future::Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            // Connect to a black-hole address with a 50ms timeout.
+            // 192.0.2.1 is TEST-NET-1 (RFC 5737) — routable but unreachable.
+            let addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
+            match ringline::connect_with_timeout(addr, 50) {
+                Ok(fut) => match fut.await {
+                    Ok(_) => {
+                        TIMEOUT_RESULT.set("UNEXPECTED_OK".into()).ok();
+                    }
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::TimedOut {
+                            TIMEOUT_RESULT.set("TIMED_OUT".into()).ok();
+                        } else {
+                            TIMEOUT_RESULT.set(format!("ERR:{e}")).ok();
+                        }
+                    }
+                },
+                Err(e) => {
+                    TIMEOUT_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                }
+            }
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        ConnectTimeoutClient
+    }
+}
+
+#[test]
+fn async_connect_timeout_fires() {
+    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+        .launch::<ConnectTimeoutClient>()
+        .expect("client launch failed");
+
+    for h in c_handles {
+        h.join().unwrap().unwrap();
+    }
+
+    let result = TIMEOUT_RESULT.get().expect("on_start did not set result");
+    // Accept either TimedOut or a connection error (some networks reject
+    // immediately instead of black-holing).
+    assert!(
+        result == "TIMED_OUT" || result.starts_with("ERR:"),
+        "expected timeout or connection error, got: {result}"
+    );
+}
