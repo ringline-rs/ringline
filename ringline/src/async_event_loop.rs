@@ -1453,6 +1453,34 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// This tests batch CQE processing where one handler's side effects
     /// affect subsequent handlers in the same drain_completions() call.
     #[cfg(test)]
+    /// Test-only: submit a linked chain of NOP injects and dispatch.
+    /// The first N-1 SQEs have IO_LINK set; the last does not.
+    /// This tests IOSQE_IO_LINK error propagation through the kernel.
+    #[cfg(test)]
+    pub(crate) fn inject_linked_chain_and_dispatch(&mut self, cqes: &[(u64, i32)]) {
+        let last = cqes.len() - 1;
+        for (i, &(user_data_raw, result)) in cqes.iter().enumerate() {
+            if i < last {
+                self.driver
+                    .ring
+                    .submit_nop_inject_linked(user_data_raw, result)
+                    .expect("submit_nop_inject_linked failed");
+            } else {
+                self.driver
+                    .ring
+                    .submit_nop_inject(user_data_raw, result)
+                    .expect("submit_nop_inject failed");
+            }
+        }
+        self.driver
+            .ring
+            .submit_and_wait(cqes.len() as u32)
+            .expect("submit_and_wait failed");
+        self.drain_completions();
+    }
+
+    /// Test-only: inject multiple NOPs and dispatch them all in one batch.
+    #[cfg(test)]
     pub(crate) fn inject_batch_and_dispatch(&mut self, cqes: &[(u64, i32)]) {
         for &(user_data_raw, result) in cqes {
             self.driver
@@ -2726,5 +2754,123 @@ mod tests {
         // and pending_notifs is still 1 — will be released when the
         // notification CQE arrives).
         // The key assertion: no panic, no hang, retry was handled.
+    }
+
+    // ── Linked SQE chain error propagation tests ───────────────────
+    //
+    // Submit linked NOP chains where the first SQE fails. The kernel
+    // cancels subsequent linked SQEs with ECANCELED. This tests the
+    // chain error handling path end-to-end through the real kernel.
+
+    #[test]
+    fn linked_chain_copy_send_first_fails_releases_all() {
+        // 3-SQE chain: first Send fails, second and third get ECANCELED.
+        // All pool slots should be released, chain should complete.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.executor.send_waiters[conn_index as usize] = true;
+
+        // Allocate 3 pool slots for the chain.
+        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
+        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (s3, _, _) = el.driver.send_copy_pool.copy_in(b"ccc").unwrap();
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        // Register chain state: 3 SQEs, 9 total bytes.
+        el.driver.chain_table.start(conn_index, 3, 9);
+
+        // Submit linked NOPs: first with injected error, rest linked.
+        // The kernel will deliver: error CQE, ECANCELED CQE, ECANCELED CQE.
+        let ud1 = UserData::encode(OpTag::Send, conn_index, s1 as u32);
+        let ud2 = UserData::encode(OpTag::Send, conn_index, s2 as u32);
+        let ud3 = UserData::encode(OpTag::Send, conn_index, s3 as u32);
+
+        el.inject_linked_chain_and_dispatch(&[
+            (ud1.raw(), -104), // ECONNRESET — first SQE fails
+            (ud2.raw(), 0),    // kernel sets result for linked NOPs
+            (ud3.raw(), 0),    // kernel sets result for linked NOPs
+        ]);
+
+        // All 3 pool slots should be released.
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before + 3,
+            "not all pool slots released after chain error"
+        );
+
+        // Chain should be complete (no longer active).
+        assert!(
+            !el.driver.chain_table.is_active(conn_index),
+            "chain still active after all CQEs processed"
+        );
+
+        // Send waiter should have been woken with an error.
+        assert!(
+            !el.executor.send_waiters[conn_index as usize],
+            "send waiter not cleared"
+        );
+        assert!(
+            el.executor.io_results[conn_index as usize].is_some(),
+            "chain result not stored"
+        );
+    }
+
+    #[test]
+    fn linked_chain_middle_fails_rest_canceled() {
+        // 3-SQE chain: first succeeds, second fails, third ECANCELED.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.executor.send_waiters[conn_index as usize] = true;
+
+        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
+        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (s3, _, _) = el.driver.send_copy_pool.copy_in(b"ccc").unwrap();
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        el.driver.chain_table.start(conn_index, 3, 9);
+
+        let ud1 = UserData::encode(OpTag::Send, conn_index, s1 as u32);
+        let ud2 = UserData::encode(OpTag::Send, conn_index, s2 as u32);
+        let ud3 = UserData::encode(OpTag::Send, conn_index, s3 as u32);
+
+        el.inject_linked_chain_and_dispatch(&[
+            (ud1.raw(), 3),    // first succeeds (3 bytes)
+            (ud2.raw(), -104), // second fails
+            (ud3.raw(), 0),    // third ECANCELED
+        ]);
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before + 3,
+            "not all pool slots released"
+        );
+        assert!(!el.driver.chain_table.is_active(conn_index));
+        assert!(!el.executor.send_waiters[conn_index as usize]);
+    }
+
+    #[test]
+    fn linked_chain_all_succeed() {
+        // 3-SQE chain: all succeed. No errors.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.executor.send_waiters[conn_index as usize] = true;
+
+        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
+        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        let (s3, _, _) = el.driver.send_copy_pool.copy_in(b"ccc").unwrap();
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        el.driver.chain_table.start(conn_index, 3, 9);
+
+        let ud1 = UserData::encode(OpTag::Send, conn_index, s1 as u32);
+        let ud2 = UserData::encode(OpTag::Send, conn_index, s2 as u32);
+        let ud3 = UserData::encode(OpTag::Send, conn_index, s3 as u32);
+
+        el.inject_linked_chain_and_dispatch(&[(ud1.raw(), 3), (ud2.raw(), 3), (ud3.raw(), 3)]);
+
+        assert_eq!(el.driver.send_copy_pool.free_count(), free_before + 3);
+        assert!(!el.driver.chain_table.is_active(conn_index));
+        assert!(!el.executor.send_waiters[conn_index as usize]);
+        assert!(el.executor.io_results[conn_index as usize].is_some());
     }
 }

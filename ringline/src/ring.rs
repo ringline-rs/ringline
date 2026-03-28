@@ -404,6 +404,26 @@ impl Ring {
         unsafe { self.push_sqe(entry) }
     }
 
+    /// Like `submit_nop_inject` but with IOSQE_IO_LINK set, so the
+    /// next SQE in the submission queue is linked to this one.
+    #[cfg(test)]
+    pub(crate) fn submit_nop_inject_linked(
+        &mut self,
+        user_data: u64,
+        result: i32,
+    ) -> io::Result<()> {
+        let mut entry = opcode::Nop::new()
+            .build()
+            .user_data(user_data)
+            .flags(squeue::Flags::IO_LINK);
+        let ptr = &mut entry as *mut squeue::Entry as *mut u8;
+        unsafe {
+            std::ptr::write_unaligned(ptr.add(24) as *mut u32, result as u32);
+            std::ptr::write_unaligned(ptr.add(28) as *mut u32, 1); // IORING_NOP_INJECT_RESULT
+        }
+        unsafe { self.push_sqe(entry) }
+    }
+
     /// # Safety
     /// The SQE must reference valid memory for the lifetime of the operation.
     pub(crate) unsafe fn push_sqe(&mut self, entry: squeue::Entry) -> io::Result<()> {
