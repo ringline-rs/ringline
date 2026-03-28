@@ -64,6 +64,7 @@ pub mod config;
 pub mod error;
 pub mod guard;
 pub mod handler;
+pub mod signal;
 
 // ── Re-exports: Handler types ─────────────────────────────────────────
 
@@ -195,6 +196,11 @@ pub use runtime::channel::TrySendError;
 pub use runtime::channel::mpsc;
 /// Single-use async channel for sending exactly one value.
 pub use runtime::channel::oneshot;
+
+// ── Re-exports: Signal handling ──────────────────────────────────────────
+
+/// A caught signal (`SIGINT` or `SIGTERM`).
+pub use signal::Signal;
 
 // ── Re-exports: Stream adapter ──────────────────────────────────────────
 

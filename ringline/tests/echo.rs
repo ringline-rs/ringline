@@ -4194,3 +4194,38 @@ fn mpsc_channel_backpressure() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── signal handling tests ───────────────────────────────────────────
+
+/// wait_on_signal shuts down workers when SIGTERM is sent to self.
+#[test]
+fn signal_wait_on_signal_shutdown() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<AsyncEcho>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    // Verify server is running.
+    let got = echo_round_trip(&addr, b"hi");
+    assert_eq!(got, b"hi");
+
+    // Send SIGTERM to self from a background thread after a short delay.
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM);
+        }
+    });
+
+    let sig = shutdown.wait_on_signal();
+    assert_eq!(sig, ringline::Signal::Terminate);
+
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
