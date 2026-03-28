@@ -3164,6 +3164,164 @@ mod tests {
                 // No assertion needed — the property is "no panic".
                 // If we get here, the sequence was handled cleanly.
             }
+
+            /// Mixed operation sequence across multiple connections.
+            /// This is the most aggressive test — it interleaves different
+            /// operation types on different connections, including connection
+            /// lifecycle (accept, use, close, slot reuse).
+            #[test]
+            fn mixed_operations_no_leak_no_panic(
+                actions in proptest::collection::vec(0..10u8, 5..30)
+            ) {
+                let mut el = make_test_loop();
+                let initial_pool_free = el.driver.send_copy_pool.free_count();
+                let initial_slab_free = el.driver.send_slab.free_count();
+
+                // Track live connections and their allocated resources.
+                let mut live_conns: Vec<u32> = Vec::new();
+                let mut pool_slots_in_flight: Vec<u16> = Vec::new();
+
+                for action in actions {
+                    match action {
+                        // Accept a new connection (if capacity available).
+                        0 => {
+                            if live_conns.len() < 8 {
+                                let ci = accept_connection(&mut el);
+                                el.driver.send_queues[ci as usize].in_flight = false;
+                                live_conns.push(ci);
+                            }
+                        }
+
+                        // Send success on a random live connection.
+                        1 if !live_conns.is_empty() => {
+                            let ci = live_conns[0];
+                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
+                                let ud = UserData::encode(OpTag::Send, ci, slot as u32);
+                                el.test_dispatch_cqe(ud.raw(), 4, 0);
+                            }
+                        }
+
+                        // Send error on a random live connection.
+                        2 if !live_conns.is_empty() => {
+                            let ci = live_conns[0];
+                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
+                                let ud = UserData::encode(OpTag::Send, ci, slot as u32);
+                                el.test_dispatch_cqe(ud.raw(), -104, 0);
+                            }
+                        }
+
+                        // ZC send success + notification on a live connection.
+                        3 if !live_conns.is_empty() => {
+                            let ci = live_conns[0];
+                            let iovecs = [libc::iovec {
+                                iov_base: std::ptr::null_mut(),
+                                iov_len: 50,
+                            }];
+                            let guards = [None, None, None, None];
+                            if let Some((slab_idx, _)) = el.driver.send_slab.allocate(
+                                ci, &iovecs, u16::MAX, guards, 0, 50,
+                            ) {
+                                let ud = UserData::encode(
+                                    OpTag::SendMsgZc, ci, slab_idx as u32,
+                                );
+                                // Operation CQE (success).
+                                el.test_dispatch_cqe(ud.raw(), 50, 0);
+                                // Notification CQE.
+                                el.test_dispatch_cqe(ud.raw(), 0, 8);
+                            }
+                        }
+
+                        // ZC send error on a live connection.
+                        4 if !live_conns.is_empty() => {
+                            let ci = live_conns[0];
+                            let iovecs = [libc::iovec {
+                                iov_base: std::ptr::null_mut(),
+                                iov_len: 50,
+                            }];
+                            let guards = [None, None, None, None];
+                            if let Some((slab_idx, _)) = el.driver.send_slab.allocate(
+                                ci, &iovecs, u16::MAX, guards, 0, 50,
+                            ) {
+                                let ud = UserData::encode(
+                                    OpTag::SendMsgZc, ci, slab_idx as u32,
+                                );
+                                el.test_dispatch_cqe(ud.raw(), -104, 0);
+                                // Release if should_release.
+                                if el.driver.send_slab.in_use(slab_idx)
+                                    && el.driver.send_slab.should_release(slab_idx)
+                                {
+                                    el.driver.send_slab.release(slab_idx);
+                                }
+                            }
+                        }
+
+                        // Recv EOF — closes the connection.
+                        5 if !live_conns.is_empty() => {
+                            let ci = live_conns.remove(0);
+                            let ud = UserData::encode(OpTag::RecvMulti, ci, 0);
+                            el.test_dispatch_cqe(ud.raw(), 0, 0);
+                            // Simulate Close CQE.
+                            let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                            el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                        }
+
+                        // Recv error.
+                        6 if !live_conns.is_empty() => {
+                            let ci = live_conns[0];
+                            let ud = UserData::encode(OpTag::RecvMulti, ci, 0);
+                            el.test_dispatch_cqe(ud.raw(), -105, 0); // ENOBUFS
+                        }
+
+                        // Send + Recv EOF in same batch (the cross-CQE bug pattern).
+                        7 if !live_conns.is_empty() => {
+                            let ci = live_conns.remove(0);
+                            if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
+                                pool_slots_in_flight.push(slot);
+                                let send_ud = UserData::encode(OpTag::Send, ci, slot as u32);
+                                let recv_ud = UserData::encode(OpTag::RecvMulti, ci, 0);
+                                // EOF first, then stale send — the bug pattern.
+                                el.test_dispatch_cqe(recv_ud.raw(), 0, 0);
+                                el.test_dispatch_cqe(send_ud.raw(), 4, 0);
+                                // Close CQE.
+                                let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                                el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                            } else {
+                                live_conns.insert(0, ci); // put it back
+                            }
+                        }
+
+                        // Close a live connection directly.
+                        8 if !live_conns.is_empty() => {
+                            let ci = live_conns.remove(0);
+                            el.driver.close_connection(ci);
+                            let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                            el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                        }
+
+                        // No-op (or action on empty conn list).
+                        _ => {}
+                    }
+                }
+
+                // Clean up remaining live connections.
+                for ci in &live_conns {
+                    el.driver.close_connection(*ci);
+                    let close_ud = UserData::encode(OpTag::Close, *ci, 0);
+                    el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                }
+
+                // Invariants: no resource leaks.
+                prop_assert_eq!(
+                    el.driver.send_copy_pool.free_count(),
+                    initial_pool_free,
+                    "pool slot leak after mixed operations"
+                );
+                prop_assert_eq!(
+                    el.driver.send_slab.free_count(),
+                    initial_slab_free,
+                    "slab entry leak after mixed operations"
+                );
+            }
         }
     }
 }
