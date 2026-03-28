@@ -27,3 +27,4 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rcgen = { workspace = true }
 rustls = { workspace = true, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { workspace = true }
+proptest = "1"
