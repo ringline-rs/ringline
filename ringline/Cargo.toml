@@ -11,9 +11,12 @@ keywords = ["io-uring", "async", "networking", "linux", "event-loop"]
 categories = ["asynchronous", "network-programming"]
 
 [features]
+default = ["futures-io"]
 timestamps = []
+futures-io = ["dep:futures-io"]
 
 [dependencies]
+futures-io = { version = "0.3", optional = true }
 bytes = "1"
 crossbeam-channel = "0.5"
 io-uring = "0.7"
@@ -24,6 +27,8 @@ thiserror = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 
 [dev-dependencies]
+futures-io = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
 rcgen = { workspace = true }
 rustls = { workspace = true, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { workspace = true }
