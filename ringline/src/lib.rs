@@ -177,6 +177,12 @@ pub use runtime::select::select3;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
 
+// ── Re-exports: Stream adapter ──────────────────────────────────────────
+
+/// Wraps a [`ConnCtx`] and implements `futures_io::{AsyncRead, AsyncWrite, AsyncBufRead}`.
+#[cfg(feature = "futures-io")]
+pub use runtime::stream::ConnStream;
+
 // ── Re-exports: Shared types ────────────────────────────────────────────
 
 /// Memory region for io_uring fixed buffer registration.
