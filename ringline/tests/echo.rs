@@ -3530,3 +3530,62 @@ fn async_outbound_connect_receives_eof() {
         "expected EOF on outbound connect, got: {result}"
     );
 }
+
+// ── Buffer ring exhaustion stress test ──────────────────────────────
+
+#[test]
+fn buffer_ring_exhaustion_recovers() {
+    // Use a tiny buffer ring (4 buffers) to force ENOBUFS under
+    // concurrent connection load, then verify all data echoes correctly.
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut config = test_config();
+    config.recv_buffer.ring_size = 4; // Very small — triggers ENOBUFS easily.
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<AsyncEcho>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    // Open 8 connections simultaneously and send data on all of them.
+    let mut threads = Vec::new();
+    for i in 0..8 {
+        let addr = addr.clone();
+        threads.push(std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(&addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+
+            // Send a message identifying this connection.
+            let msg = format!("connection-{i}-payload");
+            stream.write_all(msg.as_bytes()).unwrap();
+            stream.flush().unwrap();
+
+            // Read back the echo.
+            let mut buf = vec![0u8; msg.len()];
+            let mut total = 0;
+            while total < msg.len() {
+                match stream.read(&mut buf[total..]) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("conn {i} read error: {e}"),
+                }
+            }
+            assert_eq!(&buf[..total], msg.as_bytes(), "conn {i} echo mismatch");
+        }));
+    }
+
+    for t in threads {
+        t.join().expect("connection thread panicked");
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
