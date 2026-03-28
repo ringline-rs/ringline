@@ -1,9 +1,10 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -123,6 +124,133 @@ impl TaskId {
             executor.standalone_slab.remove(self.0);
         });
     }
+}
+
+// ── JoinHandle ──────────────────────────────────────────────────────
+
+/// Shared state between a spawned wrapper future and its [`JoinHandle`].
+struct JoinState<T> {
+    /// The task's return value, written by the wrapper when it completes.
+    result: Option<T>,
+    /// Raw task ID of the task awaiting this handle (includes `STANDALONE_BIT`
+    /// for standalone tasks). Set by `JoinHandle::poll` when it returns `Pending`.
+    waiter: Option<u32>,
+    /// True if [`JoinHandle::abort`] was called.
+    aborted: bool,
+}
+
+/// Handle to a spawned task's return value.
+///
+/// Obtained from [`spawn_with_handle()`]. Implements [`Future`] — awaiting it
+/// yields the task's return value `T` once the task completes.
+///
+/// # Drop semantics
+///
+/// Dropping a `JoinHandle` without awaiting it **detaches** the task: the
+/// task continues running but its result is discarded. This matches tokio's
+/// semantics.
+///
+/// # Abort
+///
+/// [`abort()`](Self::abort) cancels the spawned task. A `JoinHandle` that has
+/// been aborted will never resolve if polled.
+pub struct JoinHandle<T> {
+    state: Rc<RefCell<JoinState<T>>>,
+    task_id: TaskId,
+}
+
+impl<T> JoinHandle<T> {
+    /// Get the underlying [`TaskId`].
+    pub fn id(&self) -> TaskId {
+        self.task_id
+    }
+
+    /// Cancel the spawned task.
+    ///
+    /// The future is dropped immediately and its slab slot is freed.
+    /// After this call, awaiting the handle will hang forever — use
+    /// [`select()`](crate::select) with a flag if you need to detect
+    /// cancellation.
+    pub fn abort(&self) {
+        self.state.borrow_mut().aborted = true;
+        self.task_id.cancel();
+    }
+}
+
+impl<T: 'static> Future for JoinHandle<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
+        let mut s = self.state.borrow_mut();
+        if s.aborted {
+            return Poll::Pending;
+        }
+        if let Some(value) = s.result.take() {
+            return Poll::Ready(value);
+        }
+        // Register this task as the waiter so the child can wake us.
+        s.waiter = Some(CURRENT_TASK_ID.with(|c| c.get()));
+        Poll::Pending
+    }
+}
+
+/// Spawn a standalone async task and return a handle to await its result.
+///
+/// Like [`spawn()`], the future runs on the current worker's single-threaded
+/// executor. The returned [`JoinHandle<T>`] implements [`Future<Output = T>`] —
+/// awaiting it yields the task's return value once it completes.
+///
+/// # Detach semantics
+///
+/// Dropping the handle without awaiting it detaches the task: the task keeps
+/// running but its result is silently discarded.
+///
+/// # Errors
+///
+/// Returns `Err` if called outside the ringline executor or if the standalone
+/// task slab is exhausted.
+///
+/// # Panics in the spawned task
+///
+/// A panic in the spawned future unwinds the worker thread (same as [`spawn()`]).
+pub fn spawn_with_handle<T: 'static>(
+    future: impl Future<Output = T> + 'static,
+) -> io::Result<JoinHandle<T>> {
+    let state = Rc::new(RefCell::new(JoinState {
+        result: None,
+        waiter: None,
+        aborted: false,
+    }));
+    let state_for_wrapper = Rc::clone(&state);
+
+    let wrapper = async move {
+        let value = future.await;
+        let mut s = state_for_wrapper.borrow_mut();
+        s.result = Some(value);
+        let waiter = s.waiter.take();
+        // Drop the borrow before calling with_state — defensive against
+        // any re-entrant borrow in the wakeup path.
+        drop(s);
+        if let Some(waiter_id) = waiter {
+            with_state(|_driver, executor| {
+                executor.wake_task(waiter_id);
+            });
+        }
+    };
+
+    try_with_state(
+        |_driver, executor| match executor.standalone_slab.spawn(Box::pin(wrapper)) {
+            Some(idx) => {
+                executor.ready_queue.push_back(idx | STANDALONE_BIT);
+                Ok(JoinHandle {
+                    state: Rc::clone(&state),
+                    task_id: TaskId(idx),
+                })
+            }
+            None => Err(io::Error::other("standalone task slab exhausted")),
+        },
+    )
+    .unwrap_or_else(|| Err(io::Error::other("called outside executor")))
 }
 
 /// Initiate an outbound TCP connection from any async task (connection or standalone).

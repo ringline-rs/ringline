@@ -3650,3 +3650,298 @@ fn async_connect_timeout_fires() {
         "expected timeout or connection error, got: {result}"
     );
 }
+
+// ── spawn_with_handle / JoinHandle tests ────────────────────────────
+
+/// Send a trigger byte and read the full response (up to 256 bytes).
+fn trigger_and_read(addr: &str) -> Vec<u8> {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = vec![0u8; 256];
+    let mut total = 0;
+    loop {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+    buf.truncate(total);
+    buf
+}
+
+static JOIN_RESULT: AtomicU32 = AtomicU32::new(0);
+
+/// Handler that uses spawn_with_handle to await a spawned task's result.
+struct JoinHandleHandler;
+
+impl AsyncEventHandler for JoinHandleHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            // Spawn a task that computes a value after a short sleep.
+            let handle = ringline::spawn_with_handle(async {
+                ringline::sleep(Duration::from_millis(10)).await;
+                99u32
+            })
+            .unwrap();
+
+            let value = handle.await;
+            JOIN_RESULT.store(value, Ordering::SeqCst);
+            let _ = conn.send_nowait(b"done");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        JoinHandleHandler
+    }
+}
+
+#[test]
+fn spawn_with_handle_awaits_result() {
+    JOIN_RESULT.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<JoinHandleHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"done");
+    assert_eq!(JOIN_RESULT.load(Ordering::SeqCst), 99);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that spawns a task returning a value synchronously (no .await).
+struct ImmediateJoinHandler;
+
+static IMMEDIATE_RESULT: AtomicU32 = AtomicU32::new(0);
+
+impl AsyncEventHandler for ImmediateJoinHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            // Task completes synchronously on first poll — result should
+            // be available immediately when JoinHandle is next polled.
+            let handle = ringline::spawn_with_handle(async { 42u32 }).unwrap();
+            // Yield once so the child gets polled.
+            ringline::sleep(Duration::from_millis(1)).await;
+            let value = handle.await;
+            IMMEDIATE_RESULT.store(value, Ordering::SeqCst);
+            let _ = conn.send_nowait(b"ok");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ImmediateJoinHandler
+    }
+}
+
+#[test]
+fn spawn_with_handle_immediate_completion() {
+    IMMEDIATE_RESULT.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<ImmediateJoinHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"ok");
+    assert_eq!(IMMEDIATE_RESULT.load(Ordering::SeqCst), 42);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that drops the JoinHandle without awaiting — task should still run.
+struct DetachHandler;
+
+static DETACH_RAN: AtomicU32 = AtomicU32::new(0);
+
+impl AsyncEventHandler for DetachHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            {
+                let _handle = ringline::spawn_with_handle(async {
+                    DETACH_RAN.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+                // _handle dropped here without await
+            }
+
+            // Give the detached task a tick to run.
+            ringline::sleep(Duration::from_millis(20)).await;
+            let _ = conn.send_nowait(b"ok");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        DetachHandler
+    }
+}
+
+#[test]
+fn spawn_with_handle_detach_on_drop() {
+    DETACH_RAN.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<DetachHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"ok");
+    assert!(DETACH_RAN.load(Ordering::SeqCst) >= 1);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that spawns a long-sleeping task and aborts it.
+struct AbortHandler;
+
+impl AsyncEventHandler for AbortHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            let handle = ringline::spawn_with_handle(async {
+                ringline::sleep(Duration::from_secs(60)).await;
+                42u32
+            })
+            .unwrap();
+
+            handle.abort();
+
+            // Verify we can spawn another task (slot was freed).
+            let ok = ringline::spawn(async {}).is_ok();
+            let _ = conn.send_nowait(if ok { b"ok" as &[u8] } else { b"fail" });
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        AbortHandler
+    }
+}
+
+#[test]
+fn spawn_with_handle_abort() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<AbortHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"ok");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that spawns multiple tasks and awaits all of them.
+struct MultiJoinHandler;
+
+static MULTI_SUM: AtomicU32 = AtomicU32::new(0);
+
+impl AsyncEventHandler for MultiJoinHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            let h1 = ringline::spawn_with_handle(async { 10u32 }).unwrap();
+            let h2 = ringline::spawn_with_handle(async { 20u32 }).unwrap();
+            let h3 = ringline::spawn_with_handle(async { 30u32 }).unwrap();
+
+            let (a, b) = ringline::join(h1, h2).await;
+            let c = h3.await;
+            MULTI_SUM.store(a + b + c, Ordering::SeqCst);
+            let _ = conn.send_nowait(b"ok");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        MultiJoinHandler
+    }
+}
+
+#[test]
+fn spawn_with_handle_multiple_join() {
+    MULTI_SUM.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<MultiJoinHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"ok");
+    assert_eq!(MULTI_SUM.load(Ordering::SeqCst), 60);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
