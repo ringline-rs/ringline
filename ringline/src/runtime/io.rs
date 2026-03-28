@@ -238,8 +238,8 @@ pub fn spawn_with_handle<T: 'static>(
         }
     };
 
-    try_with_state(|_driver, executor| {
-        match executor.standalone_slab.spawn(Box::pin(wrapper)) {
+    try_with_state(
+        |_driver, executor| match executor.standalone_slab.spawn(Box::pin(wrapper)) {
             Some(idx) => {
                 executor.ready_queue.push_back(idx | STANDALONE_BIT);
                 Ok(JoinHandle {
@@ -248,8 +248,8 @@ pub fn spawn_with_handle<T: 'static>(
                 })
             }
             None => Err(io::Error::other("standalone task slab exhausted")),
-        }
-    })
+        },
+    )
     .unwrap_or_else(|| Err(io::Error::other("called outside executor")))
 }
 
