@@ -181,6 +181,21 @@ pub use runtime::select::select3;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
 
+// ── Re-exports: Channels ────────────────────────────────────────────────
+
+/// Error returned by [`oneshot::Receiver`] when the sender is dropped.
+pub use runtime::channel::RecvError;
+/// Error returned by [`mpsc::Sender::send`] when the receiver is dropped.
+pub use runtime::channel::SendError;
+/// Error returned by [`mpsc::Receiver::try_recv`].
+pub use runtime::channel::TryRecvError;
+/// Error returned by [`mpsc::Sender::try_send`].
+pub use runtime::channel::TrySendError;
+/// Bounded multi-producer, single-consumer async channel.
+pub use runtime::channel::mpsc;
+/// Single-use async channel for sending exactly one value.
+pub use runtime::channel::oneshot;
+
 // ── Re-exports: Stream adapter ──────────────────────────────────────────
 
 /// Wraps a [`ConnCtx`] and implements `futures_io::{AsyncRead, AsyncWrite, AsyncBufRead}`.
