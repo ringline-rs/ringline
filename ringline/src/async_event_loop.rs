@@ -2873,4 +2873,111 @@ mod tests {
         assert!(!el.executor.send_waiters[conn_index as usize]);
         assert!(el.executor.io_results[conn_index as usize].is_some());
     }
+
+    // ── Cancel injection tests ─────────────────────────────────────
+    //
+    // Submit a real timeout SQE, then cancel it with ASYNC_CANCEL.
+    // This exercises the timer ECANCELED path through the real kernel,
+    // simulating what happens when SleepFuture is dropped via select!.
+
+    #[test]
+    fn cancel_injection_timer_ecanceled() {
+        let mut el = make_test_loop();
+
+        // Allocate a timer slot and submit a real timeout (10 seconds — won't fire).
+        let waker_id = 0u32;
+        let (slot, generation) = el.executor.timer_pool.allocate(waker_id).unwrap();
+
+        // Set up the timespec in the pool.
+        el.executor.timer_pool.timespecs[slot as usize] =
+            io_uring::types::Timespec::new().sec(10).nsec(0);
+
+        let payload = TimerSlotPool::encode_payload(slot, generation);
+        let timer_ud = UserData::encode(OpTag::Timer, 0, payload);
+        let ts_ptr =
+            &el.executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
+
+        // Submit the real timeout SQE.
+        el.driver
+            .ring
+            .submit_timeout(ts_ptr, timer_ud)
+            .expect("submit_timeout failed");
+
+        // Now cancel it — simulating SleepFuture::drop.
+        el.driver
+            .ring
+            .submit_async_cancel(timer_ud.raw(), 0)
+            .expect("submit_async_cancel failed");
+
+        // Process CQEs: should get Timer CQE with -ECANCELED,
+        // and Cancel CQE (which is a no-op in dispatch).
+        el.driver
+            .ring
+            .submit_and_wait(2)
+            .expect("submit_and_wait failed");
+        el.drain_completions();
+
+        // Timer should NOT be fired (it was cancelled, not expired).
+        assert!(
+            !el.executor.timer_pool.is_fired(slot),
+            "cancelled timer should not be fired"
+        );
+
+        // Simulate SleepFuture::drop releasing the slot.
+        el.executor.timer_pool.release(slot);
+
+        // Verify the slot can be reallocated (proves it was returned).
+        let (slot2, _gen2) = el.executor.timer_pool.allocate(0).unwrap();
+        assert_eq!(slot2, slot, "released slot should be reusable");
+        el.executor.timer_pool.release(slot2);
+    }
+
+    #[test]
+    fn cancel_injection_timer_fires_before_cancel() {
+        // Submit a very short timeout (1ns), then cancel. The timeout
+        // might fire before the cancel takes effect. Both outcomes
+        // should be handled without panic or leak.
+        let mut el = make_test_loop();
+
+        let waker_id = 0u32;
+        let (slot, generation) = el.executor.timer_pool.allocate(waker_id).unwrap();
+
+        // 1 nanosecond timeout — will fire almost immediately.
+        el.executor.timer_pool.timespecs[slot as usize] =
+            io_uring::types::Timespec::new().sec(0).nsec(1);
+
+        let payload = TimerSlotPool::encode_payload(slot, generation);
+        let timer_ud = UserData::encode(OpTag::Timer, 0, payload);
+        let ts_ptr =
+            &el.executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
+
+        el.driver
+            .ring
+            .submit_timeout(ts_ptr, timer_ud)
+            .expect("submit_timeout failed");
+        el.driver
+            .ring
+            .submit_async_cancel(timer_ud.raw(), 0)
+            .expect("submit_async_cancel failed");
+
+        // Process all CQEs.
+        el.driver
+            .ring
+            .submit_and_wait(1)
+            .expect("submit_and_wait failed");
+        // Small sleep to let both CQEs arrive.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        el.drain_completions();
+
+        // Either the timer fired (-ETIME) or was cancelled (-ECANCELED).
+        // In both cases: no panic, no leak.
+        // If fired, the slot is marked as fired.
+        // If cancelled, the slot is not fired.
+        // Release the slot (simulating SleepFuture::drop).
+        el.executor.timer_pool.release(slot);
+
+        // No assertions on fired state — both outcomes are valid.
+        // The key assertion: no panic during processing, and the slot
+        // is cleanly released.
+    }
 }
