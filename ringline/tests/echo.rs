@@ -3945,3 +3945,252 @@ fn spawn_with_handle_multiple_join() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── oneshot channel tests ───────────────────────────────────────────
+
+static ONESHOT_RESULT: AtomicU32 = AtomicU32::new(0);
+
+/// Spawn a task that sends a value on a oneshot, await it from the connection task.
+struct OneshotHandler;
+
+impl AsyncEventHandler for OneshotHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            let (tx, rx) = ringline::oneshot::channel::<u32>();
+            ringline::spawn(async move {
+                ringline::sleep(Duration::from_millis(10)).await;
+                let _ = tx.send(77);
+            })
+            .unwrap();
+
+            match rx.await {
+                Ok(val) => ONESHOT_RESULT.store(val, Ordering::SeqCst),
+                Err(_) => ONESHOT_RESULT.store(999, Ordering::SeqCst),
+            }
+            let _ = conn.send_nowait(b"done");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        OneshotHandler
+    }
+}
+
+#[test]
+fn oneshot_channel_async_wakeup() {
+    ONESHOT_RESULT.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<OneshotHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"done");
+    assert_eq!(ONESHOT_RESULT.load(Ordering::SeqCst), 77);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Sender dropped without sending — receiver gets RecvError.
+static ONESHOT_CLOSED: AtomicU32 = AtomicU32::new(0);
+
+struct OneshotClosedHandler;
+
+impl AsyncEventHandler for OneshotClosedHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            let (tx, rx) = ringline::oneshot::channel::<u32>();
+            ringline::spawn(async move {
+                drop(tx); // Drop without sending.
+            })
+            .unwrap();
+
+            // Give the spawned task a tick to run.
+            ringline::sleep(Duration::from_millis(10)).await;
+            match rx.await {
+                Ok(_) => ONESHOT_CLOSED.store(0, Ordering::SeqCst),
+                Err(_) => ONESHOT_CLOSED.store(1, Ordering::SeqCst),
+            }
+            let _ = conn.send_nowait(b"done");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        OneshotClosedHandler
+    }
+}
+
+#[test]
+fn oneshot_channel_sender_dropped() {
+    ONESHOT_CLOSED.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<OneshotClosedHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"done");
+    assert_eq!(ONESHOT_CLOSED.load(Ordering::SeqCst), 1);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── mpsc channel tests ──────────────────────────────────────────────
+
+static MPSC_SUM: AtomicU32 = AtomicU32::new(0);
+
+/// Multiple senders, single receiver via mpsc.
+struct MpscHandler;
+
+impl AsyncEventHandler for MpscHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            let (tx, rx) = ringline::mpsc::channel::<u32>(16);
+
+            // Spawn 3 senders.
+            for i in 0..3 {
+                let tx = tx.clone();
+                ringline::spawn(async move {
+                    ringline::sleep(Duration::from_millis(5)).await;
+                    let _ = tx.try_send(10 * (i + 1));
+                })
+                .unwrap();
+            }
+            // Drop original sender so only the clones remain.
+            drop(tx);
+
+            // Receive until channel closes.
+            let mut sum = 0u32;
+            while let Some(val) = rx.recv().await {
+                sum += val;
+            }
+            MPSC_SUM.store(sum, Ordering::SeqCst);
+            let _ = conn.send_nowait(b"done");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        MpscHandler
+    }
+}
+
+#[test]
+fn mpsc_channel_multiple_senders() {
+    MPSC_SUM.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<MpscHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"done");
+    // 10 + 20 + 30 = 60
+    assert_eq!(MPSC_SUM.load(Ordering::SeqCst), 60);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// async send with backpressure — channel capacity 1, multiple sends.
+static MPSC_BACKPRESSURE: AtomicU32 = AtomicU32::new(0);
+
+struct MpscBackpressureHandler;
+
+impl AsyncEventHandler for MpscBackpressureHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            let (tx, rx) = ringline::mpsc::channel::<u32>(1);
+
+            // Sender task: send 5 values through a capacity-1 channel.
+            ringline::spawn(async move {
+                for i in 1..=5 {
+                    tx.send(i).await.unwrap();
+                }
+            })
+            .unwrap();
+
+            // Receiver: drain all values.
+            let mut sum = 0u32;
+            while let Some(val) = rx.recv().await {
+                sum += val;
+            }
+            MPSC_BACKPRESSURE.store(sum, Ordering::SeqCst);
+            let _ = conn.send_nowait(b"done");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        MpscBackpressureHandler
+    }
+}
+
+#[test]
+fn mpsc_channel_backpressure() {
+    MPSC_BACKPRESSURE.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<MpscBackpressureHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"done");
+    // 1 + 2 + 3 + 4 + 5 = 15
+    assert_eq!(MPSC_BACKPRESSURE.load(Ordering::SeqCst), 15);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
