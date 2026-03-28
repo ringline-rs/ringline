@@ -142,6 +142,10 @@ pub use runtime::io::sleep;
 pub use runtime::io::sleep_until;
 /// Spawn a standalone async task on the current worker.
 pub use runtime::io::spawn;
+/// Spawn a standalone async task and return a handle to await its result.
+pub use runtime::io::spawn_with_handle;
+/// Handle to a spawned task's return value, obtained from [`spawn_with_handle()`].
+pub use runtime::io::JoinHandle;
 /// Wrap a future with a deadline.
 pub use runtime::io::timeout;
 /// Wrap a future with an absolute deadline.
