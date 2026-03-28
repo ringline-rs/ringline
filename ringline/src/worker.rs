@@ -34,6 +34,19 @@ impl ShutdownHandle {
         &self.worker_eventfds
     }
 
+    /// Block the calling thread until `SIGINT` or `SIGTERM` is received,
+    /// then trigger graceful shutdown.
+    ///
+    /// Equivalent to calling [`signal::wait()`](crate::signal::wait) followed
+    /// by [`shutdown()`](Self::shutdown).
+    ///
+    /// Returns which signal was caught.
+    pub fn wait_on_signal(&self) -> crate::signal::Signal {
+        let sig = crate::signal::wait();
+        self.shutdown();
+        sig
+    }
+
     /// Signal all workers to shut down gracefully.
     ///
     /// Workers will stop accepting new connections, close all active connections,
