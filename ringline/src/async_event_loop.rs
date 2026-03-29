@@ -39,6 +39,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         spawn_rx: Option<crossbeam_channel::Receiver<crate::spawner::SpawnResponse>>,
         spawn_tx: Option<crossbeam_channel::Sender<crate::spawner::SpawnResponse>>,
         spawner: Option<std::sync::Arc<crate::spawner::SpawnerPool>>,
+        blocking_rx: Option<crossbeam_channel::Receiver<crate::blocking::BlockingResponse>>,
+        blocking_tx: Option<crossbeam_channel::Sender<crate::blocking::BlockingResponse>>,
+        blocking_pool: Option<std::sync::Arc<crate::blocking::BlockingPool>>,
     ) -> Result<Self, crate::error::Error> {
         let driver = Driver::new(
             config,
@@ -51,6 +54,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             spawn_rx,
             spawn_tx,
             spawner,
+            blocking_rx,
+            blocking_tx,
+            blocking_pool,
         )?;
         let executor = Executor::new(
             config.max_connections,
@@ -797,6 +803,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             while let Ok(response) = rx.try_recv() {
                 self.executor
                     .deliver_spawn(response.request_id, response.result);
+            }
+        }
+
+        // Drain blocking responses.
+        if let Some(ref rx) = self.driver.blocking_rx {
+            while let Ok(response) = rx.try_recv() {
+                self.executor
+                    .deliver_blocking(response.request_id, response.result);
             }
         }
 
@@ -1638,6 +1652,9 @@ mod tests {
             None,
             eventfd,
             shutdown,
+            None,
+            None,
+            None,
             None,
             None,
             None,

@@ -227,6 +227,12 @@ pub(crate) struct Driver {
     pub(crate) spawn_tx: Option<crossbeam_channel::Sender<crate::spawner::SpawnResponse>>,
     /// Shared spawner pool (for submitting requests).
     pub(crate) spawner: Option<std::sync::Arc<crate::spawner::SpawnerPool>>,
+    /// Per-worker channel for blocking responses from the blocking pool.
+    pub(crate) blocking_rx: Option<crossbeam_channel::Receiver<crate::blocking::BlockingResponse>>,
+    /// Per-worker sender for blocking responses (cloned into each request).
+    pub(crate) blocking_tx: Option<crossbeam_channel::Sender<crate::blocking::BlockingResponse>>,
+    /// Shared blocking pool (for submitting requests).
+    pub(crate) blocking_pool: Option<std::sync::Arc<crate::blocking::BlockingPool>>,
     /// Whether to set TCP_NODELAY on connections.
     pub(crate) tcp_nodelay: bool,
     /// Whether SO_TIMESTAMPING is enabled for connections.
@@ -290,6 +296,9 @@ impl Driver {
         spawn_rx: Option<crossbeam_channel::Receiver<crate::spawner::SpawnResponse>>,
         spawn_tx: Option<crossbeam_channel::Sender<crate::spawner::SpawnResponse>>,
         spawner: Option<std::sync::Arc<crate::spawner::SpawnerPool>>,
+        blocking_rx: Option<crossbeam_channel::Receiver<crate::blocking::BlockingResponse>>,
+        blocking_tx: Option<crossbeam_channel::Sender<crate::blocking::BlockingResponse>>,
+        blocking_pool: Option<std::sync::Arc<crate::blocking::BlockingPool>>,
     ) -> Result<Self, crate::error::Error> {
         config.validate()?;
         let ring = Ring::setup(config)?;
@@ -459,6 +468,9 @@ impl Driver {
             spawn_rx,
             spawn_tx,
             spawner,
+            blocking_rx,
+            blocking_tx,
+            blocking_pool,
         };
 
         // Submit initial recvmsg for each UDP socket.
