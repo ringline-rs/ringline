@@ -54,6 +54,7 @@ pub mod direct_io;
 pub(crate) mod driver;
 pub(crate) mod metrics;
 pub mod nvme;
+pub(crate) mod resolver;
 pub(crate) mod ring;
 pub(crate) mod runtime;
 pub(crate) mod tls;
@@ -103,6 +104,8 @@ pub use runtime::io::JoinHandle;
 pub use runtime::io::ParseResult;
 /// Future that resolves when recv data is available (sink, accumulator, or close).
 pub use runtime::io::RecvReadyFuture;
+/// Future returned by [`resolve()`].
+pub use runtime::io::ResolveFuture;
 /// Future that completes when a send finishes.
 pub use runtime::io::SendFuture;
 /// Future returned by [`sleep()`].
@@ -139,6 +142,8 @@ pub use runtime::io::open_direct_io_file;
 pub use runtime::io::open_nvme_device;
 /// Request graceful shutdown from any async task.
 pub use runtime::io::request_shutdown;
+/// Resolve a hostname to a `SocketAddr` using the dedicated resolver pool.
+pub use runtime::io::resolve;
 /// Create a future that completes after a duration.
 pub use runtime::io::sleep;
 /// Create a future that completes at an absolute deadline.

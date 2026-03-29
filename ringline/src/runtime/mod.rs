@@ -183,6 +183,10 @@ pub(crate) struct Executor {
     pub(crate) disk_io_waiters: HashMap<u32, u32>,
     /// Disk I/O: maps command slab_idx → i32 result from CQE.
     pub(crate) disk_io_results: HashMap<u32, i32>,
+    /// Pending DNS resolve requests: request_id → (task_id to wake, result slot).
+    pub(crate) pending_resolves: HashMap<u64, (u32, Option<stdio::Result<std::net::SocketAddr>>)>,
+    /// Monotonic counter for resolve request IDs.
+    pub(crate) next_resolve_id: u64,
 }
 
 impl Executor {
@@ -222,6 +226,8 @@ impl Executor {
             udp_recv_waiters: vec![None; udp],
             disk_io_waiters: HashMap::new(),
             disk_io_results: HashMap::new(),
+            pending_resolves: HashMap::new(),
+            next_resolve_id: 0,
         }
     }
 
@@ -322,6 +328,19 @@ impl Executor {
     pub(crate) fn wake_disk_io(&mut self, seq: u32, result: i32) {
         self.disk_io_results.insert(seq, result);
         if let Some(task_id) = self.disk_io_waiters.remove(&seq) {
+            self.wake_task(task_id);
+        }
+    }
+
+    /// Deliver a DNS resolve response and wake the waiting task.
+    pub(crate) fn deliver_resolve(
+        &mut self,
+        request_id: u64,
+        result: stdio::Result<std::net::SocketAddr>,
+    ) {
+        if let Some((task_id, slot)) = self.pending_resolves.get_mut(&request_id) {
+            *slot = Some(result);
+            let task_id = *task_id;
             self.wake_task(task_id);
         }
     }

@@ -4229,3 +4229,177 @@ fn signal_wait_on_signal_shutdown() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── DNS resolver tests ──────────────────────────────────────────────
+
+static RESOLVE_RESULT: AtomicU32 = AtomicU32::new(0);
+
+/// Handler that resolves "localhost" and verifies the result.
+struct ResolveHandler;
+
+impl AsyncEventHandler for ResolveHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            match ringline::resolve("localhost", 80) {
+                Ok(fut) => match fut.await {
+                    Ok(addr) => {
+                        if addr.ip().is_loopback() && addr.port() == 80 {
+                            RESOLVE_RESULT.store(1, Ordering::SeqCst);
+                        }
+                        let _ = conn.send_nowait(b"ok");
+                    }
+                    Err(_) => {
+                        let _ = conn.send_nowait(b"err");
+                    }
+                },
+                Err(_) => {
+                    let _ = conn.send_nowait(b"no-resolver");
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ResolveHandler
+    }
+}
+
+#[test]
+fn resolve_localhost() {
+    RESOLVE_RESULT.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<ResolveHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"ok");
+    assert_eq!(RESOLVE_RESULT.load(Ordering::SeqCst), 1);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Resolve an invalid hostname — should return an error.
+static RESOLVE_ERR: AtomicU32 = AtomicU32::new(0);
+
+struct ResolveErrorHandler;
+
+impl AsyncEventHandler for ResolveErrorHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            match ringline::resolve("nonexistent.invalid", 80) {
+                Ok(fut) => match fut.await {
+                    Ok(_) => {
+                        let _ = conn.send_nowait(b"unexpected-ok");
+                    }
+                    Err(_) => {
+                        RESOLVE_ERR.store(1, Ordering::SeqCst);
+                        let _ = conn.send_nowait(b"ok");
+                    }
+                },
+                Err(_) => {
+                    let _ = conn.send_nowait(b"no-resolver");
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ResolveErrorHandler
+    }
+}
+
+#[test]
+fn resolve_invalid_hostname() {
+    RESOLVE_ERR.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<ResolveErrorHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"ok");
+    assert_eq!(RESOLVE_ERR.load(Ordering::SeqCst), 1);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Resolver disabled (0 threads) — resolve() returns error.
+struct ResolveDisabledHandler;
+
+impl AsyncEventHandler for ResolveDisabledHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            match ringline::resolve("localhost", 80) {
+                Ok(_) => {
+                    let _ = conn.send_nowait(b"unexpected");
+                }
+                Err(_) => {
+                    let _ = conn.send_nowait(b"ok");
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ResolveDisabledHandler
+    }
+}
+
+#[test]
+fn resolve_disabled_returns_error() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut config = test_config();
+    config.resolver_threads = 0;
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<ResolveDisabledHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"ok");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}

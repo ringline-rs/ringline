@@ -364,6 +364,74 @@ pub fn connect_tls_with_timeout(
     })
 }
 
+// ── DNS Resolution ──────────────────────────────────────────────────
+
+/// Resolve a hostname to a [`SocketAddr`] using the dedicated resolver pool.
+///
+/// Performs `getaddrinfo` on a background thread, keeping the io_uring event
+/// loop unblocked. Returns the first resolved address.
+///
+/// # Errors
+///
+/// Returns `Err` if called outside the ringline executor, the resolver pool
+/// is not configured (`resolver_threads = 0`), or `getaddrinfo` fails.
+pub fn resolve(host: &str, port: u16) -> io::Result<ResolveFuture> {
+    let host = host.to_string();
+    try_with_state(|driver, executor| {
+        let resolver = driver
+            .resolver
+            .as_ref()
+            .ok_or_else(|| io::Error::other("resolver pool not configured"))?;
+        let resolve_tx = driver
+            .resolve_tx
+            .as_ref()
+            .ok_or_else(|| io::Error::other("resolver pool not configured"))?;
+
+        let request_id = executor.next_resolve_id;
+        executor.next_resolve_id += 1;
+
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor
+            .pending_resolves
+            .insert(request_id, (task_id, None));
+
+        resolver
+            .request_tx
+            .send(crate::resolver::ResolveRequest {
+                host,
+                port,
+                request_id,
+                response_tx: resolve_tx.clone(),
+                worker_eventfd: driver.eventfd,
+            })
+            .map_err(|_| io::Error::other("resolver pool shut down"))?;
+
+        Ok(ResolveFuture { request_id })
+    })
+    .unwrap_or_else(|| Err(io::Error::other("called outside executor")))
+}
+
+/// Future returned by [`resolve()`]. Resolves to a [`SocketAddr`].
+pub struct ResolveFuture {
+    request_id: u64,
+}
+
+impl Future for ResolveFuture {
+    type Output = io::Result<std::net::SocketAddr>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_state(|_driver, executor| {
+            if let Some((_, slot)) = executor.pending_resolves.get_mut(&self.request_id)
+                && let Some(result) = slot.take()
+            {
+                executor.pending_resolves.remove(&self.request_id);
+                return Poll::Ready(result);
+            }
+            Poll::Pending
+        })
+    }
+}
+
 /// Request graceful shutdown of the worker event loop from any async task.
 ///
 /// This is the free-function equivalent of [`ConnCtx::request_shutdown()`] —

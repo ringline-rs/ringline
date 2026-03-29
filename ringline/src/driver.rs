@@ -140,6 +140,12 @@ pub(crate) struct Driver {
     /// Tuple: (user_data, result, flags, big_cqe). The big_cqe field
     /// contains the extra 16 bytes from Entry32 CQEs (used by NVMe passthrough).
     pub(crate) cqe_batch: Vec<(u64, i32, u32, [u64; 2])>,
+    /// Per-worker channel for DNS resolve responses from the resolver pool.
+    pub(crate) resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
+    /// Per-worker sender for resolve responses (cloned into each request).
+    pub(crate) resolve_tx: Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
+    /// Shared resolver pool (for submitting requests).
+    pub(crate) resolver: Option<std::sync::Arc<crate::resolver::ResolverPool>>,
     /// Whether to set TCP_NODELAY on connections.
     pub(crate) tcp_nodelay: bool,
     /// Whether SO_TIMESTAMPING is enabled for connections.
@@ -190,6 +196,9 @@ impl Driver {
         accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
         eventfd: RawFd,
         shutdown_flag: Arc<AtomicBool>,
+        resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
+        resolve_tx: Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
+        resolver: Option<std::sync::Arc<crate::resolver::ResolverPool>>,
     ) -> Result<Self, crate::error::Error> {
         config.validate()?;
         let ring = Ring::setup(config)?;
@@ -341,6 +350,9 @@ impl Driver {
                 .as_ref()
                 .map(|d| crate::direct_io::DirectIoCmdSlab::new(d.max_commands_in_flight)),
             direct_io_fd_base: config.max_connections + udp_count + nvme_max,
+            resolve_rx,
+            resolve_tx,
+            resolver,
         };
 
         // Submit initial recvmsg for each UDP socket.
