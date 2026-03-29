@@ -734,7 +734,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 };
 
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.peer_addr = Some(peer_addr);
+                    cs.peer_addr = Some(crate::connection::PeerAddr::Tcp(peer_addr));
                 }
 
                 if self

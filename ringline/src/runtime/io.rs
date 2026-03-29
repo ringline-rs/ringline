@@ -304,6 +304,31 @@ pub fn connect_with_timeout(addr: SocketAddr, timeout_ms: u64) -> io::Result<Con
     })
 }
 
+/// Initiate an outbound Unix domain socket connection from any async task.
+///
+/// Free-function equivalent of [`ConnCtx::connect_unix()`].
+///
+/// Returns a [`ConnectFuture`] that resolves with a [`ConnCtx`] for the new connection.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor.
+pub fn connect_unix(path: impl AsRef<std::path::Path>) -> io::Result<ConnectFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let token = ctx
+            .connect_unix(path.as_ref())
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+        executor.owner_task[token.index as usize] = Some(calling_task);
+        executor.connect_waiters[token.index as usize] = true;
+        Ok(ConnectFuture {
+            conn_index: token.index,
+            generation: token.generation,
+        })
+    })
+}
+
 /// Initiate an outbound TLS connection from any async task (connection or standalone).
 ///
 /// This is the free-function equivalent of [`ConnCtx::connect_tls()`] — it can be
@@ -675,6 +700,25 @@ impl ConnCtx {
         })
     }
 
+    /// Initiate an outbound Unix domain socket connection and await the result.
+    ///
+    /// Returns a new `ConnCtx` for the peer connection on success.
+    pub fn connect_unix(&self, path: impl AsRef<std::path::Path>) -> io::Result<ConnectFuture> {
+        with_state(|driver, executor| {
+            let mut ctx = driver.make_ctx();
+            let token = ctx
+                .connect_unix(path.as_ref())
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let calling_task = CURRENT_TASK_ID.with(|c| c.get());
+            executor.owner_task[token.index as usize] = Some(calling_task);
+            executor.connect_waiters[token.index as usize] = true;
+            Ok(ConnectFuture {
+                conn_index: token.index,
+                generation: token.generation,
+            })
+        })
+    }
+
     // ── Send chain ────────────────────────────────────────────────────
 
     /// Build an IO_LINK chained send on this connection (fire-and-forget).
@@ -830,13 +874,13 @@ impl ConnCtx {
     }
 
     /// Access peer address.
-    pub fn peer_addr(&self) -> Option<SocketAddr> {
+    pub fn peer_addr(&self) -> Option<crate::connection::PeerAddr> {
         with_state(|driver, _| {
             let conn = driver.connections.get(self.conn_index)?;
             if conn.generation != self.generation {
                 return None;
             }
-            conn.peer_addr
+            conn.peer_addr.clone()
         })
     }
 

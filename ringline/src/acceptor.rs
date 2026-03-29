@@ -72,8 +72,8 @@ pub fn run_acceptor(config: AcceptorConfig) {
             }
         }
 
-        // Set TCP_NODELAY if configured.
-        if config.tcp_nodelay {
+        // Set TCP_NODELAY if configured (skip for Unix domain sockets).
+        if config.tcp_nodelay && addr_storage.ss_family != libc::AF_UNIX as libc::sa_family_t {
             let optval: libc::c_int = 1;
             unsafe {
                 libc::setsockopt(

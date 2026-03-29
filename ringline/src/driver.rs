@@ -74,6 +74,74 @@ pub(crate) fn sockaddr_to_socket_addr(
     }
 }
 
+/// Convert a libc sockaddr_storage to a `PeerAddr` (TCP or Unix).
+#[allow(dead_code)]
+pub(crate) fn sockaddr_to_peer_addr(
+    addr: &libc::sockaddr_storage,
+    len: u32,
+) -> Option<crate::connection::PeerAddr> {
+    match addr.ss_family as libc::c_int {
+        libc::AF_INET | libc::AF_INET6 => {
+            sockaddr_to_socket_addr(addr, len).map(crate::connection::PeerAddr::Tcp)
+        }
+        libc::AF_UNIX => {
+            let sa = unsafe { &*(addr as *const _ as *const libc::sockaddr_un) };
+            // Path length: total len minus the offset of sun_path.
+            let path_offset = memoffset(sa);
+            let path_len = (len as usize).saturating_sub(path_offset);
+            if path_len == 0 {
+                Some(crate::connection::PeerAddr::Unix(std::path::PathBuf::new()))
+            } else {
+                // sun_path may be null-terminated.
+                let bytes = &sa.sun_path[..path_len];
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(path_len);
+                let path =
+                    std::str::from_utf8(unsafe { std::slice::from_raw_parts(bytes.as_ptr(), end) })
+                        .unwrap_or("");
+                Some(crate::connection::PeerAddr::Unix(std::path::PathBuf::from(
+                    path,
+                )))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Offset of `sun_path` within `sockaddr_un`.
+fn memoffset(sa: &libc::sockaddr_un) -> usize {
+    let base = sa as *const _ as usize;
+    let path = sa.sun_path.as_ptr() as usize;
+    path - base
+}
+
+/// Write a Unix socket path into a sockaddr_storage, return the address length.
+pub(crate) fn unix_path_to_sockaddr(
+    path: &std::path::Path,
+    storage: &mut libc::sockaddr_storage,
+) -> u32 {
+    unsafe {
+        std::ptr::write_bytes(
+            storage as *mut _ as *mut u8,
+            0,
+            std::mem::size_of::<libc::sockaddr_storage>(),
+        );
+    }
+    let sa = storage as *mut _ as *mut libc::sockaddr_un;
+    unsafe {
+        (*sa).sun_family = libc::AF_UNIX as libc::sa_family_t;
+    }
+    let path_bytes = path.as_os_str().as_encoded_bytes();
+    let max_len = std::mem::size_of_val(unsafe { &(*sa).sun_path }) - 1; // leave room for null
+    let copy_len = path_bytes.len().min(max_len);
+    unsafe {
+        std::ptr::copy_nonoverlapping(path_bytes.as_ptr(), (*sa).sun_path.as_mut_ptr(), copy_len);
+    }
+    // Length: offset of sun_path + path bytes + null terminator.
+    let sa_ref = unsafe { &*sa };
+    let offset = memoffset(sa_ref);
+    (offset + copy_len + 1) as u32
+}
+
 /// Write a SocketAddr into a sockaddr_storage, return the address length.
 pub(crate) fn socket_addr_to_sockaddr(
     addr: SocketAddr,

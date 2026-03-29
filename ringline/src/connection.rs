@@ -1,3 +1,30 @@
+use std::fmt;
+use std::path::PathBuf;
+
+/// Peer address for a connection — either TCP (IPv4/IPv6) or Unix domain socket.
+#[derive(Debug, Clone)]
+pub enum PeerAddr {
+    /// TCP peer address (IPv4 or IPv6).
+    Tcp(std::net::SocketAddr),
+    /// Unix domain socket path. Empty path for unnamed/abstract sockets.
+    Unix(PathBuf),
+}
+
+impl fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PeerAddr::Tcp(addr) => write!(f, "{addr}"),
+            PeerAddr::Unix(path) => {
+                if path.as_os_str().is_empty() {
+                    f.write_str("(unnamed)")
+                } else {
+                    write!(f, "{}", path.display())
+                }
+            }
+        }
+    }
+}
+
 /// Recv mode for a connection.
 #[derive(Debug)]
 pub enum RecvMode {
@@ -26,7 +53,7 @@ pub struct ConnectionState {
     /// `on_close` is only fired when `established == true`.
     pub established: bool,
     /// Peer address (set on accept or connect).
-    pub peer_addr: Option<std::net::SocketAddr>,
+    pub peer_addr: Option<PeerAddr>,
     /// Whether a connect timeout SQE is armed for this connection.
     pub connect_timeout_armed: bool,
     /// Most recent kernel RX timestamp (nanoseconds since epoch, CLOCK_REALTIME).

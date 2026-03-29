@@ -1,6 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -72,6 +73,12 @@ impl ShutdownHandle {
     }
 }
 
+/// Internal enum for the bound listen address.
+enum BindAddr {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
 /// Builder for launching ringline workers with optional listener/acceptor.
 ///
 /// Create a builder with [`RinglineBuilder::new(config)`](Self::new), optionally
@@ -83,7 +90,7 @@ impl ShutdownHandle {
 /// connections via [`AsyncEventHandler::on_start`].
 pub struct RinglineBuilder {
     config: Config,
-    bind_addr: Option<SocketAddr>,
+    bind_addr: Option<BindAddr>,
 }
 
 impl RinglineBuilder {
@@ -98,7 +105,16 @@ impl RinglineBuilder {
     /// Set the bind address for the TCP listener. If not set, no listener
     /// or acceptor thread is created (client-only mode).
     pub fn bind(mut self, addr: SocketAddr) -> Self {
-        self.bind_addr = Some(addr);
+        self.bind_addr = Some(BindAddr::Tcp(addr));
+        self
+    }
+
+    /// Set the bind path for a Unix domain socket listener. If not set, no
+    /// listener or acceptor thread is created (client-only mode).
+    ///
+    /// Any existing socket file at the given path is unlinked before binding.
+    pub fn bind_unix(mut self, path: impl AsRef<Path>) -> Self {
+        self.bind_addr = Some(BindAddr::Unix(path.as_ref().to_path_buf()));
         self
     }
 
@@ -207,8 +223,13 @@ impl RinglineBuilder {
         };
 
         // Optionally create listener + acceptor.
-        let (listen_fd, listen_fd_closed) = if let Some(addr) = self.bind_addr {
-            let fd = create_listener(addr, self.config.backlog)?;
+        let (listen_fd, listen_fd_closed) = if let Some(bind_addr) = self.bind_addr {
+            let (fd, is_unix) = match bind_addr {
+                BindAddr::Tcp(addr) => (create_listener(addr, self.config.backlog)?, false),
+                BindAddr::Unix(ref path) => {
+                    (create_unix_listener(path, self.config.backlog)?, true)
+                }
+            };
             let closed = Arc::new(AtomicBool::new(false));
 
             let acceptor_config = AcceptorConfig {
@@ -216,7 +237,11 @@ impl RinglineBuilder {
                 worker_channels: worker_txs,
                 worker_eventfds: worker_eventfds.clone(),
                 shutdown_flag: shutdown_flag.clone(),
-                tcp_nodelay: self.config.tcp_nodelay,
+                tcp_nodelay: if is_unix {
+                    false
+                } else {
+                    self.config.tcp_nodelay
+                },
                 #[cfg(feature = "timestamps")]
                 timestamps: self.config.timestamps,
             };
@@ -243,7 +268,7 @@ impl RinglineBuilder {
 
         // Spawn worker threads.
         let mut handles = Vec::with_capacity(num_threads);
-        let has_acceptor = self.bind_addr.is_some();
+        let has_acceptor = listen_fd.is_some();
 
         for worker_id in 0..num_threads {
             let config = self.config.clone();
@@ -395,6 +420,49 @@ fn create_listener(addr: SocketAddr, backlog: i32) -> Result<RawFd, crate::error
     // Bind — use the driver's sockaddr helper.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let addr_len = crate::driver::socket_addr_to_sockaddr(addr, &mut storage);
+
+    let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(crate::error::Error::Io(err));
+    }
+
+    // Switch to blocking mode for the acceptor thread's accept4 call.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+    }
+
+    let ret = unsafe { libc::listen(fd, backlog) };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(crate::error::Error::Io(err));
+    }
+
+    Ok(fd)
+}
+
+/// Create a Unix domain socket listener at the given path.
+///
+/// Unlinks any existing socket file before binding.
+fn create_unix_listener(path: &Path, backlog: i32) -> Result<RawFd, crate::error::Error> {
+    // Remove existing socket file if present (ignore errors — path may not exist).
+    let _ = std::fs::remove_file(path);
+
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 {
+        return Err(crate::error::Error::Io(io::Error::last_os_error()));
+    }
+
+    // Bind using the driver's sockaddr helper.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let addr_len = crate::driver::unix_path_to_sockaddr(path, &mut storage);
 
     let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
     if ret < 0 {

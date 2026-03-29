@@ -120,12 +120,12 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Get the peer address for a connection.
-    pub fn peer_addr(&self, conn: ConnToken) -> Option<SocketAddr> {
+    pub fn peer_addr(&self, conn: ConnToken) -> Option<crate::connection::PeerAddr> {
         let cs = self.connections.get(conn.index)?;
         if cs.generation != conn.generation {
             return None;
         }
-        cs.peer_addr
+        cs.peer_addr.clone()
     }
 
     /// Check if a connection is outbound (initiated via connect/connect_tls).
@@ -381,7 +381,7 @@ impl<'a> DriverCtx<'a> {
 
         // Store peer address.
         if let Some(cs) = self.connections.get_mut(conn_index) {
-            cs.peer_addr = Some(addr);
+            cs.peer_addr = Some(crate::connection::PeerAddr::Tcp(addr));
         }
 
         // Create socket.
@@ -465,6 +465,69 @@ impl<'a> DriverCtx<'a> {
         Ok(ConnToken::new(conn_index, generation))
     }
 
+    /// Initiate an outbound Unix domain socket connection. Returns immediately
+    /// with a `ConnToken`. The `on_connect` callback fires when the connection
+    /// completes (or fails).
+    pub fn connect_unix(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<ConnToken, crate::error::Error> {
+        let conn_index = self
+            .connections
+            .allocate_outbound()
+            .ok_or(crate::error::Error::ConnectionLimitReached)?;
+        let generation = self.connections.generation(conn_index);
+
+        // Store peer address.
+        if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.peer_addr = Some(crate::connection::PeerAddr::Unix(path.to_path_buf()));
+        }
+
+        // Create AF_UNIX socket.
+        let raw_fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if raw_fd < 0 {
+            self.connections.release(conn_index);
+            return Err(crate::error::Error::Io(io::Error::last_os_error()));
+        }
+
+        // Register in the direct file table, then close the original fd.
+        if let Err(e) = self.ring.register_files_update(conn_index, &[raw_fd]) {
+            unsafe {
+                libc::close(raw_fd);
+            }
+            self.connections.release(conn_index);
+            return Err(crate::error::Error::Io(e));
+        }
+        unsafe {
+            libc::close(raw_fd);
+        }
+
+        // Fill sockaddr_storage for the connect SQE.
+        let addrlen = crate::driver::unix_path_to_sockaddr(
+            path,
+            &mut self.connect_addrs[conn_index as usize],
+        );
+
+        // Submit the async connect.
+        if let Err(e) = self.ring.submit_connect(
+            conn_index,
+            &self.connect_addrs[conn_index as usize] as *const _ as *const libc::sockaddr,
+            addrlen,
+        ) {
+            let _ = self.ring.register_files_update(conn_index, &[-1]);
+            self.connections.release(conn_index);
+            return Err(crate::error::Error::Io(e));
+        }
+
+        Ok(ConnToken::new(conn_index, generation))
+    }
+
     /// Initiate an outbound TCP connection with a timeout.
     /// If the connection is not established within `timeout_ms`, `on_connect` fires
     /// with `Err(TimedOut)`.
@@ -505,7 +568,7 @@ impl<'a> DriverCtx<'a> {
 
         // Store peer address.
         if let Some(cs) = self.connections.get_mut(conn_index) {
-            cs.peer_addr = Some(addr);
+            cs.peer_addr = Some(crate::connection::PeerAddr::Tcp(addr));
         }
 
         // Create socket.
