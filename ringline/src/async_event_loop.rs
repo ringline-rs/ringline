@@ -36,6 +36,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
         resolve_tx: Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
         resolver: Option<std::sync::Arc<crate::resolver::ResolverPool>>,
+        spawn_rx: Option<crossbeam_channel::Receiver<crate::spawner::SpawnResponse>>,
+        spawn_tx: Option<crossbeam_channel::Sender<crate::spawner::SpawnResponse>>,
+        spawner: Option<std::sync::Arc<crate::spawner::SpawnerPool>>,
     ) -> Result<Self, crate::error::Error> {
         let driver = Driver::new(
             config,
@@ -45,6 +48,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             resolve_rx,
             resolve_tx,
             resolver,
+            spawn_rx,
+            spawn_tx,
+            spawner,
         )?;
         let executor = Executor::new(
             config.max_connections,
@@ -371,6 +377,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
             OpTag::DirectIo => self.handle_direct_io(ud, result),
             OpTag::Fs => self.handle_fs(ud, result),
+            OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
             #[cfg(feature = "timestamps")]
             OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
@@ -782,6 +789,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             while let Ok(response) = rx.try_recv() {
                 self.executor
                     .deliver_resolve(response.request_id, response.result);
+            }
+        }
+
+        // Drain process spawn responses.
+        if let Some(ref rx) = self.driver.spawn_rx {
+            while let Ok(response) = rx.try_recv() {
+                self.executor
+                    .deliver_spawn(response.request_id, response.result);
             }
         }
 
@@ -1391,6 +1406,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.executor.wake_disk_io(slab_idx as u32, result);
     }
 
+    fn handle_pidfd_poll(&mut self, ud: UserData, result: i32) {
+        let seq = ud.payload();
+        self.executor.wake_pidfd(seq, result);
+    }
+
     /// Arm the appropriate multishot recv for a connection.
     ///
     /// When the `timestamps` feature is enabled and configured, uses
@@ -1618,6 +1638,9 @@ mod tests {
             None,
             eventfd,
             shutdown,
+            None,
+            None,
+            None,
             None,
             None,
             None,

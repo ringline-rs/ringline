@@ -140,7 +140,10 @@ impl RinglineBuilder {
              shutdown_flag,
              resolve_rx,
              resolve_tx,
-             resolver| {
+             resolver,
+             spawn_rx,
+             spawn_tx,
+             spawner| {
                 let handler = A::create_for_worker(worker_id);
                 let mut event_loop = AsyncEventLoop::new(
                     &config,
@@ -151,6 +154,9 @@ impl RinglineBuilder {
                     resolve_rx,
                     resolve_tx,
                     resolver,
+                    spawn_rx,
+                    spawn_tx,
+                    spawner,
                 )?;
                 event_loop.run()?;
                 Ok(())
@@ -171,6 +177,9 @@ impl RinglineBuilder {
                 Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
                 Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
                 Option<Arc<crate::resolver::ResolverPool>>,
+                Option<crossbeam_channel::Receiver<crate::spawner::SpawnResponse>>,
+                Option<crossbeam_channel::Sender<crate::spawner::SpawnResponse>>,
+                Option<Arc<crate::spawner::SpawnerPool>>,
             ) -> Result<(), crate::error::Error>
             + Send
             + Clone
@@ -215,6 +224,21 @@ impl RinglineBuilder {
             let mut rxs = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
                 let (tx, rx) = crossbeam_channel::unbounded::<crate::resolver::ResolveResponse>();
+                rxs.push((tx, rx));
+            }
+            (Some(pool), Some(rxs))
+        } else {
+            (None, None)
+        };
+
+        // Create spawner pool if configured.
+        let (spawner_pool, spawn_rxs) = if self.config.spawner_threads > 0 {
+            let pool = Arc::new(crate::spawner::SpawnerPool::start(
+                self.config.spawner_threads,
+            ));
+            let mut rxs = Vec::with_capacity(num_threads);
+            for _ in 0..num_threads {
+                let (tx, rx) = crossbeam_channel::unbounded::<crate::spawner::SpawnResponse>();
                 rxs.push((tx, rx));
             }
             (Some(pool), Some(rxs))
@@ -285,6 +309,14 @@ impl RinglineBuilder {
                     (None, None, None)
                 };
 
+            let (worker_spawn_rx, worker_spawn_tx, worker_spawner) =
+                if let Some(ref rxs) = spawn_rxs {
+                    let (ref tx, ref rx) = rxs[worker_id];
+                    (Some(rx.clone()), Some(tx.clone()), spawner_pool.clone())
+                } else {
+                    (None, None, None)
+                };
+
             let handle = thread::Builder::new()
                 .name(format!("ringline-worker-{worker_id}"))
                 .spawn(move || {
@@ -305,6 +337,9 @@ impl RinglineBuilder {
                         worker_resolve_rx,
                         worker_resolve_tx,
                         worker_resolver,
+                        worker_spawn_rx,
+                        worker_spawn_tx,
+                        worker_spawner,
                     )
                 })
                 .map_err(crate::error::Error::Io)?;

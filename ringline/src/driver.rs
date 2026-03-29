@@ -221,6 +221,12 @@ pub(crate) struct Driver {
     pub(crate) resolve_tx: Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
     /// Shared resolver pool (for submitting requests).
     pub(crate) resolver: Option<std::sync::Arc<crate::resolver::ResolverPool>>,
+    /// Per-worker channel for spawn responses from the spawner pool.
+    pub(crate) spawn_rx: Option<crossbeam_channel::Receiver<crate::spawner::SpawnResponse>>,
+    /// Per-worker sender for spawn responses (cloned into each request).
+    pub(crate) spawn_tx: Option<crossbeam_channel::Sender<crate::spawner::SpawnResponse>>,
+    /// Shared spawner pool (for submitting requests).
+    pub(crate) spawner: Option<std::sync::Arc<crate::spawner::SpawnerPool>>,
     /// Whether to set TCP_NODELAY on connections.
     pub(crate) tcp_nodelay: bool,
     /// Whether SO_TIMESTAMPING is enabled for connections.
@@ -272,6 +278,7 @@ pub(crate) struct Driver {
 
 impl Driver {
     /// Create a new driver for a worker thread.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &Config,
         accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
@@ -280,6 +287,9 @@ impl Driver {
         resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
         resolve_tx: Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
         resolver: Option<std::sync::Arc<crate::resolver::ResolverPool>>,
+        spawn_rx: Option<crossbeam_channel::Receiver<crate::spawner::SpawnResponse>>,
+        spawn_tx: Option<crossbeam_channel::Sender<crate::spawner::SpawnResponse>>,
+        spawner: Option<std::sync::Arc<crate::spawner::SpawnerPool>>,
     ) -> Result<Self, crate::error::Error> {
         config.validate()?;
         let ring = Ring::setup(config)?;
@@ -446,6 +456,9 @@ impl Driver {
             resolve_rx,
             resolve_tx,
             resolver,
+            spawn_rx,
+            spawn_tx,
+            spawner,
         };
 
         // Submit initial recvmsg for each UDP socket.

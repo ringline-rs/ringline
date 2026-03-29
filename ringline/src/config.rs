@@ -105,6 +105,13 @@ pub struct Config {
     /// 0 = disabled (no resolver pool; [`resolve()`](crate::resolve) will
     /// return an error). Default: 2.
     pub resolver_threads: usize,
+    /// Number of dedicated process spawner threads. The spawner pool runs
+    /// `posix_spawnp` + `pidfd_open` on background threads, keeping blocking
+    /// process creation isolated from the io_uring event loop.
+    ///
+    /// 0 = disabled (no spawner pool; [`Command::spawn()`](crate::process::Command::spawn)
+    /// will return an error). Default: 1.
+    pub spawner_threads: usize,
 }
 
 impl Default for Config {
@@ -138,6 +145,7 @@ impl Default for Config {
             direct_io: None,
             fs: Some(crate::fs::FsConfig::default()),
             resolver_threads: 2,
+            spawner_threads: 1,
         }
     }
 }
@@ -425,6 +433,12 @@ impl ConfigBuilder {
     /// Set the number of DNS resolver threads. 0 = disabled.
     pub fn resolver_threads(mut self, threads: usize) -> Self {
         self.config.resolver_threads = threads;
+        self
+    }
+
+    /// Set the number of process spawner threads. 0 = disabled.
+    pub fn spawner_threads(mut self, threads: usize) -> Self {
+        self.config.spawner_threads = threads;
         self
     }
 
