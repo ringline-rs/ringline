@@ -66,7 +66,7 @@ pub(crate) fn clear_driver_state() {
 }
 
 /// Access the thread-local driver state. Panics if called outside the executor.
-pub(super) fn with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R) -> R {
+pub(crate) fn with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R) -> R {
     let ptr = CURRENT_DRIVER.with(|c| c.get());
     assert!(!ptr.is_null(), "called outside executor");
     let state = unsafe { &mut *ptr };
@@ -76,7 +76,7 @@ pub(super) fn with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R) -> 
 }
 
 /// Access the thread-local driver state, returning `None` if called outside the executor.
-pub(super) fn try_with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R) -> Option<R> {
+pub(crate) fn try_with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R) -> Option<R> {
     let ptr = CURRENT_DRIVER.with(|c| c.get());
     if ptr.is_null() {
         return None;

@@ -262,6 +262,12 @@ pub(crate) struct Driver {
     pub(crate) direct_io_cmd_slab: Option<crate::direct_io::DirectIoCmdSlab>,
     /// Base offset in the fixed file table for direct I/O file fds.
     pub(crate) direct_io_fd_base: u32,
+    /// Filesystem file tracking table. `None` when fs is not configured.
+    pub(crate) fs_files: Option<crate::fs::FsFileTable>,
+    /// Filesystem command slab for tracking in-flight commands. `None` when not configured.
+    pub(crate) fs_cmd_slab: Option<crate::fs::FsCmdSlab>,
+    /// Base offset in the fixed file table for filesystem file fds.
+    pub(crate) fs_fd_base: u32,
 }
 
 impl Driver {
@@ -297,10 +303,13 @@ impl Driver {
             .as_ref()
             .map(|d| d.max_files as u32)
             .unwrap_or(0);
+        let fs_max = config.fs.as_ref().map(|f| f.max_files as u32).unwrap_or(0);
 
         // Register resources with the kernel
         ring.register_buffers(&fixed_buffers)?;
-        ring.register_files_sparse(config.max_connections + udp_count + nvme_max + direct_io_max)?;
+        ring.register_files_sparse(
+            config.max_connections + udp_count + nvme_max + direct_io_max + fs_max,
+        )?;
         ring.register_buf_ring(&provided_bufs)?;
 
         let connections = ConnectionTable::new(config.max_connections);
@@ -425,6 +434,15 @@ impl Driver {
                 .as_ref()
                 .map(|d| crate::direct_io::DirectIoCmdSlab::new(d.max_commands_in_flight)),
             direct_io_fd_base: config.max_connections + udp_count + nvme_max,
+            fs_files: config
+                .fs
+                .as_ref()
+                .map(|f| crate::fs::FsFileTable::new(f.max_files)),
+            fs_cmd_slab: config
+                .fs
+                .as_ref()
+                .map(|f| crate::fs::FsCmdSlab::new(f.max_commands_in_flight)),
+            fs_fd_base: config.max_connections + udp_count + nvme_max + direct_io_max,
             resolve_rx,
             resolve_tx,
             resolver,
@@ -476,6 +494,9 @@ impl Driver {
             direct_io_files: &mut self.direct_io_files,
             direct_io_cmd_slab: &mut self.direct_io_cmd_slab,
             direct_io_fd_base: self.direct_io_fd_base,
+            fs_files: &mut self.fs_files,
+            fs_cmd_slab: &mut self.fs_cmd_slab,
+            fs_fd_base: self.fs_fd_base,
         }
     }
 

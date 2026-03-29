@@ -183,6 +183,8 @@ pub(crate) struct Executor {
     pub(crate) disk_io_waiters: HashMap<u32, u32>,
     /// Disk I/O: maps command slab_idx → i32 result from CQE.
     pub(crate) disk_io_results: HashMap<u32, i32>,
+    /// Filesystem stat results: maps slab_idx → Metadata (populated by handle_fs for Statx ops).
+    pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
     /// Pending DNS resolve requests: request_id → (task_id to wake, result slot).
     pub(crate) pending_resolves: HashMap<u64, (u32, Option<stdio::Result<std::net::SocketAddr>>)>,
     /// Monotonic counter for resolve request IDs.
@@ -226,6 +228,7 @@ impl Executor {
             udp_recv_waiters: vec![None; udp],
             disk_io_waiters: HashMap::new(),
             disk_io_results: HashMap::new(),
+            fs_stat_results: HashMap::new(),
             pending_resolves: HashMap::new(),
             next_resolve_id: 0,
         }

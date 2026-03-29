@@ -52,6 +52,7 @@ pub(crate) mod connection;
 pub(crate) mod counter;
 pub mod direct_io;
 pub(crate) mod driver;
+pub mod fs;
 pub(crate) mod metrics;
 pub mod nvme;
 pub(crate) mod resolver;

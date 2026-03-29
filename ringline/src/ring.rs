@@ -3,7 +3,7 @@ use std::os::fd::RawFd;
 
 use io_uring::cqueue;
 use io_uring::squeue;
-use io_uring::types::{Fd, Fixed};
+use io_uring::types::{DestinationSlot, Fd, Fixed};
 use io_uring::{IoUring, opcode};
 
 use crate::buffer::fixed::FixedBufferRegistry;
@@ -592,6 +592,125 @@ impl Ring {
         let entry = opcode::Fsync::new(Fixed(fd_index))
             .build()
             .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    // ── Filesystem I/O submission methods ──────────────────────────────
+
+    /// Submit an openat via io_uring. The fd is installed directly into the
+    /// fixed file table at `fd_index`.
+    ///
+    /// # Safety
+    /// `pathname` must point to a valid null-terminated C string that remains
+    /// valid until the CQE arrives.
+    pub unsafe fn submit_openat(
+        &mut self,
+        fd_index: u32,
+        pathname: *const libc::c_char,
+        flags: i32,
+        mode: u32,
+        ud: u64,
+    ) -> io::Result<()> {
+        let dest = DestinationSlot::try_from_slot_target(fd_index)
+            .map_err(|_| io::Error::other("invalid fd_index for openat"))?;
+        let entry = opcode::OpenAt::new(Fd(libc::AT_FDCWD), pathname)
+            .flags(flags)
+            .mode(mode)
+            .file_index(Some(dest))
+            .build()
+            .user_data(ud);
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a statx via io_uring.
+    ///
+    /// # Safety
+    /// `pathname` must point to a valid null-terminated C string and `statxbuf`
+    /// must point to valid memory, both remaining valid until the CQE arrives.
+    pub unsafe fn submit_statx(
+        &mut self,
+        pathname: *const libc::c_char,
+        statxbuf: *mut libc::statx,
+        ud: u64,
+    ) -> io::Result<()> {
+        // STATX_BASIC_STATS = 0x7ff
+        let entry = opcode::Statx::new(
+            Fd(libc::AT_FDCWD),
+            pathname,
+            statxbuf as *mut io_uring::types::statx,
+        )
+        .flags(libc::AT_STATX_SYNC_AS_STAT)
+        .mask(0x7ff)
+        .build()
+        .user_data(ud);
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a renameat via io_uring.
+    ///
+    /// # Safety
+    /// `oldpath` and `newpath` must point to valid null-terminated C strings
+    /// that remain valid until the CQE arrives.
+    pub unsafe fn submit_renameat(
+        &mut self,
+        oldpath: *const libc::c_char,
+        newpath: *const libc::c_char,
+        ud: u64,
+    ) -> io::Result<()> {
+        let entry = opcode::RenameAt::new(Fd(libc::AT_FDCWD), oldpath, Fd(libc::AT_FDCWD), newpath)
+            .build()
+            .user_data(ud);
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit an unlinkat via io_uring.
+    ///
+    /// # Safety
+    /// `pathname` must point to a valid null-terminated C string that remains
+    /// valid until the CQE arrives.
+    pub unsafe fn submit_unlinkat(
+        &mut self,
+        pathname: *const libc::c_char,
+        flags: i32,
+        ud: u64,
+    ) -> io::Result<()> {
+        let entry = opcode::UnlinkAt::new(Fd(libc::AT_FDCWD), pathname)
+            .flags(flags)
+            .build()
+            .user_data(ud);
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a mkdirat via io_uring.
+    ///
+    /// # Safety
+    /// `pathname` must point to a valid null-terminated C string that remains
+    /// valid until the CQE arrives.
+    pub unsafe fn submit_mkdirat(
+        &mut self,
+        pathname: *const libc::c_char,
+        mode: u32,
+        ud: u64,
+    ) -> io::Result<()> {
+        let entry = opcode::MkDirAt::new(Fd(libc::AT_FDCWD), pathname)
+            .mode(mode)
+            .build()
+            .user_data(ud);
         unsafe {
             self.push_sqe(entry)?;
         }
