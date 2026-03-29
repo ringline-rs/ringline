@@ -346,6 +346,15 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a PollAdd for a raw file descriptor (e.g., pidfd for process exit).
+    pub fn submit_poll_add(&mut self, fd: RawFd, mask: u32, ud: u64) -> io::Result<()> {
+        let entry = opcode::PollAdd::new(Fd(fd), mask).build().user_data(ud);
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit all pending SQEs and wait for at least `min_complete` CQEs.
     pub fn submit_and_wait(&self, min_complete: u32) -> io::Result<()> {
         self.ring

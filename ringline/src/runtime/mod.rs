@@ -186,10 +186,21 @@ pub(crate) struct Executor {
     pub(crate) disk_io_results: HashMap<u32, i32>,
     /// Filesystem stat results: maps slab_idx → Metadata (populated by handle_fs for Statx ops).
     pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
-    /// Pending DNS resolve requests: request_id → (task_id to wake, result slot).
+    /// Pending DNS resolve requests: request_id -> (task_id to wake, result slot).
     pub(crate) pending_resolves: HashMap<u64, (u32, Option<stdio::Result<std::net::SocketAddr>>)>,
     /// Monotonic counter for resolve request IDs.
     pub(crate) next_resolve_id: u64,
+    /// Pending process spawn requests: request_id -> (task_id to wake, result slot).
+    pub(crate) pending_spawns:
+        HashMap<u64, (u32, Option<stdio::Result<crate::spawner::SpawnResult>>)>,
+    /// Monotonic counter for spawn request IDs.
+    pub(crate) next_spawn_id: u64,
+    /// Pidfd poll waiters: seq -> task_id to wake on pidfd readability.
+    pub(crate) pidfd_waiters: HashMap<u32, u32>,
+    /// Pidfd poll results: seq -> CQE result (stored until polled by WaitFuture).
+    pub(crate) pidfd_results: HashMap<u32, i32>,
+    /// Monotonic counter for pidfd poll sequence numbers.
+    pub(crate) next_pidfd_seq: u32,
 }
 
 impl Executor {
@@ -232,6 +243,11 @@ impl Executor {
             fs_stat_results: HashMap::new(),
             pending_resolves: HashMap::new(),
             next_resolve_id: 0,
+            pending_spawns: HashMap::new(),
+            next_spawn_id: 0,
+            pidfd_waiters: HashMap::new(),
+            pidfd_results: HashMap::new(),
+            next_pidfd_seq: 0,
         }
     }
 
@@ -332,6 +348,27 @@ impl Executor {
     pub(crate) fn wake_disk_io(&mut self, seq: u32, result: i32) {
         self.disk_io_results.insert(seq, result);
         if let Some(task_id) = self.disk_io_waiters.remove(&seq) {
+            self.wake_task(task_id);
+        }
+    }
+
+    /// Deliver a process spawn response and wake the waiting task.
+    pub(crate) fn deliver_spawn(
+        &mut self,
+        request_id: u64,
+        result: stdio::Result<crate::spawner::SpawnResult>,
+    ) {
+        if let Some((task_id, slot)) = self.pending_spawns.get_mut(&request_id) {
+            *slot = Some(result);
+            let task_id = *task_id;
+            self.wake_task(task_id);
+        }
+    }
+
+    /// Wake a task waiting for pidfd poll completion (child process exit).
+    pub(crate) fn wake_pidfd(&mut self, seq: u32, result: i32) {
+        self.pidfd_results.insert(seq, result);
+        if let Some(task_id) = self.pidfd_waiters.remove(&seq) {
             self.wake_task(task_id);
         }
     }

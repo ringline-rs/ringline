@@ -55,9 +55,11 @@ pub(crate) mod driver;
 pub mod fs;
 pub(crate) mod metrics;
 pub mod nvme;
+pub mod process;
 pub(crate) mod resolver;
 pub(crate) mod ring;
 pub(crate) mod runtime;
+pub(crate) mod spawner;
 pub(crate) mod tls;
 pub(crate) mod worker;
 

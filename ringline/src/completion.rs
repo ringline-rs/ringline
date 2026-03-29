@@ -33,6 +33,8 @@ pub enum OpTag {
     RecvMsgMultiTs = 17,
     /// Filesystem I/O command (open, read, write, fsync, stat, rename, unlink, mkdir).
     Fs = 18,
+    /// PollAdd on a pidfd for async child process exit notification.
+    PidfdPoll = 19,
 }
 
 impl OpTag {
@@ -57,6 +59,7 @@ impl OpTag {
             #[cfg(feature = "timestamps")]
             17 => Some(OpTag::RecvMsgMultiTs),
             18 => Some(OpTag::Fs),
+            19 => Some(OpTag::PidfdPoll),
             _ => None,
         }
     }
