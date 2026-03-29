@@ -69,6 +69,8 @@ pub mod signal;
 
 // ── Re-exports: Handler types ─────────────────────────────────────────
 
+/// Peer address for a connection — TCP or Unix domain socket.
+pub use connection::PeerAddr;
 /// Opaque connection handle.
 pub use handler::ConnToken;
 /// I/O context passed to [`AsyncEventHandler::on_tick`] and [`AsyncEventHandler::on_notify`].
@@ -126,6 +128,8 @@ pub use runtime::io::connect;
 pub use runtime::io::connect_tls;
 /// Initiate an outbound TLS connection with a timeout from any async task.
 pub use runtime::io::connect_tls_with_timeout;
+/// Initiate an outbound Unix domain socket connection from any async task.
+pub use runtime::io::connect_unix;
 /// Initiate an outbound TCP connection with a timeout from any async task.
 pub use runtime::io::connect_with_timeout;
 /// Submit a Direct I/O read and return a future for the result.

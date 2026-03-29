@@ -4403,3 +4403,102 @@ fn resolve_disabled_returns_error() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── Unix domain socket tests ────────────────────────────────────────
+
+/// UDS echo server: bind_unix, connect via std UnixStream, echo round trip.
+#[test]
+fn unix_socket_echo() {
+    use std::os::unix::net::UnixStream;
+
+    let dir = std::env::temp_dir();
+    let sock_path = dir.join(format!("ringline-test-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock_path);
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind_unix(&sock_path)
+        .launch::<AsyncEcho>()
+        .expect("launch failed");
+
+    // Wait for the socket file to appear.
+    for _ in 0..200 {
+        if sock_path.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(sock_path.exists(), "socket file not created");
+
+    let mut stream = UnixStream::connect(&sock_path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let msg = b"hello unix";
+    stream.write_all(msg).unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = vec![0u8; msg.len()];
+    stream.read_exact(&mut buf).unwrap();
+    assert_eq!(buf, msg);
+
+    // Multi-round trip.
+    for i in 0..5 {
+        let payload = format!("uds-msg-{i}");
+        stream.write_all(payload.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        stream.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, payload.as_bytes());
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    let _ = std::fs::remove_file(&sock_path);
+}
+
+/// peer_addr returns PeerAddr::Tcp for TCP connections (regression).
+#[test]
+fn peer_addr_tcp_regression() {
+    static TCP_PEER: AtomicU32 = AtomicU32::new(0);
+
+    struct PeerAddrHandler;
+    impl AsyncEventHandler for PeerAddrHandler {
+        fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+            async move {
+                if let Some(ringline::PeerAddr::Tcp(_)) = conn.peer_addr() {
+                    TCP_PEER.store(1, Ordering::SeqCst);
+                }
+                let _ = conn
+                    .with_data(|data| {
+                        let _ = conn.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            PeerAddrHandler
+        }
+    }
+
+    TCP_PEER.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<PeerAddrHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+    let _ = echo_round_trip(&addr, b"x");
+    assert_eq!(TCP_PEER.load(Ordering::SeqCst), 1);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
