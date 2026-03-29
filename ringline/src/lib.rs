@@ -192,6 +192,13 @@ pub use runtime::select::select3;
 /// Opaque handle for a standalone spawned task.
 pub use runtime::task::TaskId;
 
+// ── Re-exports: Cancellation ────────────────────────────────────────────
+
+/// Token for cooperative cancellation of async tasks.
+pub use runtime::cancellation::CancellationToken;
+/// Future returned by [`CancellationToken::cancelled()`].
+pub use runtime::cancellation::CancelledFuture;
+
 // ── Re-exports: Channels ────────────────────────────────────────────────
 
 /// Error returned by [`oneshot::Receiver`] when the sender is dropped.

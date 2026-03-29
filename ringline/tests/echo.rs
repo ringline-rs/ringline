@@ -4502,3 +4502,127 @@ fn peer_addr_tcp_regression() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── CancellationToken tests ─────────────────────────────────────────
+
+static CANCEL_RESULT: AtomicU32 = AtomicU32::new(0);
+
+/// Cancellation token interrupts a long-running task via select.
+struct CancellationHandler;
+
+impl AsyncEventHandler for CancellationHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            let token = ringline::CancellationToken::new();
+            let child = token.child_token();
+
+            // Spawn a task that waits for cancellation.
+            let handle = ringline::spawn_with_handle(async move {
+                child.cancelled().await;
+                42u32
+            })
+            .unwrap();
+
+            // Cancel after a short delay.
+            ringline::sleep(Duration::from_millis(10)).await;
+            token.cancel();
+
+            // The spawned task should now complete.
+            let val = handle.await;
+            CANCEL_RESULT.store(val, Ordering::SeqCst);
+            let _ = conn.send_nowait(b"done");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        CancellationHandler
+    }
+}
+
+#[test]
+fn cancellation_token_wakes_task() {
+    CANCEL_RESULT.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<CancellationHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"done");
+    assert_eq!(CANCEL_RESULT.load(Ordering::SeqCst), 42);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Select between data and cancellation — cancellation wins.
+static SELECT_CANCEL: AtomicU32 = AtomicU32::new(0);
+
+struct SelectCancelHandler;
+
+impl AsyncEventHandler for SelectCancelHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            let token = ringline::CancellationToken::new();
+
+            // Cancel immediately — the select should pick cancellation
+            // over a long sleep.
+            token.cancel();
+
+            let result =
+                ringline::select(ringline::sleep(Duration::from_secs(60)), token.cancelled()).await;
+
+            match result {
+                ringline::Either::Right(()) => SELECT_CANCEL.store(1, Ordering::SeqCst),
+                _ => SELECT_CANCEL.store(99, Ordering::SeqCst),
+            }
+            let _ = conn.send_nowait(b"done");
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        SelectCancelHandler
+    }
+}
+
+#[test]
+fn cancellation_token_with_select() {
+    SELECT_CANCEL.store(0, Ordering::SeqCst);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<SelectCancelHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let got = trigger_and_read(&addr);
+    assert_eq!(&got, b"done");
+    assert_eq!(SELECT_CANCEL.load(Ordering::SeqCst), 1);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}

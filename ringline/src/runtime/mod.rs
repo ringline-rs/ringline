@@ -18,6 +18,7 @@
 //! A mio backend would provide an alternative `driver.rs`, `async_event_loop.rs`,
 //! and `runtime/io.rs` while reusing everything else unchanged.
 
+pub(crate) mod cancellation;
 pub mod channel;
 pub(crate) mod handler;
 pub(crate) mod io;
