@@ -26,14 +26,26 @@ pub(crate) struct AsyncEventLoop<A: AsyncEventHandler> {
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Create a new async event loop for a worker thread.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &crate::config::Config,
         handler: A,
         accept_rx: Option<crossbeam_channel::Receiver<(std::os::fd::RawFd, std::net::SocketAddr)>>,
         eventfd: std::os::fd::RawFd,
         shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
+        resolve_tx: Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
+        resolver: Option<std::sync::Arc<crate::resolver::ResolverPool>>,
     ) -> Result<Self, crate::error::Error> {
-        let driver = Driver::new(config, accept_rx, eventfd, shutdown_flag)?;
+        let driver = Driver::new(
+            config,
+            accept_rx,
+            eventfd,
+            shutdown_flag,
+            resolve_rx,
+            resolve_tx,
+            resolver,
+        )?;
         let executor = Executor::new(
             config.max_connections,
             config.standalone_task_capacity,
@@ -761,6 +773,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 metrics::CONNECTIONS_ACCEPTED.increment();
                 metrics::CONNECTIONS_ACTIVE.increment();
                 self.spawn_accept_task(conn_index);
+            }
+        }
+
+        // Drain DNS resolve responses.
+        if let Some(ref rx) = self.driver.resolve_rx {
+            while let Ok(response) = rx.try_recv() {
+                self.executor
+                    .deliver_resolve(response.request_id, response.result);
             }
         }
 
@@ -1538,8 +1558,17 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         assert!(eventfd >= 0, "eventfd creation failed");
-        AsyncEventLoop::new(&config, NoopHandler, None, eventfd, shutdown)
-            .expect("failed to create test event loop")
+        AsyncEventLoop::new(
+            &config,
+            NoopHandler,
+            None,
+            eventfd,
+            shutdown,
+            None,
+            None,
+            None,
+        )
+        .expect("failed to create test event loop")
     }
 
     /// Simulate an accepted plaintext connection at the given index.

@@ -116,13 +116,30 @@ impl RinglineBuilder {
     /// Each accepted connection gets a long-lived async task. The executor
     /// polls futures on the same thread-per-core model.
     pub fn launch<A: AsyncEventHandler>(self) -> LaunchResult {
-        self.launch_inner(|worker_id, config, accept_rx, eventfd, shutdown_flag| {
-            let handler = A::create_for_worker(worker_id);
-            let mut event_loop =
-                AsyncEventLoop::new(&config, handler, accept_rx, eventfd, shutdown_flag)?;
-            event_loop.run()?;
-            Ok(())
-        })
+        self.launch_inner(
+            |worker_id,
+             config,
+             accept_rx,
+             eventfd,
+             shutdown_flag,
+             resolve_rx,
+             resolve_tx,
+             resolver| {
+                let handler = A::create_for_worker(worker_id);
+                let mut event_loop = AsyncEventLoop::new(
+                    &config,
+                    handler,
+                    accept_rx,
+                    eventfd,
+                    shutdown_flag,
+                    resolve_rx,
+                    resolve_tx,
+                    resolver,
+                )?;
+                event_loop.run()?;
+                Ok(())
+            },
+        )
     }
 
     /// Common infrastructure setup for launch.
@@ -135,6 +152,9 @@ impl RinglineBuilder {
                 Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
                 RawFd,
                 Arc<AtomicBool>,
+                Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
+                Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
+                Option<Arc<crate::resolver::ResolverPool>>,
             ) -> Result<(), crate::error::Error>
             + Send
             + Clone
@@ -170,6 +190,21 @@ impl RinglineBuilder {
         }
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+        // Create resolver pool if configured.
+        let (resolver_pool, resolve_rxs) = if self.config.resolver_threads > 0 {
+            let pool = Arc::new(crate::resolver::ResolverPool::start(
+                self.config.resolver_threads,
+            ));
+            let mut rxs = Vec::with_capacity(num_threads);
+            for _ in 0..num_threads {
+                let (tx, rx) = crossbeam_channel::unbounded::<crate::resolver::ResolveResponse>();
+                rxs.push((tx, rx));
+            }
+            (Some(pool), Some(rxs))
+        } else {
+            (None, None)
+        };
 
         // Optionally create listener + acceptor.
         let (listen_fd, listen_fd_closed) = if let Some(addr) = self.bind_addr {
@@ -217,6 +252,14 @@ impl RinglineBuilder {
             let shutdown_flag = shutdown_flag.clone();
             let worker_fn = worker_fn.clone();
 
+            let (worker_resolve_rx, worker_resolve_tx, worker_resolver) =
+                if let Some(ref rxs) = resolve_rxs {
+                    let (ref tx, ref rx) = rxs[worker_id];
+                    (Some(rx.clone()), Some(tx.clone()), resolver_pool.clone())
+                } else {
+                    (None, None, None)
+                };
+
             let handle = thread::Builder::new()
                 .name(format!("ringline-worker-{worker_id}"))
                 .spawn(move || {
@@ -228,7 +271,16 @@ impl RinglineBuilder {
                     crate::counter::set_thread_shard(worker_id);
 
                     let accept_rx = if has_acceptor { Some(rx) } else { None };
-                    worker_fn(worker_id, config, accept_rx, eventfd, shutdown_flag)
+                    worker_fn(
+                        worker_id,
+                        config,
+                        accept_rx,
+                        eventfd,
+                        shutdown_flag,
+                        worker_resolve_rx,
+                        worker_resolve_tx,
+                        worker_resolver,
+                    )
                 })
                 .map_err(crate::error::Error::Io)?;
 
