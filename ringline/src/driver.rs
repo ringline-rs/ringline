@@ -92,12 +92,14 @@ pub(crate) fn sockaddr_to_peer_addr(
             if path_len == 0 {
                 Some(crate::connection::PeerAddr::Unix(std::path::PathBuf::new()))
             } else {
-                // sun_path may be null-terminated.
-                let bytes = &sa.sun_path[..path_len];
+                // sun_path may be null-terminated. Cast to u8 for portability
+                // (c_char is i8 on x86_64, u8 on aarch64).
+                #[allow(clippy::unnecessary_cast)]
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(sa.sun_path.as_ptr() as *const u8, path_len)
+                };
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(path_len);
-                let path =
-                    std::str::from_utf8(unsafe { std::slice::from_raw_parts(bytes.as_ptr(), end) })
-                        .unwrap_or("");
+                let path = std::str::from_utf8(&bytes[..end]).unwrap_or("");
                 Some(crate::connection::PeerAddr::Unix(std::path::PathBuf::from(
                     path,
                 )))
@@ -133,8 +135,13 @@ pub(crate) fn unix_path_to_sockaddr(
     let path_bytes = path.as_os_str().as_encoded_bytes();
     let max_len = std::mem::size_of_val(unsafe { &(*sa).sun_path }) - 1; // leave room for null
     let copy_len = path_bytes.len().min(max_len);
+    #[allow(clippy::unnecessary_cast)]
     unsafe {
-        std::ptr::copy_nonoverlapping(path_bytes.as_ptr(), (*sa).sun_path.as_mut_ptr(), copy_len);
+        std::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            (*sa).sun_path.as_mut_ptr() as *mut u8,
+            copy_len,
+        );
     }
     // Length: offset of sun_path + path bytes + null terminator.
     let sa_ref = unsafe { &*sa };
