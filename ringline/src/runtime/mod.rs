@@ -201,6 +201,10 @@ pub(crate) struct Executor {
     pub(crate) pidfd_results: HashMap<u32, i32>,
     /// Monotonic counter for pidfd poll sequence numbers.
     pub(crate) next_pidfd_seq: u32,
+    /// Pending blocking requests: request_id -> (task_id to wake, result slot).
+    pub(crate) pending_blocking: HashMap<u64, (u32, Option<Box<dyn std::any::Any + Send>>)>,
+    /// Monotonic counter for blocking request IDs.
+    pub(crate) next_blocking_id: u64,
 }
 
 impl Executor {
@@ -248,6 +252,8 @@ impl Executor {
             pidfd_waiters: HashMap::new(),
             pidfd_results: HashMap::new(),
             next_pidfd_seq: 0,
+            pending_blocking: HashMap::new(),
+            next_blocking_id: 0,
         }
     }
 
@@ -369,6 +375,19 @@ impl Executor {
     pub(crate) fn wake_pidfd(&mut self, seq: u32, result: i32) {
         self.pidfd_results.insert(seq, result);
         if let Some(task_id) = self.pidfd_waiters.remove(&seq) {
+            self.wake_task(task_id);
+        }
+    }
+
+    /// Deliver a blocking response and wake the waiting task.
+    pub(crate) fn deliver_blocking(
+        &mut self,
+        request_id: u64,
+        result: Box<dyn std::any::Any + Send>,
+    ) {
+        if let Some((task_id, slot)) = self.pending_blocking.get_mut(&request_id) {
+            *slot = Some(result);
+            let task_id = *task_id;
             self.wake_task(task_id);
         }
     }

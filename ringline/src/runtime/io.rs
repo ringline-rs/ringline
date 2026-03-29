@@ -253,6 +253,81 @@ pub fn spawn_with_handle<T: 'static>(
     .unwrap_or_else(|| Err(io::Error::other("called outside executor")))
 }
 
+/// Offload a blocking closure to the dedicated blocking thread pool.
+///
+/// The closure runs on a low-priority background thread (`SCHED_IDLE`),
+/// keeping the io_uring event loop unblocked. Returns a future that
+/// resolves to the closure's return value.
+///
+/// # Errors
+///
+/// Returns `Err` if called outside the ringline executor or if the blocking
+/// pool is not configured (`blocking_threads = 0`).
+pub fn spawn_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<BlockingJoinHandle<T>> {
+    try_with_state(|driver, executor| {
+        let pool = driver
+            .blocking_pool
+            .as_ref()
+            .ok_or_else(|| io::Error::other("blocking pool not configured"))?;
+        let blocking_tx = driver
+            .blocking_tx
+            .as_ref()
+            .ok_or_else(|| io::Error::other("blocking pool not configured"))?;
+
+        let request_id = executor.next_blocking_id;
+        executor.next_blocking_id += 1;
+
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor
+            .pending_blocking
+            .insert(request_id, (task_id, None));
+
+        let work = Box::new(move || -> Box<dyn std::any::Any + Send> { Box::new(f()) });
+
+        pool.request_tx
+            .send(crate::blocking::BlockingRequest {
+                work,
+                request_id,
+                response_tx: blocking_tx.clone(),
+                worker_eventfd: driver.eventfd,
+            })
+            .map_err(|_| io::Error::other("blocking pool shut down"))?;
+
+        Ok(BlockingJoinHandle {
+            request_id,
+            _phantom: std::marker::PhantomData,
+        })
+    })
+    .unwrap_or_else(|| Err(io::Error::other("called outside executor")))
+}
+
+/// Future returned by [`spawn_blocking()`]. Resolves to the closure's return value.
+pub struct BlockingJoinHandle<T> {
+    request_id: u64,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T: 'static> Future for BlockingJoinHandle<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
+        with_state(|_driver, executor| {
+            if let Some((_, slot)) = executor.pending_blocking.get_mut(&self.request_id)
+                && let Some(boxed) = slot.take()
+            {
+                executor.pending_blocking.remove(&self.request_id);
+                let value = *boxed
+                    .downcast::<T>()
+                    .expect("type mismatch in BlockingJoinHandle");
+                return Poll::Ready(value);
+            }
+            Poll::Pending
+        })
+    }
+}
+
 /// Initiate an outbound TCP connection from any async task (connection or standalone).
 ///
 /// This is the free-function equivalent of [`ConnCtx::connect()`] — it can be

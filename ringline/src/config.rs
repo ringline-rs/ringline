@@ -112,6 +112,13 @@ pub struct Config {
     /// 0 = disabled (no spawner pool; [`Command::spawn()`](crate::process::Command::spawn)
     /// will return an error). Default: 1.
     pub spawner_threads: usize,
+    /// Number of dedicated blocking threads. The blocking pool runs
+    /// user-provided closures on low-priority (`SCHED_IDLE`) background threads,
+    /// keeping CPU-bound or blocking work isolated from the io_uring event loop.
+    ///
+    /// 0 = disabled (no blocking pool; [`spawn_blocking()`](crate::spawn_blocking)
+    /// will return an error). Default: 4.
+    pub blocking_threads: usize,
 }
 
 impl Default for Config {
@@ -146,6 +153,7 @@ impl Default for Config {
             fs: Some(crate::fs::FsConfig::default()),
             resolver_threads: 2,
             spawner_threads: 1,
+            blocking_threads: 4,
         }
     }
 }
@@ -439,6 +447,12 @@ impl ConfigBuilder {
     /// Set the number of process spawner threads. 0 = disabled.
     pub fn spawner_threads(mut self, threads: usize) -> Self {
         self.config.spawner_threads = threads;
+        self
+    }
+
+    /// Set the number of blocking threads. 0 = disabled.
+    pub fn blocking_threads(mut self, threads: usize) -> Self {
+        self.config.blocking_threads = threads;
         self
     }
 

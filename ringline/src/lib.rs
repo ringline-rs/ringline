@@ -45,6 +45,7 @@
 pub(crate) mod acceptor;
 pub(crate) mod accumulator;
 pub(crate) mod async_event_loop;
+pub(crate) mod blocking;
 pub(crate) mod buffer;
 pub(crate) mod chain;
 pub(crate) mod completion;
@@ -93,6 +94,8 @@ pub use error::UdpSendError;
 pub use runtime::handler::AsyncEventHandler;
 /// Async scatter-gather send builder.
 pub use runtime::io::AsyncSendBuilder;
+/// Future returned by [`spawn_blocking()`]. Resolves to the closure's return value.
+pub use runtime::io::BlockingJoinHandle;
 /// Async connection context with send/recv futures.
 pub use runtime::io::ConnCtx;
 /// Future that completes when a connect finishes.
@@ -157,6 +160,8 @@ pub use runtime::io::sleep;
 pub use runtime::io::sleep_until;
 /// Spawn a standalone async task on the current worker.
 pub use runtime::io::spawn;
+/// Offload a blocking closure to the dedicated blocking thread pool.
+pub use runtime::io::spawn_blocking;
 /// Spawn a standalone async task and return a handle to await its result.
 pub use runtime::io::spawn_with_handle;
 /// Wrap a future with a deadline.
