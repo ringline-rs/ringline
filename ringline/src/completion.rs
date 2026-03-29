@@ -31,6 +31,8 @@ pub enum OpTag {
     /// Multishot recvmsg for TCP connections with SO_TIMESTAMPING.
     #[cfg(feature = "timestamps")]
     RecvMsgMultiTs = 17,
+    /// Filesystem I/O command (open, read, write, fsync, stat, rename, unlink, mkdir).
+    Fs = 18,
 }
 
 impl OpTag {
@@ -54,6 +56,7 @@ impl OpTag {
             16 => Some(OpTag::DirectIo),
             #[cfg(feature = "timestamps")]
             17 => Some(OpTag::RecvMsgMultiTs),
+            18 => Some(OpTag::Fs),
             _ => None,
         }
     }

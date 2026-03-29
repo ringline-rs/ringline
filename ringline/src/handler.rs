@@ -110,6 +110,12 @@ pub struct DriverCtx<'a> {
     pub(crate) direct_io_cmd_slab: &'a mut Option<crate::direct_io::DirectIoCmdSlab>,
     /// Base offset in the fixed file table for direct I/O file fds.
     pub(crate) direct_io_fd_base: u32,
+    /// Filesystem file table. `None` when fs is not configured.
+    pub(crate) fs_files: &'a mut Option<crate::fs::FsFileTable>,
+    /// Filesystem command slab. `None` when fs is not configured.
+    pub(crate) fs_cmd_slab: &'a mut Option<crate::fs::FsCmdSlab>,
+    /// Base offset in the fixed file table for filesystem file fds.
+    pub(crate) fs_fd_base: u32,
 }
 
 impl<'a> DriverCtx<'a> {
@@ -1184,6 +1190,428 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("invalid direct I/O file handle"))?;
         if f.generation != file.generation {
             return Err(io::Error::other("stale direct I/O file handle"));
+        }
+        Ok(f.fd_index)
+    }
+
+    // ── Filesystem I/O methods ─────────────────────────────────────────────
+
+    /// Open a file asynchronously via io_uring.
+    ///
+    /// Allocates a file table slot and command slab entry, submits an openat
+    /// SQE that installs the fd directly into the fixed file table.
+    ///
+    /// Returns `(file_index, generation, slab_idx)`.
+    pub(crate) fn fs_open(
+        &mut self,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        mode: u32,
+    ) -> io::Result<(u16, u16, u32)> {
+        let files = self
+            .fs_files
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+
+        let file_index = files
+            .allocate()
+            .ok_or_else(|| io::Error::other("filesystem file table full"))?;
+
+        let generation = files.get(file_index).map(|f| f.generation).unwrap_or(0);
+        let fd_index = self.fs_fd_base + file_index as u32;
+
+        // Store fd_index in file state.
+        if let Some(f) = files.get_mut(file_index) {
+            f.fd_index = fd_index;
+        }
+
+        let c_path = crate::fs::path_to_cstring(path).inspect_err(|_| {
+            self.fs_files.as_mut().unwrap().release(file_index);
+        })?;
+
+        let slab = self.fs_cmd_slab.as_mut().ok_or_else(|| {
+            self.fs_files.as_mut().unwrap().release(file_index);
+            io::Error::other("filesystem I/O not configured")
+        })?;
+
+        let slab_idx = slab
+            .allocate(file_index, crate::fs::FsOp::Open)
+            .ok_or_else(|| {
+                self.fs_files.as_mut().unwrap().release(file_index);
+                io::Error::other("filesystem command slab exhausted")
+            })?;
+
+        // Store the CString in the slab entry so it lives until CQE.
+        if let Some(entry) = slab.get_mut(slab_idx) {
+            entry.path = Some(c_path);
+        }
+
+        let path_ptr = self
+            .fs_cmd_slab
+            .as_ref()
+            .unwrap()
+            .get(slab_idx)
+            .unwrap()
+            .path
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::Fs,
+            file_index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe {
+            self.ring
+                .submit_openat(fd_index, path_ptr, flags.0, mode, ud.raw())
+        } {
+            Ok(()) => Ok((file_index, generation, slab_idx as u32)),
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                if let Some(files) = self.fs_files.as_mut() {
+                    files.release(file_index);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit a filesystem read.
+    ///
+    /// # Safety
+    /// `buf` must point to valid, writable memory of at least `len` bytes
+    /// that remains valid until the completion fires.
+    pub(crate) unsafe fn fs_read(
+        &mut self,
+        file: crate::fs::File,
+        offset: u64,
+        buf: *mut u8,
+        len: u32,
+    ) -> io::Result<u32> {
+        let fd_index = self.validate_fs_file(file)?;
+
+        let slab = self
+            .fs_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+        let slab_idx = slab
+            .allocate(file.index, crate::fs::FsOp::Read)
+            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::Fs,
+            file.index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) } {
+            Ok(()) => {
+                if let Some(files) = self.fs_files.as_mut()
+                    && let Some(f) = files.get_mut(file.index)
+                {
+                    f.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit a filesystem write.
+    ///
+    /// # Safety
+    /// `buf` must point to valid, readable memory of at least `len` bytes
+    /// that remains valid until the completion fires.
+    pub(crate) unsafe fn fs_write(
+        &mut self,
+        file: crate::fs::File,
+        offset: u64,
+        buf: *const u8,
+        len: u32,
+    ) -> io::Result<u32> {
+        let fd_index = self.validate_fs_file(file)?;
+
+        let slab = self
+            .fs_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+        let slab_idx = slab
+            .allocate(file.index, crate::fs::FsOp::Write)
+            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::Fs,
+            file.index as u32,
+            slab_idx as u32,
+        );
+
+        match unsafe {
+            self.ring
+                .submit_direct_write(fd_index, buf, len, offset, ud)
+        } {
+            Ok(()) => {
+                if let Some(files) = self.fs_files.as_mut()
+                    && let Some(f) = files.get_mut(file.index)
+                {
+                    f.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit an fsync for a filesystem file.
+    pub(crate) fn fs_fsync(&mut self, file: crate::fs::File) -> io::Result<u32> {
+        let fd_index = self.validate_fs_file(file)?;
+
+        let slab = self
+            .fs_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+        let slab_idx = slab
+            .allocate(file.index, crate::fs::FsOp::Fsync)
+            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::Fs,
+            file.index as u32,
+            slab_idx as u32,
+        );
+
+        match self.ring.submit_direct_fsync(fd_index, ud) {
+            Ok(()) => {
+                if let Some(files) = self.fs_files.as_mut()
+                    && let Some(f) = files.get_mut(file.index)
+                {
+                    f.in_flight += 1;
+                }
+                Ok(slab_idx as u32)
+            }
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Close a filesystem file.
+    ///
+    /// Deregisters the fd from the fixed file table and releases the file slot.
+    pub(crate) fn fs_close(&mut self, file: crate::fs::File) -> io::Result<()> {
+        let fd_index = self.validate_fs_file(file)?;
+
+        // Unregister from the fixed file table.
+        let _ = self.ring.register_files_update(fd_index, &[-1i32]);
+
+        if let Some(files) = self.fs_files.as_mut() {
+            files.release(file.index);
+        }
+
+        Ok(())
+    }
+
+    /// Submit a statx via io_uring.
+    ///
+    /// Returns the slab_idx (seq number for DiskIoFuture).
+    pub(crate) fn fs_stat(&mut self, path: &std::path::Path) -> io::Result<u32> {
+        let c_path = crate::fs::path_to_cstring(path)?;
+
+        let slab = self
+            .fs_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+        let slab_idx = slab
+            .allocate(0, crate::fs::FsOp::Statx)
+            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+
+        // Allocate the statx buffer and store it in the slab entry.
+        let statx_buf: Box<libc::statx> = Box::new(unsafe { std::mem::zeroed() });
+        let statx_ptr = &*statx_buf as *const libc::statx as *mut libc::statx;
+
+        if let Some(entry) = slab.get_mut(slab_idx) {
+            entry.path = Some(c_path);
+            entry.statx_buf = Some(statx_buf);
+        }
+
+        let path_ptr = self
+            .fs_cmd_slab
+            .as_ref()
+            .unwrap()
+            .get(slab_idx)
+            .unwrap()
+            .path
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+
+        let ud =
+            crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, slab_idx as u32);
+
+        match unsafe { self.ring.submit_statx(path_ptr, statx_ptr, ud.raw()) } {
+            Ok(()) => Ok(slab_idx as u32),
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit a renameat via io_uring.
+    pub(crate) fn fs_rename(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> io::Result<u32> {
+        let c_from = crate::fs::path_to_cstring(from)?;
+        let c_to = crate::fs::path_to_cstring(to)?;
+
+        let slab = self
+            .fs_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+        let slab_idx = slab
+            .allocate(0, crate::fs::FsOp::Rename)
+            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+
+        if let Some(entry) = slab.get_mut(slab_idx) {
+            entry.path = Some(c_from);
+            entry.path2 = Some(c_to);
+        }
+
+        let (old_ptr, new_ptr) = {
+            let entry = self.fs_cmd_slab.as_ref().unwrap().get(slab_idx).unwrap();
+            (
+                entry.path.as_ref().unwrap().as_ptr(),
+                entry.path2.as_ref().unwrap().as_ptr(),
+            )
+        };
+
+        let ud =
+            crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, slab_idx as u32);
+
+        match unsafe { self.ring.submit_renameat(old_ptr, new_ptr, ud.raw()) } {
+            Ok(()) => Ok(slab_idx as u32),
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit an unlinkat via io_uring.
+    pub(crate) fn fs_unlink(&mut self, path: &std::path::Path) -> io::Result<u32> {
+        let c_path = crate::fs::path_to_cstring(path)?;
+
+        let slab = self
+            .fs_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+        let slab_idx = slab
+            .allocate(0, crate::fs::FsOp::Unlink)
+            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+
+        if let Some(entry) = slab.get_mut(slab_idx) {
+            entry.path = Some(c_path);
+        }
+
+        let path_ptr = self
+            .fs_cmd_slab
+            .as_ref()
+            .unwrap()
+            .get(slab_idx)
+            .unwrap()
+            .path
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+
+        let ud =
+            crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, slab_idx as u32);
+
+        match unsafe { self.ring.submit_unlinkat(path_ptr, 0, ud.raw()) } {
+            Ok(()) => Ok(slab_idx as u32),
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Submit a mkdirat via io_uring.
+    pub(crate) fn fs_mkdir(&mut self, path: &std::path::Path, mode: u32) -> io::Result<u32> {
+        let c_path = crate::fs::path_to_cstring(path)?;
+
+        let slab = self
+            .fs_cmd_slab
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+        let slab_idx = slab
+            .allocate(0, crate::fs::FsOp::Mkdir)
+            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+
+        if let Some(entry) = slab.get_mut(slab_idx) {
+            entry.path = Some(c_path);
+        }
+
+        let path_ptr = self
+            .fs_cmd_slab
+            .as_ref()
+            .unwrap()
+            .get(slab_idx)
+            .unwrap()
+            .path
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+
+        let ud =
+            crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, slab_idx as u32);
+
+        match unsafe { self.ring.submit_mkdirat(path_ptr, mode, ud.raw()) } {
+            Ok(()) => Ok(slab_idx as u32),
+            Err(e) => {
+                if let Some(slab) = self.fs_cmd_slab.as_mut() {
+                    slab.release(slab_idx);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Validate a filesystem file handle and return the fd_index.
+    fn validate_fs_file(&self, file: crate::fs::File) -> io::Result<u32> {
+        let files = self
+            .fs_files
+            .as_ref()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+        let f = files
+            .get(file.index)
+            .ok_or_else(|| io::Error::other("invalid filesystem file handle"))?;
+        if f.generation != file.generation {
+            return Err(io::Error::other("stale filesystem file handle"));
         }
         Ok(f.fd_index)
     }

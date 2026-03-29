@@ -370,6 +370,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
             OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
             OpTag::DirectIo => self.handle_direct_io(ud, result),
+            OpTag::Fs => self.handle_fs(ud, result),
             #[cfg(feature = "timestamps")]
             OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
@@ -1334,6 +1335,59 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Wake the async task waiting for this Direct I/O completion.
+        self.executor.wake_disk_io(slab_idx as u32, result);
+    }
+
+    fn handle_fs(&mut self, ud: UserData, result: i32) {
+        let slab_idx = ud.payload() as u16;
+        let file_index = ud.conn_index() as u16;
+
+        let cmd_slab = match self.driver.fs_cmd_slab {
+            Some(ref mut s) => s,
+            None => return,
+        };
+
+        if !cmd_slab.in_use(slab_idx) {
+            return;
+        }
+
+        let op = cmd_slab.get(slab_idx).map(|e| e.op);
+
+        // For Statx ops, convert the statx buffer to Metadata before releasing the slab.
+        if op == Some(crate::fs::FsOp::Statx)
+            && result >= 0
+            && let Some(entry) = cmd_slab.get(slab_idx)
+            && let Some(ref statx_buf) = entry.statx_buf
+        {
+            let metadata = crate::fs::Metadata::from_statx(statx_buf);
+            self.executor
+                .fs_stat_results
+                .insert(slab_idx as u32, metadata);
+        }
+
+        // For Open ops, handle success/failure of the file slot.
+        if op == Some(crate::fs::FsOp::Open) && result < 0 {
+            // Open failed — release the pre-allocated file slot.
+            if let Some(ref mut files) = self.driver.fs_files {
+                files.release(file_index);
+            }
+        }
+
+        let (released_file_index, released_op) = cmd_slab.release(slab_idx);
+
+        // Decrement in-flight count for file-bound ops.
+        match released_op {
+            crate::fs::FsOp::Read | crate::fs::FsOp::Write | crate::fs::FsOp::Fsync => {
+                if let Some(ref mut files) = self.driver.fs_files
+                    && let Some(f) = files.get_mut(released_file_index)
+                {
+                    f.in_flight = f.in_flight.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+
+        // Wake the async task waiting for this completion.
         self.executor.wake_disk_io(slab_idx as u32, result);
     }
 

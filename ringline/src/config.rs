@@ -95,6 +95,9 @@ pub struct Config {
     /// Optional direct I/O configuration. When set, enables `O_DIRECT` file I/O
     /// via io_uring `IORING_OP_READ` / `IORING_OP_WRITE`, bypassing the page cache.
     pub direct_io: Option<crate::direct_io::DirectIoConfig>,
+    /// Optional buffered filesystem I/O configuration. When set, enables async
+    /// file open/read/write/stat/rename/unlink/mkdir via io_uring.
+    pub fs: Option<crate::fs::FsConfig>,
     /// Number of dedicated DNS resolver threads. The resolver pool runs
     /// `getaddrinfo` on background threads, keeping blocking DNS isolated
     /// from the io_uring event loop.
@@ -133,6 +136,7 @@ impl Default for Config {
             udp_bind: Vec::new(),
             nvme: None,
             direct_io: None,
+            fs: Some(crate::fs::FsConfig::default()),
             resolver_threads: 2,
         }
     }
@@ -409,6 +413,12 @@ impl ConfigBuilder {
     /// Set direct I/O configuration.
     pub fn direct_io(mut self, config: crate::direct_io::DirectIoConfig) -> Self {
         self.config.direct_io = Some(config);
+        self
+    }
+
+    /// Set filesystem I/O configuration.
+    pub fn fs(mut self, config: crate::fs::FsConfig) -> Self {
+        self.config.fs = Some(config);
         self
     }
 
