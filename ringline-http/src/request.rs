@@ -39,7 +39,9 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Send the request and return the response.
-    pub async fn send(self) -> Result<Response, HttpError> {
+    pub async fn send(mut self) -> Result<Response, HttpError> {
+        self.inject_accept_encoding();
+
         let extra: Vec<(&str, &str)> = self
             .headers
             .iter()
@@ -60,7 +62,13 @@ impl<'a> RequestBuilder<'a> {
     ///
     /// Returns as soon as headers are received. Body chunks are yielded
     /// incrementally via [`StreamingResponse::next_chunk()`].
-    pub async fn send_streaming(self) -> Result<StreamingResponse<'a>, HttpError> {
+    ///
+    /// **Note:** streaming responses do not automatically decompress the body.
+    /// If the server sends a compressed response, chunks will contain raw
+    /// compressed bytes. Buffer and decompress manually if needed.
+    pub async fn send_streaming(mut self) -> Result<StreamingResponse<'a>, HttpError> {
+        self.inject_accept_encoding();
+
         let extra: Vec<(&str, &str)> = self
             .headers
             .iter()
@@ -75,5 +83,18 @@ impl<'a> RequestBuilder<'a> {
         self.client
             .send_request_streaming(&self.method, &self.path, &extra, body_bytes)
             .await
+    }
+
+    /// Inject `Accept-Encoding` header if compression features are enabled
+    /// and the caller has not already set one.
+    fn inject_accept_encoding(&mut self) {
+        let has_ae = self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"));
+        if !has_ae && let Some(ae) = crate::compress::accept_encoding_value() {
+            self.headers
+                .push(("accept-encoding".to_string(), ae.to_string()));
+        }
     }
 }
