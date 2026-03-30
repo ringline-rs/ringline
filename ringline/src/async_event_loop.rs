@@ -1637,6 +1637,7 @@ mod tests {
         config.max_connections = 16;
         config.send_copy_count = 16;
         config.send_slab_slots = 8;
+        config.fs = None; // reduce fixed file table size for proptest
         config
     }
 
