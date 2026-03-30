@@ -40,4 +40,8 @@ pub enum HttpError {
     /// Protocol error (unexpected event, bad state).
     #[error("protocol error: {0}")]
     Protocol(String),
+
+    /// Decompression error.
+    #[error("decompression error: {0}")]
+    Decompress(String),
 }

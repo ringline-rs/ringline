@@ -127,6 +127,17 @@ impl H1Conn {
         }
         // else: no body (e.g. HEAD response, 204, 304)
 
+        // Decompress body if Content-Encoding is set.
+        #[cfg(any(feature = "gzip", feature = "zstd", feature = "brotli"))]
+        if let Some(ref encoding) = hdr.content_encoding {
+            let decompressed = crate::compress::decompress(encoding, &body_buf)?;
+            return Ok(Response::new(
+                hdr.status,
+                hdr.headers,
+                bytes::Bytes::from(decompressed),
+            ));
+        }
+
         Ok(Response::new(hdr.status, hdr.headers, body_buf.freeze()))
     }
 
@@ -184,10 +195,22 @@ impl H1Conn {
         req.extend_from_slice(self.host.as_bytes());
         req.extend_from_slice(b"\r\n");
 
+        let has_accept_encoding = extra_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"));
+
         for (name, value) in extra_headers {
             req.extend_from_slice(name.as_bytes());
             req.extend_from_slice(b": ");
             req.extend_from_slice(value.as_bytes());
+            req.extend_from_slice(b"\r\n");
+        }
+
+        // Auto-inject Accept-Encoding when compression features are enabled
+        // and the caller has not already set one.
+        if !has_accept_encoding && let Some(ae) = crate::compress::accept_encoding_value() {
+            req.extend_from_slice(b"accept-encoding: ");
+            req.extend_from_slice(ae.as_bytes());
             req.extend_from_slice(b"\r\n");
         }
 
@@ -214,6 +237,7 @@ impl H1Conn {
         let mut headers: Vec<(String, String)> = Vec::new();
         let mut content_length: Option<usize> = None;
         let mut chunked = false;
+        let mut content_encoding: Option<String> = None;
         let mut headers_done = false;
         let mut body_leftover = BytesMut::new();
         let mut parse_error = false;
@@ -229,6 +253,7 @@ impl H1Conn {
                             headers = parsed.headers;
                             content_length = parsed.content_length;
                             chunked = parsed.chunked;
+                            content_encoding = parsed.content_encoding;
                             headers_done = true;
                             let header_consumed = end + 4;
 
@@ -259,6 +284,7 @@ impl H1Conn {
             headers,
             content_length,
             chunked,
+            content_encoding,
             body_leftover,
         })
     }
@@ -270,6 +296,11 @@ struct H1HeaderResult {
     headers: Vec<(String, String)>,
     content_length: Option<usize>,
     chunked: bool,
+    #[cfg_attr(
+        not(any(feature = "gzip", feature = "zstd", feature = "brotli")),
+        allow(dead_code)
+    )]
+    content_encoding: Option<String>,
     body_leftover: BytesMut,
 }
 
@@ -404,6 +435,7 @@ struct ParsedHeaders {
     headers: Vec<(String, String)>,
     content_length: Option<usize>,
     chunked: bool,
+    content_encoding: Option<String>,
 }
 
 /// Parse HTTP/1.1 response headers (everything before `\r\n\r\n`).
@@ -421,6 +453,7 @@ fn parse_response_headers(data: &[u8]) -> Option<ParsedHeaders> {
     let mut headers = Vec::new();
     let mut content_length = None;
     let mut chunked = false;
+    let mut content_encoding = None;
 
     for line in lines {
         if line.is_empty() {
@@ -438,6 +471,9 @@ fn parse_response_headers(data: &[u8]) -> Option<ParsedHeaders> {
             {
                 chunked = true;
             }
+            if name.eq_ignore_ascii_case("content-encoding") {
+                content_encoding = Some(value.clone());
+            }
 
             headers.push((name, value));
         }
@@ -448,6 +484,7 @@ fn parse_response_headers(data: &[u8]) -> Option<ParsedHeaders> {
         headers,
         content_length,
         chunked,
+        content_encoding,
     })
 }
 

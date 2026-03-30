@@ -26,6 +26,8 @@ struct PendingStream {
     streaming: bool,
     /// Buffered chunks for streaming responses.
     chunks: VecDeque<Bytes>,
+    /// Content-Encoding from response headers (for decompression).
+    content_encoding: Option<String>,
 }
 
 impl PendingStream {
@@ -37,11 +39,25 @@ impl PendingStream {
             done: false,
             streaming: false,
             chunks: VecDeque::new(),
+            content_encoding: None,
         }
     }
 
-    fn into_response(self) -> Response {
-        Response::new(self.status.unwrap_or(0), self.headers, self.body.freeze())
+    fn into_response(self) -> Result<Response, HttpError> {
+        let body = self.body.freeze();
+
+        // Decompress body if Content-Encoding is set.
+        #[cfg(any(feature = "gzip", feature = "zstd", feature = "brotli"))]
+        if let Some(ref encoding) = self.content_encoding {
+            let decompressed = crate::compress::decompress(encoding, &body)?;
+            return Ok(Response::new(
+                self.status.unwrap_or(0),
+                self.headers,
+                Bytes::from(decompressed),
+            ));
+        }
+
+        Ok(Response::new(self.status.unwrap_or(0), self.headers, body))
     }
 }
 
@@ -164,8 +180,18 @@ impl H2AsyncConn {
             HeaderField::new(b":authority", host.as_bytes()),
         ];
 
+        let has_accept_encoding = extra_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"));
+
         for (name, value) in extra_headers {
             headers.push(HeaderField::new(name.as_bytes(), value.as_bytes()));
+        }
+
+        // Auto-inject Accept-Encoding when compression features are enabled
+        // and the caller has not already set one.
+        if !has_accept_encoding && let Some(ae) = crate::compress::accept_encoding_value() {
+            headers.push(HeaderField::new(b"accept-encoding", ae.as_bytes()));
         }
 
         let end_stream = !has_body;
@@ -246,7 +272,6 @@ impl H2AsyncConn {
         // Borrow-split: capture mutable refs before the closure.
         let h2 = &mut self.h2;
         let pending = &mut self.pending_streams;
-        let completed = &mut self.completed;
         let blocked = &mut self.blocked_sends;
         let settings_acked = &mut self.settings_acked;
 
@@ -279,6 +304,9 @@ impl H2AsyncConn {
                                     } else {
                                         let name = String::from_utf8_lossy(&h.name).into_owned();
                                         let value = String::from_utf8_lossy(&h.value).into_owned();
+                                        if name.eq_ignore_ascii_case("content-encoding") {
+                                            ps.content_encoding = Some(value.clone());
+                                        }
                                         ps.headers.push((name, value));
                                     }
                                 }
@@ -344,14 +372,15 @@ impl H2AsyncConn {
         }
 
         // Move completed non-streaming streams to the completed queue.
-        let done_ids: Vec<u32> = pending
+        let done_ids: Vec<u32> = self
+            .pending_streams
             .iter()
             .filter(|(_, ps)| ps.done && !ps.streaming)
             .map(|(id, _)| *id)
             .collect();
         for id in done_ids {
-            if let Some(ps) = pending.remove(&id) {
-                completed.push_back((id, ps.into_response()));
+            if let Some(ps) = self.pending_streams.remove(&id) {
+                self.completed.push_back((id, ps.into_response()?));
             }
         }
 

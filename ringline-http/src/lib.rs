@@ -66,6 +66,7 @@
 
 pub mod body;
 pub mod client;
+pub(crate) mod compress;
 pub mod error;
 pub mod h1_conn;
 pub mod h2_conn;
