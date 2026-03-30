@@ -7,8 +7,15 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+gzip = ["dep:flate2"]
+zstd = ["dep:zstd"]
+compression = ["gzip", "zstd"]
+
 [dependencies]
 ringline-h2 = { path = "../ringline-h2", version = "0.1.0" }
+flate2 = { version = "1", optional = true }
+zstd = { version = "0.13", optional = true, default-features = false }
 
 [dev-dependencies]
 ringline = { workspace = true }
