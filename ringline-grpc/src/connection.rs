@@ -12,6 +12,14 @@ use ringline_h2::{ErrorCode, H2Connection, H2Event};
 use crate::error::{GrpcError, GrpcStatus};
 use crate::message::{self, MessageBuffer};
 
+/// Per-stream state for tracking the server's chosen encoding.
+#[derive(Debug, Default)]
+struct StreamState {
+    buffer: MessageBuffer,
+    /// The encoding advertised by the server for this stream (from `grpc-encoding` header).
+    encoding: Option<String>,
+}
+
 /// Events produced by the gRPC connection for the application.
 #[derive(Debug)]
 pub enum GrpcEvent {
@@ -46,7 +54,7 @@ pub struct GrpcConnection {
     h2: H2Connection,
     ready: bool,
     /// Per-stream message reassembly buffers.
-    buffers: HashMap<u32, MessageBuffer>,
+    buffers: HashMap<u32, StreamState>,
     /// Pending gRPC events.
     events: VecDeque<GrpcEvent>,
 }
@@ -103,7 +111,7 @@ impl GrpcConnection {
         self.h2.send_data(stream_id, &framed, true)?;
 
         // Allocate a message buffer for the response.
-        self.buffers.insert(stream_id, MessageBuffer::new());
+        self.buffers.insert(stream_id, StreamState::default());
 
         Ok(stream_id)
     }
@@ -118,7 +126,7 @@ impl GrpcConnection {
         metadata: &[HeaderField],
     ) -> Result<u32, GrpcError> {
         let stream_id = self.send_headers(service, method, metadata, false)?;
-        self.buffers.insert(stream_id, MessageBuffer::new());
+        self.buffers.insert(stream_id, StreamState::default());
         Ok(stream_id)
     }
 
@@ -158,6 +166,9 @@ impl GrpcConnection {
             HeaderField::new(b"content-type", b"application/grpc"),
             HeaderField::new(b"te", b"trailers"),
         ];
+        if let Some(enc) = crate::compress::accept_encoding_value() {
+            headers.push(HeaderField::new(b"grpc-accept-encoding", enc.as_bytes()));
+        }
         headers.extend_from_slice(metadata);
 
         let stream_id = self.h2.send_request(&headers, end_stream)?;
@@ -196,6 +207,15 @@ impl GrpcConnection {
                             metadata: headers,
                         });
                     } else {
+                        // Extract grpc-encoding from response headers.
+                        if let Some(state) = self.buffers.get_mut(&stream_id) {
+                            for h in &headers {
+                                if h.name.eq_ignore_ascii_case(b"grpc-encoding") {
+                                    state.encoding =
+                                        Some(String::from_utf8_lossy(&h.value).into_owned());
+                                }
+                            }
+                        }
                         self.events.push_back(GrpcEvent::Response {
                             stream_id,
                             metadata: headers,
@@ -207,13 +227,23 @@ impl GrpcConnection {
                     data,
                     end_stream,
                 } => {
-                    if let Some(buf) = self.buffers.get_mut(&stream_id) {
-                        buf.push(&data);
-                        while let Some(payload) = buf.try_decode() {
-                            self.events.push_back(GrpcEvent::Message {
-                                stream_id,
-                                data: payload,
-                            });
+                    if let Some(state) = self.buffers.get_mut(&stream_id) {
+                        state.buffer.push(&data);
+                        while let Some((payload, compressed)) = state.buffer.try_decode() {
+                            let data = if compressed {
+                                if let Some(ref enc) = state.encoding {
+                                    match crate::compress::decompress(enc, &payload) {
+                                        Ok(decompressed) => decompressed,
+                                        Err(_) => payload, // fallback to raw on error
+                                    }
+                                } else {
+                                    payload // compressed flag set but no encoding header
+                                }
+                            } else {
+                                payload
+                            };
+                            self.events
+                                .push_back(GrpcEvent::Message { stream_id, data });
                         }
                     }
 
@@ -223,12 +253,19 @@ impl GrpcConnection {
                 }
                 H2Event::Trailers { stream_id, headers } => {
                     // Drain any remaining buffered messages.
-                    if let Some(buf) = self.buffers.get_mut(&stream_id) {
-                        while let Some(payload) = buf.try_decode() {
-                            self.events.push_back(GrpcEvent::Message {
-                                stream_id,
-                                data: payload,
-                            });
+                    if let Some(state) = self.buffers.get_mut(&stream_id) {
+                        while let Some((payload, compressed)) = state.buffer.try_decode() {
+                            let data = if compressed {
+                                if let Some(ref enc) = state.encoding {
+                                    crate::compress::decompress(enc, &payload).unwrap_or(payload)
+                                } else {
+                                    payload
+                                }
+                            } else {
+                                payload
+                            };
+                            self.events
+                                .push_back(GrpcEvent::Message { stream_id, data });
                         }
                     }
 
