@@ -77,7 +77,7 @@ impl OpTag {
 /// Bits 31..0:  Payload (32 bits, buffer index or seq number)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UserData(pub u64);
+pub struct UserData(pub(crate) u64);
 
 impl UserData {
     const TAG_SHIFT: u64 = 56;
