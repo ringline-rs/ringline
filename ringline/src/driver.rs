@@ -894,7 +894,7 @@ impl Driver {
             }
 
             for i in 0..self.cqe_batch.len() {
-                let (user_data_raw, _result, flags, _big_cqe) = self.cqe_batch[i];
+                let (user_data_raw, result, flags, _big_cqe) = self.cqe_batch[i];
                 let ud = UserData(user_data_raw);
                 let tag = match ud.tag() {
                     Some(t) => t,
@@ -920,7 +920,12 @@ impl Driver {
                                 }
                             }
                         } else {
-                            self.send_slab.inc_pending_notifs(slab_idx);
+                            // Only expect a ZC notification when result > 0.
+                            // On error/zero, no notification arrives — incrementing
+                            // would permanently leak the slab entry.
+                            if result > 0 {
+                                self.send_slab.inc_pending_notifs(slab_idx);
+                            }
                             self.send_slab.mark_awaiting_notifications(slab_idx);
                             if self.send_slab.should_release(slab_idx) {
                                 let pool_slot = self.send_slab.release(slab_idx);

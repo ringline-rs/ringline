@@ -399,6 +399,59 @@ mod tests {
         assert_eq!(slab.free_count(), 4);
     }
 
+    /// Regression test: shutdown handler must not call inc_pending_notifs
+    /// when result <= 0 (no ZC notification will arrive). Doing so permanently
+    /// leaks the slab entry because pending_notifs never returns to 0.
+    #[test]
+    fn error_result_without_inc_notifs_releases_immediately() {
+        let mut slab = InFlightSendSlab::new(4);
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
+
+        // Simulate error result (result < 0): do NOT call inc_pending_notifs.
+        // This is what the shutdown handler should do for error CQEs.
+        slab.mark_awaiting_notifications(idx);
+        assert!(
+            slab.should_release(idx),
+            "slab entry should be releasable on error (no notification expected)"
+        );
+        slab.release(idx);
+        assert_eq!(slab.free_count(), 4);
+    }
+
+    /// Demonstrates the bug: if inc_pending_notifs IS called on an error
+    /// result, the slab entry is permanently leaked.
+    #[test]
+    fn inc_notifs_on_error_prevents_release() {
+        let mut slab = InFlightSendSlab::new(4);
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
+
+        // Bug scenario: incorrectly calling inc_pending_notifs on error result.
+        slab.inc_pending_notifs(idx);
+        slab.mark_awaiting_notifications(idx);
+
+        // should_release returns false — pending_notifs == 1, no notification
+        // will ever arrive to decrement it. This is the leak.
+        assert!(
+            !slab.should_release(idx),
+            "slab entry should NOT be releasable with pending notifications"
+        );
+
+        // Clean up: manually decrement so we don't leak in the test.
+        slab.dec_pending_notifs(idx);
+        assert!(slab.should_release(idx));
+        slab.release(idx);
+    }
+
     #[test]
     fn exhaust_slab() {
         let mut slab = InFlightSendSlab::new(1);
