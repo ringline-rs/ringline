@@ -166,6 +166,11 @@ impl Config {
                 "recv_buffer.ring_size must be a power of two".into(),
             ));
         }
+        if self.recv_buffer.buffer_size == 0 || self.recv_buffer.buffer_size > 65535 {
+            return Err(crate::error::Error::RingSetup(
+                "recv_buffer.buffer_size must be > 0 and <= 65535".into(),
+            ));
+        }
         if self.max_connections == 0 || self.max_connections >= (1 << 24) {
             return Err(crate::error::Error::RingSetup(
                 "max_connections must be > 0 and < 2^24".into(),
@@ -482,5 +487,125 @@ impl ConfigBuilder {
     pub fn build(self) -> Result<Config, crate::error::Error> {
         self.config.validate()?;
         Ok(self.config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a Config with a single field override.
+    /// Avoids clippy::field_reassign_with_default on the multi-field Config struct.
+    fn config_with(f: impl FnOnce(&mut Config)) -> Config {
+        let mut c = Config::default();
+        f(&mut c);
+        c
+    }
+
+    #[test]
+    fn validate_default_config_passes() {
+        Config::default()
+            .validate()
+            .expect("default config should be valid");
+    }
+
+    #[test]
+    fn validate_buffer_size_zero_rejected() {
+        assert!(
+            config_with(|c| c.recv_buffer.buffer_size = 0)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_buffer_size_max_accepted() {
+        assert!(
+            config_with(|c| c.recv_buffer.buffer_size = 65535)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_buffer_size_overflow_rejected() {
+        let err = config_with(|c| c.recv_buffer.buffer_size = 65536)
+            .validate()
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("buffer_size"),
+            "error should mention buffer_size: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_buffer_size_large_rejected() {
+        assert!(
+            config_with(|c| c.recv_buffer.buffer_size = 131072)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_ring_size_not_power_of_two_rejected() {
+        assert!(
+            config_with(|c| c.recv_buffer.ring_size = 3)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_sq_entries_not_power_of_two_rejected() {
+        assert!(config_with(|c| c.sq_entries = 3).validate().is_err());
+    }
+
+    #[test]
+    fn validate_sq_entries_zero_rejected() {
+        assert!(config_with(|c| c.sq_entries = 0).validate().is_err());
+    }
+
+    #[test]
+    fn validate_max_connections_zero_rejected() {
+        assert!(config_with(|c| c.max_connections = 0).validate().is_err());
+    }
+
+    #[test]
+    fn validate_max_connections_too_large_rejected() {
+        assert!(
+            config_with(|c| c.max_connections = 1 << 24)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_timer_slots_too_large_rejected() {
+        assert!(config_with(|c| c.timer_slots = 65536).validate().is_err());
+    }
+
+    #[test]
+    fn validate_send_copy_slot_size_zero_rejected() {
+        assert!(
+            config_with(|c| c.send_copy_slot_size = 0)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_send_copy_count_zero_rejected() {
+        assert!(config_with(|c| c.send_copy_count = 0).validate().is_err());
+    }
+
+    #[test]
+    fn validate_standalone_task_capacity_too_large_rejected() {
+        assert!(
+            config_with(|c| c.standalone_task_capacity = 1 << 31)
+                .validate()
+                .is_err()
+        );
     }
 }

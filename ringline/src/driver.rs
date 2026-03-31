@@ -214,6 +214,10 @@ pub(crate) struct Driver {
     /// buffer ID has NOT been pushed to `pending_replenish` and must be
     /// replenished when the slot is cleared.
     pub(crate) pending_recv_bufs: Vec<Option<PendingRecvBuf>>,
+    /// Per-connection original data length for in-flight SendRecvBuf operations.
+    /// Set when `forward_recv_buf` initiates a send; used by `handle_send_recv_buf`
+    /// to compute the correct offset on partial sends (since buf_size != data_len).
+    pub(crate) send_recv_buf_original_lens: Vec<u32>,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
@@ -412,6 +416,7 @@ impl Driver {
             accumulators,
             pending_replenish: Vec::with_capacity(config.recv_buffer.ring_size as usize),
             pending_recv_bufs: vec![None; config.max_connections as usize],
+            send_recv_buf_original_lens: vec![0; config.max_connections as usize],
             accept_rx,
             eventfd,
             eventfd_buf: [0u8; 8],
