@@ -79,6 +79,18 @@ impl ConnStream {
             .map(|c| matches!(c.recv_mode, RecvMode::Closed))
             .unwrap_or(true)
     }
+
+    /// Flush any pending zero-copy recv buffer to the accumulator so
+    /// `ConnStream` can read it. The zero-copy path holds kernel buffers
+    /// in `pending_recv_bufs` for `with_data()`/`with_bytes()` callers;
+    /// `ConnStream` must flush these since it reads from the accumulator.
+    fn flush_pending_recv(driver: &mut crate::driver::Driver, conn_index: u32) {
+        if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
+            let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+            driver.accumulators.append(conn_index, data);
+            driver.pending_replenish.push(pending.bid);
+        }
+    }
 }
 
 impl AsyncRead for ConnStream {
@@ -104,6 +116,9 @@ impl AsyncRead for ConnStream {
         let conn_index = self.ctx.conn_index;
 
         with_state(|driver, executor| {
+            // Flush zero-copy recv buffer to accumulator if present.
+            Self::flush_pending_recv(driver, conn_index);
+
             let data = driver.accumulators.data(conn_index);
             if !data.is_empty() {
                 let n = data.len().min(buf.len());
@@ -137,6 +152,9 @@ impl AsyncBufRead for ConnStream {
 
         // Try to detach the accumulator as a refcounted Bytes (O(1)).
         let frozen = with_state(|driver, executor| {
+            // Flush zero-copy recv buffer to accumulator if present.
+            Self::flush_pending_recv(driver, conn_index);
+
             let data = driver.accumulators.data(conn_index);
             if !data.is_empty() {
                 return Ok(Some(driver.accumulators.take_frozen(conn_index)));
