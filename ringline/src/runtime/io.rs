@@ -1609,8 +1609,10 @@ impl Drop for SleepFuture {
             if !executor.timer_pool.is_fired(slot) {
                 let payload = TimerSlotPool::encode_payload(slot, self.generation);
                 let target_ud = UserData::encode(OpTag::Timer, 0, payload);
+                // Best effort cancel; timer fires harmlessly if already expired.
                 let _ = driver.ring.submit_async_cancel(target_ud.raw(), 0);
             }
+            // Slot released regardless — stale timer CQE detected via generation.
             executor.timer_pool.release(slot);
         }
     }

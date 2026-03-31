@@ -116,6 +116,8 @@ pub struct DriverCtx<'a> {
     pub(crate) fs_cmd_slab: &'a mut Option<crate::fs::FsCmdSlab>,
     /// Base offset in the fixed file table for filesystem file fds.
     pub(crate) fs_fd_base: u32,
+    /// Pending close retries from failed submit_close calls.
+    pub(crate) pending_close_retries: &'a mut Vec<u32>,
 }
 
 impl<'a> DriverCtx<'a> {
@@ -304,7 +306,10 @@ impl<'a> DriverCtx<'a> {
                 tls_table.send_close_notify(conn.index, self.ring, self.send_copy_pool);
             }
 
-            let _ = self.ring.submit_close(conn.index);
+            if self.ring.submit_close(conn.index).is_err() {
+                crate::metrics::CLOSE_SUBMIT_FAILURES.increment();
+                self.pending_close_retries.push(conn.index);
+            }
         }
     }
 
@@ -314,6 +319,7 @@ impl<'a> DriverCtx<'a> {
             if conn_state.generation != conn.generation {
                 return;
             }
+            // Best effort half-close; connection will be fully closed later.
             let _ = self.ring.submit_shutdown(conn.index);
         }
     }
@@ -463,6 +469,7 @@ impl<'a> DriverCtx<'a> {
             &self.connect_addrs[conn_index as usize] as *const _ as *const libc::sockaddr,
             addrlen,
         ) {
+            // Stale fixed file entry is overwritten when the slot is reused.
             let _ = self.ring.register_files_update(conn_index, &[-1]);
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
@@ -526,6 +533,7 @@ impl<'a> DriverCtx<'a> {
             &self.connect_addrs[conn_index as usize] as *const _ as *const libc::sockaddr,
             addrlen,
         ) {
+            // Stale fixed file entry is overwritten when the slot is reused.
             let _ = self.ring.register_files_update(conn_index, &[-1]);
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
@@ -640,11 +648,13 @@ impl<'a> DriverCtx<'a> {
 
         // Create TLS client state (buffers ClientHello internally).
         let sni = rustls::pki_types::ServerName::try_from(server_name.to_owned()).map_err(|e| {
+            // Stale fixed file entry is overwritten when the slot is reused.
             let _ = self.ring.register_files_update(conn_index, &[-1]);
             self.connections.release(conn_index);
             crate::error::Error::RingSetup(format!("invalid server name: {e}"))
         })?;
         if let Err(e) = tls_table.create_client(conn_index, sni) {
+            // Stale fixed file entry is overwritten when the slot is reused.
             let _ = self.ring.register_files_update(conn_index, &[-1]);
             self.connections.release(conn_index);
             return Err(crate::error::Error::RingSetup(format!(
@@ -665,6 +675,7 @@ impl<'a> DriverCtx<'a> {
             addrlen,
         ) {
             tls_table.remove(conn_index);
+            // Stale fixed file entry is overwritten when the slot is reused.
             let _ = self.ring.register_files_update(conn_index, &[-1]);
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
@@ -718,6 +729,7 @@ impl<'a> DriverCtx<'a> {
                 conn.index,
                 0,
             );
+            // Best effort cancel; timeout fires harmlessly if already established.
             let _ = self.ring.submit_async_cancel(timeout_ud.raw(), conn.index);
         }
 
@@ -943,7 +955,7 @@ impl<'a> DriverCtx<'a> {
         let (fd_index, _nsid) = self.validate_nvme_device(device)?;
 
         // Unregister from the fixed file table.
-        let _ = self.ring.register_files_update(fd_index, &[-1i32]);
+        self.ring.register_files_update(fd_index, &[-1i32])?;
 
         if let Some(devices) = self.nvme_devices.as_mut() {
             devices.release(device.index);
@@ -1170,7 +1182,7 @@ impl<'a> DriverCtx<'a> {
         let fd_index = self.validate_direct_io_file(file)?;
 
         // Unregister from the fixed file table.
-        let _ = self.ring.register_files_update(fd_index, &[-1i32]);
+        self.ring.register_files_update(fd_index, &[-1i32])?;
 
         if let Some(files) = self.direct_io_files.as_mut() {
             files.release(file.index);
@@ -1418,7 +1430,7 @@ impl<'a> DriverCtx<'a> {
         let fd_index = self.validate_fs_file(file)?;
 
         // Unregister from the fixed file table.
-        let _ = self.ring.register_files_update(fd_index, &[-1i32]);
+        self.ring.register_files_update(fd_index, &[-1i32])?;
 
         if let Some(files) = self.fs_files.as_mut() {
             files.release(file.index);
