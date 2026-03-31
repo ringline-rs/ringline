@@ -20,8 +20,8 @@
 //!     let value = client.get("my-cache", b"key").await?;
 //!
 //!     // Multiplexed fire/recv API
-//!     let id1 = client.fire_get("my-cache", b"key1")?;
-//!     let id2 = client.fire_get("my-cache", b"key2")?;
+//!     let id1 = client.fire_get("my-cache", b"key1", 0)?;
+//!     let id2 = client.fire_get("my-cache", b"key2", 0)?;
 //!     let op1 = client.recv().await?;
 //!     let op2 = client.recv().await?;
 //!
@@ -90,18 +90,21 @@ pub enum CompletedOp {
         id: RequestId,
         key: Bytes,
         result: Result<Option<Bytes>, Error>,
+        user_data: u64,
     },
     /// Set operation completed.
     Set {
         id: RequestId,
         key: Bytes,
         result: Result<(), Error>,
+        user_data: u64,
     },
     /// Delete operation completed.
     Delete {
         id: RequestId,
         key: Bytes,
         result: Result<(), Error>,
+        user_data: u64,
     },
 }
 
@@ -134,6 +137,7 @@ struct PendingOp {
     key: Bytes,
     send_ts: u64,
     start: Option<Instant>,
+    user_data: u64,
 }
 
 // ── ClientMetrics ───────────────────────────────────────────────────────
@@ -358,7 +362,12 @@ impl Client {
     // ── Multiplexed fire API ────────────────────────────────────────────
 
     /// Fire a GET request. Returns immediately with a RequestId.
-    pub fn fire_get(&mut self, cache: &str, key: &[u8]) -> Result<RequestId, Error> {
+    pub fn fire_get(
+        &mut self,
+        cache: &str,
+        key: &[u8],
+        user_data: u64,
+    ) -> Result<RequestId, Error> {
         let message_id = self.next_id();
         let ns = self.namespace_for(cache);
         let key = Bytes::copy_from_slice(key);
@@ -380,6 +389,7 @@ impl Client {
                 key,
                 send_ts,
                 start,
+                user_data,
             },
         );
 
@@ -393,6 +403,7 @@ impl Client {
         key: &[u8],
         value: &[u8],
         ttl_ms: u64,
+        user_data: u64,
     ) -> Result<RequestId, Error> {
         let message_id = self.next_id();
         let ns = self.namespace_for(cache);
@@ -417,6 +428,7 @@ impl Client {
                 key,
                 send_ts,
                 start,
+                user_data,
             },
         );
 
@@ -424,7 +436,12 @@ impl Client {
     }
 
     /// Fire a DELETE request. Returns immediately with a RequestId.
-    pub fn fire_delete(&mut self, cache: &str, key: &[u8]) -> Result<RequestId, Error> {
+    pub fn fire_delete(
+        &mut self,
+        cache: &str,
+        key: &[u8],
+        user_data: u64,
+    ) -> Result<RequestId, Error> {
         let message_id = self.next_id();
         let ns = self.namespace_for(cache);
         let key = Bytes::copy_from_slice(key);
@@ -446,6 +463,7 @@ impl Client {
                 key,
                 send_ts,
                 start,
+                user_data,
             },
         );
 
@@ -513,7 +531,7 @@ impl Client {
 
     /// Sequential get: fire + recv.
     pub async fn get(&mut self, cache: &str, key: &[u8]) -> Result<Option<Bytes>, Error> {
-        let _id = self.fire_get(cache, key)?;
+        let _id = self.fire_get(cache, key, 0)?;
         match self.recv().await? {
             CompletedOp::Get { result, .. } => result,
             _ => Err(Error::Protocol("unexpected response type".into())),
@@ -528,7 +546,7 @@ impl Client {
         value: &[u8],
         ttl_ms: u64,
     ) -> Result<(), Error> {
-        let _id = self.fire_set(cache, key, value, ttl_ms)?;
+        let _id = self.fire_set(cache, key, value, ttl_ms, 0)?;
         match self.recv().await? {
             CompletedOp::Set { result, .. } => result,
             _ => Err(Error::Protocol("unexpected response type".into())),
@@ -537,7 +555,7 @@ impl Client {
 
     /// Sequential delete.
     pub async fn delete(&mut self, cache: &str, key: &[u8]) -> Result<(), Error> {
-        let _id = self.fire_delete(cache, key)?;
+        let _id = self.fire_delete(cache, key, 0)?;
         match self.recv().await? {
             CompletedOp::Delete { result, .. } => result,
             _ => Err(Error::Protocol("unexpected response type".into())),
@@ -723,6 +741,7 @@ fn dispatch_response(
     let op = pending.remove(&message_id)?;
     let send_ts = op.send_ts;
     let start = op.start;
+    let user_data = op.user_data;
 
     match op.kind {
         PendingOpKind::Get => {
@@ -741,6 +760,7 @@ fn dispatch_response(
                     id,
                     key: op.key,
                     result,
+                    user_data,
                 },
                 cmd_type: CommandType::Get,
                 success,
@@ -763,6 +783,7 @@ fn dispatch_response(
                     id,
                     key: op.key,
                     result,
+                    user_data,
                 },
                 cmd_type: CommandType::Set,
                 success,
@@ -787,6 +808,7 @@ fn dispatch_response(
                     id,
                     key: op.key,
                     result,
+                    user_data,
                 },
                 cmd_type: CommandType::Delete,
                 success,

@@ -4626,3 +4626,198 @@ fn cancellation_token_with_select() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── Zero-copy forward tests ────────────────────────────────────────
+//
+// These tests exercise the forward_recv_buf path, which sends directly
+// from the kernel recv buffer without copying into the send pool.
+
+struct ForwardEcho;
+
+impl AsyncEventHandler for ForwardEcho {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| {
+                        let _ = conn.forward_recv_buf(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ForwardEcho
+    }
+}
+
+#[test]
+fn forward_echo_small_message() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<ForwardEcho>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let msg = b"Hello, zero-copy forward!";
+    let response = echo_round_trip(&addr, msg);
+    assert_eq!(response, msg);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn forward_echo_large_message() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut config = test_config();
+    config.recv_buffer.buffer_size = 32768;
+    config.send_copy_slot_size = 32768;
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<ForwardEcho>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    // 32KB — exercises the full zero-copy recv + forward path.
+    let msg: Vec<u8> = (0..32768).map(|i| (i % 256) as u8).collect();
+    let response = echo_round_trip(&addr, &msg);
+    assert_eq!(response, msg);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn forward_echo_message_larger_than_buffer() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    // Buffer is 4KB but message is 8KB — forces accumulator fallback
+    // (forward_recv_buf falls back to send_nowait when data is from accumulator).
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<ForwardEcho>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let msg: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
+    let response = echo_round_trip(&addr, &msg);
+    assert_eq!(response, msg);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn forward_echo_multiple_connections() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<ForwardEcho>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let mut join_handles = Vec::new();
+    for conn_id in 0..10u8 {
+        let addr = addr.clone();
+        join_handles.push(std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(&addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.set_nodelay(true).unwrap();
+
+            for round in 0..20u8 {
+                let msg = vec![conn_id ^ round; 64];
+                stream.write_all(&msg).unwrap();
+
+                let mut buf = vec![0u8; 64];
+                let mut total = 0;
+                while total < 64 {
+                    match stream.read(&mut buf[total..]) {
+                        Ok(0) => panic!("unexpected EOF"),
+                        Ok(n) => total += n,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => panic!("read error: {e}"),
+                    }
+                }
+                assert_eq!(buf, msg, "data mismatch conn={conn_id} round={round}");
+            }
+        }));
+    }
+
+    for h in join_handles {
+        h.join().unwrap();
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn forward_echo_sequential_sends() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<ForwardEcho>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    // Many sequential round-trips on one connection to stress the
+    // pending recv buf → replenish → reuse cycle.
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.set_nodelay(true).unwrap();
+
+    for i in 0..500u16 {
+        let msg = format!("msg-{i:04}");
+        stream.write_all(msg.as_bytes()).unwrap();
+
+        let mut buf = vec![0u8; msg.len()];
+        let mut total = 0;
+        while total < msg.len() {
+            match stream.read(&mut buf[total..]) {
+                Ok(0) => panic!("unexpected EOF at msg {i}"),
+                Ok(n) => total += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("read error at msg {i}: {e}"),
+            }
+        }
+        assert_eq!(buf, msg.as_bytes(), "data mismatch at msg {i}");
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}

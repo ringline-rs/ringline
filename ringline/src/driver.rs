@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::sync::Arc;
@@ -186,6 +187,17 @@ pub(crate) fn socket_addr_to_sockaddr(
     }
 }
 
+/// A kernel recv buffer held in-place for zero-copy access.
+///
+/// The pointer is into `ProvidedBufRing::buf_backing`, which is allocated once
+/// and never resized, so it remains valid until the bid is replenished.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingRecvBuf {
+    pub(crate) bid: u16,
+    pub(crate) len: u32,
+    pub(crate) ptr: *const u8,
+}
+
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
@@ -198,6 +210,10 @@ pub(crate) struct Driver {
     pub(crate) send_slab: InFlightSendSlab,
     pub(crate) accumulators: AccumulatorTable,
     pub(crate) pending_replenish: Vec<u16>,
+    /// Per-connection pending recv buffer for zero-copy recv. When `Some`, the
+    /// buffer ID has NOT been pushed to `pending_replenish` and must be
+    /// replenished when the slot is cleared.
+    pub(crate) pending_recv_bufs: Vec<Option<PendingRecvBuf>>,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
@@ -395,6 +411,7 @@ impl Driver {
             send_slab,
             accumulators,
             pending_replenish: Vec::with_capacity(config.recv_buffer.ring_size as usize),
+            pending_recv_bufs: vec![None; config.max_connections as usize],
             accept_rx,
             eventfd,
             eventfd_buf: [0u8; 8],
@@ -573,6 +590,43 @@ impl Driver {
             None => {
                 state.in_flight = false;
                 false
+            }
+        }
+    }
+
+    /// Submit a built send SQE or queue it if a send is already in-flight.
+    ///
+    /// This is the Driver-level equivalent of `DriverCtx::submit_or_queue`,
+    /// used by zero-copy forward paths that bypass DriverCtx.
+    pub(crate) fn submit_or_queue_send(
+        &mut self,
+        conn_index: u32,
+        built: crate::handler::BuiltSend,
+    ) -> io::Result<()> {
+        let state = &mut self.send_queues[conn_index as usize];
+        if state.in_flight {
+            state.queue.push_back(built);
+            Ok(())
+        } else {
+            let entry = built.entry.clone();
+            match unsafe { self.ring.push_sqe(entry) } {
+                Ok(()) => {
+                    state.in_flight = true;
+                    Ok(())
+                }
+                Err(e) => {
+                    // For SendRecvBuf, pool_slot and slab_idx are u16::MAX (no resources).
+                    // The caller is responsible for replenishing the recv buffer bid on error.
+                    if built.slab_idx != u16::MAX {
+                        let pool_slot = self.send_slab.release(built.slab_idx);
+                        if pool_slot != u16::MAX {
+                            self.send_copy_pool.release(pool_slot);
+                        }
+                    } else if built.pool_slot != u16::MAX {
+                        self.send_copy_pool.release(built.pool_slot);
+                    }
+                    Err(e)
+                }
             }
         }
     }

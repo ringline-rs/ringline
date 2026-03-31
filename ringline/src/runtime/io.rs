@@ -699,6 +699,69 @@ impl ConnCtx {
         })
     }
 
+    /// Forward the current pending recv buffer as a zero-copy send.
+    ///
+    /// This is intended for use inside a `with_data` closure. If the connection
+    /// has a pending recv buffer (from the zero-copy recv path), it is taken and
+    /// used as the send source directly — no copy into the send pool. The recv
+    /// buffer is replenished when the send completes.
+    ///
+    /// Falls back to `send_nowait(data)` if there is no pending recv buffer
+    /// (e.g., data came from the accumulator or a TLS connection).
+    ///
+    /// Only works for plaintext connections; TLS connections always copy.
+    pub fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
+        with_state(|driver, _| {
+            let conn_index = self.conn_index;
+
+            // Check for pending recv buffer.
+            if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
+                // Verify the data pointer matches the pending buffer (sanity check).
+                let pending_ptr = pending.ptr;
+                let data_ptr = data.as_ptr();
+                if data_ptr == pending_ptr && data.len() == pending.len as usize {
+                    // Submit send SQE from the recv buffer. The bid is replenished
+                    // on send completion via handle_send_recv_buf.
+                    // Payload: bid in low 16 bits, remaining_len in high 16 bits.
+                    let payload = (pending.bid as u32) | ((pending.len) << 16);
+                    let user_data = crate::completion::UserData::encode(
+                        crate::completion::OpTag::SendRecvBuf,
+                        conn_index,
+                        payload,
+                    );
+                    let entry = io_uring::opcode::Send::new(
+                        io_uring::types::Fixed(conn_index),
+                        pending_ptr,
+                        pending.len,
+                    )
+                    .build()
+                    .user_data(user_data.raw());
+
+                    let built = crate::handler::BuiltSend {
+                        entry,
+                        pool_slot: u16::MAX,
+                        slab_idx: u16::MAX,
+                        total_len: pending.len,
+                    };
+
+                    let result = driver.submit_or_queue_send(conn_index, built);
+                    if result.is_err() {
+                        // Submit failed — replenish the recv buffer.
+                        driver.pending_replenish.push(pending.bid);
+                    }
+                    return result;
+                }
+
+                // Pointer mismatch — put it back and fall through to copy path.
+                driver.pending_recv_bufs[conn_index as usize] = Some(pending);
+            }
+
+            // No pending recv buffer — fall back to copy send.
+            let mut ctx = driver.make_ctx();
+            ctx.send(self.token(), data)
+        })
+    }
+
     /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
     ///
     /// This mirrors `DriverCtx::send_parts()` — use `.copy(data)` for copied parts
@@ -1106,6 +1169,67 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
         with_state(|driver, executor| {
+            // Zero-copy fast path: check pending recv buffer before accumulator.
+            if driver.pending_recv_bufs[self.conn_index as usize].is_some() {
+                let acc_empty = driver.accumulators.data(self.conn_index).is_empty();
+                if acc_empty {
+                    // Borrow the kernel buffer in-place — no copy.
+                    let pending = driver.pending_recv_bufs[self.conn_index as usize].unwrap();
+                    let data =
+                        unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                    let f = self.f.as_mut().expect("WithDataFuture polled after Ready");
+                    let result = f(data);
+                    match result {
+                        ParseResult::Consumed(consumed) if consumed > 0 => {
+                            // The closure may have called forward_recv_buf(), which
+                            // takes the pending slot. Only replenish if still present.
+                            if let Some(pending) =
+                                driver.pending_recv_bufs[self.conn_index as usize].take()
+                            {
+                                if consumed < pending.len as usize {
+                                    // Partial consume: copy remainder to accumulator.
+                                    let remainder = unsafe {
+                                        std::slice::from_raw_parts(
+                                            pending.ptr.add(consumed),
+                                            pending.len as usize - consumed,
+                                        )
+                                    };
+                                    driver.accumulators.append(self.conn_index, remainder);
+                                }
+                                driver.pending_replenish.push(pending.bid);
+                            }
+                            self.f.take();
+                            return Poll::Ready(consumed);
+                        }
+                        _ => {
+                            // NeedMore / Consumed(0): flush pending to accumulator
+                            // and fall through to the existing accumulator path.
+                            if let Some(pending) =
+                                driver.pending_recv_bufs[self.conn_index as usize].take()
+                            {
+                                let pending_data = unsafe {
+                                    std::slice::from_raw_parts(pending.ptr, pending.len as usize)
+                                };
+                                driver.accumulators.append(self.conn_index, pending_data);
+                                driver.pending_replenish.push(pending.bid);
+                            }
+                            // Fall through to accumulator path below.
+                        }
+                    }
+                } else {
+                    // Accumulator has data AND there's a pending buffer.
+                    // Flush pending to accumulator (prepend — it arrived first).
+                    let pending = driver.pending_recv_bufs[self.conn_index as usize]
+                        .take()
+                        .unwrap();
+                    let pending_data =
+                        unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                    driver.accumulators.prepend(self.conn_index, pending_data);
+                    driver.pending_replenish.push(pending.bid);
+                    // Fall through to accumulator path below.
+                }
+            }
+
             let data = driver.accumulators.data(self.conn_index);
             if data.is_empty() {
                 // Check if the connection has been closed — return 0 (EOF)
@@ -1174,6 +1298,15 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
         with_state(|driver, executor| {
+            // Flush any pending zero-copy recv buffer to accumulator so
+            // take_frozen() will include it.
+            if let Some(pending) = driver.pending_recv_bufs[self.conn_index as usize].take() {
+                let pending_data =
+                    unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                driver.accumulators.append(self.conn_index, pending_data);
+                driver.pending_replenish.push(pending.bid);
+            }
+
             let data = driver.accumulators.data(self.conn_index);
             if data.is_empty() {
                 // Check if the connection has been closed — return 0 (EOF).

@@ -200,10 +200,10 @@ fn momento_fire_recv() {
     run_momento_test!(FIRE_RECV_RESULT, |client, cache| {
         Box::pin(async move {
             let set_id = client
-                .fire_set(cache, b"ringline-test:fire", b"fire-value", 60_000)
+                .fire_set(cache, b"ringline-test:fire", b"fire-value", 60_000, 0)
                 .map_err(|e| format!("fire_set: {e}"))?;
             let get_id = client
-                .fire_get(cache, b"ringline-test:fire")
+                .fire_get(cache, b"ringline-test:fire", 0)
                 .map_err(|e| format!("fire_get: {e}"))?;
 
             let mut set_ok = false;

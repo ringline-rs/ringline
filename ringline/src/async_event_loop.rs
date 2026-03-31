@@ -384,6 +384,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::DirectIo => self.handle_direct_io(ud, result),
             OpTag::Fs => self.handle_fs(ud, result),
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
+            OpTag::SendRecvBuf => self.handle_send_recv_buf(ud, result),
             #[cfg(feature = "timestamps")]
             OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
@@ -445,7 +446,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
         let data = unsafe { std::slice::from_raw_parts(buf_ptr, bytes_received as usize) };
 
-        self.driver.pending_replenish.push(bid);
+        // NOTE: bid is NOT unconditionally pushed to pending_replenish here.
+        // The zero-copy recv path defers replenishment until the task consumes
+        // the data. Each branch below is responsible for either pushing the bid
+        // to pending_replenish or storing it in a pending_recv_bufs slot.
 
         // TLS path
         let is_tls_conn = self
@@ -455,6 +459,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .is_some_and(|t| t.has(conn_index));
 
         if is_tls_conn {
+            self.driver.pending_replenish.push(bid);
             {
                 let tls_table = self.driver.tls_table.as_mut().unwrap();
                 let result = crate::tls::feed_tls_recv(
@@ -520,8 +525,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
         } else {
-            // Plaintext path: route through recv sink if active, else accumulator.
+            // Plaintext path: route through recv sink if active, else zero-copy/accumulator.
             if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
+                self.driver.pending_replenish.push(bid);
                 let remaining_cap = sink.cap - sink.pos;
                 let to_sink = data.len().min(remaining_cap);
                 if to_sink > 0 {
@@ -541,7 +547,29 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         .append(conn_index, &data[to_sink..]);
                 }
             } else {
-                self.driver.accumulators.append(conn_index, data);
+                // Zero-copy fast path: if no pending buffer AND accumulator is
+                // empty, hold the kernel buffer in-place instead of copying.
+                let acc_empty = self.driver.accumulators.data(conn_index).is_empty();
+                let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
+
+                if acc_empty && slot.is_none() {
+                    *slot = Some(crate::driver::PendingRecvBuf {
+                        bid,
+                        len: bytes_received,
+                        ptr: buf_ptr,
+                    });
+                } else {
+                    // Flush any existing pending buffer to accumulator first.
+                    if let Some(pending) = slot.take() {
+                        let pending_data = unsafe {
+                            std::slice::from_raw_parts(pending.ptr, pending.len as usize)
+                        };
+                        self.driver.accumulators.append(conn_index, pending_data);
+                        self.driver.pending_replenish.push(pending.bid);
+                    }
+                    self.driver.accumulators.append(conn_index, data);
+                    self.driver.pending_replenish.push(bid);
+                }
             }
             self.executor.wake_recv(conn_index);
         }
@@ -767,6 +795,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     libc::close(raw_fd);
                 }
 
+                if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
+                    self.driver.pending_replenish.push(pending.bid);
+                }
                 self.driver.accumulators.reset(conn_index);
                 self.arm_recv(conn_index);
 
@@ -884,6 +915,67 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         self.driver.send_copy_pool.release(pool_slot);
         self.driver.drain_conn_send_queue(conn_index);
+
+        let io_result = if result == 0 {
+            Ok(0u32)
+        } else {
+            Err(io::Error::from_raw_os_error(-result))
+        };
+        self.executor.wake_send(conn_index, io_result);
+    }
+
+    /// Handle completion of a send from a recv buffer (zero-copy forward).
+    ///
+    /// Payload encoding: `bid` in low 16 bits, `remaining_len` in high 16 bits.
+    /// On partial send, resubmits from offset. On completion, replenishes the bid.
+    fn handle_send_recv_buf(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let payload = ud.payload();
+        let bid = (payload & 0xFFFF) as u16;
+        let remaining_before = payload >> 16;
+
+        if result > 0 {
+            let bytes_sent = result as u32;
+
+            if bytes_sent < remaining_before {
+                // Partial send — resubmit the remainder.
+                let new_remaining = remaining_before - bytes_sent;
+                let (buf_ptr, buf_size) = self.driver.provided_bufs.get_buffer(bid);
+                let offset = buf_size - new_remaining;
+                let new_ptr = unsafe { buf_ptr.add(offset as usize) };
+                let new_payload = (bid as u32) | ((new_remaining) << 16);
+                let new_ud = UserData::encode(
+                    crate::completion::OpTag::SendRecvBuf,
+                    conn_index,
+                    new_payload,
+                );
+                let entry = io_uring::opcode::Send::new(
+                    io_uring::types::Fixed(conn_index),
+                    new_ptr,
+                    new_remaining,
+                )
+                .build()
+                .user_data(new_ud.raw());
+
+                if unsafe { self.driver.ring.push_sqe(entry) }.is_err() {
+                    // SQ full — replenish and give up.
+                    self.driver.pending_replenish.push(bid);
+                    self.driver.submit_next_queued(conn_index);
+                }
+                return;
+            }
+
+            // Full send complete.
+            metrics::BYTES_SENT.add(remaining_before as u64);
+            self.driver.pending_replenish.push(bid);
+            self.driver.submit_next_queued(conn_index);
+            self.executor.wake_send(conn_index, Ok(remaining_before));
+            return;
+        }
+
+        // Error or zero-length send.
+        self.driver.pending_replenish.push(bid);
+        self.driver.submit_next_queued(conn_index);
 
         let io_result = if result == 0 {
             Ok(0u32)
@@ -1104,6 +1196,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
+        if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
+            self.driver.pending_replenish.push(pending.bid);
+        }
         self.driver.accumulators.reset(conn_index);
 
         // TLS client path
@@ -1172,6 +1267,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     fn handle_close(&mut self, ud: UserData) {
         let conn_index = ud.conn_index();
+
+        // Replenish any held zero-copy recv buffer.
+        if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
+            self.driver.pending_replenish.push(pending.bid);
+        }
 
         let was_established = self
             .driver
@@ -1931,15 +2031,66 @@ mod tests {
         let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
         el.test_dispatch_cqe(ud.raw(), bytes_received, flags);
 
-        // Data should be in the accumulator.
+        // With zero-copy recv, first completion should be held in pending
+        // buffer slot (not copied to accumulator). Accumulator should be empty.
         let data = el.driver.accumulators.data(conn_index);
-        assert_eq!(data, b"hello", "data not appended to accumulator");
-
-        // Buffer should be queued for replenish.
         assert!(
-            el.driver.pending_replenish.contains(&bid),
-            "buffer not queued for replenish"
+            data.is_empty(),
+            "data should NOT be in accumulator (zero-copy)"
         );
+
+        let pending = el.driver.pending_recv_bufs[conn_index as usize];
+        assert!(pending.is_some(), "pending recv buf should be set");
+        let pending = pending.unwrap();
+        assert_eq!(pending.bid, bid);
+        assert_eq!(pending.len, bytes_received as u32);
+
+        // Buffer should NOT be queued for replenish yet (deferred).
+        assert!(
+            !el.driver.pending_replenish.contains(&bid),
+            "buffer should NOT be replenished yet (zero-copy deferred)"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_second_completion_flushes_to_accumulator() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let flags = 1u32 | 2u32; // IORING_CQE_F_BUFFER | IORING_CQE_F_MORE, bid=0
+
+        // First recv: bid=0, "hello"
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
+        }
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 5, flags);
+
+        // Second recv: bid=1, " world"
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b" world".as_ptr(), buf_ptr as *mut u8, 6);
+        }
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 6, flags | (1u32 << 16));
+
+        // Both buffers should be replenished (first flushed, second appended directly).
+        assert!(
+            el.driver.pending_replenish.contains(&0),
+            "first buffer should be replenished"
+        );
+        assert!(
+            el.driver.pending_replenish.contains(&1),
+            "second buffer should be replenished"
+        );
+
+        // No pending buffer (second completion went through accumulator path).
+        assert!(el.driver.pending_recv_bufs[conn_index as usize].is_none());
+
+        // Accumulator should contain both buffers' data concatenated.
+        let data = el.driver.accumulators.data(conn_index);
+        assert_eq!(data, b"hello world");
     }
 
     #[test]

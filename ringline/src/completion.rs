@@ -35,6 +35,8 @@ pub enum OpTag {
     Fs = 18,
     /// PollAdd on a pidfd for async child process exit notification.
     PidfdPoll = 19,
+    /// Send from a recv buffer (zero-copy forward). Payload = bid to replenish on completion.
+    SendRecvBuf = 20,
 }
 
 impl OpTag {
@@ -60,6 +62,7 @@ impl OpTag {
             17 => Some(OpTag::RecvMsgMultiTs),
             18 => Some(OpTag::Fs),
             19 => Some(OpTag::PidfdPoll),
+            20 => Some(OpTag::SendRecvBuf),
             _ => None,
         }
     }
