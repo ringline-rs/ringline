@@ -184,3 +184,194 @@ impl ConnectionTable {
         self.slots[idx as usize].generation
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocate_returns_indices_and_marks_active() {
+        let mut table = ConnectionTable::new(4);
+        assert_eq!(table.active_count(), 0);
+
+        let idx = table.allocate().unwrap();
+        assert_eq!(table.active_count(), 1);
+        assert!(table.get(idx).is_some());
+        assert!(table.get(idx).unwrap().active);
+        assert!(matches!(table.get(idx).unwrap().recv_mode, RecvMode::Multi));
+    }
+
+    #[test]
+    fn allocate_outbound_sets_connecting_mode() {
+        let mut table = ConnectionTable::new(4);
+        let idx = table.allocate_outbound().unwrap();
+
+        let conn = table.get(idx).unwrap();
+        assert!(conn.outbound);
+        assert!(!conn.established);
+        assert!(matches!(conn.recv_mode, RecvMode::Connecting));
+    }
+
+    #[test]
+    fn release_makes_slot_reusable() {
+        let mut table = ConnectionTable::new(2);
+        let idx0 = table.allocate().unwrap();
+        let idx1 = table.allocate().unwrap();
+        assert_eq!(table.active_count(), 2);
+        assert!(table.allocate().is_none()); // full
+
+        table.release(idx0);
+        assert_eq!(table.active_count(), 1);
+        assert!(table.get(idx0).is_none()); // no longer active
+
+        // Can allocate again — gets the released slot.
+        let idx_new = table.allocate().unwrap();
+        assert_eq!(idx_new, idx0);
+        assert_eq!(table.active_count(), 2);
+
+        table.release(idx1);
+        table.release(idx_new);
+    }
+
+    #[test]
+    fn release_increments_generation() {
+        let mut table = ConnectionTable::new(4);
+        let idx = table.allocate().unwrap();
+        assert_eq!(table.generation(idx), 0);
+
+        table.release(idx);
+        assert_eq!(table.generation(idx), 1);
+
+        let idx2 = table.allocate().unwrap();
+        assert_eq!(idx2, idx);
+        assert_eq!(table.generation(idx), 1); // generation persists across reuse
+
+        table.release(idx);
+        assert_eq!(table.generation(idx), 2);
+    }
+
+    #[test]
+    fn generation_wraps_at_u32_max() {
+        let mut table = ConnectionTable::new(1);
+        let idx = table.allocate().unwrap();
+
+        // Manually set generation near max.
+        table.slots[idx as usize].generation = u32::MAX;
+        table.release(idx);
+        assert_eq!(table.generation(idx), 0); // wraps to 0
+    }
+
+    #[test]
+    fn double_release_is_no_op() {
+        let mut table = ConnectionTable::new(4);
+        let idx = table.allocate().unwrap();
+        let gen_before = table.generation(idx);
+
+        table.release(idx);
+        let gen_after = table.generation(idx);
+        assert_eq!(gen_after, gen_before + 1);
+
+        // Second release: already inactive, should be no-op.
+        table.release(idx);
+        assert_eq!(table.generation(idx), gen_after); // generation unchanged
+        assert_eq!(table.active_count(), 0);
+
+        // Free list should have exactly max_slots entries (no double-push).
+        let idx0 = table.allocate().unwrap();
+        let idx1 = table.allocate().unwrap();
+        let idx2 = table.allocate().unwrap();
+        let idx3 = table.allocate().unwrap();
+        assert!(table.allocate().is_none()); // exactly 4 slots, all used
+        table.release(idx0);
+        table.release(idx1);
+        table.release(idx2);
+        table.release(idx3);
+    }
+
+    #[test]
+    fn get_returns_none_for_inactive_slot() {
+        let mut table = ConnectionTable::new(4);
+        // Unallocated slot.
+        assert!(table.get(0).is_none());
+
+        let idx = table.allocate().unwrap();
+        assert!(table.get(idx).is_some());
+
+        table.release(idx);
+        assert!(table.get(idx).is_none());
+    }
+
+    #[test]
+    fn get_returns_none_for_out_of_bounds() {
+        let table = ConnectionTable::new(4);
+        assert!(table.get(99).is_none());
+    }
+
+    #[test]
+    fn release_out_of_bounds_is_no_op() {
+        let mut table = ConnectionTable::new(4);
+        // Should not panic.
+        table.release(99);
+        assert_eq!(table.active_count(), 0);
+    }
+
+    #[test]
+    fn exhaust_all_slots() {
+        let mut table = ConnectionTable::new(3);
+        let a = table.allocate().unwrap();
+        let b = table.allocate().unwrap();
+        let c = table.allocate().unwrap();
+        assert!(table.allocate().is_none());
+        assert_eq!(table.active_count(), 3);
+
+        table.release(b);
+        assert_eq!(table.active_count(), 2);
+
+        let d = table.allocate().unwrap();
+        assert_eq!(d, b); // reuses released slot
+        assert_eq!(table.active_count(), 3);
+        assert!(table.allocate().is_none());
+
+        table.release(a);
+        table.release(c);
+        table.release(d);
+    }
+
+    #[test]
+    fn deactivate_resets_all_fields() {
+        let mut table = ConnectionTable::new(4);
+        let idx = table.allocate_outbound().unwrap();
+
+        // Simulate connection becoming established.
+        if let Some(cs) = table.get_mut(idx) {
+            cs.established = true;
+            cs.connect_timeout_armed = true;
+            cs.peer_addr = Some(PeerAddr::Tcp("127.0.0.1:8080".parse().unwrap()));
+        }
+
+        table.release(idx);
+
+        // After release, all fields should be reset.
+        let cs = &table.slots[idx as usize];
+        assert!(!cs.active);
+        assert!(!cs.outbound);
+        assert!(!cs.established);
+        assert!(!cs.connect_timeout_armed);
+        assert!(cs.peer_addr.is_none());
+        assert!(matches!(cs.recv_mode, RecvMode::Closed));
+    }
+
+    #[test]
+    fn max_slots_returns_capacity() {
+        let table = ConnectionTable::new(16);
+        assert_eq!(table.max_slots(), 16);
+        assert_eq!(table.active_count(), 0);
+    }
+
+    #[test]
+    fn allocate_gives_lowest_index_first() {
+        let table = ConnectionTable::new(4);
+        // Free list is reversed, so pop gives lowest first.
+        assert_eq!(table.free_list.last(), Some(&0));
+    }
+}

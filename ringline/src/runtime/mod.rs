@@ -544,4 +544,122 @@ mod tests {
         assert_eq!(exec.ready_queue.len(), 1);
         assert_eq!(exec.ready_queue[0], 1);
     }
+
+    // ── TimerSlotPool tests ────────────────────────────────────────
+
+    #[test]
+    fn timer_allocate_and_fire() {
+        let mut pool = TimerSlotPool::new(4);
+
+        let (slot, generation) = pool.allocate(42).unwrap();
+        assert!(!pool.is_fired(slot));
+
+        let waker_id = pool.fire(slot, generation).unwrap();
+        assert_eq!(waker_id, 42);
+        assert!(pool.is_fired(slot));
+    }
+
+    #[test]
+    fn timer_fire_stale_generation_returns_none() {
+        let mut pool = TimerSlotPool::new(4);
+
+        let (slot, generation) = pool.allocate(10).unwrap();
+        pool.release(slot); // increments generation
+
+        // Fire with old generation — should return None (stale).
+        assert!(pool.fire(slot, generation).is_none());
+    }
+
+    #[test]
+    fn timer_release_increments_generation() {
+        let mut pool = TimerSlotPool::new(4);
+
+        let (slot, gen0) = pool.allocate(1).unwrap();
+        pool.release(slot);
+
+        let (slot2, gen1) = pool.allocate(2).unwrap();
+        assert_eq!(slot2, slot); // same slot reused
+        assert_eq!(gen1, gen0 + 1);
+
+        pool.release(slot2);
+    }
+
+    #[test]
+    fn timer_generation_wraps_at_u16_max() {
+        let mut pool = TimerSlotPool::new(1);
+
+        let (slot, _) = pool.allocate(1).unwrap();
+        pool.generations[slot as usize] = u16::MAX;
+        pool.release(slot);
+
+        let (slot2, generation) = pool.allocate(2).unwrap();
+        assert_eq!(slot2, slot);
+        assert_eq!(generation, 0); // wrapped from u16::MAX
+    }
+
+    #[test]
+    fn timer_encode_decode_round_trip() {
+        let slot = 1234u32;
+        let generation = 5678u16;
+        let payload = TimerSlotPool::encode_payload(slot, generation);
+        let (decoded_slot, decoded_gen) = TimerSlotPool::decode_payload(payload);
+        assert_eq!(decoded_slot, slot);
+        assert_eq!(decoded_gen, generation);
+    }
+
+    #[test]
+    fn timer_encode_decode_boundary_values() {
+        // Max slot (16 bits) and max generation (16 bits).
+        let payload = TimerSlotPool::encode_payload(0xFFFF, 0xFFFF);
+        let (slot, generation) = TimerSlotPool::decode_payload(payload);
+        assert_eq!(slot, 0xFFFF);
+        assert_eq!(generation, 0xFFFF);
+
+        // Zero values.
+        let payload = TimerSlotPool::encode_payload(0, 0);
+        let (slot, generation) = TimerSlotPool::decode_payload(payload);
+        assert_eq!(slot, 0);
+        assert_eq!(generation, 0);
+    }
+
+    #[test]
+    fn timer_exhaust_pool() {
+        let mut pool = TimerSlotPool::new(2);
+
+        let (s0, _) = pool.allocate(1).unwrap();
+        let (s1, _) = pool.allocate(2).unwrap();
+        assert!(pool.allocate(3).is_none()); // full
+
+        pool.release(s0);
+        assert!(pool.allocate(4).is_some()); // one freed
+        assert!(pool.allocate(5).is_none()); // full again
+
+        pool.release(s1);
+    }
+
+    #[test]
+    fn timer_is_fired_out_of_bounds() {
+        let pool = TimerSlotPool::new(2);
+        assert!(!pool.is_fired(99)); // out of bounds returns false
+    }
+
+    #[test]
+    fn timer_fire_out_of_bounds_returns_none() {
+        let mut pool = TimerSlotPool::new(2);
+        assert!(pool.fire(99, 0).is_none());
+    }
+
+    #[test]
+    fn timer_allocate_resets_fired_flag() {
+        let mut pool = TimerSlotPool::new(2);
+
+        let (slot, generation) = pool.allocate(1).unwrap();
+        pool.fire(slot, generation).unwrap();
+        assert!(pool.is_fired(slot));
+
+        pool.release(slot);
+        let (slot2, _) = pool.allocate(2).unwrap();
+        assert_eq!(slot2, slot);
+        assert!(!pool.is_fired(slot2)); // fired flag reset on allocate
+    }
 }
