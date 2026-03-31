@@ -294,10 +294,14 @@ fn run_bench_tokio(
     let mut merged = LatencyHistogram::new();
     client_rt.block_on(async {
         for handle in task_handles {
-            if let Ok(histogram) = handle.await {
-                for &sample in histogram.samples() {
-                    merged.record(sample);
+            match tokio::time::timeout(Duration::from_secs(2), handle).await {
+                Ok(Ok(histogram)) => {
+                    for &sample in histogram.samples() {
+                        merged.record(sample);
+                    }
                 }
+                Ok(Err(_join_err)) => {}
+                Err(_timeout) => {}
             }
         }
     });

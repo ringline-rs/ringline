@@ -183,28 +183,37 @@ impl<'a> DriverCtx<'a> {
             }
         }
 
-        let (slot, ptr, len) = self
-            .send_copy_pool
-            .copy_in(data)
-            .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
+        let slot_size = self.send_copy_pool.slot_size() as usize;
 
-        let user_data = crate::completion::UserData::encode(
-            crate::completion::OpTag::Send,
-            conn.index,
-            slot as u32,
-        );
-        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn.index), ptr, len)
-            .build()
-            .user_data(user_data.raw());
+        // Chunk data that exceeds the send copy slot size. Each chunk gets its
+        // own pool slot and SQE; the per-connection send queue ensures they are
+        // transmitted in order.
+        for chunk in data.chunks(slot_size) {
+            let (slot, ptr, len) = self
+                .send_copy_pool
+                .copy_in(chunk)
+                .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
 
-        let built = BuiltSend {
-            entry,
-            pool_slot: slot,
-            slab_idx: u16::MAX,
-            total_len: data.len() as u32,
-        };
+            let user_data = crate::completion::UserData::encode(
+                crate::completion::OpTag::Send,
+                conn.index,
+                slot as u32,
+            );
+            let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn.index), ptr, len)
+                .build()
+                .user_data(user_data.raw());
 
-        self.submit_or_queue(conn.index, built)
+            let built = BuiltSend {
+                entry,
+                pool_slot: slot,
+                slab_idx: u16::MAX,
+                total_len: chunk.len() as u32,
+            };
+
+            self.submit_or_queue(conn.index, built)?;
+        }
+
+        Ok(())
     }
 
     /// Submit a built send SQE or queue it if a send is already in-flight.

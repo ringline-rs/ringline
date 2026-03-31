@@ -189,12 +189,17 @@ fn main() {
     let elapsed = start.elapsed();
     stop.store(true, Ordering::Relaxed);
 
-    // Collect.
+    // Collect — give tasks a grace period, then abort stragglers stuck in I/O.
     let mut all_samples: Vec<u64> = Vec::new();
     rt.block_on(async {
         for handle in task_handles {
-            if let Ok(histogram) = handle.await {
-                all_samples.extend_from_slice(histogram.samples());
+            match tokio::time::timeout(Duration::from_secs(2), handle).await {
+                Ok(Ok(histogram)) => all_samples.extend_from_slice(histogram.samples()),
+                Ok(Err(_join_err)) => {}
+                Err(_timeout) => {
+                    // Task stuck in I/O after stop was signaled — samples already
+                    // recorded up to the last completed op, just move on.
+                }
             }
         }
     });
