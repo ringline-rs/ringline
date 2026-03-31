@@ -11,6 +11,7 @@ members = [
     "ringline-momento",
     "ringline-grpc",
     "ringline-http",
+    "ringline-bench",
 ]
 
 [workspace.package]
