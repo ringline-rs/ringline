@@ -723,7 +723,14 @@ impl ConnCtx {
                     // Submit send SQE from the recv buffer. The bid is replenished
                     // on send completion via handle_send_recv_buf.
                     // Payload: bid in low 16 bits, remaining_len in high 16 bits.
+                    debug_assert!(
+                        pending.len <= 0xFFFF,
+                        "forward_recv_buf: data length {} exceeds 16-bit payload capacity",
+                        pending.len,
+                    );
                     let payload = (pending.bid as u32) | ((pending.len) << 16);
+                    // Store original data length for correct offset on partial sends.
+                    driver.send_recv_buf_original_lens[conn_index as usize] = pending.len;
                     let user_data = crate::completion::UserData::encode(
                         crate::completion::OpTag::SendRecvBuf,
                         conn_index,
