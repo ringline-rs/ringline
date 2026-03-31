@@ -367,7 +367,10 @@ fn flush_tls_output_inner(
     for chunk in write_buf.chunks(slot_size) {
         match send_copy_pool.copy_in(chunk) {
             Some((slot, ptr, len)) => {
-                let _ = ring.submit_tls_send(conn_index, ptr, len, slot);
+                if ring.submit_tls_send(conn_index, ptr, len, slot).is_err() {
+                    send_copy_pool.release(slot);
+                    return false;
+                }
             }
             None => return false,
         }
@@ -399,7 +402,13 @@ fn flush_close_notify_linked(
     for chunk in write_buf.chunks(slot_size) {
         match send_copy_pool.copy_in(chunk) {
             Some((slot, ptr, len)) => {
-                let _ = ring.submit_tls_send_linked(conn_index, ptr, len, slot);
+                if ring
+                    .submit_tls_send_linked(conn_index, ptr, len, slot)
+                    .is_err()
+                {
+                    send_copy_pool.release(slot);
+                    return;
+                }
             }
             None => {
                 // Pool exhausted — skip remaining close_notify chunks.

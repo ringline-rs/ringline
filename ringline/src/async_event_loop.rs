@@ -123,6 +123,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 && let Some(ref ts) = self.driver.tick_timeout_ts
             {
                 let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
+                // Best effort: submit_and_wait will unblock on any CQE regardless.
                 let _ = self
                     .driver
                     .ring
@@ -230,6 +231,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         let err = io::Error::other("SQ full during partial copy send resubmission");
                         self.executor.wake_send(conn_index, Err(err));
                         self.driver.close_connection(conn_index);
+                    }
+                }
+            }
+
+            // Retry any close submissions that failed (SQ was full).
+            if !self.driver.pending_close_retries.is_empty() {
+                let retries: Vec<_> = self.driver.pending_close_retries.drain(..).collect();
+                for conn_index in retries {
+                    if self.driver.ring.submit_close(conn_index).is_err() {
+                        // Still failing — re-queue for next tick.
+                        self.driver.pending_close_retries.push(conn_index);
                     }
                 }
             }
@@ -342,6 +354,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if (i & 0xF) == 0xF {
                     let now = Instant::now();
                     if now.duration_since(last_flush) >= interval {
+                        // Best effort latency optimization; SQEs submitted by next submit_and_wait.
                         let _ = self.driver.ring.flush();
                         last_flush = now;
                     }
@@ -416,8 +429,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let errno = -result;
             if errno == libc::ENOBUFS {
                 metrics::BUFFER_RING_EMPTY.increment();
-                if !has_more {
-                    let _ = self.driver.ring.submit_multishot_recv(conn_index);
+                if !has_more && self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+                    metrics::RECV_ARM_FAILURES.increment();
+                    self.executor.wake_recv(conn_index);
+                    self.driver.close_connection(conn_index);
                 }
             } else if errno == libc::ECANCELED {
                 return;
@@ -577,8 +592,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if !has_more
             && let Some(conn) = self.driver.connections.get(conn_index)
             && matches!(conn.recv_mode, RecvMode::Multi)
+            && self.driver.ring.submit_multishot_recv(conn_index).is_err()
         {
-            let _ = self.driver.ring.submit_multishot_recv(conn_index);
+            metrics::RECV_ARM_FAILURES.increment();
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
         }
     }
 
@@ -1536,16 +1554,27 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         #[cfg(feature = "timestamps")]
         if self.driver.timestamps {
             let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
-            let _ = self
+            if self
                 .driver
                 .ring
-                .submit_multishot_recvmsg(conn_index, msghdr_ptr);
+                .submit_multishot_recvmsg(conn_index, msghdr_ptr)
+                .is_err()
+            {
+                metrics::RECV_ARM_FAILURES.increment();
+                self.executor.wake_recv(conn_index);
+                self.driver.close_connection(conn_index);
+                return;
+            }
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.recv_mode = RecvMode::MsgMulti;
             }
             return;
         }
-        let _ = self.driver.ring.submit_multishot_recv(conn_index);
+        if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+            metrics::RECV_ARM_FAILURES.increment();
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+        }
     }
 
     /// Spawn an async task for a newly accepted connection.
@@ -1653,6 +1682,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let err = io::Error::other("SQ full during partial ZC send resubmission");
                     self.executor.wake_send(conn_index, Err(err));
                     self.driver.close_connection(conn_index);
+                }
+            }
+        }
+
+        // Close retry drain.
+        if !self.driver.pending_close_retries.is_empty() {
+            let retries: Vec<_> = self.driver.pending_close_retries.drain(..).collect();
+            for conn_index in retries {
+                if self.driver.ring.submit_close(conn_index).is_err() {
+                    self.driver.pending_close_retries.push(conn_index);
                 }
             }
         }

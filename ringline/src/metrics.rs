@@ -30,6 +30,8 @@ pub mod bytes {
 pub mod ring {
     pub const CQE_PROCESSED: usize = 0;
     pub const SQE_SUBMIT_FAILURES: usize = 1;
+    pub const CLOSE_SUBMIT_FAILURES: usize = 2;
+    pub const RECV_ARM_FAILURES: usize = 3;
 }
 
 /// Counter slot indices for pool exhaustion metrics.
@@ -84,6 +86,18 @@ pub static CQE_PROCESSED: Counter = Counter::new(&RING, ring::CQE_PROCESSED);
     description = "SQE submission failures"
 )]
 pub static SQE_SUBMIT_FAILURES: Counter = Counter::new(&RING, ring::SQE_SUBMIT_FAILURES);
+
+#[metric(
+    name = "ringline/sqe/close_submit_failures",
+    description = "Close SQE submission failures (fd may leak)"
+)]
+pub static CLOSE_SUBMIT_FAILURES: Counter = Counter::new(&RING, ring::CLOSE_SUBMIT_FAILURES);
+
+#[metric(
+    name = "ringline/sqe/recv_arm_failures",
+    description = "Recv arm SQE submission failures (connection closed)"
+)]
+pub static RECV_ARM_FAILURES: Counter = Counter::new(&RING, ring::RECV_ARM_FAILURES);
 
 // ── Pool exhaustion ──────────────────────────────────────────────
 

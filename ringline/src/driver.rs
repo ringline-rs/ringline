@@ -279,6 +279,8 @@ pub(crate) struct Driver {
     pub(crate) pending_zc_retries: Vec<(u32, u32, u16)>,
     /// Pending copy send retries: (conn_index, generation, pool_slot). Drained each tick.
     pub(crate) pending_copy_retries: Vec<(u32, u32, u16)>,
+    /// Pending close retries: conn_index values whose submit_close failed. Drained each tick.
+    pub(crate) pending_close_retries: Vec<u32>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
     /// NVMe device tracking table. `None` when NVMe is not configured.
@@ -456,6 +458,7 @@ impl Driver {
             eventfd_armed: false,
             pending_zc_retries: Vec::new(),
             pending_copy_retries: Vec::new(),
+            pending_close_retries: Vec::new(),
             udp_sockets,
             nvme_devices: config
                 .nvme
@@ -500,7 +503,14 @@ impl Driver {
             let ud = UserData::encode(OpTag::RecvMsgUdp, udp_idx as u32, 0);
             let msghdr_ptr = &mut *driver.udp_sockets[udp_idx].recv_msghdr as *mut libc::msghdr;
             let fd_index = driver.udp_sockets[udp_idx].fd_index;
-            let _ = driver.ring.submit_recvmsg(fd_index, msghdr_ptr, ud);
+            driver
+                .ring
+                .submit_recvmsg(fd_index, msghdr_ptr, ud)
+                .map_err(|e| {
+                    crate::error::Error::RingSetup(format!(
+                        "failed to submit initial UDP recvmsg: {e}"
+                    ))
+                })?;
         }
 
         Ok(driver)
@@ -544,6 +554,7 @@ impl Driver {
             fs_files: &mut self.fs_files,
             fs_cmd_slab: &mut self.fs_cmd_slab,
             fs_fd_base: self.fs_fd_base,
+            pending_close_retries: &mut self.pending_close_retries,
         }
     }
 
@@ -560,7 +571,10 @@ impl Driver {
         self.chain_table.cancel(conn_index);
         // Drain queued sends and release resources.
         self.drain_conn_send_queue(conn_index);
-        let _ = self.ring.submit_close(conn_index);
+        if self.ring.submit_close(conn_index).is_err() {
+            crate::metrics::CLOSE_SUBMIT_FAILURES.increment();
+            self.pending_close_retries.push(conn_index);
+        }
     }
 
     /// Pop the next queued send for a connection and submit it to the ring.
@@ -833,7 +847,10 @@ impl Driver {
         let ud = UserData::encode(OpTag::RecvMsgUdp, udp_index, 0);
         let msghdr_ptr = &mut *self.udp_sockets[idx].recv_msghdr as *mut libc::msghdr;
         let fd_index = self.udp_sockets[idx].fd_index;
-        let _ = self.ring.submit_recvmsg(fd_index, msghdr_ptr, ud);
+        if self.ring.submit_recvmsg(fd_index, msghdr_ptr, ud).is_err() {
+            // UDP recv is dead for this socket until the next successful submit.
+            crate::metrics::SQE_SUBMIT_FAILURES.increment();
+        }
     }
 
     /// Shutdown: close all connections, drain remaining CQEs, close eventfd.
@@ -843,6 +860,7 @@ impl Driver {
         for i in 0..max {
             if self.connections.get(i).is_some() {
                 self.drain_conn_send_queue(i);
+                // Best effort: kernel cleans up fds on thread/process exit.
                 let _ = self.ring.submit_close(i);
             }
         }
@@ -856,6 +874,7 @@ impl Driver {
                 break;
             }
             let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
+            // Best effort: the 100-iteration bound prevents infinite block.
             let _ = self.ring.submit_tick_timeout(&shutdown_ts, ud.raw());
             if self.ring.submit_and_wait(1).is_err() {
                 break;
@@ -930,7 +949,15 @@ impl Driver {
         // 3. Unregister the provided buffer ring before Driver is dropped
         // (which munmaps the ring memory). Without this, the kernel holds a
         // dangling pointer to the freed mmap region.
-        let _ = self.ring.unregister_buf_ring(self.provided_bufs.bgid());
+        if self
+            .ring
+            .unregister_buf_ring(self.provided_bufs.bgid())
+            .is_err()
+        {
+            // Kernel may hold a dangling pointer to the freed mmap region.
+            // This is a best-effort operation during shutdown.
+            crate::metrics::SQE_SUBMIT_FAILURES.increment();
+        }
 
         // 4. Close the eventfd.
         unsafe {
