@@ -4640,7 +4640,10 @@ impl AsyncEventHandler for ForwardEcho {
             loop {
                 let n = conn
                     .with_data(|data| {
-                        let _ = conn.forward_recv_buf(data);
+                        if let Err(e) = conn.forward_recv_buf(data) {
+                            eprintln!("echo: forward_recv_buf failed: {e}");
+                            return ParseResult::NeedMore;
+                        }
                         ParseResult::Consumed(data.len())
                     })
                     .await;
