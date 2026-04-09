@@ -60,11 +60,14 @@ jobs:
           NEXT_DEV="${MAJOR}.${MINOR}.$((PATCH + 1))-alpha.0"
           echo "Bumping to next dev version: $NEXT_DEV"
 
-          # Update Cargo.toml version
+          # Update ringline/Cargo.toml version
           sed -i "0,/^version = \"${VERSION}\"/s//version = \"${NEXT_DEV}\"/" ringline/Cargo.toml
 
+          # Update workspace dependency in root Cargo.toml
+          sed -i "s/ringline = { path = \"ringline\", version = \"${VERSION}\" }/ringline = { path = \"ringline\", version = \"${NEXT_DEV}\" }/" Cargo.toml
+
           # Commit and push
-          git add ringline/Cargo.toml
+          git add ringline/Cargo.toml Cargo.toml
           git commit -m "chore: bump to ${NEXT_DEV} for next development iteration"
           git push origin main
 
