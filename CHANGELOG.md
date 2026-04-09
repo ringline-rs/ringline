@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-04-09
+
+### Fixed
+- Skip Momento integration tests in CI when `MOMENTO_ENDPOINT` secret is not configured
+- Pass secrets to reusable CI workflow in release pipeline (`secrets: inherit`)
+
 ## [0.0.4] - 2026-04-09
 
 ### Fixed
