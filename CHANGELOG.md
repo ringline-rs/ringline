@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-04-09
+
+### Fixed
+- Treat empty `MOMENTO_ENDPOINT` and `MOMENTO_REGION` env vars as unset in `Credential::from_env()`
+- Update workspace dependency in `tag-release.yml` dev version bump
+
 ## [0.0.3] - 2026-04-09
 
 ### Added
