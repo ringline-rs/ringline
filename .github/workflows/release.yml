@@ -55,13 +55,28 @@ jobs:
 
             if [ "$published" = "$version" ]; then
               echo "  $crate v$version — already published, skipping"
-            else
-              echo "  $crate v$version — publishing..."
-              cargo publish -p "$crate"
-              # Brief pause to let the crates.io index update before
-              # dependents try to resolve.
-              sleep 15
+              return 0
             fi
+
+            # Publish with retry on rate limit (HTTP 429).
+            # crates.io allows 5 new-crate burst, then 1 per 10 minutes.
+            # Retry every 60s to catch the window as soon as it opens.
+            local attempt
+            for attempt in $(seq 1 15); do
+              echo "  $crate v$version — publishing (attempt $attempt)..."
+              if cargo publish -p "$crate" 2>&1; then
+                sleep 30
+                return 0
+              fi
+
+              if [ "$attempt" -lt 15 ]; then
+                echo "  $crate — publish failed, retrying in 60s..."
+                sleep 60
+              fi
+            done
+
+            echo "  ERROR: $crate failed after 15 attempts"
+            return 1
           }
 
           echo "=== Publishing workspace crates ==="
