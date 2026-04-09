@@ -1,6 +1,6 @@
 [package]
 name = "ringline-http"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Async HTTP/1.1 and HTTP/2 client for the ringline io_uring runtime"
 authors.workspace = true
@@ -19,7 +19,7 @@ flate2 = { version = "1", optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
 brotli = { version = "7", optional = true }
 ringline = { workspace = true }
-ringline-h2 = { path = "../ringline-h2", version = "0.1.0" }
+ringline-h2 = { path = "../ringline-h2", version = "0.1.1" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

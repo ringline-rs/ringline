@@ -1,6 +1,6 @@
 [package]
 name = "ringline-h2"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Sans-IO HTTP/2 client framing layer"
 authors.workspace = true
