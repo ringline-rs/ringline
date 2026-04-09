@@ -22,7 +22,7 @@ repository = "https://github.com/brayniac/ringline"
 
 [workspace.dependencies]
 # Internal crates
-ringline = { path = "ringline", version = "0.0.3" }
+ringline = { path = "ringline", version = "0.0.4-alpha.0" }
 resp-proto = "0.0.1"
 memcache-proto = "0.0.2"
 ping-proto = "0.0.1"
