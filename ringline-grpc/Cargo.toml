@@ -1,6 +1,6 @@
 [package]
 name = "ringline-grpc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Sans-IO gRPC client framing layer"
 authors.workspace = true
@@ -13,7 +13,7 @@ zstd = ["dep:zstd"]
 compression = ["gzip", "zstd"]
 
 [dependencies]
-ringline-h2 = { path = "../ringline-h2", version = "0.1.0" }
+ringline-h2 = { path = "../ringline-h2", version = "0.1.1" }
 flate2 = { version = "1", optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
 

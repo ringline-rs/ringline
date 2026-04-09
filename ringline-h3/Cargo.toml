@@ -1,6 +1,6 @@
 [package]
 name = "ringline-h3"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ description = "Sans-IO HTTP/3 client framing layer"
 
 [dependencies]
 bytes = { workspace = true }
-ringline-quic = { path = "../ringline-quic", version = "0.1.1" }
+ringline-quic = { path = "../ringline-quic", version = "0.1.2" }
 
 [dev-dependencies]
 ringline = { workspace = true }
