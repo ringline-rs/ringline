@@ -61,8 +61,10 @@ impl Credential {
         // Check for SNI hostname (used when connecting to IP addresses)
         let sni_host = std::env::var("MOMENTO_SNI_HOST").ok();
 
-        // Check for explicit endpoint
-        if let Ok(endpoint) = std::env::var("MOMENTO_ENDPOINT") {
+        // Check for explicit endpoint (treat empty string as unset)
+        if let Ok(endpoint) = std::env::var("MOMENTO_ENDPOINT")
+            && !endpoint.is_empty()
+        {
             // Add "cache." prefix if not already present
             let endpoint = if endpoint.starts_with("cache.") {
                 endpoint
@@ -76,8 +78,10 @@ impl Credential {
             });
         }
 
-        // Check for region-based endpoint
-        if let Ok(region) = std::env::var("MOMENTO_REGION") {
+        // Check for region-based endpoint (treat empty string as unset)
+        if let Ok(region) = std::env::var("MOMENTO_REGION")
+            && !region.is_empty()
+        {
             let endpoint = format!("cache.cell-4-{}-1.prod.a.momentohq.com", region);
             return Ok(Self {
                 token,
