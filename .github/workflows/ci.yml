@@ -111,8 +111,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p ringline-momento --test integration -- --ignored --nocapture
+      - name: Run Momento integration tests
+        if: env.MOMENTO_ENDPOINT != ''
+        run: cargo test -p ringline-momento --test integration -- --ignored --nocapture
         env:
           MOMENTO_AUTH_TOKEN: ${{ secrets.MOMENTO_AUTH_TOKEN }}
           MOMENTO_ENDPOINT: ${{ secrets.MOMENTO_ENDPOINT }}
           MOMENTO_CACHE_NAME: ${{ secrets.MOMENTO_CACHE_NAME }}
+      - name: Skip (no MOMENTO_ENDPOINT configured)
+        if: env.MOMENTO_ENDPOINT == ''
+        run: echo "Skipping — MOMENTO_ENDPOINT secret is not configured"
+        env:
+          MOMENTO_ENDPOINT: ${{ secrets.MOMENTO_ENDPOINT }}

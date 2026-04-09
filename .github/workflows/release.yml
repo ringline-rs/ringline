@@ -15,6 +15,7 @@ jobs:
   ci:
     name: CI
     uses: ./.github/workflows/ci.yml
+    secrets: inherit
 
   publish:
     name: Publish to crates.io
