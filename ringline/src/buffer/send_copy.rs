@@ -137,7 +137,7 @@ impl SendCopyPool {
     }
 
     /// Number of free slots.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn free_count(&self) -> usize {
         self.free_list.len()
     }

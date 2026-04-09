@@ -21,15 +21,16 @@ use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
 use crate::ring::Ring;
 
 /// Per-worker UDP socket state.
-#[allow(dead_code)]
 pub(crate) struct UdpSocketState {
     /// Fixed file table index for this socket.
     pub fd_index: u32,
     /// Bound address.
+    #[allow(dead_code)] // stored for diagnostics
     pub local_addr: SocketAddr,
     // ── Recv state (heap-allocated for stable addresses) ──
     pub recv_buf: Box<[u8]>,
     pub recv_addr: Box<libc::sockaddr_storage>,
+    #[allow(dead_code)] // referenced via raw pointer in msghdr
     pub recv_iov: Box<libc::iovec>,
     pub recv_msghdr: Box<libc::msghdr>,
     // ── Send state ──

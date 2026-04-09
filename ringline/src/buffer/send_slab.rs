@@ -197,7 +197,7 @@ impl InFlightSendSlab {
     }
 
     /// Get the connection index for an entry.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn conn_index(&self, idx: u16) -> u32 {
         self.entries[idx as usize].conn_index
     }
@@ -208,7 +208,7 @@ impl InFlightSendSlab {
     }
 
     /// Number of free slots.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn free_count(&self) -> usize {
         self.free_list.len()
     }

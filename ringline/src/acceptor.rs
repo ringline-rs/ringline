@@ -6,7 +6,6 @@ use std::sync::atomic::AtomicBool;
 use crossbeam_channel::Sender;
 
 /// Configuration for the centralized acceptor thread.
-#[allow(dead_code)]
 pub struct AcceptorConfig {
     /// The listening socket fd.
     pub listen_fd: RawFd,
@@ -15,6 +14,7 @@ pub struct AcceptorConfig {
     /// Per-worker eventfds to wake io_uring.
     pub worker_eventfds: Vec<RawFd>,
     /// Shared flag set by ShutdownHandle to signal the acceptor to stop.
+    #[allow(dead_code)] // stored for future use; acceptor currently uses channel disconnect
     pub shutdown_flag: Arc<AtomicBool>,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub tcp_nodelay: bool,

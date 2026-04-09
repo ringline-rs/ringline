@@ -37,7 +37,6 @@ use self::task::{StandaloneTaskSlab, TaskSlab};
 use self::waker::drain_ready_queue;
 
 /// I/O result stored per-connection for async task wakeup.
-#[allow(dead_code)]
 pub(crate) enum IoResult {
     /// Send completed with total bytes or error.
     Send(stdio::Result<u32>),
