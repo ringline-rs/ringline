@@ -39,6 +39,7 @@ pub mod sharded;
 pub use pool::{Pool, PoolConfig};
 pub use sharded::{ShardedClient, ShardedConfig};
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
@@ -132,6 +133,10 @@ pub struct CommandResult {
     pub success: bool,
     /// Time-to-first-byte in nanoseconds (not available in sequential mode).
     pub ttfb_ns: Option<u64>,
+    /// Bytes transmitted for this command (protocol-encoded request size).
+    pub tx_bytes: u32,
+    /// Bytes received for this command (protocol-encoded response size).
+    pub rx_bytes: u32,
 }
 
 // ── ClientMetrics ───────────────────────────────────────────────────────
@@ -214,6 +219,7 @@ struct PendingOp {
     send_ts: u64,
     start: Option<Instant>,
     user_data: u64,
+    tx_bytes: u32,
 }
 
 /// A completed fire/recv operation with its result.
@@ -222,16 +228,19 @@ pub enum CompletedOp {
     Get {
         result: Result<Option<Value>, Error>,
         user_data: u64,
+        latency_ns: u64,
     },
     /// SET completed.
     Set {
         result: Result<(), Error>,
         user_data: u64,
+        latency_ns: u64,
     },
     /// DELETE completed.
     Delete {
         result: Result<bool, Error>,
         user_data: u64,
+        latency_ns: u64,
     },
 }
 
@@ -285,6 +294,7 @@ impl ClientBuilder {
             conn: self.conn,
             on_result: self.on_result,
             pending: VecDeque::new(),
+            last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
             #[cfg(feature = "metrics")]
@@ -308,6 +318,7 @@ pub struct Client {
     conn: ConnCtx,
     on_result: Option<ResultCallback>,
     pending: VecDeque<PendingOp>,
+    last_rx_bytes: Cell<u32>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -323,6 +334,7 @@ impl Client {
             conn,
             on_result: None,
             pending: VecDeque::new(),
+            last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -421,6 +433,24 @@ impl Client {
         }
     }
 
+    #[cfg(feature = "timestamps")]
+    #[inline]
+    fn compute_ttfb(&self, send_ts: u64) -> Option<u64> {
+        if self.use_kernel_ts {
+            let recv_ts = self.conn.recv_timestamp();
+            if recv_ts > 0 && recv_ts > send_ts {
+                return Some(recv_ts - send_ts);
+            }
+        }
+        None
+    }
+
+    #[cfg(not(feature = "timestamps"))]
+    #[inline]
+    fn compute_ttfb(&self, _send_ts: u64) -> Option<u64> {
+        None
+    }
+
     /// Number of in-flight requests.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
@@ -429,6 +459,7 @@ impl Client {
     /// Fire a GET request without waiting for the response.
     pub fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         let encoded = encode_request(&McRequest::get(key));
+        let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
@@ -436,6 +467,7 @@ impl Client {
             send_ts,
             start,
             user_data,
+            tx_bytes,
         });
         Ok(())
     }
@@ -450,6 +482,7 @@ impl Client {
         user_data: u64,
     ) -> Result<(), Error> {
         let encoded = encode_set(key, value, flags, exptime);
+        let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
@@ -457,6 +490,7 @@ impl Client {
             send_ts,
             start,
             user_data,
+            tx_bytes,
         });
         Ok(())
     }
@@ -472,6 +506,7 @@ impl Client {
     ) -> Result<(), Error> {
         let (_, value_len) = guard.as_ptr_len();
         let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime);
+        let tx_bytes = (prefix.len() + value_len as usize + 2) as u32;
         self.conn.send_parts().build(move |b| {
             b.copy(&prefix)
                 .guard(GuardBox::new(guard))
@@ -484,6 +519,7 @@ impl Client {
             send_ts,
             start,
             user_data,
+            tx_bytes,
         });
         Ok(())
     }
@@ -491,6 +527,7 @@ impl Client {
     /// Fire a DELETE request without waiting for the response.
     pub fn fire_delete(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         let encoded = encode_request(&McRequest::delete(key));
+        let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
@@ -498,6 +535,7 @@ impl Client {
             send_ts,
             start,
             user_data,
+            tx_bytes,
         });
         Ok(())
     }
@@ -507,6 +545,9 @@ impl Client {
     /// Returns `Err(Error::NoPending)` if there are no in-flight requests.
     pub async fn recv(&mut self) -> Result<CompletedOp, Error> {
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
+
+        // Capture pre-read recv timestamp for TTFB before blocking on data.
+        let ttfb_ns = self.compute_ttfb(pending.send_ts);
 
         let response = match self.read_response().await {
             Ok(v) => v,
@@ -522,6 +563,8 @@ impl Client {
             Some(start) => self.finish_timing(pending.send_ts, start),
             None => 0,
         };
+        let rx_bytes = self.last_rx_bytes.get();
+        let tx_bytes = pending.tx_bytes;
 
         let op = match pending.kind {
             PendingOpKind::Get => {
@@ -553,11 +596,14 @@ impl Client {
                     latency_ns,
                     hit,
                     success,
-                    ttfb_ns: None,
+                    ttfb_ns,
+                    tx_bytes,
+                    rx_bytes,
                 });
                 CompletedOp::Get {
                     result,
                     user_data: pending.user_data,
+                    latency_ns,
                 }
             }
             PendingOpKind::Set => {
@@ -573,11 +619,14 @@ impl Client {
                     latency_ns,
                     hit: None,
                     success: result.is_ok(),
-                    ttfb_ns: None,
+                    ttfb_ns,
+                    tx_bytes,
+                    rx_bytes,
                 });
                 CompletedOp::Set {
                     result,
                     user_data: pending.user_data,
+                    latency_ns,
                 }
             }
             PendingOpKind::Delete => {
@@ -594,11 +643,14 @@ impl Client {
                     latency_ns,
                     hit: None,
                     success: result.is_ok(),
-                    ttfb_ns: None,
+                    ttfb_ns,
+                    tx_bytes,
+                    rx_bytes,
                 });
                 CompletedOp::Delete {
                     result,
                     user_data: pending.user_data,
+                    latency_ns,
                 }
             }
         };
@@ -632,6 +684,7 @@ impl Client {
                 }
             })
             .await;
+        self.last_rx_bytes.set(n as u32);
         if n == 0 {
             return result.unwrap_or(Err(Error::ConnectionClosed));
         }
@@ -672,10 +725,12 @@ impl Client {
             };
         }
 
+        let tx_bytes = encoded.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
         let response = self.execute(&encoded).await;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
 
         let result = match response {
             Ok(McResponseBytes::Values(mut values)) => {
@@ -704,6 +759,8 @@ impl Client {
             hit,
             success,
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         result
     }
@@ -758,10 +815,12 @@ impl Client {
             };
         }
 
+        let tx_bytes = encoded.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
         let response = self.execute(&encoded).await;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
 
         let result = match response {
             Ok(McResponseBytes::Stored) => Ok(()),
@@ -774,6 +833,8 @@ impl Client {
             hit: None,
             success: result.is_ok(),
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         result
     }
@@ -916,10 +977,12 @@ impl Client {
             };
         }
 
+        let tx_bytes = encoded.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
         let response = self.execute(&encoded).await;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
 
         let result = match response {
             Ok(McResponseBytes::Deleted) => Ok(true),
@@ -933,6 +996,8 @@ impl Client {
             hit: None,
             success: result.is_ok(),
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         result
     }
@@ -987,11 +1052,12 @@ impl Client {
             };
         }
 
-        let send_ts = self.send_timestamp();
-        let start = Instant::now();
-
         let (_, value_len) = guard.as_ptr_len();
         let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime);
+        let tx_bytes = (prefix.len() + value_len as usize + 2) as u32;
+
+        let send_ts = self.send_timestamp();
+        let start = Instant::now();
 
         self.conn.send_parts().build(move |b| {
             b.copy(&prefix)
@@ -1002,6 +1068,7 @@ impl Client {
 
         let response = self.read_response().await;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
 
         let result = match response {
             Ok(ref r) => {
@@ -1019,6 +1086,8 @@ impl Client {
             hit: None,
             success: result.is_ok(),
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         result
     }

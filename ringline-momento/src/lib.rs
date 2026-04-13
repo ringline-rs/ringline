@@ -91,6 +91,7 @@ pub enum CompletedOp {
         key: Bytes,
         result: Result<Option<Bytes>, Error>,
         user_data: u64,
+        latency_ns: u64,
     },
     /// Set operation completed.
     Set {
@@ -98,6 +99,7 @@ pub enum CompletedOp {
         key: Bytes,
         result: Result<(), Error>,
         user_data: u64,
+        latency_ns: u64,
     },
     /// Delete operation completed.
     Delete {
@@ -105,6 +107,7 @@ pub enum CompletedOp {
         key: Bytes,
         result: Result<(), Error>,
         user_data: u64,
+        latency_ns: u64,
     },
 }
 
@@ -117,6 +120,12 @@ pub struct CommandResult {
     pub latency_ns: u64,
     /// Whether the command succeeded.
     pub success: bool,
+    /// Time-to-first-byte in nanoseconds (not available in sequential mode).
+    pub ttfb_ns: Option<u64>,
+    /// Bytes transmitted for this command (protobuf-encoded request size).
+    pub tx_bytes: u32,
+    /// Bytes received for this command (protobuf-encoded response size).
+    pub rx_bytes: u32,
 }
 
 /// Callback type for per-request result notifications.
@@ -138,6 +147,7 @@ struct PendingOp {
     send_ts: u64,
     start: Option<Instant>,
     user_data: u64,
+    tx_bytes: u32,
 }
 
 // ── ClientMetrics ───────────────────────────────────────────────────────
@@ -380,6 +390,7 @@ impl Client {
         );
 
         self.send_command(&cmd)?;
+        let tx_bytes = self.send_buf.len() as u32;
 
         let (send_ts, start) = self.timing_start();
         self.pending.insert(
@@ -390,6 +401,7 @@ impl Client {
                 send_ts,
                 start,
                 user_data,
+                tx_bytes,
             },
         );
 
@@ -419,6 +431,7 @@ impl Client {
         );
 
         self.send_command(&cmd)?;
+        let tx_bytes = self.send_buf.len() as u32;
 
         let (send_ts, start) = self.timing_start();
         self.pending.insert(
@@ -429,6 +442,7 @@ impl Client {
                 send_ts,
                 start,
                 user_data,
+                tx_bytes,
             },
         );
 
@@ -454,6 +468,7 @@ impl Client {
         );
 
         self.send_command(&cmd)?;
+        let tx_bytes = self.send_buf.len() as u32;
 
         let (send_ts, start) = self.timing_start();
         self.pending.insert(
@@ -464,6 +479,7 @@ impl Client {
                 send_ts,
                 start,
                 user_data,
+                tx_bytes,
             },
         );
 
@@ -481,6 +497,11 @@ impl Client {
         if self.pending.is_empty() {
             return Err(Error::NoPending);
         }
+
+        // Capture pre-read recv timestamp for TTFB before the mutable borrow
+        // of self.pending needed by the with_bytes closure.
+        let ttfb_send_ts = self.pending.values().next().map(|p| p.send_ts).unwrap_or(0);
+        let ttfb_ns = self.compute_ttfb(ttfb_send_ts);
 
         let pending = &mut self.pending;
         let mut dispatch_result: Option<DispatchResult> = None;
@@ -515,16 +536,66 @@ impl Client {
             }
         };
 
-        if self.is_instrumented() {
+        let rx_bytes = n as u32;
+        let latency_ns = if self.is_instrumented() {
             let latency_ns = self.finish_timing(dr.send_ts, dr.start);
             self.record(&CommandResult {
                 command: dr.cmd_type,
                 latency_ns,
                 success: dr.success,
+                ttfb_ns,
+                tx_bytes: dr.tx_bytes,
+                rx_bytes,
             });
-        }
+            latency_ns
+        } else {
+            0
+        };
 
-        Ok(dr.op)
+        // Set latency_ns on the CompletedOp.
+        let op = match dr.op {
+            CompletedOp::Get {
+                id,
+                key,
+                result,
+                user_data,
+                ..
+            } => CompletedOp::Get {
+                id,
+                key,
+                result,
+                user_data,
+                latency_ns,
+            },
+            CompletedOp::Set {
+                id,
+                key,
+                result,
+                user_data,
+                ..
+            } => CompletedOp::Set {
+                id,
+                key,
+                result,
+                user_data,
+                latency_ns,
+            },
+            CompletedOp::Delete {
+                id,
+                key,
+                result,
+                user_data,
+                ..
+            } => CompletedOp::Delete {
+                id,
+                key,
+                result,
+                user_data,
+                latency_ns,
+            },
+        };
+
+        Ok(op)
     }
 
     // ── Sequential convenience API ──────────────────────────────────────
@@ -676,6 +747,24 @@ impl Client {
 
     #[cfg(feature = "timestamps")]
     #[inline]
+    fn compute_ttfb(&self, send_ts: u64) -> Option<u64> {
+        if self.use_kernel_ts {
+            let recv_ts = self.conn.recv_timestamp();
+            if recv_ts > 0 && recv_ts > send_ts {
+                return Some(recv_ts - send_ts);
+            }
+        }
+        None
+    }
+
+    #[cfg(not(feature = "timestamps"))]
+    #[inline]
+    fn compute_ttfb(&self, _send_ts: u64) -> Option<u64> {
+        None
+    }
+
+    #[cfg(feature = "timestamps")]
+    #[inline]
     fn send_timestamp(&self) -> u64 {
         if self.use_kernel_ts {
             now_realtime_ns()
@@ -728,6 +817,7 @@ struct DispatchResult {
     success: bool,
     send_ts: u64,
     start: Option<Instant>,
+    tx_bytes: u32,
 }
 
 /// Dispatch a decoded CacheResponse to the appropriate pending operation.
@@ -742,6 +832,7 @@ fn dispatch_response(
     let send_ts = op.send_ts;
     let start = op.start;
     let user_data = op.user_data;
+    let tx_bytes = op.tx_bytes;
 
     match op.kind {
         PendingOpKind::Get => {
@@ -761,11 +852,13 @@ fn dispatch_response(
                     key: op.key,
                     result,
                     user_data,
+                    latency_ns: 0,
                 },
                 cmd_type: CommandType::Get,
                 success,
                 send_ts,
                 start,
+                tx_bytes,
             })
         }
         PendingOpKind::Set => {
@@ -784,11 +877,13 @@ fn dispatch_response(
                     key: op.key,
                     result,
                     user_data,
+                    latency_ns: 0,
                 },
                 cmd_type: CommandType::Set,
                 success,
                 send_ts,
                 start,
+                tx_bytes,
             })
         }
         PendingOpKind::Delete => {
@@ -809,11 +904,13 @@ fn dispatch_response(
                     key: op.key,
                     result,
                     user_data,
+                    latency_ns: 0,
                 },
                 cmd_type: CommandType::Delete,
                 success,
                 send_ts,
                 start,
+                tx_bytes,
             })
         }
     }
