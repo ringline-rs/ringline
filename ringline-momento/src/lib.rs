@@ -498,13 +498,13 @@ impl Client {
             return Err(Error::NoPending);
         }
 
+        // Capture pre-read recv timestamp for TTFB before the mutable borrow
+        // of self.pending needed by the with_bytes closure.
+        let ttfb_send_ts = self.pending.values().next().map(|p| p.send_ts).unwrap_or(0);
+        let ttfb_ns = self.compute_ttfb(ttfb_send_ts);
+
         let pending = &mut self.pending;
         let mut dispatch_result: Option<DispatchResult> = None;
-
-        // Capture pre-read recv timestamp for TTFB before blocking on data.
-        // (must be done before the borrow of self.pending in with_bytes)
-        let ttfb_send_ts = pending.values().next().map(|p| p.send_ts).unwrap_or(0);
-        let ttfb_ns = self.compute_ttfb(ttfb_send_ts);
 
         let n = self
             .conn
