@@ -26,6 +26,7 @@
 pub mod pool;
 pub use pool::{Pool, PoolConfig};
 
+use std::cell::Cell;
 use std::io;
 use std::time::Instant;
 
@@ -77,6 +78,10 @@ pub struct CommandResult {
     pub success: bool,
     /// Time-to-first-byte in nanoseconds (not available in sequential mode).
     pub ttfb_ns: Option<u64>,
+    /// Bytes transmitted for this command (protocol-encoded request size).
+    pub tx_bytes: u32,
+    /// Bytes received for this command (protocol-encoded response size).
+    pub rx_bytes: u32,
 }
 
 // ── ClientMetrics ───────────────────────────────────────────────────────
@@ -164,6 +169,7 @@ impl ClientBuilder {
         Client {
             conn: self.conn,
             on_result: self.on_result,
+            last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
             #[cfg(feature = "metrics")]
@@ -186,6 +192,7 @@ impl ClientBuilder {
 pub struct Client {
     conn: ConnCtx,
     on_result: Option<ResultCallback>,
+    last_rx_bytes: Cell<u32>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -200,6 +207,7 @@ impl Client {
         Self {
             conn,
             on_result: None,
+            last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -306,6 +314,7 @@ impl Client {
                 }
             })
             .await;
+        self.last_rx_bytes.set(n as u32);
         if n == 0 {
             return result.unwrap_or(Err(Error::ConnectionClosed));
         }
@@ -334,10 +343,12 @@ impl Client {
             };
         }
 
+        let tx_bytes = len as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
         let response = self.execute(&buf[..len]).await;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
 
         let result = match response {
             Ok(PingResponse::Pong) => Ok(()),
@@ -349,6 +360,8 @@ impl Client {
             latency_ns,
             success: result.is_ok(),
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         result
     }

@@ -44,6 +44,7 @@ pub use cluster::{ClusterClient, ClusterConfig};
 pub use pool::{Pool, PoolConfig};
 pub use sharded::{ShardedClient, ShardedConfig};
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
@@ -115,6 +116,10 @@ pub struct CommandResult {
     pub success: bool,
     /// Time-to-first-byte in nanoseconds (not available in sequential mode).
     pub ttfb_ns: Option<u64>,
+    /// Bytes transmitted for this command (RESP-encoded request size).
+    pub tx_bytes: u32,
+    /// Bytes received for this command (RESP-encoded response size).
+    pub rx_bytes: u32,
 }
 
 // ── ClientMetrics ───────────────────────────────────────────────────────
@@ -197,6 +202,7 @@ struct PendingOp {
     send_ts: u64,
     start: Option<Instant>,
     user_data: u64,
+    tx_bytes: u32,
 }
 
 /// A completed fire/recv operation with its result.
@@ -205,16 +211,19 @@ pub enum CompletedOp {
     Get {
         result: Result<Option<Bytes>, Error>,
         user_data: u64,
+        latency_ns: u64,
     },
     /// SET completed.
     Set {
         result: Result<(), Error>,
         user_data: u64,
+        latency_ns: u64,
     },
     /// DEL completed.
     Del {
         result: Result<u64, Error>,
         user_data: u64,
+        latency_ns: u64,
     },
 }
 
@@ -270,6 +279,7 @@ impl ClientBuilder {
             conn: self.conn,
             on_result: self.on_result,
             pending: VecDeque::new(),
+            last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
             #[cfg(feature = "metrics")]
@@ -293,6 +303,7 @@ pub struct Client {
     conn: ConnCtx,
     on_result: Option<ResultCallback>,
     pending: VecDeque<PendingOp>,
+    last_rx_bytes: Cell<u32>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -308,6 +319,7 @@ impl Client {
             conn,
             on_result: None,
             pending: VecDeque::new(),
+            last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -408,6 +420,24 @@ impl Client {
         }
     }
 
+    #[cfg(feature = "timestamps")]
+    #[inline]
+    fn compute_ttfb(&self, send_ts: u64) -> Option<u64> {
+        if self.use_kernel_ts {
+            let recv_ts = self.conn.recv_timestamp();
+            if recv_ts > 0 && recv_ts > send_ts {
+                return Some(recv_ts - send_ts);
+            }
+        }
+        None
+    }
+
+    #[cfg(not(feature = "timestamps"))]
+    #[inline]
+    fn compute_ttfb(&self, _send_ts: u64) -> Option<u64> {
+        None
+    }
+
     /// Number of in-flight requests.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
@@ -416,6 +446,7 @@ impl Client {
     /// Fire a GET request without waiting for the response.
     pub fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         let encoded = Self::encode_request(&Request::get(key));
+        let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
@@ -423,6 +454,7 @@ impl Client {
             send_ts,
             start,
             user_data,
+            tx_bytes,
         });
         Ok(())
     }
@@ -431,6 +463,7 @@ impl Client {
     pub fn fire_set(&mut self, key: &[u8], value: &[u8], user_data: u64) -> Result<(), Error> {
         let set_req = Request::set(key, value);
         let (prefix, suffix) = set_req.encode_parts();
+        let tx_bytes = (prefix.len() + value.len() + suffix.len()) as u32;
         self.conn
             .send_parts()
             .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())?;
@@ -440,6 +473,7 @@ impl Client {
             send_ts,
             start,
             user_data,
+            tx_bytes,
         });
         Ok(())
     }
@@ -453,6 +487,7 @@ impl Client {
     ) -> Result<(), Error> {
         let (_, value_len) = guard.as_ptr_len();
         let prefix = encode_set_guard_prefix(key, value_len as usize, None);
+        let tx_bytes = (prefix.len() + value_len as usize + 2) as u32;
         self.conn.send_parts().build(move |b| {
             b.copy(&prefix)
                 .guard(GuardBox::new(guard))
@@ -465,6 +500,7 @@ impl Client {
             send_ts,
             start,
             user_data,
+            tx_bytes,
         });
         Ok(())
     }
@@ -479,6 +515,7 @@ impl Client {
     ) -> Result<(), Error> {
         let set_req = Request::set(key, value).ex(ttl_secs);
         let (prefix, suffix) = set_req.encode_parts();
+        let tx_bytes = (prefix.len() + value.len() + suffix.len()) as u32;
         self.conn
             .send_parts()
             .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())?;
@@ -488,6 +525,7 @@ impl Client {
             send_ts,
             start,
             user_data,
+            tx_bytes,
         });
         Ok(())
     }
@@ -502,6 +540,7 @@ impl Client {
     ) -> Result<(), Error> {
         let (_, value_len) = guard.as_ptr_len();
         let (prefix, suffix) = encode_set_guard_prefix_ex(key, value_len as usize, ttl_secs);
+        let tx_bytes = (prefix.len() + value_len as usize + suffix.len()) as u32;
         self.conn.send_parts().build(move |b| {
             b.copy(&prefix)
                 .guard(GuardBox::new(guard))
@@ -514,6 +553,7 @@ impl Client {
             send_ts,
             start,
             user_data,
+            tx_bytes,
         });
         Ok(())
     }
@@ -521,6 +561,7 @@ impl Client {
     /// Fire a DEL request without waiting for the response.
     pub fn fire_del(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         let encoded = Self::encode_request(&Request::del(key));
+        let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
@@ -528,6 +569,7 @@ impl Client {
             send_ts,
             start,
             user_data,
+            tx_bytes,
         });
         Ok(())
     }
@@ -537,6 +579,9 @@ impl Client {
     /// Returns `Err(Error::NoPending)` if there are no in-flight requests.
     pub async fn recv(&mut self) -> Result<CompletedOp, Error> {
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
+
+        // Capture pre-read recv timestamp for TTFB before blocking on data.
+        let ttfb_ns = self.compute_ttfb(pending.send_ts);
 
         let resp = match self.read_value().await {
             Ok(v) => v,
@@ -552,6 +597,8 @@ impl Client {
             Some(start) => self.finish_timing(pending.send_ts, start),
             None => 0,
         };
+        let rx_bytes = self.last_rx_bytes.get();
+        let tx_bytes = pending.tx_bytes;
 
         let op = match pending.kind {
             PendingOpKind::Get => {
@@ -573,11 +620,14 @@ impl Client {
                     latency_ns,
                     hit,
                     success,
-                    ttfb_ns: None,
+                    ttfb_ns,
+                    tx_bytes,
+                    rx_bytes,
                 });
                 CompletedOp::Get {
                     result,
                     user_data: pending.user_data,
+                    latency_ns,
                 }
             }
             PendingOpKind::Set => {
@@ -593,11 +643,14 @@ impl Client {
                     latency_ns,
                     hit: None,
                     success: result.is_ok(),
-                    ttfb_ns: None,
+                    ttfb_ns,
+                    tx_bytes,
+                    rx_bytes,
                 });
                 CompletedOp::Set {
                     result,
                     user_data: pending.user_data,
+                    latency_ns,
                 }
             }
             PendingOpKind::Del => {
@@ -613,11 +666,14 @@ impl Client {
                     latency_ns,
                     hit: None,
                     success: result.is_ok(),
-                    ttfb_ns: None,
+                    ttfb_ns,
+                    tx_bytes,
+                    rx_bytes,
                 });
                 CompletedOp::Del {
                     result,
                     user_data: pending.user_data,
+                    latency_ns,
                 }
             }
         };
@@ -651,6 +707,7 @@ impl Client {
                 }
             })
             .await;
+        self.last_rx_bytes.set(n as u32);
         if n == 0 {
             return result.unwrap_or(Err(Error::ConnectionClosed));
         }
@@ -735,17 +792,16 @@ impl Client {
     /// Get the value of a key.
     pub async fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
+        let encoded = Self::encode_request(&Request::get(key));
         if !self.is_instrumented() {
-            return self
-                .execute_bulk(&Self::encode_request(&Request::get(key)))
-                .await;
+            return self.execute_bulk(&encoded).await;
         }
+        let tx_bytes = encoded.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let result = self
-            .execute_bulk(&Self::encode_request(&Request::get(key)))
-            .await;
+        let result = self.execute_bulk(&encoded).await;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
         let (success, hit) = match &result {
             Ok(Some(_)) => (true, Some(true)),
             Ok(None) => (true, Some(false)),
@@ -757,6 +813,8 @@ impl Client {
             hit,
             success,
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         result
     }
@@ -769,17 +827,20 @@ impl Client {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
+        let set_req = Request::set(key, value);
         if !self.is_instrumented() {
-            let resp = self.execute_set(&Request::set(key, value), value).await?;
+            let resp = self.execute_set(&set_req, value).await?;
             return match resp {
                 Value::SimpleString(_) | Value::Null => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
             };
         }
+        let tx_bytes = set_req.encoded_len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let result = self.execute_set(&Request::set(key, value), value).await;
+        let result = self.execute_set(&set_req, value).await;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
         let success = result.is_ok();
         let final_result = match result {
             Ok(Value::SimpleString(_) | Value::Null) => Ok(()),
@@ -792,6 +853,8 @@ impl Client {
             hit: None,
             success,
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         final_result
     }
@@ -805,21 +868,20 @@ impl Client {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
+        let set_req = Request::set(key, value).ex(ttl_secs);
         if !self.is_instrumented() {
-            let resp = self
-                .execute_set(&Request::set(key, value).ex(ttl_secs), value)
-                .await?;
+            let resp = self.execute_set(&set_req, value).await?;
             return match resp {
                 Value::SimpleString(_) => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
             };
         }
+        let tx_bytes = set_req.encoded_len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let result = self
-            .execute_set(&Request::set(key, value).ex(ttl_secs), value)
-            .await;
+        let result = self.execute_set(&set_req, value).await;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
         let success = result.is_ok();
         let final_result = match result {
             Ok(Value::SimpleString(_)) => Ok(()),
@@ -832,6 +894,8 @@ impl Client {
             hit: None,
             success,
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         final_result
     }
@@ -875,25 +939,24 @@ impl Client {
     /// Delete a key. Returns the number of keys deleted.
     pub async fn del(&mut self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
         let key = key.as_ref();
+        let encoded = Self::encode_request(&Request::del(key));
         if !self.is_instrumented() {
-            return self
-                .execute_int(&Self::encode_request(&Request::del(key)))
-                .await
-                .map(|n| n as u64);
+            return self.execute_int(&encoded).await.map(|n| n as u64);
         }
+        let tx_bytes = encoded.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let result = self
-            .execute_int(&Self::encode_request(&Request::del(key)))
-            .await
-            .map(|n| n as u64);
+        let result = self.execute_int(&encoded).await.map(|n| n as u64);
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
         self.record(&CommandResult {
             command: CommandType::Del,
             latency_ns,
             hit: None,
             success: result.is_ok(),
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         result
     }
@@ -1513,19 +1576,20 @@ impl Client {
 
     /// Ping the server.
     pub async fn ping(&mut self) -> Result<(), Error> {
+        let encoded = Self::encode_request(&Request::ping());
         if !self.is_instrumented() {
-            let value = self
-                .execute(&Self::encode_request(&Request::ping()))
-                .await?;
+            let value = self.execute(&encoded).await?;
             return match value {
                 Value::SimpleString(_) => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
             };
         }
+        let tx_bytes = encoded.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let result = self.execute(&Self::encode_request(&Request::ping())).await;
+        let result = self.execute(&encoded).await;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
         let success = result.is_ok();
         let final_result = match result {
             Ok(Value::SimpleString(_)) => Ok(()),
@@ -1538,6 +1602,8 @@ impl Client {
             hit: None,
             success,
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         final_result
     }
@@ -1643,6 +1709,7 @@ impl Client {
         }
         let (_, value_len) = guard.as_ptr_len();
         let prefix = encode_set_guard_prefix(key, value_len as usize, None);
+        let tx_bytes = (prefix.len() + value_len as usize + 2) as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
         self.conn.send_parts().build(move |b| {
@@ -1653,6 +1720,7 @@ impl Client {
         })?;
         let resp = self.read_value().await?;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
         let result = if let Value::Error(ref msg) = resp {
             Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()))
         } else {
@@ -1667,6 +1735,8 @@ impl Client {
             hit: None,
             success: result.is_ok(),
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         result
     }
@@ -1698,6 +1768,7 @@ impl Client {
         }
         let (_, value_len) = guard.as_ptr_len();
         let (prefix, suffix) = encode_set_guard_prefix_ex(key, value_len as usize, ttl_secs);
+        let tx_bytes = (prefix.len() + value_len as usize + suffix.len()) as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
         self.conn.send_parts().build(move |b| {
@@ -1708,6 +1779,7 @@ impl Client {
         })?;
         let resp = self.read_value().await?;
         let latency_ns = self.finish_timing(send_ts, start);
+        let rx_bytes = self.last_rx_bytes.get();
         let result = if let Value::Error(ref msg) = resp {
             Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()))
         } else {
@@ -1722,6 +1794,8 @@ impl Client {
             hit: None,
             success: result.is_ok(),
             ttfb_ns: None,
+            tx_bytes,
+            rx_bytes,
         });
         result
     }
