@@ -544,13 +544,6 @@ impl Client {
             return Err(Error::NoPending);
         }
 
-        // Capture the kernel recv timestamp before the mutable borrow of
-        // self.pending needed by the with_bytes closure.  We cannot compute
-        // TTFB yet because we don't know which pending op this response
-        // belongs to (multiplexed protocol) — that is determined after
-        // dispatch_response matches by message_id.
-        let recv_ts = self.capture_recv_ts();
-
         let pending = &mut self.pending;
         let mut dispatch_result: Option<DispatchResult> = None;
 
@@ -584,10 +577,15 @@ impl Client {
             }
         };
 
+        // Read recv_timestamp once, after with_bytes completes, so the
+        // kernel timestamp reflects the CQE that delivered this response.
+        // Used for both TTFB and latency to avoid redundant reads and
+        // stale-timestamp risk when with_bytes had to yield.
+        let recv_ts = self.capture_recv_ts();
         let rx_bytes = n as u32;
         let ttfb_ns = Self::ttfb_from_timestamps(recv_ts, dr.send_ts);
         let latency_ns = if self.is_instrumented() {
-            let latency_ns = self.finish_timing(dr.send_ts, dr.start);
+            let latency_ns = self.finish_timing(recv_ts, dr.send_ts, dr.start);
             self.record(&CommandResult {
                 command: dr.cmd_type,
                 latency_ns,
@@ -792,21 +790,11 @@ impl Client {
         0
     }
 
-    #[cfg(feature = "timestamps")]
     #[inline]
-    fn finish_timing(&self, send_ts: u64, start: Option<Instant>) -> u64 {
-        if self.use_kernel_ts {
-            let recv_ts = self.conn.recv_timestamp();
-            if recv_ts > 0 && recv_ts > send_ts {
-                return recv_ts - send_ts;
-            }
+    fn finish_timing(&self, recv_ts: u64, send_ts: u64, start: Option<Instant>) -> u64 {
+        if recv_ts > 0 && recv_ts > send_ts {
+            return recv_ts - send_ts;
         }
-        start.map_or(0, |s| s.elapsed().as_nanos() as u64)
-    }
-
-    #[cfg(not(feature = "timestamps"))]
-    #[inline]
-    fn finish_timing(&self, _send_ts: u64, start: Option<Instant>) -> u64 {
         start.map_or(0, |s| s.elapsed().as_nanos() as u64)
     }
 
