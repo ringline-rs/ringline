@@ -111,6 +111,52 @@ pub enum CompletedOp {
     },
 }
 
+impl CompletedOp {
+    fn set_latency(self, latency_ns: u64) -> Self {
+        match self {
+            Self::Get {
+                id,
+                key,
+                result,
+                user_data,
+                ..
+            } => Self::Get {
+                id,
+                key,
+                result,
+                user_data,
+                latency_ns,
+            },
+            Self::Set {
+                id,
+                key,
+                result,
+                user_data,
+                ..
+            } => Self::Set {
+                id,
+                key,
+                result,
+                user_data,
+                latency_ns,
+            },
+            Self::Delete {
+                id,
+                key,
+                result,
+                user_data,
+                ..
+            } => Self::Delete {
+                id,
+                key,
+                result,
+                user_data,
+                latency_ns,
+            },
+        }
+    }
+}
+
 /// Result metadata for a completed command, passed to the `on_result` callback.
 #[derive(Debug, Clone)]
 pub struct CommandResult {
@@ -498,10 +544,12 @@ impl Client {
             return Err(Error::NoPending);
         }
 
-        // Capture pre-read recv timestamp for TTFB before the mutable borrow
-        // of self.pending needed by the with_bytes closure.
-        let ttfb_send_ts = self.pending.values().next().map(|p| p.send_ts).unwrap_or(0);
-        let ttfb_ns = self.compute_ttfb(ttfb_send_ts);
+        // Capture the kernel recv timestamp before the mutable borrow of
+        // self.pending needed by the with_bytes closure.  We cannot compute
+        // TTFB yet because we don't know which pending op this response
+        // belongs to (multiplexed protocol) — that is determined after
+        // dispatch_response matches by message_id.
+        let recv_ts = self.capture_recv_ts();
 
         let pending = &mut self.pending;
         let mut dispatch_result: Option<DispatchResult> = None;
@@ -537,6 +585,7 @@ impl Client {
         };
 
         let rx_bytes = n as u32;
+        let ttfb_ns = Self::ttfb_from_timestamps(recv_ts, dr.send_ts);
         let latency_ns = if self.is_instrumented() {
             let latency_ns = self.finish_timing(dr.send_ts, dr.start);
             self.record(&CommandResult {
@@ -552,50 +601,7 @@ impl Client {
             0
         };
 
-        // Set latency_ns on the CompletedOp.
-        let op = match dr.op {
-            CompletedOp::Get {
-                id,
-                key,
-                result,
-                user_data,
-                ..
-            } => CompletedOp::Get {
-                id,
-                key,
-                result,
-                user_data,
-                latency_ns,
-            },
-            CompletedOp::Set {
-                id,
-                key,
-                result,
-                user_data,
-                ..
-            } => CompletedOp::Set {
-                id,
-                key,
-                result,
-                user_data,
-                latency_ns,
-            },
-            CompletedOp::Delete {
-                id,
-                key,
-                result,
-                user_data,
-                ..
-            } => CompletedOp::Delete {
-                id,
-                key,
-                result,
-                user_data,
-                latency_ns,
-            },
-        };
-
-        Ok(op)
+        Ok(dr.op.set_latency(latency_ns))
     }
 
     // ── Sequential convenience API ──────────────────────────────────────
@@ -747,20 +753,27 @@ impl Client {
 
     #[cfg(feature = "timestamps")]
     #[inline]
-    fn compute_ttfb(&self, send_ts: u64) -> Option<u64> {
+    fn capture_recv_ts(&self) -> u64 {
         if self.use_kernel_ts {
-            let recv_ts = self.conn.recv_timestamp();
-            if recv_ts > 0 && recv_ts > send_ts {
-                return Some(recv_ts - send_ts);
-            }
+            self.conn.recv_timestamp()
+        } else {
+            0
         }
-        None
     }
 
     #[cfg(not(feature = "timestamps"))]
     #[inline]
-    fn compute_ttfb(&self, _send_ts: u64) -> Option<u64> {
-        None
+    fn capture_recv_ts(&self) -> u64 {
+        0
+    }
+
+    #[inline]
+    fn ttfb_from_timestamps(recv_ts: u64, send_ts: u64) -> Option<u64> {
+        if recv_ts > 0 && recv_ts > send_ts {
+            Some(recv_ts - send_ts)
+        } else {
+            None
+        }
     }
 
     #[cfg(feature = "timestamps")]
