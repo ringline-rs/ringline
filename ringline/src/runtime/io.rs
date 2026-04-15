@@ -1961,7 +1961,7 @@ pub fn open_direct_io_file(path: &str) -> io::Result<crate::direct_io::DirectIoF
 /// Open an NVMe device from any async task.
 ///
 /// Returns an [`NvmeDevice`](crate::nvme::NvmeDevice) handle
-/// for use with [`nvme_read()`].
+/// for use with [`nvme_read()`], [`nvme_write()`], and [`nvme_flush()`].
 ///
 /// # Panics
 ///
@@ -2053,6 +2053,25 @@ pub unsafe fn direct_io_write(
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
         let seq = unsafe { ctx.direct_io_write(file, offset, buf, len)? };
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor.disk_io_waiters.insert(seq, task_id);
+        Ok(DiskIoFuture { seq })
+    })
+}
+
+/// Submit an NVMe flush and return a future for the result.
+///
+/// Flushes volatile write caches on the device, ensuring all previously
+/// written data is persisted to non-volatile storage. The returned future
+/// completes when the io_uring CQE arrives.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor.
+pub fn nvme_flush(device: crate::nvme::NvmeDevice) -> io::Result<DiskIoFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let seq = ctx.nvme_flush(device)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
         Ok(DiskIoFuture { seq })
