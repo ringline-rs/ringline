@@ -1,4 +1,4 @@
 pub mod fixed;
 pub mod send_copy;
-#[cfg(feature = "io-uring")]
+#[cfg(has_io_uring)]
 pub mod send_slab;

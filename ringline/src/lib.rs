@@ -245,10 +245,10 @@ pub use buffer::fixed::MemoryRegion;
 /// Region identifier for [`SendGuard`] implementations.
 pub use buffer::fixed::RegionId;
 /// Maximum zero-copy guards per scatter-gather send.
-#[cfg(feature = "io-uring")]
+#[cfg(has_io_uring)]
 pub use buffer::send_slab::MAX_GUARDS;
 /// Maximum iovecs per scatter-gather send.
-#[cfg(feature = "io-uring")]
+#[cfg(has_io_uring)]
 pub use buffer::send_slab::MAX_IOVECS;
 /// Runtime configuration.
 pub use config::Config;

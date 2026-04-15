@@ -32,7 +32,7 @@ impl WakeHandle {
 
     /// Wake the worker by writing to the underlying fd.
     pub(crate) fn wake(&self) {
-        #[cfg(feature = "io-uring")]
+        #[cfg(has_io_uring)]
         {
             // eventfd expects exactly 8 bytes (a u64).
             let val: u64 = 1;
@@ -40,7 +40,7 @@ impl WakeHandle {
                 libc::write(self.fd, &val as *const u64 as *const libc::c_void, 8);
             }
         }
-        #[cfg(not(feature = "io-uring"))]
+        #[cfg(not(has_io_uring))]
         {
             // pipe expects any non-zero write; 1 byte suffices.
             let val: u8 = 1;
@@ -55,7 +55,7 @@ impl WakeHandle {
 ///
 /// With io_uring: creates an `eventfd(2)`.
 /// Without io_uring: creates a `pipe(2)` and returns `(read_fd, WakeHandle)`.
-#[cfg(feature = "io-uring")]
+#[cfg(has_io_uring)]
 pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     if efd < 0 {
@@ -68,7 +68,7 @@ pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
 ///
 /// Returns `(read_fd, WakeHandle)` where `read_fd` is registered with the
 /// poller and `WakeHandle` wraps the write end for cross-thread waking.
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(has_io_uring))]
 pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {

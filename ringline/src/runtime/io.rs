@@ -715,7 +715,7 @@ impl ConnCtx {
         with_state(|driver, _| {
             let conn_index = self.conn_index;
 
-            #[cfg(feature = "io-uring")]
+            #[cfg(has_io_uring)]
             {
                 // Check for pending recv buffer.
                 if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
@@ -750,7 +750,7 @@ impl ConnCtx {
                         let built = crate::handler::BuiltSend {
                             entry,
                             pool_slot: u16::MAX,
-                            #[cfg(feature = "io-uring")]
+                            #[cfg(has_io_uring)]
                             slab_idx: u16::MAX,
                             total_len: pending.len,
                         };

@@ -72,7 +72,7 @@ thread_local! {
 /// prevent stale completions from waking the wrong task after slot reuse.
 pub(crate) struct TimerSlotPool {
     /// Timespec values — must remain at stable addresses for io_uring.
-    #[cfg(feature = "io-uring")]
+    #[cfg(has_io_uring)]
     pub(crate) timespecs: Vec<io_uring::types::Timespec>,
     /// Which task (with STANDALONE_BIT encoding) to wake when this timer fires.
     pub(crate) waker_ids: Vec<u32>,
@@ -93,7 +93,7 @@ impl TimerSlotPool {
             free_list.push(i);
         }
         TimerSlotPool {
-            #[cfg(feature = "io-uring")]
+            #[cfg(has_io_uring)]
             timespecs: vec![io_uring::types::Timespec::new(); cap],
             waker_ids: vec![0; cap],
             fired: vec![false; cap],
@@ -150,7 +150,7 @@ impl TimerSlotPool {
 
     /// Store a relative duration into the timer slot and return a raw pointer
     /// to the timespec for io_uring submission.
-    #[cfg(feature = "io-uring")]
+    #[cfg(has_io_uring)]
     pub(crate) fn set_relative(
         &mut self,
         slot: u32,
@@ -165,7 +165,7 @@ impl TimerSlotPool {
 
     /// Store an absolute deadline into the timer slot and return a raw pointer
     /// to the timespec for io_uring submission.
-    #[cfg(feature = "io-uring")]
+    #[cfg(has_io_uring)]
     pub(crate) fn set_absolute(
         &mut self,
         slot: u32,
