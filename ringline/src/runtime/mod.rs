@@ -74,6 +74,9 @@ pub(crate) struct TimerSlotPool {
     /// Timespec values — must remain at stable addresses for io_uring.
     #[cfg(has_io_uring)]
     pub(crate) timespecs: Vec<io_uring::types::Timespec>,
+    /// Deadline instants for the mio backend timer expiry.
+    #[cfg(not(has_io_uring))]
+    pub(crate) deadlines: Vec<Option<std::time::Instant>>,
     /// Which task (with STANDALONE_BIT encoding) to wake when this timer fires.
     pub(crate) waker_ids: Vec<u32>,
     /// Whether the CQE/event has arrived for this timer.
@@ -95,6 +98,8 @@ impl TimerSlotPool {
         TimerSlotPool {
             #[cfg(has_io_uring)]
             timespecs: vec![io_uring::types::Timespec::new(); cap],
+            #[cfg(not(has_io_uring))]
+            deadlines: vec![None; cap],
             waker_ids: vec![0; cap],
             fired: vec![false; cap],
             generations: vec![0; cap],
@@ -175,6 +180,37 @@ impl TimerSlotPool {
         let idx = slot as usize;
         self.timespecs[idx] = io_uring::types::Timespec::new().sec(secs).nsec(nsecs);
         &self.timespecs[idx] as *const _
+    }
+
+    /// Store a relative duration as a deadline (mio backend).
+    #[cfg(not(has_io_uring))]
+    pub(crate) fn set_relative(&mut self, slot: u32, duration: std::time::Duration) {
+        let idx = slot as usize;
+        self.deadlines[idx] = Some(std::time::Instant::now() + duration);
+    }
+
+    /// Store an absolute deadline (mio backend).
+    /// The secs/nsecs are CLOCK_MONOTONIC values; convert to Instant.
+    #[cfg(not(has_io_uring))]
+    pub(crate) fn set_absolute(&mut self, slot: u32, secs: u64, nsecs: u32) {
+        let idx = slot as usize;
+        // Approximate: compute offset from current monotonic clock to the deadline.
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        }
+        let now_ns = ts.tv_sec as u128 * 1_000_000_000 + ts.tv_nsec as u128;
+        let deadline_ns = secs as u128 * 1_000_000_000 + nsecs as u128;
+        let deadline = if deadline_ns > now_ns {
+            std::time::Instant::now()
+                + std::time::Duration::from_nanos((deadline_ns - now_ns) as u64)
+        } else {
+            std::time::Instant::now()
+        };
+        self.deadlines[idx] = Some(deadline);
     }
 }
 

@@ -64,8 +64,8 @@ impl Driver {
         let events = mio::Events::with_capacity(1024);
 
         let tls_table = {
-            let server_config = config.tls.as_ref().and_then(|t| t.server_config.clone());
-            let client_config = config.tls.as_ref().and_then(|t| t.client_config.clone());
+            let server_config = config.tls.as_ref().map(|t| t.server_config.clone());
+            let client_config = config.tls_client.as_ref().map(|t| t.client_config.clone());
             if server_config.is_some() || client_config.is_some() {
                 Some(crate::tls::TlsTable::new(
                     config.max_connections,
@@ -81,12 +81,9 @@ impl Driver {
             connections: ConnectionTable::new(config.max_connections),
             accumulators: AccumulatorTable::new(
                 config.max_connections,
-                config.recv_buffer.buf_size,
+                config.recv_buffer.buffer_size as usize,
             ),
-            send_copy_pool: SendCopyPool::new(
-                config.send_copy_pool_slots,
-                config.send_copy_slot_size,
-            ),
+            send_copy_pool: SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size),
             send_queues: (0..max_conn).map(|_| ConnSendState::new()).collect(),
             accept_rx,
             wake_handle: crate::wakeup::WakeHandle::from_raw_fd(eventfd),
@@ -118,7 +115,6 @@ impl Driver {
 
         DriverCtx {
             connections: &mut self.connections,
-            fixed_buffers: todo!("mio DriverCtx not yet implemented"),
             send_copy_pool: &mut self.send_copy_pool,
             tls_table: tls_ptr,
             shutdown_requested: &mut self.shutdown_local,
@@ -128,8 +124,6 @@ impl Driver {
             timestamps: false,
             #[cfg(feature = "timestamps")]
             recvmsg_msghdr: std::ptr::null(),
-            chain_table: todo!("mio DriverCtx not yet implemented"),
-            max_chain_length: 0,
             send_queues: &mut self.send_queues,
         }
     }

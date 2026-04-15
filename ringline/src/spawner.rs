@@ -115,19 +115,27 @@ fn do_spawn(program: &CString, args: &[CString]) -> io::Result<SpawnResult> {
         return Err(io::Error::from_raw_os_error(ret));
     }
 
-    // Get pidfd for the child.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_int) } as RawFd;
-    if pidfd < 0 {
-        // pidfd_open failed -- kill the child and return error.
-        let err = io::Error::last_os_error();
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
+    // Get pidfd for the child (Linux-only via pidfd_open syscall).
+    #[cfg(target_os = "linux")]
+    let pidfd = {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_int) } as RawFd;
+        if fd < 0 {
+            // pidfd_open failed -- kill the child and return error.
+            let err = io::Error::last_os_error();
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            unsafe {
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            return Err(err);
         }
-        unsafe {
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
-        }
-        return Err(err);
-    }
+        fd
+    };
+
+    // Non-Linux: pidfd not available, use -1 as sentinel.
+    #[cfg(not(target_os = "linux"))]
+    let pidfd: RawFd = -1;
 
     Ok(SpawnResult {
         pid: pid as u32,

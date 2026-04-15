@@ -5,6 +5,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, ServerConnection};
 
 use crate::accumulator::AccumulatorTable;
+#[cfg(has_io_uring)]
 use crate::backend::Ring;
 use crate::buffer::send_copy::SendCopyPool;
 
@@ -213,6 +214,7 @@ impl TlsTable {
     /// Send a TLS close_notify alert and flush the resulting ciphertext.
     /// All SQEs are submitted with IOSQE_IO_LINK so the caller's subsequent
     /// Close SQE is chained and only runs after the close_notify is sent.
+    #[cfg(has_io_uring)]
     pub fn send_close_notify(
         &mut self,
         conn_index: u32,
@@ -242,6 +244,7 @@ pub enum TlsRecvResult {
 
 /// Feed received ciphertext into the TLS connection, decrypt plaintext into
 /// the accumulator, and flush any TLS output (handshake responses, alerts).
+#[cfg(has_io_uring)]
 pub fn feed_tls_recv(
     tls_table: &mut TlsTable,
     accumulators: &mut AccumulatorTable,
@@ -328,6 +331,7 @@ pub fn feed_tls_recv(
 
 /// Flush pending TLS output to the network. Public entry point takes `&mut TlsTable`.
 /// Returns `false` if pool exhaustion prevented flushing all output.
+#[cfg(has_io_uring)]
 pub fn flush_tls_output(
     tls_table: &mut TlsTable,
     ring: &mut Ring,
@@ -345,6 +349,7 @@ pub fn flush_tls_output(
 /// Inner flush: takes disjoint borrows of TlsConn and the shared write_buf.
 /// Returns `true` if all output was flushed, `false` if pool exhaustion
 /// prevented sending some chunks (the connection should be considered broken).
+#[cfg(has_io_uring)]
 fn flush_tls_output_inner(
     tls_conn: &mut TlsConn,
     write_buf: &mut Vec<u8>,
@@ -381,6 +386,7 @@ fn flush_tls_output_inner(
 /// Flush close_notify ciphertext using linked SQEs (IOSQE_IO_LINK).
 /// All TlsSend SQEs are linked so the caller's subsequent Close SQE
 /// is chained — the kernel won't close the fd until the alert is sent.
+#[cfg(has_io_uring)]
 fn flush_close_notify_linked(
     tls_conn: &mut TlsConn,
     write_buf: &mut Vec<u8>,
@@ -421,6 +427,7 @@ fn flush_close_notify_linked(
 
 /// Encrypt plaintext and send it. Uses OpTag::Send so the handler
 /// receives on_send_complete.
+#[cfg(has_io_uring)]
 pub fn encrypt_and_send(
     tls_table: &mut TlsTable,
     ring: &mut Ring,
