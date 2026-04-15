@@ -1,4 +1,5 @@
 #![allow(clippy::manual_async_fn)]
+#![cfg(has_io_uring)]
 //! Integration tests: direct I/O via ringline's `O_DIRECT` support.
 //!
 //! These tests exercise the full io_uring submission path for

@@ -2119,9 +2119,11 @@ fn async_send_await_basic() {
     }
 }
 
+#[cfg(has_io_uring)]
 /// Handler that tests send_chain_await.
 struct SendChainAwaitHandler;
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for SendChainAwaitHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -2158,6 +2160,7 @@ impl AsyncEventHandler for SendChainAwaitHandler {
 }
 
 #[test]
+#[cfg(has_io_uring)]
 fn async_send_chain_await_basic() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");

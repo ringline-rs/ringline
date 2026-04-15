@@ -1684,6 +1684,9 @@ pub struct DriverCtx<'a> {
     #[cfg(feature = "timestamps")]
     pub(crate) recvmsg_msghdr: *const libc::msghdr,
     pub(crate) send_queues: &'a mut Vec<ConnSendState>,
+    /// Per-connection pending send buffers (mio backend).
+    /// DriverCtx::send() pushes data here; the event loop flushes on writable.
+    pub(crate) pending_sends: &'a mut Vec<std::collections::VecDeque<(Vec<u8>, usize)>>,
 }
 
 #[cfg(not(has_io_uring))]
@@ -1705,10 +1708,24 @@ impl<'a> DriverCtx<'a> {
             .map_or(false, |cs| cs.outbound)
     }
 
-    /// Send data on a connection (copy into send pool).
-    pub fn send(&mut self, _conn: ConnToken, _data: &[u8]) -> io::Result<()> {
-        // TODO: implement mio send
-        Err(io::Error::other("mio send not yet implemented"))
+    /// Send data on a connection (copy into pending send buffer).
+    ///
+    /// The data is buffered in the per-connection send queue. The event loop
+    /// flushes it when the socket becomes writable.
+    pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
+        let conn_state = self
+            .connections
+            .get(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
+        if conn_state.generation != conn.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        let idx = conn.index as usize;
+        self.pending_sends[idx].push_back((data.to_vec(), 0));
+        Ok(())
     }
 
     /// Close a connection.
