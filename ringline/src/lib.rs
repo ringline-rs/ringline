@@ -142,6 +142,8 @@ pub use runtime::io::connect_with_timeout;
 pub use runtime::io::direct_io_read;
 /// Submit a Direct I/O write and return a future for the result.
 pub use runtime::io::direct_io_write;
+/// Submit an NVMe flush and return a future for the result.
+pub use runtime::io::nvme_flush;
 /// Submit an NVMe read and return a future for the result.
 pub use runtime::io::nvme_read;
 /// Submit an NVMe write and return a future for the result.
