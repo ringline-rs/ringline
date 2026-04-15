@@ -68,6 +68,38 @@ pub(crate) mod tls;
 pub(crate) mod wakeup;
 pub(crate) mod worker;
 
+// ── Backend detection ───────────────────────────────────────────────────
+
+/// The I/O backend selected at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// io_uring backend (Linux 6.0+).
+    IoUring,
+    /// mio backend (cross-platform fallback).
+    Mio,
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backend::IoUring => f.write_str("io_uring"),
+            Backend::Mio => f.write_str("mio"),
+        }
+    }
+}
+
+/// Returns the I/O backend selected at compile time.
+pub fn backend() -> Backend {
+    #[cfg(has_io_uring)]
+    {
+        Backend::IoUring
+    }
+    #[cfg(not(has_io_uring))]
+    {
+        Backend::Mio
+    }
+}
+
 // ── Public modules ──────────────────────────────────────────────────────
 pub mod config;
 pub mod error;
