@@ -291,7 +291,7 @@ pub fn spawn_blocking<T: Send + 'static>(
                 work,
                 request_id,
                 response_tx: blocking_tx.clone(),
-                worker_eventfd: driver.eventfd,
+                wake_handle: driver.wake_handle,
             })
             .map_err(|_| io::Error::other("blocking pool shut down"))?;
 
@@ -502,7 +502,7 @@ pub fn resolve(host: &str, port: u16) -> io::Result<ResolveFuture> {
                 port,
                 request_id,
                 response_tx: resolve_tx.clone(),
-                worker_eventfd: driver.eventfd,
+                wake_handle: driver.wake_handle,
             })
             .map_err(|_| io::Error::other("resolver pool shut down"))?;
 
@@ -710,60 +710,65 @@ impl ConnCtx {
     /// (e.g., data came from the accumulator or a TLS connection).
     ///
     /// Only works for plaintext connections; TLS connections always copy.
+    /// On the mio backend, this always uses the copy path.
     pub fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
         with_state(|driver, _| {
             let conn_index = self.conn_index;
 
-            // Check for pending recv buffer.
-            if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
-                // Verify the data pointer matches the pending buffer (sanity check).
-                let pending_ptr = pending.ptr;
-                let data_ptr = data.as_ptr();
-                if data_ptr == pending_ptr && data.len() == pending.len as usize {
-                    // Submit send SQE from the recv buffer. The bid is replenished
-                    // on send completion via handle_send_recv_buf.
-                    // Payload: bid in low 16 bits, remaining_len in high 16 bits.
-                    debug_assert!(
-                        pending.len <= 0xFFFF,
-                        "forward_recv_buf: data length {} exceeds 16-bit payload capacity",
-                        pending.len,
-                    );
-                    let payload = (pending.bid as u32) | ((pending.len) << 16);
-                    // Store original data length for correct offset on partial sends.
-                    driver.send_recv_buf_original_lens[conn_index as usize] = pending.len;
-                    let user_data = crate::completion::UserData::encode(
-                        crate::completion::OpTag::SendRecvBuf,
-                        conn_index,
-                        payload,
-                    );
-                    let entry = io_uring::opcode::Send::new(
-                        io_uring::types::Fixed(conn_index),
-                        pending_ptr,
-                        pending.len,
-                    )
-                    .build()
-                    .user_data(user_data.raw());
+            #[cfg(has_io_uring)]
+            {
+                // Check for pending recv buffer.
+                if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
+                    // Verify the data pointer matches the pending buffer (sanity check).
+                    let pending_ptr = pending.ptr;
+                    let data_ptr = data.as_ptr();
+                    if data_ptr == pending_ptr && data.len() == pending.len as usize {
+                        // Submit send SQE from the recv buffer. The bid is replenished
+                        // on send completion via handle_send_recv_buf.
+                        // Payload: bid in low 16 bits, remaining_len in high 16 bits.
+                        debug_assert!(
+                            pending.len <= 0xFFFF,
+                            "forward_recv_buf: data length {} exceeds 16-bit payload capacity",
+                            pending.len,
+                        );
+                        let payload = (pending.bid as u32) | ((pending.len) << 16);
+                        // Store original data length for correct offset on partial sends.
+                        driver.send_recv_buf_original_lens[conn_index as usize] = pending.len;
+                        let user_data = crate::completion::UserData::encode(
+                            crate::completion::OpTag::SendRecvBuf,
+                            conn_index,
+                            payload,
+                        );
+                        let entry = io_uring::opcode::Send::new(
+                            io_uring::types::Fixed(conn_index),
+                            pending_ptr,
+                            pending.len,
+                        )
+                        .build()
+                        .user_data(user_data.raw());
 
-                    let built = crate::handler::BuiltSend {
-                        entry,
-                        pool_slot: u16::MAX,
-                        slab_idx: u16::MAX,
-                        total_len: pending.len,
-                    };
+                        let built = crate::handler::BuiltSend {
+                            entry,
+                            pool_slot: u16::MAX,
+                            #[cfg(has_io_uring)]
+                            slab_idx: u16::MAX,
+                            total_len: pending.len,
+                        };
 
-                    let result = driver.submit_or_queue_send(conn_index, built);
-                    if result.is_err() {
-                        // Submit failed — replenish the recv buffer.
-                        driver.pending_replenish.push(pending.bid);
+                        let result = driver.submit_or_queue_send(conn_index, built);
+                        if result.is_err() {
+                            // Submit failed — replenish the recv buffer.
+                            driver.pending_replenish.push(pending.bid);
+                        }
+                        return result;
                     }
-                    return result;
-                }
 
-                // Pointer mismatch — put it back and fall through to copy path.
-                driver.pending_recv_bufs[conn_index as usize] = Some(pending);
+                    // Pointer mismatch �� put it back and fall through to copy path.
+                    driver.pending_recv_bufs[conn_index as usize] = Some(pending);
+                }
             }
 
-            // No pending recv buffer — fall back to copy send.
+            // No pending recv buffer (or mio backend) — fall back to copy send.
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), data)
         })
@@ -1558,26 +1563,16 @@ impl Future for SleepFuture {
                 }
             };
 
-            let is_absolute = self.absolute.is_some();
-            if let Some(deadline) = self.absolute {
-                executor.timer_pool.timespecs[slot as usize] = io_uring::types::Timespec::new()
-                    .sec(deadline.secs)
-                    .nsec(deadline.nsecs);
-            } else {
-                let secs = self.duration.as_secs();
-                let nsecs = self.duration.subsec_nanos();
-                executor.timer_pool.timespecs[slot as usize] =
-                    io_uring::types::Timespec::new().sec(secs).nsec(nsecs);
-            }
-
             let payload = TimerSlotPool::encode_payload(slot, generation);
             let ud = UserData::encode(OpTag::Timer, 0, payload);
-            let ts_ptr =
-                &executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
 
-            let submit_result = if is_absolute {
+            let submit_result = if let Some(deadline) = self.absolute {
+                let ts_ptr = executor
+                    .timer_pool
+                    .set_absolute(slot, deadline.secs, deadline.nsecs);
                 driver.ring.submit_timeout_abs(ts_ptr, ud)
             } else {
+                let ts_ptr = executor.timer_pool.set_relative(slot, self.duration);
                 driver.ring.submit_timeout(ts_ptr, ud)
             };
 
@@ -1636,15 +1631,9 @@ pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
             TimerExhausted
         })?;
 
-        let secs = duration.as_secs();
-        let nsecs = duration.subsec_nanos();
-        executor.timer_pool.timespecs[slot as usize] =
-            io_uring::types::Timespec::new().sec(secs).nsec(nsecs);
-
         let payload = TimerSlotPool::encode_payload(slot, generation);
         let ud = UserData::encode(OpTag::Timer, 0, payload);
-        let ts_ptr =
-            &executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
+        let ts_ptr = executor.timer_pool.set_relative(slot, duration);
 
         if let Err(_e) = driver.ring.submit_timeout(ts_ptr, ud) {
             executor.timer_pool.release(slot);
@@ -1760,14 +1749,11 @@ pub fn try_sleep_until(deadline: Deadline) -> Result<SleepFuture, TimerExhausted
             TimerExhausted
         })?;
 
-        executor.timer_pool.timespecs[slot as usize] = io_uring::types::Timespec::new()
-            .sec(deadline.secs)
-            .nsec(deadline.nsecs);
-
         let payload = TimerSlotPool::encode_payload(slot, generation);
         let ud = UserData::encode(OpTag::Timer, 0, payload);
-        let ts_ptr =
-            &executor.timer_pool.timespecs[slot as usize] as *const io_uring::types::Timespec;
+        let ts_ptr = executor
+            .timer_pool
+            .set_absolute(slot, deadline.secs, deadline.nsecs);
 
         if let Err(_e) = driver.ring.submit_timeout_abs(ts_ptr, ud) {
             executor.timer_pool.release(slot);

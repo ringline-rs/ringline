@@ -11,8 +11,8 @@ pub struct AcceptorConfig {
     pub listen_fd: RawFd,
     /// Per-worker channels to send accepted (fd, peer_addr) pairs.
     pub worker_channels: Vec<Sender<(RawFd, SocketAddr)>>,
-    /// Per-worker eventfds to wake io_uring.
-    pub worker_eventfds: Vec<RawFd>,
+    /// Per-worker wake handles to wake the event loop after sending a connection.
+    pub worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
     /// Shared flag set by ShutdownHandle to signal the acceptor to stop.
     #[allow(dead_code)] // stored for future use; acceptor currently uses channel disconnect
     pub shutdown_flag: Arc<AtomicBool>,
@@ -42,14 +42,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
         let mut addr_len: libc::socklen_t =
             std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
-        let fd = unsafe {
-            libc::accept4(
-                config.listen_fd,
-                &mut addr_storage as *mut _ as *mut libc::sockaddr,
-                &mut addr_len,
-                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            )
-        };
+        let fd = accept_nonblock(config.listen_fd, &mut addr_storage, &mut addr_len);
 
         if fd < 0 {
             let err = std::io::Error::last_os_error();
@@ -133,15 +126,8 @@ pub fn run_acceptor(config: AcceptorConfig) {
                 continue;
             }
 
-            // Wake the worker's io_uring via eventfd.
-            let val: u64 = 1;
-            unsafe {
-                libc::write(
-                    config.worker_eventfds[worker_idx],
-                    &val as *const u64 as *const libc::c_void,
-                    8,
-                );
-            }
+            // Wake the worker's event loop.
+            config.worker_wake_handles[worker_idx].wake();
             sent = true;
             break;
         }
@@ -156,7 +142,43 @@ pub fn run_acceptor(config: AcceptorConfig) {
     }
 }
 
-/// Convert a `sockaddr_storage` (from accept4) to a Rust `SocketAddr`.
+/// Accept a connection and set it to non-blocking + close-on-exec.
+///
+/// On Linux, uses `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)` for a single syscall.
+/// On other platforms, falls back to `accept()` + `fcntl()`.
+fn accept_nonblock(
+    listen_fd: libc::c_int,
+    addr: &mut libc::sockaddr_storage,
+    addr_len: &mut libc::socklen_t,
+) -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            libc::accept4(
+                listen_fd,
+                addr as *mut _ as *mut libc::sockaddr,
+                addr_len,
+                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            )
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let fd =
+            unsafe { libc::accept(listen_fd, addr as *mut _ as *mut libc::sockaddr, addr_len) };
+        if fd >= 0 {
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+                libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
+            }
+        }
+        fd
+    }
+}
+
+/// Convert a `sockaddr_storage` (from accept) to a Rust `SocketAddr`.
 fn sockaddr_to_socket_addr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {

@@ -4,7 +4,6 @@
 //! Threads run at `SCHED_IDLE` priority so the kernel prefers async workers.
 
 use std::any::Any;
-use std::os::unix::io::RawFd;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -15,8 +14,8 @@ pub(crate) struct BlockingRequest {
     pub(crate) request_id: u64,
     /// Per-worker response channel.
     pub(crate) response_tx: Sender<BlockingResponse>,
-    /// Worker's eventfd — written after sending the response to wake io_uring.
-    pub(crate) worker_eventfd: RawFd,
+    /// Wake handle — used to wake the worker after sending the response.
+    pub(crate) wake_handle: crate::wakeup::WakeHandle,
 }
 
 /// A response from the blocking pool to a worker.
@@ -46,10 +45,13 @@ impl BlockingPool {
             let handle = thread::Builder::new()
                 .name(format!("ringline-blocking-{i}"))
                 .spawn(move || {
-                    // Set SCHED_IDLE priority — lowest possible.
-                    let param: libc::sched_param = unsafe { std::mem::zeroed() };
-                    unsafe {
-                        libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+                    // Set SCHED_IDLE priority — lowest possible (Linux only).
+                    #[cfg(target_os = "linux")]
+                    {
+                        let param: libc::sched_param = unsafe { std::mem::zeroed() };
+                        unsafe {
+                            libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+                        }
                     }
                     blocking_thread(rx);
                 })
@@ -73,14 +75,7 @@ fn blocking_thread(rx: Receiver<BlockingRequest>) {
             result,
         });
         // Wake the requesting worker so it drains the response channel.
-        let val: u64 = 1;
-        unsafe {
-            libc::write(
-                req.worker_eventfd,
-                &val as *const u64 as *const libc::c_void,
-                8,
-            );
-        }
+        req.wake_handle.wake();
     }
     // Channel closed — pool is shutting down.
 }

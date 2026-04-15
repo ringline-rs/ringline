@@ -3,6 +3,7 @@ use std::io;
 use std::net::SocketAddr;
 
 use crate::buffer::send_copy::SendCopyPool;
+#[cfg(has_io_uring)]
 use crate::buffer::send_slab::{InFlightSendSlab, MAX_GUARDS, MAX_IOVECS};
 use crate::guard::GuardBox;
 
@@ -67,6 +68,7 @@ pub struct DriverCtx<'a> {
     pub(crate) connections: &'a mut crate::connection::ConnectionTable,
     pub(crate) fixed_buffers: &'a mut crate::buffer::fixed::FixedBufferRegistry,
     pub(crate) send_copy_pool: &'a mut SendCopyPool,
+    #[cfg(has_io_uring)]
     pub(crate) send_slab: &'a mut InFlightSendSlab,
     // SAFETY: Raw pointer for borrow splitting with the connection table.
     // Sound because: (1) single-threaded — DriverCtx is only created and used
@@ -87,7 +89,8 @@ pub struct DriverCtx<'a> {
     /// Pointer to the per-worker RecvMsgMulti msghdr template.
     #[cfg(feature = "timestamps")]
     pub(crate) recvmsg_msghdr: *const libc::msghdr,
-    /// Pre-allocated timespec storage for connect timeouts.
+    /// Pre-allocated timespec storage for connect timeouts (io_uring only).
+    #[cfg(has_io_uring)]
     pub(crate) connect_timespecs: &'a mut Vec<io_uring::types::Timespec>,
     /// Per-connection send chain tracking.
     pub(crate) chain_table: &'a mut crate::chain::SendChainTable,
@@ -1637,6 +1640,7 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Arm a connect timeout for the given connection index.
+    #[cfg(has_io_uring)]
     fn arm_connect_timeout(&mut self, conn_index: u32, timeout_ms: u64) {
         let ts = &mut self.connect_timespecs[conn_index as usize];
         *ts = io_uring::types::Timespec::new()
@@ -1653,14 +1657,17 @@ impl<'a> DriverCtx<'a> {
     }
 }
 
-/// A prepared SQE with its associated resources, ready for submission.
+/// A prepared send operation with its associated resources, ready for submission.
 pub(crate) struct BuiltSend {
+    /// The io_uring SQE to submit.
+    #[cfg(has_io_uring)]
     pub entry: io_uring::squeue::Entry,
     /// SendCopyPool slot index. u16::MAX if none.
     pub pool_slot: u16,
     /// InFlightSendSlab index. u16::MAX if none (only for SendMsgZc).
+    #[cfg(has_io_uring)]
     pub slab_idx: u16,
-    /// Total bytes this SQE will send.
+    /// Total bytes this send will transmit.
     pub total_len: u32,
 }
 
