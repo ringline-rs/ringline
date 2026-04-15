@@ -63,7 +63,7 @@ impl UdpToken {
 ///
 /// This is a short-lived borrow into the driver's internal state.
 pub struct DriverCtx<'a> {
-    pub(crate) ring: &'a mut crate::ring::Ring,
+    pub(crate) ring: &'a mut crate::backend::Ring,
     pub(crate) connections: &'a mut crate::connection::ConnectionTable,
     pub(crate) fixed_buffers: &'a mut crate::buffer::fixed::FixedBufferRegistry,
     pub(crate) send_copy_pool: &'a mut SendCopyPool,
@@ -96,7 +96,7 @@ pub struct DriverCtx<'a> {
     /// Per-connection send queues for serializing sends.
     pub(crate) send_queues: &'a mut Vec<ConnSendState>,
     /// Per-worker UDP socket state.
-    pub(crate) udp_sockets: &'a mut Vec<crate::driver::UdpSocketState>,
+    pub(crate) udp_sockets: &'a mut Vec<crate::backend::UdpSocketState>,
     /// NVMe device table. `None` when NVMe is not configured.
     pub(crate) nvme_devices: &'a mut Option<crate::nvme::NvmeDeviceTable>,
     /// NVMe command slab. `None` when NVMe is not configured.
@@ -359,7 +359,7 @@ impl<'a> DriverCtx<'a> {
 
         // Set up destination address.
         let addr_len =
-            crate::driver::socket_addr_to_sockaddr(peer, &mut self.udp_sockets[idx].send_addr);
+            crate::backend::socket_addr_to_sockaddr(peer, &mut self.udp_sockets[idx].send_addr);
 
         // Set up iovec.
         self.udp_sockets[idx].send_iov.iov_base = ptr as *mut libc::c_void;
@@ -466,7 +466,7 @@ impl<'a> DriverCtx<'a> {
         }
 
         // Fill sockaddr_storage for the connect SQE.
-        let addrlen = crate::driver::socket_addr_to_sockaddr(
+        let addrlen = crate::backend::socket_addr_to_sockaddr(
             addr,
             &mut self.connect_addrs[conn_index as usize],
         );
@@ -530,7 +530,7 @@ impl<'a> DriverCtx<'a> {
         }
 
         // Fill sockaddr_storage for the connect SQE.
-        let addrlen = crate::driver::unix_path_to_sockaddr(
+        let addrlen = crate::backend::unix_path_to_sockaddr(
             path,
             &mut self.connect_addrs[conn_index as usize],
         );
@@ -671,7 +671,7 @@ impl<'a> DriverCtx<'a> {
         }
 
         // Fill sockaddr_storage for the connect SQE.
-        let addrlen = crate::driver::socket_addr_to_sockaddr(
+        let addrlen = crate::backend::socket_addr_to_sockaddr(
             addr,
             &mut self.connect_addrs[conn_index as usize],
         );

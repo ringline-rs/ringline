@@ -6,8 +6,8 @@ use io_uring::squeue;
 use io_uring::types::{DestinationSlot, Fd, Fixed};
 use io_uring::{IoUring, opcode};
 
+use crate::backend::ProvidedBufRing;
 use crate::buffer::fixed::FixedBufferRegistry;
-use crate::buffer::provided::ProvidedBufRing;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
 use crate::nvme::{NVME_URING_CMD_IO, NvmeUringCmd};

@@ -5,8 +5,8 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, ServerConnection};
 
 use crate::accumulator::AccumulatorTable;
+use crate::backend::Ring;
 use crate::buffer::send_copy::SendCopyPool;
-use crate::ring::Ring;
 
 /// Information about a negotiated TLS session.
 pub struct TlsInfo {

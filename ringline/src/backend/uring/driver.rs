@@ -9,8 +9,9 @@ use std::time::Duration;
 use io_uring::cqueue;
 
 use crate::accumulator::AccumulatorTable;
+use crate::backend::ProvidedBufRing;
+use crate::backend::Ring;
 use crate::buffer::fixed::FixedBufferRegistry;
-use crate::buffer::provided::ProvidedBufRing;
 use crate::buffer::send_copy::SendCopyPool;
 use crate::buffer::send_slab::InFlightSendSlab;
 use crate::chain::SendChainTable;
@@ -18,7 +19,6 @@ use crate::completion::{OpTag, UserData};
 use crate::config::Config;
 use crate::connection::{ConnectionTable, RecvMode};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
-use crate::ring::Ring;
 
 /// Per-worker UDP socket state.
 pub(crate) struct UdpSocketState {
