@@ -5,11 +5,11 @@ use std::time::Instant;
 
 use io_uring::cqueue;
 
+use crate::backend::Driver;
+use crate::backend::sockaddr_to_socket_addr;
 use crate::chain::ChainEvent;
 use crate::completion::{OpTag, UserData};
 use crate::connection::RecvMode;
-use crate::driver::Driver;
-use crate::driver::sockaddr_to_socket_addr;
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
 use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, clear_driver_state, set_driver_state};
@@ -568,7 +568,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
 
                 if acc_empty && slot.is_none() {
-                    *slot = Some(crate::driver::PendingRecvBuf {
+                    *slot = Some(crate::backend::PendingRecvBuf {
                         bid,
                         len: bytes_received,
                         ptr: buf_ptr,

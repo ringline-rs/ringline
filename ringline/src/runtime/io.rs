@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
+use crate::backend::Driver;
 use crate::completion::{OpTag, UserData};
-use crate::driver::Driver;
 use crate::error::TimerExhausted;
 use crate::handler::ConnToken;
 use crate::runtime::task::TaskId;

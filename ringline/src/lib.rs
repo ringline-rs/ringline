@@ -44,7 +44,7 @@
 // ── Internal modules ────────────────────────────────────────────────────
 pub(crate) mod acceptor;
 pub(crate) mod accumulator;
-pub(crate) mod async_event_loop;
+pub(crate) mod backend;
 pub(crate) mod blocking;
 pub(crate) mod buffer;
 pub(crate) mod chain;
@@ -52,13 +52,11 @@ pub(crate) mod completion;
 pub(crate) mod connection;
 pub(crate) mod counter;
 pub mod direct_io;
-pub(crate) mod driver;
 pub mod fs;
 pub(crate) mod metrics;
 pub mod nvme;
 pub mod process;
 pub(crate) mod resolver;
-pub(crate) mod ring;
 pub(crate) mod runtime;
 pub(crate) mod spawner;
 pub(crate) mod tls;

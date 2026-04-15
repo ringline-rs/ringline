@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use crate::acceptor::{AcceptorConfig, run_acceptor};
-use crate::async_event_loop::AsyncEventLoop;
+use crate::backend::AsyncEventLoop;
 use crate::config::Config;
 use crate::runtime::handler::AsyncEventHandler;
 
@@ -489,7 +489,7 @@ fn create_listener(addr: SocketAddr, backlog: i32) -> Result<RawFd, crate::error
 
     // Bind — use the driver's sockaddr helper.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let addr_len = crate::driver::socket_addr_to_sockaddr(addr, &mut storage);
+    let addr_len = crate::backend::socket_addr_to_sockaddr(addr, &mut storage);
 
     let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
     if ret < 0 {
@@ -532,7 +532,7 @@ fn create_unix_listener(path: &Path, backlog: i32) -> Result<RawFd, crate::error
 
     // Bind using the driver's sockaddr helper.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let addr_len = crate::driver::unix_path_to_sockaddr(path, &mut storage);
+    let addr_len = crate::backend::unix_path_to_sockaddr(path, &mut storage);
 
     let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
     if ret < 0 {

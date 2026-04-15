@@ -72,7 +72,7 @@ impl ConnStream {
     }
 
     /// Check whether the connection's recv side is closed.
-    fn is_recv_closed(driver: &mut crate::driver::Driver, conn_index: u32) -> bool {
+    fn is_recv_closed(driver: &mut crate::backend::Driver, conn_index: u32) -> bool {
         driver
             .connections
             .get(conn_index)
@@ -84,7 +84,7 @@ impl ConnStream {
     /// `ConnStream` can read it. The zero-copy path holds kernel buffers
     /// in `pending_recv_bufs` for `with_data()`/`with_bytes()` callers;
     /// `ConnStream` must flush these since it reads from the accumulator.
-    fn flush_pending_recv(driver: &mut crate::driver::Driver, conn_index: u32) {
+    fn flush_pending_recv(driver: &mut crate::backend::Driver, conn_index: u32) {
         if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
             let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
             driver.accumulators.append(conn_index, data);
