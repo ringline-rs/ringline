@@ -1,6 +1,7 @@
-//! ringline — io_uring-native async I/O runtime for Linux.
+//! ringline — async I/O runtime with io_uring and mio backends.
 //!
-//! ringline is a thread-per-core I/O framework built directly on io_uring.
+//! ringline is a thread-per-core I/O framework with two compile-time
+//! selectable backends: io_uring (Linux, default) and mio (cross-platform).
 //! It provides an async/await API ([`AsyncEventHandler`]) on a single-threaded
 //! executor with no work-stealing.
 //!
@@ -38,8 +39,12 @@
 //!
 //! # Platform
 //!
-//! Linux 6.0+ only. Requires io_uring with multishot recv, ring-provided
-//! buffers, SendMsgZc, and fixed file table support.
+//! With `io-uring` feature (default): Linux 6.0+. Requires io_uring with
+//! multishot recv, ring-provided buffers, SendMsgZc, and fixed file table
+//! support.
+//!
+//! With `--no-default-features`: mio backend, works on Linux and macOS.
+//! NVMe passthrough, direct I/O, and zero-copy sends are not available.
 
 // ── Internal modules ────────────────────────────────────────────────────
 pub(crate) mod acceptor;
@@ -60,6 +65,7 @@ pub(crate) mod resolver;
 pub(crate) mod runtime;
 pub(crate) mod spawner;
 pub(crate) mod tls;
+pub(crate) mod wakeup;
 pub(crate) mod worker;
 
 // ── Public modules ──────────────────────────────────────────────────────
@@ -239,8 +245,10 @@ pub use buffer::fixed::MemoryRegion;
 /// Region identifier for [`SendGuard`] implementations.
 pub use buffer::fixed::RegionId;
 /// Maximum zero-copy guards per scatter-gather send.
+#[cfg(feature = "io-uring")]
 pub use buffer::send_slab::MAX_GUARDS;
 /// Maximum iovecs per scatter-gather send.
+#[cfg(feature = "io-uring")]
 pub use buffer::send_slab::MAX_IOVECS;
 /// Runtime configuration.
 pub use config::Config;

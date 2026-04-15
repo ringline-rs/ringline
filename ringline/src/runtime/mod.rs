@@ -66,19 +66,19 @@ thread_local! {
     pub(crate) static CURRENT_TASK_ID: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Pool of timer slots for io_uring timeout SQEs.
+/// Pool of timer slots backed by stable memory for the I/O backend.
 ///
-/// Each `sleep()` call allocates a slot that holds the `Timespec` (stable
-/// memory for io_uring) and metadata. Generation counters prevent stale
-/// CQEs from waking the wrong task after slot reuse.
+/// Each `sleep()` call allocates a slot and metadata. Generation counters
+/// prevent stale completions from waking the wrong task after slot reuse.
 pub(crate) struct TimerSlotPool {
     /// Timespec values — must remain at stable addresses for io_uring.
+    #[cfg(feature = "io-uring")]
     pub(crate) timespecs: Vec<io_uring::types::Timespec>,
     /// Which task (with STANDALONE_BIT encoding) to wake when this timer fires.
     pub(crate) waker_ids: Vec<u32>,
-    /// Whether the CQE has arrived for this timer.
+    /// Whether the CQE/event has arrived for this timer.
     pub(crate) fired: Vec<bool>,
-    /// Generation counter per slot to prevent stale CQE races.
+    /// Generation counter per slot to prevent stale event races.
     pub(crate) generations: Vec<u16>,
     /// Free slot indices for O(1) allocation.
     free_list: Vec<u32>,
@@ -93,6 +93,7 @@ impl TimerSlotPool {
             free_list.push(i);
         }
         TimerSlotPool {
+            #[cfg(feature = "io-uring")]
             timespecs: vec![io_uring::types::Timespec::new(); cap],
             waker_ids: vec![0; cap],
             fired: vec![false; cap],
@@ -145,6 +146,35 @@ impl TimerSlotPool {
         let slot = payload & 0xFFFF;
         let generation = (payload >> 16) as u16;
         (slot, generation)
+    }
+
+    /// Store a relative duration into the timer slot and return a raw pointer
+    /// to the timespec for io_uring submission.
+    #[cfg(feature = "io-uring")]
+    pub(crate) fn set_relative(
+        &mut self,
+        slot: u32,
+        duration: std::time::Duration,
+    ) -> *const io_uring::types::Timespec {
+        let idx = slot as usize;
+        self.timespecs[idx] = io_uring::types::Timespec::new()
+            .sec(duration.as_secs())
+            .nsec(duration.subsec_nanos());
+        &self.timespecs[idx] as *const _
+    }
+
+    /// Store an absolute deadline into the timer slot and return a raw pointer
+    /// to the timespec for io_uring submission.
+    #[cfg(feature = "io-uring")]
+    pub(crate) fn set_absolute(
+        &mut self,
+        slot: u32,
+        secs: u64,
+        nsecs: u32,
+    ) -> *const io_uring::types::Timespec {
+        let idx = slot as usize;
+        self.timespecs[idx] = io_uring::types::Timespec::new().sec(secs).nsec(nsecs);
+        &self.timespecs[idx] as *const _
     }
 }
 

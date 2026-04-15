@@ -5,13 +5,14 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "io_uring-native async I/O runtime for Linux"
+description = "Async I/O runtime with io_uring (Linux) and mio (cross-platform) backends"
 readme = "README.md"
-keywords = ["io-uring", "async", "networking", "linux", "event-loop"]
+keywords = ["io-uring", "async", "networking", "event-loop"]
 categories = ["asynchronous", "network-programming"]
 
 [features]
-default = ["futures-io"]
+default = ["io-uring", "futures-io"]
+io-uring = ["dep:io-uring"]
 timestamps = []
 futures-io = ["dep:futures-io"]
 
@@ -19,8 +20,9 @@ futures-io = ["dep:futures-io"]
 futures-io = { version = "0.3", optional = true }
 bytes = "1"
 crossbeam-channel = "0.5"
-io-uring = "0.7"
+io-uring = { version = "0.7", optional = true }
 libc = "0.2"
+mio = { version = "1", features = ["os-poll", "net"] }
 metriken = "0.7"
 pin-project-lite = "0.2"
 thiserror = "2"

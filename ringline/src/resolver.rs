@@ -4,11 +4,10 @@
 //! blocking DNS resolution isolated from the io_uring event loop.
 //!
 //! Workers submit requests via [`resolve()`](crate::resolve) and receive
-//! results through a per-worker crossbeam channel + eventfd wakeup.
+//! results through a per-worker crossbeam channel + wakeup.
 
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::os::unix::io::RawFd;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -20,8 +19,8 @@ pub(crate) struct ResolveRequest {
     pub(crate) request_id: u64,
     /// Per-worker response channel.
     pub(crate) response_tx: Sender<ResolveResponse>,
-    /// Worker's eventfd — written after sending the response to wake io_uring.
-    pub(crate) worker_eventfd: RawFd,
+    /// Wake handle — used to wake the worker after sending the response.
+    pub(crate) wake_handle: crate::wakeup::WakeHandle,
 }
 
 /// A response from the resolver pool to a worker.
@@ -71,14 +70,7 @@ fn resolver_thread(rx: Receiver<ResolveRequest>) {
             result,
         });
         // Wake the requesting worker so it drains the response channel.
-        let val: u64 = 1;
-        unsafe {
-            libc::write(
-                req.worker_eventfd,
-                &val as *const u64 as *const libc::c_void,
-                8,
-            );
-        }
+        req.wake_handle.wake();
     }
     // Channel closed — pool is shutting down.
 }

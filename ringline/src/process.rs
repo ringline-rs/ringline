@@ -228,7 +228,7 @@ impl Command {
                     args,
                     request_id,
                     response_tx: spawn_tx.clone(),
-                    worker_eventfd: driver.eventfd,
+                    wake_handle: driver.wake_handle,
                 })
                 .map_err(|_| io::Error::other("spawner pool shut down"))?;
 

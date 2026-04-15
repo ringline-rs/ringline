@@ -24,8 +24,8 @@ pub(crate) struct SpawnRequest {
     pub(crate) request_id: u64,
     /// Per-worker response channel.
     pub(crate) response_tx: Sender<SpawnResponse>,
-    /// Worker's eventfd -- written after sending the response to wake io_uring.
-    pub(crate) worker_eventfd: RawFd,
+    /// Wake handle — used to wake the worker after sending the response.
+    pub(crate) wake_handle: crate::wakeup::WakeHandle,
 }
 
 /// A response from the spawner pool to a worker.
@@ -81,14 +81,7 @@ fn spawner_thread(rx: Receiver<SpawnRequest>) {
             result,
         });
         // Wake the requesting worker so it drains the response channel.
-        let val: u64 = 1;
-        unsafe {
-            libc::write(
-                req.worker_eventfd,
-                &val as *const u64 as *const libc::c_void,
-                8,
-            );
-        }
+        req.wake_handle.wake();
     }
     // Channel closed -- pool is shutting down.
 }

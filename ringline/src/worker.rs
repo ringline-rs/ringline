@@ -23,18 +23,12 @@ type LaunchResult = Result<
 /// Handle returned by `launch()` to trigger graceful shutdown of all workers.
 pub struct ShutdownHandle {
     shutdown_flag: Arc<AtomicBool>,
-    worker_eventfds: Vec<RawFd>,
+    worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
     listen_fd: Option<RawFd>,
     listen_fd_closed: Option<Arc<AtomicBool>>,
 }
 
 impl ShutdownHandle {
-    /// Returns the per-worker eventfd file descriptors.
-    /// External threads can write to these to wake specific workers.
-    pub fn worker_eventfds(&self) -> &[RawFd] {
-        &self.worker_eventfds
-    }
-
     /// Block the calling thread until `SIGINT` or `SIGTERM` is received,
     /// then trigger graceful shutdown.
     ///
@@ -51,11 +45,11 @@ impl ShutdownHandle {
     /// Signal all workers to shut down gracefully.
     ///
     /// Workers will stop accepting new connections, close all active connections,
-    /// drain remaining CQEs, and exit their event loops returning `Ok(())`.
-    /// Also closes the listen fd to unblock the acceptor's `accept4`.
+    /// drain remaining completions, and exit their event loops returning `Ok(())`.
+    /// Also closes the listen fd to unblock the acceptor's `accept()`.
     pub fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
-        // Close listen_fd to unblock the acceptor thread's accept4() call.
+        // Close listen_fd to unblock the acceptor thread's accept() call.
         if let (Some(fd), Some(closed)) = (self.listen_fd, &self.listen_fd_closed)
             && !closed.swap(true, Ordering::AcqRel)
         {
@@ -63,12 +57,9 @@ impl ShutdownHandle {
                 libc::close(fd);
             }
         }
-        // Wake all workers so they see the flag even if blocked in submit_and_wait.
-        for &efd in &self.worker_eventfds {
-            let val: u64 = 1;
-            unsafe {
-                libc::write(efd, &val as *const u64 as *const libc::c_void, 8);
-            }
+        // Wake all workers so they see the flag even if blocked on I/O.
+        for wh in &self.worker_wake_handles {
+            wh.wake();
         }
     }
 }
@@ -202,25 +193,20 @@ impl RinglineBuilder {
 
         ensure_nofile_limit(self.config.max_connections, num_threads)?;
 
-        // Create per-worker channels and eventfds.
+        // Create per-worker channels and wake fds.
         let mut worker_txs = Vec::with_capacity(num_threads);
         let mut worker_rxs = Vec::with_capacity(num_threads);
         let mut worker_eventfds = Vec::with_capacity(num_threads);
+        let mut worker_wake_handles = Vec::with_capacity(num_threads);
 
         for _ in 0..num_threads {
             let (tx, rx) = crossbeam_channel::unbounded::<(RawFd, SocketAddr)>();
-            let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-            if efd < 0 {
-                for &fd in &worker_eventfds {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                }
-                return Err(crate::error::Error::Io(io::Error::last_os_error()));
-            }
+            let (read_fd, wake_handle) =
+                crate::wakeup::create_wake_fd().map_err(crate::error::Error::Io)?;
             worker_txs.push(tx);
             worker_rxs.push(rx);
-            worker_eventfds.push(efd);
+            worker_eventfds.push(read_fd);
+            worker_wake_handles.push(wake_handle);
         }
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -283,7 +269,7 @@ impl RinglineBuilder {
             let acceptor_config = AcceptorConfig {
                 listen_fd: fd,
                 worker_channels: worker_txs,
-                worker_eventfds: worker_eventfds.clone(),
+                worker_wake_handles: worker_wake_handles.clone(),
                 shutdown_flag: shutdown_flag.clone(),
                 tcp_nodelay: if is_unix {
                     false
@@ -384,7 +370,7 @@ impl RinglineBuilder {
 
         let shutdown_handle = ShutdownHandle {
             shutdown_flag,
-            worker_eventfds,
+            worker_wake_handles,
             listen_fd,
             listen_fd_closed,
         };
@@ -470,7 +456,7 @@ fn create_listener(addr: SocketAddr, backlog: i32) -> Result<RawFd, crate::error
         libc::AF_INET6
     };
 
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(crate::error::Error::Io(io::Error::last_os_error()));
     }
@@ -500,12 +486,6 @@ fn create_listener(addr: SocketAddr, backlog: i32) -> Result<RawFd, crate::error
         return Err(crate::error::Error::Io(err));
     }
 
-    // Switch to blocking mode for the acceptor thread's accept4 call.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-    }
-
     let ret = unsafe { libc::listen(fd, backlog) };
     if ret < 0 {
         let err = io::Error::last_os_error();
@@ -525,7 +505,7 @@ fn create_unix_listener(path: &Path, backlog: i32) -> Result<RawFd, crate::error
     // Remove existing socket file if present (ignore errors — path may not exist).
     let _ = std::fs::remove_file(path);
 
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(crate::error::Error::Io(io::Error::last_os_error()));
     }
@@ -541,12 +521,6 @@ fn create_unix_listener(path: &Path, backlog: i32) -> Result<RawFd, crate::error
             libc::close(fd);
         }
         return Err(crate::error::Error::Io(err));
-    }
-
-    // Switch to blocking mode for the acceptor thread's accept4 call.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
     }
 
     let ret = unsafe { libc::listen(fd, backlog) };
