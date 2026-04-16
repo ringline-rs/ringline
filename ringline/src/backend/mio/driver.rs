@@ -169,13 +169,22 @@ impl Driver {
             return;
         }
 
+        // Flush any pending send data before closing.
+        if let Some(ref mut stream) = self.tcp_streams[idx] {
+            use std::io::Write;
+            for (data, offset) in self.pending_sends[idx].drain(..) {
+                let _ = stream.write_all(&data[offset..]);
+            }
+            let _ = stream.flush();
+        }
+
         // Deregister from poll and drop the TcpStream.
         if let Some(mut stream) = self.tcp_streams[idx].take() {
             let _ = self.poll.registry().deregister(&mut stream);
             // stream is dropped here, closing the fd
         }
 
-        // Clear pending sends.
+        // Clear pending sends (already drained above, but reset state).
         self.pending_sends[idx].clear();
         self.writable[idx] = false;
 
