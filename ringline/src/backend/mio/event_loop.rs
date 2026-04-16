@@ -126,7 +126,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 match token {
                     WAKE_TOKEN => {
                         if readable {
-                            self.handle_wake();
+                            self.drain_wake_pipe();
                         }
                     }
                     tok => {
@@ -141,7 +141,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
 
-            // 5. Collect wakeups and poll ready tasks.
+            // 5. Drain cross-thread channels unconditionally (not just on wake
+            //    events). On macOS/kqueue, SourceFd edge-triggered semantics can
+            //    miss pipe writes that arrive between reregister and poll. The
+            //    try_recv calls are cheap — O(1) when empty.
+            self.drain_channels();
+
+            // 6. Collect wakeups and poll ready tasks.
             self.executor.collect_wakeups();
             self.poll_ready_tasks();
 
@@ -164,10 +170,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Handle the wake pipe becoming readable: drain the pipe, then process
-    /// accept, resolve, spawn, and blocking channels.
-    fn handle_wake(&mut self) {
-        // Drain the pipe read end (read until WouldBlock).
+    /// Drain the wake pipe and re-register for the next event.
+    fn drain_wake_pipe(&mut self) {
         let mut drain_buf = [0u8; 256];
         loop {
             let result = unsafe {
@@ -181,7 +185,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 break;
             }
         }
+        // Re-register so we get notified again (kqueue consumes the registration).
+        let _ = self.driver.poll.registry().reregister(
+            &mut mio::unix::SourceFd(&self.driver.wake_pipe_fd),
+            WAKE_TOKEN,
+            mio::Interest::READABLE,
+        );
+    }
 
+    /// Drain all cross-thread channels: accept, resolve, spawn, blocking.
+    ///
+    /// Called unconditionally on every event loop iteration (not just on wake
+    /// pipe events) to avoid missed wakeups on macOS/kqueue.
+    fn drain_channels(&mut self) {
         // Drain accept channel (server mode).
         loop {
             let item = match self.driver.accept_rx {
