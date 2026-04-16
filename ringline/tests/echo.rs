@@ -346,9 +346,11 @@ fn graceful_shutdown() {
 
 // ── Shutdown-write test ─────────────────────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Handler that echoes back data then half-closes the write side.
 struct ShutdownWriteEcho;
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for ShutdownWriteEcho {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -370,6 +372,7 @@ impl AsyncEventHandler for ShutdownWriteEcho {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_shutdown_write_triggers_eof() {
     let port = free_port();
@@ -741,6 +744,7 @@ fn async_timeout_expires() {
 
 // ── Cross-connection I/O tests ──────────────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Forwarder handler: on accept, connects to a backend, forwards data
 /// through it (echo), and sends the response back to the client.
 /// This exercises the owner_task wakeup chain: client task at index N
@@ -752,8 +756,10 @@ struct ForwarderHandler {
 
 use std::net::SocketAddr;
 
+#[cfg(has_io_uring)]
 static FORWARDER_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for ForwarderHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
@@ -822,6 +828,7 @@ impl AsyncEventHandler for ForwarderHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_outbound_connect_and_echo() {
     // 1. Start a backend echo server.
@@ -871,11 +878,14 @@ fn async_outbound_connect_and_echo() {
     }
 }
 
+#[cfg(has_io_uring)]
 /// Handler that tries to connect to a non-listening address.
 struct ConnectRefusedHandler;
 
+#[cfg(has_io_uring)]
 static CONNECT_REFUSED_PORT: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for ConnectRefusedHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -905,6 +915,7 @@ impl AsyncEventHandler for ConnectRefusedHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_outbound_connect_refused() {
     // Bind to a port, then drop the listener so nothing is listening.
@@ -966,11 +977,14 @@ fn async_outbound_connect_refused() {
     }
 }
 
+#[cfg(has_io_uring)]
 /// Handler that opens multiple outbound connections from a single task.
 struct MultiOutboundHandler;
 
+#[cfg(has_io_uring)]
 static MULTI_OUTBOUND_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for MultiOutboundHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         let backend_addr = *MULTI_OUTBOUND_BACKEND_ADDR
@@ -1059,6 +1073,7 @@ impl AsyncEventHandler for MultiOutboundHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_multiple_outbound_from_one_task() {
     // Start backend echo server.
@@ -1126,14 +1141,18 @@ fn async_multiple_outbound_from_one_task() {
 
 // ── Select tests ────────────────────────────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Handler that uses select to monitor two backend connections.
 /// Connects to two backend echo servers, sends data to one, and uses
 /// select to determine which responds first.
 struct SelectTwoHandler;
 
+#[cfg(has_io_uring)]
 static SELECT_BACKEND1_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+#[cfg(has_io_uring)]
 static SELECT_BACKEND2_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for SelectTwoHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         let addr1 = *SELECT_BACKEND1_ADDR.get().expect("backend1 addr not set");
@@ -1207,6 +1226,7 @@ impl AsyncEventHandler for SelectTwoHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_select_two_connections() {
     // Start two backend echo servers.
@@ -1287,13 +1307,17 @@ fn async_select_two_connections() {
     }
 }
 
+#[cfg(has_io_uring)]
 /// Handler that uses select to show the second branch can win.
 /// Sends data to backend2 (not backend1), so Right should win.
 struct SelectSecondWinsHandler;
 
+#[cfg(has_io_uring)]
 static SELECT2_BACKEND1_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+#[cfg(has_io_uring)]
 static SELECT2_BACKEND2_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for SelectSecondWinsHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         let addr1 = *SELECT2_BACKEND1_ADDR.get().expect("backend1 addr not set");
@@ -1364,6 +1388,7 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_select_second_wins() {
     let b1_port = free_port();
@@ -1536,11 +1561,14 @@ fn async_select_with_sleep() {
 
 // ── select3 test ────────────────────────────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Handler that uses select3 with two data sources + sleep.
 struct Select3Handler;
 
+#[cfg(has_io_uring)]
 static SELECT3_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for Select3Handler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         let backend_addr = *SELECT3_BACKEND_ADDR.get().expect("backend addr not set");
@@ -1602,6 +1630,7 @@ impl AsyncEventHandler for Select3Handler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_select3_basic() {
     let b_port = free_port();
@@ -2023,10 +2052,12 @@ fn multi_worker_graceful_shutdown() {
 
 // ── Awaitable send tests ────────────────────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Handler that tests send_await: sends a known payload via send_await
 /// and reports the byte count from the SendFuture.
 struct SendAwaitHandler;
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for SendAwaitHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -2060,6 +2091,7 @@ impl AsyncEventHandler for SendAwaitHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_send_await_basic() {
     let port = free_port();
@@ -2407,9 +2439,11 @@ fn async_try_timeout_exhaustion() {
 
 // ── join / join3 ──────────────────────────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Handler that joins two send_await calls and reports byte counts.
 struct JoinHandler;
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for JoinHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -2446,6 +2480,7 @@ impl AsyncEventHandler for JoinHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_join_basic() {
     let port = free_port();
@@ -2499,9 +2534,11 @@ fn async_join_basic() {
     }
 }
 
+#[cfg(has_io_uring)]
 /// Handler that joins three futures: send_await + sleep + with_data.
 struct Join3Handler;
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for Join3Handler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -2542,6 +2579,7 @@ impl AsyncEventHandler for Join3Handler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_join3_mixed() {
     let port = free_port();
@@ -2767,9 +2805,11 @@ fn async_timeout_at_expires() {
 
 // ── UDP ───────────────────────────────────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Async handler that echoes UDP datagrams via UdpCtx.
 struct UdpEchoAsync;
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for UdpEchoAsync {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -2799,6 +2839,7 @@ impl AsyncEventHandler for UdpEchoAsync {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_udp_echo() {
     let udp_port = free_port();
@@ -2840,12 +2881,15 @@ fn async_udp_echo() {
 
 // ── Standalone task using free connect() ─────────────────────────
 
+#[cfg(has_io_uring)]
 /// Handler where on_accept spawns a standalone task that uses the free
 /// ringline::connect() (not ConnCtx::connect) to reach a backend echo server.
 struct StandaloneConnectHandler;
 
+#[cfg(has_io_uring)]
 static STANDALONE_CONNECT_BACKEND: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for StandaloneConnectHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         let backend_addr = *STANDALONE_CONNECT_BACKEND
@@ -2911,6 +2955,7 @@ impl AsyncEventHandler for StandaloneConnectHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_standalone_connect() {
     // Start backend echo server.
@@ -2977,13 +3022,17 @@ fn async_standalone_connect() {
 
 // ── Client-only mode via on_start() ─────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Handler that uses on_start() for client-only mode: connects to a
 /// backend, sends data, reads echo, then shuts down.
 struct OnStartClientHandler;
 
+#[cfg(has_io_uring)]
 static ON_START_BACKEND_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+#[cfg(has_io_uring)]
 static ON_START_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for OnStartClientHandler {
     fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         // No inbound connections expected in client-only mode.
@@ -3042,6 +3091,7 @@ impl AsyncEventHandler for OnStartClientHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_on_start_client_only() {
     // Start backend echo server.
@@ -3078,12 +3128,15 @@ fn async_on_start_client_only() {
 
 // ── Free connect() to dead port returns error ────────────────────
 
+#[cfg(has_io_uring)]
 /// Handler where on_accept spawns a standalone task that tries to
 /// connect to a dead port via ringline::connect().
 struct StandaloneConnectRefusedHandler;
 
+#[cfg(has_io_uring)]
 static STANDALONE_REFUSED_PORT: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for StandaloneConnectRefusedHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -3118,6 +3171,7 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_standalone_connect_refused() {
     // Bind to a port then drop it so nothing is listening.
@@ -3257,11 +3311,14 @@ fn async_peer_close_delivers_eof() {
 
 // ── Send pool exhaustion ────────────────────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Handler that fires many send_nowait calls to exhaust the send pool.
 struct PoolExhaustionHandler;
 
+#[cfg(has_io_uring)]
 static POOL_EXHAUSTION_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for PoolExhaustionHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -3292,6 +3349,7 @@ impl AsyncEventHandler for PoolExhaustionHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_send_pool_exhaustion() {
     let port = free_port();
@@ -3335,9 +3393,11 @@ fn async_send_pool_exhaustion() {
 
 // ── Scatter-gather send_parts test ──────────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Handler that uses send_parts with multiple copy segments.
 struct SendPartsHandler;
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for SendPartsHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -3369,6 +3429,7 @@ impl AsyncEventHandler for SendPartsHandler {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_send_parts_scatter_gather() {
     let port = free_port();
@@ -3494,6 +3555,7 @@ impl AsyncEventHandler for OutboundEofClient {
 }
 
 #[test]
+#[cfg(has_io_uring)]
 fn async_outbound_connect_receives_eof() {
     let port = free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -3536,6 +3598,7 @@ fn async_outbound_connect_receives_eof() {
 
 // ── Buffer ring exhaustion stress test ──────────────────────────────
 
+#[cfg(has_io_uring)]
 #[test]
 fn buffer_ring_exhaustion_recovers() {
     // Use a tiny buffer ring (4 buffers) to force ENOBUFS under
@@ -3595,10 +3658,13 @@ fn buffer_ring_exhaustion_recovers() {
 
 // ── Connect timeout test ────────────────────────────────────────────
 
+#[cfg(has_io_uring)]
 static TIMEOUT_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+#[cfg(has_io_uring)]
 struct ConnectTimeoutClient;
 
+#[cfg(has_io_uring)]
 impl AsyncEventHandler for ConnectTimeoutClient {
     fn on_accept(&self, _conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
         async {}
@@ -3635,6 +3701,7 @@ impl AsyncEventHandler for ConnectTimeoutClient {
     }
 }
 
+#[cfg(has_io_uring)]
 #[test]
 fn async_connect_timeout_fires() {
     let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
