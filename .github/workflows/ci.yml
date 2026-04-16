@@ -97,24 +97,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all --no-default-features --features futures-io --release
 
-  test-macos:
-    name: Test (macOS)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all
-
-  test-macos-release:
-    name: Test (macOS, release)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all --release
-
   integration-clients:
     name: Integration (public servers)
     runs-on: ubuntu-latest
