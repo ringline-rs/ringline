@@ -151,7 +151,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.collect_wakeups();
             self.poll_ready_tasks();
 
-            // 6. Flush pending sends that were queued during task polling.
+            // 6a. Deliver buffered send completions and re-poll until drained.
+            self.drain_send_completions();
+
+            // 6b. Flush pending sends that were queued during task polling.
             self.flush_all_pending_sends();
 
             // 7. on_tick callback (synchronous).
@@ -160,7 +163,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.handler.on_tick(&mut ctx);
             }
 
-            // 8. Flush any sends queued by on_tick.
+            // 8. Deliver send completions and flush any sends queued by on_tick.
+            self.drain_send_completions();
             self.flush_all_pending_sends();
 
             // 9. Check shutdown.
@@ -360,9 +364,50 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Handle a connection becoming writable: flush pending sends.
+    /// Handle a connection becoming writable: detect connect completion or flush pending sends.
     fn handle_writable(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
+
+        // Check if this is a connecting socket completing its connect.
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            if matches!(cs.recv_mode, RecvMode::Connecting) {
+                // Connect completed — check for errors via peer_addr().
+                let result = if let Some(ref stream) = self.driver.tcp_streams[idx] {
+                    match stream.peer_addr() {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err(io::Error::other("stream missing"))
+                };
+
+                if result.is_ok() {
+                    cs.recv_mode = RecvMode::Multi;
+                    cs.established = true;
+
+                    // Set TCP_NODELAY if configured.
+                    if self.driver.tcp_nodelay {
+                        if let Some(ref stream) = self.driver.tcp_streams[idx] {
+                            let _ = stream.set_nodelay(true);
+                        }
+                    }
+
+                    // Reset accumulator for the new connection.
+                    self.driver.accumulators.reset(conn_index);
+
+                    metrics::CONNECTIONS_ACTIVE.increment();
+                }
+
+                let io_result = match result {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(e),
+                };
+                self.executor.wake_connect(conn_index, io_result);
+                return;
+            }
+        }
+
+        // Normal writable — mark writable and flush sends.
         self.driver.writable[idx] = true;
         self.driver.flush_sends(conn_index);
     }
@@ -379,6 +424,30 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.driver.flush_sends(idx as u32);
                 }
             }
+        }
+    }
+
+    /// Drain per-connection send completion queues, calling wake_send for
+    /// each and re-polling tasks so that each SendFuture resolves.
+    fn drain_send_completions(&mut self) {
+        loop {
+            let mut delivered = false;
+            let max = self.driver.send_completions.len();
+            for idx in 0..max {
+                if let Some(bytes) = self.driver.send_completions[idx].pop_front() {
+                    if self.executor.send_waiters[idx] {
+                        self.executor.wake_send(idx as u32, Ok(bytes));
+                        delivered = true;
+                    }
+                }
+            }
+            if !delivered {
+                break;
+            }
+            // Re-poll tasks woken by the completions so they can consume
+            // the results and potentially re-register waiters.
+            self.executor.collect_wakeups();
+            self.poll_ready_tasks();
         }
     }
 

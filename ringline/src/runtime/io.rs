@@ -799,10 +799,18 @@ impl ConnCtx {
     ///
     /// Returns `Err` if the send copy pool is exhausted or the submission queue is full.
     pub fn send(&self, data: &[u8]) -> io::Result<SendFuture> {
+        let len = data.len() as u32;
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), data)?;
             executor.send_waiters[self.conn_index as usize] = true;
+            // On mio, the send is buffered synchronously — record a pending
+            // completion so the event loop can deliver wake_send for each
+            // individual awaitable send.
+            #[cfg(not(has_io_uring))]
+            {
+                driver.send_completions[self.conn_index as usize].push_back(len);
+            }
             Ok(SendFuture {
                 conn_index: self.conn_index,
             })
