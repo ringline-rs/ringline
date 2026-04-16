@@ -589,7 +589,7 @@ impl Driver {
 
         // Bind.
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let addr_len = socket_addr_to_sockaddr(bind_addr, &mut storage);
+        let addr_len = crate::backend::socket_addr_to_sockaddr(bind_addr, &mut storage);
         let ret =
             unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
         if ret < 0 {
@@ -674,7 +674,8 @@ impl Driver {
             .ok_or(crate::error::UdpSendError::PoolExhausted)?;
 
         // Set up destination address.
-        let addr_len = socket_addr_to_sockaddr(peer, &mut self.udp_sockets[idx].send_addr);
+        let addr_len =
+            crate::backend::socket_addr_to_sockaddr(peer, &mut self.udp_sockets[idx].send_addr);
 
         // Set up iovec.
         self.udp_sockets[idx].send_iov.iov_base = ptr as *mut libc::c_void;
