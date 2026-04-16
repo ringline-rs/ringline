@@ -3736,12 +3736,10 @@ mod tests {
                 for action in actions {
                     match action {
                         // Accept a new connection (if capacity available).
-                        0 => {
-                            if live_conns.len() < 8 {
-                                let ci = accept_connection(&mut el);
-                                el.driver.send_queues[ci as usize].in_flight = false;
-                                live_conns.push(ci);
-                            }
+                        0 if live_conns.len() < 8 => {
+                            let ci = accept_connection(&mut el);
+                            el.driver.send_queues[ci as usize].in_flight = false;
+                            live_conns.push(ci);
                         }
 
                         // Send success on a random live connection.

@@ -85,11 +85,14 @@ impl ConnStream {
     /// in `pending_recv_bufs` for `with_data()`/`with_bytes()` callers;
     /// `ConnStream` must flush these since it reads from the accumulator.
     fn flush_pending_recv(driver: &mut crate::backend::Driver, conn_index: u32) {
+        #[cfg(has_io_uring)]
         if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
             let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
             driver.accumulators.append(conn_index, data);
             driver.pending_replenish.push(pending.bid);
         }
+        #[cfg(not(has_io_uring))]
+        let _ = (driver, conn_index);
     }
 }
 

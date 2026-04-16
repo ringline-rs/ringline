@@ -25,7 +25,7 @@ futures-io = { version = "0.3", optional = true }
 bytes = "1"
 crossbeam-channel = "0.5"
 libc = "0.2"
-mio = { version = "1", features = ["os-poll", "net"] }
+mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
 metriken = "0.7"
 pin-project-lite = "0.2"
 thiserror = "2"

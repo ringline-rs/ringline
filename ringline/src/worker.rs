@@ -435,6 +435,7 @@ fn ensure_nofile_limit(
 }
 
 /// Pin the current thread to a specific CPU core.
+#[cfg(target_os = "linux")]
 fn pin_to_core(core: usize) -> Result<(), crate::error::Error> {
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
@@ -445,6 +446,13 @@ fn pin_to_core(core: usize) -> Result<(), crate::error::Error> {
             return Err(crate::error::Error::Io(io::Error::last_os_error()));
         }
     }
+    Ok(())
+}
+
+/// Pin the current thread to a specific CPU core (no-op on non-Linux).
+#[cfg(not(target_os = "linux"))]
+fn pin_to_core(_core: usize) -> Result<(), crate::error::Error> {
+    // Thread pinning is not supported on this platform.
     Ok(())
 }
 

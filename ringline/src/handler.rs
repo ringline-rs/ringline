@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use crate::buffer::send_copy::SendCopyPool;
 #[cfg(has_io_uring)]
 use crate::buffer::send_slab::{InFlightSendSlab, MAX_GUARDS, MAX_IOVECS};
+#[cfg(has_io_uring)]
 use crate::guard::GuardBox;
 
 /// Per-connection send queue state.
@@ -60,6 +61,13 @@ impl UdpToken {
     }
 }
 
+// ── io_uring DriverCtx + send builders ──────────────��───────────────────
+//
+// The entire DriverCtx implementation, SendBuilder, SendChainBuilder, and
+// ChainPartsBuilder are io_uring-specific. On the mio backend, a minimal
+// DriverCtx is provided below.
+
+#[cfg(has_io_uring)]
 /// The context provided to handler callbacks for issuing operations.
 ///
 /// This is a short-lived borrow into the driver's internal state.
@@ -122,6 +130,7 @@ pub struct DriverCtx<'a> {
     pub(crate) pending_close_retries: &'a mut Vec<u32>,
 }
 
+#[cfg(has_io_uring)]
 impl<'a> DriverCtx<'a> {
     /// Request shutdown of this worker's event loop.
     /// The worker will stop after the current iteration completes.
@@ -1657,6 +1666,315 @@ impl<'a> DriverCtx<'a> {
     }
 }
 
+// ── mio DriverCtx (minimal stub) ───────────────────────────────────────
+
+#[cfg(not(has_io_uring))]
+/// The context provided to handler callbacks for issuing operations.
+///
+/// This is a short-lived borrow into the driver's internal state.
+pub struct DriverCtx<'a> {
+    pub(crate) connections: &'a mut crate::connection::ConnectionTable,
+    pub(crate) send_copy_pool: &'a mut SendCopyPool,
+    pub(crate) tls_table: *mut crate::tls::TlsTable,
+    pub(crate) shutdown_requested: &'a mut bool,
+    pub(crate) connect_addrs: &'a mut Vec<libc::sockaddr_storage>,
+    pub(crate) tcp_nodelay: bool,
+    #[cfg(feature = "timestamps")]
+    pub(crate) timestamps: bool,
+    #[cfg(feature = "timestamps")]
+    pub(crate) recvmsg_msghdr: *const libc::msghdr,
+    pub(crate) send_queues: &'a mut Vec<ConnSendState>,
+    /// Per-connection pending send buffers (mio backend).
+    /// DriverCtx::send() pushes data here; the event loop flushes on writable.
+    pub(crate) pending_sends: &'a mut Vec<std::collections::VecDeque<(Vec<u8>, usize)>>,
+}
+
+#[cfg(not(has_io_uring))]
+impl<'a> DriverCtx<'a> {
+    /// Request shutdown of this worker's event loop.
+    pub fn request_shutdown(&mut self) {
+        *self.shutdown_requested = true;
+    }
+
+    /// Get the peer address for a connection.
+    pub fn peer_addr(&self, conn: ConnToken) -> Option<crate::connection::PeerAddr> {
+        self.connections.get(conn.index)?.peer_addr.clone()
+    }
+
+    /// Whether the connection is outbound (initiated by this worker).
+    pub fn is_outbound(&self, conn: ConnToken) -> bool {
+        self.connections
+            .get(conn.index)
+            .map_or(false, |cs| cs.outbound)
+    }
+
+    /// Send data on a connection (copy into pending send buffer).
+    ///
+    /// The data is buffered in the per-connection send queue. The event loop
+    /// flushes it when the socket becomes writable.
+    pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
+        let conn_state = self
+            .connections
+            .get(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
+        if conn_state.generation != conn.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+        let idx = conn.index as usize;
+        self.pending_sends[idx].push_back((data.to_vec(), 0));
+        Ok(())
+    }
+
+    /// Close a connection.
+    pub fn close(&mut self, _conn: ConnToken) {
+        // TODO: implement mio close
+    }
+
+    /// Get TLS session info for a connection.
+    pub fn tls_info(&self, _conn: ConnToken) -> Option<crate::tls::TlsInfo> {
+        None
+    }
+
+    /// Shut down the write half of a connection.
+    pub fn shutdown_write(&mut self, _conn: ConnToken) {
+        // TODO: implement mio shutdown_write
+    }
+
+    /// Cancel an in-flight operation.
+    pub fn cancel(&mut self, _conn: ConnToken) -> io::Result<()> {
+        // TODO: implement mio cancel
+        Ok(())
+    }
+
+    /// Connect to a remote address.
+    pub fn connect(&mut self, _addr: SocketAddr) -> Result<ConnToken, crate::error::Error> {
+        Err(crate::error::Error::Io(io::Error::other(
+            "mio connect not yet implemented",
+        )))
+    }
+
+    /// Connect to a Unix socket.
+    pub fn connect_unix(
+        &mut self,
+        _path: &std::path::Path,
+    ) -> Result<ConnToken, crate::error::Error> {
+        Err(crate::error::Error::Io(io::Error::other(
+            "mio connect_unix not yet implemented",
+        )))
+    }
+
+    /// Connect with a timeout.
+    pub fn connect_with_timeout(
+        &mut self,
+        addr: SocketAddr,
+        _timeout_ms: u64,
+    ) -> Result<ConnToken, crate::error::Error> {
+        self.connect(addr)
+    }
+
+    /// Connect with TLS.
+    pub fn connect_tls(
+        &mut self,
+        _addr: SocketAddr,
+        _server_name: &str,
+    ) -> Result<ConnToken, crate::error::Error> {
+        Err(crate::error::Error::Io(io::Error::other(
+            "mio connect_tls not yet implemented",
+        )))
+    }
+
+    /// Connect with TLS and a timeout.
+    pub fn connect_tls_with_timeout(
+        &mut self,
+        addr: SocketAddr,
+        server_name: &str,
+        _timeout_ms: u64,
+    ) -> Result<ConnToken, crate::error::Error> {
+        self.connect_tls(addr, server_name)
+    }
+
+    /// Open an NVMe device (not supported on mio backend).
+    pub fn open_nvme_device(
+        &mut self,
+        _path: &str,
+        _nsid: u32,
+    ) -> io::Result<crate::nvme::NvmeDevice> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "NVMe passthrough requires the io_uring backend",
+        ))
+    }
+
+    /// NVMe read (not supported on mio backend).
+    pub fn nvme_read(
+        &mut self,
+        _device: crate::nvme::NvmeDevice,
+        _lba: u64,
+        _num_blocks: u16,
+        _buf_addr: u64,
+        _buf_len: u32,
+    ) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "NVMe passthrough requires the io_uring backend",
+        ))
+    }
+
+    /// NVMe write (not supported on mio backend).
+    pub fn nvme_write(
+        &mut self,
+        _device: crate::nvme::NvmeDevice,
+        _lba: u64,
+        _num_blocks: u16,
+        _buf_addr: u64,
+        _buf_len: u32,
+    ) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "NVMe passthrough requires the io_uring backend",
+        ))
+    }
+
+    /// NVMe flush (not supported on mio backend).
+    pub fn nvme_flush(&mut self, _device: crate::nvme::NvmeDevice) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "NVMe passthrough requires the io_uring backend",
+        ))
+    }
+
+    /// Open a direct I/O file (not supported on mio backend).
+    pub fn open_direct_io_file(
+        &mut self,
+        _path: &str,
+    ) -> io::Result<crate::direct_io::DirectIoFile> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Direct I/O requires the io_uring backend",
+        ))
+    }
+
+    /// Direct I/O read (not supported on mio backend).
+    pub fn direct_io_read(
+        &mut self,
+        _file: crate::direct_io::DirectIoFile,
+        _offset: u64,
+        _buf: *mut u8,
+        _len: u32,
+    ) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Direct I/O requires the io_uring backend",
+        ))
+    }
+
+    /// Direct I/O write (not supported on mio backend).
+    pub fn direct_io_write(
+        &mut self,
+        _file: crate::direct_io::DirectIoFile,
+        _offset: u64,
+        _buf: *const u8,
+        _len: u32,
+    ) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Direct I/O requires the io_uring backend",
+        ))
+    }
+
+    /// Filesystem open (not supported on mio backend).
+    pub fn fs_open(
+        &mut self,
+        _path: &std::path::Path,
+        _flags: crate::fs::OpenFlags,
+        _mode: u32,
+    ) -> io::Result<(u16, u16, u32)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem operations require the io_uring backend",
+        ))
+    }
+
+    /// Filesystem stat (not supported on mio backend).
+    pub fn fs_stat(&mut self, _path: &std::path::Path) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem operations require the io_uring backend",
+        ))
+    }
+
+    /// Filesystem read (not supported on mio backend).
+    pub fn fs_read(
+        &mut self,
+        _file: crate::fs::File,
+        _offset: u64,
+        _buf: *mut u8,
+        _len: u32,
+    ) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem operations require the io_uring backend",
+        ))
+    }
+
+    /// Filesystem write (not supported on mio backend).
+    pub fn fs_write(
+        &mut self,
+        _file: crate::fs::File,
+        _offset: u64,
+        _buf: *const u8,
+        _len: u32,
+    ) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem operations require the io_uring backend",
+        ))
+    }
+
+    /// Filesystem fsync (not supported on mio backend).
+    pub fn fs_fsync(&mut self, _file: crate::fs::File) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem operations require the io_uring backend",
+        ))
+    }
+
+    /// Filesystem rename (not supported on mio backend).
+    pub fn fs_rename(&mut self, _from: &std::path::Path, _to: &std::path::Path) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem operations require the io_uring backend",
+        ))
+    }
+
+    /// Filesystem unlink (not supported on mio backend).
+    pub fn fs_unlink(&mut self, _path: &std::path::Path) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem operations require the io_uring backend",
+        ))
+    }
+
+    /// Filesystem mkdir (not supported on mio backend).
+    pub fn fs_mkdir(&mut self, _path: &std::path::Path, _mode: u32) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem operations require the io_uring backend",
+        ))
+    }
+
+    /// Filesystem close (not supported on mio backend).
+    pub fn fs_close(&mut self, _file: crate::fs::File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Filesystem operations require the io_uring backend",
+        ))
+    }
+}
+
 /// A prepared send operation with its associated resources, ready for submission.
 pub(crate) struct BuiltSend {
     /// The io_uring SQE to submit.
@@ -1671,6 +1989,7 @@ pub(crate) struct BuiltSend {
     pub total_len: u32,
 }
 
+#[cfg(has_io_uring)]
 /// A pre-classified part for `AsyncSendBuilder::submit_batch`.
 ///
 /// Used to build mixed scatter-gather sends in the async API without the
@@ -1682,6 +2001,7 @@ pub enum SendPart<'a> {
     Guard(GuardBox),
 }
 
+#[cfg(has_io_uring)]
 /// Part type in a scatter-gather send.
 #[derive(Clone, Copy)]
 enum PartSlot {
@@ -1690,6 +2010,7 @@ enum PartSlot {
     Guard { guard_idx: u8 },
 }
 
+#[cfg(has_io_uring)]
 /// Builder for scatter-gather sends with mixed copy + zero-copy guard parts.
 pub struct SendBuilder<'b, 'a> {
     ctx: &'b mut DriverCtx<'a>,
@@ -1705,6 +2026,7 @@ pub struct SendBuilder<'b, 'a> {
     error: Option<io::Error>,
 }
 
+#[cfg(has_io_uring)]
 impl<'b, 'a> SendBuilder<'b, 'a> {
     /// Add a copy part. The data will be copied into the send pool on `submit()`.
     /// The data reference must outlive the builder (guaranteed by the `'b` lifetime).
@@ -2026,6 +2348,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     }
 }
 
+#[cfg(has_io_uring)]
 /// Builder for submitting multiple SQEs as a linked IO_LINK chain.
 ///
 /// Collects send operations (copy-only or scatter-gather) and submits them
@@ -2042,6 +2365,7 @@ pub struct SendChainBuilder<'b, 'a> {
     finished: bool,
 }
 
+#[cfg(has_io_uring)]
 impl<'b, 'a> SendChainBuilder<'b, 'a> {
     /// Add a copy-only send to the chain.
     pub fn copy(mut self, data: &[u8]) -> Self {
@@ -2160,6 +2484,7 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
     }
 }
 
+#[cfg(has_io_uring)]
 impl Drop for SendChainBuilder<'_, '_> {
     fn drop(&mut self) {
         if !self.finished {
@@ -2168,6 +2493,7 @@ impl Drop for SendChainBuilder<'_, '_> {
     }
 }
 
+#[cfg(has_io_uring)]
 /// Sub-builder for a scatter-gather SQE within a [`SendChainBuilder`] chain.
 ///
 /// Created via [`SendChainBuilder::parts`]. Call `.copy()` and `.guard()`
@@ -2184,6 +2510,7 @@ pub struct ChainPartsBuilder<'b, 'a> {
     total_len: u32,
 }
 
+#[cfg(has_io_uring)]
 impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
     /// Add a copy part to this scatter-gather SQE.
     pub fn copy(mut self, data: &[u8]) -> Self {

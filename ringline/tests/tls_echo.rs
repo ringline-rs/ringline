@@ -1,3 +1,4 @@
+#![cfg(has_io_uring)]
 //! End-to-end TLS echo tests.
 //!
 //! Tests the core TLS machinery: server-side TLS accept (handshake + data

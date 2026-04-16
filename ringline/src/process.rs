@@ -51,6 +51,7 @@ impl Child {
     ///
     /// Submits an io_uring `PollAdd` on the child's pidfd and returns a future
     /// that resolves when the child exits.
+    #[cfg(has_io_uring)]
     pub fn wait(&self) -> io::Result<WaitFuture> {
         with_state(|driver, executor| {
             let seq = executor.next_pidfd_seq;
@@ -64,6 +65,15 @@ impl Child {
                 .submit_poll_add(self.pidfd, libc::POLLIN as u32, ud.raw())?;
             Ok(WaitFuture { seq, pid: self.pid })
         })
+    }
+
+    /// Wait for the child to exit (not yet implemented on mio backend).
+    #[cfg(not(has_io_uring))]
+    pub fn wait(&self) -> io::Result<WaitFuture> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process wait requires the io_uring backend",
+        ))
     }
 
     /// Send `SIGKILL` to the child.

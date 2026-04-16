@@ -1,4 +1,5 @@
 #![allow(clippy::manual_async_fn)]
+#![cfg(has_io_uring)]
 //! Integration tests for async process spawning.
 
 use std::future::Future;

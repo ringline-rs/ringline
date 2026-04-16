@@ -779,6 +779,7 @@ impl ConnCtx {
     /// This mirrors `DriverCtx::send_parts()` — use `.copy(data)` for copied parts
     /// and `.guard(guard)` for zero-copy parts backed by `SendGuard`. Call `.submit()`
     /// to submit the SQE. Fire-and-forget: no future returned.
+    #[cfg(has_io_uring)]
     pub fn send_parts(&self) -> AsyncSendBuilder {
         AsyncSendBuilder {
             token: self.token(),
@@ -878,6 +879,7 @@ impl ConnCtx {
     /// then `.finish()` to submit the chain.
     ///
     /// For backpressure-aware chained sending, use [`send_chain()`](Self::send_chain).
+    #[cfg(has_io_uring)]
     pub fn send_chain_nowait<F, R>(&self, f: F) -> R
     where
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
@@ -898,6 +900,7 @@ impl ConnCtx {
     /// resolves with total bytes sent.
     ///
     /// For fire-and-forget chained sending, use [`send_chain_nowait()`](Self::send_chain_nowait).
+    #[cfg(has_io_uring)]
     pub fn send_chain<F>(&self, f: F) -> io::Result<SendFuture>
     where
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
@@ -1048,6 +1051,7 @@ impl ConnCtx {
 
 // ── AsyncSendBuilder ─────────────────────────────────────────────────
 
+#[cfg(has_io_uring)]
 /// Builder for scatter-gather sends in the async API.
 ///
 /// Wraps `DriverCtx::send_parts()` — call `.copy()` and `.guard()` to add
@@ -1057,6 +1061,7 @@ pub struct AsyncSendBuilder {
     token: ConnToken,
 }
 
+#[cfg(has_io_uring)]
 impl AsyncSendBuilder {
     /// Build and submit the send by calling the provided closure with a
     /// `SendBuilder` from the `DriverCtx`.
@@ -1168,6 +1173,97 @@ impl AsyncSendBuilder {
     }
 }
 
+// ── mio AsyncSendBuilder (copy-only fallback) ───────────────────────
+
+#[cfg(not(has_io_uring))]
+/// Builder for scatter-gather sends in the async API (mio fallback).
+///
+/// On the mio backend, all parts are copied into a single buffer and
+/// sent as one operation. Zero-copy guards are consumed by copying their
+/// data.
+pub struct AsyncSendBuilder {
+    token: ConnToken,
+}
+
+#[cfg(not(has_io_uring))]
+impl ConnCtx {
+    /// Begin building a scatter-gather send.
+    ///
+    /// On the mio backend, this degrades to copy-only sends.
+    pub fn send_parts(&self) -> AsyncSendBuilder {
+        AsyncSendBuilder {
+            token: self.token(),
+        }
+    }
+}
+
+#[cfg(not(has_io_uring))]
+impl AsyncSendBuilder {
+    /// Build and submit the send by concatenating all copy parts.
+    pub fn build<F>(self, f: F) -> io::Result<()>
+    where
+        F: FnOnce(MioSendBuilder<'_>) -> io::Result<()>,
+    {
+        with_state(|driver, _| {
+            let mut buf = Vec::new();
+            let builder = MioSendBuilder { buf: &mut buf };
+            f(builder)?;
+            if !buf.is_empty() {
+                let mut ctx = driver.make_ctx();
+                ctx.send(self.token, &buf)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Build and submit, then await completion.
+    pub fn build_await<F>(self, f: F) -> io::Result<SendFuture>
+    where
+        F: FnOnce(MioSendBuilder<'_>) -> io::Result<()>,
+    {
+        with_state(|driver, executor| {
+            let mut buf = Vec::new();
+            let builder = MioSendBuilder { buf: &mut buf };
+            f(builder)?;
+            if !buf.is_empty() {
+                let mut ctx = driver.make_ctx();
+                ctx.send(self.token, &buf)?;
+            }
+            let conn_index = self.token.index;
+            executor.send_waiters[conn_index as usize] = true;
+            Ok(SendFuture { conn_index })
+        })
+    }
+}
+
+/// Mio send builder — accumulates parts into a single buffer.
+#[cfg(not(has_io_uring))]
+pub struct MioSendBuilder<'a> {
+    buf: &'a mut Vec<u8>,
+}
+
+#[cfg(not(has_io_uring))]
+impl<'a> MioSendBuilder<'a> {
+    /// Add a copy part.
+    pub fn copy(self, data: &[u8]) -> Self {
+        self.buf.extend_from_slice(data);
+        self
+    }
+
+    /// Add a guard part (copies the data on mio backend).
+    pub fn guard(self, guard: crate::guard::GuardBox) -> Self {
+        let (ptr, len) = guard.as_ptr_len();
+        let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        self.buf.extend_from_slice(data);
+        self
+    }
+
+    /// Submit the accumulated send.
+    pub fn submit(self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 // ── WithDataFuture ───────────────────────────────────────────────────
 
 /// Future returned by [`ConnCtx::with_data`].
@@ -1182,6 +1278,8 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
         with_state(|driver, executor| {
             // Zero-copy fast path: check pending recv buffer before accumulator.
+            // Only available on io_uring where kernel-provided buffers are used.
+            #[cfg(has_io_uring)]
             if driver.pending_recv_bufs[self.conn_index as usize].is_some() {
                 let acc_empty = driver.accumulators.data(self.conn_index).is_empty();
                 if acc_empty {
@@ -1311,7 +1409,8 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
         with_state(|driver, executor| {
             // Flush any pending zero-copy recv buffer to accumulator so
-            // take_frozen() will include it.
+            // take_frozen() will include it (io_uring only).
+            #[cfg(has_io_uring)]
             if let Some(pending) = driver.pending_recv_bufs[self.conn_index as usize].take() {
                 let pending_data =
                     unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
@@ -1542,6 +1641,7 @@ impl Future for SleepFuture {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
         with_state(|driver, executor| {
+            let _ = driver; // used only on io_uring path
             if let Some(slot) = self.timer_slot {
                 // Already submitted — check if fired.
                 if executor.timer_pool.is_fired(slot) {
@@ -1563,23 +1663,39 @@ impl Future for SleepFuture {
                 }
             };
 
-            let payload = TimerSlotPool::encode_payload(slot, generation);
-            let ud = UserData::encode(OpTag::Timer, 0, payload);
+            #[cfg(has_io_uring)]
+            {
+                let payload = TimerSlotPool::encode_payload(slot, generation);
+                let ud = UserData::encode(OpTag::Timer, 0, payload);
 
-            let submit_result = if let Some(deadline) = self.absolute {
-                let ts_ptr = executor
-                    .timer_pool
-                    .set_absolute(slot, deadline.secs, deadline.nsecs);
-                driver.ring.submit_timeout_abs(ts_ptr, ud)
-            } else {
-                let ts_ptr = executor.timer_pool.set_relative(slot, self.duration);
-                driver.ring.submit_timeout(ts_ptr, ud)
-            };
+                let submit_result = if let Some(deadline) = self.absolute {
+                    let ts_ptr =
+                        executor
+                            .timer_pool
+                            .set_absolute(slot, deadline.secs, deadline.nsecs);
+                    driver.ring.submit_timeout_abs(ts_ptr, ud)
+                } else {
+                    let ts_ptr = executor.timer_pool.set_relative(slot, self.duration);
+                    driver.ring.submit_timeout(ts_ptr, ud)
+                };
 
-            if let Err(_e) = submit_result {
-                executor.timer_pool.release(slot);
-                // On SQE submission failure, complete immediately rather than hang.
-                return Poll::Ready(());
+                if let Err(_e) = submit_result {
+                    executor.timer_pool.release(slot);
+                    // On SQE submission failure, complete immediately rather than hang.
+                    return Poll::Ready(());
+                }
+            }
+
+            #[cfg(not(has_io_uring))]
+            {
+                // Mio backend: store deadline; the event loop polls timer expiry.
+                if let Some(deadline) = self.absolute {
+                    executor
+                        .timer_pool
+                        .set_absolute(slot, deadline.secs, deadline.nsecs);
+                } else {
+                    executor.timer_pool.set_relative(slot, self.duration);
+                }
             }
 
             self.timer_slot = Some(slot);
@@ -1598,14 +1714,18 @@ impl Drop for SleepFuture {
                 return;
             }
             let state = unsafe { &mut *ptr };
+            #[cfg(has_io_uring)]
             let driver = unsafe { &mut *state.driver };
             let executor = unsafe { &mut *state.executor };
 
             if !executor.timer_pool.is_fired(slot) {
-                let payload = TimerSlotPool::encode_payload(slot, self.generation);
-                let target_ud = UserData::encode(OpTag::Timer, 0, payload);
-                // Best effort cancel; timer fires harmlessly if already expired.
-                let _ = driver.ring.submit_async_cancel(target_ud.raw(), 0);
+                #[cfg(has_io_uring)]
+                {
+                    let payload = TimerSlotPool::encode_payload(slot, self.generation);
+                    let target_ud = UserData::encode(OpTag::Timer, 0, payload);
+                    // Best effort cancel; timer fires harmlessly if already expired.
+                    let _ = driver.ring.submit_async_cancel(target_ud.raw(), 0);
+                }
             }
             // Slot released regardless — stale timer CQE detected via generation.
             executor.timer_pool.release(slot);
@@ -1625,25 +1745,34 @@ impl Drop for SleepFuture {
 /// Panics if called outside the ringline async executor.
 pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
     with_state(|driver, executor| {
+        let _ = driver; // used only on io_uring path
         let waker_id = CURRENT_TASK_ID.with(|c| c.get());
         let (slot, generation) = executor.timer_pool.allocate(waker_id).ok_or_else(|| {
             crate::metrics::TIMER_POOL_EXHAUSTED.increment();
             TimerExhausted
         })?;
 
-        let payload = TimerSlotPool::encode_payload(slot, generation);
-        let ud = UserData::encode(OpTag::Timer, 0, payload);
-        let ts_ptr = executor.timer_pool.set_relative(slot, duration);
+        #[cfg(has_io_uring)]
+        {
+            let payload = TimerSlotPool::encode_payload(slot, generation);
+            let ud = UserData::encode(OpTag::Timer, 0, payload);
+            let ts_ptr = executor.timer_pool.set_relative(slot, duration);
 
-        if let Err(_e) = driver.ring.submit_timeout(ts_ptr, ud) {
-            executor.timer_pool.release(slot);
-            // SQE submission failure — complete immediately (same as sleep()).
-            return Ok(SleepFuture {
-                duration,
-                timer_slot: None,
-                generation: 0,
-                absolute: None,
-            });
+            if let Err(_e) = driver.ring.submit_timeout(ts_ptr, ud) {
+                executor.timer_pool.release(slot);
+                // SQE submission failure — complete immediately (same as sleep()).
+                return Ok(SleepFuture {
+                    duration,
+                    timer_slot: None,
+                    generation: 0,
+                    absolute: None,
+                });
+            }
+        }
+
+        #[cfg(not(has_io_uring))]
+        {
+            executor.timer_pool.set_relative(slot, duration);
         }
 
         Ok(SleepFuture {
@@ -1743,26 +1872,37 @@ pub fn sleep_until(deadline: Deadline) -> SleepFuture {
 /// Panics if called outside the ringline async executor.
 pub fn try_sleep_until(deadline: Deadline) -> Result<SleepFuture, TimerExhausted> {
     with_state(|driver, executor| {
+        let _ = driver; // used only on io_uring path
         let waker_id = CURRENT_TASK_ID.with(|c| c.get());
         let (slot, generation) = executor.timer_pool.allocate(waker_id).ok_or_else(|| {
             crate::metrics::TIMER_POOL_EXHAUSTED.increment();
             TimerExhausted
         })?;
 
-        let payload = TimerSlotPool::encode_payload(slot, generation);
-        let ud = UserData::encode(OpTag::Timer, 0, payload);
-        let ts_ptr = executor
-            .timer_pool
-            .set_absolute(slot, deadline.secs, deadline.nsecs);
+        #[cfg(has_io_uring)]
+        {
+            let payload = TimerSlotPool::encode_payload(slot, generation);
+            let ud = UserData::encode(OpTag::Timer, 0, payload);
+            let ts_ptr = executor
+                .timer_pool
+                .set_absolute(slot, deadline.secs, deadline.nsecs);
 
-        if let Err(_e) = driver.ring.submit_timeout_abs(ts_ptr, ud) {
-            executor.timer_pool.release(slot);
-            return Ok(SleepFuture {
-                duration: Duration::ZERO,
-                timer_slot: None,
-                generation: 0,
-                absolute: Some(deadline),
-            });
+            if let Err(_e) = driver.ring.submit_timeout_abs(ts_ptr, ud) {
+                executor.timer_pool.release(slot);
+                return Ok(SleepFuture {
+                    duration: Duration::ZERO,
+                    timer_slot: None,
+                    generation: 0,
+                    absolute: Some(deadline),
+                });
+            }
+        }
+
+        #[cfg(not(has_io_uring))]
+        {
+            executor
+                .timer_pool
+                .set_absolute(slot, deadline.secs, deadline.nsecs);
         }
 
         Ok(SleepFuture {
@@ -2126,8 +2266,22 @@ impl UdpCtx {
     ///
     /// Copies `data` into the send pool and submits a `sendmsg` SQE.
     /// Only one send can be in-flight per UDP socket at a time.
+    #[cfg(has_io_uring)]
     pub fn send_to(&self, peer: SocketAddr, data: &[u8]) -> Result<(), crate::error::UdpSendError> {
         with_state(|driver, _executor| driver.udp_send_to(self.udp_index, peer, data))
+    }
+
+    /// Send a datagram to the given peer (not yet implemented on mio backend).
+    #[cfg(not(has_io_uring))]
+    pub fn send_to(
+        &self,
+        _peer: SocketAddr,
+        _data: &[u8],
+    ) -> Result<(), crate::error::UdpSendError> {
+        Err(crate::error::UdpSendError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "UDP send not yet implemented on mio backend",
+        )))
     }
 }
 

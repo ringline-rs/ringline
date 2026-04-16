@@ -63,6 +63,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    #[cfg(target_os = "linux")]
     pub(crate) fn from_statx(stx: &libc::statx) -> Self {
         Metadata {
             size: stx.stx_size,
@@ -187,6 +188,7 @@ pub(crate) struct FsCmdEntry {
     /// Second path for rename (kept alive until CQE).
     pub path2: Option<CString>,
     /// Heap-allocated statx buffer (kept alive until CQE).
+    #[cfg(target_os = "linux")]
     pub statx_buf: Option<Box<libc::statx>>,
 }
 
@@ -207,6 +209,7 @@ impl FsCmdSlab {
                 in_use: false,
                 path: None,
                 path2: None,
+                #[cfg(target_os = "linux")]
                 statx_buf: None,
             });
             free_list.push(i);
@@ -232,7 +235,10 @@ impl FsCmdSlab {
         entry.in_use = false;
         entry.path = None;
         entry.path2 = None;
-        entry.statx_buf = None;
+        #[cfg(target_os = "linux")]
+        {
+            entry.statx_buf = None;
+        }
         self.free_list.push(idx);
         (file_index, op)
     }
@@ -581,7 +587,10 @@ mod tests {
         {
             let entry = slab.get_mut(a).unwrap();
             entry.path = Some(CString::new("/tmp/test").unwrap());
-            entry.statx_buf = Some(Box::new(unsafe { std::mem::zeroed() }));
+            #[cfg(target_os = "linux")]
+            {
+                entry.statx_buf = Some(Box::new(unsafe { std::mem::zeroed() }));
+            }
         }
         slab.release(a);
         // After release, the entry is not in use but the path/statx_buf should be None.
@@ -590,6 +599,7 @@ mod tests {
         assert_eq!(b, a);
         let entry = slab.get(b).unwrap();
         assert!(entry.path.is_none());
+        #[cfg(target_os = "linux")]
         assert!(entry.statx_buf.is_none());
     }
 

@@ -70,12 +70,21 @@ fn setup() {
         // Create pipe with close-on-exec. Read end is blocking (so wait()
         // blocks), write end will be set to non-blocking (so the signal
         // handler never blocks).
+        #[cfg(target_os = "linux")]
         let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-        assert!(
-            ret == 0,
-            "pipe2 failed: {}",
-            std::io::Error::last_os_error()
-        );
+        #[cfg(not(target_os = "linux"))]
+        let ret = unsafe {
+            let r = libc::pipe(fds.as_mut_ptr());
+            if r == 0 {
+                // Set close-on-exec on both ends.
+                for fd in &fds {
+                    let fd_flags = libc::fcntl(*fd, libc::F_GETFD);
+                    libc::fcntl(*fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
+                }
+            }
+            r
+        };
+        assert!(ret == 0, "pipe failed: {}", std::io::Error::last_os_error());
 
         // Make write end non-blocking.
         let flags = unsafe { libc::fcntl(fds[1], libc::F_GETFL) };

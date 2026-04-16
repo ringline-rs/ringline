@@ -130,16 +130,14 @@ impl AsyncEventHandler for GrpcEchoServer {
                         Ok(Some((frame, consumed))) => {
                             recv_buf.drain(..consumed);
                             match frame {
-                                Frame::Settings { ack, .. } => {
-                                    if !ack {
-                                        let mut buf = Vec::new();
-                                        Frame::Settings {
-                                            ack: true,
-                                            settings: Settings::default(),
-                                        }
-                                        .encode(&mut buf);
-                                        let _ = conn.send_nowait(&buf);
+                                Frame::Settings { ack, .. } if !ack => {
+                                    let mut buf = Vec::new();
+                                    Frame::Settings {
+                                        ack: true,
+                                        settings: Settings::default(),
                                     }
+                                    .encode(&mut buf);
+                                    let _ = conn.send_nowait(&buf);
                                 }
                                 Frame::Headers {
                                     stream_id: _,
