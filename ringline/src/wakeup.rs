@@ -26,6 +26,7 @@ impl WakeHandle {
     }
 
     /// Return the underlying file descriptor.
+    #[allow(dead_code)]
     pub(crate) fn as_raw_fd(&self) -> RawFd {
         self.fd
     }
