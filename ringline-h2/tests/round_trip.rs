@@ -458,9 +458,6 @@ impl H2TestClient {
 
 #[test]
 fn h2_request_response() {
-    if ringline::backend() == ringline::Backend::Mio {
-        return;
-    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_tls = server_tls_config(certs.clone(), key);
@@ -512,9 +509,6 @@ fn h2_request_response() {
 
 #[test]
 fn h2_request_with_body() {
-    if ringline::backend() == ringline::Backend::Mio {
-        return;
-    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_tls = server_tls_config(certs.clone(), key);

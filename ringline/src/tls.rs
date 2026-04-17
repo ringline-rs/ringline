@@ -482,6 +482,175 @@ pub fn encrypt_and_send(
     Ok(())
 }
 
+// ── Mio backend TLS helpers ─────────────────────────────────────────────
+
+/// Feed received ciphertext into the TLS connection, decrypt plaintext into
+/// the accumulator, and flush any TLS output (handshake responses, alerts).
+///
+/// Mio version: writes ciphertext directly to the TcpStream instead of
+/// submitting io_uring SQEs.
+#[cfg(not(has_io_uring))]
+pub fn feed_tls_recv_mio(
+    tls_table: &mut TlsTable,
+    accumulators: &mut AccumulatorTable,
+    stream: &mut mio::net::TcpStream,
+    scratch: &mut Vec<u8>,
+    conn_index: u32,
+    ciphertext: &[u8],
+) -> TlsRecvResult {
+    let tls_conn = match tls_table.conns[conn_index as usize].as_mut() {
+        Some(tc) => tc,
+        None => return TlsRecvResult::Closed,
+    };
+
+    let was_handshaking = !tls_conn.handshake_complete;
+    let mut peer_closed = false;
+    let mut remaining = ciphertext;
+
+    // Feed ciphertext into rustls in a loop. `read_tls` may not consume all
+    // input at once (rustls has an internal buffer limit, typically 4KB).
+    // After each `read_tls` + `process_new_packets`, drain decrypted plaintext
+    // and retry with remaining ciphertext.
+    while !remaining.is_empty() {
+        let mut cursor = io::Cursor::new(remaining);
+        if let Err(e) = tls_conn.conn.read_tls(&mut cursor) {
+            return TlsRecvResult::Error(rustls::Error::General(e.to_string()));
+        }
+        let consumed = cursor.position() as usize;
+        if consumed == 0 {
+            // read_tls consumed nothing — shouldn't happen with a non-empty
+            // cursor, but guard against infinite loops.
+            break;
+        }
+        remaining = &remaining[consumed..];
+
+        // Drive the TLS state machine.
+        let state = match tls_conn.conn.process_new_packets() {
+            Ok(state) => state,
+            Err(e) => {
+                // Try to flush alert before returning error.
+                if tls_conn.conn.wants_write() {
+                    flush_tls_output_mio_inner(tls_conn, &mut tls_table.write_buf, stream);
+                }
+                return TlsRecvResult::Error(e);
+            }
+        };
+
+        // Read decrypted plaintext into accumulator.
+        if state.plaintext_bytes_to_read() > 0 {
+            let mut reader = tls_conn.conn.reader();
+            loop {
+                match reader.read(scratch.as_mut_slice()) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        accumulators.append(conn_index, &scratch[..n]);
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Flush any TLS output (handshake messages, alerts, etc.).
+        if tls_conn.conn.wants_write() {
+            flush_tls_output_mio_inner(tls_conn, &mut tls_table.write_buf, stream);
+        }
+
+        if state.peer_has_closed() {
+            peer_closed = true;
+        }
+    }
+
+    // Check if handshake just completed.
+    if was_handshaking && !tls_conn.conn.is_handshaking() {
+        tls_conn.handshake_complete = true;
+        return TlsRecvResult::HandshakeJustCompleted;
+    }
+
+    // Check for clean close.
+    if peer_closed {
+        return TlsRecvResult::Closed;
+    }
+
+    TlsRecvResult::Ok
+}
+
+/// Flush pending TLS output to the network via direct stream write.
+/// Public entry point takes `&mut TlsTable`.
+#[cfg(not(has_io_uring))]
+pub fn flush_tls_output_mio(
+    tls_table: &mut TlsTable,
+    stream: &mut mio::net::TcpStream,
+    conn_index: u32,
+) {
+    let (conn_slot, write_buf) = borrow_conn_and_buf(tls_table, conn_index);
+    if let Some(tls_conn) = conn_slot {
+        flush_tls_output_mio_inner(tls_conn, write_buf, stream);
+    }
+}
+
+/// Inner flush for mio: writes ciphertext directly to the TcpStream.
+#[cfg(not(has_io_uring))]
+fn flush_tls_output_mio_inner(
+    tls_conn: &mut TlsConn,
+    write_buf: &mut Vec<u8>,
+    stream: &mut mio::net::TcpStream,
+) {
+    write_buf.clear();
+    if tls_conn.conn.write_tls(write_buf).is_err() {
+        return;
+    }
+
+    if write_buf.is_empty() {
+        return;
+    }
+
+    // Write ciphertext to the stream. For non-blocking sockets we do our
+    // best effort — partial writes during handshake are unlikely because the
+    // messages are small, but we handle WouldBlock gracefully.
+    let mut offset = 0;
+    while offset < write_buf.len() {
+        match stream.write(&write_buf[offset..]) {
+            Ok(0) => break,
+            Ok(n) => offset += n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Encrypt plaintext and return the ciphertext for buffered sending.
+/// Mio version: encrypts data and returns ciphertext bytes. The caller
+/// pushes the result into the pending_sends queue for the event loop to
+/// flush when the socket is writable.
+#[cfg(not(has_io_uring))]
+pub fn encrypt_for_send_mio(
+    tls_table: &mut TlsTable,
+    conn_index: u32,
+    plaintext: &[u8],
+) -> io::Result<Vec<u8>> {
+    let (conn_slot, write_buf) = borrow_conn_and_buf(tls_table, conn_index);
+    let tls_conn = conn_slot.as_mut().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotConnected, "no TLS state for connection")
+    })?;
+
+    // Write plaintext into rustls (encrypts in place).
+    tls_conn
+        .conn
+        .writer()
+        .write_all(plaintext)
+        .map_err(io::Error::other)?;
+
+    // Extract ciphertext into shared scratch buffer.
+    write_buf.clear();
+    tls_conn
+        .conn
+        .write_tls(write_buf)
+        .map_err(io::Error::other)?;
+
+    Ok(write_buf.clone())
+}
+
 /// Borrow a connection slot and the shared write_buf from a TlsTable simultaneously.
 /// This is the borrow-splitting helper: `conns[i]` and `write_buf` are disjoint fields.
 fn borrow_conn_and_buf(
