@@ -1,4 +1,3 @@
-#![cfg(has_io_uring)]
 //! End-to-end TLS echo tests.
 //!
 //! Tests the core TLS machinery: server-side TLS accept (handshake + data
@@ -165,7 +164,12 @@ fn tls_echo_with_external_client() {
         match stream.read(&mut large_buf[total..]) {
             Ok(0) => break,
             Ok(n) => total += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // rustls::Stream may return WouldBlock if the TLS record
+                // isn't fully available yet; retry after a short delay.
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             Err(e) => panic!("TLS read error (large): {e}"),
         }
     }

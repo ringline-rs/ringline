@@ -1721,6 +1721,9 @@ impl<'a> DriverCtx<'a> {
     ///
     /// The data is buffered in the per-connection send queue. The event loop
     /// flushes it when the socket becomes writable.
+    ///
+    /// For TLS connections, data is encrypted and written directly to the
+    /// TcpStream (bypassing the pending send queue).
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
         let conn_state = self
             .connections
@@ -1732,6 +1735,20 @@ impl<'a> DriverCtx<'a> {
                 "stale connection",
             ));
         }
+
+        // TLS path: encrypt and push ciphertext into the pending send queue.
+        if !self.tls_table.is_null() {
+            let tls_table = unsafe { &mut *self.tls_table };
+            if tls_table.has(conn.index) {
+                let ciphertext = crate::tls::encrypt_for_send_mio(tls_table, conn.index, data)?;
+                if !ciphertext.is_empty() {
+                    let idx = conn.index as usize;
+                    self.pending_sends[idx].push_back((ciphertext, 0));
+                }
+                return Ok(());
+            }
+        }
+
         let idx = conn.index as usize;
         self.pending_sends[idx].push_back((data.to_vec(), 0));
         Ok(())
@@ -1743,8 +1760,16 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Get TLS session info for a connection.
-    pub fn tls_info(&self, _conn: ConnToken) -> Option<crate::tls::TlsInfo> {
-        None
+    pub fn tls_info(&self, conn: ConnToken) -> Option<crate::tls::TlsInfo> {
+        let cs = self.connections.get(conn.index)?;
+        if cs.generation != conn.generation {
+            return None;
+        }
+        if self.tls_table.is_null() {
+            return None;
+        }
+        let tls_table = unsafe { &*self.tls_table };
+        tls_table.get_info(conn.index)
     }
 
     /// Shut down the write half of a connection.
@@ -1828,12 +1853,34 @@ impl<'a> DriverCtx<'a> {
     /// Connect with TLS.
     pub fn connect_tls(
         &mut self,
-        _addr: SocketAddr,
-        _server_name: &str,
+        addr: SocketAddr,
+        server_name: &str,
     ) -> Result<ConnToken, crate::error::Error> {
-        Err(crate::error::Error::Io(io::Error::other(
-            "mio connect_tls not yet implemented",
-        )))
+        if self.tls_table.is_null() {
+            return Err(crate::error::Error::RingSetup(
+                "TLS not configured".to_string(),
+            ));
+        }
+        let tls_table = unsafe { &mut *self.tls_table };
+        if !tls_table.has_client_config() {
+            return Err(crate::error::Error::RingSetup(
+                "TLS client config not set".to_string(),
+            ));
+        }
+
+        // Perform the TCP connect first.
+        let token = self.connect(addr)?;
+
+        // Create TLS client state (buffers ClientHello internally).
+        let sni = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .map_err(|e| crate::error::Error::RingSetup(format!("invalid server name: {e}")))?;
+        if let Err(e) = tls_table.create_client(token.index, sni) {
+            return Err(crate::error::Error::RingSetup(format!(
+                "TLS client setup failed: {e}"
+            )));
+        }
+
+        Ok(token)
     }
 
     /// Connect with TLS and a timeout.

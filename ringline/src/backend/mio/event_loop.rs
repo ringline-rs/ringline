@@ -254,7 +254,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.pending_sends[idx].clear();
             self.driver.writable[idx] = false;
 
-            // Mark connection as established.
+            // TLS path: defer accept until handshake completes in handle_readable.
+            if let Some(ref mut tls_table) = self.driver.tls_table
+                && tls_table.has_server_config()
+            {
+                if tls_table.create(conn_index).is_err() {
+                    self.driver.close_connection(conn_index);
+                }
+                continue;
+            }
+
+            // Plaintext path: mark connection as established and spawn accept task.
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.established = true;
             }
@@ -306,6 +316,120 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
+        // Check if this is a TLS connection.
+        let is_tls = self
+            .driver
+            .tls_table
+            .as_ref()
+            .is_some_and(|t| t.has(conn_index));
+
+        if is_tls {
+            // TLS path: read ciphertext, decrypt, put plaintext in accumulator.
+            loop {
+                // Take the stream out temporarily to avoid borrow conflicts
+                // (feed_tls_recv_mio needs &mut tls_table, &mut accumulators,
+                // &mut stream — all fields of driver).
+                let mut stream = match self.driver.tcp_streams[idx].take() {
+                    Some(s) => s,
+                    None => return,
+                };
+
+                let n = match stream.read(recv_buf) {
+                    Ok(0) => {
+                        self.driver.tcp_streams[idx] = Some(stream);
+                        // EOF
+                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                            cs.recv_mode = RecvMode::Closed;
+                        }
+                        self.executor.wake_recv(conn_index);
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        self.driver.tcp_streams[idx] = Some(stream);
+                        break;
+                    }
+                    Err(_) => {
+                        self.driver.tcp_streams[idx] = Some(stream);
+                        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                            cs.recv_mode = RecvMode::Closed;
+                        }
+                        self.executor.wake_recv(conn_index);
+                        break;
+                    }
+                };
+
+                let tls_table = self.driver.tls_table.as_mut().unwrap();
+                let result = crate::tls::feed_tls_recv_mio(
+                    tls_table,
+                    &mut self.driver.accumulators,
+                    &mut stream,
+                    &mut self.driver.tls_scratch,
+                    conn_index,
+                    &recv_buf[..n],
+                );
+
+                // Put the stream back.
+                self.driver.tcp_streams[idx] = Some(stream);
+
+                match result {
+                    crate::tls::TlsRecvResult::HandshakeJustCompleted => {
+                        let is_outbound = self
+                            .driver
+                            .connections
+                            .get(conn_index)
+                            .map(|c| c.outbound)
+                            .unwrap_or(false);
+
+                        if is_outbound {
+                            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                                cs.established = true;
+                            }
+                            // Wake connect waiter.
+                            self.executor.wake_connect(conn_index, Ok(()));
+                        } else {
+                            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                                cs.established = true;
+                            }
+                            metrics::CONNECTIONS_ACCEPTED.increment();
+                            metrics::CONNECTIONS_ACTIVE.increment();
+                            // Spawn async task for accepted connection.
+                            self.spawn_accept_task(conn_index);
+                        }
+
+                        // Wake recv waiter if data accumulated during handshake.
+                        self.executor.wake_recv(conn_index);
+                    }
+                    crate::tls::TlsRecvResult::Ok => {
+                        self.executor.wake_recv(conn_index);
+                    }
+                    crate::tls::TlsRecvResult::Error(e) => {
+                        // Wake connect waiter if handshake hasn't completed yet.
+                        let established = self
+                            .driver
+                            .connections
+                            .get(conn_index)
+                            .map(|c| c.established)
+                            .unwrap_or(false);
+                        if !established {
+                            let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, e);
+                            self.executor.wake_connect(conn_index, Err(err));
+                        }
+                        self.executor.wake_recv(conn_index);
+                        self.driver.close_connection(conn_index);
+                        break;
+                    }
+                    crate::tls::TlsRecvResult::Closed => {
+                        self.executor.wake_recv(conn_index);
+                        self.driver.close_connection(conn_index);
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Plaintext path.
         loop {
             let stream = match self.driver.tcp_streams[idx].as_mut() {
                 Some(s) => s,
@@ -384,7 +508,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             if result.is_ok() {
                 cs.recv_mode = RecvMode::Multi;
-                cs.established = true;
 
                 // Set TCP_NODELAY if configured.
                 if self.driver.tcp_nodelay
@@ -396,6 +519,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // Reset accumulator for the new connection.
                 self.driver.accumulators.reset(conn_index);
 
+                // TLS client path: flush ClientHello, don't wake connect waiter
+                // yet — wait for the TLS handshake to complete in handle_readable.
+                if let Some(ref mut tls_table) = self.driver.tls_table
+                    && tls_table.has(conn_index)
+                {
+                    let mut stream = self.driver.tcp_streams[idx].take().unwrap();
+                    crate::tls::flush_tls_output_mio(tls_table, &mut stream, conn_index);
+                    self.driver.tcp_streams[idx] = Some(stream);
+                    return;
+                }
+
+                cs.established = true;
                 metrics::CONNECTIONS_ACTIVE.increment();
             }
 

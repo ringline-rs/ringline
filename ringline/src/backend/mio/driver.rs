@@ -56,6 +56,8 @@ pub(crate) struct Driver {
     pub(crate) pending_sends: Vec<VecDeque<PendingSend>>,
     /// Per-connection writable flag (most recent readiness from mio).
     pub(crate) writable: Vec<bool>,
+    /// Scratch buffer for TLS plaintext decryption (one per worker thread).
+    pub(crate) tls_scratch: Vec<u8>,
     /// Raw fd of the wake pipe read end — registered with mio as WAKE_TOKEN.
     pub(crate) wake_pipe_fd: RawFd,
     /// Whether to set TCP_NODELAY on accepted connections.
@@ -130,6 +132,7 @@ impl Driver {
             tcp_streams: (0..max_conn).map(|_| None).collect(),
             pending_sends: (0..max_conn).map(|_| VecDeque::new()).collect(),
             writable: vec![false; max_conn],
+            tls_scratch: vec![0u8; 16384],
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
@@ -192,6 +195,17 @@ impl Driver {
                 let _ = stream.write_all(&data[offset..]);
             }
             let _ = stream.flush();
+
+            // Send TLS close_notify if this is a TLS connection.
+            if let Some(ref mut tls_table) = self.tls_table
+                && tls_table.has(conn_index)
+            {
+                if let Some(tls_conn) = tls_table.get_mut(conn_index) {
+                    tls_conn.conn.send_close_notify();
+                }
+                crate::tls::flush_tls_output_mio(tls_table, stream, conn_index);
+                tls_table.remove(conn_index);
+            }
         }
 
         // Deregister from poll and drop the TcpStream.
