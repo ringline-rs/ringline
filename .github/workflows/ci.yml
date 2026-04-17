@@ -41,7 +41,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --no-default-features --features futures-io -- -D warnings
+      - run: cargo clippy --all-targets --features force-mio -- -D warnings
 
   doc:
     name: Doc
@@ -86,7 +86,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all --no-default-features --features futures-io
+      - run: cargo test --all --features force-mio
 
   test-mio-release:
     name: Test (mio, release)
@@ -95,31 +95,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all --no-default-features --features futures-io --release
-
-  integration-services-mio:
-    name: Integration (Redis + Memcache, mio)
-    runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      memcached:
-        image: memcached:1.6
-        ports:
-          - 11211:11211
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p ringline-redis --test integration --no-default-features --features metrics -- --ignored --nocapture
-      - run: cargo test -p ringline-memcache --test integration --no-default-features --features metrics -- --ignored --nocapture
+      - run: cargo test --all --features force-mio --release
 
   integration-clients:
     name: Integration (public servers)
@@ -155,6 +131,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p ringline-redis --test integration -- --ignored --nocapture
       - run: cargo test -p ringline-memcache --test integration -- --ignored --nocapture
+
+  integration-services-mio:
+    name: Integration (Redis + Memcache, mio)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      memcached:
+        image: memcached:1.6
+        ports:
+          - 11211:11211
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ringline-redis --test integration --features ringline/force-mio -- --ignored --nocapture
+      - run: cargo test -p ringline-memcache --test integration --features ringline/force-mio -- --ignored --nocapture
 
   integration-momento:
     name: Integration (Momento)

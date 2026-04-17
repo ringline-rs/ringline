@@ -8,8 +8,6 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["io-uring"]
-io-uring = ["ringline/io-uring"]
 gzip = ["dep:flate2"]
 zstd = ["dep:zstd"]
 brotli = ["dep:brotli"]

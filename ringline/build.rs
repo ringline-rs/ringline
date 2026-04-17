@@ -1,8 +1,8 @@
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let feature = std::env::var("CARGO_FEATURE_IO_URING").is_ok();
+    let force_mio = std::env::var("CARGO_FEATURE_FORCE_MIO").is_ok();
 
-    if target_os == "linux" && feature && kernel_version_sufficient() {
+    if target_os == "linux" && !force_mio && kernel_version_sufficient() {
         println!("cargo:rustc-cfg=has_io_uring");
     }
 }

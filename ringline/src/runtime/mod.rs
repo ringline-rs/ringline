@@ -24,7 +24,6 @@ pub(crate) mod handler;
 pub(crate) mod io;
 pub(crate) mod join;
 pub(crate) mod select;
-#[cfg(feature = "futures-io")]
 pub(crate) mod stream;
 pub(crate) mod task;
 pub(crate) mod waker;

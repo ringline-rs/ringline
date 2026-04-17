@@ -8,8 +8,7 @@ repository.workspace = true
 description = "Momento cache client for the ringline io_uring runtime"
 
 [features]
-default = ["io-uring", "metrics"]
-io-uring = ["ringline/io-uring"]
+default = ["metrics"]
 metrics = ["dep:histogram"]
 timestamps = ["ringline/timestamps", "dep:libc"]
 

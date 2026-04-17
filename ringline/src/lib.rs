@@ -269,7 +269,6 @@ pub use signal::Signal;
 // ── Re-exports: Stream adapter ──────────────────────────────────────────
 
 /// Wraps a [`ConnCtx`] and implements `futures_io::{AsyncRead, AsyncWrite, AsyncBufRead}`.
-#[cfg(feature = "futures-io")]
 pub use runtime::stream::ConnStream;
 
 // ── Re-exports: Shared types ────────────────────────────────────────────
