@@ -159,13 +159,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         let conn_index = (tok.0 - 1) as u32;
                         // On error events for connecting sockets, treat as writable
                         // so handle_writable detects the connect failure via SO_ERROR.
-                        if is_err {
-                            if let Some(cs) = self.driver.connections.get(conn_index)
-                                && matches!(cs.recv_mode, RecvMode::Connecting)
-                            {
-                                self.handle_writable(conn_index);
-                                continue;
-                            }
+                        if is_err
+                            && let Some(cs) = self.driver.connections.get(conn_index)
+                            && matches!(cs.recv_mode, RecvMode::Connecting)
+                        {
+                            self.handle_writable(conn_index);
+                            continue;
                         }
                         if readable {
                             self.handle_readable(conn_index, &mut recv_buf);
@@ -574,13 +573,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 metrics::CONNECTIONS_ACTIVE.increment();
             }
 
-            if result.is_err() {
-                // Connect failed — clean up the connection.
-                self.executor
-                    .wake_connect(conn_index, Err(result.unwrap_err()));
-                self.driver.close_connection(conn_index);
-            } else {
-                self.executor.wake_connect(conn_index, Ok(()));
+            match result {
+                Err(e) => {
+                    // Connect failed — clean up the connection.
+                    self.executor.wake_connect(conn_index, Err(e));
+                    self.driver.close_connection(conn_index);
+                }
+                Ok(()) => {
+                    self.executor.wake_connect(conn_index, Ok(()));
+                }
             }
             return;
         }
