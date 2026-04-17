@@ -97,6 +97,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all --no-default-features --features futures-io --release
 
+  integration-services-mio:
+    name: Integration (Redis + Memcache, mio)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      memcached:
+        image: memcached:1.6
+        ports:
+          - 11211:11211
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ringline-redis --test integration --no-default-features --features futures-io -- --ignored --nocapture
+      - run: cargo test -p ringline-memcache --test integration --no-default-features --features futures-io -- --ignored --nocapture
+
   integration-clients:
     name: Integration (public servers)
     runs-on: ubuntu-latest
