@@ -2,7 +2,6 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::sync::Arc;
@@ -336,6 +335,8 @@ impl Driver {
     /// got WouldBlock mid-flush. `bytes_written` is the total bytes written
     /// in this call.
     pub(crate) fn flush_sends(&mut self, conn_index: u32) -> (bool, u32) {
+        use std::os::fd::AsRawFd;
+
         let idx = conn_index as usize;
         let stream = match self.tcp_streams[idx].as_mut() {
             Some(s) => s,
@@ -343,27 +344,62 @@ impl Driver {
         };
 
         let mut total_written: u32 = 0;
-        while let Some((data, offset)) = self.pending_sends[idx].front_mut() {
-            match stream.write(&data[*offset..]) {
-                Ok(0) => {
-                    // Connection closed by peer during write.
-                    return (true, total_written);
+
+        // Use writev() to coalesce multiple pending sends into a single
+        // syscall, reducing TCP segment count under pipelining.
+        while !self.pending_sends[idx].is_empty() {
+            let mut iovecs: Vec<libc::iovec> =
+                Vec::with_capacity(self.pending_sends[idx].len().min(1024));
+            for (data, offset) in self.pending_sends[idx].iter() {
+                if iovecs.len() >= 1024 {
+                    break;
                 }
-                Ok(n) => {
-                    total_written += n as u32;
-                    *offset += n;
-                    if *offset >= data.len() {
-                        // This send is complete.
-                        self.pending_sends[idx].pop_front();
-                    }
+                let remaining = &data[*offset..];
+                if !remaining.is_empty() {
+                    iovecs.push(libc::iovec {
+                        iov_base: remaining.as_ptr() as *mut libc::c_void,
+                        iov_len: remaining.len(),
+                    });
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+            }
+
+            if iovecs.is_empty() {
+                self.pending_sends[idx].clear();
+                break;
+            }
+
+            let fd = stream.as_raw_fd();
+            let result = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as i32) };
+
+            if result < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
                     self.writable[idx] = false;
                     return (false, total_written);
                 }
-                Err(_) => {
-                    // Write error — connection will be closed.
-                    return (true, total_written);
+                // Write error — connection will be closed.
+                return (true, total_written);
+            }
+            if result == 0 {
+                // Connection closed by peer.
+                return (true, total_written);
+            }
+
+            // Advance through the pending sends by the number of bytes written.
+            let mut remaining = result as usize;
+            total_written += result as u32;
+            while remaining > 0 {
+                if let Some((data, offset)) = self.pending_sends[idx].front_mut() {
+                    let avail = data.len() - *offset;
+                    if remaining >= avail {
+                        remaining -= avail;
+                        self.pending_sends[idx].pop_front();
+                    } else {
+                        *offset += remaining;
+                        remaining = 0;
+                    }
+                } else {
+                    break;
                 }
             }
         }
