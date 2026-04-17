@@ -716,7 +716,8 @@ impl ConnCtx {
     /// On the mio backend, this always uses the copy path.
     pub fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
         with_state(|driver, _| {
-            let _conn_index = self.conn_index;
+            #[cfg_attr(not(has_io_uring), allow(unused_variables))]
+            let conn_index = self.conn_index;
 
             #[cfg(has_io_uring)]
             {
@@ -2132,7 +2133,8 @@ pub unsafe fn direct_io_read(
         let mut ctx = driver.make_ctx();
         // Safety: the outer `direct_io_read()` is already unsafe, and the
         // caller guarantees the buffer invariants.
-        let seq = ctx.direct_io_read(file, offset, buf, len)?;
+        #[allow(unused_unsafe)]
+        let seq = unsafe { ctx.direct_io_read(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
         Ok(DiskIoFuture { seq })
@@ -2192,7 +2194,8 @@ pub unsafe fn direct_io_write(
         let mut ctx = driver.make_ctx();
         // Safety: the outer `direct_io_write()` is already unsafe, and the
         // caller guarantees the buffer invariants.
-        let seq = ctx.direct_io_write(file, offset, buf, len)?;
+        #[allow(unused_unsafe)]
+        let seq = unsafe { ctx.direct_io_write(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
         Ok(DiskIoFuture { seq })
