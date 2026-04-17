@@ -18,6 +18,10 @@ path = "src/bin/server.rs"
 name = "bench-client"
 path = "src/bin/client.rs"
 
+[features]
+default = ["io-uring"]
+io-uring = ["ringline/io-uring"]
+
 [dependencies]
 ringline = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }

@@ -8,7 +8,8 @@ repository.workspace = true
 description = "PING/PONG client for the ringline io_uring runtime"
 
 [features]
-default = ["metrics"]
+default = ["io-uring", "metrics"]
+io-uring = ["ringline/io-uring"]
 metrics = ["dep:histogram"]
 timestamps = ["ringline/timestamps", "dep:libc"]
 

@@ -178,9 +178,16 @@ impl Driver {
             return;
         }
 
-        // Flush any pending send data before closing.
+        // Flush any pending send data before closing. Temporarily switch to
+        // blocking mode so write_all doesn't fail with WouldBlock.
         if let Some(ref mut stream) = self.tcp_streams[idx] {
             use std::io::Write;
+            use std::os::fd::AsRawFd;
+            let fd = stream.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
             for (data, offset) in self.pending_sends[idx].drain(..) {
                 let _ = stream.write_all(&data[offset..]);
             }
