@@ -369,42 +369,42 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let idx = conn_index as usize;
 
         // Check if this is a connecting socket completing its connect.
-        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-            if matches!(cs.recv_mode, RecvMode::Connecting) {
-                // Connect completed — check for errors via peer_addr().
-                let result = if let Some(ref stream) = self.driver.tcp_streams[idx] {
-                    match stream.peer_addr() {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    Err(io::Error::other("stream missing"))
-                };
+        if let Some(cs) = self.driver.connections.get_mut(conn_index)
+            && matches!(cs.recv_mode, RecvMode::Connecting)
+        {
+            // Connect completed — check for errors via peer_addr().
+            let result = if let Some(ref stream) = self.driver.tcp_streams[idx] {
+                match stream.peer_addr() {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            } else {
+                Err(io::Error::other("stream missing"))
+            };
 
-                if result.is_ok() {
-                    cs.recv_mode = RecvMode::Multi;
-                    cs.established = true;
+            if result.is_ok() {
+                cs.recv_mode = RecvMode::Multi;
+                cs.established = true;
 
-                    // Set TCP_NODELAY if configured.
-                    if self.driver.tcp_nodelay {
-                        if let Some(ref stream) = self.driver.tcp_streams[idx] {
-                            let _ = stream.set_nodelay(true);
-                        }
-                    }
-
-                    // Reset accumulator for the new connection.
-                    self.driver.accumulators.reset(conn_index);
-
-                    metrics::CONNECTIONS_ACTIVE.increment();
+                // Set TCP_NODELAY if configured.
+                if self.driver.tcp_nodelay
+                    && let Some(ref stream) = self.driver.tcp_streams[idx]
+                {
+                    let _ = stream.set_nodelay(true);
                 }
 
-                let io_result = match result {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(e),
-                };
-                self.executor.wake_connect(conn_index, io_result);
-                return;
+                // Reset accumulator for the new connection.
+                self.driver.accumulators.reset(conn_index);
+
+                metrics::CONNECTIONS_ACTIVE.increment();
             }
+
+            let io_result = match result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e),
+            };
+            self.executor.wake_connect(conn_index, io_result);
+            return;
         }
 
         // Normal writable — mark writable and flush sends.
@@ -434,11 +434,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let mut delivered = false;
             let max = self.driver.send_completions.len();
             for idx in 0..max {
-                if let Some(bytes) = self.driver.send_completions[idx].pop_front() {
-                    if self.executor.send_waiters[idx] {
-                        self.executor.wake_send(idx as u32, Ok(bytes));
-                        delivered = true;
-                    }
+                if let Some(bytes) = self.driver.send_completions[idx].pop_front()
+                    && self.executor.send_waiters[idx]
+                {
+                    self.executor.wake_send(idx as u32, Ok(bytes));
+                    delivered = true;
                 }
             }
             if !delivered {

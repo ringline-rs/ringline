@@ -1672,6 +1672,7 @@ impl<'a> DriverCtx<'a> {
 /// The context provided to handler callbacks for issuing operations.
 ///
 /// This is a short-lived borrow into the driver's internal state.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub struct DriverCtx<'a> {
     pub(crate) connections: &'a mut crate::connection::ConnectionTable,
     pub(crate) send_copy_pool: &'a mut SendCopyPool,
@@ -1713,7 +1714,7 @@ impl<'a> DriverCtx<'a> {
     pub fn is_outbound(&self, conn: ConnToken) -> bool {
         self.connections
             .get(conn.index)
-            .map_or(false, |cs| cs.outbound)
+            .is_some_and(|cs| cs.outbound)
     }
 
     /// Send data on a connection (copy into pending send buffer).
@@ -2025,6 +2026,7 @@ impl<'a> DriverCtx<'a> {
 }
 
 /// A prepared send operation with its associated resources, ready for submission.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) struct BuiltSend {
     /// The io_uring SQE to submit.
     #[cfg(has_io_uring)]

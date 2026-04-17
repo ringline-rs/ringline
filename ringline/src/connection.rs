@@ -164,11 +164,13 @@ impl ConnectionTable {
     }
 
     /// Number of active connections.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub fn active_count(&self) -> usize {
         self.slots.len().saturating_sub(self.free_list.len())
     }
 
     /// Total number of connection slots (max_connections).
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub fn max_slots(&self) -> u32 {
         self.slots.len() as u32
     }

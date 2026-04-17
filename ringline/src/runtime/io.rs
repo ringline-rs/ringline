@@ -11,12 +11,15 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::backend::Driver;
+#[cfg(has_io_uring)]
 use crate::completion::{OpTag, UserData};
 use crate::error::TimerExhausted;
 use crate::handler::ConnToken;
+#[cfg(has_io_uring)]
+use crate::runtime::TimerSlotPool;
 use crate::runtime::task::TaskId;
 use crate::runtime::waker::STANDALONE_BIT;
-use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult, TimerSlotPool};
+use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult};
 
 /// Result of a parse closure passed to [`ConnCtx::with_data`] or [`ConnCtx::with_bytes`].
 ///
@@ -713,7 +716,7 @@ impl ConnCtx {
     /// On the mio backend, this always uses the copy path.
     pub fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
         with_state(|driver, _| {
-            let conn_index = self.conn_index;
+            let _conn_index = self.conn_index;
 
             #[cfg(has_io_uring)]
             {
@@ -2127,7 +2130,9 @@ pub unsafe fn direct_io_read(
 ) -> io::Result<DiskIoFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        let seq = unsafe { ctx.direct_io_read(file, offset, buf, len)? };
+        // Safety: the outer `direct_io_read()` is already unsafe, and the
+        // caller guarantees the buffer invariants.
+        let seq = ctx.direct_io_read(file, offset, buf, len)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
         Ok(DiskIoFuture { seq })
@@ -2185,7 +2190,9 @@ pub unsafe fn direct_io_write(
 ) -> io::Result<DiskIoFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        let seq = unsafe { ctx.direct_io_write(file, offset, buf, len)? };
+        // Safety: the outer `direct_io_write()` is already unsafe, and the
+        // caller guarantees the buffer invariants.
+        let seq = ctx.direct_io_write(file, offset, buf, len)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
         Ok(DiskIoFuture { seq })

@@ -28,6 +28,7 @@ use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+#[cfg(has_io_uring)]
 use crate::completion::{OpTag, UserData};
 use crate::runtime::CURRENT_TASK_ID;
 use crate::runtime::io::{try_with_state, with_state};

@@ -3,6 +3,7 @@ pub(crate) mod sockaddr;
 
 #[allow(unused_imports)]
 pub(crate) use sockaddr::sockaddr_to_peer_addr;
+#[allow(unused_imports)]
 pub(crate) use sockaddr::sockaddr_to_socket_addr;
 pub(crate) use sockaddr::socket_addr_to_sockaddr;
 pub(crate) use sockaddr::unix_path_to_sockaddr;

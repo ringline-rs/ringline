@@ -362,7 +362,9 @@ impl Drop for OpenFuture {
 pub unsafe fn read(file: File, offset: u64, buf: *mut u8, len: u32) -> io::Result<DiskIoFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        let seq = unsafe { ctx.fs_read(file, offset, buf, len)? };
+        // Safety: the outer `read()` is already unsafe, and the caller
+        // guarantees the buffer invariants.
+        let seq = ctx.fs_read(file, offset, buf, len)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
         Ok(DiskIoFuture { seq })
@@ -384,7 +386,9 @@ pub unsafe fn read(file: File, offset: u64, buf: *mut u8, len: u32) -> io::Resul
 pub unsafe fn write(file: File, offset: u64, buf: *const u8, len: u32) -> io::Result<DiskIoFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        let seq = unsafe { ctx.fs_write(file, offset, buf, len)? };
+        // Safety: the outer `write()` is already unsafe, and the caller
+        // guarantees the buffer invariants.
+        let seq = ctx.fs_write(file, offset, buf, len)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
         Ok(DiskIoFuture { seq })
