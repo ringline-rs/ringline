@@ -3421,17 +3421,13 @@ fn async_send_parts_scatter_gather() {
 
 // ── Outbound connect EOF delivery ───────────────────────────────────
 
-#[cfg(has_io_uring)]
 static OUTBOUND_EOF_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
-#[cfg(has_io_uring)]
 static OUTBOUND_EOF_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Client that connects outbound to a std TCP server, sends data, reads
 /// echo, then waits for EOF. Exercises the outbound plaintext recv_mode fix.
-#[cfg(has_io_uring)]
 struct OutboundEofClient;
 
-#[cfg(has_io_uring)]
 impl AsyncEventHandler for OutboundEofClient {
     fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async {}
@@ -3505,7 +3501,6 @@ impl AsyncEventHandler for OutboundEofClient {
 }
 
 #[test]
-#[cfg(has_io_uring)]
 fn async_outbound_connect_receives_eof() {
     let port = free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();

@@ -1893,9 +1893,12 @@ impl<'a> DriverCtx<'a> {
         &mut self,
         addr: SocketAddr,
         server_name: &str,
-        _timeout_ms: u64,
+        timeout_ms: u64,
     ) -> Result<ConnToken, crate::error::Error> {
-        self.connect_tls(addr, server_name)
+        let token = self.connect_tls(addr, server_name)?;
+        self.connect_deadlines[token.index as usize] =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+        Ok(token)
     }
 
     /// Open an NVMe device (not supported on mio backend).
