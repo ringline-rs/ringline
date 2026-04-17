@@ -128,13 +128,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 4. Handle events.
             // Collect events into a temporary vec to avoid borrow conflict
             // (self.driver.events borrows driver, but handlers need &mut driver).
-            let mut event_list: Vec<(mio::Token, bool, bool)> =
+            let mut event_list: Vec<(mio::Token, bool, bool, bool)> =
                 Vec::with_capacity(self.driver.events.iter().count());
             for event in self.driver.events.iter() {
-                event_list.push((event.token(), event.is_readable(), event.is_writable()));
+                let is_err = event.is_error() || event.is_read_closed() || event.is_write_closed();
+                event_list.push((
+                    event.token(),
+                    event.is_readable(),
+                    event.is_writable(),
+                    is_err,
+                ));
             }
 
-            for (token, readable, writable) in event_list {
+            for (token, readable, writable, is_err) in event_list {
                 match token {
                     WAKE_TOKEN => {
                         if readable {
@@ -151,6 +157,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     tok => {
                         let conn_index = (tok.0 - 1) as u32;
+                        // On error events for connecting sockets, treat as writable
+                        // so handle_writable detects the connect failure via SO_ERROR.
+                        if is_err
+                            && let Some(cs) = self.driver.connections.get(conn_index)
+                            && matches!(cs.recv_mode, RecvMode::Connecting)
+                        {
+                            self.handle_writable(conn_index);
+                            continue;
+                        }
                         if readable {
                             self.handle_readable(conn_index, &mut recv_buf);
                         }
@@ -516,11 +531,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if let Some(cs) = self.driver.connections.get_mut(conn_index)
             && matches!(cs.recv_mode, RecvMode::Connecting)
         {
-            // Connect completed — check for errors via peer_addr().
+            // Connect completed — check SO_ERROR for connect failure.
+            // Clear any connect timeout.
+            self.driver.connect_deadlines[idx] = None;
+
             let result = if let Some(ref stream) = self.driver.tcp_streams[idx] {
-                match stream.peer_addr() {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(e),
+                match stream.take_error() {
+                    Ok(Some(e)) => Err(e), // connect failed (ECONNREFUSED, etc.)
+                    Ok(None) => Ok(()),    // connect succeeded
+                    Err(e) => Err(e),      // getsockopt itself failed
                 }
             } else {
                 Err(io::Error::other("stream missing"))
@@ -554,11 +573,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 metrics::CONNECTIONS_ACTIVE.increment();
             }
 
-            let io_result = match result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(e),
-            };
-            self.executor.wake_connect(conn_index, io_result);
+            match result {
+                Err(e) => {
+                    // Connect failed — clean up the connection.
+                    self.executor.wake_connect(conn_index, Err(e));
+                    self.driver.close_connection(conn_index);
+                }
+                Ok(()) => {
+                    self.executor.wake_connect(conn_index, Ok(()));
+                }
+            }
             return;
         }
 
@@ -645,6 +669,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if let Some(waker_id) = self.executor.timer_pool.fire(slot, generation) {
                 self.executor.wake_task(waker_id);
             }
+        }
+
+        // Check for timed-out connect operations.
+        let mut timed_out: Vec<u32> = Vec::new();
+        for (idx, deadline) in self.driver.connect_deadlines.iter().enumerate() {
+            if let Some(dl) = deadline
+                && now >= *dl
+            {
+                timed_out.push(idx as u32);
+            }
+        }
+        for conn_index in timed_out {
+            self.driver.connect_deadlines[conn_index as usize] = None;
+            let err = io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
+            self.executor.wake_connect(conn_index, Err(err));
+            self.driver.close_connection(conn_index);
         }
     }
 
