@@ -14,6 +14,8 @@ use crate::config::Config;
 use crate::connection::{ConnectionTable, RecvMode};
 use crate::handler::{ConnSendState, DriverCtx};
 
+use mio::Interest;
+
 /// mio token 0 is reserved for the wake pipe.
 pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
 
@@ -66,6 +68,12 @@ pub(crate) struct Driver {
     /// `DriverCtx::send_await()` pushes len here; the event loop drains
     /// these and calls `Executor::wake_send()` for each.
     pub(crate) send_completions: Vec<VecDeque<u32>>,
+    /// Bound UDP sockets (one per `config.udp_bind` address).
+    pub(crate) udp_sockets: Vec<mio::net::UdpSocket>,
+    /// First mio token used for UDP sockets. UDP socket `i` has token
+    /// `udp_token_base + i`. Tokens below this are WAKE_TOKEN (0) and
+    /// TCP connections (1..=max_connections).
+    pub(crate) udp_token_base: usize,
 }
 
 impl Driver {
@@ -104,6 +112,25 @@ impl Driver {
             }
         };
 
+        // UDP token range starts after WAKE_TOKEN (0) and TCP connections
+        // (1..=max_connections).
+        let udp_token_base = max_conn + 2;
+
+        // Bind UDP sockets and register with mio poll.
+        let mut udp_sockets = Vec::with_capacity(config.udp_bind.len());
+        for (i, addr) in config.udp_bind.iter().enumerate() {
+            let std_socket = std::net::UdpSocket::bind(addr)
+                .map_err(|e| io::Error::new(e.kind(), format!("UDP bind {addr}: {e}")))?;
+            std_socket.set_nonblocking(true)?;
+            let mut mio_socket = mio::net::UdpSocket::from_std(std_socket);
+            poll.registry().register(
+                &mut mio_socket,
+                mio::Token(udp_token_base + i),
+                Interest::READABLE,
+            )?;
+            udp_sockets.push(mio_socket);
+        }
+
         Ok(Driver {
             connections: ConnectionTable::new(config.max_connections),
             accumulators: AccumulatorTable::new(
@@ -136,6 +163,8 @@ impl Driver {
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
+            udp_sockets,
+            udp_token_base,
         })
     }
 

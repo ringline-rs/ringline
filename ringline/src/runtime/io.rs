@@ -2288,17 +2288,21 @@ impl UdpCtx {
         with_state(|driver, _executor| driver.udp_send_to(self.udp_index, peer, data))
     }
 
-    /// Send a datagram to the given peer (not yet implemented on mio backend).
+    /// Send a datagram to the given peer (mio backend — synchronous non-blocking send).
     #[cfg(not(has_io_uring))]
-    pub fn send_to(
-        &self,
-        _peer: SocketAddr,
-        _data: &[u8],
-    ) -> Result<(), crate::error::UdpSendError> {
-        Err(crate::error::UdpSendError::Io(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "UDP send not yet implemented on mio backend",
-        )))
+    pub fn send_to(&self, peer: SocketAddr, data: &[u8]) -> Result<(), crate::error::UdpSendError> {
+        with_state(|driver, _executor| {
+            let idx = self.udp_index as usize;
+            if idx >= driver.udp_sockets.len() {
+                return Err(crate::error::UdpSendError::Io(io::Error::other(
+                    "invalid UDP socket index",
+                )));
+            }
+            match driver.udp_sockets[idx].send_to(data, peer) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(crate::error::UdpSendError::Io(e)),
+            }
+        })
     }
 }
 

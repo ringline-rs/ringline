@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::connection::RecvMode;
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
-use crate::runtime::io::{ConnCtx, DriverState, clear_driver_state, set_driver_state};
+use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, clear_driver_state, set_driver_state};
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor};
 
@@ -85,6 +85,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             mio::Interest::READABLE,
         )?;
 
+        // Spawn UDP handler tasks for each bound UDP socket.
+        for udp_index in 0..self.driver.udp_sockets.len() {
+            let udp_ctx = UdpCtx {
+                udp_index: udp_index as u32,
+            };
+            if let Some(future) = self.handler.on_udp_bind(udp_ctx)
+                && let Some(idx) = self.executor.standalone_slab.spawn(future)
+            {
+                self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+            }
+        }
+
         // Spawn on_start task (client-only entry point).
         if let Some(future) = self.handler.on_start()
             && let Some(idx) = self.executor.standalone_slab.spawn(future)
@@ -127,6 +139,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     WAKE_TOKEN => {
                         if readable {
                             self.drain_wake_pipe();
+                        }
+                    }
+                    tok if tok.0 >= self.driver.udp_token_base
+                        && tok.0 < self.driver.udp_token_base + self.driver.udp_sockets.len() =>
+                    {
+                        if readable {
+                            let udp_index = (tok.0 - self.driver.udp_token_base) as u32;
+                            self.handle_udp_readable(udp_index);
                         }
                     }
                     tok => {
@@ -545,6 +565,26 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Normal writable — mark writable and flush sends.
         self.driver.writable[idx] = true;
         self.driver.flush_sends(conn_index);
+    }
+
+    /// Handle a UDP socket becoming readable: drain datagrams into the
+    /// executor's recv queue and wake the waiting task.
+    fn handle_udp_readable(&mut self, udp_index: u32) {
+        let idx = udp_index as usize;
+        let socket = &self.driver.udp_sockets[idx];
+        let mut buf = [0u8; 65536];
+
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((n, peer)) => {
+                    let data = buf[..n].to_vec();
+                    self.executor.udp_recv_queues[idx].push_back((data, peer));
+                    self.executor.wake_udp_recv(udp_index);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
     }
 
     /// Flush pending sends for all connections that have buffered data.
