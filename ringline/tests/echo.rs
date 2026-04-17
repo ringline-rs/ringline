@@ -871,14 +871,11 @@ fn async_outbound_connect_and_echo() {
     }
 }
 
-#[cfg(has_io_uring)]
 /// Handler that tries to connect to a non-listening address.
 struct ConnectRefusedHandler;
 
-#[cfg(has_io_uring)]
 static CONNECT_REFUSED_PORT: AtomicU32 = AtomicU32::new(0);
 
-#[cfg(has_io_uring)]
 impl AsyncEventHandler for ConnectRefusedHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -909,7 +906,6 @@ impl AsyncEventHandler for ConnectRefusedHandler {
 }
 
 #[test]
-#[cfg(has_io_uring)]
 fn async_outbound_connect_refused() {
     // Bind to a port, then drop the listener so nothing is listening.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3082,15 +3078,12 @@ fn async_on_start_client_only() {
 
 // ── Free connect() to dead port returns error ────────────────────
 
-#[cfg(has_io_uring)]
 /// Handler where on_accept spawns a standalone task that tries to
 /// connect to a dead port via ringline::connect().
 struct StandaloneConnectRefusedHandler;
 
-#[cfg(has_io_uring)]
 static STANDALONE_REFUSED_PORT: AtomicU32 = AtomicU32::new(0);
 
-#[cfg(has_io_uring)]
 impl AsyncEventHandler for StandaloneConnectRefusedHandler {
     fn on_accept(&self, client: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -3126,7 +3119,6 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
 }
 
 #[test]
-#[cfg(has_io_uring)]
 fn async_standalone_connect_refused() {
     // Bind to a port then drop it so nothing is listening.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3616,13 +3608,10 @@ fn buffer_ring_exhaustion_recovers() {
 
 // ── Connect timeout test ────────────────────────────────────────────
 
-#[cfg(has_io_uring)]
 static TIMEOUT_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-#[cfg(has_io_uring)]
 struct ConnectTimeoutClient;
 
-#[cfg(has_io_uring)]
 impl AsyncEventHandler for ConnectTimeoutClient {
     fn on_accept(&self, _conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
         async {}
@@ -3660,7 +3649,6 @@ impl AsyncEventHandler for ConnectTimeoutClient {
 }
 
 #[test]
-#[cfg(has_io_uring)]
 fn async_connect_timeout_fires() {
     let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
         .launch::<ConnectTimeoutClient>()

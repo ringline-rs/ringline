@@ -1696,6 +1696,8 @@ pub struct DriverCtx<'a> {
     pub(crate) writable: &'a mut Vec<bool>,
     /// Per-connection send completion queue (byte counts for awaitable sends).
     pub(crate) send_completions: &'a mut Vec<std::collections::VecDeque<u32>>,
+    /// Per-connection connect timeout deadlines.
+    pub(crate) connect_deadlines: &'a mut Vec<Option<std::time::Instant>>,
 }
 
 #[cfg(not(has_io_uring))]
@@ -1845,9 +1847,12 @@ impl<'a> DriverCtx<'a> {
     pub fn connect_with_timeout(
         &mut self,
         addr: SocketAddr,
-        _timeout_ms: u64,
+        timeout_ms: u64,
     ) -> Result<ConnToken, crate::error::Error> {
-        self.connect(addr)
+        let token = self.connect(addr)?;
+        self.connect_deadlines[token.index as usize] =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+        Ok(token)
     }
 
     /// Connect with TLS.

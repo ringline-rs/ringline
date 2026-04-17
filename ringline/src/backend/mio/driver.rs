@@ -58,6 +58,8 @@ pub(crate) struct Driver {
     pub(crate) pending_sends: Vec<VecDeque<PendingSend>>,
     /// Per-connection writable flag (most recent readiness from mio).
     pub(crate) writable: Vec<bool>,
+    /// Per-connection connect timeout deadline (None if no timeout or not connecting).
+    pub(crate) connect_deadlines: Vec<Option<std::time::Instant>>,
     /// Scratch buffer for TLS plaintext decryption (one per worker thread).
     pub(crate) tls_scratch: Vec<u8>,
     /// Raw fd of the wake pipe read end — registered with mio as WAKE_TOKEN.
@@ -159,6 +161,7 @@ impl Driver {
             tcp_streams: (0..max_conn).map(|_| None).collect(),
             pending_sends: (0..max_conn).map(|_| VecDeque::new()).collect(),
             writable: vec![false; max_conn],
+            connect_deadlines: vec![None; max_conn],
             tls_scratch: vec![0u8; 16384],
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
@@ -193,6 +196,7 @@ impl Driver {
             poll: &mut self.poll,
             writable: &mut self.writable,
             send_completions: &mut self.send_completions,
+            connect_deadlines: &mut self.connect_deadlines,
         }
     }
 
@@ -246,6 +250,7 @@ impl Driver {
         // Clear pending sends (already drained above, but reset state).
         self.pending_sends[idx].clear();
         self.writable[idx] = false;
+        self.connect_deadlines[idx] = None;
         self.send_completions[idx].clear();
 
         // Clear send queue.
