@@ -349,9 +349,9 @@ impl Driver {
         // syscall, reducing TCP segment count under pipelining.
         while !self.pending_sends[idx].is_empty() {
             let mut iovecs: Vec<libc::iovec> =
-                Vec::with_capacity(self.pending_sends[idx].len().min(libc::IOV_MAX as usize));
+                Vec::with_capacity(self.pending_sends[idx].len().min(1024));
             for (data, offset) in self.pending_sends[idx].iter() {
-                if iovecs.len() >= libc::IOV_MAX as usize {
+                if iovecs.len() >= 1024 {
                     break;
                 }
                 let remaining = &data[*offset..];
