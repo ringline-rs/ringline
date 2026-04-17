@@ -126,8 +126,7 @@ pub use connection::PeerAddr;
 pub use handler::ConnToken;
 /// I/O context passed to [`AsyncEventHandler::on_tick`] and [`AsyncEventHandler::on_notify`].
 pub use handler::DriverCtx;
-#[cfg(has_io_uring)]
-/// Pre-classified part for [`AsyncSendBuilder::submit_batch`].
+/// Pre-classified part for scatter-gather sends via `submit_batch`.
 pub use handler::SendPart;
 /// Opaque handle for a UDP socket.
 pub use handler::UdpToken;

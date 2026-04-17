@@ -1227,6 +1227,33 @@ impl AsyncSendBuilder {
         })
     }
 
+    /// Submit a scatter-gather send from pre-classified `SendPart`s.
+    ///
+    /// On the mio backend, guard data is copied (no kernel zero-copy).
+    pub fn submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<usize> {
+        use crate::handler::SendPart;
+        with_state(|driver, _| {
+            let mut buf = Vec::new();
+            let mut consumed = 0usize;
+            for part in &parts {
+                match part {
+                    SendPart::Copy(data) => buf.extend_from_slice(data),
+                    SendPart::Guard(guard) => {
+                        let (ptr, len) = guard.as_ptr_len();
+                        let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                        buf.extend_from_slice(data);
+                    }
+                }
+                consumed += 1;
+            }
+            if !buf.is_empty() {
+                let mut ctx = driver.make_ctx();
+                ctx.send(self.token, &buf)?;
+            }
+            Ok(consumed)
+        })
+    }
+
     /// Build and submit, then await completion.
     pub fn build_await<F>(self, f: F) -> io::Result<SendFuture>
     where

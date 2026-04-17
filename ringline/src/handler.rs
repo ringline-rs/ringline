@@ -5,7 +5,6 @@ use std::net::SocketAddr;
 use crate::buffer::send_copy::SendCopyPool;
 #[cfg(has_io_uring)]
 use crate::buffer::send_slab::{InFlightSendSlab, MAX_GUARDS, MAX_IOVECS};
-#[cfg(has_io_uring)]
 use crate::guard::GuardBox;
 
 /// Per-connection send queue state.
@@ -2464,11 +2463,10 @@ pub(crate) struct BuiltSend {
     pub total_len: u32,
 }
 
-#[cfg(has_io_uring)]
-/// A pre-classified part for `AsyncSendBuilder::submit_batch`.
+/// A pre-classified part for scatter-gather sends via `submit_batch`.
 ///
-/// Used to build mixed scatter-gather sends in the async API without the
-/// lifetime constraints of the closure-based `AsyncSendBuilder::build`.
+/// Used to build mixed copy + zero-copy guard sends without the lifetime
+/// constraints of the closure-based builder API.
 pub enum SendPart<'a> {
     /// Data to be copied into the send pool on submit.
     Copy(&'a [u8]),

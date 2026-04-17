@@ -280,6 +280,9 @@ impl ClientBuilder {
             on_result: self.on_result,
             pending: VecDeque::new(),
             last_rx_bytes: Cell::new(0),
+            write_buf: Vec::new(),
+            write_guards: Vec::new(),
+            flushed_count: 0,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
             #[cfg(feature = "metrics")]
@@ -304,6 +307,16 @@ pub struct Client {
     on_result: Option<ResultCallback>,
     pending: VecDeque<PendingOp>,
     last_rx_bytes: Cell<u32>,
+    /// Write buffer for coalescing `fire_*` commands. Contains all copy data
+    /// (command framing, prefixes, suffixes, non-guard values). Guard values
+    /// are stored separately in `write_guards` with byte offsets into this buffer.
+    write_buf: Vec<u8>,
+    /// Zero-copy guards pending flush. Each entry is `(offset, guard)` where
+    /// `offset` is the byte position in `write_buf` where the guard value
+    /// should be inserted in the byte stream.
+    write_guards: Vec<(usize, GuardBox)>,
+    /// Number of pending ops whose send_ts has been finalized (at flush time).
+    flushed_count: usize,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -320,6 +333,9 @@ impl Client {
             on_result: None,
             pending: VecDeque::new(),
             last_rx_bytes: Cell::new(0),
+            write_buf: Vec::new(),
+            write_guards: Vec::new(),
+            flushed_count: 0,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -444,10 +460,58 @@ impl Client {
     }
 
     /// Fire a GET request without waiting for the response.
+    /// Flush buffered `fire_*` commands as a single send.
+    ///
+    /// Called automatically by [`recv()`](Self::recv). Call explicitly if you
+    /// need commands to hit the wire before reading responses (e.g., when
+    /// interleaving fire/recv across multiple clients).
+    pub fn flush(&mut self) -> Result<(), Error> {
+        if self.write_buf.is_empty() && self.write_guards.is_empty() {
+            return Ok(());
+        }
+
+        if self.write_guards.is_empty() {
+            // Fast path: no guards, single copy send.
+            self.conn.send_nowait(&self.write_buf)?;
+        } else {
+            // Scatter-gather path: interleave copy slices and zero-copy guards.
+            // Build a Vec<SendPart> to avoid lifetime issues with the closure API.
+            use ringline::SendPart;
+            let mut parts: Vec<SendPart<'_>> = Vec::new();
+            let mut pos = 0;
+            for (offset, guard) in self.write_guards.drain(..) {
+                if offset > pos {
+                    parts.push(SendPart::Copy(&self.write_buf[pos..offset]));
+                }
+                parts.push(SendPart::Guard(guard));
+                pos = offset;
+            }
+            if pos < self.write_buf.len() {
+                parts.push(SendPart::Copy(&self.write_buf[pos..]));
+            }
+            self.conn.send_parts().submit_batch(parts)?;
+        }
+
+        self.write_buf.clear();
+        self.write_guards.clear();
+
+        // Update send timestamps for all unflushed pending ops to now —
+        // this is when the commands actually hit the wire.
+        let (send_ts, start) = self.timing_start();
+        for pending in self.pending.iter_mut().skip(self.flushed_count) {
+            pending.send_ts = send_ts;
+            pending.start = start;
+        }
+        self.flushed_count = self.pending.len();
+
+        Ok(())
+    }
+
+    /// Fire a GET request without waiting for the response.
     pub fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         let encoded = Self::encode_request(&Request::get(key));
         let tx_bytes = encoded.len() as u32;
-        self.conn.send_nowait(&encoded)?;
+        self.write_buf.extend_from_slice(&encoded);
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Get,
@@ -464,9 +528,9 @@ impl Client {
         let set_req = Request::set(key, value);
         let (prefix, suffix) = set_req.encode_parts();
         let tx_bytes = (prefix.len() + value.len() + suffix.len()) as u32;
-        self.conn
-            .send_parts()
-            .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())?;
+        self.write_buf.extend_from_slice(&prefix);
+        self.write_buf.extend_from_slice(value);
+        self.write_buf.extend_from_slice(&suffix);
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
@@ -479,6 +543,9 @@ impl Client {
     }
 
     /// Fire a SET request with zero-copy value via SendGuard.
+    ///
+    /// The guard value is kept alive and sent zero-copy at flush time via
+    /// scatter-gather I/O. The command prefix/suffix are buffered as copy data.
     pub fn fire_set_with_guard<G: SendGuard>(
         &mut self,
         key: &[u8],
@@ -488,12 +555,11 @@ impl Client {
         let (_, value_len) = guard.as_ptr_len();
         let prefix = encode_set_guard_prefix(key, value_len as usize, None);
         let tx_bytes = (prefix.len() + value_len as usize + 2) as u32;
-        self.conn.send_parts().build(move |b| {
-            b.copy(&prefix)
-                .guard(GuardBox::new(guard))
-                .copy(b"\r\n")
-                .submit()
-        })?;
+        // Buffer prefix, record guard insertion point, buffer suffix.
+        self.write_buf.extend_from_slice(&prefix);
+        self.write_guards
+            .push((self.write_buf.len(), GuardBox::new(guard)));
+        self.write_buf.extend_from_slice(b"\r\n");
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
@@ -516,9 +582,9 @@ impl Client {
         let set_req = Request::set(key, value).ex(ttl_secs);
         let (prefix, suffix) = set_req.encode_parts();
         let tx_bytes = (prefix.len() + value.len() + suffix.len()) as u32;
-        self.conn
-            .send_parts()
-            .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())?;
+        self.write_buf.extend_from_slice(&prefix);
+        self.write_buf.extend_from_slice(value);
+        self.write_buf.extend_from_slice(&suffix);
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
@@ -531,6 +597,9 @@ impl Client {
     }
 
     /// Fire a SET EX request with zero-copy value via SendGuard.
+    ///
+    /// The guard value is kept alive and sent zero-copy at flush time via
+    /// scatter-gather I/O. The command prefix/suffix are buffered as copy data.
     pub fn fire_set_ex_with_guard<G: SendGuard>(
         &mut self,
         key: &[u8],
@@ -541,12 +610,10 @@ impl Client {
         let (_, value_len) = guard.as_ptr_len();
         let (prefix, suffix) = encode_set_guard_prefix_ex(key, value_len as usize, ttl_secs);
         let tx_bytes = (prefix.len() + value_len as usize + suffix.len()) as u32;
-        self.conn.send_parts().build(move |b| {
-            b.copy(&prefix)
-                .guard(GuardBox::new(guard))
-                .copy(&suffix)
-                .submit()
-        })?;
+        self.write_buf.extend_from_slice(&prefix);
+        self.write_guards
+            .push((self.write_buf.len(), GuardBox::new(guard)));
+        self.write_buf.extend_from_slice(&suffix);
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
@@ -562,7 +629,7 @@ impl Client {
     pub fn fire_del(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         let encoded = Self::encode_request(&Request::del(key));
         let tx_bytes = encoded.len() as u32;
-        self.conn.send_nowait(&encoded)?;
+        self.write_buf.extend_from_slice(&encoded);
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Del,
@@ -578,7 +645,11 @@ impl Client {
     ///
     /// Returns `Err(Error::NoPending)` if there are no in-flight requests.
     pub async fn recv(&mut self) -> Result<CompletedOp, Error> {
+        // Flush any buffered fire_* commands before reading.
+        self.flush()?;
+
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
+        self.flushed_count = self.flushed_count.saturating_sub(1);
 
         // Capture pre-read recv timestamp for TTFB before blocking on data.
         let ttfb_ns = self.compute_ttfb(pending.send_ts);
