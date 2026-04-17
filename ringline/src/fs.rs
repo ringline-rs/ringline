@@ -84,6 +84,7 @@ impl Metadata {
     /// Used by the mio backend's disk I/O pool for `fs_stat` on platforms
     /// that don't have `statx` (e.g., macOS).
     #[cfg(not(has_io_uring))]
+    #[allow(clippy::unnecessary_cast)]
     pub(crate) fn from_stat(st: &libc::stat) -> Self {
         #[cfg(target_os = "macos")]
         let (atime, mtime, ctime) = (
