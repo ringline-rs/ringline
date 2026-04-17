@@ -12,6 +12,7 @@ use crate::accumulator::AccumulatorTable;
 use crate::buffer::send_copy::SendCopyPool;
 use crate::config::Config;
 use crate::connection::{ConnectionTable, RecvMode};
+use crate::disk_io_pool::DiskIoPool;
 use crate::handler::{ConnSendState, DriverCtx};
 
 use mio::Interest;
@@ -76,6 +77,32 @@ pub(crate) struct Driver {
     /// `udp_token_base + i`. Tokens below this are WAKE_TOKEN (0) and
     /// TCP connections (1..=max_connections).
     pub(crate) udp_token_base: usize,
+
+    // ── Disk I/O pool state ─────────���───────────────────────────────
+    /// Disk I/O response channel (worker-local receive end).
+    pub(crate) disk_io_rx: Option<crossbeam_channel::Receiver<crate::disk_io_pool::DiskIoResponse>>,
+    /// Disk I/O response channel (worker-local send end, passed into requests).
+    pub(crate) disk_io_tx: Option<crossbeam_channel::Sender<crate::disk_io_pool::DiskIoResponse>>,
+    /// Shared disk I/O pool.
+    pub(crate) disk_io_pool: Option<Arc<DiskIoPool>>,
+    /// Monotonic sequence counter for disk I/O requests.
+    pub(crate) next_disk_io_seq: u32,
+
+    // ── Direct I/O file management ──────────��───────────────────────
+    /// Direct I/O file table (allocates file slots, tracks raw fds).
+    pub(crate) direct_io_files: Option<crate::direct_io::DirectIoFileTable>,
+    /// Raw fds for direct I/O files, indexed by file slot.
+    pub(crate) direct_io_fds: Vec<Option<RawFd>>,
+
+    // ── Filesystem file management ──────────────────────────────────
+    /// Filesystem file table (allocates file slots, tracks raw fds).
+    pub(crate) fs_files: Option<crate::fs::FsFileTable>,
+    /// Raw fds for filesystem files, indexed by file slot.
+    pub(crate) fs_fds: Vec<Option<RawFd>>,
+    /// Pending fs_open requests: maps seq → file_index. On completion, the
+    /// result (fd) is stored in `fs_fds[file_index]`. On failure, the file
+    /// slot is released.
+    pub(crate) pending_fs_opens: std::collections::HashMap<u32, u16>,
 }
 
 impl Driver {
@@ -95,6 +122,9 @@ impl Driver {
         blocking_rx: Option<crossbeam_channel::Receiver<crate::blocking::BlockingResponse>>,
         blocking_tx: Option<crossbeam_channel::Sender<crate::blocking::BlockingResponse>>,
         blocking_pool: Option<Arc<crate::blocking::BlockingPool>>,
+        disk_io_rx: Option<crossbeam_channel::Receiver<crate::disk_io_pool::DiskIoResponse>>,
+        disk_io_tx: Option<crossbeam_channel::Sender<crate::disk_io_pool::DiskIoResponse>>,
+        disk_io_pool: Option<Arc<DiskIoPool>>,
     ) -> io::Result<Self> {
         let max_conn = config.max_connections as usize;
         let poll = mio::Poll::new()?;
@@ -168,6 +198,29 @@ impl Driver {
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
             udp_sockets,
             udp_token_base,
+            disk_io_rx,
+            disk_io_tx,
+            disk_io_pool,
+            next_disk_io_seq: 0,
+            direct_io_files: config
+                .direct_io
+                .as_ref()
+                .map(|dio| crate::direct_io::DirectIoFileTable::new(dio.max_files)),
+            direct_io_fds: config
+                .direct_io
+                .as_ref()
+                .map(|dio| vec![None; dio.max_files as usize])
+                .unwrap_or_default(),
+            fs_files: config
+                .fs
+                .as_ref()
+                .map(|fs| crate::fs::FsFileTable::new(fs.max_files)),
+            fs_fds: config
+                .fs
+                .as_ref()
+                .map(|fs| vec![None; fs.max_files as usize])
+                .unwrap_or_default(),
+            pending_fs_opens: std::collections::HashMap::new(),
         })
     }
 
@@ -197,6 +250,15 @@ impl Driver {
             writable: &mut self.writable,
             send_completions: &mut self.send_completions,
             connect_deadlines: &mut self.connect_deadlines,
+            disk_io_pool: &self.disk_io_pool,
+            disk_io_tx: &self.disk_io_tx,
+            wake_handle: self.wake_handle,
+            next_disk_io_seq: &mut self.next_disk_io_seq,
+            direct_io_files: &mut self.direct_io_files,
+            direct_io_fds: &mut self.direct_io_fds,
+            fs_files: &mut self.fs_files,
+            fs_fds: &mut self.fs_fds,
+            pending_fs_opens: &mut self.pending_fs_opens,
         }
     }
 

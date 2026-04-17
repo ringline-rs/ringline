@@ -44,7 +44,8 @@
 //! support.
 //!
 //! With `--no-default-features`: mio backend, works on Linux and macOS.
-//! NVMe passthrough, direct I/O, and zero-copy sends are not available.
+//! NVMe passthrough and zero-copy sends are not available. Direct I/O and
+//! filesystem operations are supported via a dedicated thread pool.
 
 // ── Internal modules ────────────────────────────────────────────────────
 pub(crate) mod acceptor;
@@ -62,6 +63,8 @@ pub(crate) mod connection;
 pub(crate) mod counter;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod direct_io;
+#[cfg(not(has_io_uring))]
+pub(crate) mod disk_io_pool;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod fs;
 pub(crate) mod metrics;

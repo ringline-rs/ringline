@@ -1,5 +1,4 @@
 #![allow(clippy::manual_async_fn)]
-#![cfg(has_io_uring)]
 //! Integration tests for the async fs module.
 
 use std::future::Future;

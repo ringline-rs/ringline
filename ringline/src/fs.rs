@@ -78,6 +78,39 @@ impl Metadata {
             is_symlink: (stx.stx_mode & libc::S_IFMT as u16) == libc::S_IFLNK as u16,
         }
     }
+
+    /// Construct `Metadata` from a POSIX `libc::stat` result.
+    ///
+    /// Used by the mio backend's disk I/O pool for `fs_stat` on platforms
+    /// that don't have `statx` (e.g., macOS).
+    #[cfg(not(has_io_uring))]
+    #[allow(clippy::unnecessary_cast)]
+    pub(crate) fn from_stat(st: &libc::stat) -> Self {
+        #[cfg(target_os = "macos")]
+        let (atime, mtime, ctime) = (
+            Duration::new(st.st_atime as u64, st.st_atime_nsec as u32),
+            Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32),
+            Duration::new(st.st_ctime as u64, st.st_ctime_nsec as u32),
+        );
+        #[cfg(target_os = "linux")]
+        let (atime, mtime, ctime) = (
+            Duration::new(st.st_atime as u64, st.st_atime_nsec as u32),
+            Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32),
+            Duration::new(st.st_ctime as u64, st.st_ctime_nsec as u32),
+        );
+        Metadata {
+            size: st.st_size as u64,
+            mode: st.st_mode as u32,
+            uid: st.st_uid,
+            gid: st.st_gid,
+            atime,
+            mtime,
+            ctime,
+            is_file: (st.st_mode & libc::S_IFMT) == libc::S_IFREG,
+            is_dir: (st.st_mode & libc::S_IFMT) == libc::S_IFDIR,
+            is_symlink: (st.st_mode & libc::S_IFMT) == libc::S_IFLNK,
+        }
+    }
 }
 
 /// Configuration for async filesystem I/O.

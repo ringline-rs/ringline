@@ -1698,6 +1698,25 @@ pub struct DriverCtx<'a> {
     pub(crate) send_completions: &'a mut Vec<std::collections::VecDeque<u32>>,
     /// Per-connection connect timeout deadlines.
     pub(crate) connect_deadlines: &'a mut Vec<Option<std::time::Instant>>,
+    /// Shared disk I/O pool for filesystem operations.
+    pub(crate) disk_io_pool: &'a Option<std::sync::Arc<crate::disk_io_pool::DiskIoPool>>,
+    /// Per-worker disk I/O response send channel (included in each request).
+    pub(crate) disk_io_tx:
+        &'a Option<crossbeam_channel::Sender<crate::disk_io_pool::DiskIoResponse>>,
+    /// Wake handle for this worker (used to wake after disk I/O completion).
+    pub(crate) wake_handle: crate::wakeup::WakeHandle,
+    /// Monotonic sequence counter for disk I/O requests.
+    pub(crate) next_disk_io_seq: &'a mut u32,
+    /// Direct I/O file table.
+    pub(crate) direct_io_files: &'a mut Option<crate::direct_io::DirectIoFileTable>,
+    /// Raw fds for direct I/O files, indexed by file slot.
+    pub(crate) direct_io_fds: &'a mut Vec<Option<std::os::fd::RawFd>>,
+    /// Filesystem file table.
+    pub(crate) fs_files: &'a mut Option<crate::fs::FsFileTable>,
+    /// Raw fds for filesystem files, indexed by file slot.
+    pub(crate) fs_fds: &'a mut Vec<Option<std::os::fd::RawFd>>,
+    /// Pending fs_open requests: maps seq → file_index.
+    pub(crate) pending_fs_opens: &'a mut std::collections::HashMap<u32, u16>,
 }
 
 #[cfg(not(has_io_uring))]
@@ -1951,132 +1970,482 @@ impl<'a> DriverCtx<'a> {
         ))
     }
 
-    /// Open a direct I/O file (not supported on mio backend).
+    // ── Direct I/O methods ────────────────────────────────────────────
+
+    /// Allocate a sequence number and submit work to the disk I/O pool.
+    fn submit_disk_io(
+        &mut self,
+        work: Box<dyn FnOnce() -> crate::disk_io_pool::DiskIoResult + Send>,
+    ) -> io::Result<u32> {
+        let pool = self
+            .disk_io_pool
+            .as_ref()
+            .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
+        let tx = self
+            .disk_io_tx
+            .as_ref()
+            .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
+
+        let seq = *self.next_disk_io_seq;
+        *self.next_disk_io_seq = seq.wrapping_add(1);
+
+        pool.request_tx
+            .send(crate::disk_io_pool::DiskIoRequest {
+                work,
+                seq,
+                response_tx: tx.clone(),
+                wake_handle: self.wake_handle,
+            })
+            .map_err(|_| io::Error::other("disk I/O pool shut down"))?;
+
+        Ok(seq)
+    }
+
+    /// Open a file for direct I/O.
+    ///
+    /// On Linux, the file is opened with `O_DIRECT`. On macOS, `fcntl(F_NOCACHE)`
+    /// is used as an approximation. This is synchronous (matching io_uring behavior
+    /// where the fd is needed immediately).
     pub fn open_direct_io_file(
         &mut self,
-        _path: &str,
+        path: &str,
     ) -> io::Result<crate::direct_io::DirectIoFile> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Direct I/O requires the io_uring backend",
-        ))
+        let files = self
+            .direct_io_files
+            .as_mut()
+            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
+
+        let index = files
+            .allocate()
+            .ok_or_else(|| io::Error::other("direct I/O file table full"))?;
+
+        let c_path =
+            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
+
+        #[cfg(target_os = "linux")]
+        let flags = libc::O_RDWR | libc::O_DIRECT;
+        #[cfg(not(target_os = "linux"))]
+        let flags = libc::O_RDWR;
+
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+        if fd < 0 {
+            files.release(index);
+            return Err(io::Error::last_os_error());
+        }
+
+        // On macOS, use F_NOCACHE to bypass the page cache.
+        #[cfg(target_os = "macos")]
+        {
+            unsafe {
+                libc::fcntl(fd, libc::F_NOCACHE, 1);
+            }
+        }
+
+        // Store the fd.
+        if let Some(f) = files.get_mut(index) {
+            f.fd_index = fd as u32;
+        }
+        self.direct_io_fds[index as usize] = Some(fd);
+
+        let generation = files.get(index).map(|f| f.generation).unwrap_or(0);
+        Ok(crate::direct_io::DirectIoFile { index, generation })
     }
 
-    /// Direct I/O read (not supported on mio backend).
+    /// Submit a direct I/O read via the disk I/O pool.
+    ///
+    /// Returns the sequence number for correlation with `DiskIoFuture`.
     pub fn direct_io_read(
         &mut self,
-        _file: crate::direct_io::DirectIoFile,
-        _offset: u64,
-        _buf: *mut u8,
-        _len: u32,
+        file: crate::direct_io::DirectIoFile,
+        offset: u64,
+        buf: *mut u8,
+        len: u32,
     ) -> io::Result<u32> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Direct I/O requires the io_uring backend",
-        ))
+        let fd = self.validate_direct_io_file(file)?;
+        let buf_addr = buf as usize;
+        let work = Box::new(move || {
+            let result = unsafe {
+                libc::pread(
+                    fd,
+                    buf_addr as *mut libc::c_void,
+                    len as usize,
+                    offset as libc::off_t,
+                )
+            };
+            let r = if result < 0 {
+                -(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            } else {
+                result as i32
+            };
+            crate::disk_io_pool::DiskIoResult {
+                result: r,
+                metadata: None,
+            }
+        });
+        self.submit_disk_io(work)
     }
 
-    /// Direct I/O write (not supported on mio backend).
+    /// Submit a direct I/O write via the disk I/O pool.
+    ///
+    /// Returns the sequence number for correlation with `DiskIoFuture`.
     pub fn direct_io_write(
         &mut self,
-        _file: crate::direct_io::DirectIoFile,
-        _offset: u64,
-        _buf: *const u8,
-        _len: u32,
+        file: crate::direct_io::DirectIoFile,
+        offset: u64,
+        buf: *const u8,
+        len: u32,
     ) -> io::Result<u32> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Direct I/O requires the io_uring backend",
-        ))
+        let fd = self.validate_direct_io_file(file)?;
+        let buf_addr = buf as usize;
+        let work = Box::new(move || {
+            let result = unsafe {
+                libc::pwrite(
+                    fd,
+                    buf_addr as *const libc::c_void,
+                    len as usize,
+                    offset as libc::off_t,
+                )
+            };
+            let r = if result < 0 {
+                -(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            } else {
+                result as i32
+            };
+            crate::disk_io_pool::DiskIoResult {
+                result: r,
+                metadata: None,
+            }
+        });
+        self.submit_disk_io(work)
     }
 
-    /// Filesystem open (not supported on mio backend).
-    pub fn fs_open(
+    /// Submit an fsync for a direct I/O file via the disk I/O pool.
+    pub fn direct_io_fsync(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
+        let fd = self.validate_direct_io_file(file)?;
+        let work = Box::new(move || {
+            let result = unsafe { libc::fsync(fd) };
+            let r = if result < 0 {
+                -(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            } else {
+                0
+            };
+            crate::disk_io_pool::DiskIoResult {
+                result: r,
+                metadata: None,
+            }
+        });
+        self.submit_disk_io(work)
+    }
+
+    /// Close a direct I/O file. Synchronous — closes the fd and releases the slot.
+    pub fn close_direct_io_file(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<()> {
+        let fd = self.validate_direct_io_file(file)?;
+        unsafe {
+            libc::close(fd);
+        }
+        self.direct_io_fds[file.index as usize] = None;
+        if let Some(files) = self.direct_io_files.as_mut() {
+            files.release(file.index);
+        }
+        Ok(())
+    }
+
+    /// Validate a direct I/O file handle and return the raw fd.
+    fn validate_direct_io_file(
+        &self,
+        file: crate::direct_io::DirectIoFile,
+    ) -> io::Result<std::os::fd::RawFd> {
+        let files = self
+            .direct_io_files
+            .as_ref()
+            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
+        let f = files
+            .get(file.index)
+            .ok_or_else(|| io::Error::other("invalid direct I/O file handle"))?;
+        if f.generation != file.generation {
+            return Err(io::Error::other("stale direct I/O file handle"));
+        }
+        self.direct_io_fds[file.index as usize]
+            .ok_or_else(|| io::Error::other("direct I/O file fd not found"))
+    }
+
+    // ── Filesystem I/O methods ────────────────────────────────────────
+
+    /// Open a file via the disk I/O pool.
+    ///
+    /// The open is dispatched to the pool. On completion, the pool sends back
+    /// the fd (as the i32 result). The event loop stores the fd in `fs_fds`
+    /// when it drains the response.
+    ///
+    /// Returns `(file_index, generation, seq)`.
+    pub(crate) fn fs_open(
         &mut self,
-        _path: &std::path::Path,
-        _flags: crate::fs::OpenFlags,
-        _mode: u32,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        mode: u32,
     ) -> io::Result<(u16, u16, u32)> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Filesystem operations require the io_uring backend",
-        ))
+        let files = self
+            .fs_files
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+
+        let file_index = files
+            .allocate()
+            .ok_or_else(|| io::Error::other("filesystem file table full"))?;
+
+        let generation = files.get(file_index).map(|f| f.generation).unwrap_or(0);
+
+        let c_path = crate::fs::path_to_cstring(path).inspect_err(|_| {
+            self.fs_files.as_mut().unwrap().release(file_index);
+        })?;
+
+        let open_flags = flags.0;
+        let work = Box::new(move || {
+            let fd = unsafe { libc::open(c_path.as_ptr(), open_flags, mode as libc::c_int) };
+            if fd < 0 {
+                let errno = io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                crate::disk_io_pool::DiskIoResult {
+                    result: -errno,
+                    metadata: None,
+                }
+            } else {
+                // Return the fd as the result (positive value).
+                crate::disk_io_pool::DiskIoResult {
+                    result: fd,
+                    metadata: None,
+                }
+            }
+        });
+
+        match self.submit_disk_io(work) {
+            Ok(seq) => {
+                self.pending_fs_opens.insert(seq, file_index);
+                Ok((file_index, generation, seq))
+            }
+            Err(e) => {
+                self.fs_files.as_mut().unwrap().release(file_index);
+                Err(e)
+            }
+        }
     }
 
-    /// Filesystem stat (not supported on mio backend).
-    pub fn fs_stat(&mut self, _path: &std::path::Path) -> io::Result<u32> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Filesystem operations require the io_uring backend",
-        ))
-    }
-
-    /// Filesystem read (not supported on mio backend).
-    pub fn fs_read(
+    /// Submit a filesystem read via the disk I/O pool.
+    pub(crate) unsafe fn fs_read(
         &mut self,
-        _file: crate::fs::File,
-        _offset: u64,
-        _buf: *mut u8,
-        _len: u32,
+        file: crate::fs::File,
+        offset: u64,
+        buf: *mut u8,
+        len: u32,
     ) -> io::Result<u32> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Filesystem operations require the io_uring backend",
-        ))
+        let fd = self.validate_fs_file(file)?;
+        let buf_addr = buf as usize;
+        let work = Box::new(move || {
+            let result = unsafe {
+                libc::pread(
+                    fd,
+                    buf_addr as *mut libc::c_void,
+                    len as usize,
+                    offset as libc::off_t,
+                )
+            };
+            let r = if result < 0 {
+                -(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            } else {
+                result as i32
+            };
+            crate::disk_io_pool::DiskIoResult {
+                result: r,
+                metadata: None,
+            }
+        });
+        self.submit_disk_io(work)
     }
 
-    /// Filesystem write (not supported on mio backend).
-    pub fn fs_write(
+    /// Submit a filesystem write via the disk I/O pool.
+    pub(crate) unsafe fn fs_write(
         &mut self,
-        _file: crate::fs::File,
-        _offset: u64,
-        _buf: *const u8,
-        _len: u32,
+        file: crate::fs::File,
+        offset: u64,
+        buf: *const u8,
+        len: u32,
     ) -> io::Result<u32> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Filesystem operations require the io_uring backend",
-        ))
+        let fd = self.validate_fs_file(file)?;
+        let buf_addr = buf as usize;
+        let work = Box::new(move || {
+            let result = unsafe {
+                libc::pwrite(
+                    fd,
+                    buf_addr as *const libc::c_void,
+                    len as usize,
+                    offset as libc::off_t,
+                )
+            };
+            let r = if result < 0 {
+                -(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            } else {
+                result as i32
+            };
+            crate::disk_io_pool::DiskIoResult {
+                result: r,
+                metadata: None,
+            }
+        });
+        self.submit_disk_io(work)
     }
 
-    /// Filesystem fsync (not supported on mio backend).
-    pub fn fs_fsync(&mut self, _file: crate::fs::File) -> io::Result<u32> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Filesystem operations require the io_uring backend",
-        ))
+    /// Submit an fsync for a filesystem file via the disk I/O pool.
+    pub(crate) fn fs_fsync(&mut self, file: crate::fs::File) -> io::Result<u32> {
+        let fd = self.validate_fs_file(file)?;
+        let work = Box::new(move || {
+            let result = unsafe { libc::fsync(fd) };
+            let r = if result < 0 {
+                -(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            } else {
+                0
+            };
+            crate::disk_io_pool::DiskIoResult {
+                result: r,
+                metadata: None,
+            }
+        });
+        self.submit_disk_io(work)
     }
 
-    /// Filesystem rename (not supported on mio backend).
-    pub fn fs_rename(&mut self, _from: &std::path::Path, _to: &std::path::Path) -> io::Result<u32> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Filesystem operations require the io_uring backend",
-        ))
+    /// Close a filesystem file. Synchronous — closes the fd and releases the slot.
+    pub(crate) fn fs_close(&mut self, file: crate::fs::File) -> io::Result<()> {
+        let fd = self.validate_fs_file(file)?;
+        unsafe {
+            libc::close(fd);
+        }
+        self.fs_fds[file.index as usize] = None;
+        if let Some(files) = self.fs_files.as_mut() {
+            files.release(file.index);
+        }
+        Ok(())
     }
 
-    /// Filesystem unlink (not supported on mio backend).
-    pub fn fs_unlink(&mut self, _path: &std::path::Path) -> io::Result<u32> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Filesystem operations require the io_uring backend",
-        ))
+    /// Submit a stat via the disk I/O pool.
+    ///
+    /// Uses `libc::stat` (portable) instead of `statx` (Linux-only). The
+    /// result is converted to `crate::fs::Metadata` inside the pool closure
+    /// and delivered via `DiskIoResponse::metadata`.
+    pub(crate) fn fs_stat(&mut self, path: &std::path::Path) -> io::Result<u32> {
+        let c_path = crate::fs::path_to_cstring(path)?;
+        let work = Box::new(move || {
+            let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+            let result = unsafe { libc::stat(c_path.as_ptr(), &mut stat_buf) };
+            if result < 0 {
+                let errno = io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                crate::disk_io_pool::DiskIoResult {
+                    result: -errno,
+                    metadata: None,
+                }
+            } else {
+                let metadata = crate::fs::Metadata::from_stat(&stat_buf);
+                crate::disk_io_pool::DiskIoResult {
+                    result: 0,
+                    metadata: Some(metadata),
+                }
+            }
+        });
+        self.submit_disk_io(work)
     }
 
-    /// Filesystem mkdir (not supported on mio backend).
-    pub fn fs_mkdir(&mut self, _path: &std::path::Path, _mode: u32) -> io::Result<u32> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Filesystem operations require the io_uring backend",
-        ))
+    /// Submit a rename via the disk I/O pool.
+    pub(crate) fn fs_rename(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> io::Result<u32> {
+        let c_from = crate::fs::path_to_cstring(from)?;
+        let c_to = crate::fs::path_to_cstring(to)?;
+        let work = Box::new(move || {
+            let result = unsafe { libc::rename(c_from.as_ptr(), c_to.as_ptr()) };
+            let r = if result < 0 {
+                -(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            } else {
+                0
+            };
+            crate::disk_io_pool::DiskIoResult {
+                result: r,
+                metadata: None,
+            }
+        });
+        self.submit_disk_io(work)
     }
 
-    /// Filesystem close (not supported on mio backend).
-    pub fn fs_close(&mut self, _file: crate::fs::File) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Filesystem operations require the io_uring backend",
-        ))
+    /// Submit an unlink via the disk I/O pool.
+    pub(crate) fn fs_unlink(&mut self, path: &std::path::Path) -> io::Result<u32> {
+        let c_path = crate::fs::path_to_cstring(path)?;
+        let work = Box::new(move || {
+            let result = unsafe { libc::unlink(c_path.as_ptr()) };
+            let r = if result < 0 {
+                -(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            } else {
+                0
+            };
+            crate::disk_io_pool::DiskIoResult {
+                result: r,
+                metadata: None,
+            }
+        });
+        self.submit_disk_io(work)
+    }
+
+    /// Submit a mkdir via the disk I/O pool.
+    pub(crate) fn fs_mkdir(&mut self, path: &std::path::Path, mode: u32) -> io::Result<u32> {
+        let c_path = crate::fs::path_to_cstring(path)?;
+        let work = Box::new(move || {
+            let result = unsafe { libc::mkdir(c_path.as_ptr(), mode as libc::mode_t) };
+            let r = if result < 0 {
+                -(io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO))
+            } else {
+                0
+            };
+            crate::disk_io_pool::DiskIoResult {
+                result: r,
+                metadata: None,
+            }
+        });
+        self.submit_disk_io(work)
+    }
+
+    /// Validate a filesystem file handle and return the raw fd.
+    fn validate_fs_file(&self, file: crate::fs::File) -> io::Result<std::os::fd::RawFd> {
+        let files = self
+            .fs_files
+            .as_ref()
+            .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
+        let f = files
+            .get(file.index)
+            .ok_or_else(|| io::Error::other("invalid filesystem file handle"))?;
+        if f.generation != file.generation {
+            return Err(io::Error::other("stale filesystem file handle"));
+        }
+        self.fs_fds[file.index as usize]
+            .ok_or_else(|| io::Error::other("filesystem file fd not found"))
     }
 }
 

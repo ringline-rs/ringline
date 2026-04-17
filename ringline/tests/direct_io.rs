@@ -1,15 +1,13 @@
 #![allow(clippy::manual_async_fn)]
-#![cfg(has_io_uring)]
-//! Integration tests: direct I/O via ringline's `O_DIRECT` support.
+//! Integration tests: direct I/O via ringline's direct I/O support.
 //!
-//! These tests exercise the full io_uring submission path for
-//! `IORING_OP_READ`, `IORING_OP_WRITE`, and `IORING_OP_FSYNC` using
-//! `O_DIRECT` files.
+//! On Linux, this exercises io_uring `IORING_OP_READ` / `IORING_OP_WRITE`
+//! with `O_DIRECT`. On macOS (mio backend), it uses the disk I/O thread pool
+//! with `fcntl(F_NOCACHE)` as an approximation.
 //!
 //! Requirements:
-//! - Linux 5.6+ (io_uring read/write)
-//! - A real filesystem (ext4, xfs, etc.) — O_DIRECT does not work on tmpfs
-//! - The test binary must be on a filesystem that supports O_DIRECT
+//! - Linux: kernel 5.6+, a real filesystem (not tmpfs)
+//! - macOS: any filesystem (F_NOCACHE works everywhere)
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -44,6 +42,7 @@ fn temp_file_path(name: &str) -> PathBuf {
 }
 
 /// Check if io_uring is supported on this kernel.
+#[cfg(target_os = "linux")]
 fn io_uring_supported() -> bool {
     // Try to create a minimal io_uring. ENOSYS means the syscall doesn't exist.
     let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
@@ -51,7 +50,13 @@ fn io_uring_supported() -> bool {
     ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn io_uring_supported() -> bool {
+    false
+}
+
 /// Check if O_DIRECT is supported by trying to open a file.
+#[cfg(target_os = "linux")]
 fn o_direct_supported() -> bool {
     let path = temp_file_path(".krio_direct_io_probe");
     let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
@@ -72,6 +77,13 @@ fn o_direct_supported() -> bool {
         let _ = std::fs::remove_file(&path);
         false
     }
+}
+
+/// On macOS, "direct I/O" uses F_NOCACHE (set by open_direct_io_file).
+/// No special filesystem support needed.
+#[cfg(not(target_os = "linux"))]
+fn o_direct_supported() -> bool {
+    true
 }
 
 // ── Write then Read roundtrip test ──────────────────────────────────
@@ -128,7 +140,7 @@ impl AsyncEventHandler for RoundtripTickHandler {
 
 #[test]
 fn direct_io_write_fsync_read_roundtrip() {
-    if !io_uring_supported() {
+    if ringline::backend() == ringline::Backend::IoUring && !io_uring_supported() {
         eprintln!("SKIP: io_uring not supported on this kernel");
         return;
     }
@@ -229,7 +241,7 @@ impl AsyncEventHandler for MultiFileTickHandler {
 
 #[test]
 fn direct_io_multiple_files() {
-    if !io_uring_supported() {
+    if ringline::backend() == ringline::Backend::IoUring && !io_uring_supported() {
         eprintln!("SKIP: io_uring not supported on this kernel");
         return;
     }

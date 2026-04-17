@@ -119,6 +119,14 @@ pub struct Config {
     /// 0 = disabled (no blocking pool; [`spawn_blocking()`](crate::spawn_blocking)
     /// will return an error). Default: 4.
     pub blocking_threads: usize,
+    /// Number of dedicated disk I/O threads (mio backend only). The disk I/O
+    /// pool executes blocking filesystem syscalls (pread, pwrite, fsync, stat,
+    /// rename, unlink, mkdir) on background threads, enabling async file I/O
+    /// on non-Linux platforms.
+    ///
+    /// 0 = disabled (filesystem/direct I/O operations return `Unsupported`).
+    /// Default: 2.
+    pub disk_io_threads: usize,
 }
 
 impl Default for Config {
@@ -154,6 +162,7 @@ impl Default for Config {
             resolver_threads: 2,
             spawner_threads: 1,
             blocking_threads: 4,
+            disk_io_threads: 2,
         }
     }
 }
@@ -458,6 +467,12 @@ impl ConfigBuilder {
     /// Set the number of blocking threads. 0 = disabled.
     pub fn blocking_threads(mut self, threads: usize) -> Self {
         self.config.blocking_threads = threads;
+        self
+    }
+
+    /// Set the number of disk I/O threads (mio backend only). 0 = disabled.
+    pub fn disk_io_threads(mut self, threads: usize) -> Self {
+        self.config.disk_io_threads = threads;
         self
     }
 
