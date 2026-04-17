@@ -1672,6 +1672,7 @@ impl<'a> DriverCtx<'a> {
 /// The context provided to handler callbacks for issuing operations.
 ///
 /// This is a short-lived borrow into the driver's internal state.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub struct DriverCtx<'a> {
     pub(crate) connections: &'a mut crate::connection::ConnectionTable,
     pub(crate) send_copy_pool: &'a mut SendCopyPool,
@@ -1687,6 +1688,14 @@ pub struct DriverCtx<'a> {
     /// Per-connection pending send buffers (mio backend).
     /// DriverCtx::send() pushes data here; the event loop flushes on writable.
     pub(crate) pending_sends: &'a mut Vec<std::collections::VecDeque<(Vec<u8>, usize)>>,
+    /// Per-connection mio TcpStream storage (for connect / shutdown_write).
+    pub(crate) tcp_streams: &'a mut Vec<Option<mio::net::TcpStream>>,
+    /// Mio poll instance (for registering new connections).
+    pub(crate) poll: &'a mut mio::Poll,
+    /// Per-connection writable flag.
+    pub(crate) writable: &'a mut Vec<bool>,
+    /// Per-connection send completion queue (byte counts for awaitable sends).
+    pub(crate) send_completions: &'a mut Vec<std::collections::VecDeque<u32>>,
 }
 
 #[cfg(not(has_io_uring))]
@@ -1705,7 +1714,7 @@ impl<'a> DriverCtx<'a> {
     pub fn is_outbound(&self, conn: ConnToken) -> bool {
         self.connections
             .get(conn.index)
-            .map_or(false, |cs| cs.outbound)
+            .is_some_and(|cs| cs.outbound)
     }
 
     /// Send data on a connection (copy into pending send buffer).
@@ -1739,8 +1748,19 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Shut down the write half of a connection.
-    pub fn shutdown_write(&mut self, _conn: ConnToken) {
-        // TODO: implement mio shutdown_write
+    ///
+    /// Flushes any buffered pending sends before issuing the TCP half-close.
+    pub fn shutdown_write(&mut self, conn: ConnToken) {
+        let idx = conn.index as usize;
+        // Flush any pending send data before shutting down.
+        if let Some(ref mut stream) = self.tcp_streams[idx] {
+            use std::io::Write;
+            for (data, offset) in self.pending_sends[idx].drain(..) {
+                let _ = stream.write_all(&data[offset..]);
+            }
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
     }
 
     /// Cancel an in-flight operation.
@@ -1750,10 +1770,40 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Connect to a remote address.
-    pub fn connect(&mut self, _addr: SocketAddr) -> Result<ConnToken, crate::error::Error> {
-        Err(crate::error::Error::Io(io::Error::other(
-            "mio connect not yet implemented",
-        )))
+    pub fn connect(&mut self, addr: SocketAddr) -> Result<ConnToken, crate::error::Error> {
+        let conn_index = self
+            .connections
+            .allocate_outbound()
+            .ok_or_else(|| crate::error::Error::Io(io::Error::other("connection table full")))?;
+
+        let mut mio_stream = match mio::net::TcpStream::connect(addr) {
+            Ok(s) => s,
+            Err(e) => {
+                self.connections.release(conn_index);
+                return Err(crate::error::Error::Io(e));
+            }
+        };
+
+        let token = mio::Token(conn_index as usize + 1);
+        if let Err(e) = self.poll.registry().register(
+            &mut mio_stream,
+            token,
+            mio::Interest::READABLE | mio::Interest::WRITABLE,
+        ) {
+            self.connections.release(conn_index);
+            return Err(crate::error::Error::Io(e));
+        }
+
+        let idx = conn_index as usize;
+        self.tcp_streams[idx] = Some(mio_stream);
+        self.writable[idx] = false;
+        self.pending_sends[idx].clear();
+        if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.peer_addr = Some(crate::connection::PeerAddr::Tcp(addr));
+        }
+
+        let generation = self.connections.generation(conn_index);
+        Ok(ConnToken::new(conn_index, generation))
     }
 
     /// Connect to a Unix socket.
@@ -1976,6 +2026,7 @@ impl<'a> DriverCtx<'a> {
 }
 
 /// A prepared send operation with its associated resources, ready for submission.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) struct BuiltSend {
     /// The io_uring SQE to submit.
     #[cfg(has_io_uring)]

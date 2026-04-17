@@ -51,19 +51,27 @@ pub(crate) mod acceptor;
 pub(crate) mod accumulator;
 pub(crate) mod backend;
 pub(crate) mod blocking;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod buffer;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod chain;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod completion;
 pub(crate) mod connection;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod counter;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod direct_io;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod fs;
 pub(crate) mod metrics;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod nvme;
 pub mod process;
 pub(crate) mod resolver;
 pub(crate) mod runtime;
 pub(crate) mod spawner;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod tls;
 pub(crate) mod wakeup;
 pub(crate) mod worker;
@@ -269,7 +277,6 @@ pub use signal::Signal;
 // ── Re-exports: Stream adapter ──────────────────────────────────────────
 
 /// Wraps a [`ConnCtx`] and implements `futures_io::{AsyncRead, AsyncWrite, AsyncBufRead}`.
-#[cfg(feature = "futures-io")]
 pub use runtime::stream::ConnStream;
 
 // ── Re-exports: Shared types ────────────────────────────────────────────

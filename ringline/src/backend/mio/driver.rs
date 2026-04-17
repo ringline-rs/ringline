@@ -60,6 +60,10 @@ pub(crate) struct Driver {
     pub(crate) wake_pipe_fd: RawFd,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub(crate) tcp_nodelay: bool,
+    /// Per-connection queue of awaitable-send byte counts.
+    /// `DriverCtx::send_await()` pushes len here; the event loop drains
+    /// these and calls `Executor::wake_send()` for each.
+    pub(crate) send_completions: Vec<VecDeque<u32>>,
 }
 
 impl Driver {
@@ -128,6 +132,7 @@ impl Driver {
             writable: vec![false; max_conn],
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
+            send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
         })
     }
 
@@ -152,6 +157,10 @@ impl Driver {
             recvmsg_msghdr: std::ptr::null(),
             send_queues: &mut self.send_queues,
             pending_sends: &mut self.pending_sends,
+            tcp_streams: &mut self.tcp_streams,
+            poll: &mut self.poll,
+            writable: &mut self.writable,
+            send_completions: &mut self.send_completions,
         }
     }
 
@@ -169,9 +178,16 @@ impl Driver {
             return;
         }
 
-        // Flush any pending send data before closing.
+        // Flush any pending send data before closing. Temporarily switch to
+        // blocking mode so write_all doesn't fail with WouldBlock.
         if let Some(ref mut stream) = self.tcp_streams[idx] {
             use std::io::Write;
+            use std::os::fd::AsRawFd;
+            let fd = stream.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
             for (data, offset) in self.pending_sends[idx].drain(..) {
                 let _ = stream.write_all(&data[offset..]);
             }
@@ -187,6 +203,7 @@ impl Driver {
         // Clear pending sends (already drained above, but reset state).
         self.pending_sends[idx].clear();
         self.writable[idx] = false;
+        self.send_completions[idx].clear();
 
         // Clear send queue.
         self.send_queues[idx].queue.clear();
@@ -204,22 +221,26 @@ impl Driver {
     /// Flush pending sends for a connection. Called by the event loop when
     /// the connection becomes writable.
     ///
-    /// Returns `true` if all pending data was flushed (or there was nothing
-    /// to flush). Returns `false` if we got WouldBlock mid-flush.
-    pub(crate) fn flush_sends(&mut self, conn_index: u32) -> bool {
+    /// Returns `(all_flushed, bytes_written)`: `all_flushed` is true if all
+    /// pending data was flushed (or there was nothing to flush), false if we
+    /// got WouldBlock mid-flush. `bytes_written` is the total bytes written
+    /// in this call.
+    pub(crate) fn flush_sends(&mut self, conn_index: u32) -> (bool, u32) {
         let idx = conn_index as usize;
         let stream = match self.tcp_streams[idx].as_mut() {
             Some(s) => s,
-            None => return true,
+            None => return (true, 0),
         };
 
+        let mut total_written: u32 = 0;
         while let Some((data, offset)) = self.pending_sends[idx].front_mut() {
             match stream.write(&data[*offset..]) {
                 Ok(0) => {
                     // Connection closed by peer during write.
-                    return true;
+                    return (true, total_written);
                 }
                 Ok(n) => {
+                    total_written += n as u32;
                     *offset += n;
                     if *offset >= data.len() {
                         // This send is complete.
@@ -228,11 +249,11 @@ impl Driver {
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.writable[idx] = false;
-                    return false;
+                    return (false, total_written);
                 }
                 Err(_) => {
                     // Write error — connection will be closed.
-                    return true;
+                    return (true, total_written);
                 }
             }
         }
@@ -245,7 +266,7 @@ impl Driver {
                 mio::Interest::READABLE,
             );
         }
-        true
+        (true, total_written)
     }
 
     /// Register writable interest for a connection (because we have

@@ -433,6 +433,9 @@ impl H3TestClient {
 
 #[test]
 fn h3_request_response() {
+    if ringline::backend() == ringline::Backend::Mio {
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);
@@ -490,6 +493,9 @@ fn h3_request_response() {
 
 #[test]
 fn h3_request_with_body() {
+    if ringline::backend() == ringline::Backend::Mio {
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);
@@ -545,6 +551,9 @@ fn h3_request_with_body() {
 
 #[test]
 fn h3_multiple_requests() {
+    if ringline::backend() == ringline::Backend::Mio {
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);

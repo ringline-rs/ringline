@@ -24,7 +24,6 @@ pub(crate) mod handler;
 pub(crate) mod io;
 pub(crate) mod join;
 pub(crate) mod select;
-#[cfg(feature = "futures-io")]
 pub(crate) mod stream;
 pub(crate) mod task;
 pub(crate) mod waker;
@@ -142,11 +141,13 @@ impl TimerSlotPool {
     }
 
     /// Encode `(slot_index, generation)` into a 32-bit payload for UserData.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn encode_payload(slot: u32, generation: u16) -> u32 {
         (slot & 0xFFFF) | ((generation as u32) << 16)
     }
 
     /// Decode payload back to `(slot_index, generation)`.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn decode_payload(payload: u32) -> (u32, u16) {
         let slot = payload & 0xFFFF;
         let generation = (payload >> 16) as u16;
@@ -265,6 +266,7 @@ pub(crate) struct Executor {
     /// Pidfd poll results: seq -> CQE result (stored until polled by WaitFuture).
     pub(crate) pidfd_results: HashMap<u32, i32>,
     /// Monotonic counter for pidfd poll sequence numbers.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) next_pidfd_seq: u32,
     /// Pending blocking requests: request_id -> (task_id to wake, result slot).
     pub(crate) pending_blocking: HashMap<u64, (u32, Option<Box<dyn std::any::Any + Send>>)>,
@@ -390,6 +392,7 @@ impl Executor {
     }
 
     /// Wake a task that was waiting for a UDP datagram.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_udp_recv(&mut self, udp_index: u32) {
         let idx = udp_index as usize;
         if idx < self.udp_recv_waiters.len()
@@ -416,6 +419,7 @@ impl Executor {
     /// Disk I/O waiters are keyed by slab_idx (not conn_index), so
     /// `remove_connection()` does not need to clear them — the task
     /// holds the `DiskIoFuture` and will consume the result.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_disk_io(&mut self, seq: u32, result: i32) {
         self.disk_io_results.insert(seq, result);
         if let Some(task_id) = self.disk_io_waiters.remove(&seq) {
@@ -437,6 +441,7 @@ impl Executor {
     }
 
     /// Wake a task waiting for pidfd poll completion (child process exit).
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_pidfd(&mut self, seq: u32, result: i32) {
         self.pidfd_results.insert(seq, result);
         if let Some(task_id) = self.pidfd_waiters.remove(&seq) {

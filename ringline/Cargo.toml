@@ -15,13 +15,11 @@ level = "warn"
 check-cfg = ["cfg(has_io_uring)"]
 
 [features]
-default = ["io-uring", "futures-io"]
-io-uring = ["dep:io-uring"]
+force-mio = []
 timestamps = []
-futures-io = ["dep:futures-io"]
 
 [dependencies]
-futures-io = { version = "0.3", optional = true }
+futures-io = "0.3"
 bytes = "1"
 crossbeam-channel = "0.5"
 libc = "0.2"
@@ -32,7 +30,7 @@ thiserror = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = { version = "0.7", optional = true }
+io-uring = "0.7"
 
 [dev-dependencies]
 futures-io = "0.3"

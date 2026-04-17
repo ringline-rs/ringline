@@ -1,12 +1,15 @@
+#[allow(unused_imports)]
 use std::io::{self, Read as _, Write as _};
 use std::sync::Arc;
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, ServerConnection};
 
+#[allow(unused_imports)]
 use crate::accumulator::AccumulatorTable;
 #[cfg(has_io_uring)]
 use crate::backend::Ring;
+#[allow(unused_imports)]
 use crate::buffer::send_copy::SendCopyPool;
 
 /// Information about a negotiated TLS session.

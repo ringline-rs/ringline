@@ -11,12 +11,15 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::backend::Driver;
+#[cfg(has_io_uring)]
 use crate::completion::{OpTag, UserData};
 use crate::error::TimerExhausted;
 use crate::handler::ConnToken;
+#[cfg(has_io_uring)]
+use crate::runtime::TimerSlotPool;
 use crate::runtime::task::TaskId;
 use crate::runtime::waker::STANDALONE_BIT;
-use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult, TimerSlotPool};
+use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult};
 
 /// Result of a parse closure passed to [`ConnCtx::with_data`] or [`ConnCtx::with_bytes`].
 ///
@@ -713,6 +716,7 @@ impl ConnCtx {
     /// On the mio backend, this always uses the copy path.
     pub fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
         with_state(|driver, _| {
+            #[cfg_attr(not(has_io_uring), allow(unused_variables))]
             let conn_index = self.conn_index;
 
             #[cfg(has_io_uring)]
@@ -803,6 +807,13 @@ impl ConnCtx {
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), data)?;
             executor.send_waiters[self.conn_index as usize] = true;
+            // On mio, the send is buffered synchronously — record a pending
+            // completion so the event loop can deliver wake_send for each
+            // individual awaitable send.
+            #[cfg(not(has_io_uring))]
+            {
+                driver.send_completions[self.conn_index as usize].push_back(data.len() as u32);
+            }
             Ok(SendFuture {
                 conn_index: self.conn_index,
             })
@@ -2120,6 +2131,9 @@ pub unsafe fn direct_io_read(
 ) -> io::Result<DiskIoFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
+        // Safety: the outer `direct_io_read()` is already unsafe, and the
+        // caller guarantees the buffer invariants.
+        #[allow(unused_unsafe)]
         let seq = unsafe { ctx.direct_io_read(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
@@ -2178,6 +2192,9 @@ pub unsafe fn direct_io_write(
 ) -> io::Result<DiskIoFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
+        // Safety: the outer `direct_io_write()` is already unsafe, and the
+        // caller guarantees the buffer invariants.
+        #[allow(unused_unsafe)]
         let seq = unsafe { ctx.direct_io_write(file, offset, buf, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
