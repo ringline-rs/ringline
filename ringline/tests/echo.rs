@@ -2771,11 +2771,9 @@ fn async_timeout_at_expires() {
 
 // ── UDP ───────────────────────────────────────────────────────────
 
-#[cfg(has_io_uring)]
 /// Async handler that echoes UDP datagrams via UdpCtx.
 struct UdpEchoAsync;
 
-#[cfg(has_io_uring)]
 impl AsyncEventHandler for UdpEchoAsync {
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {
@@ -2805,7 +2803,6 @@ impl AsyncEventHandler for UdpEchoAsync {
     }
 }
 
-#[cfg(has_io_uring)]
 #[test]
 fn async_udp_echo() {
     let udp_port = free_port();

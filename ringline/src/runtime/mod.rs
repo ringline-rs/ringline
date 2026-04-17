@@ -392,7 +392,6 @@ impl Executor {
     }
 
     /// Wake a task that was waiting for a UDP datagram.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_udp_recv(&mut self, udp_index: u32) {
         let idx = udp_index as usize;
         if idx < self.udp_recv_waiters.len()
