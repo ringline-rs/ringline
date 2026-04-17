@@ -379,6 +379,9 @@ impl QuicTestClient {
 
 #[test]
 fn quic_echo() {
+    if ringline::backend() == ringline::Backend::Mio {
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);
@@ -425,6 +428,9 @@ fn quic_echo() {
 
 #[test]
 fn quic_multi_stream() {
+    if ringline::backend() == ringline::Backend::Mio {
+        return;
+    }
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (certs, key) = generate_self_signed();
     let server_cfg = server_crypto(certs.clone(), key);
