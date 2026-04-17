@@ -46,6 +46,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         blocking_tx: Option<crossbeam_channel::Sender<crate::blocking::BlockingResponse>>,
         blocking_pool: Option<Arc<crate::blocking::BlockingPool>>,
     ) -> io::Result<Self> {
+        // Create per-worker disk I/O pool and channels if configured.
+        // Each worker gets its own pool instance (lightweight — just thread
+        // handles) and its own channel pair. This avoids changing the
+        // launch_inner / worker_fn signature.
+        let (disk_io_rx, disk_io_tx, disk_io_pool) = if config.disk_io_threads > 0
+            && (config.direct_io.is_some() || config.fs.is_some())
+        {
+            let pool = Arc::new(crate::disk_io_pool::DiskIoPool::start(
+                config.disk_io_threads,
+            ));
+            let (tx, rx) = crossbeam_channel::unbounded::<crate::disk_io_pool::DiskIoResponse>();
+            (Some(rx), Some(tx), Some(pool))
+        } else {
+            (None, None, None)
+        };
+
         let driver = Driver::new(
             config,
             accept_rx,
@@ -60,6 +76,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             blocking_rx,
             blocking_tx,
             blocking_pool,
+            disk_io_rx,
+            disk_io_tx,
+            disk_io_pool,
         )?;
 
         let executor = Executor::new(
@@ -332,6 +351,40 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             while let Ok(response) = rx.try_recv() {
                 self.executor
                     .deliver_blocking(response.request_id, response.result);
+            }
+        }
+
+        // Drain disk I/O responses.
+        if let Some(ref rx) = self.driver.disk_io_rx {
+            while let Ok(response) = rx.try_recv() {
+                // Handle fs_open completions: install fd or release slot.
+                if let Some(file_index) = self.driver.pending_fs_opens.remove(&response.seq) {
+                    if response.result >= 0 {
+                        // Success — result is the fd.
+                        let fd = response.result;
+                        self.driver.fs_fds[file_index as usize] = Some(fd as std::os::fd::RawFd);
+                        if let Some(ref mut files) = self.driver.fs_files
+                            && let Some(f) = files.get_mut(file_index)
+                        {
+                            f.fd_index = fd as u32;
+                        }
+                        // Convert to success (0) for the OpenFuture.
+                        self.executor.wake_disk_io(response.seq, 0);
+                    } else {
+                        // Failure — release the pre-allocated file slot.
+                        if let Some(ref mut files) = self.driver.fs_files {
+                            files.release(file_index);
+                        }
+                        self.executor.wake_disk_io(response.seq, response.result);
+                    }
+                    continue;
+                }
+
+                // If the response carries metadata (stat), store it.
+                if let Some(metadata) = response.metadata {
+                    self.executor.fs_stat_results.insert(response.seq, metadata);
+                }
+                self.executor.wake_disk_io(response.seq, response.result);
             }
         }
 

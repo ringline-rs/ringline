@@ -163,6 +163,7 @@ impl RinglineBuilder {
 
     /// Common infrastructure setup for launch.
     #[allow(clippy::needless_range_loop)]
+    #[allow(clippy::type_complexity)]
     fn launch_inner<F>(self, worker_fn: F) -> LaunchResult
     where
         F: Fn(
