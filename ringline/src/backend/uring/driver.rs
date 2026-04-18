@@ -436,7 +436,7 @@ impl Driver {
         // Drain queued sends and release resources.
         self.drain_conn_send_queue(conn_index);
         if self.ring.submit_close(conn_index).is_err() {
-            crate::metrics::CLOSE_SUBMIT_FAILURES.increment();
+            crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
             self.pending_close_retries.push(conn_index);
         }
     }
@@ -696,7 +696,7 @@ impl Driver {
 
         match self.ring.submit_sendmsg(fd_index, msghdr_ptr, ud) {
             Ok(()) => {
-                crate::metrics::UDP_DATAGRAMS_SENT.increment();
+                crate::metrics::UDP.increment(crate::metrics::udp::DATAGRAMS_SENT);
                 self.udp_sockets[idx].send_in_flight = true;
                 self.udp_sockets[idx].send_pool_slot = pool_slot;
                 Ok(())
@@ -720,7 +720,7 @@ impl Driver {
         let fd_index = self.udp_sockets[idx].fd_index;
         if self.ring.submit_recvmsg(fd_index, msghdr_ptr, ud).is_err() {
             // UDP recv is dead for this socket until the next successful submit.
-            crate::metrics::SQE_SUBMIT_FAILURES.increment();
+            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
         }
     }
 
@@ -832,7 +832,7 @@ impl Driver {
         {
             // Kernel may hold a dangling pointer to the freed mmap region.
             // This is a best-effort operation during shutdown.
-            crate::metrics::SQE_SUBMIT_FAILURES.increment();
+            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
         }
 
         // 4. Close the eventfd.

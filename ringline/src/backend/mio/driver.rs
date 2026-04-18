@@ -323,7 +323,7 @@ impl Driver {
             self.connections.release(conn_index);
         }
 
-        crate::metrics::CONNECTIONS_CLOSED.increment();
+        crate::metrics::CONNECTIONS.increment(crate::metrics::conn::CLOSED);
         crate::metrics::CONNECTIONS_ACTIVE.decrement();
     }
 

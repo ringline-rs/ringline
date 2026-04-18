@@ -1786,7 +1786,7 @@ pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
         let _ = driver; // used only on io_uring path
         let waker_id = CURRENT_TASK_ID.with(|c| c.get());
         let (slot, generation) = executor.timer_pool.allocate(waker_id).ok_or_else(|| {
-            crate::metrics::TIMER_POOL_EXHAUSTED.increment();
+            crate::metrics::POOL.increment(crate::metrics::pool::TIMER_EXHAUSTED);
             TimerExhausted
         })?;
 
@@ -1913,7 +1913,7 @@ pub fn try_sleep_until(deadline: Deadline) -> Result<SleepFuture, TimerExhausted
         let _ = driver; // used only on io_uring path
         let waker_id = CURRENT_TASK_ID.with(|c| c.get());
         let (slot, generation) = executor.timer_pool.allocate(waker_id).ok_or_else(|| {
-            crate::metrics::TIMER_POOL_EXHAUSTED.increment();
+            crate::metrics::POOL.increment(crate::metrics::pool::TIMER_EXHAUSTED);
             TimerExhausted
         })?;
 
