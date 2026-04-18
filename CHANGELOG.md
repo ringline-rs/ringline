@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-04-18
+
+### Added
+- **Cross-platform mio backend** — ringline now compiles and runs on macOS and Linux without io_uring. The backend is selected automatically via `build.rs` (io_uring on Linux 6.0+, mio elsewhere). Use `--features force-mio` to opt into mio on Linux. The public API is identical across backends. (#94–#102)
+- `ringline::backend()` returns `Backend::IoUring` or `Backend::Mio` for runtime detection (#95)
+- `nvme_flush()` async free function for NVMe flush operations (#93)
+- Per-command byte metrics (`tx_bytes`, `rx_bytes`), `latency` on `CompletedOp`, and TTFB tracking for redis, memcache, and momento clients (#91)
+
+### Changed
+- Backend selection is automatic — no feature flags needed. `io-uring` is a target-conditional dependency (Linux only). `futures-io` is always enabled. (#95)
+- **ringline-redis**: `fire_*` commands are now coalesced into a single send per pipeline batch, reducing TCP segments from N to 1 under deep pipelining. Guard values remain zero-copy via scatter-gather I/O. (#104)
+- CI now tests both io_uring and mio backends, including Redis, Memcache, and public server integration tests on mio (#96–#102)
+
+### Fixed
+- Correct `send_ts` for TTFB calculation in momento multiplexed recv (#92)
+- Add retry with backoff for crates.io rate limits in CI (#90)
+
 ## [0.0.5] - 2026-04-09
 
 ### Fixed

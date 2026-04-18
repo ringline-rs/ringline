@@ -1,6 +1,6 @@
 [package]
 name = "ringline-bench"
-version = "0.0.4"
+version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
