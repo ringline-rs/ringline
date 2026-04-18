@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+      - 'ringline-*-v*'
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,17 +27,50 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Verify tag matches ringline version
+      - name: Parse tag
+        id: parse
         run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
-          CARGO_VERSION=$(grep '^version = ' ringline/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          if [ "$TAG" != "$CARGO_VERSION" ]; then
-            echo "ERROR: Tag v$TAG does not match ringline/Cargo.toml version $CARGO_VERSION"
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=$TAG"
+
+          if [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            # Workspace release: v0.1.0
+            echo "mode=workspace" >> $GITHUB_OUTPUT
+            echo "version=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" =~ ^([a-z-]+)-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            # Per-crate release: ringline-redis-v0.2.1
+            echo "mode=crate" >> $GITHUB_OUTPUT
+            echo "crate=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+            echo "version=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+          else
+            echo "ERROR: Unrecognized tag format: $TAG"
             exit 1
           fi
-          echo "Release tag: v$TAG"
+
+      - name: Verify version (workspace)
+        if: steps.parse.outputs.mode == 'workspace'
+        run: |
+          TAG_VERSION="${{ steps.parse.outputs.version }}"
+          CARGO_VERSION=$(grep '^version = ' ringline/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "ERROR: Tag v$TAG_VERSION does not match ringline/Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      - name: Verify version (crate)
+        if: steps.parse.outputs.mode == 'crate'
+        run: |
+          CRATE="${{ steps.parse.outputs.crate }}"
+          TAG_VERSION="${{ steps.parse.outputs.version }}"
+          CRATE_PATH="${CRATE}/Cargo.toml"
+          CARGO_VERSION=$(grep '^version = ' "$CRATE_PATH" | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "ERROR: Tag version $TAG_VERSION does not match $CRATE_PATH version $CARGO_VERSION"
+            exit 1
+          fi
 
       - name: Publish workspace crates
+        if: steps.parse.outputs.mode == 'workspace'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -59,8 +93,6 @@ jobs:
             fi
 
             # Publish with retry on rate limit (HTTP 429).
-            # crates.io allows 5 new-crate burst, then 1 per 10 minutes.
-            # Retry every 60s to catch the window as soon as it opens.
             local attempt
             for attempt in $(seq 1 15); do
               echo "  $crate v$version — publishing (attempt $attempt)..."
@@ -98,6 +130,40 @@ jobs:
           publish_if_needed ringline-http
 
           echo "=== Done ==="
+
+      - name: Publish single crate
+        if: steps.parse.outputs.mode == 'crate'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          CRATE="${{ steps.parse.outputs.crate }}"
+          VERSION="${{ steps.parse.outputs.version }}"
+
+          # Check if already published.
+          PUBLISHED=$(curl -s "https://crates.io/api/v1/crates/$CRATE/$VERSION" \
+            | jq -r '.version.num // empty')
+
+          if [ "$PUBLISHED" = "$VERSION" ]; then
+            echo "$CRATE v$VERSION — already published, skipping"
+            exit 0
+          fi
+
+          # Publish with retry.
+          for attempt in $(seq 1 15); do
+            echo "$CRATE v$VERSION — publishing (attempt $attempt)..."
+            if cargo publish -p "$CRATE" 2>&1; then
+              echo "Published $CRATE v$VERSION"
+              exit 0
+            fi
+
+            if [ "$attempt" -lt 15 ]; then
+              echo "$CRATE — publish failed, retrying in 60s..."
+              sleep 60
+            fi
+          done
+
+          echo "ERROR: $CRATE failed after 15 attempts"
+          exit 1
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -9,12 +9,13 @@ env:
 
 jobs:
   tag-release:
-    name: Tag release and bump dev version
+    name: Tag release
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # Only run if the commit message starts with "release: v" (matches merge commit titles)
-    if: "startsWith(github.event.head_commit.message, 'release: v')"
+      pull-requests: write
+    # Run on commits starting with "release: " (workspace or per-crate)
+    if: "startsWith(github.event.head_commit.message, 'release: ')"
 
     steps:
       - uses: actions/checkout@v4
@@ -27,37 +28,77 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Extract version
-        id: version
+      - name: Parse release type
+        id: parse
         run: |
-          VERSION=$(grep '^version = ' ringline/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Detected version: $VERSION"
+          MSG="${{ github.event.head_commit.message }}"
+          echo "Commit message: $MSG"
+
+          if [[ "$MSG" =~ ^release:\ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            # Full workspace release: "release: v0.1.0"
+            echo "mode=workspace" >> $GITHUB_OUTPUT
+            echo "version=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+            echo "tag=v${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+            echo "Detected workspace release: v${BASH_REMATCH[1]}"
+          elif [[ "$MSG" =~ ^release:\ ([a-z-]+)\ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            # Per-crate release: "release: ringline-redis v0.2.1"
+            echo "mode=crate" >> $GITHUB_OUTPUT
+            echo "crate=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+            echo "version=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+            echo "tag=${BASH_REMATCH[1]}-v${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+            echo "Detected crate release: ${BASH_REMATCH[1]} v${BASH_REMATCH[2]}"
+          else
+            echo "mode=none" >> $GITHUB_OUTPUT
+            echo "Commit message does not match release pattern, skipping"
+          fi
+
+      - name: Verify version matches Cargo.toml
+        if: steps.parse.outputs.mode != 'none'
+        run: |
+          MODE="${{ steps.parse.outputs.mode }}"
+          VERSION="${{ steps.parse.outputs.version }}"
+
+          if [ "$MODE" = "workspace" ]; then
+            CARGO_VERSION=$(grep '^version = ' ringline/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+            CRATE_PATH="ringline/Cargo.toml"
+          else
+            CRATE="${{ steps.parse.outputs.crate }}"
+            CRATE_PATH="${CRATE}/Cargo.toml"
+            CARGO_VERSION=$(grep '^version = ' "$CRATE_PATH" | head -1 | sed 's/version = "\(.*\)"/\1/')
+          fi
+
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "ERROR: Tag version $VERSION does not match $CRATE_PATH version $CARGO_VERSION"
+            exit 1
+          fi
+          echo "Version $VERSION matches $CRATE_PATH"
 
       - name: Check if tag exists
         id: check_tag
+        if: steps.parse.outputs.mode != 'none'
         run: |
-          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+          TAG="${{ steps.parse.outputs.tag }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Tag v${{ steps.version.outputs.version }} already exists"
+            echo "Tag $TAG already exists"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Create and push tag
-        if: steps.check_tag.outputs.exists == 'false'
+        if: steps.parse.outputs.mode != 'none' && steps.check_tag.outputs.exists == 'false'
         run: |
-          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
-          git push origin "v${{ steps.version.outputs.version }}"
-          echo "Created and pushed tag v${{ steps.version.outputs.version }}"
+          TAG="${{ steps.parse.outputs.tag }}"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          echo "Created and pushed tag $TAG"
 
-      - name: Bump to next dev version
-        if: steps.check_tag.outputs.exists == 'false'
+      - name: Bump to next dev version (workspace only)
+        if: steps.parse.outputs.mode == 'workspace' && steps.check_tag.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
-          # Calculate next dev version (patch bump + alpha.0)
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${{ steps.parse.outputs.version }}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
           NEXT_DEV="${MAJOR}.${MINOR}.$((PATCH + 1))-alpha.0"
           echo "Bumping to next dev version: $NEXT_DEV"
@@ -65,13 +106,9 @@ jobs:
           BRANCH="chore/bump-${NEXT_DEV}"
           git checkout -b "$BRANCH"
 
-          # Update ringline/Cargo.toml version
           sed -i "0,/^version = \"${VERSION}\"/s//version = \"${NEXT_DEV}\"/" ringline/Cargo.toml
-
-          # Update workspace dependency in root Cargo.toml
           sed -i "s/ringline = { path = \"ringline\", version = \"${VERSION}\" }/ringline = { path = \"ringline\", version = \"${NEXT_DEV}\" }/" Cargo.toml
 
-          # Commit, push branch, create PR
           git add ringline/Cargo.toml Cargo.toml
           git commit -m "chore: bump to ${NEXT_DEV} for next development iteration"
           git push origin "$BRANCH"
@@ -82,15 +119,42 @@ jobs:
             --base main \
             --head "$BRANCH"
 
+      - name: Bump to next dev version (per-crate)
+        if: steps.parse.outputs.mode == 'crate' && steps.check_tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          CRATE="${{ steps.parse.outputs.crate }}"
+          VERSION="${{ steps.parse.outputs.version }}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          NEXT_PATCH="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "Bumping $CRATE to next patch version: $NEXT_PATCH"
+
+          BRANCH="chore/bump-${CRATE}-${NEXT_PATCH}"
+          git checkout -b "$BRANCH"
+
+          sed -i "0,/^version = \"${VERSION}\"/s//version = \"${NEXT_PATCH}\"/" "${CRATE}/Cargo.toml"
+
+          git add "${CRATE}/Cargo.toml"
+          git commit -m "chore: bump ${CRATE} to ${NEXT_PATCH} for next development iteration"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "chore: bump ${CRATE} to ${NEXT_PATCH}" \
+            --body "Automated version bump after ${CRATE} v${VERSION} release." \
+            --base main \
+            --head "$BRANCH"
+
       - name: Summary
+        if: steps.parse.outputs.mode != 'none'
         run: |
           echo "## Release Tagged" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ steps.check_tag.outputs.exists }}" == "true" ]; then
-            echo "Tag v${{ steps.version.outputs.version }} already existed, skipped." >> $GITHUB_STEP_SUMMARY
+            echo "Tag ${{ steps.parse.outputs.tag }} already existed, skipped." >> $GITHUB_STEP_SUMMARY
           else
-            echo "- Created tag: v${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-            echo "- Bumped to next dev version" >> $GITHUB_STEP_SUMMARY
+            echo "- Created tag: ${{ steps.parse.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Mode: ${{ steps.parse.outputs.mode }}" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The release workflow will now build and publish artifacts." >> $GITHUB_STEP_SUMMARY
+            echo "The release workflow will now build and publish." >> $GITHUB_STEP_SUMMARY
           fi
