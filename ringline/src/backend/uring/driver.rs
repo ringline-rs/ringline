@@ -466,12 +466,18 @@ impl Driver {
                             &mut self.send_copy_pool,
                         );
                         state.in_flight = false;
+                        state.shutdown_pending = false;
                         false
                     }
                 }
             }
             None => {
                 state.in_flight = false;
+                // Submit deferred shutdown_write now that the send queue is drained.
+                if state.shutdown_pending {
+                    state.shutdown_pending = false;
+                    let _ = self.ring.submit_shutdown(conn_index);
+                }
                 false
             }
         }
