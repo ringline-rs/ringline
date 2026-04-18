@@ -53,6 +53,8 @@ jobs:
 
       - name: Bump to next dev version
         if: steps.check_tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           # Calculate next dev version (patch bump + alpha.0)
           VERSION="${{ steps.version.outputs.version }}"
@@ -60,16 +62,25 @@ jobs:
           NEXT_DEV="${MAJOR}.${MINOR}.$((PATCH + 1))-alpha.0"
           echo "Bumping to next dev version: $NEXT_DEV"
 
+          BRANCH="chore/bump-${NEXT_DEV}"
+          git checkout -b "$BRANCH"
+
           # Update ringline/Cargo.toml version
           sed -i "0,/^version = \"${VERSION}\"/s//version = \"${NEXT_DEV}\"/" ringline/Cargo.toml
 
           # Update workspace dependency in root Cargo.toml
           sed -i "s/ringline = { path = \"ringline\", version = \"${VERSION}\" }/ringline = { path = \"ringline\", version = \"${NEXT_DEV}\" }/" Cargo.toml
 
-          # Commit and push
+          # Commit, push branch, create PR
           git add ringline/Cargo.toml Cargo.toml
           git commit -m "chore: bump to ${NEXT_DEV} for next development iteration"
-          git push origin main
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "chore: bump to ${NEXT_DEV} for next development iteration" \
+            --body "Automated version bump after v${VERSION} release." \
+            --base main \
+            --head "$BRANCH"
 
       - name: Summary
         run: |
