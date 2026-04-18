@@ -100,16 +100,17 @@ jobs:
         run: |
           VERSION="${{ steps.parse.outputs.version }}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-          NEXT_DEV="${MAJOR}.${MINOR}.$((PATCH + 1))-alpha.0"
+          NEXT_DEV="${MAJOR}.${MINOR}.$((PATCH + 1))"
           echo "Bumping to next dev version: $NEXT_DEV"
 
           BRANCH="chore/bump-${NEXT_DEV}"
           git checkout -b "$BRANCH"
 
+          # Only bump ringline/Cargo.toml. The workspace dep uses a semver
+          # range (e.g., "0.1") so it doesn't need updating for patch bumps.
           sed -i "0,/^version = \"${VERSION}\"/s//version = \"${NEXT_DEV}\"/" ringline/Cargo.toml
-          sed -i "s/ringline = { path = \"ringline\", version = \"${VERSION}\" }/ringline = { path = \"ringline\", version = \"${NEXT_DEV}\" }/" Cargo.toml
 
-          git add ringline/Cargo.toml Cargo.toml
+          git add ringline/Cargo.toml
           git commit -m "chore: bump to ${NEXT_DEV} for next development iteration"
           git push origin "$BRANCH"
 
