@@ -1428,11 +1428,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         self.driver.send_copy_pool.release(pool_slot);
 
+        let mut slot_returned = false;
         if idx < self.driver.udp_sockets.len() {
             let sock = &mut self.driver.udp_sockets[idx];
             if (slot_idx as usize) < sock.send_slots.len() {
                 sock.send_freelist.push(slot_idx);
+                slot_returned = true;
             }
+        }
+
+        // A freed slot may unblock a task awaiting `UdpCtx::send_ready`.
+        if slot_returned {
+            self.executor.wake_udp_send_ready(udp_index);
         }
 
         if result < 0 {
@@ -2394,6 +2401,31 @@ mod tests {
         assert!(
             el.driver.udp_sockets[0].send_freelist.contains(&slot_idx),
             "send slot not returned to freelist after CQE"
+        );
+    }
+
+    #[test]
+    fn handle_send_msg_udp_wakes_send_ready_waiter() {
+        let mut el = make_test_loop();
+
+        if el.driver.udp_sockets.is_empty() {
+            return;
+        }
+
+        // Register a waiter as though a task had polled UdpCtx::send_ready.
+        el.executor.udp_send_ready_waiters[0] = Some(42);
+
+        let data = b"wake";
+        let (pool_slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let slot_idx = el.driver.udp_sockets[0].send_freelist.pop().unwrap();
+
+        let payload = crate::backend::uring::driver::encode_udp_send_payload(slot_idx, pool_slot);
+        let ud = UserData::encode(OpTag::SendMsgUdp, 0u32, payload);
+        el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
+
+        assert!(
+            el.executor.udp_send_ready_waiters[0].is_none(),
+            "send_ready waiter not cleared after CQE"
         );
     }
 

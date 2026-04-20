@@ -2306,6 +2306,24 @@ impl UdpCtx {
         }
     }
 
+    /// Resolve when at least one UDP send slot is available on this socket.
+    ///
+    /// Use this to back off when [`UdpCtx::send_to`] returns
+    /// [`crate::error::UdpSendError::PoolExhausted`], rather than busy-looping.
+    /// On the io_uring backend the future suspends until a completion frees
+    /// a slot. On the mio backend sends are synchronous and this future is
+    /// always immediately ready — callers can still use it to stay
+    /// backend-agnostic.
+    ///
+    /// Only one task should await this per socket at a time; a second waiter
+    /// overwrites the first, which is then leaked (it must still be driven
+    /// from another wake source).
+    pub fn send_ready(&self) -> UdpSendReadyFuture {
+        UdpSendReadyFuture {
+            udp_index: self.udp_index,
+        }
+    }
+
     /// Send a datagram to the given peer (fire-and-forget, copying).
     ///
     /// Copies `data` into the send pool and submits a `sendmsg` SQE.
@@ -2365,5 +2383,40 @@ impl Future for UdpRecvFuture {
             }
             Poll::Pending
         })
+    }
+}
+
+/// Future returned by [`UdpCtx::send_ready()`].
+pub struct UdpSendReadyFuture {
+    /// Never read on the mio backend — the future resolves immediately
+    /// without looking at any per-socket state.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    udp_index: u32,
+}
+
+impl Future for UdpSendReadyFuture {
+    type Output = ();
+
+    #[cfg(has_io_uring)]
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        with_state(|driver, executor| {
+            let idx = self.udp_index as usize;
+            if idx < driver.udp_sockets.len() && !driver.udp_sockets[idx].send_freelist.is_empty() {
+                return Poll::Ready(());
+            }
+            // Register as the waiter. CQE handler wakes us when a slot frees.
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            if idx < executor.udp_send_ready_waiters.len() {
+                executor.udp_send_ready_waiters[idx] = Some(task_id);
+            }
+            Poll::Pending
+        })
+    }
+
+    /// Mio backend: sends are synchronous `send_to` calls that never queue,
+    /// so this future resolves immediately. Callers stay backend-agnostic.
+    #[cfg(not(has_io_uring))]
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Ready(())
     }
 }

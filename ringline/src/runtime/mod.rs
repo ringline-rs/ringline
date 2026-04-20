@@ -246,6 +246,11 @@ pub(crate) struct Executor {
     pub(crate) udp_recv_queues: Vec<VecDeque<(Vec<u8>, std::net::SocketAddr)>>,
     /// Per-UDP-socket: task ID waiting for recv_from (None = no waiter).
     pub(crate) udp_recv_waiters: Vec<Option<u32>>,
+    /// Per-UDP-socket: task ID waiting for a free send slot (None = no waiter).
+    /// Driven by the io_uring backend's slot ring; the mio backend leaves this
+    /// empty because sends are synchronous and never suspend.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) udp_send_ready_waiters: Vec<Option<u32>>,
     /// Disk I/O: maps command slab_idx → task_id to wake on completion.
     pub(crate) disk_io_waiters: HashMap<u32, u32>,
     /// Disk I/O: maps command slab_idx → i32 result from CQE.
@@ -309,6 +314,7 @@ impl Executor {
             },
             udp_recv_queues: (0..udp).map(|_| VecDeque::new()).collect(),
             udp_recv_waiters: vec![None; udp],
+            udp_send_ready_waiters: vec![None; udp],
             disk_io_waiters: HashMap::new(),
             disk_io_results: HashMap::new(),
             fs_stat_results: HashMap::new(),
@@ -396,6 +402,17 @@ impl Executor {
         let idx = udp_index as usize;
         if idx < self.udp_recv_waiters.len()
             && let Some(task_id) = self.udp_recv_waiters[idx].take()
+        {
+            self.wake_task(task_id);
+        }
+    }
+
+    /// Wake a task that was waiting for a free UDP send slot.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn wake_udp_send_ready(&mut self, udp_index: u32) {
+        let idx = udp_index as usize;
+        if idx < self.udp_send_ready_waiters.len()
+            && let Some(task_id) = self.udp_send_ready_waiters[idx].take()
         {
             self.wake_task(task_id);
         }
