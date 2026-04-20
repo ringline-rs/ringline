@@ -330,7 +330,7 @@ impl<'a> DriverCtx<'a> {
             }
 
             if self.ring.submit_close(conn.index).is_err() {
-                crate::metrics::CLOSE_SUBMIT_FAILURES.increment();
+                crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
                 self.pending_close_retries.push(conn.index);
             }
         }
@@ -401,7 +401,7 @@ impl<'a> DriverCtx<'a> {
 
         match self.ring.submit_sendmsg(fd_index, msghdr_ptr, ud) {
             Ok(()) => {
-                crate::metrics::UDP_DATAGRAMS_SENT.increment();
+                crate::metrics::UDP.increment(crate::metrics::udp::DATAGRAMS_SENT);
                 self.udp_sockets[idx].send_in_flight = true;
                 self.udp_sockets[idx].send_pool_slot = pool_slot;
                 Ok(())

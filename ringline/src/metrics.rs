@@ -4,15 +4,37 @@
 //! exhaustion. Automatically exposed via Prometheus when registered with
 //! the admin server.
 
-use crate::counter::{Counter, CounterGroup};
-use metriken::{Gauge, metric};
+use metriken::{Gauge, ShardedCounterGroup, metric};
 
-// Counter groups (sharded storage — one shard per worker, no false sharing).
-static CONN: CounterGroup = CounterGroup::new();
-static BYTES: CounterGroup = CounterGroup::new();
-static RING: CounterGroup = CounterGroup::new();
-static POOL: CounterGroup = CounterGroup::new();
-static UDP: CounterGroup = CounterGroup::new();
+// ── Sharded counter groups ──────────────────────────────────────
+
+#[metric(
+    name = "ringline/connections",
+    description = "Connection lifecycle counters"
+)]
+pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(2);
+
+#[metric(name = "ringline/bytes", description = "Byte transfer counters")]
+pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
+
+#[metric(name = "ringline/ring", description = "Ring utilization counters")]
+pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(4);
+
+#[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
+pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(3);
+
+#[metric(name = "ringline/udp", description = "UDP counters")]
+pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(3);
+
+// ── Gauge (not sharded) ─────────────────────────────────────────
+
+#[metric(
+    name = "ringline/connections/active",
+    description = "Currently active connections"
+)]
+pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
+
+// ── Index constants ─────────────────────────────────────────────
 
 /// Counter slot indices for connection metrics.
 pub mod conn {
@@ -48,93 +70,46 @@ pub mod udp {
     pub const SEND_ERRORS: usize = 2;
 }
 
-// ── Connection lifecycle ─────────────────────────────────────────
+/// Initialize per-entry metadata (labels) for all counter groups.
+///
+/// Call once at startup before metrics are scraped.
+pub fn init_metadata() {
+    CONNECTIONS.insert_metadata(conn::ACCEPTED, "op".into(), "accepted".into());
+    CONNECTIONS.insert_metadata(conn::CLOSED, "op".into(), "closed".into());
 
-#[metric(
-    name = "ringline/connections/accepted",
-    description = "Total connections accepted"
-)]
-pub static CONNECTIONS_ACCEPTED: Counter = Counter::new(&CONN, conn::ACCEPTED);
+    BYTES.insert_metadata(bytes::RECEIVED, "op".into(), "received".into());
+    BYTES.insert_metadata(bytes::SENT, "op".into(), "sent".into());
 
-#[metric(
-    name = "ringline/connections/closed",
-    description = "Total connections closed"
-)]
-pub static CONNECTIONS_CLOSED: Counter = Counter::new(&CONN, conn::CLOSED);
+    RING.insert_metadata(ring::CQE_PROCESSED, "op".into(), "cqe_processed".into());
+    RING.insert_metadata(
+        ring::SQE_SUBMIT_FAILURES,
+        "op".into(),
+        "sqe_submit_failures".into(),
+    );
+    RING.insert_metadata(
+        ring::CLOSE_SUBMIT_FAILURES,
+        "op".into(),
+        "close_submit_failures".into(),
+    );
+    RING.insert_metadata(
+        ring::RECV_ARM_FAILURES,
+        "op".into(),
+        "recv_arm_failures".into(),
+    );
 
-#[metric(
-    name = "ringline/connections/active",
-    description = "Currently active connections"
-)]
-pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
+    POOL.insert_metadata(pool::SEND_EXHAUSTED, "op".into(), "send_exhausted".into());
+    POOL.insert_metadata(pool::TIMER_EXHAUSTED, "op".into(), "timer_exhausted".into());
+    POOL.insert_metadata(
+        pool::BUFFER_RING_EMPTY,
+        "op".into(),
+        "buffer_ring_empty".into(),
+    );
 
-// ── Bytes ────────────────────────────────────────────────────────
-
-#[metric(name = "ringline/bytes/received", description = "Total bytes received")]
-pub static BYTES_RECEIVED: Counter = Counter::new(&BYTES, bytes::RECEIVED);
-
-#[metric(name = "ringline/bytes/sent", description = "Total bytes sent")]
-pub static BYTES_SENT: Counter = Counter::new(&BYTES, bytes::SENT);
-
-// ── Ring utilization ─────────────────────────────────────────────
-
-#[metric(name = "ringline/cqe/processed", description = "Total CQEs processed")]
-pub static CQE_PROCESSED: Counter = Counter::new(&RING, ring::CQE_PROCESSED);
-
-#[metric(
-    name = "ringline/sqe/submit_failures",
-    description = "SQE submission failures"
-)]
-pub static SQE_SUBMIT_FAILURES: Counter = Counter::new(&RING, ring::SQE_SUBMIT_FAILURES);
-
-#[metric(
-    name = "ringline/sqe/close_submit_failures",
-    description = "Close SQE submission failures (fd may leak)"
-)]
-pub static CLOSE_SUBMIT_FAILURES: Counter = Counter::new(&RING, ring::CLOSE_SUBMIT_FAILURES);
-
-#[metric(
-    name = "ringline/sqe/recv_arm_failures",
-    description = "Recv arm SQE submission failures (connection closed)"
-)]
-pub static RECV_ARM_FAILURES: Counter = Counter::new(&RING, ring::RECV_ARM_FAILURES);
-
-// ── Pool exhaustion ──────────────────────────────────────────────
-
-#[metric(
-    name = "ringline/pool/send_exhausted",
-    description = "Send copy pool exhaustion events"
-)]
-pub static SEND_POOL_EXHAUSTED: Counter = Counter::new(&POOL, pool::SEND_EXHAUSTED);
-
-#[metric(
-    name = "ringline/pool/timer_exhausted",
-    description = "Timer pool exhaustion events"
-)]
-pub static TIMER_POOL_EXHAUSTED: Counter = Counter::new(&POOL, pool::TIMER_EXHAUSTED);
-
-#[metric(
-    name = "ringline/pool/buffer_ring_empty",
-    description = "Recv buffer ring empty events"
-)]
-pub static BUFFER_RING_EMPTY: Counter = Counter::new(&POOL, pool::BUFFER_RING_EMPTY);
-
-// ── UDP ──────────────────────────────────────────────────────────
-
-#[metric(
-    name = "ringline/udp/datagrams_received",
-    description = "Total UDP datagrams received"
-)]
-pub static UDP_DATAGRAMS_RECEIVED: Counter = Counter::new(&UDP, udp::DATAGRAMS_RECEIVED);
-
-#[metric(
-    name = "ringline/udp/datagrams_sent",
-    description = "Total UDP datagrams sent"
-)]
-pub static UDP_DATAGRAMS_SENT: Counter = Counter::new(&UDP, udp::DATAGRAMS_SENT);
-
-#[metric(
-    name = "ringline/udp/send_errors",
-    description = "Total UDP send errors"
-)]
-pub static UDP_SEND_ERRORS: Counter = Counter::new(&UDP, udp::SEND_ERRORS);
+    UDP.insert_metadata(
+        udp::DATAGRAMS_RECEIVED,
+        "op".into(),
+        "datagrams_received".into(),
+    );
+    UDP.insert_metadata(udp::DATAGRAMS_SENT, "op".into(), "datagrams_sent".into());
+    UDP.insert_metadata(udp::SEND_ERRORS, "op".into(), "send_errors".into());
+}

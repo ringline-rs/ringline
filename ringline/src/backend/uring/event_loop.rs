@@ -369,7 +369,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     fn dispatch_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
-        metrics::CQE_PROCESSED.increment();
+        metrics::RING.increment(metrics::ring::CQE_PROCESSED);
         let ud = UserData(user_data_raw);
         let tag = match ud.tag() {
             Some(t) => t,
@@ -428,9 +428,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             let errno = -result;
             if errno == libc::ENOBUFS {
-                metrics::BUFFER_RING_EMPTY.increment();
+                metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
                 if !has_more && self.driver.ring.submit_multishot_recv(conn_index).is_err() {
-                    metrics::RECV_ARM_FAILURES.increment();
+                    metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                     self.executor.wake_recv(conn_index);
                     self.driver.close_connection(conn_index);
                 }
@@ -457,7 +457,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
 
         let bytes_received = result as u32;
-        metrics::BYTES_RECEIVED.add(bytes_received as u64);
+        metrics::BYTES.add(metrics::bytes::RECEIVED, bytes_received as u64);
         let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
         let data = unsafe { std::slice::from_raw_parts(buf_ptr, bytes_received as usize) };
 
@@ -506,7 +506,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                                 cs.established = true;
                             }
-                            metrics::CONNECTIONS_ACCEPTED.increment();
+                            metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
                             metrics::CONNECTIONS_ACTIVE.increment();
                             // Spawn async task for accepted connection.
                             self.spawn_accept_task(conn_index);
@@ -594,7 +594,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && matches!(conn.recv_mode, RecvMode::Multi)
             && self.driver.ring.submit_multishot_recv(conn_index).is_err()
         {
-            metrics::RECV_ARM_FAILURES.increment();
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
         }
@@ -627,7 +627,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             let errno = -result;
             if errno == libc::ENOBUFS {
-                metrics::BUFFER_RING_EMPTY.increment();
+                metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
                 if !has_more {
                     let msghdr_ptr = &*self.driver.recvmsg_msghdr as *const libc::msghdr;
                     let _ = self
@@ -678,7 +678,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        metrics::BYTES_RECEIVED.add(payload.len() as u64);
+        metrics::BYTES.add(metrics::bytes::RECEIVED, payload.len() as u64);
 
         // Extract SCM_TIMESTAMPING from control data.
         let control = msg_out.control_data();
@@ -833,7 +833,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.established = true;
                 }
-                metrics::CONNECTIONS_ACCEPTED.increment();
+                metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
                 metrics::CONNECTIONS_ACTIVE.increment();
                 self.spawn_accept_task(conn_index);
             }
@@ -921,7 +921,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             let total = self.driver.send_copy_pool.original_len(pool_slot);
-            metrics::BYTES_SENT.add(total as u64);
+            metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.driver.send_copy_pool.release(pool_slot);
 
             self.driver.submit_next_queued(conn_index);
@@ -985,7 +985,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
 
             // Full send complete.
-            metrics::BYTES_SENT.add(remaining_before as u64);
+            metrics::BYTES.add(metrics::bytes::SENT, remaining_before as u64);
             self.driver.pending_replenish.push(bid);
             self.driver.submit_next_queued(conn_index);
             self.executor.wake_send(conn_index, Ok(remaining_before));
@@ -1109,7 +1109,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if result >= 0 {
-            metrics::BYTES_SENT.add(total_len as u64);
+            metrics::BYTES.add(metrics::bytes::SENT, total_len as u64);
             self.driver.submit_next_queued(conn_index);
         } else {
             self.driver.drain_conn_send_queue(conn_index);
@@ -1304,7 +1304,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if was_established {
-            metrics::CONNECTIONS_CLOSED.increment();
+            metrics::CONNECTIONS.increment(metrics::conn::CLOSED);
             metrics::CONNECTIONS_ACTIVE.decrement();
         }
 
@@ -1411,7 +1411,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.resubmit_udp_recvmsg(udp_index);
 
         if let Some(peer) = peer {
-            metrics::UDP_DATAGRAMS_RECEIVED.increment();
+            metrics::UDP.increment(metrics::udp::DATAGRAMS_RECEIVED);
             // Push to the async recv queue and wake waiting task.
             if idx < self.executor.udp_recv_queues.len() {
                 self.executor.udp_recv_queues[idx].push_back((data, peer));
@@ -1432,7 +1432,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if result < 0 {
-            metrics::UDP_SEND_ERRORS.increment();
+            metrics::UDP.increment(metrics::udp::SEND_ERRORS);
         }
     }
 
@@ -1560,7 +1560,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .submit_multishot_recvmsg(conn_index, msghdr_ptr)
                 .is_err()
             {
-                metrics::RECV_ARM_FAILURES.increment();
+                metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                 self.executor.wake_recv(conn_index);
                 self.driver.close_connection(conn_index);
                 return;
@@ -1571,7 +1571,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
-            metrics::RECV_ARM_FAILURES.increment();
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
         }

@@ -60,8 +60,6 @@ pub(crate) mod chain;
 pub(crate) mod completion;
 pub(crate) mod connection;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
-pub(crate) mod counter;
-#[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod direct_io;
 #[cfg(not(has_io_uring))]
 pub(crate) mod disk_io_pool;

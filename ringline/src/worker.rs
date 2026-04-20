@@ -194,6 +194,8 @@ impl RinglineBuilder {
 
         ensure_nofile_limit(self.config.max_connections, num_threads)?;
 
+        crate::metrics::init_metadata();
+
         // Create per-worker channels and wake fds.
         let mut worker_txs = Vec::with_capacity(num_threads);
         let mut worker_rxs = Vec::with_capacity(num_threads);
@@ -344,7 +346,7 @@ impl RinglineBuilder {
                         pin_to_core(core)?;
                     }
 
-                    crate::counter::set_thread_shard(worker_id);
+                    metriken::set_thread_shard(worker_id);
 
                     let accept_rx = if has_acceptor { Some(rx) } else { None };
                     worker_fn(

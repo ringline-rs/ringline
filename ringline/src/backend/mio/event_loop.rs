@@ -323,7 +323,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 cs.established = true;
             }
 
-            metrics::CONNECTIONS_ACCEPTED.increment();
+            metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
             metrics::CONNECTIONS_ACTIVE.increment();
 
             // Spawn async accept task.
@@ -479,7 +479,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                                 cs.established = true;
                             }
-                            metrics::CONNECTIONS_ACCEPTED.increment();
+                            metrics::CONNECTIONS.increment(metrics::conn::ACCEPTED);
                             metrics::CONNECTIONS_ACTIVE.increment();
                             // Spawn async task for accepted connection.
                             self.spawn_accept_task(conn_index);
