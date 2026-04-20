@@ -357,8 +357,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Send a UDP datagram to the given peer address.
     ///
-    /// Copies `data` into the send pool and submits a `sendmsg` SQE. Only one
-    /// send can be in-flight per UDP socket at a time.
+    /// Copies `data` into the send pool and submits a `sendmsg` SQE. Up to
+    /// `Config::udp_send_slots` sends can be in flight concurrently per
+    /// socket; exhaustion returns [`crate::error::UdpSendError::PoolExhausted`].
     pub fn send_to(
         &mut self,
         socket: UdpToken,
@@ -371,43 +372,43 @@ impl<'a> DriverCtx<'a> {
                 "invalid UDP socket index",
             )));
         }
-        if self.udp_sockets[idx].send_in_flight {
-            return Err(crate::error::UdpSendError::SendInFlight);
-        }
 
-        let (pool_slot, ptr, len) = self
-            .send_copy_pool
-            .copy_in(data)
+        let slot_idx = self.udp_sockets[idx]
+            .send_freelist
+            .pop()
             .ok_or(crate::error::UdpSendError::PoolExhausted)?;
 
-        // Set up destination address.
-        let addr_len =
-            crate::backend::socket_addr_to_sockaddr(peer, &mut self.udp_sockets[idx].send_addr);
-
-        // Set up iovec.
-        self.udp_sockets[idx].send_iov.iov_base = ptr as *mut libc::c_void;
-        self.udp_sockets[idx].send_iov.iov_len = len as usize;
-
-        // Update msghdr.
-        self.udp_sockets[idx].send_msghdr.msg_namelen = addr_len;
+        let (pool_slot, ptr, len) = match self.send_copy_pool.copy_in(data) {
+            Some(v) => v,
+            None => {
+                self.udp_sockets[idx].send_freelist.push(slot_idx);
+                return Err(crate::error::UdpSendError::PoolExhausted);
+            }
+        };
 
         let fd_index = self.udp_sockets[idx].fd_index;
-        let msghdr_ptr = &*self.udp_sockets[idx].send_msghdr as *const libc::msghdr;
+        let slot = &mut self.udp_sockets[idx].send_slots[slot_idx as usize];
+        let addr_len = crate::backend::socket_addr_to_sockaddr(peer, &mut slot.send_addr);
+        slot.send_iov.iov_base = ptr as *mut libc::c_void;
+        slot.send_iov.iov_len = len as usize;
+        slot.send_msghdr.msg_namelen = addr_len;
+
+        let msghdr_ptr = &*slot.send_msghdr as *const libc::msghdr;
+        let payload = crate::backend::uring::driver::encode_udp_send_payload(slot_idx, pool_slot);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::SendMsgUdp,
             socket.0,
-            pool_slot as u32,
+            payload,
         );
 
         match self.ring.submit_sendmsg(fd_index, msghdr_ptr, ud) {
             Ok(()) => {
                 crate::metrics::UDP.increment(crate::metrics::udp::DATAGRAMS_SENT);
-                self.udp_sockets[idx].send_in_flight = true;
-                self.udp_sockets[idx].send_pool_slot = pool_slot;
                 Ok(())
             }
             Err(_e) => {
                 self.send_copy_pool.release(pool_slot);
+                self.udp_sockets[idx].send_freelist.push(slot_idx);
                 Err(crate::error::UdpSendError::SubmissionQueueFull)
             }
         }

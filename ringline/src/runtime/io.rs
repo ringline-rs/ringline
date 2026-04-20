@@ -2316,6 +2316,9 @@ impl UdpCtx {
     }
 
     /// Send a datagram to the given peer (mio backend — synchronous non-blocking send).
+    ///
+    /// `WouldBlock` is surfaced as [`crate::error::UdpSendError::PoolExhausted`] so callers
+    /// have a single "try again later" branch that matches the io_uring backend.
     #[cfg(not(has_io_uring))]
     pub fn send_to(&self, peer: SocketAddr, data: &[u8]) -> Result<(), crate::error::UdpSendError> {
         with_state(|driver, _executor| {
@@ -2326,7 +2329,13 @@ impl UdpCtx {
                 )));
             }
             match driver.udp_sockets[idx].send_to(data, peer) {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    crate::metrics::UDP.increment(crate::metrics::udp::DATAGRAMS_SENT);
+                    Ok(())
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    Err(crate::error::UdpSendError::PoolExhausted)
+                }
                 Err(e) => Err(crate::error::UdpSendError::Io(e)),
             }
         })
