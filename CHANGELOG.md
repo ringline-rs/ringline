@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `UdpCtx::send_ready()` awaits a free UDP send slot.
+
 ### Changed
 
 - UDP sends are now pipelined (io_uring).
