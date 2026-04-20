@@ -1422,13 +1422,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     fn handle_send_msg_udp(&mut self, ud: UserData, result: i32) {
         let udp_index = ud.conn_index();
-        let pool_slot = ud.payload() as u16;
+        let (slot_idx, pool_slot) =
+            crate::backend::uring::driver::decode_udp_send_payload(ud.payload());
         let idx = udp_index as usize;
 
         self.driver.send_copy_pool.release(pool_slot);
 
         if idx < self.driver.udp_sockets.len() {
-            self.driver.udp_sockets[idx].send_in_flight = false;
+            let sock = &mut self.driver.udp_sockets[idx];
+            if (slot_idx as usize) < sock.send_slots.len() {
+                sock.send_freelist.push(slot_idx);
+            }
         }
 
         if result < 0 {
@@ -2369,12 +2373,17 @@ mod tests {
         }
 
         let data = b"datagram";
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let (pool_slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
         let free_before = el.driver.send_copy_pool.free_count();
+
+        // Pop the send slot we'll "simulate" — so the CQE pushes it back cleanly
+        // (mirrors the real submit path).
+        let slot_idx = el.driver.udp_sockets[0].send_freelist.pop().unwrap();
 
         // Simulate UDP send CQE (success).
         let udp_index = 0u32;
-        let ud = UserData::encode(OpTag::SendMsgUdp, udp_index, slot as u32);
+        let payload = crate::backend::uring::driver::encode_udp_send_payload(slot_idx, pool_slot);
+        let ud = UserData::encode(OpTag::SendMsgUdp, udp_index, payload);
         el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
 
         assert_eq!(
@@ -2382,6 +2391,21 @@ mod tests {
             free_before + 1,
             "pool slot not released after UDP send"
         );
+        assert!(
+            el.driver.udp_sockets[0].send_freelist.contains(&slot_idx),
+            "send slot not returned to freelist after CQE"
+        );
+    }
+
+    #[test]
+    fn udp_send_payload_roundtrip() {
+        use crate::backend::uring::driver::{decode_udp_send_payload, encode_udp_send_payload};
+        for slot_idx in [0u16, 1, 63, 255, u16::MAX] {
+            for pool_slot in [0u16, 1, 511, 1023, u16::MAX] {
+                let p = encode_udp_send_payload(slot_idx, pool_slot);
+                assert_eq!(decode_udp_send_payload(p), (slot_idx, pool_slot));
+            }
+        }
     }
 
     // ── Partial send retry queue tests ─────────────────────────────

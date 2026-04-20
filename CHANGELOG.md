@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- UDP sends are now pipelined (io_uring).
+- `QuicConfig` is now `Clone`.
+
 ## [ringline-redis 0.2.1] - 2026-04-18
 
 ### Changed

@@ -89,6 +89,12 @@ pub struct Config {
     /// UDP bind addresses. Each worker creates its own socket with SO_REUSEPORT.
     /// Empty = no UDP sockets.
     pub udp_bind: Vec<SocketAddr>,
+    /// Number of concurrent in-flight UDP sends per socket. Each slot owns a
+    /// pre-allocated `sockaddr_storage` + `iovec` + `msghdr` triple used to
+    /// submit a `sendmsg` SQE; the slot is returned to the freelist on CQE.
+    /// Exhaustion returns [`crate::error::UdpSendError::PoolExhausted`].
+    /// Default: 64.
+    pub udp_send_slots: u16,
     /// Optional NVMe passthrough configuration. When set, enables NVMe device
     /// management and `IORING_OP_URING_CMD` submission for direct NVMe I/O.
     pub nvme: Option<crate::nvme::NvmeConfig>,
@@ -156,6 +162,7 @@ impl Default for Config {
             standalone_task_capacity: 256,
             timer_slots: 256,
             udp_bind: Vec::new(),
+            udp_send_slots: 64,
             nvme: None,
             direct_io: None,
             fs: Some(crate::fs::FsConfig::default()),
@@ -208,6 +215,11 @@ impl Config {
         if self.standalone_task_capacity >= (1 << 31) {
             return Err(crate::error::Error::RingSetup(
                 "standalone_task_capacity must be < 2^31".into(),
+            ));
+        }
+        if !self.udp_bind.is_empty() && self.udp_send_slots == 0 {
+            return Err(crate::error::Error::RingSetup(
+                "udp_send_slots must be > 0 when udp_bind is non-empty".into(),
             ));
         }
         Ok(())
@@ -429,6 +441,12 @@ impl ConfigBuilder {
     /// Add a UDP bind address. Can be called multiple times.
     pub fn udp_bind(mut self, addr: SocketAddr) -> Self {
         self.config.udp_bind.push(addr);
+        self
+    }
+
+    /// Set the number of concurrent in-flight UDP sends per socket.
+    pub fn udp_send_slots(mut self, n: u16) -> Self {
+        self.config.udp_send_slots = n;
         self
     }
 

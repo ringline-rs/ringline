@@ -37,12 +37,9 @@ pub enum Error {
 /// Errors returned by UDP send operations.
 #[derive(Debug, Error)]
 pub enum UdpSendError {
-    /// UDP send pool exhausted.
+    /// No free send slot or copy-pool slot available (try again after a CQE).
     #[error("UDP send pool exhausted")]
     PoolExhausted,
-    /// UDP send already in-flight.
-    #[error("UDP send already in-flight")]
-    SendInFlight,
     /// UDP submission queue full.
     #[error("UDP submission queue full")]
     SubmissionQueueFull,

@@ -3,6 +3,12 @@ use std::sync::Arc;
 use quinn_proto::{ClientConfig, EndpointConfig, ServerConfig};
 
 /// Configuration for a [`QuicEndpoint`](crate::QuicEndpoint).
+///
+/// `Clone` lets the same configuration drive multiple per-worker endpoints
+/// (e.g. one `QuicEndpoint` per ringline worker, each bound to a different
+/// port via `SO_REUSEPORT`). All inner state (`endpoint_config`,
+/// `server_config`, `client_config`) is `Arc`-backed, so cloning is cheap.
+#[derive(Clone)]
 pub struct QuicConfig {
     /// Shared endpoint configuration (connection IDs, supported versions, etc.).
     pub endpoint_config: Arc<EndpointConfig>,
