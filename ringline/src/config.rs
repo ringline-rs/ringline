@@ -27,8 +27,19 @@ pub struct Config {
     pub sqpoll_idle_ms: u32,
     /// Pin SQPOLL kernel thread to this CPU core. Only meaningful when sqpoll=true.
     pub sqpoll_cpu: Option<u32>,
-    /// Recv buffer configuration (provided buffer ring).
+    /// Recv buffer configuration (provided buffer ring) for TCP multishot recv.
     pub recv_buffer: RecvBufferConfig,
+    /// Recv buffer configuration for UDP multishot recvmsg.
+    ///
+    /// UDP uses a separate provided buffer ring from TCP so the two can be
+    /// sized independently. Each buffer must fit an `io_uring_recvmsg_out`
+    /// header (16 bytes) + `sockaddr_storage` (128 bytes) + the datagram
+    /// payload. Default: 128 buffers × 2048 bytes (room for a standard-MTU
+    /// datagram plus the multishot metadata); bump `buffer_size` if you
+    /// expect jumbo datagrams.
+    ///
+    /// `bgid` must differ from `recv_buffer.bgid` when UDP is in use.
+    pub udp_recv_buffer: RecvBufferConfig,
     /// User-registered memory regions (e.g., mmap'd storage arenas).
     pub registered_regions: Vec<MemoryRegion>,
     /// Worker/thread configuration.
@@ -143,6 +154,11 @@ impl Default for Config {
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
             recv_buffer: RecvBufferConfig::default(),
+            udp_recv_buffer: RecvBufferConfig {
+                ring_size: 128,
+                buffer_size: 2048,
+                bgid: 1,
+            },
             registered_regions: Vec::new(),
             worker: WorkerConfig::default(),
             backlog: 1024,
@@ -221,6 +237,33 @@ impl Config {
             return Err(crate::error::Error::RingSetup(
                 "udp_send_slots must be > 0 when udp_bind is non-empty".into(),
             ));
+        }
+        if !self.udp_bind.is_empty() {
+            if !self.udp_recv_buffer.ring_size.is_power_of_two() {
+                return Err(crate::error::Error::RingSetup(
+                    "udp_recv_buffer.ring_size must be a power of two".into(),
+                ));
+            }
+            if self.udp_recv_buffer.buffer_size == 0 || self.udp_recv_buffer.buffer_size > 65535 {
+                return Err(crate::error::Error::RingSetup(
+                    "udp_recv_buffer.buffer_size must be > 0 and <= 65535".into(),
+                ));
+            }
+            // Each datagram occupies one buffer that also holds the
+            // io_uring_recvmsg_out header (16 bytes) + sockaddr_storage
+            // (128 bytes). Below that floor the kernel can't fit even a
+            // zero-byte datagram plus the metadata.
+            if self.udp_recv_buffer.buffer_size < 160 {
+                return Err(crate::error::Error::RingSetup(
+                    "udp_recv_buffer.buffer_size must be >= 160 to hold recvmsg header + sockaddr"
+                        .into(),
+                ));
+            }
+            if self.udp_recv_buffer.bgid == self.recv_buffer.bgid {
+                return Err(crate::error::Error::RingSetup(
+                    "udp_recv_buffer.bgid must differ from recv_buffer.bgid".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -447,6 +490,15 @@ impl ConfigBuilder {
     /// Set the number of concurrent in-flight UDP sends per socket.
     pub fn udp_send_slots(mut self, n: u16) -> Self {
         self.config.udp_send_slots = n;
+        self
+    }
+
+    /// Set the UDP recv buffer configuration (ring_size, buffer_size).
+    /// The `bgid` is left at its default; change it via `config_mut()` if
+    /// you need to override.
+    pub fn udp_recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
+        self.config.udp_recv_buffer.ring_size = ring_size;
+        self.config.udp_recv_buffer.buffer_size = buffer_size;
         self
     }
 

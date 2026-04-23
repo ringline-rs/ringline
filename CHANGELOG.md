@@ -14,13 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - `QuicEndpoint::flush()` drains pending transmits on demand.
-
-### Added
-
 - `UdpCtx::send_ready()` awaits a free UDP send slot.
 
 ### Changed
 
+- UDP recv now uses multishot `recvmsg` with a provided buffer ring (io_uring). New `Config::udp_recv_buffer`.
 - UDP sends are now pipelined (io_uring).
 - `QuicConfig` is now `Clone`.
 
