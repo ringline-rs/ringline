@@ -165,6 +165,24 @@ impl QuicEndpoint {
             .map(|pkt| (pkt.destination, pkt.data))
     }
 
+    /// Drain pending transmits from every connection into the send queue.
+    ///
+    /// Call after a batch of [`stream_send`](Self::stream_send) /
+    /// [`stream_finish`](Self::stream_finish) / [`open_bi`](Self::open_bi) /
+    /// [`open_uni`](Self::open_uni) operations to make sure the resulting
+    /// frames are exposed via [`poll_send`](Self::poll_send). Otherwise those
+    /// frames stay buffered inside the connection until the next inbound
+    /// datagram or expiring timer happens to flush them.
+    pub fn flush(&mut self, now: Instant) {
+        let keys: Vec<u32> = self.connections.iter().map(|(k, _)| k as u32).collect();
+        for key in keys {
+            let key = key as usize;
+            if self.connections.contains(key) {
+                self.drain_transmits(key, now);
+            }
+        }
+    }
+
     /// Initiate an outbound QUIC connection.
     ///
     /// Returns a [`QuicConnId`] that will appear in a future
@@ -379,12 +397,24 @@ impl QuicEndpoint {
                 }
                 Event::Stream(stream_event) => match stream_event {
                     StreamEvent::Opened { dir } => {
-                        // Accept all new streams from the peer.
+                        // Accept all new streams from the peer and synthesise a
+                        // StreamReadable for each. quinn-proto's on_stream_frame
+                        // suppresses Readable when the opening STREAM frame also
+                        // carries data (setting `opened` instead). Without this
+                        // synthetic event, an application that only reads on
+                        // StreamReadable would hang for short one-shot messages
+                        // that fit in a single frame. A stream_recv on an empty
+                        // stream is a no-op, so emitting this unconditionally
+                        // is safe.
                         while let Some(stream) = self.connections[key].conn.streams().accept(dir) {
                             self.events.push_back(QuicEvent::StreamOpened {
                                 conn: conn_id,
                                 stream,
                                 bidi: dir == Dir::Bi,
+                            });
+                            self.events.push_back(QuicEvent::StreamReadable {
+                                conn: conn_id,
+                                stream,
                             });
                         }
                     }

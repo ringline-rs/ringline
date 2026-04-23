@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `ringline-quic` now emits `StreamReadable` when a stream opens with data in the first frame (previously hung).
+
+### Added
+
+- `QuicEndpoint::flush()` drains pending transmits on demand.
+
 ### Added
 
 - `UdpCtx::send_ready()` awaits a free UDP send slot.
