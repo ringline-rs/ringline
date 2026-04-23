@@ -314,22 +314,6 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a recvmsg for a UDP socket (single-shot with pre-allocated buffer).
-    pub fn submit_recvmsg(
-        &mut self,
-        fd_index: u32,
-        msghdr: *mut libc::msghdr,
-        user_data: UserData,
-    ) -> io::Result<()> {
-        let entry = opcode::RecvMsg::new(Fixed(fd_index), msghdr)
-            .build()
-            .user_data(user_data.raw());
-        unsafe {
-            self.push_sqe(entry)?;
-        }
-        Ok(())
-    }
-
     /// Submit a multishot recvmsg for a UDP socket backed by a provided buffer ring.
     ///
     /// `msghdr` is used as a *template* by the kernel to decide how to lay out
