@@ -219,6 +219,28 @@ impl QuicEndpoint {
         Ok(n)
     }
 
+    /// Send scatter-gather data on a QUIC stream without copying.
+    ///
+    /// Each [`Bytes`](bytes::Bytes) in `chunks` is handed to quinn-proto's
+    /// [`SendStream::write_chunks`](quinn_proto::SendStream::write_chunks);
+    /// partial chunks are advanced in place (their refcount drops the
+    /// consumed prefix) and fully-consumed chunks are replaced with an
+    /// empty `Bytes`. Returns the total bytes written across all chunks.
+    ///
+    /// Use this when you already have refcounted buffers (e.g. from
+    /// `Bytes::from(Vec<u8>)`) and want to avoid the copy that
+    /// [`stream_send`](Self::stream_send) would pay.
+    pub fn stream_send_chunks(
+        &mut self,
+        conn: QuicConnId,
+        stream: StreamId,
+        chunks: &mut [bytes::Bytes],
+    ) -> Result<usize, Error> {
+        let c = self.get_conn_mut(conn)?;
+        let written = c.conn.send_stream(stream).write_chunks(chunks)?;
+        Ok(written.bytes)
+    }
+
     /// Read data from a QUIC stream into `buf`.
     ///
     /// Returns `(bytes_read, is_finished)`. When `is_finished` is true, the peer

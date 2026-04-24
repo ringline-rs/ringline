@@ -1,15 +1,18 @@
-//! Flow-control backpressure test for [`H3Connection::send_data`].
+//! Flow-control backpressure tests for [`H3Connection::send_data`] and
+//! [`H3Connection::send_data_bytes`].
 //!
 //! Regression against the silent-data-loss bug where `send_data` ignored
 //! partial writes from quinn-proto. We shrink the client's per-stream
 //! receive window far below the response body size, force the server to
 //! write in chunks across many `StreamWritable` events, and assert the
-//! client ultimately receives every byte.
+//! client ultimately receives every byte. Parameterised so both the
+//! `&[u8]` and the zero-copy `Bytes` send paths get the same treatment.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use quinn_proto::{ClientConfig, ServerConfig, TransportConfig};
 use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
 use ringline_quic::{QuicConfig, QuicConnId, QuicEndpoint, QuicEvent, StreamId};
@@ -124,11 +127,16 @@ fn pump_h3(ep: &mut QuicEndpoint, h3: &mut H3Connection) {
     }
 }
 
-#[test]
-fn send_data_is_resilient_to_flow_control_backpressure() {
+#[derive(Clone, Copy)]
+enum SendApi {
+    Slice,
+    Bytes,
+}
+
+fn run_backpressure_test(api: SendApi, client_port: u16, server_port: u16) {
     let (certs, key) = self_signed();
-    let client_addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
-    let server_addr: SocketAddr = "127.0.0.1:50002".parse().unwrap();
+    let client_addr: SocketAddr = format!("127.0.0.1:{client_port}").parse().unwrap();
+    let server_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
 
     // Client's per-stream receive window — the ceiling the server must write
     // under. Deliberately far smaller than the response body so the server
@@ -214,9 +222,18 @@ fn send_data_is_resilient_to_flow_control_backpressure() {
         .expect("send_response");
 
     let body: Vec<u8> = (0u8..=255).cycle().take(BODY_LEN).collect();
-    server_h3
-        .send_data(&mut server_ep, resp_stream, &body, true)
-        .expect("send_data");
+    match api {
+        SendApi::Slice => {
+            server_h3
+                .send_data(&mut server_ep, resp_stream, &body, true)
+                .expect("send_data");
+        }
+        SendApi::Bytes => {
+            server_h3
+                .send_data_bytes(&mut server_ep, resp_stream, Bytes::from(body.clone()), true)
+                .expect("send_data_bytes");
+        }
+    }
 
     // The first send couldn't possibly have flushed the whole 128 KB body
     // through a 4 KB window. If queue_send is working, this is true.
@@ -261,4 +278,14 @@ fn send_data_is_resilient_to_flow_control_backpressure() {
     );
     assert_eq!(received.len(), body.len(), "body length mismatch");
     assert_eq!(received, body, "body payload mismatch");
+}
+
+#[test]
+fn send_data_is_resilient_to_flow_control_backpressure() {
+    run_backpressure_test(SendApi::Slice, 50001, 50002);
+}
+
+#[test]
+fn send_data_bytes_is_resilient_to_flow_control_backpressure() {
+    run_backpressure_test(SendApi::Bytes, 50003, 50004);
 }
