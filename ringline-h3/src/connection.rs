@@ -5,13 +5,24 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use ringline_quic::{QuicConnId, QuicEndpoint, QuicEvent, StreamId};
+use ringline_quic::{QuicConnId, QuicEndpoint, QuicEvent, StreamId, WriteError};
 
 use crate::error::H3Error;
 use crate::frame::{self, Frame};
 use crate::qpack::{self, HeaderField};
 use crate::settings::Settings;
 use crate::stream::{RequestStream, StreamState};
+
+/// Bytes queued for a stream that didn't fit in the current flow-control
+/// window. Drained on `StreamWritable` events.
+#[derive(Default)]
+struct PendingStream {
+    /// Unflushed bytes in FIFO order. Fresh `send_*` calls append to the tail.
+    buf: Vec<u8>,
+    /// Caller requested FIN once `buf` fully drains. `stream_finish` fires
+    /// then, not when the app called the send method.
+    pending_fin: bool,
+}
 
 /// HTTP/3 uni-stream type identifiers (RFC 9114 Section 6.2).
 const STREAM_TYPE_CONTROL: u64 = 0x00;
@@ -93,6 +104,10 @@ pub struct H3Connection {
 
     /// Read buffer for stream_recv calls (avoids repeated allocation).
     read_buf: Vec<u8>,
+
+    /// Per-stream buffered outbound bytes that didn't fit in the flow-control
+    /// window at the time of the send. Drained on `QuicEvent::StreamWritable`.
+    pending_sends: HashMap<u64, PendingStream>,
 }
 
 impl H3Connection {
@@ -111,6 +126,7 @@ impl H3Connection {
             settings_sent: false,
             conn_id: None,
             read_buf: vec![0u8; 65536],
+            pending_sends: HashMap::new(),
         }
     }
 
@@ -126,13 +142,14 @@ impl H3Connection {
             .ok_or_else(|| H3Error::Internal("cannot open control stream".into()))?;
         self.our_control_stream = Some(stream);
 
-        // Send stream type (control = 0x00) + SETTINGS frame.
+        // Send stream type (control = 0x00) + SETTINGS frame. Route through
+        // queue_send so a flow-control-blocked write doesn't silently lose the
+        // SETTINGS bytes. Never FIN: RFC 9114 §6.2.1 makes closing the control
+        // stream a connection error.
         let mut buf = Vec::new();
         frame::encode_varint(&mut buf, STREAM_TYPE_CONTROL);
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
-        quic.stream_send(conn, stream, &buf)?;
-        // Note: do NOT call stream_finish on the control stream.
-        // RFC 9114 Section 6.2.1: closing the control stream is a connection error.
+        self.queue_send(quic, conn, stream, &buf, false)?;
 
         self.settings_sent = true;
         Ok(())
@@ -151,11 +168,11 @@ impl H3Connection {
             .ok_or_else(|| H3Error::Internal("cannot open control stream".into()))?;
         self.our_control_stream = Some(stream);
 
-        // Send stream type (control = 0x00) + SETTINGS frame.
+        // Same routing as accept().
         let mut buf = Vec::new();
         frame::encode_varint(&mut buf, STREAM_TYPE_CONTROL);
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
-        quic.stream_send(conn, stream, &buf)?;
+        self.queue_send(quic, conn, stream, &buf, false)?;
 
         self.settings_sent = true;
         Ok(())
@@ -189,18 +206,18 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        quic.stream_send(conn, stream_id, &buf)?;
-
-        let state = if end_stream {
-            quic.stream_finish(conn, stream_id)?;
+        // Register the stream up-front so queue_send's finalize_local_close
+        // finds it when the FIN actually reaches the wire (possibly later,
+        // once flow control opens).
+        let mut rs = RequestStream::new(true);
+        rs.state = if end_stream {
             StreamState::HalfClosedLocal
         } else {
             StreamState::Open
         };
-
-        let mut rs = RequestStream::new(true);
-        rs.state = state;
         self.request_streams.insert(u64::from(stream_id), rs);
+
+        self.queue_send(quic, conn, stream_id, &buf, end_stream)?;
 
         Ok(stream_id)
     }
@@ -238,10 +255,13 @@ impl H3Connection {
             QuicEvent::StreamReadable { conn, stream } => {
                 self.handle_stream_readable(quic, *conn, *stream)?;
             }
+            QuicEvent::StreamWritable { conn, stream } => {
+                self.drain_pending_stream(quic, *conn, *stream)?;
+            }
             QuicEvent::ConnectionClosed { .. } => {
                 self.state = H3State::Closed;
             }
-            // StreamWritable, StreamFinished — not yet handled.
+            // StreamFinished — not yet handled.
             _ => {}
         }
         Ok(())
@@ -253,6 +273,10 @@ impl H3Connection {
     }
 
     /// Send response headers on a stream.
+    ///
+    /// Partial writes due to flow-control backpressure are queued and
+    /// flushed on subsequent `QuicEvent::StreamWritable` events; see
+    /// [`send_data`](Self::send_data) for the same semantics.
     pub fn send_response(
         &mut self,
         quic: &mut QuicEndpoint,
@@ -273,22 +297,16 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        quic.stream_send(conn, stream_id, &buf)?;
-
-        if end_stream {
-            quic.stream_finish(conn, stream_id)?;
-            if let Some(rs) = self.request_streams.get_mut(&u64::from(stream_id)) {
-                rs.state = match rs.state {
-                    StreamState::HalfClosedRemote => StreamState::Closed,
-                    _ => StreamState::HalfClosedLocal,
-                };
-            }
-        }
-
-        Ok(())
+        self.queue_send(quic, conn, stream_id, &buf, end_stream)
     }
 
     /// Send response body data on a stream.
+    ///
+    /// If the peer's flow-control window can't absorb all of `data`, the
+    /// remainder is queued and flushed on subsequent `QuicEvent::StreamWritable`
+    /// events. `stream_finish` is deferred to the moment the queue drains.
+    /// Poll [`has_pending_writes`](Self::has_pending_writes) to observe
+    /// progress.
     pub fn send_data(
         &mut self,
         quic: &mut QuicEndpoint,
@@ -306,19 +324,7 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        quic.stream_send(conn, stream_id, &buf)?;
-
-        if end_stream {
-            quic.stream_finish(conn, stream_id)?;
-            if let Some(rs) = self.request_streams.get_mut(&u64::from(stream_id)) {
-                rs.state = match rs.state {
-                    StreamState::HalfClosedRemote => StreamState::Closed,
-                    _ => StreamState::HalfClosedLocal,
-                };
-            }
-        }
-
-        Ok(())
+        self.queue_send(quic, conn, stream_id, &buf, end_stream)
     }
 
     /// Send a GOAWAY frame on the control stream (graceful shutdown).
@@ -340,12 +346,147 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        quic.stream_send(conn, control, &buf)?;
+        self.queue_send(quic, conn, control, &buf, false)?;
         self.state = H3State::Closing;
         Ok(())
     }
 
+    /// Returns `true` if any bytes destined for this stream are still waiting
+    /// for flow-control credit. Callers that want to observe drain progress
+    /// (e.g. "has all my response body been handed to QUIC yet?") can poll
+    /// this after processing events.
+    pub fn has_pending_writes(&self, stream_id: StreamId) -> bool {
+        self.pending_sends
+            .get(&u64::from(stream_id))
+            .is_some_and(|p| !p.buf.is_empty() || p.pending_fin)
+    }
+
     // ── Internal helpers ────────────────────────────────────────────
+
+    /// Try to push `data` to a stream, queueing any remainder that didn't fit
+    /// in the current flow-control window. If `fin` is set, the stream is
+    /// finished — immediately if everything flushed, or deferred until the
+    /// queue drains.
+    ///
+    /// The `on_local_close` closure runs when the FIN actually reaches
+    /// `stream_finish` (either in-line here or later from
+    /// [`drain_pending_stream`]), giving the caller a hook to update its
+    /// local stream state.
+    fn queue_send(
+        &mut self,
+        quic: &mut QuicEndpoint,
+        conn: QuicConnId,
+        stream_id: StreamId,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<(), H3Error> {
+        let key = u64::from(stream_id);
+
+        // If this stream already has queued bytes, preserve FIFO ordering by
+        // appending instead of racing the head. The queue drains on the next
+        // StreamWritable.
+        if let Some(pending) = self.pending_sends.get_mut(&key)
+            && (!pending.buf.is_empty() || pending.pending_fin)
+        {
+            pending.buf.extend_from_slice(data);
+            if fin {
+                pending.pending_fin = true;
+            }
+            return Ok(());
+        }
+
+        let mut offset = 0;
+        match quic.stream_send(conn, stream_id, data) {
+            Ok(n) => offset = n,
+            Err(ringline_quic::Error::Write(WriteError::Blocked)) => {
+                // Nothing written — queue it all below.
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let remainder = &data[offset..];
+        if remainder.is_empty() && !fin {
+            // Whole send landed, nothing to track.
+            return Ok(());
+        }
+
+        if remainder.is_empty() && fin {
+            quic.stream_finish(conn, stream_id)?;
+            self.finalize_local_close(stream_id);
+            self.pending_sends.remove(&key);
+            return Ok(());
+        }
+
+        let entry = self.pending_sends.entry(key).or_default();
+        entry.buf.extend_from_slice(remainder);
+        if fin {
+            entry.pending_fin = true;
+        }
+        Ok(())
+    }
+
+    /// Drain queued bytes for `stream_id` until either the queue is empty or
+    /// quinn-proto blocks again. If the queue empties and FIN was deferred,
+    /// call `stream_finish` now.
+    fn drain_pending_stream(
+        &mut self,
+        quic: &mut QuicEndpoint,
+        conn: QuicConnId,
+        stream_id: StreamId,
+    ) -> Result<(), H3Error> {
+        let key = u64::from(stream_id);
+        loop {
+            let pending = match self.pending_sends.get_mut(&key) {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            if pending.buf.is_empty() {
+                break;
+            }
+            match quic.stream_send(conn, stream_id, &pending.buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pending.buf.drain(..n);
+                }
+                Err(ringline_quic::Error::Write(WriteError::Blocked)) => break,
+                Err(e) => {
+                    // Stream is stopped / reset / otherwise unwritable. Drop the
+                    // queued bytes and surface the error to the app.
+                    self.pending_sends.remove(&key);
+                    self.events.push_back(H3Event::Error(e.into()));
+                    return Ok(());
+                }
+            }
+        }
+
+        // Buffer is empty (or we broke on block). Finish if we deferred FIN
+        // earlier and there's truly nothing left to write.
+        if let Some(pending) = self.pending_sends.get(&key)
+            && pending.buf.is_empty()
+        {
+            let do_fin = pending.pending_fin;
+            if do_fin {
+                quic.stream_finish(conn, stream_id)?;
+                self.finalize_local_close(stream_id);
+            }
+            if do_fin || !self.has_pending_writes(stream_id) {
+                self.pending_sends.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Advance the request-stream state machine when the local send side
+    /// closes (either immediately after a successful write or later after the
+    /// queue drains).
+    fn finalize_local_close(&mut self, stream_id: StreamId) {
+        if let Some(rs) = self.request_streams.get_mut(&u64::from(stream_id)) {
+            rs.state = match rs.state {
+                StreamState::HalfClosedRemote => StreamState::Closed,
+                _ => StreamState::HalfClosedLocal,
+            };
+        }
+    }
 
     fn handle_stream_readable(
         &mut self,
