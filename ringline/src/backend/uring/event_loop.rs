@@ -148,6 +148,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .replenish_batch(&self.driver.pending_replenish);
                 self.driver.pending_replenish.clear();
             }
+            if !self.driver.udp_pending_replenish.is_empty()
+                && let Some(ref mut udp_bufs) = self.driver.udp_provided_bufs
+            {
+                udp_bufs.replenish_batch(&self.driver.udp_pending_replenish);
+                self.driver.udp_pending_replenish.clear();
+            }
 
             // Retry any ZC send resubmissions that failed on the previous tick
             // (SQ was full). The SQ has been flushed by submit_and_wait above.
@@ -391,7 +397,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.tick_timeout_armed = false;
             }
             OpTag::Timer => self.handle_timer(ud, result),
-            OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result),
+            OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result, flags),
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
             OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
             OpTag::DirectIo => self.handle_direct_io(ud, result),
@@ -1385,38 +1391,102 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    fn handle_recv_msg_udp(&mut self, ud: UserData, result: i32) {
+    fn handle_recv_msg_udp(&mut self, ud: UserData, result: i32, flags: u32) {
+        /// Parse the `name` region from a multishot `recvmsg` output into a
+        /// `SocketAddr`. The region is a `sockaddr_in` or `sockaddr_in6`
+        /// depending on `ss_family`; we copy it into an aligned
+        /// `sockaddr_storage` before decoding.
+        fn parse_recvmsg_name(name: &[u8]) -> Option<std::net::SocketAddr> {
+            if name.len() < std::mem::size_of::<libc::sa_family_t>() {
+                return None;
+            }
+            let max = std::mem::size_of::<libc::sockaddr_storage>();
+            let copy_len = name.len().min(max);
+            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    name.as_ptr(),
+                    &mut storage as *mut _ as *mut u8,
+                    copy_len,
+                );
+            }
+            sockaddr_to_socket_addr(&storage, copy_len as u32)
+        }
+
         let udp_index = ud.conn_index();
         let idx = udp_index as usize;
+        let has_more = cqueue::more(flags);
 
         if idx >= self.driver.udp_sockets.len() {
+            // Stale socket. If a buffer was attached, hand it back so it
+            // doesn't leak out of the ring.
+            if result > 0
+                && let Some(bid) = cqueue::buffer_select(flags)
+            {
+                self.driver.udp_pending_replenish.push(bid);
+            }
             return;
         }
+
+        // udp_sockets is non-empty → udp_provided_bufs is Some.
+        let udp_bgid = match self.driver.udp_provided_bufs.as_ref() {
+            Some(r) => r.bgid(),
+            None => return,
+        };
 
         if result <= 0 {
-            self.driver.resubmit_udp_recvmsg(udp_index);
+            let errno = -result;
+            // If the multishot was torn down, rearm so the socket stays
+            // live. ECANCELED is a quiet teardown during shutdown; skip.
+            if !has_more && errno != libc::ECANCELED {
+                if errno == libc::ENOBUFS {
+                    metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
+                }
+                self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
+            }
             return;
         }
 
-        let bytes = result as usize;
-        let peer = sockaddr_to_socket_addr(
-            &self.driver.udp_sockets[idx].recv_addr,
-            self.driver.udp_sockets[idx].recv_msghdr.msg_namelen,
-        );
+        let bid = match cqueue::buffer_select(flags) {
+            Some(b) => b,
+            None => {
+                if !has_more {
+                    self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
+                }
+                return;
+            }
+        };
 
-        // Copy datagram to avoid borrow conflict.
-        let data = self.driver.udp_sockets[idx].recv_buf[..bytes].to_vec();
+        // SAFETY: The buffer pointer belongs to the UDP provided buffer ring
+        // and remains valid until we replenish the bid below.
+        let buf_len = result as u32;
+        let buf = {
+            let udp_bufs = self.driver.udp_provided_bufs.as_ref().unwrap();
+            let (buf_ptr, _) = udp_bufs.get_buffer(bid);
+            unsafe { std::slice::from_raw_parts(buf_ptr, buf_len as usize) }
+        };
 
-        // Resubmit recvmsg before waking task.
-        self.driver.resubmit_udp_recvmsg(udp_index);
+        // Hand the buffer back unconditionally — even on parse error — so the
+        // ring doesn't bleed.
+        let parse_result =
+            io_uring::types::RecvMsgOut::parse(buf, &self.driver.udp_sockets[idx].recv_msghdr);
+        self.driver.udp_pending_replenish.push(bid);
 
-        if let Some(peer) = peer {
+        if let Ok(msg_out) = parse_result
+            && !msg_out.is_name_data_truncated()
+            && !msg_out.is_payload_truncated()
+            && let Some(peer) = parse_recvmsg_name(msg_out.name_data())
+        {
+            let payload = msg_out.payload_data().to_vec();
             metrics::UDP.increment(metrics::udp::DATAGRAMS_RECEIVED);
-            // Push to the async recv queue and wake waiting task.
             if idx < self.executor.udp_recv_queues.len() {
-                self.executor.udp_recv_queues[idx].push_back((data, peer));
+                self.executor.udp_recv_queues[idx].push_back((payload, peer));
                 self.executor.wake_udp_recv(udp_index);
             }
+        }
+
+        if !has_more {
+            self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
         }
     }
 

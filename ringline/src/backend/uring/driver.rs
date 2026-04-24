@@ -50,22 +50,15 @@ pub(crate) struct UdpSocketState {
     /// Bound address.
     #[allow(dead_code)] // stored for diagnostics
     pub local_addr: SocketAddr,
-    // ── Recv state (heap-allocated for stable addresses) ──
-    pub recv_buf: Box<[u8]>,
-    pub recv_addr: Box<libc::sockaddr_storage>,
-    #[allow(dead_code)] // referenced via raw pointer in msghdr
-    pub recv_iov: Box<libc::iovec>,
+    /// `msghdr` template used by `IORING_OP_RECVMSG_MULTISHOT`. The kernel
+    /// reads its `msg_namelen`/`msg_controllen`/etc. to decide how to carve
+    /// up each provided buffer into `[io_uring_recvmsg_out][name][control]
+    /// [payload]`. `RecvMsgOut::parse` reads the same template on the CQE
+    /// side. Must stay heap-stable for the lifetime of the multishot.
     pub recv_msghdr: Box<libc::msghdr>,
     // ── Send state: fixed-size ring of per-SQE slots + a stack-freelist ──
     pub send_slots: Box<[UdpSendSlot]>,
     pub send_freelist: Vec<u16>,
-}
-
-impl UdpSocketState {
-    /// Reset msg_namelen before re-submitting recvmsg.
-    pub fn reset_recv_namelen(&mut self) {
-        self.recv_msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-    }
 }
 
 /// A kernel recv buffer held in-place for zero-copy access.
@@ -87,6 +80,12 @@ pub(crate) struct Driver {
     pub(crate) connections: ConnectionTable,
     pub(crate) fixed_buffers: FixedBufferRegistry,
     pub(crate) provided_bufs: ProvidedBufRing,
+    /// Provided buffer ring backing UDP multishot recvmsg. `None` when no UDP
+    /// sockets are configured.
+    pub(crate) udp_provided_bufs: Option<ProvidedBufRing>,
+    /// Buffer IDs from `udp_provided_bufs` that have been consumed and need
+    /// to be handed back to the kernel. Drained each tick.
+    pub(crate) udp_pending_replenish: Vec<u16>,
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_slab: InFlightSendSlab,
     pub(crate) accumulators: AccumulatorTable,
@@ -217,6 +216,15 @@ impl Driver {
         )?;
 
         let udp_count = config.udp_bind.len() as u32;
+        let udp_provided_bufs = if udp_count > 0 {
+            Some(ProvidedBufRing::new(
+                config.udp_recv_buffer.bgid,
+                config.udp_recv_buffer.ring_size,
+                config.udp_recv_buffer.buffer_size,
+            )?)
+        } else {
+            None
+        };
         let nvme_max = config
             .nvme
             .as_ref()
@@ -235,6 +243,9 @@ impl Driver {
             config.max_connections + udp_count + nvme_max + direct_io_max + fs_max,
         )?;
         ring.register_buf_ring(&provided_bufs)?;
+        if let Some(ref udp_bufs) = udp_provided_bufs {
+            ring.register_buf_ring(udp_bufs)?;
+        }
 
         let connections = ConnectionTable::new(config.max_connections);
         let send_copy_pool = SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
@@ -296,6 +307,8 @@ impl Driver {
             connections,
             fixed_buffers,
             provided_bufs,
+            udp_provided_bufs,
+            udp_pending_replenish: Vec::new(),
             send_copy_pool,
             send_slab,
             accumulators,
@@ -382,17 +395,20 @@ impl Driver {
             blocking_pool,
         };
 
-        // Submit initial recvmsg for each UDP socket.
+        // Arm multishot recvmsg for each UDP socket against the UDP buffer
+        // group. One SQE per socket stays live in the kernel and fans out a
+        // CQE per datagram until the buffer ring is exhausted.
+        let udp_bgid = config.udp_recv_buffer.bgid;
         for udp_idx in 0..driver.udp_sockets.len() {
             let ud = UserData::encode(OpTag::RecvMsgUdp, udp_idx as u32, 0);
-            let msghdr_ptr = &mut *driver.udp_sockets[udp_idx].recv_msghdr as *mut libc::msghdr;
+            let msghdr_ptr = &*driver.udp_sockets[udp_idx].recv_msghdr as *const libc::msghdr;
             let fd_index = driver.udp_sockets[udp_idx].fd_index;
             driver
                 .ring
-                .submit_recvmsg(fd_index, msghdr_ptr, ud)
+                .submit_recvmsg_multishot(fd_index, msghdr_ptr, udp_bgid, ud)
                 .map_err(|e| {
                     crate::error::Error::RingSetup(format!(
-                        "failed to submit initial UDP recvmsg: {e}"
+                        "failed to submit initial UDP multishot recvmsg: {e}"
                     ))
                 })?;
         }
@@ -633,22 +649,16 @@ impl Driver {
             libc::close(fd);
         }
 
-        // Allocate recv state.
-        let recv_buf = vec![0u8; 65536].into_boxed_slice();
-        let mut recv_addr: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
-        let mut recv_iov = Box::new(libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        });
+        // Build the msghdr *template* for multishot recvmsg. The kernel only
+        // reads `msg_namelen` / `msg_controllen` / `msg_iovlen` from this;
+        // the actual name/control/payload land inside a buffer from the
+        // provided buffer ring (laid out as `io_uring_recvmsg_out` + name +
+        // control + payload). No iov is needed for multishot.
         let mut recv_msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-
-        // Set up pointers (stable because everything is boxed).
-        recv_iov.iov_base = recv_buf.as_ptr() as *mut libc::c_void;
-        recv_iov.iov_len = recv_buf.len();
-        recv_msghdr.msg_name = &mut *recv_addr as *mut _ as *mut libc::c_void;
         recv_msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-        recv_msghdr.msg_iov = &mut *recv_iov as *mut libc::iovec;
-        recv_msghdr.msg_iovlen = 1;
+        recv_msghdr.msg_controllen = 0;
+        recv_msghdr.msg_iov = std::ptr::null_mut();
+        recv_msghdr.msg_iovlen = 0;
 
         // Allocate send slot ring. Each slot owns its own (addr, iov, msghdr)
         // so multiple sendmsg SQEs can be in-flight concurrently.
@@ -679,9 +689,6 @@ impl Driver {
         Ok(UdpSocketState {
             fd_index,
             local_addr: bind_addr,
-            recv_buf,
-            recv_addr,
-            recv_iov,
             recv_msghdr,
             send_slots: send_slots_box,
             send_freelist,
@@ -745,18 +752,26 @@ impl Driver {
         }
     }
 
-    /// Re-submit recvmsg for a UDP socket after processing a datagram.
-    pub(crate) fn resubmit_udp_recvmsg(&mut self, udp_index: u32) {
+    /// Re-arm the UDP multishot recvmsg for a socket. Called when the kernel
+    /// tears the multishot down (e.g. on `ENOBUFS` after the buffer ring
+    /// emptied) — the CQE handler pushes the hint here once replenishment
+    /// has refilled the ring.
+    pub(crate) fn rearm_udp_recvmsg(&mut self, udp_index: u32, bgid: u16) {
         let idx = udp_index as usize;
         if idx >= self.udp_sockets.len() {
             return;
         }
-        self.udp_sockets[idx].reset_recv_namelen();
+        // Reset msg_namelen in case the kernel cleared it during teardown.
+        self.udp_sockets[idx].recv_msghdr.msg_namelen =
+            std::mem::size_of::<libc::sockaddr_storage>() as u32;
         let ud = UserData::encode(OpTag::RecvMsgUdp, udp_index, 0);
-        let msghdr_ptr = &mut *self.udp_sockets[idx].recv_msghdr as *mut libc::msghdr;
+        let msghdr_ptr = &*self.udp_sockets[idx].recv_msghdr as *const libc::msghdr;
         let fd_index = self.udp_sockets[idx].fd_index;
-        if self.ring.submit_recvmsg(fd_index, msghdr_ptr, ud).is_err() {
-            // UDP recv is dead for this socket until the next successful submit.
+        if self
+            .ring
+            .submit_recvmsg_multishot(fd_index, msghdr_ptr, bgid, ud)
+            .is_err()
+        {
             crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
         }
     }
@@ -859,7 +874,7 @@ impl Driver {
             }
         }
 
-        // 3. Unregister the provided buffer ring before Driver is dropped
+        // 3. Unregister the provided buffer rings before Driver is dropped
         // (which munmaps the ring memory). Without this, the kernel holds a
         // dangling pointer to the freed mmap region.
         if self
@@ -867,8 +882,11 @@ impl Driver {
             .unregister_buf_ring(self.provided_bufs.bgid())
             .is_err()
         {
-            // Kernel may hold a dangling pointer to the freed mmap region.
-            // This is a best-effort operation during shutdown.
+            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+        }
+        if let Some(ref udp_bufs) = self.udp_provided_bufs
+            && self.ring.unregister_buf_ring(udp_bufs.bgid()).is_err()
+        {
             crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
         }
 

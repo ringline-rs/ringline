@@ -314,14 +314,21 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a recvmsg for a UDP socket (single-shot with pre-allocated buffer).
-    pub fn submit_recvmsg(
+    /// Submit a multishot recvmsg for a UDP socket backed by a provided buffer ring.
+    ///
+    /// `msghdr` is used as a *template* by the kernel to decide how to lay out
+    /// each datagram inside the ring buffer it picks (name / control / payload
+    /// regions). It must remain valid for as long as the multishot is armed.
+    /// Use [`io_uring::types::RecvMsgOut::parse`] on the returned buffer to
+    /// extract the datagram.
+    pub fn submit_recvmsg_multishot(
         &mut self,
         fd_index: u32,
-        msghdr: *mut libc::msghdr,
+        msghdr: *const libc::msghdr,
+        bgid: u16,
         user_data: UserData,
     ) -> io::Result<()> {
-        let entry = opcode::RecvMsg::new(Fixed(fd_index), msghdr)
+        let entry = opcode::RecvMsgMulti::new(Fixed(fd_index), msghdr, bgid)
             .build()
             .user_data(user_data.raw());
         unsafe {
