@@ -5,23 +5,33 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use bytes::Bytes;
 use ringline_quic::{QuicConnId, QuicEndpoint, QuicEvent, StreamId, WriteError};
 
 use crate::error::H3Error;
-use crate::frame::{self, Frame};
+use crate::frame::{self, Frame, encode_frame_header};
 use crate::qpack::{self, HeaderField};
 use crate::settings::Settings;
 use crate::stream::{RequestStream, StreamState};
 
-/// Bytes queued for a stream that didn't fit in the current flow-control
-/// window. Drained on `StreamWritable` events.
+/// Refcounted payload chunks queued for a stream that didn't fit in the
+/// current flow-control window. Drained on `StreamWritable` events.
+///
+/// Each chunk stays as a distinct `Bytes` so slicing stays O(1) and we don't
+/// re-copy user payloads onto a contiguous `Vec<u8>` when we have to queue
+/// behind a slow receiver.
 #[derive(Default)]
 struct PendingStream {
-    /// Unflushed bytes in FIFO order. Fresh `send_*` calls append to the tail.
-    buf: Vec<u8>,
-    /// Caller requested FIN once `buf` fully drains. `stream_finish` fires
+    queue: VecDeque<Bytes>,
+    /// Caller requested FIN once `queue` fully drains. `stream_finish` fires
     /// then, not when the app called the send method.
     pending_fin: bool,
+}
+
+impl PendingStream {
+    fn is_done(&self) -> bool {
+        self.queue.is_empty() && !self.pending_fin
+    }
 }
 
 /// HTTP/3 uni-stream type identifiers (RFC 9114 Section 6.2).
@@ -149,7 +159,7 @@ impl H3Connection {
         let mut buf = Vec::new();
         frame::encode_varint(&mut buf, STREAM_TYPE_CONTROL);
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
-        self.queue_send(quic, conn, stream, &buf, false)?;
+        self.queue_send(quic, conn, stream, vec![Bytes::from(buf)], false)?;
 
         self.settings_sent = true;
         Ok(())
@@ -172,7 +182,7 @@ impl H3Connection {
         let mut buf = Vec::new();
         frame::encode_varint(&mut buf, STREAM_TYPE_CONTROL);
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
-        self.queue_send(quic, conn, stream, &buf, false)?;
+        self.queue_send(quic, conn, stream, vec![Bytes::from(buf)], false)?;
 
         self.settings_sent = true;
         Ok(())
@@ -217,7 +227,7 @@ impl H3Connection {
         };
         self.request_streams.insert(u64::from(stream_id), rs);
 
-        self.queue_send(quic, conn, stream_id, &buf, end_stream)?;
+        self.queue_send(quic, conn, stream_id, vec![Bytes::from(buf)], end_stream)?;
 
         Ok(stream_id)
     }
@@ -297,7 +307,7 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        self.queue_send(quic, conn, stream_id, &buf, end_stream)
+        self.queue_send(quic, conn, stream_id, vec![Bytes::from(buf)], end_stream)
     }
 
     /// Send response body data on a stream.
@@ -307,6 +317,10 @@ impl H3Connection {
     /// events. `stream_finish` is deferred to the moment the queue drains.
     /// Poll [`has_pending_writes`](Self::has_pending_writes) to observe
     /// progress.
+    ///
+    /// The body is copied into a refcounted `Bytes`. Callers that already
+    /// own a `Bytes` (e.g. from a file-backed response) should use
+    /// [`send_data_bytes`](Self::send_data_bytes) instead to avoid the copy.
     pub fn send_data(
         &mut self,
         quic: &mut QuicEndpoint,
@@ -314,17 +328,34 @@ impl H3Connection {
         data: &[u8],
         end_stream: bool,
     ) -> Result<(), H3Error> {
+        self.send_data_bytes(quic, stream_id, Bytes::copy_from_slice(data), end_stream)
+    }
+
+    /// Zero-copy counterpart of [`send_data`](Self::send_data). The payload
+    /// is sent as a refcounted `Bytes`: the DATA frame header is the only
+    /// freshly-allocated bytes on the wire path, and any portion that gets
+    /// queued behind flow control keeps its refcount — no memcpy on
+    /// backpressure.
+    pub fn send_data_bytes(
+        &mut self,
+        quic: &mut QuicEndpoint,
+        stream_id: StreamId,
+        data: Bytes,
+        end_stream: bool,
+    ) -> Result<(), H3Error> {
         let conn = self
             .conn_id
             .ok_or(H3Error::Internal("no connection".into()))?;
 
-        let mut buf = Vec::new();
-        Frame::Data {
-            payload: data.to_vec(),
-        }
-        .encode(&mut buf);
+        // DATA frame = type varint + length varint + payload. The first two
+        // are tiny (≤ 9 bytes); build them as a small `Bytes` and hand the
+        // payload through as its own chunk so quinn-proto sees it without
+        // a memcpy.
+        let mut header = Vec::with_capacity(16);
+        encode_frame_header(&mut header, frame::FRAME_DATA, data.len() as u64);
+        let chunks = vec![Bytes::from(header), data];
 
-        self.queue_send(quic, conn, stream_id, &buf, end_stream)
+        self.queue_send(quic, conn, stream_id, chunks, end_stream)
     }
 
     /// Send a GOAWAY frame on the control stream (graceful shutdown).
@@ -346,7 +377,7 @@ impl H3Connection {
         }
         .encode(&mut buf);
 
-        self.queue_send(quic, conn, control, &buf, false)?;
+        self.queue_send(quic, conn, control, vec![Bytes::from(buf)], false)?;
         self.state = H3State::Closing;
         Ok(())
     }
@@ -358,26 +389,23 @@ impl H3Connection {
     pub fn has_pending_writes(&self, stream_id: StreamId) -> bool {
         self.pending_sends
             .get(&u64::from(stream_id))
-            .is_some_and(|p| !p.buf.is_empty() || p.pending_fin)
+            .is_some_and(|p| !p.queue.is_empty() || p.pending_fin)
     }
 
     // ── Internal helpers ────────────────────────────────────────────
 
-    /// Try to push `data` to a stream, queueing any remainder that didn't fit
-    /// in the current flow-control window. If `fin` is set, the stream is
-    /// finished — immediately if everything flushed, or deferred until the
-    /// queue drains.
-    ///
-    /// The `on_local_close` closure runs when the FIN actually reaches
-    /// `stream_finish` (either in-line here or later from
-    /// [`drain_pending_stream`]), giving the caller a hook to update its
-    /// local stream state.
+    /// Push one or more [`Bytes`] chunks onto a stream. Chunks that don't
+    /// fit in the current flow-control window are queued verbatim — they
+    /// stay refcounted, no `extend_from_slice` — and flushed on the next
+    /// [`QuicEvent::StreamWritable`]. If `fin` is set, the stream is
+    /// finished either immediately (everything flushed) or later
+    /// ([`drain_pending_stream`]).
     fn queue_send(
         &mut self,
         quic: &mut QuicEndpoint,
         conn: QuicConnId,
         stream_id: StreamId,
-        data: &[u8],
+        mut chunks: Vec<Bytes>,
         fin: bool,
     ) -> Result<(), H3Error> {
         let key = u64::from(stream_id);
@@ -386,41 +414,59 @@ impl H3Connection {
         // appending instead of racing the head. The queue drains on the next
         // StreamWritable.
         if let Some(pending) = self.pending_sends.get_mut(&key)
-            && (!pending.buf.is_empty() || pending.pending_fin)
+            && (!pending.queue.is_empty() || pending.pending_fin)
         {
-            pending.buf.extend_from_slice(data);
+            for chunk in chunks.drain(..) {
+                if !chunk.is_empty() {
+                    pending.queue.push_back(chunk);
+                }
+            }
             if fin {
                 pending.pending_fin = true;
             }
             return Ok(());
         }
 
-        let mut offset = 0;
-        match quic.stream_send(conn, stream_id, data) {
-            Ok(n) => offset = n,
+        match quic.stream_send_chunks(conn, stream_id, &mut chunks) {
+            Ok(_) => {}
             Err(ringline_quic::Error::Write(WriteError::Blocked)) => {
-                // Nothing written — queue it all below.
+                // Budget was zero — all chunks still hold their original
+                // data. Fall through and queue them.
             }
             Err(e) => return Err(e.into()),
         }
 
-        let remainder = &data[offset..];
-        if remainder.is_empty() && !fin {
-            // Whole send landed, nothing to track.
-            return Ok(());
+        // Anything left in any chunk is the remainder. Queue it.
+        let mut any_remaining = false;
+        for chunk in chunks.drain(..) {
+            if !chunk.is_empty() {
+                self.pending_sends
+                    .entry(key)
+                    .or_default()
+                    .queue
+                    .push_back(chunk);
+                any_remaining = true;
+            }
         }
 
-        if remainder.is_empty() && fin {
+        if !any_remaining && fin {
             quic.stream_finish(conn, stream_id)?;
             self.finalize_local_close(stream_id);
             self.pending_sends.remove(&key);
             return Ok(());
         }
 
-        let entry = self.pending_sends.entry(key).or_default();
-        entry.buf.extend_from_slice(remainder);
         if fin {
-            entry.pending_fin = true;
+            self.pending_sends.entry(key).or_default().pending_fin = true;
+        }
+
+        // Garbage-collect entries that wound up with nothing to track.
+        if self
+            .pending_sends
+            .get(&key)
+            .is_some_and(PendingStream::is_done)
+        {
+            self.pending_sends.remove(&key);
         }
         Ok(())
     }
@@ -440,18 +486,27 @@ impl H3Connection {
                 Some(p) => p,
                 None => return Ok(()),
             };
-            if pending.buf.is_empty() {
+            if pending.queue.is_empty() {
                 break;
             }
-            match quic.stream_send(conn, stream_id, &pending.buf) {
+            // `make_contiguous` rearranges VecDeque into a single slice so we
+            // can hand quinn-proto multiple chunks per write call. Partial
+            // chunks are advanced in place via `split_to`.
+            let chunks = pending.queue.make_contiguous();
+            let result = quic.stream_send_chunks(conn, stream_id, chunks);
+
+            // Regardless of Ok/Err, scrub now-empty chunks from the front.
+            while pending.queue.front().is_some_and(Bytes::is_empty) {
+                pending.queue.pop_front();
+            }
+
+            match result {
                 Ok(0) => break,
-                Ok(n) => {
-                    pending.buf.drain(..n);
-                }
+                Ok(_) => {}
                 Err(ringline_quic::Error::Write(WriteError::Blocked)) => break,
                 Err(e) => {
-                    // Stream is stopped / reset / otherwise unwritable. Drop the
-                    // queued bytes and surface the error to the app.
+                    // Stream stopped/reset/unwritable. Drop the queue and
+                    // surface the error; the app can observe it via poll_event.
                     self.pending_sends.remove(&key);
                     self.events.push_back(H3Event::Error(e.into()));
                     return Ok(());
@@ -461,15 +516,18 @@ impl H3Connection {
 
         // Buffer is empty (or we broke on block). Finish if we deferred FIN
         // earlier and there's truly nothing left to write.
-        if let Some(pending) = self.pending_sends.get(&key)
-            && pending.buf.is_empty()
-        {
-            let do_fin = pending.pending_fin;
+        let (queue_drained, do_fin) = self
+            .pending_sends
+            .get(&key)
+            .map(|p| (p.queue.is_empty(), p.pending_fin))
+            .unwrap_or((false, false));
+        if queue_drained {
             if do_fin {
                 quic.stream_finish(conn, stream_id)?;
                 self.finalize_local_close(stream_id);
-            }
-            if do_fin || !self.has_pending_writes(stream_id) {
+                self.pending_sends.remove(&key);
+            } else {
+                // Nothing queued and no deferred FIN → nothing left to track.
                 self.pending_sends.remove(&key);
             }
         }

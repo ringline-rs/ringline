@@ -15,8 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - `QuicEndpoint::flush()` drains pending transmits on demand.
+- `QuicEndpoint::stream_send_chunks()` sends a scatter-gather `&mut [Bytes]` without copying.
 - `UdpCtx::send_ready()` awaits a free UDP send slot.
 - `H3Connection::has_pending_writes()` reports whether queued bytes are waiting for flow-control credit.
+- `H3Connection::send_data_bytes()` zero-copy send for callers that already hold a `Bytes`.
 
 ### Changed
 
