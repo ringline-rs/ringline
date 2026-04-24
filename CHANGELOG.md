@@ -10,11 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - `ringline-quic` now emits `StreamReadable` when a stream opens with data in the first frame (previously hung).
+- `ringline-h3` no longer drops body bytes when the peer's flow-control window is tight.
 
 ### Added
 
 - `QuicEndpoint::flush()` drains pending transmits on demand.
 - `UdpCtx::send_ready()` awaits a free UDP send slot.
+- `H3Connection::has_pending_writes()` reports whether queued bytes are waiting for flow-control credit.
 
 ### Changed
 

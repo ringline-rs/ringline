@@ -38,4 +38,4 @@ pub use error::Error;
 pub use event::{QuicConnId, QuicEvent};
 
 // Re-export commonly used quinn-proto types for convenience.
-pub use quinn_proto::{Dir, StreamId};
+pub use quinn_proto::{Dir, StreamId, WriteError};
