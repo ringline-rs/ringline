@@ -82,7 +82,10 @@ jobs:
             version=$(cargo metadata --no-deps --format-version 1 \
               | jq -r ".packages[] | select(.name == \"$crate\") | .version")
 
-            # Check if this version is already on crates.io.
+            # Best-effort pre-check via the crates.io API. May come back empty
+            # on rate limit or transient API failure, in which case we fall
+            # through to `cargo publish` and rely on the post-attempt grep
+            # for "already exists" to short-circuit cleanly.
             local published
             published=$(curl -s "https://crates.io/api/v1/crates/$crate/$version" \
               | jq -r '.version.num // empty')
@@ -92,12 +95,22 @@ jobs:
               return 0
             fi
 
-            # Publish with retry on rate limit (HTTP 429).
+            # Publish with retry on rate limit (HTTP 429). Treat "already
+            # exists" as success so a flaky API check doesn't loop us for
+            # 15 minutes on a no-op crate.
             local attempt
             for attempt in $(seq 1 15); do
               echo "  $crate v$version — publishing (attempt $attempt)..."
-              if cargo publish -p "$crate" 2>&1; then
+              local output
+              if output=$(cargo publish -p "$crate" 2>&1); then
+                echo "$output"
                 sleep 30
+                return 0
+              fi
+              echo "$output"
+
+              if echo "$output" | grep -q "already exists on crates.io index"; then
+                echo "  $crate v$version — already published (API check missed), skipping"
                 return 0
               fi
 
@@ -148,11 +161,19 @@ jobs:
             exit 0
           fi
 
-          # Publish with retry.
+          # Publish with retry. Treat "already exists" as success so a
+          # flaky API check doesn't loop us on a no-op republish.
           for attempt in $(seq 1 15); do
             echo "$CRATE v$VERSION — publishing (attempt $attempt)..."
-            if cargo publish -p "$CRATE" 2>&1; then
+            if output=$(cargo publish -p "$CRATE" 2>&1); then
+              echo "$output"
               echo "Published $CRATE v$VERSION"
+              exit 0
+            fi
+            echo "$output"
+
+            if echo "$output" | grep -q "already exists on crates.io index"; then
+              echo "$CRATE v$VERSION — already published (API check missed), skipping"
               exit 0
             fi
 
