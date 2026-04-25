@@ -7,14 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [ringline-h3 0.2.1] - 2026-04-24
+
 ### Fixed
 
-- `ringline-h3` no longer drops body bytes when the peer's flow-control window is tight.
+- `H3Connection::send_data` no longer drops body bytes when the peer's flow-control window is tight. Previously the `usize` returned by `QuicEndpoint::stream_send` was ignored, so any partial-write remainder went silently into the void; now it's queued and flushed on subsequent `QuicEvent::StreamWritable` events. `stream_finish` is deferred until the queue drains. (#119)
 
 ### Added
 
-- `H3Connection::has_pending_writes()` reports whether queued bytes are waiting for flow-control credit.
-- `H3Connection::send_data_bytes()` zero-copy send for callers that already hold a `Bytes`.
+- `H3Connection::has_pending_writes(stream)` reports whether queued bytes are waiting for flow-control credit. (#119)
+- `H3Connection::send_data_bytes(stream, data: Bytes, fin)` — end-to-end zero-copy send for callers that already hold a `Bytes`. The DATA frame header is the only fresh allocation on the wire path; partial writes and queue spills stay refcounted (no `extend_from_slice`). (#120)
+
+### Changed
+
+- Internal send queue is now `VecDeque<Bytes>`; queued bytes stay refcounted on backpressure (no memcpy on partial writes). All control-stream and request-stream sends route through the same chunks-based path. (#120)
+- `ringline-quic` dependency bumped to `0.2.1` for `stream_send_chunks` and the `WriteError` re-export.
 
 ## [ringline-quic 0.2.1] - 2026-04-24
 
