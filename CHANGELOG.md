@@ -16,15 +16,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `QuicEndpoint::flush()` drains pending transmits on demand.
 - `QuicEndpoint::stream_send_chunks()` sends a scatter-gather `&mut [Bytes]` without copying.
-- `UdpCtx::send_ready()` awaits a free UDP send slot.
 - `H3Connection::has_pending_writes()` reports whether queued bytes are waiting for flow-control credit.
 - `H3Connection::send_data_bytes()` zero-copy send for callers that already hold a `Bytes`.
 
 ### Changed
 
-- UDP recv now uses multishot `recvmsg` with a provided buffer ring (io_uring). New `Config::udp_recv_buffer`.
-- UDP sends are now pipelined (io_uring).
 - `QuicConfig` is now `Clone`.
+
+## [0.1.1] - 2026-04-24
+
+### Added
+
+- `UdpCtx::send_ready()` awaits a free UDP send slot. (#116)
+- `Config::udp_send_slots` controls per-socket UDP send pipeline depth (default 64). (#115)
+- `Config::udp_recv_buffer` configures the dedicated provided buffer ring for UDP multishot recv. (#118)
+
+### Changed
+
+- UDP sends are now pipelined on the io_uring backend — up to `Config::udp_send_slots` datagrams in flight per socket. (#115)
+- UDP recv now uses multishot `recvmsg` with a provided buffer ring on the io_uring backend, eliminating per-datagram SQE resubmission and the 65 KiB per-socket recv buffer. (#118)
+- Upgraded `metriken` to 0.9 and switched to its built-in `ShardedCounterGroup`; the metrics module now exposes counter groups (e.g. `metrics::UDP.increment(udp::DATAGRAMS_SENT)`) instead of standalone counters. (#114)
+
+### Fixed
+
+- `shutdown_write` is deferred until the per-connection send queue drains, preventing FIN from racing pending sends. (#111)
+
+### Removed
+
+- **Breaking:** `UdpSendError::SendInFlight` variant. The slot ring made it unreachable; exhaustion now uniformly returns `UdpSendError::PoolExhausted`.
 
 ## [ringline-redis 0.2.1] - 2026-04-18
 
