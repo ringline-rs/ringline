@@ -9,19 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- `ringline-quic` now emits `StreamReadable` when a stream opens with data in the first frame (previously hung).
 - `ringline-h3` no longer drops body bytes when the peer's flow-control window is tight.
 
 ### Added
 
-- `QuicEndpoint::flush()` drains pending transmits on demand.
-- `QuicEndpoint::stream_send_chunks()` sends a scatter-gather `&mut [Bytes]` without copying.
 - `H3Connection::has_pending_writes()` reports whether queued bytes are waiting for flow-control credit.
 - `H3Connection::send_data_bytes()` zero-copy send for callers that already hold a `Bytes`.
 
+## [ringline-quic 0.2.1] - 2026-04-24
+
+### Fixed
+
+- `StreamReadable` is now emitted alongside `StreamOpened` when a stream opens with data in the first frame. quinn-proto's `on_stream_frame` suppresses the Readable event in that exact case; applications waiting on `StreamReadable` before reading would hang for short one-shot messages. (#117)
+
+### Added
+
+- `QuicEndpoint::flush()` drains pending transmits on all connections — call it after `stream_send` / `open_*` so frames don't sit buffered until the next inbound datagram. (#117)
+- `QuicEndpoint::stream_send_chunks(conn, stream, &mut [Bytes])` wraps quinn-proto's `SendStream::write_chunks` for scatter-gather zero-copy sends; partial chunks are advanced in place via `Bytes::split_to`. (#120)
+- Re-exports `quinn_proto::WriteError` so downstream crates can match on `WriteError::Blocked` without taking quinn-proto as a direct dependency. (#119)
+
 ### Changed
 
-- `QuicConfig` is now `Clone`.
+- `QuicConfig` now derives `Clone`. All inner state is `Arc`-backed, so cloning stays cheap and one config can drive multiple per-worker endpoints. (#115)
 
 ## [0.1.1] - 2026-04-24
 
