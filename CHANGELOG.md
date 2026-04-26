@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-04-26
+
+### Added
+
+- Safe `read_into` / `write_from` interface for fs io. (#126)
+
 ## [ringline-h3 0.2.1] - 2026-04-24
 
 ### Fixed
