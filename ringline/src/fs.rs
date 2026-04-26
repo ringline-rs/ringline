@@ -660,7 +660,10 @@ fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
             file_index as u32,
             seq,
         );
-        let _ = driver.ring.submit_async_cancel(target.raw(), u32::MAX);
+        // The cancel CQE handler is a no-op (event_loop.rs), so the
+        // conn_index encoded into the cancel SQE's own user_data is
+        // unused — pass 0 to satisfy `UserData::encode`'s 24-bit guard.
+        let _ = driver.ring.submit_async_cancel(target.raw(), 0);
     }
 }
 
