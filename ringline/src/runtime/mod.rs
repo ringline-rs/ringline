@@ -255,6 +255,11 @@ pub(crate) struct Executor {
     pub(crate) disk_io_waiters: HashMap<u32, u32>,
     /// Disk I/O: maps command slab_idx → i32 result from CQE.
     pub(crate) disk_io_results: HashMap<u32, i32>,
+    /// Disk I/O buffer graveyard: holds buffers whose owning future was dropped
+    /// before the CQE arrived. Entry is removed (and the buffer freed) when
+    /// `wake_disk_io` fires, ensuring the kernel's pointer remains valid for
+    /// the entire op even after the future goes away.
+    pub(crate) disk_io_graveyard: HashMap<u32, bytes::BytesMut>,
     /// Filesystem stat results: maps slab_idx → Metadata (populated by handle_fs for Statx ops).
     pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
     /// Pending DNS resolve requests: request_id -> (task_id to wake, result slot).
@@ -317,6 +322,7 @@ impl Executor {
             udp_send_ready_waiters: vec![None; udp],
             disk_io_waiters: HashMap::new(),
             disk_io_results: HashMap::new(),
+            disk_io_graveyard: HashMap::new(),
             fs_stat_results: HashMap::new(),
             pending_resolves: HashMap::new(),
             next_resolve_id: 0,
@@ -435,8 +441,16 @@ impl Executor {
     /// Disk I/O waiters are keyed by slab_idx (not conn_index), so
     /// `remove_connection()` does not need to clear them — the task
     /// holds the `DiskIoFuture` and will consume the result.
+    ///
+    /// If the owning future was dropped before completion, its buffer was
+    /// parked in `disk_io_graveyard`. We free it here (the kernel is now
+    /// done with the pointer) and discard the result, since no future
+    /// remains to read it.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_disk_io(&mut self, seq: u32, result: i32) {
+        if self.disk_io_graveyard.remove(&seq).is_some() {
+            return;
+        }
         self.disk_io_results.insert(seq, result);
         if let Some(task_id) = self.disk_io_waiters.remove(&seq) {
             self.wake_task(task_id);

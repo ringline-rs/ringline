@@ -10,6 +10,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::BytesMut;
+
 use crate::runtime::CURRENT_TASK_ID;
 use crate::runtime::io::{CURRENT_DRIVER, DiskIoFuture, with_state};
 
@@ -428,6 +430,241 @@ pub unsafe fn write(file: File, offset: u64, buf: *const u8, len: u32) -> io::Re
         executor.disk_io_waiters.insert(seq, task_id);
         Ok(DiskIoFuture { seq })
     })
+}
+
+// ── Safe owned-buffer API ─────────────────────────────────────────────
+
+/// Read from a file at the given offset into a [`BytesMut`].
+///
+/// The kernel writes into `buf`'s spare capacity (`buf.capacity() - buf.len()`).
+/// On success, the returned future yields `(Ok(n), buf)` with `buf.len()` extended
+/// by `n` bytes. On failure, the buffer is returned unchanged alongside the error.
+///
+/// If the future is dropped before the I/O completes, the buffer is parked
+/// in the runtime until the kernel reports completion (a best-effort
+/// `ASYNC_CANCEL` is also submitted). This avoids the use-after-free that
+/// motivates the `unsafe` on [`read()`].
+///
+/// Returns [`io::ErrorKind::InvalidInput`] if `buf` has no spare capacity
+/// or if spare capacity exceeds `u32::MAX`.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor.
+pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadFuture> {
+    let initial_len = buf.len();
+    let cap = buf.capacity();
+    if initial_len >= cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BytesMut has no spare capacity",
+        ));
+    }
+    let spare = cap - initial_len;
+    if spare > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spare capacity exceeds u32::MAX",
+        ));
+    }
+    // Safety: `as_mut_ptr().add(initial_len)` points into the spare region of
+    // the BytesMut's backing allocation. The future owns `buf` (or parks it on
+    // drop), so the allocation outlives the kernel's use of the pointer.
+    let ptr = unsafe { buf.as_mut_ptr().add(initial_len) };
+    let len = spare as u32;
+    let file_index = file.index;
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        // Safety: caller-side invariant is upheld by ReadFuture's ownership +
+        // graveyard-on-drop (see ReadFuture::Drop).
+        let seq = unsafe { ctx.fs_read(file, offset, ptr, len)? };
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor.disk_io_waiters.insert(seq, task_id);
+        Ok(ReadFuture {
+            seq,
+            file_index,
+            initial_len,
+            buf: Some(buf),
+        })
+    })
+}
+
+/// Write to a file at the given offset from a [`BytesMut`].
+///
+/// The kernel reads `buf.len()` bytes starting at `buf.as_ptr()`. The future
+/// yields `(io::Result<usize>, buf)` — the buffer is returned unchanged.
+///
+/// If the future is dropped before the I/O completes, the buffer is parked
+/// until the kernel reports completion (a best-effort `ASYNC_CANCEL` is also
+/// submitted).
+///
+/// Returns [`io::ErrorKind::InvalidInput`] if `buf.len() > u32::MAX`.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor.
+pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFuture> {
+    let len = buf.len();
+    if len > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "buffer len exceeds u32::MAX",
+        ));
+    }
+    let ptr = buf.as_ptr();
+    let len_u32 = len as u32;
+    let file_index = file.index;
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        // Safety: caller-side invariant is upheld by WriteFuture's ownership +
+        // graveyard-on-drop (see WriteFuture::Drop).
+        let seq = unsafe { ctx.fs_write(file, offset, ptr, len_u32)? };
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor.disk_io_waiters.insert(seq, task_id);
+        Ok(WriteFuture {
+            seq,
+            file_index,
+            buf: Some(buf),
+        })
+    })
+}
+
+/// Future returned by [`read_into()`].
+///
+/// Resolves to `(io::Result<usize>, BytesMut)`. On success `buf.len()` is
+/// extended by the number of bytes read.
+pub struct ReadFuture {
+    seq: u32,
+    file_index: u16,
+    initial_len: usize,
+    buf: Option<BytesMut>,
+}
+
+impl Future for ReadFuture {
+    type Output = (io::Result<usize>, BytesMut);
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        with_state(|_driver, executor| {
+            match executor.disk_io_results.remove(&me.seq) {
+                Some(result) if result < 0 => {
+                    let buf = me.buf.take().expect("ReadFuture polled after completion");
+                    Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
+                }
+                Some(result) => {
+                    let mut buf = me.buf.take().expect("ReadFuture polled after completion");
+                    let n = result as usize;
+                    let max_n = buf.capacity() - me.initial_len;
+                    let n = n.min(max_n);
+                    // Safety: kernel wrote `n` bytes into the spare region
+                    // [initial_len, initial_len + n), initializing them.
+                    unsafe { buf.set_len(me.initial_len + n) };
+                    Poll::Ready((Ok(n), buf))
+                }
+                None => {
+                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
+                    executor.disk_io_waiters.insert(me.seq, task_id);
+                    Poll::Pending
+                }
+            }
+        })
+    }
+}
+
+impl Drop for ReadFuture {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.take() else { return };
+        park_or_drop(self.seq, self.file_index, buf);
+    }
+}
+
+/// Future returned by [`write_from()`].
+///
+/// Resolves to `(io::Result<usize>, BytesMut)`. The buffer is returned
+/// unchanged regardless of success or failure.
+pub struct WriteFuture {
+    seq: u32,
+    file_index: u16,
+    buf: Option<BytesMut>,
+}
+
+impl Future for WriteFuture {
+    type Output = (io::Result<usize>, BytesMut);
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        with_state(
+            |_driver, executor| match executor.disk_io_results.remove(&me.seq) {
+                Some(result) if result < 0 => {
+                    let buf = me.buf.take().expect("WriteFuture polled after completion");
+                    Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
+                }
+                Some(result) => {
+                    let buf = me.buf.take().expect("WriteFuture polled after completion");
+                    Poll::Ready((Ok(result as usize), buf))
+                }
+                None => {
+                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
+                    executor.disk_io_waiters.insert(me.seq, task_id);
+                    Poll::Pending
+                }
+            },
+        )
+    }
+}
+
+impl Drop for WriteFuture {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.take() else { return };
+        park_or_drop(self.seq, self.file_index, buf);
+    }
+}
+
+/// Drop-side handler shared by [`ReadFuture`] and [`WriteFuture`].
+///
+/// If the CQE has already arrived (result is sitting in `disk_io_results`),
+/// the kernel is done with the buffer — drop it immediately. Otherwise park
+/// the buffer in `disk_io_graveyard` keyed by `seq`; the fs CQE handler will
+/// drop it when the op completes (with `-ECANCELED` if the cancel below
+/// raced ahead, or with the natural result otherwise).
+///
+/// On the io_uring backend, also submit a best-effort `ASYNC_CANCEL` SQE
+/// to speed up the inevitable completion. The mio backend has no equivalent
+/// (the syscall is already in-flight on a worker thread); the buffer just
+/// waits in the graveyard until the worker thread finishes.
+fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
+    let ptr = CURRENT_DRIVER.with(|c| c.get());
+    if ptr.is_null() {
+        // Outside the executor — leak the buffer rather than risk freeing
+        // memory the kernel may still write into. This shouldn't happen in
+        // practice (futures are owned by tasks pinned to a worker thread),
+        // but `forget` is the safe fallback if it ever does.
+        std::mem::forget(buf);
+        return;
+    }
+    let state = unsafe { &mut *ptr };
+    let executor = unsafe { &mut *state.executor };
+    executor.disk_io_waiters.remove(&seq);
+    if executor.disk_io_results.remove(&seq).is_some() {
+        // CQE already arrived — kernel released the buffer. Drop normally.
+        drop(buf);
+        let _ = file_index;
+        return;
+    }
+    executor.disk_io_graveyard.insert(seq, buf);
+    #[cfg(has_io_uring)]
+    {
+        let driver = unsafe { &mut *state.driver };
+        let target = crate::completion::UserData::encode(
+            crate::completion::OpTag::Fs,
+            file_index as u32,
+            seq,
+        );
+        // The cancel CQE handler is a no-op (event_loop.rs), so the
+        // conn_index encoded into the cancel SQE's own user_data is
+        // unused — pass 0 to satisfy `UserData::encode`'s 24-bit guard.
+        let _ = driver.ring.submit_async_cancel(target.raw(), 0);
+    }
 }
 
 /// Fsync a file, flushing all data and metadata to disk.

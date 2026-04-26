@@ -281,3 +281,130 @@ fn fs_mkdir_and_stat() {
     }
     assert_eq!(FS_MKDIR_RESULT.load(Ordering::SeqCst), 1);
 }
+
+// ── Safe owned-buffer API: read_into / write_from ───────────────────
+
+static FS_SAFE_RESULT: AtomicU32 = AtomicU32::new(0);
+
+struct FsSafeRoundtripHandler;
+
+impl AsyncEventHandler for FsSafeRoundtripHandler {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let path = temp_path("safe-rw.txt");
+            let payload: &[u8] = b"safe api roundtrip data";
+
+            // write_from: hand the runtime an owned BytesMut, get it back.
+            let file = ringline::fs::create(&path).unwrap().await.unwrap();
+            let mut wbuf = bytes::BytesMut::with_capacity(payload.len());
+            wbuf.extend_from_slice(payload);
+            let (wres, wbuf) = ringline::fs::write_from(file, 0, wbuf).unwrap().await;
+            assert_eq!(wres.unwrap(), payload.len());
+            // Buffer is returned with len unchanged.
+            assert_eq!(&wbuf[..], payload);
+            ringline::fs::close(file).unwrap();
+
+            // read_into: kernel fills spare capacity, future yields updated buf.
+            let file = ringline::fs::open(&path, ringline::fs::OpenFlags::READ, 0)
+                .unwrap()
+                .await
+                .unwrap();
+            let rbuf = bytes::BytesMut::with_capacity(64);
+            let (rres, rbuf) = ringline::fs::read_into(file, 0, rbuf).unwrap().await;
+            let n = rres.unwrap();
+            if n == payload.len() && &rbuf[..n] == payload {
+                FS_SAFE_RESULT.store(1, Ordering::SeqCst);
+            }
+
+            ringline::fs::close(file).unwrap();
+            let _ = std::fs::remove_file(&path);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        FsSafeRoundtripHandler
+    }
+}
+
+#[test]
+fn fs_safe_api_roundtrip() {
+    FS_SAFE_RESULT.store(0, Ordering::SeqCst);
+
+    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+        .launch::<FsSafeRoundtripHandler>()
+        .expect("launch failed");
+
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    assert_eq!(FS_SAFE_RESULT.load(Ordering::SeqCst), 1);
+}
+
+// ── Drop in-flight: buffer must be parked, no UAF, follow-up read works ─
+
+static FS_DROP_RESULT: AtomicU32 = AtomicU32::new(0);
+
+struct FsDropInFlightHandler;
+
+impl AsyncEventHandler for FsDropInFlightHandler {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let path = temp_path("safe-drop.txt");
+            let payload: &[u8] = b"abandon the first read";
+
+            std::fs::write(&path, payload).unwrap();
+            let file = ringline::fs::open(&path, ringline::fs::OpenFlags::READ, 0)
+                .unwrap()
+                .await
+                .unwrap();
+
+            // Submit a read and immediately drop the future without awaiting.
+            // The buffer must be parked in the runtime until the kernel CQE
+            // arrives; if it isn't, the kernel may scribble into freed memory.
+            {
+                let _fut =
+                    ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(payload.len()))
+                        .unwrap();
+                // _fut dropped here without poll.
+            }
+
+            // Issue a second read on the same file. If the graveyard logic
+            // is broken, this is where memory corruption would surface.
+            let rbuf = bytes::BytesMut::with_capacity(payload.len());
+            let (rres, rbuf) = ringline::fs::read_into(file, 0, rbuf).unwrap().await;
+            let n = rres.unwrap();
+            if n == payload.len() && &rbuf[..n] == payload {
+                FS_DROP_RESULT.store(1, Ordering::SeqCst);
+            }
+
+            ringline::fs::close(file).unwrap();
+            let _ = std::fs::remove_file(&path);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        FsDropInFlightHandler
+    }
+}
+
+#[test]
+fn fs_safe_api_drop_in_flight() {
+    FS_DROP_RESULT.store(0, Ordering::SeqCst);
+
+    let (_shutdown, handles) = RinglineBuilder::new(test_config())
+        .launch::<FsDropInFlightHandler>()
+        .expect("launch failed");
+
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    assert_eq!(FS_DROP_RESULT.load(Ordering::SeqCst), 1);
+}
