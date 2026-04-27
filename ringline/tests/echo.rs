@@ -4859,3 +4859,81 @@ fn forward_echo_sequential_sends() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── Connection-task panic recovery ─────────────────────────────────────
+
+/// Handler that panics if any received data starts with `die`, otherwise
+/// echoes. Lets one test run both paths against the same worker.
+struct PanickingThenEcho;
+
+#[allow(clippy::manual_async_fn)]
+impl AsyncEventHandler for PanickingThenEcho {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| {
+                        if data.starts_with(b"die") {
+                            panic!("intentional panic in connection task");
+                        }
+                        let _ = conn.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        PanickingThenEcho
+    }
+}
+
+#[test]
+fn connection_task_panic_does_not_kill_worker() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<PanickingThenEcho>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    // Connection 1: trigger panic. Connection should be torn down; we
+    // expect the read side to see EOF.
+    {
+        let mut s = TcpStream::connect(&addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(b"die-now").unwrap();
+        let mut buf = [0u8; 16];
+        // The worker should close us; read returns 0 (EOF) or an error.
+        let _ = s.read(&mut buf);
+    }
+
+    // Connection 2: must succeed — proves the worker is still alive.
+    {
+        let mut s = TcpStream::connect(&addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(b"hello").unwrap();
+        let mut buf = vec![0u8; 5];
+        let mut total = 0;
+        while total < 5 {
+            match s.read(&mut buf[total..]) {
+                Ok(0) => panic!("worker died after panic — second connection got EOF"),
+                Ok(n) => total += n,
+                Err(e) => panic!("worker died after panic: {e}"),
+            }
+        }
+        assert_eq!(&buf, b"hello");
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        // The worker should exit cleanly; the panic was caught.
+        let _ = h.join();
+    }
+}
