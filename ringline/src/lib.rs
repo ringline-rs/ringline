@@ -65,7 +65,7 @@ pub mod direct_io;
 pub(crate) mod disk_io_pool;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod fs;
-pub(crate) mod metrics;
+pub mod metrics;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod nvme;
 pub mod process;

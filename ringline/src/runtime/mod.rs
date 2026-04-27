@@ -244,6 +244,11 @@ pub(crate) struct Executor {
     pub(crate) recv_sinks: Vec<Option<RecvSink>>,
     /// Per-UDP-socket datagram recv queue for async tasks.
     pub(crate) udp_recv_queues: Vec<VecDeque<(Vec<u8>, std::net::SocketAddr)>>,
+    /// Hard cap on each `udp_recv_queues[i]`. Datagrams arriving when the
+    /// queue is full are dropped (`udp::DATAGRAMS_DROPPED` is incremented).
+    /// This prevents unbounded memory growth when the consumer future
+    /// stalls or has exited.
+    pub(crate) udp_recv_queue_capacity: usize,
     /// Per-UDP-socket: task ID waiting for recv_from (None = no waiter).
     pub(crate) udp_recv_waiters: Vec<Option<u32>>,
     /// Per-UDP-socket: task ID waiting for a free send slot (None = no waiter).
@@ -291,6 +296,7 @@ impl Executor {
         standalone_capacity: u32,
         timer_slots: u32,
         udp_count: u32,
+        udp_recv_queue_capacity: usize,
     ) -> Self {
         let cap = max_connections as usize;
         let udp = udp_count as usize;
@@ -318,6 +324,7 @@ impl Executor {
                 v
             },
             udp_recv_queues: (0..udp).map(|_| VecDeque::new()).collect(),
+            udp_recv_queue_capacity,
             udp_recv_waiters: vec![None; udp],
             udp_send_ready_waiters: vec![None; udp],
             disk_io_waiters: HashMap::new(),
@@ -512,7 +519,7 @@ mod tests {
 
     #[test]
     fn executor_new() {
-        let exec = Executor::new(16, 8, 8, 0);
+        let exec = Executor::new(16, 8, 8, 0, 0);
         assert!(exec.ready_queue.is_empty());
         assert_eq!(exec.recv_waiters.len(), 16);
         assert_eq!(exec.send_waiters.len(), 16);
@@ -523,7 +530,7 @@ mod tests {
 
     #[test]
     fn remove_connection_clears_state() {
-        let mut exec = Executor::new(4, 4, 4, 0);
+        let mut exec = Executor::new(4, 4, 4, 0, 0);
         exec.recv_waiters[1] = true;
         exec.send_waiters[1] = true;
         exec.connect_waiters[1] = true;
@@ -540,7 +547,7 @@ mod tests {
 
     #[test]
     fn wake_task_connection_task() {
-        let mut exec = Executor::new(4, 4, 4, 0);
+        let mut exec = Executor::new(4, 4, 4, 0, 0);
         // Spawn a task at index 1 (simulated by setting it up as Ready then parking).
         exec.task_slab
             .spawn(1, Box::pin(std::future::pending::<()>()));
@@ -554,7 +561,7 @@ mod tests {
 
     #[test]
     fn wake_task_standalone_task() {
-        let mut exec = Executor::new(4, 4, 4, 0);
+        let mut exec = Executor::new(4, 4, 4, 0, 0);
         let idx = exec
             .standalone_slab
             .spawn(Box::pin(std::future::pending::<()>()))
@@ -570,7 +577,7 @@ mod tests {
 
     #[test]
     fn owner_task_routes_recv_wakeup() {
-        let mut exec = Executor::new(16, 4, 4, 0);
+        let mut exec = Executor::new(16, 4, 4, 0, 0);
 
         // Task at index 5 owns connection 12 (outbound connect scenario).
         exec.task_slab
@@ -591,7 +598,7 @@ mod tests {
 
     #[test]
     fn owner_task_routes_send_wakeup() {
-        let mut exec = Executor::new(16, 4, 4, 0);
+        let mut exec = Executor::new(16, 4, 4, 0, 0);
 
         exec.task_slab
             .spawn(3, Box::pin(std::future::pending::<()>()));
@@ -611,7 +618,7 @@ mod tests {
 
     #[test]
     fn owner_task_routes_connect_wakeup() {
-        let mut exec = Executor::new(16, 4, 4, 0);
+        let mut exec = Executor::new(16, 4, 4, 0, 0);
 
         exec.task_slab
             .spawn(2, Box::pin(std::future::pending::<()>()));
@@ -630,7 +637,7 @@ mod tests {
 
     #[test]
     fn owner_task_none_falls_back_to_conn_index() {
-        let mut exec = Executor::new(4, 4, 4, 0);
+        let mut exec = Executor::new(4, 4, 4, 0, 0);
 
         // owner_task is None — should fall back to using conn_index directly.
         exec.task_slab

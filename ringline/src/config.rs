@@ -106,6 +106,17 @@ pub struct Config {
     /// Exhaustion returns [`crate::error::UdpSendError::PoolExhausted`].
     /// Default: 64.
     pub udp_send_slots: u16,
+    /// Maximum number of datagrams buffered per UDP socket awaiting a
+    /// consumer. The runtime fills this queue from `recvmsg` completions;
+    /// the application's `on_udp_bind` future drains it via
+    /// [`UdpCtx::recv_from`](crate::UdpCtx::recv_from). When the queue is
+    /// full, additional datagrams are dropped and
+    /// `udp::DATAGRAMS_DROPPED` is incremented — this guards against
+    /// unbounded memory growth when the handler future stalls, panics,
+    /// or returns early.
+    ///
+    /// Default: 1024.
+    pub udp_recv_queue_capacity: usize,
     /// Optional NVMe passthrough configuration. When set, enables NVMe device
     /// management and `IORING_OP_URING_CMD` submission for direct NVMe I/O.
     pub nvme: Option<crate::nvme::NvmeConfig>,
@@ -179,6 +190,7 @@ impl Default for Config {
             timer_slots: 256,
             udp_bind: Vec::new(),
             udp_send_slots: 64,
+            udp_recv_queue_capacity: 1024,
             nvme: None,
             direct_io: None,
             fs: Some(crate::fs::FsConfig::default()),
@@ -236,6 +248,11 @@ impl Config {
         if !self.udp_bind.is_empty() && self.udp_send_slots == 0 {
             return Err(crate::error::Error::RingSetup(
                 "udp_send_slots must be > 0 when udp_bind is non-empty".into(),
+            ));
+        }
+        if !self.udp_bind.is_empty() && self.udp_recv_queue_capacity == 0 {
+            return Err(crate::error::Error::RingSetup(
+                "udp_recv_queue_capacity must be > 0 when udp_bind is non-empty".into(),
             ));
         }
         if !self.udp_bind.is_empty() {
@@ -499,6 +516,15 @@ impl ConfigBuilder {
     pub fn udp_recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
         self.config.udp_recv_buffer.ring_size = ring_size;
         self.config.udp_recv_buffer.buffer_size = buffer_size;
+        self
+    }
+
+    /// Set the per-UDP-socket recv queue capacity.
+    ///
+    /// Datagrams that arrive while the queue is full are dropped and
+    /// counted in `udp::DATAGRAMS_DROPPED`. Default: 1024.
+    pub fn udp_recv_queue_capacity(mut self, capacity: usize) -> Self {
+        self.config.udp_recv_queue_capacity = capacity;
         self
     }
 

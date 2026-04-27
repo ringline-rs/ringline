@@ -63,6 +63,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             config.standalone_task_capacity,
             config.timer_slots,
             config.udp_bind.len() as u32,
+            config.udp_recv_queue_capacity,
         );
         Ok(AsyncEventLoop {
             driver,
@@ -1504,11 +1505,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && !msg_out.is_payload_truncated()
             && let Some(peer) = parse_recvmsg_name(msg_out.name_data())
         {
-            let payload = msg_out.payload_data().to_vec();
             metrics::UDP.increment(metrics::udp::DATAGRAMS_RECEIVED);
             if idx < self.executor.udp_recv_queues.len() {
-                self.executor.udp_recv_queues[idx].push_back((payload, peer));
-                self.executor.wake_udp_recv(udp_index);
+                if self.executor.udp_recv_queues[idx].len() >= self.executor.udp_recv_queue_capacity
+                {
+                    // The handler isn't draining fast enough (or has
+                    // exited). Drop on the floor so we don't grow without
+                    // bound. UDP is lossy by definition; the metric flags
+                    // it for operators.
+                    metrics::UDP.increment(metrics::udp::DATAGRAMS_DROPPED);
+                } else {
+                    let payload = msg_out.payload_data().to_vec();
+                    self.executor.udp_recv_queues[idx].push_back((payload, peer));
+                    self.executor.wake_udp_recv(udp_index);
+                }
             }
         }
 
