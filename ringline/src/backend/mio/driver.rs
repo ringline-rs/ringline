@@ -435,6 +435,17 @@ impl Driver {
     }
 }
 
+impl Drop for Driver {
+    fn drop(&mut self) {
+        // Close the wake pipe's read end. The write end is held by
+        // `WakeHandle` clones that may live longer than the worker;
+        // those are closed by `ShutdownHandle::Drop`.
+        unsafe {
+            libc::close(self.wake_pipe_fd);
+        }
+    }
+}
+
 /// Create and bind a UDP socket with `SO_REUSEPORT` enabled, returning a
 /// `std::net::UdpSocket`.
 ///

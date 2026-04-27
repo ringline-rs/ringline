@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -1481,4 +1481,368 @@ fn udp_concurrent_inflight_sends_recycle_slots() {
     for h in handles {
         h.join().unwrap().unwrap();
     }
+}
+
+// ── Max-size loopback datagram ─────────────────────────────────────────
+
+#[test]
+#[cfg(target_os = "linux")]
+fn udp_max_size_loopback_datagram() {
+    // UDP's theoretical max payload is 65507 bytes (65535 IP MTU - 20
+    // IPv4 header - 8 UDP header). We pick a payload that's clearly
+    // beyond the standard MTU but still fits comfortably under that
+    // cap, and verify it round-trips on loopback. The recv buffer
+    // must hold the io_uring_recvmsg_out header (16) + sockaddr_storage
+    // (128) + payload, and the send slot must be at least the payload
+    // size.
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_echo_started();
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // The recv buffer is capped at 65535 by config validation; that
+    // leaves ~65535 - 16 (recvmsg_out) - 128 (sockaddr_storage) =
+    // 65391 bytes for payload. Pick a size well under that but
+    // larger than any standard MTU so we exercise loopback's
+    // happy-with-jumbo path.
+    let payload_len = 65000;
+    let mut cfg = base_config();
+    cfg.send_copy_slot_size = 65535;
+    cfg.udp_recv_buffer.buffer_size = 65535;
+    cfg.udp_recv_buffer.ring_size = 16;
+
+    let (shutdown, handles) = RinglineBuilder::new(cfg)
+        .bind_udp(addr)
+        .launch::<UdpEcho>()
+        .expect("launch");
+    await_handler_started(ECHO_STARTED.get().unwrap());
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+
+    let payload: Vec<u8> = (0..payload_len).map(|i| (i & 0xFF) as u8).collect();
+    client.send_to(&payload, addr).unwrap();
+
+    let mut buf = vec![0u8; 128 * 1024];
+    let (n, src) = client.recv_from(&mut buf).unwrap();
+    assert_eq!(n, payload_len, "echoed datagram length should match");
+    assert_eq!(&buf[..n], payload.as_slice(), "echoed payload mismatch");
+    assert_eq!(src, addr);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── Recv buffer ring exhaustion under burst ────────────────────────────
+
+/// Handler that *blocks* on an atomic flag before calling `recv_from`,
+/// then drains and echoes everything in a tight loop. With a tiny
+/// `udp_recv_buffer.ring_size`, we can deterministically force the
+/// kernel's multishot recvmsg to hit `ENOBUFS` while the handler is
+/// blocked — then unblock and verify the worker recovers and processes
+/// the surviving datagrams. Using a flag (not a sleep-per-recv) makes
+/// the test robust to debug-vs-release-mode timing.
+struct BlockedThenEcho {
+    started: Arc<AtomicUsize>,
+    unblock: Arc<AtomicBool>,
+}
+
+static BLOCKED_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static BLOCKED_UNBLOCK: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+impl AsyncEventHandler for BlockedThenEcho {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        BlockedThenEcho {
+            started: BLOCKED_STARTED.get_or_init(Default::default).clone(),
+            unblock: BLOCKED_UNBLOCK.get_or_init(Default::default).clone(),
+        }
+    }
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        let unblock = self.unblock.clone();
+        Some(Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            // Yield the executor until the test signals us to start
+            // draining. While we're here, the kernel piles up datagrams
+            // in our io_uring buffer ring (and beyond, in the socket's
+            // kernel queue) — and once the buffer ring is empty, the
+            // multishot recvmsg returns ENOBUFS and is torn down.
+            while !unblock.load(Ordering::SeqCst) {
+                let _ = ringline::sleep(Duration::from_millis(2)).await;
+            }
+            // Drain whatever survived into the recv queue.
+            loop {
+                let (data, peer) = udp.recv_from().await;
+                let _ = udp.send_to(peer, &data);
+            }
+        }))
+    }
+}
+
+#[test]
+fn udp_recv_ring_exhaustion_under_burst() {
+    if ringline::backend() != ringline::Backend::IoUring {
+        // mio's recv path uses a 64 KiB stack buffer per call; there's
+        // no buffer ring to exhaust.
+        return;
+    }
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    BLOCKED_STARTED
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+    BLOCKED_UNBLOCK
+        .get_or_init(Default::default)
+        .store(false, Ordering::SeqCst);
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let mut cfg = base_config();
+    cfg.udp_recv_buffer.ring_size = 4;
+    cfg.udp_recv_buffer.buffer_size = 256;
+
+    let buf_empty_before = ringline::metrics::POOL
+        .value(ringline::metrics::pool::BUFFER_RING_EMPTY)
+        .unwrap_or(0);
+
+    let (shutdown, handles) = RinglineBuilder::new(cfg)
+        .bind_udp(addr)
+        .launch::<BlockedThenEcho>()
+        .expect("launch");
+    await_handler_started(BLOCKED_STARTED.get().unwrap());
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+
+    // While the handler is blocked, fire a flood. The kernel will fill
+    // our 4-slot buffer ring and then return ENOBUFS for everything
+    // else, tearing down the multishot.
+    for i in 0..200u32 {
+        let payload = format!("burst-{i:04}");
+        let _ = client.send_to(payload.as_bytes(), addr);
+    }
+    // Give the kernel a moment to deliver as many as it can.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Now release the handler. It should recover (the multishot will
+    // be re-armed once buffers replenish) and echo whatever is still
+    // in the kernel queue.
+    BLOCKED_UNBLOCK.get().unwrap().store(true, Ordering::SeqCst);
+
+    let mut received = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut buf = [0u8; 64];
+    while std::time::Instant::now() < deadline {
+        match client.recv_from(&mut buf) {
+            Ok(_) => received += 1,
+            Err(_) => break,
+        }
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+
+    let buf_empty_after = ringline::metrics::POOL
+        .value(ringline::metrics::pool::BUFFER_RING_EMPTY)
+        .unwrap_or(0);
+    let ring_empty_events = buf_empty_after - buf_empty_before;
+
+    // The handler must have survived the ENOBUFS storm and resumed
+    // processing — at least one datagram must round-trip after we
+    // unblock.
+    assert!(
+        received >= 1,
+        "expected the worker to recover after the ENOBUFS storm and \
+         echo at least one of the surviving datagrams (received={received})"
+    );
+    // And we should have observed the ring-empty path at least once.
+    // The handler being blocked while we burst 200 datagrams into a
+    // 4-slot ring guarantees this regardless of optimisation level.
+    assert!(
+        ring_empty_events >= 1,
+        "expected the io_uring buffer ring to go empty at least once \
+         (ring_size=4, blocked consumer, 200-datagram burst); observed delta = {ring_empty_events}"
+    );
+}
+
+// ── Send to unreachable peer ───────────────────────────────────────────
+
+/// Handler that, on first recv, attempts to send to a peer that's
+/// guaranteed to have no listener (loopback :1). That send may fail
+/// async via ICMP, but the worker must keep running so subsequent
+/// real traffic still flows.
+struct UnreachableProbe {
+    started: Arc<AtomicUsize>,
+    follow_up_ok: Arc<AtomicUsize>,
+}
+
+static UNREACH_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static UNREACH_FOLLOWUP: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+
+impl AsyncEventHandler for UnreachableProbe {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        UnreachableProbe {
+            started: UNREACH_STARTED.get_or_init(Default::default).clone(),
+            follow_up_ok: UNREACH_FOLLOWUP.get_or_init(Default::default).clone(),
+        }
+    }
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        let follow_up_ok = self.follow_up_ok.clone();
+        Some(Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            // First recv: unblock the test by reading the trigger
+            // datagram. Then send to an unreachable peer.
+            let (_data, peer) = udp.recv_from().await;
+            let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            for _ in 0..5 {
+                let _ = udp.send_to(dead, b"to-the-void");
+            }
+            // Wait for the kernel's async ICMP storm to settle.
+            let _ = ringline::sleep(Duration::from_millis(100)).await;
+            // Now reply to the original peer; this must succeed.
+            if udp.send_to(peer, b"alive").is_ok() {
+                follow_up_ok.fetch_add(1, Ordering::SeqCst);
+            }
+        }))
+    }
+}
+
+#[test]
+fn udp_send_to_unreachable_peer_does_not_kill_worker() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    UNREACH_STARTED
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+    UNREACH_FOLLOWUP
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let (shutdown, handles) = RinglineBuilder::new(base_config())
+        .bind_udp(addr)
+        .launch::<UnreachableProbe>()
+        .expect("launch");
+    await_handler_started(UNREACH_STARTED.get().unwrap());
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    client.send_to(b"trigger", addr).unwrap();
+
+    let mut buf = [0u8; 16];
+    let (n, _src) = client.recv_from(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"alive", "live peer must still receive its echo");
+
+    let follow_up_ok = UNREACH_FOLLOWUP.get().unwrap().load(Ordering::SeqCst);
+    assert_eq!(
+        follow_up_ok, 1,
+        "follow-up send to live peer must succeed after spamming a dead peer"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── Invalid bind address propagates an error ───────────────────────────
+
+#[test]
+fn udp_invalid_bind_address_returns_error() {
+    // 192.0.2.0/24 is RFC-5737 documentation space — guaranteed not to
+    // be assigned to any local interface, so bind() with a non-zero
+    // address there fails with EADDRNOTAVAIL.
+    let bogus: SocketAddr = "192.0.2.1:9".parse().unwrap();
+
+    let result = RinglineBuilder::new(base_config())
+        .bind_udp(bogus)
+        .launch::<UdpEcho>();
+
+    assert!(
+        result.is_err(),
+        "binding UDP to an unassigned address must surface the failure to launch()"
+    );
+}
+
+// ── No fd leak across repeated launch+shutdown cycles ──────────────────
+
+#[cfg(target_os = "linux")]
+fn open_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count())
+        .unwrap_or(0)
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn udp_repeated_launch_does_not_leak_fds() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Burn a few launches first so any one-shot allocations (resolver
+    // pool, blocking pool, etc.) settle in. Compare counts after that.
+    for _ in 0..2 {
+        reset_echo_started();
+        let port = free_udp_port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let (shutdown, handles) = RinglineBuilder::new(base_config())
+            .bind_udp(addr)
+            .launch::<UdpEcho>()
+            .expect("launch");
+        await_handler_started(ECHO_STARTED.get().unwrap());
+        shutdown.shutdown();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+    }
+
+    // Brief grace period for io_uring teardown to release fds.
+    std::thread::sleep(Duration::from_millis(50));
+    let baseline = open_fd_count();
+
+    for _ in 0..6 {
+        reset_echo_started();
+        let port = free_udp_port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let (shutdown, handles) = RinglineBuilder::new(base_config())
+            .bind_udp(addr)
+            .launch::<UdpEcho>()
+            .expect("launch");
+        await_handler_started(ECHO_STARTED.get().unwrap());
+        shutdown.shutdown();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+    }
+
+    // Allow background drops to settle.
+    std::thread::sleep(Duration::from_millis(100));
+    let after = open_fd_count();
+
+    // Allow some slack for transient fds (logger flush, /proc handle,
+    // timing artifacts) but we expect no per-iteration leak.
+    let delta = after.saturating_sub(baseline);
+    assert!(
+        delta < 6,
+        "fd count grew by {delta} after 6 launch+shutdown cycles \
+         (baseline={baseline}, after={after}); suggests a UDP/io_uring fd leak"
+    );
 }
