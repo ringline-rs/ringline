@@ -640,6 +640,14 @@ impl AsyncEventHandler for OversizedSend {
 
 #[test]
 fn udp_oversized_send_does_not_corrupt_state() {
+    // Only the io_uring backend funnels sends through `send_copy_pool`,
+    // where oversize datagrams hit the slot-size limit and need an
+    // explicit rejection. The mio backend hands the buffer straight to
+    // the kernel, which happily accepts datagrams up to ~65 KiB on
+    // loopback, so this scenario doesn't apply there.
+    if ringline::backend() != ringline::Backend::IoUring {
+        return;
+    }
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     OVER_STARTED
         .get_or_init(Default::default)

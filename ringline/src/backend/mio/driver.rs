@@ -148,9 +148,15 @@ impl Driver {
         let udp_token_base = max_conn + 2;
 
         // Bind UDP sockets and register with mio poll.
+        //
+        // We can't use `std::net::UdpSocket::bind` here because it binds
+        // before we get a chance to set `SO_REUSEPORT`, which the io_uring
+        // backend already enables and which is required for multi-worker
+        // setups (each worker creates its own socket bound to the same
+        // address).
         let mut udp_sockets = Vec::with_capacity(config.udp_bind.len());
         for (i, addr) in config.udp_bind.iter().enumerate() {
-            let std_socket = std::net::UdpSocket::bind(addr)
+            let std_socket = bind_udp_with_reuseport(*addr)
                 .map_err(|e| io::Error::new(e.kind(), format!("UDP bind {addr}: {e}")))?;
             std_socket.set_nonblocking(true)?;
             let mut mio_socket = mio::net::UdpSocket::from_std(std_socket);
@@ -427,4 +433,51 @@ impl Driver {
             );
         }
     }
+}
+
+/// Create and bind a UDP socket with `SO_REUSEPORT` enabled, returning a
+/// `std::net::UdpSocket`.
+///
+/// `std::net::UdpSocket::bind` binds before any setsockopt can run, so it
+/// can't be used here — multi-worker setups bind every worker to the same
+/// port and need `SO_REUSEPORT` set before bind.
+fn bind_udp_with_reuseport(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    use std::os::fd::FromRawFd;
+
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let optval: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &optval as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let addr_len = crate::backend::socket_addr_to_sockaddr(addr, &mut storage);
+    let rc = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, addr_len) };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+
+    Ok(unsafe { std::net::UdpSocket::from_raw_fd(fd) })
 }
