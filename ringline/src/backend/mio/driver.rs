@@ -449,9 +449,24 @@ fn bind_udp_with_reuseport(addr: SocketAddr) -> io::Result<std::net::UdpSocket> 
     } else {
         libc::AF_INET6
     };
-    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    // `SOCK_CLOEXEC` is Linux-only; on macOS/BSD we set FD_CLOEXEC via fcntl
+    // after the socket is created, mirroring the pattern in `acceptor.rs`.
+    #[cfg(target_os = "linux")]
+    let sock_type = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let sock_type = libc::SOCK_DGRAM;
+    let fd = unsafe { libc::socket(domain, sock_type, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+        if fd_flags < 0 || libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) < 0 {
+            let err = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(err);
+        }
     }
 
     let optval: libc::c_int = 1;
