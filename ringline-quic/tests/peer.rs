@@ -1383,3 +1383,168 @@ fn zero_rtt_no_resumption_uses_normal_handshake() {
         "accepted_0rtt should be false when there were no 0-RTT keys to begin with"
     );
 }
+
+// ── Path migration ─────────────────────────────────────────────────────
+
+/// Ferry packets between two endpoints, but pretend the client lives at
+/// a different `client_addr` than its own `local_addr`. The server's
+/// quinn-proto state machine sees inbound packets coming from
+/// `apparent_client_addr`, which is what triggers path-migration
+/// behavior.
+fn drain_with_apparent_client(
+    client: &mut QuicEndpoint,
+    server: &mut QuicEndpoint,
+    apparent_client_addr: SocketAddr,
+    server_addr: SocketAddr,
+) {
+    let now = Instant::now();
+    for _ in 0..64 {
+        let mut moved = false;
+        while let Some((_dest, data)) = client.poll_send() {
+            server.handle_datagram(now, &data, apparent_client_addr);
+            moved = true;
+        }
+        while let Some((_dest, data)) = server.poll_send() {
+            // The server's PATH_CHALLENGE is destined for the new path
+            // address; the client's QuicEndpoint routes packets by CID
+            // regardless of `dest`, so we just hand it the bytes.
+            client.handle_datagram(now, &data, server_addr);
+            moved = true;
+        }
+        client.drive_timers(now);
+        server.drive_timers(now);
+        if !moved {
+            break;
+        }
+    }
+}
+
+fn server_config_with_migration(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    migration_allowed: bool,
+) -> QuicConfig {
+    let mut sc = ServerConfig::with_single_cert(certs, key).unwrap();
+    sc.migration(migration_allowed);
+    let transport = Arc::get_mut(&mut sc.transport).unwrap();
+    transport.max_concurrent_bidi_streams(64u32.into());
+    transport.max_concurrent_uni_streams(64u32.into());
+    QuicConfig::server(Arc::new(sc))
+}
+
+#[test]
+fn peer_address_changed_event_fires_on_migration() {
+    // Simulate a client NAT-rebinding mid-connection.  Both endpoints
+    // run in-process; we change the apparent source address of
+    // client→server packets to drive the server's path-migration
+    // machinery. After the validation handshake completes the server
+    // must surface a `PeerAddressChanged` event with the new path.
+    let (certs, key) = self_signed();
+    let ca1: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+    let ca2: SocketAddr = "127.0.0.1:53001".parse().unwrap();
+    let sa: SocketAddr = "127.0.0.1:53002".parse().unwrap();
+
+    let mut client = QuicEndpoint::new(client_config(&certs), ca1);
+    let mut server = QuicEndpoint::new(server_config_with_migration(certs, key, true), sa);
+
+    // Standard handshake from ca1.
+    let (cc, sc) = handshake(&mut client, &mut server, ca1, sa);
+    assert_eq!(server.remote_addr(sc), Some(ca1));
+
+    // Open a stream and send some bytes so the connection has live data.
+    // Path validation triggers when a non-probing packet arrives from a
+    // new source — this stream traffic provides that.
+    let stream = client.open_bi(cc).unwrap().expect("open_bi");
+    client.stream_send(cc, stream, b"hello-from-ca1").unwrap();
+    client.flush(Instant::now());
+    drain(&mut client, &mut server, ca1, sa);
+
+    // Drain server events to clear the noise so we can isolate the
+    // PeerAddressChanged signal we're testing.
+    while let Some(_ev) = server.poll_event() {}
+
+    // Now NAT-rebind: future packets the client sends arrive at the
+    // server claiming source = ca2.
+    client.stream_send(cc, stream, b"now-from-ca2").unwrap();
+    client.flush(Instant::now());
+
+    let mut got_event = None;
+    for _ in 0..32 {
+        drain_with_apparent_client(&mut client, &mut server, ca2, sa);
+        while let Some(ev) = server.poll_event() {
+            if let QuicEvent::PeerAddressChanged {
+                conn,
+                previous,
+                current,
+            } = ev
+                && conn == sc
+            {
+                got_event = Some((previous, current));
+            }
+        }
+        if got_event.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let (prev, curr) =
+        got_event.expect("server should observe PeerAddressChanged after path validation");
+    assert_eq!(prev, ca1, "previous address should be the original path");
+    assert_eq!(curr, ca2, "current address should be the new path");
+    assert_eq!(
+        server.remote_addr(sc),
+        Some(ca2),
+        "remote_addr should match the validated path"
+    );
+}
+
+#[test]
+fn migration_disabled_drops_packets_from_new_address() {
+    // With `ServerConfig::migration(false)`, quinn-proto silently drops
+    // packets that arrive from a new source address rather than
+    // initiating path validation. The connection stays on the original
+    // path; no event fires.
+    let (certs, key) = self_signed();
+    let ca1: SocketAddr = "127.0.0.1:53100".parse().unwrap();
+    let ca2: SocketAddr = "127.0.0.1:53101".parse().unwrap();
+    let sa: SocketAddr = "127.0.0.1:53102".parse().unwrap();
+
+    let mut client = QuicEndpoint::new(client_config(&certs), ca1);
+    let mut server = QuicEndpoint::new(server_config_with_migration(certs, key, false), sa);
+
+    let (cc, sc) = handshake(&mut client, &mut server, ca1, sa);
+    assert_eq!(server.remote_addr(sc), Some(ca1));
+
+    let stream = client.open_bi(cc).unwrap().expect("open_bi");
+    client.stream_send(cc, stream, b"hello").unwrap();
+    client.flush(Instant::now());
+    drain(&mut client, &mut server, ca1, sa);
+    while let Some(_ev) = server.poll_event() {}
+
+    // Try to migrate. Packets are dropped server-side; the connection
+    // stays on the original path.
+    client.stream_send(cc, stream, b"would-migrate").unwrap();
+    client.flush(Instant::now());
+    for _ in 0..16 {
+        drain_with_apparent_client(&mut client, &mut server, ca2, sa);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // No PeerAddressChanged should have fired.
+    let mut saw_change = false;
+    while let Some(ev) = server.poll_event() {
+        if let QuicEvent::PeerAddressChanged { .. } = ev {
+            saw_change = true;
+        }
+    }
+    assert!(
+        !saw_change,
+        "PeerAddressChanged must not fire when migration is disabled"
+    );
+    assert_eq!(
+        server.remote_addr(sc),
+        Some(ca1),
+        "remote_addr should still be the original path"
+    );
+}

@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use bytes::Bytes;
 use quinn_proto::{ConnectionError, Dir, StreamId, VarInt};
 
@@ -73,6 +75,24 @@ pub enum QuicEvent {
     /// genuinely had 0-RTT keys — connections that never had keys
     /// don't generate the event.
     ZeroRttRejected { conn: QuicConnId },
+
+    /// The peer's address changed and the new path was successfully
+    /// validated (NAT rebinding, mobile network handoff, etc.).
+    ///
+    /// Quinn handles the path validation handshake (PATH_CHALLENGE /
+    /// PATH_RESPONSE) internally; this event surfaces *after* the new
+    /// path is confirmed, so the application can update logging,
+    /// rate limits keyed on peer address, or per-connection state.
+    ///
+    /// Server-side migration is gated on
+    /// [`quinn_proto::ServerConfig::migration`] (default true). If
+    /// `migration` is false, peer-initiated path changes are dropped
+    /// and this event never fires.
+    PeerAddressChanged {
+        conn: QuicConnId,
+        previous: SocketAddr,
+        current: SocketAddr,
+    },
 
     /// A QUIC connection was closed or lost.
     ConnectionClosed {
