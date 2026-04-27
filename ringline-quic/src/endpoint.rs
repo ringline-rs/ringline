@@ -299,6 +299,42 @@ impl QuicEndpoint {
         Ok(())
     }
 
+    /// Ask the peer to stop sending on `stream` (sends a STOP_SENDING frame).
+    ///
+    /// On the peer the corresponding send stream will surface a
+    /// [`QuicEvent::StreamStopped`] with the supplied `error_code`. Locally,
+    /// the recv side of `stream` is considered done once this returns.
+    pub fn stop_sending(
+        &mut self,
+        conn: QuicConnId,
+        stream: StreamId,
+        error_code: quinn_proto::VarInt,
+    ) -> Result<(), Error> {
+        let c = self.get_conn_mut(conn)?;
+        c.conn
+            .recv_stream(stream)
+            .stop(error_code)
+            .map_err(|_| Error::ConnectionClosed)?;
+        Ok(())
+    }
+
+    /// Reset `stream`, indicating to the peer that no more data will be
+    /// sent. The peer's recv side will surface a
+    /// [`quinn_proto::ReadError::Reset`] on its next `stream_recv`.
+    pub fn reset_stream(
+        &mut self,
+        conn: QuicConnId,
+        stream: StreamId,
+        error_code: quinn_proto::VarInt,
+    ) -> Result<(), Error> {
+        let c = self.get_conn_mut(conn)?;
+        c.conn
+            .send_stream(stream)
+            .reset(error_code)
+            .map_err(|_| Error::ConnectionClosed)?;
+        Ok(())
+    }
+
     /// Open a bidirectional stream.
     ///
     /// Returns `None` if the peer's stream concurrency limit has been reached.
@@ -479,8 +515,16 @@ impl QuicEndpoint {
                             stream: id,
                         });
                     }
-                    StreamEvent::Stopped { .. } | StreamEvent::Available { .. } => {
-                        // Not surfaced to application.
+                    StreamEvent::Stopped { id, error_code } => {
+                        self.events.push_back(QuicEvent::StreamStopped {
+                            conn: conn_id,
+                            stream: id,
+                            error_code,
+                        });
+                    }
+                    StreamEvent::Available { .. } => {
+                        // Not surfaced to application — handled via
+                        // open_bi / open_uni returning None.
                     }
                 },
                 Event::HandshakeDataReady | Event::DatagramReceived | Event::DatagramsUnblocked => {
