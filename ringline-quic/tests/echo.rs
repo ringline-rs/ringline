@@ -158,6 +158,8 @@ impl AsyncEventHandler for QuicEchoServer {
                         | QuicEvent::StreamWritable { .. }
                         | QuicEvent::StreamFinished { .. }
                         | QuicEvent::StreamStopped { .. }
+                        | QuicEvent::StreamsAvailable { .. }
+                        | QuicEvent::DatagramReceived { .. }
                         | QuicEvent::ConnectionClosed { .. } => {}
                     }
                 }

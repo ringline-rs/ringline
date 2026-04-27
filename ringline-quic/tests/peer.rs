@@ -798,3 +798,184 @@ fn send_queue_capacity_caps_queued_packets() {
     // No assertion on bytes received: dropping is allowed under cap.
     // Just verify no panic, no inconsistent state.
 }
+
+// ── StreamsAvailable event ─────────────────────────────────────────────
+
+fn server_config_with_stream_limits(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    bidi: u32,
+    uni: u32,
+) -> QuicConfig {
+    let mut sc = ServerConfig::with_single_cert(certs, key).unwrap();
+    let transport = Arc::get_mut(&mut sc.transport).unwrap();
+    transport.max_concurrent_bidi_streams(bidi.into());
+    transport.max_concurrent_uni_streams(uni.into());
+    QuicConfig::server(Arc::new(sc))
+}
+
+#[test]
+fn streams_available_fires_when_peer_raises_limit() {
+    // Quinn fires `StreamEvent::Available` when the peer increases the
+    // stream limit. We surface it as `QuicEvent::StreamsAvailable` so
+    // applications that hit `Ok(None)` from `open_bi` can resume work
+    // on an event instead of polling.
+    let (certs, key) = self_signed();
+    let ca: SocketAddr = "127.0.0.1:51200".parse().unwrap();
+    let sa: SocketAddr = "127.0.0.1:51201".parse().unwrap();
+
+    // Server allows 2 bidi streams initially; the client will see this
+    // as its open_bi limit.
+    let mut client = QuicEndpoint::new(client_config(&certs), ca);
+    let mut server = QuicEndpoint::new(server_config_with_stream_limits(certs, key, 2, 64), sa);
+    let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
+
+    // Open the two streams the server allows. Send a small payload on
+    // each + finish so the streams reach the FullyClosed state once
+    // the server peer-finishes; quinn won't increment the credit (and
+    // therefore won't send MAX_STREAMS) for streams that never carried
+    // application bytes.
+    let s1 = client.open_bi(cc).unwrap().expect("first stream");
+    let s2 = client.open_bi(cc).unwrap().expect("second stream");
+    client.stream_send(cc, s1, b"a").unwrap();
+    client.stream_send(cc, s2, b"b").unwrap();
+    client.stream_finish(cc, s1).unwrap();
+    client.stream_finish(cc, s2).unwrap();
+    // Third must hit the limit.
+    assert!(
+        client.open_bi(cc).unwrap().is_none(),
+        "expected to hit the stream limit at 2 concurrent bidi streams"
+    );
+    client.flush(Instant::now());
+    drain(&mut client, &mut server, ca, sa);
+
+    // Server: read both streams to FIN, then finish their send side.
+    let mut server_streams = Vec::new();
+    while let Some(ev) = server.poll_event() {
+        if let QuicEvent::StreamOpened { stream, .. } = ev {
+            server_streams.push(stream);
+        }
+    }
+    assert_eq!(
+        server_streams.len(),
+        2,
+        "server should observe both streams"
+    );
+    let mut buf = [0u8; 16];
+    for s in &server_streams {
+        // Read until FIN; server.stream_recv returns (n, true) once the
+        // FIN flag arrives.
+        for _ in 0..8 {
+            match server.stream_recv(sc, *s, &mut buf) {
+                Ok((_, true)) => break,
+                Ok((_, false)) => {
+                    drain(&mut client, &mut server, ca, sa);
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = server.stream_finish(sc, *s);
+    }
+    server.flush(Instant::now());
+
+    // Drive enough rounds for the FINs to ACK and the server to issue
+    // MAX_STREAMS.
+    let mut got_avail = false;
+    for _ in 0..32 {
+        drain(&mut client, &mut server, ca, sa);
+        while let Some(ev) = client.poll_event() {
+            if let QuicEvent::StreamsAvailable { dir, .. } = ev
+                && dir == quinn_proto::Dir::Bi
+            {
+                got_avail = true;
+            }
+        }
+        if got_avail {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        got_avail,
+        "client should see StreamsAvailable(Bi) after server frees stream slots"
+    );
+
+    // Sanity: open should now succeed again.
+    assert!(client.open_bi(cc).unwrap().is_some());
+}
+
+// ── Unreliable QUIC datagrams (RFC 9221) ───────────────────────────────
+
+#[test]
+fn datagram_round_trip() {
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
+
+    // Both endpoints should advertise datagram support after the
+    // handshake. The exact size depends on path MTU and peer params,
+    // but should be at least a few hundred bytes.
+    let max = client
+        .max_datagram_size(cc)
+        .expect("datagrams should be supported by default");
+    assert!(max >= 256, "max_datagram_size suspiciously small: {max}");
+
+    let payload = bytes::Bytes::from_static(b"unreliable hello");
+    client.send_datagram(cc, payload.clone(), false).unwrap();
+    drain(&mut client, &mut server, ca, sa);
+
+    let mut got = None;
+    while let Some(ev) = server.poll_event() {
+        if let QuicEvent::DatagramReceived { data, .. } = ev {
+            got = Some(data);
+        }
+    }
+    assert_eq!(
+        got.as_ref(),
+        Some(&payload),
+        "datagram should round-trip verbatim"
+    );
+}
+
+#[test]
+fn datagram_send_too_large_errors() {
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
+
+    let max = client.max_datagram_size(cc).unwrap();
+    // 4 KiB is well above any sane datagram MTU on loopback after path
+    // overhead — quinn-proto rejects it.
+    let too_big = bytes::Bytes::from(vec![0xFFu8; (max + 1) * 4]);
+    let res = client.send_datagram(cc, too_big, false);
+    assert!(res.is_err(), "oversize datagram must fail to enqueue");
+}
+
+#[test]
+fn datagram_drop_old_when_full_does_not_error() {
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
+
+    // Burst many datagrams without ferrying so the local outgoing
+    // buffer fills. With drop=true, sends never fail; older queued
+    // datagrams are dropped to make room.
+    let payload = bytes::Bytes::from(vec![0xCDu8; 1100]);
+    for _ in 0..256 {
+        client.send_datagram(cc, payload.clone(), true).unwrap();
+    }
+
+    // Now actually deliver. Server should receive *some* datagrams (we
+    // don't pin a count — drop semantics are timing-dependent), but the
+    // client must not have errored mid-burst.
+    drain(&mut client, &mut server, ca, sa);
+    let mut received = 0usize;
+    while let Some(ev) = server.poll_event() {
+        if let QuicEvent::DatagramReceived { .. } = ev {
+            received += 1;
+        }
+    }
+    // Even one delivery proves the path didn't poison itself; many is
+    // also fine.
+    assert!(
+        received >= 1,
+        "expected at least one datagram to round-trip after drop-on-full burst"
+    );
+}
