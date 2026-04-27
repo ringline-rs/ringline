@@ -26,9 +26,17 @@ pub struct ShutdownHandle {
     worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
     listen_fd: Option<RawFd>,
     listen_fd_closed: Option<Arc<AtomicBool>>,
+    bound_addr: Option<SocketAddr>,
 }
 
 impl ShutdownHandle {
+    /// The actual TCP address the listener bound to, if any. Returns `Some`
+    /// for TCP `bind()` (port may have been zero-resolved) and `None` for
+    /// client-only mode or Unix-socket binds.
+    pub fn bound_addr(&self) -> Option<SocketAddr> {
+        self.bound_addr
+    }
+
     /// Block the calling thread until `SIGINT` or `SIGTERM` is received,
     /// then trigger graceful shutdown.
     ///
@@ -68,6 +76,43 @@ impl ShutdownHandle {
 enum BindAddr {
     Tcp(SocketAddr),
     Unix(PathBuf),
+}
+
+/// Resolve the actual bound address of a TCP listen fd via `getsockname(2)`.
+/// Returns `None` if the fd is not an IPv4/IPv6 TCP socket or the syscall fails.
+fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
+    use std::mem::{MaybeUninit, size_of};
+
+    let mut storage: MaybeUninit<libc::sockaddr_storage> = MaybeUninit::zeroed();
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            storage.as_mut_ptr() as *mut libc::sockaddr,
+            &mut len as *mut _,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let s = unsafe { storage.assume_init() };
+    match s.ss_family as i32 {
+        libc::AF_INET => {
+            let addr_in: libc::sockaddr_in =
+                unsafe { std::ptr::read(&s as *const _ as *const libc::sockaddr_in) };
+            let ip = std::net::Ipv4Addr::from(u32::from_be(addr_in.sin_addr.s_addr));
+            let port = u16::from_be(addr_in.sin_port);
+            Some(SocketAddr::from((ip, port)))
+        }
+        libc::AF_INET6 => {
+            let addr_in6: libc::sockaddr_in6 =
+                unsafe { std::ptr::read(&s as *const _ as *const libc::sockaddr_in6) };
+            let ip = std::net::Ipv6Addr::from(addr_in6.sin6_addr.s6_addr);
+            let port = u16::from_be(addr_in6.sin6_port);
+            Some(SocketAddr::from((ip, port)))
+        }
+        _ => None,
+    }
 }
 
 /// Builder for launching ringline workers with optional listener/acceptor.
@@ -260,9 +305,14 @@ impl RinglineBuilder {
         };
 
         // Optionally create listener + acceptor.
+        let mut bound_addr: Option<SocketAddr> = None;
         let (listen_fd, listen_fd_closed) = if let Some(bind_addr) = self.bind_addr {
             let (fd, is_unix) = match bind_addr {
-                BindAddr::Tcp(addr) => (create_listener(addr, self.config.backlog)?, false),
+                BindAddr::Tcp(addr) => {
+                    let fd = create_listener(addr, self.config.backlog)?;
+                    bound_addr = getsockname_v4_v6(fd);
+                    (fd, false)
+                }
                 BindAddr::Unix(ref path) => {
                     (create_unix_listener(path, self.config.backlog)?, true)
                 }
@@ -376,6 +426,7 @@ impl RinglineBuilder {
             worker_wake_handles,
             listen_fd,
             listen_fd_closed,
+            bound_addr,
         };
 
         Ok((shutdown_handle, handles))

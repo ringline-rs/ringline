@@ -94,6 +94,30 @@ fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[test]
+fn shutdown_handle_reports_bound_addr() {
+    // Bind to :0 so the kernel picks a port, and verify ShutdownHandle
+    // surfaces the resolved address (not the wildcard the user passed in).
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<AsyncEcho>()
+        .expect("launch failed");
+
+    let bound = shutdown
+        .bound_addr()
+        .expect("bound_addr should be Some after a TCP bind");
+    assert_eq!(bound.ip().to_string(), "127.0.0.1");
+    assert_ne!(bound.port(), 0, "kernel-assigned port must be non-zero");
+
+    // Sanity: the reported port actually accepts connections.
+    wait_for_server(&bound.to_string());
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
 fn echo_small_message() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
