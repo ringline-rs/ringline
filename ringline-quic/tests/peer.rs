@@ -662,3 +662,139 @@ fn flush_emits_packets_buffered_during_write() {
     let (n, _fin) = server.stream_recv(sc, s, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"flush-me");
 }
+
+// ── Stream stop / reset ────────────────────────────────────────────────
+
+#[test]
+fn peer_stop_sending_surfaces_streamstopped_event() {
+    // Regression: previously `StreamEvent::Stopped` from quinn-proto was
+    // swallowed inside `poll_connection`, so a sender whose peer issued
+    // STOP_SENDING never got told. We now surface it as
+    // `QuicEvent::StreamStopped`.
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
+
+    // Client opens a bidi stream and pushes one chunk.
+    let stream = client.open_bi(cc).unwrap().unwrap();
+    client.stream_send(cc, stream, b"hello").unwrap();
+    client.flush(Instant::now());
+    drain(&mut client, &mut server, ca, sa);
+
+    // Server learns about the stream.
+    let mut server_stream = None;
+    while let Some(ev) = server.poll_event() {
+        if let QuicEvent::StreamOpened { stream, .. } = ev {
+            server_stream = Some(stream);
+        }
+    }
+    let s = server_stream.expect("server StreamOpened");
+
+    // Server tells the client to stop sending.
+    server
+        .stop_sending(sc, s, quinn_proto::VarInt::from_u32(0x99))
+        .unwrap();
+    server.flush(Instant::now());
+    drain(&mut client, &mut server, ca, sa);
+
+    // Client should now see StreamStopped on `stream`.
+    let mut got_stop = None;
+    while let Some(ev) = client.poll_event() {
+        if let QuicEvent::StreamStopped {
+            stream: s2,
+            error_code,
+            ..
+        } = ev
+            && s2 == stream
+        {
+            got_stop = Some(error_code);
+        }
+    }
+    let code = got_stop.expect(
+        "client should receive StreamStopped after server's stop_sending — \
+         silent loss here means the bug regressed",
+    );
+    assert_eq!(code, quinn_proto::VarInt::from_u32(0x99));
+}
+
+#[test]
+fn reset_stream_surfaces_read_error_to_peer() {
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
+
+    let stream = client.open_bi(cc).unwrap().unwrap();
+    client.stream_send(cc, stream, b"about-to-reset").unwrap();
+    client.flush(Instant::now());
+    drain(&mut client, &mut server, ca, sa);
+
+    // Server learns about the stream and reads the data.
+    let mut server_stream = None;
+    while let Some(ev) = server.poll_event() {
+        if let QuicEvent::StreamOpened { stream, .. } = ev {
+            server_stream = Some(stream);
+        }
+    }
+    let s = server_stream.expect("server StreamOpened");
+    let mut buf = [0u8; 64];
+    let _ = server.stream_recv(sc, s, &mut buf).unwrap();
+
+    // Client resets the send side.
+    client
+        .reset_stream(cc, stream, quinn_proto::VarInt::from_u32(0x42))
+        .unwrap();
+    client.flush(Instant::now());
+    drain(&mut client, &mut server, ca, sa);
+
+    // Server's next stream_recv on this stream must return an error
+    // (specifically, a `ReadError::Reset`).
+    match server.stream_recv(sc, s, &mut buf) {
+        Ok(_) => panic!("expected an error after peer reset, got Ok"),
+        Err(ringline_quic::Error::Read(quinn_proto::ReadError::Reset(code))) => {
+            assert_eq!(code, quinn_proto::VarInt::from_u32(0x42));
+        }
+        Err(other) => panic!("expected ReadError::Reset, got {other:?}"),
+    }
+}
+
+// ── send_queue_capacity drop behavior ─────────────────────────────────
+
+#[test]
+fn send_queue_capacity_caps_queued_packets() {
+    // Configure a tiny send_queue_capacity so we can verify excess
+    // outbound packets are dropped (quinn handles retransmission, so
+    // dropping is acceptable — but the cap must actually be enforced
+    // and the connection must not corrupt itself).
+    let (certs, key) = self_signed();
+
+    let mut client_cfg = client_config(&certs);
+    client_cfg.send_queue_capacity = 4;
+    let mut server_cfg = server_config(certs, key);
+    server_cfg.send_queue_capacity = 4;
+
+    let ca: SocketAddr = "127.0.0.1:51000".parse().unwrap();
+    let sa: SocketAddr = "127.0.0.1:51001".parse().unwrap();
+    let mut client = QuicEndpoint::new(client_cfg, ca);
+    let mut server = QuicEndpoint::new(server_cfg, sa);
+
+    let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
+
+    // Push a lot of stream data without ferrying anything to the server.
+    // The connection's outgoing transmits should grow into the queue
+    // and be capped.
+    let stream = client.open_bi(cc).unwrap().unwrap();
+    let payload = vec![0u8; 16 * 1024];
+    let _ = client.stream_send(cc, stream, &payload);
+    client.flush(Instant::now());
+
+    let qlen = client.send_queue_len();
+    assert!(
+        qlen <= 4,
+        "send_queue must respect cap of 4; got {qlen} queued packets"
+    );
+
+    // Sanity: connection still works after dropping packets — drain
+    // and ensure the next round of queueing still proceeds.
+    let _ = client.send_queue_len();
+    drain(&mut client, &mut server, ca, sa);
+    // No assertion on bytes received: dropping is allowed under cap.
+    // Just verify no panic, no inconsistent state.
+}

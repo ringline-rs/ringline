@@ -1053,3 +1053,381 @@ fn udp_and_tcp_coexist() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── Handler future exits early ─────────────────────────────────────────
+
+/// Handler whose UDP future returns immediately after recording it
+/// started — emulates a buggy app that drops out of the recv loop.
+/// Datagrams arriving after the future returns must not crash the worker.
+struct ExitingUdpHandler {
+    started: Arc<AtomicUsize>,
+}
+
+static EXITING_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+
+impl AsyncEventHandler for ExitingUdpHandler {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ExitingUdpHandler {
+            started: EXITING_STARTED.get_or_init(Default::default).clone(),
+        }
+    }
+    fn on_udp_bind(&self, _udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        Some(Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            // Future returns immediately; no recv loop runs.
+        }))
+    }
+}
+
+#[test]
+fn udp_handler_exit_does_not_crash_worker() {
+    // The on_udp_bind future returns straight away. We then send a flood
+    // of datagrams and verify the worker stays alive: the shutdown
+    // sequence completes, no panics, no thread join errors. This proves
+    // there's no crash on the read side, and is the minimum bar before
+    // we worry about the secondary concern (queue growth — see the
+    // comment at the bottom of this test).
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    EXITING_STARTED
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let (shutdown, handles) = RinglineBuilder::new(base_config())
+        .bind_udp(addr)
+        .launch::<ExitingUdpHandler>()
+        .expect("launch");
+    await_handler_started(EXITING_STARTED.get().unwrap());
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // Fire many datagrams; the server has no recv loop so it accepts and
+    // ignores them.
+    for i in 0..200u32 {
+        let payload = format!("orphan-{i}");
+        let _ = client.send_to(payload.as_bytes(), addr);
+    }
+
+    // Give the runtime time to chew through the kernel queue.
+    std::thread::sleep(Duration::from_millis(200));
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join()
+            .expect("worker thread panicked")
+            .expect("worker exited with error");
+    }
+
+    // NOTE: the datagrams successfully accepted by the runtime are
+    // currently buffered indefinitely in `udp_recv_queues[idx]` because
+    // there is no consumer. That's a memory-leak hazard separate from
+    // this test. Capping the queue or de-arming the multishot when the
+    // future exits would address it. For now this test only guarantees
+    // the immediate "does not crash" property.
+}
+
+// ── Handler future panic ───────────────────────────────────────────────
+
+/// Handler whose UDP future panics on the first received datagram.
+/// We want the worker to keep running — at minimum, a separate UDP
+/// socket must continue to function, and shutdown must complete.
+struct PanickingUdpHandler {
+    started: Arc<AtomicUsize>,
+}
+
+static PANIC_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+
+impl AsyncEventHandler for PanickingUdpHandler {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        PanickingUdpHandler {
+            started: PANIC_STARTED.get_or_init(Default::default).clone(),
+        }
+    }
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        // Only the FIRST socket panics; the second is a normal echo so we
+        // can verify the worker stayed alive.
+        if udp.index() == 0 {
+            Some(Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let (_data, _peer) = udp.recv_from().await;
+                panic!("intentional panic from UDP handler");
+            }))
+        } else {
+            Some(Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                loop {
+                    let (data, peer) = udp.recv_from().await;
+                    let _ = udp.send_to(peer, &data);
+                }
+            }))
+        }
+    }
+}
+
+#[test]
+fn udp_handler_panic_keeps_worker_alive() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    PANIC_STARTED
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+
+    let p1 = free_udp_port();
+    let p2 = loop {
+        let p = free_udp_port();
+        if p != p1 {
+            break p;
+        }
+    };
+    let panicking_addr: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
+    let echo_addr: SocketAddr = format!("127.0.0.1:{p2}").parse().unwrap();
+
+    let (shutdown, handles) = RinglineBuilder::new(base_config())
+        .bind_udp(panicking_addr) // index 0 — the panicking one
+        .bind_udp(echo_addr) // index 1 — normal echo
+        .launch::<PanickingUdpHandler>()
+        .expect("launch");
+
+    let started = PANIC_STARTED.get().unwrap();
+    for _ in 0..400 {
+        if started.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        started.load(Ordering::SeqCst) >= 2,
+        "both UDP handlers should have started"
+    );
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    // Trigger the panic.
+    client.send_to(b"boom", panicking_addr).unwrap();
+    // Give the panic a moment to propagate (or be caught).
+    std::thread::sleep(Duration::from_millis(100));
+
+    // The other UDP socket on the *same worker* must still echo. If the
+    // panic took down the worker, this recv times out and the test fails.
+    client.send_to(b"still-alive", echo_addr).unwrap();
+    let mut buf = [0u8; 32];
+    match client.recv_from(&mut buf) {
+        Ok((n, _src)) => assert_eq!(&buf[..n], b"still-alive"),
+        Err(e) => panic!("worker appears dead after handler panic: {e}"),
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        // We tolerate the worker thread surfacing the panic as a join
+        // error, but we *don't* tolerate it deadlocking shutdown.
+        let _ = h.join();
+    }
+}
+
+// ── Shutdown with in-flight UDP sends ─────────────────────────────────
+
+struct InFlightSendHandler {
+    started: Arc<AtomicUsize>,
+}
+
+static INFLIGHT_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+
+impl AsyncEventHandler for InFlightSendHandler {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        InFlightSendHandler {
+            started: INFLIGHT_STARTED.get_or_init(Default::default).clone(),
+        }
+    }
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        Some(Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            let (_data, peer) = udp.recv_from().await;
+            // Saturate the slot ring as fast as possible; some sends will
+            // succeed, some will hit PoolExhausted. We don't await
+            // completions — the test wants in-flight sends pending when
+            // shutdown fires.
+            let payload = vec![0xCDu8; 256];
+            for _ in 0..1_000u32 {
+                let _ = udp.send_to(peer, &payload);
+            }
+            // Sleep forever to keep the future alive past shutdown.
+            loop {
+                let _ = udp.recv_from().await;
+            }
+        }))
+    }
+}
+
+#[test]
+fn udp_shutdown_with_inflight_sends_completes() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    INFLIGHT_STARTED
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let (shutdown, handles) = RinglineBuilder::new(base_config())
+        .bind_udp(addr)
+        .launch::<InFlightSendHandler>()
+        .expect("launch");
+    await_handler_started(INFLIGHT_STARTED.get().unwrap());
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let client_addr = client.local_addr().unwrap();
+    client.send_to(b"trigger", addr).unwrap();
+
+    // Wait briefly so the handler kicks off its 1k send burst.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let start = std::time::Instant::now();
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker errored");
+    }
+    let elapsed = start.elapsed();
+
+    // Shutdown should not hang: the worker drains its CQEs (or just exits)
+    // and the join returns within seconds even though sends were in flight.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "shutdown hung waiting on in-flight UDP sends: took {elapsed:?}"
+    );
+    // Sanity: client may or may not have received some echoes; we just
+    // care that the kernel address still works (worker is gone).
+    let _ = client_addr;
+}
+
+// ── Concurrent in-flight send_to (slot-ring accounting) ────────────────
+
+struct ConcurrentSenders {
+    started: Arc<AtomicUsize>,
+    sent_total: Arc<AtomicU64>,
+}
+
+static CONC_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static CONC_SENT: OnceLock<Arc<AtomicU64>> = OnceLock::new();
+
+impl AsyncEventHandler for ConcurrentSenders {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        ConcurrentSenders {
+            started: CONC_STARTED.get_or_init(Default::default).clone(),
+            sent_total: CONC_SENT.get_or_init(Default::default).clone(),
+        }
+    }
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        let sent_total = self.sent_total.clone();
+        Some(Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            let (_data, peer) = udp.recv_from().await;
+            // 8 send slots, 64 sends → must observe slot recycle multiple
+            // times to complete. Tests that the freelist correctly
+            // returns slots on CQE.
+            let mut sent = 0u64;
+            let payload = b"slot-test".to_vec();
+            for i in 0..64u32 {
+                loop {
+                    match udp.send_to(peer, &payload) {
+                        Ok(()) => {
+                            sent += 1;
+                            break;
+                        }
+                        Err(UdpSendError::PoolExhausted)
+                        | Err(UdpSendError::SubmissionQueueFull) => {
+                            udp.send_ready().await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = i;
+            }
+            sent_total.store(sent, Ordering::SeqCst);
+        }))
+    }
+}
+
+#[test]
+fn udp_concurrent_inflight_sends_recycle_slots() {
+    if ringline::backend() != ringline::Backend::IoUring {
+        // mio's send is synchronous; there's no slot ring to recycle.
+        return;
+    }
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    CONC_STARTED
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+    CONC_SENT
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let mut cfg = base_config();
+    cfg.udp_send_slots = 8;
+    let (shutdown, handles) = RinglineBuilder::new(cfg)
+        .bind_udp(addr)
+        .launch::<ConcurrentSenders>()
+        .expect("launch");
+    await_handler_started(CONC_STARTED.get().unwrap());
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    client.send_to(b"go", addr).unwrap();
+
+    // Drain everything the server sends.
+    let mut received = 0u64;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut buf = [0u8; 64];
+    while std::time::Instant::now() < deadline {
+        match client.recv_from(&mut buf) {
+            Ok(_) => received += 1,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if CONC_SENT.get().unwrap().load(Ordering::SeqCst) == 64 {
+                    break;
+                }
+            }
+            Err(e) => panic!("recv: {e}"),
+        }
+    }
+
+    let sent = CONC_SENT.get().unwrap().load(Ordering::SeqCst);
+    assert_eq!(
+        sent, 64,
+        "handler should have completed all 64 sends; sent={sent}"
+    );
+    assert!(
+        received >= 60,
+        "client should have received almost all datagrams; received={received}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}

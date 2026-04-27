@@ -802,12 +802,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(raw_id));
-                    match fut.as_mut().poll(&mut cx) {
-                        std::task::Poll::Ready(()) => {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        fut.as_mut().poll(&mut cx)
+                    }));
+                    match result {
+                        Ok(std::task::Poll::Ready(())) => {
                             executor.standalone_slab.remove(task_idx);
                         }
-                        std::task::Poll::Pending => {
+                        Ok(std::task::Poll::Pending) => {
                             executor.standalone_slab.park(task_idx, fut);
+                        }
+                        Err(_panic) => {
+                            drop(fut);
+                            executor.standalone_slab.remove(task_idx);
+                            eprintln!("ringline: standalone task panicked; dropped");
                         }
                     }
                 }
@@ -819,14 +827,25 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(conn_index));
-                    match fut.as_mut().poll(&mut cx) {
-                        std::task::Poll::Ready(()) => {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        fut.as_mut().poll(&mut cx)
+                    }));
+                    match result {
+                        Ok(std::task::Poll::Ready(())) => {
                             // Task completed — connection handler is done.
                             driver.close_connection(conn_index);
                             executor.remove_connection(conn_index);
                         }
-                        std::task::Poll::Pending => {
+                        Ok(std::task::Poll::Pending) => {
                             executor.task_slab.park(conn_index, fut);
+                        }
+                        Err(_panic) => {
+                            drop(fut);
+                            driver.close_connection(conn_index);
+                            executor.remove_connection(conn_index);
+                            eprintln!(
+                                "ringline: connection task panicked; connection {conn_index} closed"
+                            );
                         }
                     }
                 }

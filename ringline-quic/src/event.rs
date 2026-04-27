@@ -1,4 +1,4 @@
-use quinn_proto::{ConnectionError, StreamId};
+use quinn_proto::{ConnectionError, StreamId, VarInt};
 
 /// Opaque identifier for a QUIC connection within a [`QuicEndpoint`](crate::QuicEndpoint).
 ///
@@ -40,6 +40,17 @@ pub enum QuicEvent {
 
     /// A send stream has been fully acknowledged by the peer.
     StreamFinished { conn: QuicConnId, stream: StreamId },
+
+    /// The peer asked us to stop sending on this stream
+    /// (peer called the equivalent of `stop_sending`).
+    ///
+    /// After this event, further writes on `stream` will fail; the stream
+    /// can no longer be flushed to the peer.
+    StreamStopped {
+        conn: QuicConnId,
+        stream: StreamId,
+        error_code: VarInt,
+    },
 
     /// A QUIC connection was closed or lost.
     ConnectionClosed {
