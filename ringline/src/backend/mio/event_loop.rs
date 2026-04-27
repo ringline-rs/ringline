@@ -86,6 +86,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             config.standalone_task_capacity,
             config.timer_slots,
             config.udp_bind.len() as u32,
+            config.udp_recv_queue_capacity,
         );
 
         Ok(AsyncEventLoop {
@@ -654,9 +655,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         loop {
             match socket.recv_from(&mut buf) {
                 Ok((n, peer)) => {
-                    let data = buf[..n].to_vec();
-                    self.executor.udp_recv_queues[idx].push_back((data, peer));
-                    self.executor.wake_udp_recv(udp_index);
+                    metrics::UDP.increment(metrics::udp::DATAGRAMS_RECEIVED);
+                    if self.executor.udp_recv_queues[idx].len()
+                        >= self.executor.udp_recv_queue_capacity
+                    {
+                        // Drop on the floor — see io_uring backend for
+                        // rationale.
+                        metrics::UDP.increment(metrics::udp::DATAGRAMS_DROPPED);
+                    } else {
+                        let data = buf[..n].to_vec();
+                        self.executor.udp_recv_queues[idx].push_back((data, peer));
+                        self.executor.wake_udp_recv(udp_index);
+                    }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => break,

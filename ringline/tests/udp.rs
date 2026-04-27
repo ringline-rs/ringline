@@ -1123,12 +1123,56 @@ fn udp_handler_exit_does_not_crash_worker() {
             .expect("worker exited with error");
     }
 
-    // NOTE: the datagrams successfully accepted by the runtime are
-    // currently buffered indefinitely in `udp_recv_queues[idx]` because
-    // there is no consumer. That's a memory-leak hazard separate from
-    // this test. Capping the queue or de-arming the multishot when the
-    // future exits would address it. For now this test only guarantees
-    // the immediate "does not crash" property.
+    // The unbounded-queue-growth concern is covered by
+    // `udp_recv_queue_capacity_drops_excess_datagrams` below.
+}
+
+#[test]
+fn udp_recv_queue_capacity_drops_excess_datagrams() {
+    // Verify the per-socket recv queue cap actually fires when a handler
+    // stops draining. With no cap, a handler that exits leaks memory at
+    // line rate; this test pins the behavior down.
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    EXITING_STARTED
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let mut cfg = base_config();
+    cfg.udp_recv_queue_capacity = 8;
+    let (shutdown, handles) = RinglineBuilder::new(cfg)
+        .bind_udp(addr)
+        .launch::<ExitingUdpHandler>()
+        .expect("launch");
+    await_handler_started(EXITING_STARTED.get().unwrap());
+
+    // Snapshot the dropped counter before the burst.
+    let before = ringline::metrics::UDP
+        .value(ringline::metrics::udp::DATAGRAMS_DROPPED)
+        .unwrap_or(0);
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for _ in 0..256u32 {
+        let _ = client.send_to(b"x", addr);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let after = ringline::metrics::UDP
+        .value(ringline::metrics::udp::DATAGRAMS_DROPPED)
+        .unwrap_or(0);
+    let dropped = after - before;
+    assert!(
+        dropped >= 200,
+        "cap should have dropped most of 256 datagrams (cap=8); \
+         dropped={dropped}, before={before}, after={after}"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
 }
 
 // ── Handler future panic ───────────────────────────────────────────────

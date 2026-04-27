@@ -24,7 +24,7 @@ pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(4);
 pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(3);
 
 #[metric(name = "ringline/udp", description = "UDP counters")]
-pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(3);
+pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(4);
 
 // ── Gauge (not sharded) ─────────────────────────────────────────
 
@@ -68,6 +68,11 @@ pub mod udp {
     pub const DATAGRAMS_RECEIVED: usize = 0;
     pub const DATAGRAMS_SENT: usize = 1;
     pub const SEND_ERRORS: usize = 2;
+    /// Datagrams dropped by the runtime because the per-socket recv queue
+    /// reached `Config::udp_recv_queue_capacity`. Usually means the
+    /// handler future has stopped consuming (panicked, returned early,
+    /// or stalled).
+    pub const DATAGRAMS_DROPPED: usize = 3;
 }
 
 /// Initialize per-entry metadata (labels) for all counter groups.
@@ -112,4 +117,9 @@ pub fn init_metadata() {
     );
     UDP.insert_metadata(udp::DATAGRAMS_SENT, "op".into(), "datagrams_sent".into());
     UDP.insert_metadata(udp::SEND_ERRORS, "op".into(), "send_errors".into());
+    UDP.insert_metadata(
+        udp::DATAGRAMS_DROPPED,
+        "op".into(),
+        "datagrams_dropped".into(),
+    );
 }
