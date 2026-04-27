@@ -114,8 +114,18 @@ impl QuicEndpoint {
                         self.drain_transmits(key, now);
                         self.poll_connection(key, now);
                     }
+                    Err(quinn_proto::AcceptError {
+                        response: Some(t), ..
+                    }) => {
+                        // Quinn produced an explicit close response (e.g. a
+                        // CONNECTION_REFUSED initial-close on handshake
+                        // failure). Forward it so the peer doesn't have to
+                        // wait for its own handshake timeout.
+                        let data = self.response_buf[..t.size].to_vec();
+                        self.queue_packet(t.destination, data);
+                    }
                     Err(_) => {
-                        // Accept failed (e.g. no server config). Silently drop.
+                        // No response packet — nothing to send back.
                     }
                 }
             }
@@ -306,14 +316,25 @@ impl QuicEndpoint {
     }
 
     /// Close a QUIC connection with the given error code and reason.
+    ///
+    /// The resulting `CONNECTION_CLOSE` packet is queued for transmission
+    /// before this call returns, so the peer is told about the closure as
+    /// soon as the caller flushes its UDP socket. There is no need for the
+    /// caller to also call [`flush`](Self::flush).
     pub fn close_connection(&mut self, conn: QuicConnId, code: u32, reason: &[u8]) {
-        if let Ok(c) = self.get_conn_mut(conn) {
-            c.conn.close(
-                Instant::now(),
-                quinn_proto::VarInt::from_u32(code),
-                bytes::Bytes::copy_from_slice(reason),
-            );
+        let key = conn.0 as usize;
+        if !self.connections.contains(key) {
+            return;
         }
+        let now = Instant::now();
+        self.connections[key].conn.close(
+            now,
+            quinn_proto::VarInt::from_u32(code),
+            bytes::Bytes::copy_from_slice(reason),
+        );
+        // Drain the CONNECTION_CLOSE packet (and any final acks) so callers
+        // don't have to remember to flush after closing.
+        self.drain_transmits(key, now);
     }
 
     /// Number of active QUIC connections.

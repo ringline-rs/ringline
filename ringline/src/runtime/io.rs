@@ -2300,6 +2300,12 @@ impl UdpCtx {
     /// Suspends until a datagram is available. Each call returns exactly one
     /// datagram. The payload is copied into a `Vec<u8>` (datagrams are
     /// typically small, so this is acceptable for the initial implementation).
+    ///
+    /// Only one task should await this per socket at a time; a second waiter
+    /// overwrites the first, which is then leaked (it must still be driven
+    /// from another wake source). If you need fan-out to multiple consumers,
+    /// run a single recv loop and forward the payloads through your own
+    /// channel.
     pub fn recv_from(&self) -> UdpRecvFuture {
         UdpRecvFuture {
             udp_index: self.udp_index,
