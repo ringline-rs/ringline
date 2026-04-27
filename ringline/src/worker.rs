@@ -124,6 +124,116 @@ fn getsockname_v4_v6(fd: RawFd) -> Option<SocketAddr> {
 /// If no bind address is set, ringline runs in client-only mode: no TCP
 /// listener or acceptor thread is created, and workers can initiate outbound
 /// connections via [`AsyncEventHandler::on_start`].
+///
+/// # Example: Echo Server
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+///
+/// struct Echo;
+///
+/// impl AsyncEventHandler for Echo {
+///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///         async move {
+///             loop {
+///                 let n = conn.with_data(|data| {
+///                     conn.send_nowait(data).ok();
+///                     ParseResult::Consumed(data.len())
+///                 }).await;
+///                 if n == 0 { break; }
+///             }
+///         }
+///     }
+///     fn create_for_worker(_id: usize) -> Self { Echo }
+/// }
+///
+/// fn main() -> Result<(), ringline::Error> {
+///     let config = Config::default();
+///     let (shutdown, handles) = RinglineBuilder::new(config)
+///         .bind("0.0.0.0:7878".parse().unwrap())
+///         .launch::<Echo>()?;
+///
+///     // Wait for shutdown signal
+///     shutdown.wait_on_signal();
+///
+///     // Join all worker threads
+///     for h in handles {
+///         h.join().unwrap()?;
+///     }
+///     Ok(())
+/// }
+/// ```
+///
+/// # Example: Client-Only Mode
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, Config, RinglineBuilder};
+/// use std::pin::Pin;
+/// use std::future::Future;
+///
+/// struct ClientHandler;
+///
+/// impl AsyncEventHandler for ClientHandler {
+///     fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+///         Some(Box::pin(async {
+///             // Connect to Redis on startup
+///             match ringline::connect("127.0.0.1:6379".parse().unwrap()) {
+///                 Ok(future) => {
+///                     if let Ok(conn) = future.await {
+///                         println!("Connected to Redis");
+///                     }
+///                 }
+///                 Err(_) => eprintln!("Failed to initiate connection"),
+///             }
+///         }))
+///     }
+///     fn on_accept(&self, _conn: ringline::ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///         async {} // No inbound connections in client-only mode
+///     }
+///     fn create_for_worker(_id: usize) -> Self { ClientHandler }
+/// }
+///
+/// fn main() -> Result<(), ringline::Error> {
+///     let config = Config::default();
+///     let (shutdown, handles) = RinglineBuilder::new(config)
+///         // No .bind() call = client-only mode
+///         .launch::<ClientHandler>()?;
+///
+///     shutdown.wait_on_signal();
+///     for h in handles { h.join().unwrap()?; }
+///     Ok(())
+/// }
+/// ```
+///
+/// # Example: Unix Domain Socket
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+///
+/// struct Handler;
+/// impl AsyncEventHandler for Handler {
+///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///         async move {
+///             loop {
+///                 let n = conn.with_data(|_data| ParseResult::Consumed(0)).await;
+///                 if n == 0 { break; }
+///             }
+///         }
+///     }
+///     fn create_for_worker(_id: usize) -> Self { Handler }
+/// }
+///
+/// fn main() -> Result<(), ringline::Error> {
+///     let config = Config::default();
+///     let (shutdown, handles) = RinglineBuilder::new(config)
+///         .bind_unix("/tmp/app.sock")
+///         .launch::<Handler>()?;
+///
+///     shutdown.wait_on_signal();
+///     for h in handles { h.join().unwrap()?; }
+///     Ok(())
+/// }
+/// ```
 pub struct RinglineBuilder {
     config: Config,
     bind_addr: Option<BindAddr>,

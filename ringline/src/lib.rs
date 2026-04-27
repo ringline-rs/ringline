@@ -37,6 +37,86 @@
 //! }
 //! ```
 //!
+//! # Architecture
+//!
+//! Ringline uses a thread-per-core model with no cross-thread task migration:
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                        Application                              │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                              │
+//!                              ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                     Acceptors Thread                            │
+//! │              (accept4() with SO_REUSEPORT)                      │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                              │
+//!              ┌───────────────┼───────────────┐
+//!              ▼               ▼               ▼
+//! ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+//! │  Worker Thread  │ │  Worker Thread  │ │  Worker Thread  │
+//! │      (Core 0)   │ │      (Core 1)   │ │      (Core N)   │
+//! │                 │ │                 │ │                 │
+//! │  ┌───────────┐  │ │  ┌───────────┐  │ │  ┌───────────┐  │
+//! │  │ io_uring  │  │ │  │ io_uring  │  │ │  │ io_uring  │  │
+//! │  │   Ring    │  │ │  │   Ring    │  │ │  │   Ring    │  │
+//! │  └─────┬─────┘  │ │  └─────┬─────┘  │ │  └─────┬─────┘  │
+//! │        │        │ │        │        │ │        │        │
+//! │  ┌─────▼─────┐  │ │  ┌─────▼─────┐  │ │  ┌─────▼─────┐  │
+//! │  │ Executor  │  │ │  │ Executor  │  │ │  │ Executor  │  │
+//! │  │ (tasks)   │  │ │  │ (tasks)   │  │ │  │ (tasks)   │  │
+//! │  └───────────┘  │ │  └───────────┘  │ │  └───────────┘  │
+//! └─────────────────┘ └─────────────────┘ └─────────────────┘
+//! ```
+//!
+//! ## Event Loop (per worker)
+//!
+//! Each worker runs `AsyncEventLoop::run()`:
+//!
+//! 1. `submit_and_wait(1)` — block until a CQE arrives
+//! 2. `drain_completions()` — decode CQEs via `OpTag` + `UserData`, dispatch to handlers
+//! 3. `collect_wakeups()` — drain thread-local `READY_QUEUE` into executor's ready list
+//! 4. `poll_ready_tasks()` — poll all Ready futures (sets `CURRENT_DRIVER` thread-local)
+//! 5. `on_tick()` — call handler's sync tick callback
+//!
+//! ## Key Abstractions
+//!
+//! - **[`AsyncEventHandler`]** — Users implement this trait. `on_accept(ConnCtx)`
+//!   returns a future that runs for the connection's lifetime.
+//!
+//! - **[`ConnCtx`]** — Async connection handle. `with_data()`/`with_bytes()` for recv,
+//!   `send()`/`send_nowait()` for send. Internally indexes into the driver's
+//!   connection table via `(conn_index, generation)`.
+//!
+//! - **[`RinglineBuilder`]** — Builder for launching workers. Call `.bind(addr)`
+//!   to enable the acceptor, then `.launch::<Handler>()` to start workers.
+//!
+//! ## Fire/Recv Pipelining Pattern
+//!
+//! Protocol clients in the ringline ecosystem (e.g., `ringline_redis::Client`,
+//! `ringline_memcache::Client`) support a fire/recv pattern for pipelined
+//! request-response without blocking on each individual response:
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                        Application                              │
+//! │                                                                 │
+//! │   client.fire_get("key1", 1)?;  ──┐                            │
+//! │   client.fire_get("key2", 2)?;  ──┼───→ [send on wire]         │
+//! │   client.fire_get("key3", 3)?;  ──┘                            │
+//! │                                                                 │
+//! │   let r1 = client.recv().await?;  ←── [response 1, user_data=1]│
+//! │   let r2 = client.recv().await?;  ←── [response 2, user_data=2]│
+//! │   let r3 = client.recv().await?;  ←── [response 3, user_data=3]│
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! This overlaps network round trips for higher throughput. See the
+//! `ringline_redis` and `ringline_memcache` crates for detailed examples
+//! of the fire/recv API.
+//!
 //! # Platform
 //!
 //! With `io-uring` feature (default): Linux 6.0+. Requires io_uring with
