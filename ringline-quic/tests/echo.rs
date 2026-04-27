@@ -161,6 +161,7 @@ impl AsyncEventHandler for QuicEchoServer {
                         | QuicEvent::StreamsAvailable { .. }
                         | QuicEvent::DatagramReceived { .. }
                         | QuicEvent::ZeroRttRejected { .. }
+                        | QuicEvent::PeerAddressChanged { .. }
                         | QuicEvent::ConnectionClosed { .. } => {}
                     }
                 }
