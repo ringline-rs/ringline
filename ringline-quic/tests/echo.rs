@@ -160,6 +160,7 @@ impl AsyncEventHandler for QuicEchoServer {
                         | QuicEvent::StreamStopped { .. }
                         | QuicEvent::StreamsAvailable { .. }
                         | QuicEvent::DatagramReceived { .. }
+                        | QuicEvent::ZeroRttRejected { .. }
                         | QuicEvent::ConnectionClosed { .. } => {}
                     }
                 }

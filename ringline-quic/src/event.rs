@@ -64,6 +64,16 @@ pub enum QuicEvent {
     /// An unreliable QUIC datagram (RFC 9221) was received from the peer.
     DatagramReceived { conn: QuicConnId, data: Bytes },
 
+    /// 0-RTT was attempted on this outbound connection but the peer
+    /// rejected it. Anything sent before the handshake completed has
+    /// been discarded by quinn-proto and must be re-sent over 1-RTT.
+    ///
+    /// Fires once, after the handshake completes (alongside or just
+    /// after `Connected`). Only fires for outbound connections that
+    /// genuinely had 0-RTT keys — connections that never had keys
+    /// don't generate the event.
+    ZeroRttRejected { conn: QuicConnId },
+
     /// A QUIC connection was closed or lost.
     ConnectionClosed {
         conn: QuicConnId,
