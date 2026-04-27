@@ -1,4 +1,5 @@
-use quinn_proto::{ConnectionError, StreamId, VarInt};
+use bytes::Bytes;
+use quinn_proto::{ConnectionError, Dir, StreamId, VarInt};
 
 /// Opaque identifier for a QUIC connection within a [`QuicEndpoint`](crate::QuicEndpoint).
 ///
@@ -51,6 +52,17 @@ pub enum QuicEvent {
         stream: StreamId,
         error_code: VarInt,
     },
+
+    /// The peer raised the per-direction stream concurrency limit, so a
+    /// previously-rejected `open_bi` / `open_uni` may now succeed.
+    ///
+    /// Quinn-proto only fires this once per "limit was hit, then opened
+    /// up" cycle. Applications that bumped into the limit should use
+    /// this as a signal to retry their open call rather than polling.
+    StreamsAvailable { conn: QuicConnId, dir: Dir },
+
+    /// An unreliable QUIC datagram (RFC 9221) was received from the peer.
+    DatagramReceived { conn: QuicConnId, data: Bytes },
 
     /// A QUIC connection was closed or lost.
     ConnectionClosed {

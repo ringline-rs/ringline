@@ -373,6 +373,56 @@ impl QuicEndpoint {
         self.drain_transmits(key, now);
     }
 
+    /// Send an unreliable QUIC datagram (RFC 9221).
+    ///
+    /// Datagrams are not retransmitted, not flow-controlled per-stream,
+    /// and may arrive out of order. They're useful for applications where
+    /// timeliness beats reliability — telemetry, gaming, real-time media.
+    ///
+    /// If `drop_old_when_full` is true and the local outgoing buffer is
+    /// full, older queued datagrams are dropped to make room. If false,
+    /// returns an error and the caller should wait for the buffer to
+    /// drain (peer acks clear queued datagrams) before retrying.
+    ///
+    /// Returns `Err(ConnectionClosed)` if the connection has been torn
+    /// down. Returns `Err(...)` from quinn-proto for buffer-full or
+    /// peer-doesn't-support-datagrams cases.
+    pub fn send_datagram(
+        &mut self,
+        conn: QuicConnId,
+        data: bytes::Bytes,
+        drop_old_when_full: bool,
+    ) -> Result<(), Error> {
+        let c = self.get_conn_mut(conn)?;
+        c.conn
+            .datagrams()
+            .send(data, drop_old_when_full)
+            .map_err(|e| Error::Io(std::io::Error::other(format!("send_datagram: {e}"))))?;
+        // Make sure the resulting DATAGRAM frame actually leaves the
+        // connection — see `close_connection` for the same lesson.
+        let key = conn.0 as usize;
+        let now = Instant::now();
+        self.drain_transmits(key, now);
+        Ok(())
+    }
+
+    /// Maximum size of a datagram that may be passed to `send_datagram`.
+    ///
+    /// Returns `None` if the peer hasn't enabled datagram support or
+    /// the connection ID is unknown.
+    pub fn max_datagram_size(&mut self, conn: QuicConnId) -> Option<usize> {
+        self.connections
+            .get_mut(conn.0 as usize)
+            .and_then(|c| c.conn.datagrams().max_size())
+    }
+
+    /// Bytes still available in the outgoing datagram send buffer.
+    pub fn datagram_send_buffer_space(&mut self, conn: QuicConnId) -> Option<usize> {
+        self.connections
+            .get_mut(conn.0 as usize)
+            .map(|c| c.conn.datagrams().send_buffer_space())
+    }
+
     /// Number of active QUIC connections.
     pub fn connection_count(&self) -> usize {
         self.connections.len()
@@ -522,12 +572,23 @@ impl QuicEndpoint {
                             error_code,
                         });
                     }
-                    StreamEvent::Available { .. } => {
-                        // Not surfaced to application — handled via
-                        // open_bi / open_uni returning None.
+                    StreamEvent::Available { dir } => {
+                        self.events
+                            .push_back(QuicEvent::StreamsAvailable { conn: conn_id, dir });
                     }
                 },
-                Event::HandshakeDataReady | Event::DatagramReceived | Event::DatagramsUnblocked => {
+                Event::DatagramReceived => {
+                    // Drain everything currently buffered. Quinn fires one
+                    // event per arriving datagram, but draining
+                    // unconditionally keeps us robust to ordering.
+                    while let Some(data) = self.connections[key].conn.datagrams().recv() {
+                        self.events.push_back(QuicEvent::DatagramReceived {
+                            conn: conn_id,
+                            data,
+                        });
+                    }
+                }
+                Event::HandshakeDataReady | Event::DatagramsUnblocked => {
                     // Not surfaced.
                 }
             }
