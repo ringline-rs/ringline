@@ -79,8 +79,8 @@ pub fn run_acceptor(config: AcceptorConfig) {
             }
         }
 
-        // Set SO_TIMESTAMPING for kernel-level RX timestamps.
-        #[cfg(feature = "timestamps")]
+        // Set SO_TIMESTAMPING for kernel-level RX timestamps (Linux only).
+        #[cfg(all(target_os = "linux", feature = "timestamps"))]
         if config.timestamps {
             let flags: libc::c_int = (libc::SOF_TIMESTAMPING_SOFTWARE
                 | libc::SOF_TIMESTAMPING_RX_SOFTWARE)

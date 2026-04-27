@@ -8,7 +8,9 @@
 //! All key and value parameters accept `impl AsRef<[u8]>`, so you can pass
 //! `&str`, `String`, `&[u8]`, `Vec<u8>`, `Bytes`, etc.
 //!
-//! # Example
+//! # Sequential API (Simple)
+//!
+//! The basic API sends one command and awaits its response:
 //!
 //! ```no_run
 //! use ringline::ConnCtx;
@@ -23,11 +25,96 @@
 //! }
 //! ```
 //!
+//! # Fire/Recv Pipelining API (High Throughput)
+//!
+//! For higher throughput, use the fire/recv pattern to pipeline multiple
+//! commands without waiting for each response:
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                        Application                              │
+//! │                                                                 │
+//! │   client.fire_get("key1", 1)?;  ──┐                            │
+//! │   client.fire_get("key2", 2)?;  ──┼───→ [single TCP send]      │
+//! │   client.fire_get("key3", 3)?;  ──┘                            │
+//! │                              │                                │
+//! │                              ▼                                │
+//! │                    [Memcache processes]                       │
+//! │                              │                                │
+//! │                              ▼                                │
+//! │   let r1 = client.recv().await?;  ←── [response 1, user_data=1]│
+//! │   let r2 = client.recv().await?;  ←── [response 2, user_data=2]│
+//! │   let r3 = client.recv().await?;  ←── [response 3, user_data=3]│
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ```no_run
+//! use ringline::ConnCtx;
+//! use ringline_memcache::{Client, CompletedOp};
+//!
+//! async fn pipelined_example(conn: ConnCtx) -> Result<(), ringline_memcache::Error> {
+//!     let mut client = Client::new(conn);
+//!
+//!     // Fire multiple requests (synchronous, non-blocking)
+//!     client.fire_get(b"session:abc", 1)?;
+//!     client.fire_get(b"session:def", 2)?;
+//!     client.fire_get(b"session:ghi", 3)?;
+//!
+//!     // Recv responses in order (async, blocks until each arrives)
+//!     match client.recv().await? {
+//!         CompletedOp::Get { result, user_data, .. } => {
+//!             assert_eq!(user_data, 1);
+//!             let value = result?; // Option<Value>
+//!             println!("session:abc = {:?}", value);
+//!         }
+//!         _ => unreachable!(),
+//!     }
+//!
+//!     // Continue with remaining responses...
+//!     match client.recv().await? {
+//!         CompletedOp::Get { result: _, user_data, .. } => {
+//!             assert_eq!(user_data, 2);
+//!         }
+//!         _ => unreachable!(),
+//!     }
+//!
+//!     match client.recv().await? {
+//!         CompletedOp::Get { result: _, user_data, .. } => {
+//!             assert_eq!(user_data, 3);
+//!         }
+//!         _ => unreachable!(),
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Fire/Recv Benefits
+//!
+//! - **Overlaps network RTT**: All commands sent before any response received
+//! - **Better TCP utilization**: Multiple commands coalesced into fewer segments
+//! - **Correlation via `user_data`**: Attach opaque `u64` to each fire, returned on recv
+//! - **Zero-copy values**: Responses are `Bytes::slice()` into the recv accumulator
+//!
+//! ## Available Fire Methods
+//!
+//! - [`Client::fire_get()`] — GET command
+//! - [`Client::fire_set()`] — SET command
+//! - [`Client::fire_set_with_guard()`] — SET with zero-copy value
+//! - [`Client::fire_delete()`] — DELETE command
+//!
+//! ## Important Notes
+//!
+//! - Responses must be consumed in FIFO order (protocol guarantee)
+//! - `recv()` returns [`Error::NoPending`] if called with no in-flight requests
+//! - Timing is zero-overhead when no callbacks/metrics are configured
+//!
 //! # Copy Semantics
 //!
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
-//! | **Recv (values)** | **0** | `with_bytes()` + `ResponseBytes::parse()`. Keys and values are `Bytes::slice()` references into the accumulator -- zero allocation, O(1) refcount. |
+//! | **Recv (values)** | **0** | `with_bytes()` + `ResponseBytes::parse()`. Keys and values are `Bytes::slice()` references into the accumulator — zero allocation, O(1) refcount. |
 //! | **Send (commands)** | 1 | `encode_request()` serializes into `Vec<u8>`, then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`]: prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
 //!

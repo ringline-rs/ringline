@@ -550,9 +550,6 @@ pub fn request_shutdown() -> io::Result<()> {
     .ok_or_else(|| io::Error::other("called outside executor"))
 }
 
-/// The async equivalent of `ConnToken` + `DriverCtx`. Passed to the
-/// connection's async fn, provides I/O methods.
-///
 /// Async connection context providing send, recv, and connect operations.
 ///
 /// Each accepted connection receives a `ConnCtx` in [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept).
@@ -563,6 +560,129 @@ pub fn request_shutdown() -> io::Result<()> {
 ///
 /// A `ConnCtx` is valid for the lifetime of the connection's async task.
 /// When the connection is closed, the task is dropped along with the `ConnCtx`.
+///
+/// # Example: Echo Handler
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+///
+/// struct Echo;
+///
+/// impl AsyncEventHandler for Echo {
+///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///         async move {
+///             loop {
+///                 let n = conn.with_data(|data| {
+///                     // Echo back whatever we received
+///                     conn.send_nowait(data).ok();
+///                     ParseResult::Consumed(data.len())
+///                 }).await;
+///                 // n == 0 means connection closed (EOF)
+///                 if n == 0 { break; }
+///             }
+///         }
+///     }
+///     fn create_for_worker(_id: usize) -> Self { Echo }
+/// }
+/// ```
+///
+/// # Example: Line-Based Protocol
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+///
+/// struct LineEcho;
+///
+/// impl AsyncEventHandler for LineEcho {
+///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///         async move {
+///             loop {
+///                 let n = conn.with_data(|data| {
+///                     // Find newline
+///                     if let Some(pos) = data.iter().position(|&b| b == b'\n') {
+///                         let line = &data[..=pos];
+///                         conn.send_nowait(line).ok();
+///                         ParseResult::Consumed(pos + 1)
+///                     } else {
+///                         ParseResult::NeedMore
+///                     }
+///                 }).await;
+///                 if n == 0 { break; }
+///             }
+///         }
+///     }
+///     fn create_for_worker(_id: usize) -> Self { LineEcho }
+/// }
+/// ```
+///
+/// # Example: Zero-Copy with `with_bytes`
+///
+/// For protocols where you want to avoid copying parsed values, use
+/// [`with_bytes`](Self::with_bytes) which provides `Bytes` handles:
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+/// use bytes::Bytes;
+///
+/// struct ZeroCopyHandler;
+///
+/// impl AsyncEventHandler for ZeroCopyHandler {
+///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///         async move {
+///             loop {
+///                 let n = conn.with_bytes(|bytes| {
+///                     // Parse protocol, return Bytes::slice() for the value
+///                     // The slice stays valid even after the accumulator advances
+///                     if let Some((consumed, value)) = parse_message(&bytes) {
+///                         process_value(value); // value: Bytes
+///                         ParseResult::Consumed(consumed)
+///                     } else {
+///                         ParseResult::NeedMore
+///                     }
+///                 }).await;
+///                 if n == 0 { break; }
+///             }
+///         }
+///     }
+///     fn create_for_worker(_id: usize) -> Self { ZeroCopyHandler }
+/// }
+///
+/// fn parse_message(data: &[u8]) -> Option<(usize, Bytes)> {
+///     // Parse length-prefixed message: 4-byte big-endian length + payload
+///     if data.len() < 4 { return None; }
+///     let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+///     if data.len() < 4 + len { return None; }
+///     let value = Bytes::copy_from_slice(&data[4..4+len]);
+///     Some((4 + len, value))
+/// }
+///
+/// fn process_value(_value: Bytes) {
+///     // Process the zero-copy value
+/// }
+/// ```
+///
+/// # Send Patterns
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, ConnCtx, ParseResult};
+///
+/// struct SendExample;
+///
+/// impl AsyncEventHandler for SendExample {
+///     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+///         async move {
+///             // Fire-and-forget (returns Err if send pool exhausted)
+///             conn.send_nowait(b"hello").ok();
+///
+///             // Await send completion
+///             if let Ok(future) = conn.send(b"world") {
+///                 future.await.ok();
+///             }
+///         }
+///     }
+///     fn create_for_worker(_id: usize) -> Self { SendExample }
+/// }
+/// ```
 #[derive(Clone, Copy)]
 pub struct ConnCtx {
     pub(crate) conn_index: u32,
