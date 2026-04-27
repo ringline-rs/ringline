@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -1486,6 +1486,7 @@ fn udp_concurrent_inflight_sends_recycle_slots() {
 // ── Max-size loopback datagram ─────────────────────────────────────────
 
 #[test]
+#[cfg(target_os = "linux")]
 fn udp_max_size_loopback_datagram() {
     // UDP's theoretical max payload is 65507 bytes (65535 IP MTU - 20
     // IPv4 header - 8 UDP header). We pick a payload that's clearly
@@ -1539,39 +1540,47 @@ fn udp_max_size_loopback_datagram() {
 
 // ── Recv buffer ring exhaustion under burst ────────────────────────────
 
-/// Echo handler that sleeps `delay_ms` between each recv. With a tiny
-/// `udp_recv_buffer.ring_size`, this guarantees the multishot recvmsg
-/// will tear down with `ENOBUFS` and have to be re-armed multiple
-/// times during a burst — the path the io_uring backend's metric
-/// `pool::BUFFER_RING_EMPTY` is meant to flag.
-struct SlowEcho {
+/// Handler that *blocks* on an atomic flag before calling `recv_from`,
+/// then drains and echoes everything in a tight loop. With a tiny
+/// `udp_recv_buffer.ring_size`, we can deterministically force the
+/// kernel's multishot recvmsg to hit `ENOBUFS` while the handler is
+/// blocked — then unblock and verify the worker recovers and processes
+/// the surviving datagrams. Using a flag (not a sleep-per-recv) makes
+/// the test robust to debug-vs-release-mode timing.
+struct BlockedThenEcho {
     started: Arc<AtomicUsize>,
-    delay_ms: u64,
+    unblock: Arc<AtomicBool>,
 }
 
-static SLOW_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
-static SLOW_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+static BLOCKED_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static BLOCKED_UNBLOCK: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
-impl AsyncEventHandler for SlowEcho {
+impl AsyncEventHandler for BlockedThenEcho {
     fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
         async move {}
     }
     fn create_for_worker(_id: usize) -> Self {
-        SlowEcho {
-            started: SLOW_STARTED.get_or_init(Default::default).clone(),
-            delay_ms: SLOW_DELAY_MS.load(Ordering::SeqCst),
+        BlockedThenEcho {
+            started: BLOCKED_STARTED.get_or_init(Default::default).clone(),
+            unblock: BLOCKED_UNBLOCK.get_or_init(Default::default).clone(),
         }
     }
     fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
-        let delay_ms = self.delay_ms;
+        let unblock = self.unblock.clone();
         Some(Box::pin(async move {
             started.fetch_add(1, Ordering::SeqCst);
+            // Yield the executor until the test signals us to start
+            // draining. While we're here, the kernel piles up datagrams
+            // in our io_uring buffer ring (and beyond, in the socket's
+            // kernel queue) — and once the buffer ring is empty, the
+            // multishot recvmsg returns ENOBUFS and is torn down.
+            while !unblock.load(Ordering::SeqCst) {
+                let _ = ringline::sleep(Duration::from_millis(2)).await;
+            }
+            // Drain whatever survived into the recv queue.
             loop {
                 let (data, peer) = udp.recv_from().await;
-                if delay_ms > 0 {
-                    let _ = ringline::sleep(Duration::from_millis(delay_ms)).await;
-                }
                 let _ = udp.send_to(peer, &data);
             }
         }))
@@ -1586,16 +1595,16 @@ fn udp_recv_ring_exhaustion_under_burst() {
         return;
     }
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    SLOW_STARTED
+    BLOCKED_STARTED
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
-    SLOW_DELAY_MS.store(5, Ordering::SeqCst);
+    BLOCKED_UNBLOCK
+        .get_or_init(Default::default)
+        .store(false, Ordering::SeqCst);
 
     let port = free_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    // Tiny ring + slow consumer guarantees a flood overruns the buffer
-    // pool and forces the multishot to tear down + re-arm.
     let mut cfg = base_config();
     cfg.udp_recv_buffer.ring_size = 4;
     cfg.udp_recv_buffer.buffer_size = 256;
@@ -1606,26 +1615,33 @@ fn udp_recv_ring_exhaustion_under_burst() {
 
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
-        .launch::<SlowEcho>()
+        .launch::<BlockedThenEcho>()
         .expect("launch");
-    await_handler_started(SLOW_STARTED.get().unwrap());
+    await_handler_started(BLOCKED_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     client
         .set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
 
-    // Burst many small datagrams. Some will be dropped due to ENOBUFS
-    // (kernel-side, not our queue cap). The ones that make it through
-    // must round-trip cleanly.
+    // While the handler is blocked, fire a flood. The kernel will fill
+    // our 4-slot buffer ring and then return ENOBUFS for everything
+    // else, tearing down the multishot.
     for i in 0..200u32 {
         let payload = format!("burst-{i:04}");
         let _ = client.send_to(payload.as_bytes(), addr);
     }
+    // Give the kernel a moment to deliver as many as it can.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Now release the handler. It should recover (the multishot will
+    // be re-armed once buffers replenish) and echo whatever is still
+    // in the kernel queue.
+    BLOCKED_UNBLOCK.get().unwrap().store(true, Ordering::SeqCst);
 
     let mut received = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut buf = [0u8; 64];
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         match client.recv_from(&mut buf) {
             Ok(_) => received += 1,
@@ -1643,17 +1659,21 @@ fn udp_recv_ring_exhaustion_under_burst() {
         .unwrap_or(0);
     let ring_empty_events = buf_empty_after - buf_empty_before;
 
-    // We don't pin a precise number — kernel scheduling makes it
-    // timing-sensitive — but at least *something* should round-trip and
-    // the worker must not have crashed.
-    assert!(received >= 1, "expected some datagrams to round-trip");
-    // And we should have observed the ring-empty path at least once
-    // given the configuration. If this assertion gets flaky in CI,
-    // bump the burst size.
+    // The handler must have survived the ENOBUFS storm and resumed
+    // processing — at least one datagram must round-trip after we
+    // unblock.
+    assert!(
+        received >= 1,
+        "expected the worker to recover after the ENOBUFS storm and \
+         echo at least one of the surviving datagrams (received={received})"
+    );
+    // And we should have observed the ring-empty path at least once.
+    // The handler being blocked while we burst 200 datagrams into a
+    // 4-slot ring guarantees this regardless of optimisation level.
     assert!(
         ring_empty_events >= 1,
         "expected the io_uring buffer ring to go empty at least once \
-         (ring_size=4, slow consumer, 200-datagram burst); observed delta = {ring_empty_events}"
+         (ring_size=4, blocked consumer, 200-datagram burst); observed delta = {ring_empty_events}"
     );
 }
 
