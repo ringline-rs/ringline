@@ -2382,9 +2382,19 @@ impl Future for UdpRecvFuture {
             {
                 return Poll::Ready(datagram);
             }
-            // Register as waiter so the CQE handler wakes us.
+            // Register as waiter so the CQE handler wakes us. There is
+            // only one waiter slot per socket; if a different task
+            // already registered, we'd silently overwrite and the prior
+            // task would get stuck forever. That's documented as
+            // "single-consumer" semantics on `recv_from`, but it's an
+            // easy mistake — fail loud in debug builds.
             let task_id = CURRENT_TASK_ID.with(|c| c.get());
             if idx < executor.udp_recv_waiters.len() {
+                debug_assert!(
+                    executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
+                    "two distinct tasks awaiting recv_from on UdpCtx index {idx}; \
+                     UdpCtx::recv_from supports a single consumer per socket"
+                );
                 executor.udp_recv_waiters[idx] = Some(task_id);
             }
             Poll::Pending
@@ -2410,9 +2420,16 @@ impl Future for UdpSendReadyFuture {
             if idx < driver.udp_sockets.len() && !driver.udp_sockets[idx].send_freelist.is_empty() {
                 return Poll::Ready(());
             }
-            // Register as the waiter. CQE handler wakes us when a slot frees.
+            // Same single-consumer story as `recv_from` — if another
+            // task is already awaiting `send_ready`, overwriting their
+            // wakeup leaks them forever.
             let task_id = CURRENT_TASK_ID.with(|c| c.get());
             if idx < executor.udp_send_ready_waiters.len() {
+                debug_assert!(
+                    executor.udp_send_ready_waiters[idx].is_none_or(|t| t == task_id),
+                    "two distinct tasks awaiting send_ready on UdpCtx index {idx}; \
+                     UdpCtx::send_ready supports a single consumer per socket"
+                );
                 executor.udp_send_ready_waiters[idx] = Some(task_id);
             }
             Poll::Pending

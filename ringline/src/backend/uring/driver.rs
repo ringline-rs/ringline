@@ -907,9 +907,9 @@ impl Driver {
             crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
         }
 
-        // 4. Close the eventfd.
-        unsafe {
-            libc::close(self.eventfd);
-        }
+        // The eventfd is owned by `ShutdownHandle::Drop` (it holds the
+        // matching `WakeHandle`), so don't close it here — the handle's
+        // wake clones live longer than the worker thread, and a
+        // double-close would race against fd-number reuse.
     }
 }

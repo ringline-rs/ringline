@@ -72,6 +72,22 @@ impl ShutdownHandle {
     }
 }
 
+impl Drop for ShutdownHandle {
+    fn drop(&mut self) {
+        // Close the wake fds. On the io_uring backend each `WakeHandle`
+        // holds the per-worker eventfd; on the mio backend each holds
+        // the write end of the worker's wake-pipe (the read end is
+        // closed by the worker's `Driver::Drop`). Without this the fds
+        // leaked across launches — visible as a +1 (uring) or +2 (mio)
+        // /proc/self/fd entry per launch cycle.
+        for wh in &self.worker_wake_handles {
+            unsafe {
+                libc::close(wh.as_raw_fd());
+            }
+        }
+    }
+}
+
 /// Internal enum for the bound listen address.
 enum BindAddr {
     Tcp(SocketAddr),
@@ -182,9 +198,14 @@ impl RinglineBuilder {
              spawner,
              blocking_rx,
              blocking_tx,
-             blocking_pool| {
+             blocking_pool,
+             startup_tx| {
                 let handler = A::create_for_worker(worker_id);
-                let mut event_loop = AsyncEventLoop::new(
+                // The io_uring backend's `AsyncEventLoop::new` returns
+                // `crate::error::Error`; the mio backend returns
+                // `io::Error`. Normalise to `crate::error::Error` so
+                // the rest of this closure is backend-agnostic.
+                let new_result = AsyncEventLoop::new(
                     &config,
                     handler,
                     accept_rx,
@@ -199,7 +220,29 @@ impl RinglineBuilder {
                     blocking_rx,
                     blocking_tx,
                     blocking_pool,
-                )?;
+                );
+                #[cfg(has_io_uring)]
+                let event_loop_result: Result<_, crate::error::Error> = new_result;
+                #[cfg(not(has_io_uring))]
+                let event_loop_result: Result<_, crate::error::Error> =
+                    new_result.map_err(crate::error::Error::Io);
+
+                // Signal setup outcome to the launching thread before
+                // doing any further work — this is what makes
+                // `launch()` actually surface bind / config errors at
+                // call time instead of swallowing them inside a
+                // never-joined worker thread.
+                let mut event_loop = match event_loop_result {
+                    Ok(el) => {
+                        let _ = startup_tx.send(Ok(()));
+                        el
+                    }
+                    Err(e) => {
+                        let _ = startup_tx.send(Err(()));
+                        return Err(e);
+                    }
+                };
+                drop(startup_tx);
                 event_loop.run()?;
                 Ok(())
             },
@@ -226,6 +269,7 @@ impl RinglineBuilder {
                 Option<crossbeam_channel::Receiver<crate::blocking::BlockingResponse>>,
                 Option<crossbeam_channel::Sender<crate::blocking::BlockingResponse>>,
                 Option<Arc<crate::blocking::BlockingPool>>,
+                crossbeam_channel::Sender<Result<(), ()>>,
             ) -> Result<(), crate::error::Error>
             + Send
             + Clone
@@ -353,9 +397,13 @@ impl RinglineBuilder {
             (None, None)
         };
 
-        // Spawn worker threads.
+        // Spawn worker threads. Each worker reports its setup outcome
+        // (Ok / Err) over `startup_rx` so we can surface bind / config
+        // errors to the caller of `launch()` instead of silently
+        // swallowing them inside a thread that never gets joined.
         let mut handles = Vec::with_capacity(num_threads);
         let has_acceptor = listen_fd.is_some();
+        let (startup_tx, startup_rx) = crossbeam_channel::bounded::<Result<(), ()>>(num_threads);
 
         for worker_id in 0..num_threads {
             let config = self.config.clone();
@@ -363,6 +411,7 @@ impl RinglineBuilder {
             let eventfd = worker_eventfds[worker_id];
             let shutdown_flag = shutdown_flag.clone();
             let worker_fn = worker_fn.clone();
+            let startup_tx = startup_tx.clone();
 
             let (worker_resolve_rx, worker_resolve_tx, worker_resolver) =
                 if let Some(ref rxs) = resolve_rxs {
@@ -393,7 +442,13 @@ impl RinglineBuilder {
                 .spawn(move || {
                     if config.worker.pin_to_core {
                         let core = config.worker.core_offset + worker_id;
-                        pin_to_core(core)?;
+                        // Report the failure before bailing — otherwise
+                        // the launching thread waits indefinitely for
+                        // a startup signal that never arrives.
+                        if let Err(e) = pin_to_core(core) {
+                            let _ = startup_tx.send(Err(()));
+                            return Err(e);
+                        }
                     }
 
                     metriken::set_thread_shard(worker_id);
@@ -414,11 +469,60 @@ impl RinglineBuilder {
                         worker_blocking_rx,
                         worker_blocking_tx,
                         worker_blocking_pool,
+                        startup_tx,
                     )
                 })
                 .map_err(crate::error::Error::Io)?;
 
             handles.push(handle);
+        }
+
+        // Drop our copy so `recv()` on the receiver side terminates if
+        // every worker happens to die before sending.
+        drop(startup_tx);
+
+        // Collect setup outcomes. If any worker failed setup, signal
+        // shutdown to the rest, join everyone, and surface the first
+        // setup error back to the caller of `launch()`.
+        let mut setup_failed = false;
+        for _ in 0..num_threads {
+            match startup_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(())) | Err(_) => {
+                    setup_failed = true;
+                    break;
+                }
+            }
+        }
+
+        if setup_failed {
+            shutdown_flag.store(true, Ordering::SeqCst);
+            // Wake workers that did successfully start so they observe
+            // the shutdown flag and exit promptly.
+            for w in &worker_wake_handles {
+                w.wake();
+            }
+            // Tear down the listener if we created one; the acceptor
+            // thread will exit when the fd closes.
+            if let (Some(fd), Some(closed)) = (listen_fd, listen_fd_closed.as_ref())
+                && !closed.swap(true, Ordering::AcqRel)
+            {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+            // Join all workers, capturing the first error to return.
+            let mut first_err: Option<crate::error::Error> = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+                    Ok(_) => {}
+                    Err(_panic) => {}
+                }
+            }
+            return Err(first_err.unwrap_or_else(|| {
+                crate::error::Error::Io(io::Error::other("worker setup failed"))
+            }));
         }
 
         let shutdown_handle = ShutdownHandle {
