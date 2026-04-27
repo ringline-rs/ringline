@@ -714,6 +714,23 @@ impl Driver {
             )));
         }
 
+        // Reject oversize datagrams up front with a non-retryable error so
+        // callers don't burn cycles awaiting `send_ready` on data that will
+        // never fit. `send_copy_pool::copy_in` would also fail here, but it
+        // collapses size and exhaustion into a single `None` — losing the
+        // distinction the API needs.
+        let slot_size = self.send_copy_pool.slot_size() as usize;
+        if data.len() > slot_size {
+            return Err(crate::error::UdpSendError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "datagram size {} exceeds send_copy_slot_size {}",
+                    data.len(),
+                    slot_size
+                ),
+            )));
+        }
+
         let slot_idx = self.udp_sockets[idx]
             .send_freelist
             .pop()
