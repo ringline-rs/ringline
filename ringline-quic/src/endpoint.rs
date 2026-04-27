@@ -48,6 +48,12 @@ struct QuicConnection {
     conn: quinn_proto::Connection,
     established: bool,
     outbound: bool,
+    /// Whether 0-RTT was possible at the time this connection was inserted.
+    /// On the client side that means we may have written application data
+    /// using 0-RTT keys. We use this flag at handshake completion to
+    /// decide whether to emit `QuicEvent::ZeroRttRejected` when the peer
+    /// declined to accept it.
+    zero_rtt_attempted: bool,
 }
 
 struct OutgoingPacket {
@@ -423,6 +429,40 @@ impl QuicEndpoint {
             .map(|c| c.conn.datagrams().send_buffer_space())
     }
 
+    /// Whether 0-RTT keys were derived for this connection (i.e. early
+    /// data is/was possible).
+    ///
+    /// On the client side this becomes true immediately after `connect`
+    /// if the configured rustls client has a session resumption ticket
+    /// for the server name. On the server side it becomes true if the
+    /// peer's Initial included 0-RTT material we could decrypt.
+    ///
+    /// Once `true`, any data written via `stream_send` /
+    /// `stream_send_chunks` / `send_datagram` before the handshake
+    /// completes is encrypted with 0-RTT keys and can arrive at the peer
+    /// before the handshake finishes. After the handshake, check
+    /// [`accepted_0rtt`](Self::accepted_0rtt) to see whether the peer
+    /// kept the early data.
+    pub fn has_0rtt(&self, conn: QuicConnId) -> bool {
+        self.connections
+            .get(conn.0 as usize)
+            .is_some_and(|c| c.conn.has_0rtt())
+    }
+
+    /// Whether the peer accepted our 0-RTT data (client-side only).
+    ///
+    /// The value is meaningless until the connection has progressed past
+    /// the handshake — usually once a `QuicEvent::Connected` has been
+    /// observed for the connection. On the server side this is always
+    /// false. If `has_0rtt` was true at connect time but this returns
+    /// false after the handshake, the peer rejected 0-RTT and a
+    /// `QuicEvent::ZeroRttRejected` event will have been emitted.
+    pub fn accepted_0rtt(&self, conn: QuicConnId) -> bool {
+        self.connections
+            .get(conn.0 as usize)
+            .is_some_and(|c| c.conn.accepted_0rtt())
+    }
+
     /// Number of active QUIC connections.
     pub fn connection_count(&self) -> usize {
         self.connections.len()
@@ -448,11 +488,18 @@ impl QuicEndpoint {
         conn: quinn_proto::Connection,
         outbound: bool,
     ) -> usize {
+        // `has_0rtt()` returns whether 0-RTT keys were derived for this
+        // connection. On the client side that's true when rustls had a
+        // resumption ticket for the server name; on the server side it's
+        // true once the client's Initial included 0-RTT material we could
+        // decrypt. Capture it now so we can detect rejection later.
+        let zero_rtt_attempted = conn.has_0rtt();
         let key = self.connections.insert(QuicConnection {
             handle: ch,
             conn,
             established: false,
             outbound,
+            zero_rtt_attempted,
         });
 
         // Grow handle_map if needed.
@@ -512,6 +559,15 @@ impl QuicEndpoint {
                     self.connections[key].established = true;
                     if self.connections[key].outbound {
                         self.events.push_back(QuicEvent::Connected(conn_id));
+                        // If we tried 0-RTT and the peer rejected it,
+                        // surface that so the application can re-send
+                        // the discarded data over 1-RTT.
+                        if self.connections[key].zero_rtt_attempted
+                            && !self.connections[key].conn.accepted_0rtt()
+                        {
+                            self.events
+                                .push_back(QuicEvent::ZeroRttRejected { conn: conn_id });
+                        }
                     } else {
                         self.events.push_back(QuicEvent::NewConnection(conn_id));
                     }

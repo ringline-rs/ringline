@@ -979,3 +979,407 @@ fn datagram_drop_old_when_full_does_not_error() {
         "expected at least one datagram to round-trip after drop-on-full burst"
     );
 }
+
+// ── 0-RTT (early data) ─────────────────────────────────────────────────
+
+/// Build a `(client_cfg, server_cfg)` pair with rustls 0-RTT enabled on
+/// both sides. The client side enables `enable_early_data` so the
+/// resumption cache is populated after the first handshake; the server
+/// side gets `max_early_data_size = u32::MAX` for free from
+/// `quinn_proto::ServerConfig::with_single_cert`.
+///
+/// Both configs are returned independently (not shared by Arc) so the
+/// returned QuicConfigs can be passed by value to `QuicEndpoint::new`.
+/// The rustls ClientConfig inside the QuicConfig contains the
+/// session-resumption cache (rustls's default in-memory cache), which is
+/// what makes 0-RTT possible on a subsequent connection.
+fn zero_rtt_configs() -> (QuicConfig, QuicConfig) {
+    let (certs, key) = self_signed();
+
+    // Server: with_single_cert already enables max_early_data_size.
+    let mut sc = ServerConfig::with_single_cert(certs.clone(), key).unwrap();
+    let transport = Arc::get_mut(&mut sc.transport).unwrap();
+    transport.max_concurrent_bidi_streams(64u32.into());
+    transport.max_concurrent_uni_streams(64u32.into());
+    let server_cfg = QuicConfig::server(Arc::new(sc));
+
+    // Client: must explicitly enable_early_data; the rustls default
+    // resumption cache (in-memory, 256 server-name slots) is on by
+    // default and stores tickets keyed by server-name.
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in &certs {
+        roots.add(cert.clone()).unwrap();
+    }
+    let mut rustls_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    rustls_cfg.enable_early_data = true;
+    let cc = ClientConfig::new(Arc::new(
+        quinn_proto::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).unwrap(),
+    ));
+    let client_cfg = QuicConfig::client(cc);
+
+    (client_cfg, server_cfg)
+}
+
+/// Wait until `client` observes a `Connected` event for `cc_id`, ferrying
+/// packets and draining timers as needed. Records whether 0-RTT was
+/// rejected during the wait.
+fn drain_until_connected(
+    client: &mut QuicEndpoint,
+    server: &mut QuicEndpoint,
+    ca: SocketAddr,
+    sa: SocketAddr,
+    cc_id: QuicConnId,
+) -> (bool, bool) {
+    let mut connected = false;
+    let mut rejected = false;
+    for _ in 0..32 {
+        drain(client, server, ca, sa);
+        while let Some(ev) = client.poll_event() {
+            match ev {
+                QuicEvent::Connected(c) if c == cc_id => connected = true,
+                QuicEvent::ZeroRttRejected { conn } if conn == cc_id => rejected = true,
+                _ => {}
+            }
+        }
+        // Drop server-side events we don't care about so the server's
+        // queue doesn't fill.
+        while let Some(_ev) = server.poll_event() {}
+        if connected {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    (connected, rejected)
+}
+
+/// Read everything `stream` ever produces, including the trailing FIN.
+/// Drives both sides for `cap` rounds at most.
+fn read_full(
+    rx: &mut QuicEndpoint,
+    tx: &mut QuicEndpoint,
+    rx_addr: SocketAddr,
+    tx_addr: SocketAddr,
+    rx_conn: QuicConnId,
+    stream: quinn_proto::StreamId,
+) -> (Vec<u8>, bool) {
+    let mut acc = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut fin = false;
+    for _ in 0..32 {
+        loop {
+            match rx.stream_recv(rx_conn, stream, &mut buf) {
+                Ok((0, true)) => {
+                    fin = true;
+                    break;
+                }
+                Ok((0, false)) => break,
+                Ok((n, more_fin)) => {
+                    acc.extend_from_slice(&buf[..n]);
+                    if more_fin {
+                        fin = true;
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if fin {
+            break;
+        }
+        rx.flush(Instant::now());
+        drain(tx, rx, tx_addr, rx_addr);
+    }
+    (acc, fin)
+}
+
+#[test]
+fn zero_rtt_round_trip() {
+    // We run two consecutive connections through one (client, server)
+    // endpoint pair:
+    //
+    // 1. Warmup: standard 1-RTT handshake. Client sends a small
+    //    bidi-stream payload and finishes. Server reads, finishes its
+    //    side. We then ferry packets long enough for the server's
+    //    NewSessionTicket post-handshake message to land in the client's
+    //    rustls resumption cache.
+    //
+    // 2. 0-RTT: client connects again; `has_0rtt` should now be true.
+    //    Client opens a unidirectional stream and writes payload data
+    //    *before* the handshake completes. The data goes out in 0-RTT
+    //    packets; the server's accept() decrypts and reads it. Once the
+    //    client observes `Connected`, `accepted_0rtt` should be true and
+    //    no `ZeroRttRejected` event should have fired.
+    let (client_cfg, server_cfg) = zero_rtt_configs();
+    let ca: SocketAddr = "127.0.0.1:52000".parse().unwrap();
+    let sa: SocketAddr = "127.0.0.1:52001".parse().unwrap();
+    let mut client = QuicEndpoint::new(client_cfg, ca);
+    let mut server = QuicEndpoint::new(server_cfg, sa);
+
+    // ── Connection 1: warmup ────────────────────────────────────────
+    let (cc1, sc1) = handshake(&mut client, &mut server, ca, sa);
+    // Sanity: first connection has no resumption material.
+    assert!(
+        !client.has_0rtt(cc1),
+        "first connection must not have 0-RTT keys"
+    );
+
+    let s1 = client.open_bi(cc1).unwrap().expect("open_bi");
+    client.stream_send(cc1, s1, b"warmup-payload").unwrap();
+    client.stream_finish(cc1, s1).unwrap();
+    client.flush(Instant::now());
+    drain(&mut client, &mut server, ca, sa);
+
+    // Server reads the warmup stream + finishes its side.
+    let mut server_warmup_stream = None;
+    while let Some(ev) = server.poll_event() {
+        if let QuicEvent::StreamOpened { stream, .. } = ev {
+            server_warmup_stream = Some(stream);
+        }
+    }
+    let s_srv = server_warmup_stream.expect("server saw warmup stream");
+    let (warmup_data, _fin) = read_full(&mut server, &mut client, sa, ca, sc1, s_srv);
+    assert_eq!(&warmup_data, b"warmup-payload");
+    server.stream_send(sc1, s_srv, b"ack").unwrap();
+    server.stream_finish(sc1, s_srv).unwrap();
+    server.flush(Instant::now());
+    drain(&mut client, &mut server, ca, sa);
+
+    // Client drains the response so quinn sees "1-RTT in use" and the
+    // server can send NewSessionTicket as a post-handshake message.
+    let mut buf = [0u8; 16];
+    let _ = client.stream_recv(cc1, s1, &mut buf);
+    drain(&mut client, &mut server, ca, sa);
+
+    // Burn enough drain rounds for the NewSessionTicket frame to be
+    // emitted by the server and consumed by the client. Quinn-proto
+    // sends the ticket shortly after handshake completion.
+    for _ in 0..16 {
+        drain(&mut client, &mut server, ca, sa);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // Close conn 1 cleanly. The server's CONNECTION_CLOSE flushes;
+    // client observes ConnectionClosed.
+    client.close_connection(cc1, 0, b"warmup-done");
+    for _ in 0..8 {
+        drain(&mut client, &mut server, ca, sa);
+        while let Some(_ev) = client.poll_event() {}
+        while let Some(_ev) = server.poll_event() {}
+    }
+
+    // ── Connection 2: 0-RTT ─────────────────────────────────────────
+    let cc2 = client
+        .connect(Instant::now(), sa, "localhost")
+        .expect("connect-0rtt");
+    assert!(
+        client.has_0rtt(cc2),
+        "second connection should have 0-RTT keys after warmup populated the resumption cache"
+    );
+
+    // Send 0-RTT data immediately, before any packet has been ferried.
+    let s2 = client.open_uni(cc2).unwrap().expect("open_uni");
+    client.stream_send(cc2, s2, b"zero-rtt-hello").unwrap();
+    client.stream_finish(cc2, s2).unwrap();
+    client.flush(Instant::now());
+
+    // Drive packets. The 0-RTT data should arrive at the server inside
+    // (or alongside) the handshake exchange.
+    drain(&mut client, &mut server, ca, sa);
+
+    // Capture server-side state while the handshake unfolds. We need to
+    // catch NewConnection (server's view of cc2) and StreamOpened (the
+    // 0-RTT uni stream) — both arrive in events, but we only get one
+    // shot at each, so collect them both as we drain.
+    let mut server_sc2: Option<QuicConnId> = None;
+    let mut server_zero_rtt_stream: Option<quinn_proto::StreamId> = None;
+    for _ in 0..16 {
+        drain(&mut client, &mut server, ca, sa);
+        while let Some(ev) = server.poll_event() {
+            match ev {
+                QuicEvent::NewConnection(c) => server_sc2 = Some(c),
+                QuicEvent::StreamOpened { stream, bidi, .. } if !bidi => {
+                    server_zero_rtt_stream = Some(stream);
+                }
+                _ => {}
+            }
+        }
+        if server_sc2.is_some() && server_zero_rtt_stream.is_some() {
+            break;
+        }
+    }
+    let server_sc2 = server_sc2.expect("server should have seen NewConnection for conn 2");
+    let server_zero_rtt_stream = server_zero_rtt_stream
+        .expect("server should observe the 0-RTT-opened uni stream during/after the handshake");
+
+    // Wait for the handshake to complete on the client side.
+    let (connected, rejected) = drain_until_connected(&mut client, &mut server, ca, sa, cc2);
+    assert!(
+        connected,
+        "client should observe Connected on the 0-RTT connection"
+    );
+    assert!(
+        !rejected,
+        "0-RTT should not be rejected; ZeroRttRejected event fired"
+    );
+    assert!(
+        client.accepted_0rtt(cc2),
+        "client.accepted_0rtt must be true after the peer accepted early data"
+    );
+    let (data, fin) = read_full(
+        &mut server,
+        &mut client,
+        sa,
+        ca,
+        server_sc2,
+        server_zero_rtt_stream,
+    );
+    assert!(fin, "server should observe FIN on the 0-RTT stream");
+    assert_eq!(
+        &data, b"zero-rtt-hello",
+        "0-RTT data must round-trip verbatim"
+    );
+}
+
+#[test]
+fn zero_rtt_rejected_event_fires_when_server_cannot_decrypt_ticket() {
+    // Build a client + two independent server endpoints. Each
+    // `QuicConfig::server` call yields a fresh rustls ServerConfig
+    // with its own session-ticket encryption key, so a ticket issued
+    // by server A cannot be decrypted by server B. Client sees a
+    // 0-RTT rejection on the second handshake.
+    //
+    // This test pins the `ZeroRttRejected` event semantics in place:
+    // it must fire when (and only when) early data was attempted and
+    // the peer declined.
+    let (certs, key) = self_signed();
+
+    // Two server configs sharing the same identity.
+    let mk_server = |certs: &Vec<CertificateDer<'static>>, key: &PrivateKeyDer<'static>| {
+        let mut sc = ServerConfig::with_single_cert(certs.clone(), key.clone_key()).unwrap();
+        let transport = Arc::get_mut(&mut sc.transport).unwrap();
+        transport.max_concurrent_bidi_streams(64u32.into());
+        transport.max_concurrent_uni_streams(64u32.into());
+        QuicConfig::server(Arc::new(sc))
+    };
+
+    // Single client config with resumption + early-data.
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in &certs {
+        roots.add(cert.clone()).unwrap();
+    }
+    let mut rustls_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    rustls_cfg.enable_early_data = true;
+    let cc = ClientConfig::new(Arc::new(
+        quinn_proto::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).unwrap(),
+    ));
+    let client_cfg = QuicConfig::client(cc);
+
+    // ── Warmup against server A ────────────────────────────────────
+    let ca: SocketAddr = "127.0.0.1:52200".parse().unwrap();
+    let sa: SocketAddr = "127.0.0.1:52201".parse().unwrap();
+    {
+        let mut client = QuicEndpoint::new(client_cfg.clone(), ca);
+        let mut server_a = QuicEndpoint::new(mk_server(&certs, &key), sa);
+        let (cc1, sc1) = handshake(&mut client, &mut server_a, ca, sa);
+        assert!(!client.has_0rtt(cc1));
+        let s1 = client.open_bi(cc1).unwrap().unwrap();
+        client.stream_send(cc1, s1, b"warmup").unwrap();
+        client.stream_finish(cc1, s1).unwrap();
+        client.flush(Instant::now());
+        drain(&mut client, &mut server_a, ca, sa);
+
+        let mut srv_stream = None;
+        while let Some(ev) = server_a.poll_event() {
+            if let QuicEvent::StreamOpened { stream, .. } = ev {
+                srv_stream = Some(stream);
+            }
+        }
+        let s_srv = srv_stream.unwrap();
+        let _ = read_full(&mut server_a, &mut client, sa, ca, sc1, s_srv);
+        server_a.stream_send(sc1, s_srv, b"ack").unwrap();
+        server_a.stream_finish(sc1, s_srv).unwrap();
+        server_a.flush(Instant::now());
+        drain(&mut client, &mut server_a, ca, sa);
+        let mut buf = [0u8; 8];
+        let _ = client.stream_recv(cc1, s1, &mut buf);
+        for _ in 0..16 {
+            drain(&mut client, &mut server_a, ca, sa);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        client.close_connection(cc1, 0, b"done");
+        for _ in 0..8 {
+            drain(&mut client, &mut server_a, ca, sa);
+        }
+        // Drop server_a + client.
+        let _ = client;
+        let _ = server_a;
+    }
+
+    // ── 0-RTT attempt against fresh server B ───────────────────────
+    let mut client = QuicEndpoint::new(client_cfg, ca);
+    let mut server_b = QuicEndpoint::new(mk_server(&certs, &key), sa);
+    let cc2 = client
+        .connect(Instant::now(), sa, "localhost")
+        .expect("connect");
+    assert!(
+        client.has_0rtt(cc2),
+        "client believes 0-RTT is available (resumption cache populated by warmup)"
+    );
+
+    // Try to send 0-RTT data; with rejection, this data will be
+    // discarded by quinn-proto on accepted_0rtt = false.
+    let s = client.open_uni(cc2).unwrap().unwrap();
+    client.stream_send(cc2, s, b"early-data-doomed").unwrap();
+    client.stream_finish(cc2, s).unwrap();
+    client.flush(Instant::now());
+
+    let (connected, rejected) = drain_until_connected(&mut client, &mut server_b, ca, sa, cc2);
+    assert!(
+        connected,
+        "client should observe Connected even on 0-RTT rejection"
+    );
+    assert!(
+        rejected,
+        "ZeroRttRejected event must fire when the server refuses to validate the ticket"
+    );
+    assert!(
+        !client.accepted_0rtt(cc2),
+        "accepted_0rtt should be false after rejection"
+    );
+}
+
+#[test]
+fn zero_rtt_no_resumption_uses_normal_handshake() {
+    // Without a warmup, the rustls client has no resumption ticket; the
+    // first connect must NOT report 0-RTT, and `accepted_0rtt` must be
+    // false post-handshake. No `ZeroRttRejected` event should fire
+    // either, since 0-RTT was never attempted.
+    let (client_cfg, server_cfg) = zero_rtt_configs();
+    let ca: SocketAddr = "127.0.0.1:52100".parse().unwrap();
+    let sa: SocketAddr = "127.0.0.1:52101".parse().unwrap();
+    let mut client = QuicEndpoint::new(client_cfg, ca);
+    let mut server = QuicEndpoint::new(server_cfg, sa);
+
+    let cc = client
+        .connect(Instant::now(), sa, "localhost")
+        .expect("connect");
+    assert!(
+        !client.has_0rtt(cc),
+        "fresh connection without resumption material must not advertise 0-RTT"
+    );
+
+    let (connected, rejected) = drain_until_connected(&mut client, &mut server, ca, sa, cc);
+    assert!(connected, "client should observe Connected");
+    assert!(
+        !rejected,
+        "no ZeroRttRejected should fire when 0-RTT was never attempted"
+    );
+    assert!(
+        !client.accepted_0rtt(cc),
+        "accepted_0rtt should be false when there were no 0-RTT keys to begin with"
+    );
+}
