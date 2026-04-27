@@ -850,6 +850,13 @@ impl AsyncEventHandler for ReuseportEcho {
 
 #[test]
 fn udp_reuseport_balances_across_workers() {
+    // SO_REUSEPORT load-balances datagrams across bound sockets only on
+    // Linux 3.9+. On macOS/BSD it just permits the multi-bind without
+    // hashing, so every datagram lands on a single worker and this
+    // assertion can never hold. Skip there.
+    if !cfg!(target_os = "linux") {
+        return;
+    }
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     REUSE_STARTED
         .get_or_init(Default::default)
