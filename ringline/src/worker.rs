@@ -27,7 +27,10 @@ pub struct ShutdownHandle {
     listen_fd: Option<RawFd>,
     listen_fd_closed: Option<Arc<AtomicBool>>,
     bound_addr: Option<SocketAddr>,
-    #[cfg(has_io_uring)]
+    /// Read on the io_uring backend by `register_region` /
+    /// `unregister_region`; on the mio backend it sits unused but is kept
+    /// so the field layout is identical across backends.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     region_registrar: Arc<crate::region_registry::RegionRegistrar>,
 }
 
@@ -61,7 +64,7 @@ impl ShutdownHandle {
     /// update.
     ///
     /// The returned [`RegionId`](crate::RegionId) is valid for use in
-    /// [`SendGuard`](crate::SendGuard) on any worker.
+    /// `SendGuard` on any worker.
     ///
     /// # Errors
     ///
@@ -70,18 +73,30 @@ impl ShutdownHandle {
     ///   [`Config::max_registered_regions`](crate::Config::max_registered_regions)).
     /// - The first kernel error reported by any worker if the underlying
     ///   `register_buffers_update` call fails.
+    /// - On the mio backend (no io_uring): always returns
+    ///   `io::ErrorKind::Unsupported`.
     ///
     /// # Caller contract
     ///
     /// The memory must outlive the registration: do not unmap or free
     /// `region` until [`unregister_region`](Self::unregister_region) has
     /// returned, or until the runtime has fully shut down.
-    #[cfg(has_io_uring)]
     pub fn register_region(
         &self,
         region: crate::buffer::fixed::MemoryRegion,
     ) -> io::Result<crate::buffer::fixed::RegionId> {
-        self.region_registrar.register(region)
+        #[cfg(has_io_uring)]
+        {
+            self.region_registrar.register(region)
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            let _ = region;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "register_region requires the io_uring backend",
+            ))
+        }
     }
 
     /// Unregister a previously registered region. Blocks until every worker
@@ -91,9 +106,21 @@ impl ShutdownHandle {
     ///
     /// No SQE referencing the slot may be in flight when this is called.
     /// After it returns, the underlying memory may be safely unmapped.
-    #[cfg(has_io_uring)]
+    ///
+    /// On the mio backend, always returns `io::ErrorKind::Unsupported`.
     pub fn unregister_region(&self, id: crate::buffer::fixed::RegionId) -> io::Result<()> {
-        self.region_registrar.unregister(id)
+        #[cfg(has_io_uring)]
+        {
+            self.region_registrar.unregister(id)
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            let _ = id;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unregister_region requires the io_uring backend",
+            ))
+        }
     }
 
     /// Block the calling thread until `SIGINT` or `SIGTERM` is received,
@@ -725,15 +752,12 @@ impl RinglineBuilder {
             }));
         }
 
-        #[cfg(has_io_uring)]
         let region_registrar = Arc::new(crate::region_registry::RegionRegistrar::new(
             self.config.max_registered_regions,
             self.config.registered_regions.len() as u16,
             region_txs,
             worker_wake_handles.clone(),
         ));
-        #[cfg(not(has_io_uring))]
-        drop(region_txs);
 
         let shutdown_handle = ShutdownHandle {
             shutdown_flag,
@@ -741,7 +765,6 @@ impl RinglineBuilder {
             listen_fd,
             listen_fd_closed,
             bound_addr,
-            #[cfg(has_io_uring)]
             region_registrar,
         };
 

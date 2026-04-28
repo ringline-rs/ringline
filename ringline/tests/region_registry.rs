@@ -1,7 +1,7 @@
 //! Integration tests for dynamic region registration via
 //! `ShutdownHandle::register_region` / `unregister_region`.
 
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", has_io_uring))]
 #![allow(clippy::manual_async_fn)]
 
 use std::future::Future;
