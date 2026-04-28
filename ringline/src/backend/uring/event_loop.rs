@@ -253,6 +253,33 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
 
+            // Retry any POLLOUT arming that failed at EAGAIN time
+            // (the SQ was full when we received the EAGAIN CQE).
+            if !self.driver.pending_send_pollout_retries.is_empty() {
+                let retries: Vec<_> = self.driver.pending_send_pollout_retries.drain(..).collect();
+                for (conn_index, generation, pool_slot) in retries {
+                    if !self.driver.send_copy_pool.in_use(pool_slot) {
+                        continue;
+                    }
+                    if self.driver.connections.get(conn_index).is_none()
+                        || self.driver.connections.generation(conn_index) != generation
+                    {
+                        self.driver.send_copy_pool.release(pool_slot);
+                        continue;
+                    }
+                    if self
+                        .driver
+                        .ring
+                        .submit_send_pollout(conn_index, pool_slot)
+                        .is_err()
+                    {
+                        self.driver
+                            .pending_send_pollout_retries
+                            .push((conn_index, generation, pool_slot));
+                    }
+                }
+            }
+
             // Drain waker-based ready queue (from wakers fired during poll).
             self.executor.collect_wakeups();
 
@@ -432,6 +459,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Fs => self.handle_fs(ud, result),
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
             OpTag::SendRecvBuf => self.handle_send_recv_buf(ud, result),
+            OpTag::SendPollOut => self.handle_send_pollout(ud, result),
             #[cfg(feature = "timestamps")]
             OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
@@ -958,6 +986,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.driver.send_copy_pool.release(pool_slot);
 
+            // One in-flight send finished; if the connection is in
+            // close-pending state and this was the last pending send,
+            // `note_send_finalized` will submit the deferred `Close`.
+            self.driver.note_send_finalized(conn_index);
             self.driver.submit_next_queued(conn_index);
 
             // Wake the send waiter.
@@ -965,8 +997,33 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
+        // `EAGAIN` / `EWOULDBLOCK` from the kernel means the socket
+        // send buffer is full and we'd block. The right response is to
+        // wait for `POLLOUT` and resubmit the same data — the pool
+        // slot still holds the unsent bytes via
+        // `current_ptr_remaining`. Don't release the slot, don't drain
+        // the queue, don't wake the send waiter.
+        let errno = -result;
+        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            if self
+                .driver
+                .ring
+                .submit_send_pollout(conn_index, pool_slot)
+                .is_err()
+            {
+                // SQ full now — queue for retry on the next tick.
+                let generation = self.driver.connections.generation(conn_index);
+                self.driver
+                    .pending_send_pollout_retries
+                    .push((conn_index, generation, pool_slot));
+            }
+            metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
+            return;
+        }
+
         self.driver.send_copy_pool.release(pool_slot);
         self.driver.drain_conn_send_queue(conn_index);
+        self.driver.note_send_finalized(conn_index);
 
         let io_result = if result == 0 {
             Ok(0u32)
@@ -974,6 +1031,53 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             Err(io::Error::from_raw_os_error(-result))
         };
         self.executor.wake_send(conn_index, io_result);
+    }
+
+    /// Handle a `POLLOUT` CQE armed after a `Send` returned `-EAGAIN`.
+    ///
+    /// Resubmits the same send using `current_ptr_remaining(pool_slot)`,
+    /// which still points at the unsent bytes inside the same pool slot
+    /// we kept alive across the EAGAIN. If the resubmit also fails to
+    /// land (SQ full), pushes onto `pending_copy_retries` so the next
+    /// tick picks it up.
+    fn handle_send_pollout(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let pool_slot = ud.payload() as u16;
+
+        // Connection may have been closed while we were waiting; in
+        // that case the pool slot was released and the queue drained
+        // by `close_connection`.
+        if !self.driver.send_copy_pool.in_use(pool_slot)
+            || self.driver.connections.get(conn_index).is_none()
+        {
+            return;
+        }
+
+        // Poll itself failed (e.g. fd closed unexpectedly). Treat
+        // the same as a generic send failure: drop everything for
+        // this connection.
+        if result < 0 {
+            self.driver.send_copy_pool.release(pool_slot);
+            self.driver.drain_conn_send_queue(conn_index);
+            self.driver.note_send_finalized(conn_index);
+            self.executor
+                .wake_send(conn_index, Err(io::Error::from_raw_os_error(-result)));
+            return;
+        }
+
+        let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
+        if self
+            .driver
+            .ring
+            .submit_send_copied(conn_index, ptr, remaining, pool_slot)
+            .is_err()
+        {
+            // SQ full — pick up on the next tick.
+            let generation = self.driver.connections.generation(conn_index);
+            self.driver
+                .pending_copy_retries
+                .push((conn_index, generation, pool_slot));
+        }
     }
 
     /// Handle completion of a send from a recv buffer (zero-copy forward).

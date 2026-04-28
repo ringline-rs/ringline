@@ -362,6 +362,22 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a one-shot PollAdd on `POLLOUT` for a fixed-table TCP fd
+    /// after a Send returned `-EAGAIN`. The CQE encodes `pool_slot` so
+    /// the handler can resubmit the original send from where it
+    /// stopped. (`current_ptr_remaining(pool_slot)` gives the right
+    /// `(ptr, len)` to retry with.)
+    pub fn submit_send_pollout(&mut self, conn_index: u32, pool_slot: u16) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::SendPollOut, conn_index, pool_slot as u32);
+        let entry = opcode::PollAdd::new(Fixed(conn_index), libc::POLLOUT as u32)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit all pending SQEs and wait for at least `min_complete` CQEs.
     pub fn submit_and_wait(&self, min_complete: u32) -> io::Result<()> {
         self.ring

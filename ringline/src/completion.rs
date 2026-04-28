@@ -37,6 +37,10 @@ pub enum OpTag {
     PidfdPoll = 19,
     /// Send from a recv buffer (zero-copy forward). Payload = bid to replenish on completion.
     SendRecvBuf = 20,
+    /// PollAdd on a TCP fd waiting for POLLOUT after a previous Send
+    /// returned `-EAGAIN` (the kernel send buffer was full). Payload =
+    /// pool_slot to resubmit when the poll fires.
+    SendPollOut = 21,
 }
 
 impl OpTag {
@@ -63,6 +67,7 @@ impl OpTag {
             18 => Some(OpTag::Fs),
             19 => Some(OpTag::PidfdPoll),
             20 => Some(OpTag::SendRecvBuf),
+            21 => Some(OpTag::SendPollOut),
             _ => None,
         }
     }

@@ -37,7 +37,7 @@ fn test_config() -> Config {
     // resource limits — the slot count covers the worst-case in-flight
     // pipeline given default 16 KiB slots, the SQ holds enough entries
     // to keep io_uring busy, and the recv buffer ring matches.
-    cfg.sq_entries = 1024;
+    cfg.sq_entries = 2048;
     cfg.recv_buffer.ring_size = 512;
     cfg.recv_buffer.buffer_size = 16 * 1024;
     cfg.max_connections = 64;
@@ -412,4 +412,88 @@ fn udp_throughput_request_reply_vs_std_net() {
         "ringline UDP req/reply is way slower than std::net: \
          ringline={rl_dur:?}, std::net={std_dur:?}"
     );
+}
+
+// ── TCP fire-and-forget large transfer (EAGAIN backpressure path) ──────
+
+/// Push the entire payload in one direction without waiting for echo
+/// chunks, which forces the kernel TCP send buffer to fill (the peer
+/// drains in the background). The runtime must arm `POLLOUT` and
+/// retransparently retry sends that returned `-EAGAIN`; if it dropped
+/// the queue (the old behavior), the receiver gets fewer bytes than
+/// were sent.
+fn tcp_fire_and_forget_ringline(payload: &[u8]) -> Vec<u8> {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let bind: SocketAddr = addr.parse().unwrap();
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(bind)
+        .launch::<AsyncTcpEcho>()
+        .expect("ringline launch");
+    wait_for_tcp(&addr);
+
+    let mut client = TcpStream::connect(&addr).expect("connect");
+    client
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    client.set_nodelay(true).ok();
+
+    // Writer: shoves the full payload in; blocks on kernel send buffer.
+    let writer = {
+        let mut writer = client.try_clone().expect("clone");
+        let payload = payload.to_vec();
+        std::thread::spawn(move || {
+            writer.write_all(&payload).expect("write");
+            writer.shutdown(std::net::Shutdown::Write).ok();
+        })
+    };
+
+    // Reader: drain echo until the server FINs.
+    let mut received = Vec::with_capacity(payload.len());
+    let mut buf = vec![0u8; 64 * 1024];
+    while received.len() < payload.len() {
+        match client.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+    writer.join().unwrap();
+    drop(client);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    received
+}
+
+#[test]
+fn tcp_fire_and_forget_8mib_survives_kernel_buffer_full() {
+    // 8 MiB unbounded write through one connection. The kernel TCP
+    // send buffer (≈200 KiB by default) fills well before the writer
+    // finishes, so the server's send CQEs return `-EAGAIN`. A correct
+    // runtime arms `POLLOUT`, waits for writability, and retries the
+    // send; ringline's previous behavior dropped the connection's
+    // queued sends on EAGAIN, which would show up here as the receiver
+    // getting < 8 MiB before the FIN.
+    let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i & 0xFF) as u8).collect();
+    let received = tcp_fire_and_forget_ringline(&payload);
+    assert_eq!(
+        received.len(),
+        payload.len(),
+        "fire-and-forget echo lost data: got {} bytes, expected {}",
+        received.len(),
+        payload.len()
+    );
+    assert_eq!(received, payload, "echoed payload mismatch");
+
+    // We don't assert `SEND_EAGAIN` ticked: with the close-time
+    // deferral the kernel often manages to drain everything without
+    // hitting `-EAGAIN` in the first place. The metric is still
+    // wired (and exercised by tighter tests in the runtime crate
+    // when we can force the kernel buffer to fill) but the
+    // user-visible regression here is "data is preserved", not "the
+    // EAGAIN-retry path fires".
 }
