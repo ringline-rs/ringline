@@ -43,6 +43,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         blocking_rx: Option<crossbeam_channel::Receiver<crate::blocking::BlockingResponse>>,
         blocking_tx: Option<crossbeam_channel::Sender<crate::blocking::BlockingResponse>>,
         blocking_pool: Option<std::sync::Arc<crate::blocking::BlockingPool>>,
+        region_rx: crate::region_registry::RegionControlRx,
     ) -> Result<Self, crate::error::Error> {
         let driver = Driver::new(
             config,
@@ -58,6 +59,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             blocking_rx,
             blocking_tx,
             blocking_pool,
+            region_rx,
         )?;
         let executor = Executor::new(
             config.max_connections,
@@ -156,6 +158,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 udp_bufs.replenish_batch(&self.driver.udp_pending_replenish);
                 self.driver.udp_pending_replenish.clear();
             }
+
+            // Drain pending region-registry updates dispatched from
+            // `ShutdownHandle::register_region` / `unregister_region`. Each
+            // message is applied to this worker's ring + registry and then
+            // acknowledged so the registrar can return to its caller.
+            self.drain_region_control();
 
             // Retry any ZC send resubmissions that failed on the previous tick
             // (SQ was full). The SQ has been flushed by submit_and_wait above.
@@ -290,6 +298,56 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // on_tick callback (synchronous).
             let mut ctx = self.driver.make_ctx();
             self.handler.on_tick(&mut ctx);
+        }
+    }
+
+    /// Apply any pending region register/unregister messages from the
+    /// runtime registrar. Each message is acked individually; the registrar
+    /// blocks on its caller until every worker reports.
+    fn drain_region_control(&mut self) {
+        use crate::region_registry::RegionControlMsg;
+        // try_iter returns immediately when the channel is empty.
+        loop {
+            let msg = match self.driver.region_rx.try_recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            match msg {
+                RegionControlMsg::Register { slot, region, ack } => {
+                    let result = self
+                        .driver
+                        .fixed_buffers
+                        .set_slot(slot, &region)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+                        .and_then(|()| {
+                            let iov = libc::iovec {
+                                iov_base: region.ptr() as *mut _,
+                                iov_len: region.len(),
+                            };
+                            // Safety: caller of `register_region` guarantees the
+                            // region outlives the registration.
+                            unsafe { self.driver.ring.register_buffers_update_one(slot, iov) }
+                        });
+                    let _ = ack.send(result);
+                }
+                RegionControlMsg::Unregister { slot, ack } => {
+                    let result = self
+                        .driver
+                        .fixed_buffers
+                        .clear_slot(slot)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+                        .and_then(|()| {
+                            let iov = libc::iovec {
+                                iov_base: std::ptr::null_mut(),
+                                iov_len: 0,
+                            };
+                            // Safety: clearing a slot does not reference any user
+                            // memory; iov is null/zero.
+                            unsafe { self.driver.ring.register_buffers_update_one(slot, iov) }
+                        });
+                    let _ = ack.send(result);
+                }
+            }
         }
     }
 
@@ -2020,6 +2078,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         assert!(eventfd >= 0, "eventfd creation failed");
+        let (_region_tx, region_rx) = crossbeam_channel::unbounded();
         AsyncEventLoop::new(
             &config,
             NoopHandler,
@@ -2035,6 +2094,7 @@ mod tests {
             None,
             None,
             None,
+            region_rx,
         )
         .expect("failed to create test event loop")
     }

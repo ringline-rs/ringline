@@ -27,6 +27,11 @@ pub struct ShutdownHandle {
     listen_fd: Option<RawFd>,
     listen_fd_closed: Option<Arc<AtomicBool>>,
     bound_addr: Option<SocketAddr>,
+    /// Read on the io_uring backend by `register_region` /
+    /// `unregister_region`; on the mio backend it sits unused but is kept
+    /// so the field layout is identical across backends.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    region_registrar: Arc<crate::region_registry::RegionRegistrar>,
 }
 
 impl ShutdownHandle {
@@ -52,6 +57,70 @@ impl ShutdownHandle {
     /// no-op write into an fd nobody is reading.
     pub fn worker_wake_handle(&self, idx: usize) -> Option<crate::wakeup::WakeHandle> {
         self.worker_wake_handles.get(idx).cloned()
+    }
+
+    /// Register a memory region with every worker's io_uring fixed-buffer
+    /// table. Blocks until every worker has acknowledged the kernel-side
+    /// update.
+    ///
+    /// The returned [`RegionId`](crate::RegionId) is valid for use in
+    /// `SendGuard` on any worker.
+    ///
+    /// # Errors
+    ///
+    /// - `io::ErrorKind::Other` "registered-region table is full" if the
+    ///   table has no free slots (size set by
+    ///   [`Config::max_registered_regions`](crate::Config::max_registered_regions)).
+    /// - The first kernel error reported by any worker if the underlying
+    ///   `register_buffers_update` call fails.
+    /// - On the mio backend (no io_uring): always returns
+    ///   `io::ErrorKind::Unsupported`.
+    ///
+    /// # Caller contract
+    ///
+    /// The memory must outlive the registration: do not unmap or free
+    /// `region` until [`unregister_region`](Self::unregister_region) has
+    /// returned, or until the runtime has fully shut down.
+    pub fn register_region(
+        &self,
+        region: crate::buffer::fixed::MemoryRegion,
+    ) -> io::Result<crate::buffer::fixed::RegionId> {
+        #[cfg(has_io_uring)]
+        {
+            self.region_registrar.register(region)
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            let _ = region;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "register_region requires the io_uring backend",
+            ))
+        }
+    }
+
+    /// Unregister a previously registered region. Blocks until every worker
+    /// has acknowledged. The slot is returned to the free list on success.
+    ///
+    /// # Caller contract
+    ///
+    /// No SQE referencing the slot may be in flight when this is called.
+    /// After it returns, the underlying memory may be safely unmapped.
+    ///
+    /// On the mio backend, always returns `io::ErrorKind::Unsupported`.
+    pub fn unregister_region(&self, id: crate::buffer::fixed::RegionId) -> io::Result<()> {
+        #[cfg(has_io_uring)]
+        {
+            self.region_registrar.unregister(id)
+        }
+        #[cfg(not(has_io_uring))]
+        {
+            let _ = id;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unregister_region requires the io_uring backend",
+            ))
+        }
     }
 
     /// Block the calling thread until `SIGINT` or `SIGTERM` is received,
@@ -316,12 +385,14 @@ impl RinglineBuilder {
              blocking_rx,
              blocking_tx,
              blocking_pool,
+             region_rx,
              startup_tx| {
                 let handler = A::create_for_worker(worker_id);
                 // The io_uring backend's `AsyncEventLoop::new` returns
                 // `crate::error::Error`; the mio backend returns
                 // `io::Error`. Normalise to `crate::error::Error` so
                 // the rest of this closure is backend-agnostic.
+                #[cfg(has_io_uring)]
                 let new_result = AsyncEventLoop::new(
                     &config,
                     handler,
@@ -337,7 +408,28 @@ impl RinglineBuilder {
                     blocking_rx,
                     blocking_tx,
                     blocking_pool,
+                    region_rx,
                 );
+                #[cfg(not(has_io_uring))]
+                let new_result = {
+                    drop(region_rx);
+                    AsyncEventLoop::new(
+                        &config,
+                        handler,
+                        accept_rx,
+                        eventfd,
+                        shutdown_flag,
+                        resolve_rx,
+                        resolve_tx,
+                        resolver,
+                        spawn_rx,
+                        spawn_tx,
+                        spawner,
+                        blocking_rx,
+                        blocking_tx,
+                        blocking_pool,
+                    )
+                };
                 #[cfg(has_io_uring)]
                 let event_loop_result: Result<_, crate::error::Error> = new_result;
                 #[cfg(not(has_io_uring))]
@@ -386,6 +478,7 @@ impl RinglineBuilder {
                 Option<crossbeam_channel::Receiver<crate::blocking::BlockingResponse>>,
                 Option<crossbeam_channel::Sender<crate::blocking::BlockingResponse>>,
                 Option<Arc<crate::blocking::BlockingPool>>,
+                crate::region_registry::RegionControlRx,
                 crossbeam_channel::Sender<Result<(), ()>>,
             ) -> Result<(), crate::error::Error>
             + Send
@@ -455,6 +548,12 @@ impl RinglineBuilder {
         } else {
             (None, None)
         };
+
+        // Region-registry control channels (one per worker). Always built;
+        // only the io_uring backend drains them and the public API is gated
+        // behind `cfg(has_io_uring)`.
+        let (region_txs, region_rxs) = crate::region_registry::build_worker_channels(num_threads);
+        let mut region_rxs_iter: Vec<_> = region_rxs.into_iter().map(Some).collect();
 
         // Create blocking pool if configured.
         let (blocking_pool, blocking_rxs) = if self.config.blocking_threads > 0 {
@@ -560,6 +659,10 @@ impl RinglineBuilder {
                     (None, None, None)
                 };
 
+            let worker_region_rx = region_rxs_iter[worker_id]
+                .take()
+                .expect("region rx already consumed");
+
             let handle = thread::Builder::new()
                 .name(format!("ringline-worker-{worker_id}"))
                 .spawn(move || {
@@ -592,6 +695,7 @@ impl RinglineBuilder {
                         worker_blocking_rx,
                         worker_blocking_tx,
                         worker_blocking_pool,
+                        worker_region_rx,
                         startup_tx,
                     )
                 })
@@ -648,12 +752,20 @@ impl RinglineBuilder {
             }));
         }
 
+        let region_registrar = Arc::new(crate::region_registry::RegionRegistrar::new(
+            self.config.max_registered_regions,
+            self.config.registered_regions.len() as u16,
+            region_txs,
+            worker_wake_handles.clone(),
+        ));
+
         let shutdown_handle = ShutdownHandle {
             shutdown_flag,
             worker_wake_handles,
             listen_fd,
             listen_fd_closed,
             bound_addr,
+            region_registrar,
         };
 
         Ok((shutdown_handle, handles))
