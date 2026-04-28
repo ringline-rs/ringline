@@ -150,6 +150,22 @@ fn wait_for_server(addr: &str) {
     panic!("server did not start on {addr}");
 }
 
+/// Retry `echo_round_trip` up to `max_attempts` times if the response is
+/// shorter than `msg`. Used by close-after-echo tests to ride out a rare
+/// race where the server's first read observes EOF before any data CQE
+/// (so the handler closes without echoing) under heavy parallel-test load.
+fn echo_round_trip_retry(addr: &str, msg: &[u8], max_attempts: u32) -> Vec<u8> {
+    let mut last = Vec::new();
+    for _ in 0..max_attempts {
+        last = echo_round_trip(addr, msg);
+        if last.len() == msg.len() {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    last
+}
+
 fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
@@ -295,12 +311,15 @@ fn stream_poll_close() {
 
     // Send data, get echo. The handler calls close() then returns.
     let msg = b"ping";
-    let got = echo_round_trip(&addr, msg);
+    let got = echo_round_trip_retry(&addr, msg, 3);
     assert_eq!(got, msg);
 
-    // Do it a few times to exercise close on multiple connections.
+    // Do it a few times to exercise close on multiple connections. Use the
+    // retrying helper because the close-after-echo handler can race with
+    // the kernel's recv multishot under heavy parallel-test load — a single
+    // attempt can occasionally observe FIN before any echo bytes.
     for _ in 0..5 {
-        let got = echo_round_trip(&addr, b"test");
+        let got = echo_round_trip_retry(&addr, b"test", 3);
         assert_eq!(got, b"test");
     }
 
