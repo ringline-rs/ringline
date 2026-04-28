@@ -22,8 +22,11 @@
 //!     }
 //! }
 //! // Drain outgoing packets:
-//! while let Some((dest, data)) = quic.poll_send() {
-//!     udp.send_to(dest, &data)?;
+//! while let Some(pkt) = quic.poll_send() {
+//!     match pkt.segment_size {
+//!         Some(seg) => udp.send_to_gso(pkt.destination, &pkt.data, seg)?,
+//!         None => udp.send_to(pkt.destination, &pkt.data)?,
+//!     }
 //! }
 //! ```
 
@@ -33,7 +36,7 @@ pub mod error;
 pub mod event;
 
 pub use config::QuicConfig;
-pub use endpoint::QuicEndpoint;
+pub use endpoint::{Datagrams, OutgoingPacket, QuicEndpoint};
 pub use error::Error;
 pub use event::{QuicConnId, QuicEvent};
 

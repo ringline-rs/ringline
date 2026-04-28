@@ -54,12 +54,16 @@ fn shuffle(
     let now = Instant::now();
     for _ in 0..32 {
         let mut moved = false;
-        while let Some((_dest, data)) = client.poll_send() {
-            server.handle_datagram(now, &data, client_addr);
+        while let Some(pkt) = client.poll_send() {
+            for dgram in pkt.datagrams() {
+                server.handle_datagram(now, dgram, client_addr);
+            }
             moved = true;
         }
-        while let Some((_dest, data)) = server.poll_send() {
-            client.handle_datagram(now, &data, server_addr);
+        while let Some(pkt) = server.poll_send() {
+            for dgram in pkt.datagrams() {
+                client.handle_datagram(now, dgram, server_addr);
+            }
             moved = true;
         }
         client.drive_timers(now);

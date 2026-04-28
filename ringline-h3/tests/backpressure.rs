@@ -70,12 +70,16 @@ fn shuffle(
         client.flush(now);
         server.flush(now);
         let mut moved = false;
-        while let Some((_, data)) = client.poll_send() {
-            server.handle_datagram(now, &data, client_addr);
+        while let Some(pkt) = client.poll_send() {
+            for dgram in pkt.datagrams() {
+                server.handle_datagram(now, dgram, client_addr);
+            }
             moved = true;
         }
-        while let Some((_, data)) = server.poll_send() {
-            client.handle_datagram(now, &data, server_addr);
+        while let Some(pkt) = server.poll_send() {
+            for dgram in pkt.datagrams() {
+                client.handle_datagram(now, dgram, server_addr);
+            }
             moved = true;
         }
         client.drive_timers(now);

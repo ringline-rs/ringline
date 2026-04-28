@@ -171,9 +171,18 @@ impl AsyncEventHandler for H3Server {
                     }
                 }
 
-                // Flush outgoing QUIC packets.
-                while let Some((dest, data)) = quic.poll_send() {
-                    let _ = udp.send_to(dest, &data);
+                // Flush outgoing QUIC packets — use UDP_SEGMENT (GSO)
+                // when quinn-proto packed multiple datagrams into one
+                // buffer.
+                while let Some(pkt) = quic.poll_send() {
+                    match pkt.segment_size {
+                        Some(seg) => {
+                            let _ = udp.send_to_gso(pkt.destination, &pkt.data, seg);
+                        }
+                        None => {
+                            let _ = udp.send_to(pkt.destination, &pkt.data);
+                        }
+                    }
                 }
             }
         }))
