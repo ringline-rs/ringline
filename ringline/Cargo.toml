@@ -34,9 +34,31 @@ io-uring = "0.7"
 
 [dev-dependencies]
 bytes = "1"
+criterion = { version = "0.5", features = ["async_tokio"] }
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
 rcgen = { workspace = true }
 rustls = { workspace = true, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { workspace = true }
 proptest = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
+
+[[bench]]
+name = "buffer"
+harness = false
+path = "benches/buffer.rs"
+
+[[bench]]
+name = "connect"
+harness = false
+path = "benches/connect.rs"
+
+[[bench]]
+name = "echo"
+harness = false
+path = "benches/echo.rs"
+
+[[bench]]
+name = "timer"
+harness = false
+path = "benches/timer.rs"
