@@ -21,7 +21,7 @@ pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
 pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(4);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
-pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(3);
+pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(4);
 
 #[metric(name = "ringline/udp", description = "UDP counters")]
 pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(4);
@@ -61,6 +61,12 @@ pub mod pool {
     pub const SEND_EXHAUSTED: usize = 0;
     pub const TIMER_EXHAUSTED: usize = 1;
     pub const BUFFER_RING_EMPTY: usize = 2;
+    /// A TCP send returned `-EAGAIN` from the kernel — the send buffer
+    /// was full and ringline armed a `POLLOUT` retry. High counts mean
+    /// the peer is consuming bytes more slowly than the producer
+    /// generates them; tune `tcp_*_buffer_size` or apply
+    /// application-level backpressure.
+    pub const SEND_EAGAIN: usize = 3;
 }
 
 /// Counter slot indices for UDP metrics.
@@ -109,6 +115,7 @@ pub fn init_metadata() {
         "op".into(),
         "buffer_ring_empty".into(),
     );
+    POOL.insert_metadata(pool::SEND_EAGAIN, "op".into(), "send_eagain".into());
 
     UDP.insert_metadata(
         udp::DATAGRAMS_RECEIVED,

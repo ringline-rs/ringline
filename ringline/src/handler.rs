@@ -19,6 +19,20 @@ pub(crate) struct ConnSendState {
     /// Deferred shutdown_write — submitted after the send queue drains.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub shutdown_pending: bool,
+    /// Number of send-related pool slots still allocated to this
+    /// connection (submitted SQEs whose CQE has not yet released the
+    /// slot, plus EAGAIN'd sends awaiting a `POLLOUT` retry). Used to
+    /// defer `close()` until every byte the application handed us has
+    /// been either sent or finally given up on; closing the fd while
+    /// sends are still pending in the kernel truncates the transfer.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub in_flight_count: u32,
+    /// Set when the application's connection task has returned but
+    /// `in_flight_count > 0` so we can't submit `Close` yet. The
+    /// runtime submits the actual close SQE once the count drops to
+    /// zero.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub close_pending: bool,
 }
 
 impl ConnSendState {
@@ -27,6 +41,8 @@ impl ConnSendState {
             in_flight: false,
             queue: VecDeque::new(),
             shutdown_pending: false,
+            in_flight_count: 0,
+            close_pending: false,
         }
     }
 }

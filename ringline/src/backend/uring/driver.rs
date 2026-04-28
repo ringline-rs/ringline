@@ -161,6 +161,11 @@ pub(crate) struct Driver {
     pub(crate) pending_zc_retries: Vec<(u32, u32, u16)>,
     /// Pending copy send retries: (conn_index, generation, pool_slot). Drained each tick.
     pub(crate) pending_copy_retries: Vec<(u32, u32, u16)>,
+    /// Pending PollAdd-on-POLLOUT retries from the EAGAIN backpressure
+    /// path: (conn_index, generation, pool_slot). Drained each tick.
+    /// Only used when `submit_send_pollout` itself failed (SQ full at
+    /// the time the EAGAIN CQE arrived).
+    pub(crate) pending_send_pollout_retries: Vec<(u32, u32, u16)>,
     /// Pending close retries: conn_index values whose submit_close failed. Drained each tick.
     pub(crate) pending_close_retries: Vec<u32>,
     /// Per-worker UDP socket state.
@@ -355,6 +360,7 @@ impl Driver {
             eventfd_armed: false,
             pending_zc_retries: Vec::new(),
             pending_copy_retries: Vec::new(),
+            pending_send_pollout_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             udp_sockets,
             nvme_devices: config
@@ -469,12 +475,86 @@ impl Driver {
         }
         // Cancel any active chain — per-SQE resources released as CQEs arrive.
         self.chain_table.cancel(conn_index);
-        // Drain queued sends and release resources.
-        self.drain_conn_send_queue(conn_index);
+        // Defer the actual `Close` SQE until every send the
+        // application enqueued has had its chance to land in the
+        // kernel TCP buffer. Without the deferral, queued sends were
+        // silently dropped on handler exit and any sends still
+        // in-flight in the kernel had their CQEs racing with `Close`,
+        // truncating sustained transfers. We:
+        //
+        //   1. Note how many sends are already in flight (state.in_flight = 1).
+        //   2. Push every queued send into the SQ; bump the count for
+        //      each that submits successfully.
+        //   3. Mark `close_pending = true` and let `try_finalize_close`
+        //      submit the actual close SQE once `in_flight_count`
+        //      reaches zero.
+        let initial = if self.send_queues[conn_index as usize].in_flight {
+            1
+        } else {
+            0
+        };
+        let pushed = self.flush_queued_sends_or_release(conn_index);
+        let state = &mut self.send_queues[conn_index as usize];
+        state.close_pending = true;
+        state.in_flight_count = initial + pushed;
+        self.try_finalize_close(conn_index);
+    }
+
+    /// Push every queued send for `conn_index` into the SQ, releasing
+    /// any whose `push_sqe` fails so we don't leak slab / pool slots.
+    /// Returns the number of SQEs successfully submitted — the caller
+    /// uses this to size the deferred-close countdown.
+    pub(crate) fn flush_queued_sends_or_release(&mut self, conn_index: u32) -> u32 {
+        let queue = std::mem::take(&mut self.send_queues[conn_index as usize].queue);
+        let mut pushed = 0;
+        for built in queue {
+            let pool_slot = built.pool_slot;
+            let slab_idx = built.slab_idx;
+            // Safety: BuiltSend was constructed via the same path as
+            // the in-flight one — same SQE shape, same lifetime
+            // requirements (the pool slot stays alive until the CQE
+            // releases it).
+            if unsafe { self.ring.push_sqe(built.entry) }.is_ok() {
+                pushed += 1;
+            } else {
+                Self::release_built_resources(
+                    &mut self.send_slab,
+                    &mut self.send_copy_pool,
+                    pool_slot,
+                    slab_idx,
+                );
+            }
+        }
+        self.send_queues[conn_index as usize].in_flight = false;
+        pushed
+    }
+
+    /// Submit the deferred `Close` SQE once every pending send for
+    /// this connection has either completed or been finally given up
+    /// on. Called from `close_connection` (immediate path) and from
+    /// `handle_send`/`handle_send_pollout` after each decrement.
+    pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
+        let state = &self.send_queues[conn_index as usize];
+        if !(state.close_pending && state.in_flight_count == 0) {
+            return;
+        }
+        self.send_queues[conn_index as usize].close_pending = false;
         if self.ring.submit_close(conn_index).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
             self.pending_close_retries.push(conn_index);
         }
+    }
+
+    /// Decrement the per-connection deferred-close countdown after a
+    /// send-related CQE released its pool slot. Triggers the actual
+    /// `Close` SQE if the connection was waiting and the count just
+    /// reached zero.
+    pub(crate) fn note_send_finalized(&mut self, conn_index: u32) {
+        let state = &mut self.send_queues[conn_index as usize];
+        if state.in_flight_count > 0 {
+            state.in_flight_count -= 1;
+        }
+        self.try_finalize_close(conn_index);
     }
 
     /// Pop the next queued send for a connection and submit it to the ring.
