@@ -213,10 +213,25 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 6b. Flush pending sends that were queued during task polling.
             self.flush_all_pending_sends();
 
-            // 7. on_tick callback (synchronous).
+            // 7. on_tick callback (synchronous). Set the executor's
+            // driver_state thread-local so user code that calls
+            // `ringline::spawn()` / wakers / `with_state` works from
+            // inside the handler. Raw pointers dodge the borrow conflict
+            // with `make_ctx()`.
             {
-                let mut ctx = self.driver.make_ctx();
-                self.handler.on_tick(&mut ctx);
+                let handler = &mut self.handler;
+                let driver_ptr = &mut self.driver as *mut Driver;
+                let executor_ptr = &mut self.executor as *mut crate::runtime::Executor;
+                let mut driver_state = DriverState {
+                    driver: unsafe { NonNull::new_unchecked(driver_ptr) },
+                    executor: unsafe { NonNull::new_unchecked(executor_ptr) },
+                };
+                unsafe { set_driver_state(&mut driver_state) };
+                {
+                    let mut ctx = unsafe { (*driver_ptr).make_ctx() };
+                    handler.on_tick(&mut ctx);
+                }
+                clear_driver_state();
             }
 
             // 8. Deliver send completions and flush any sends queued by on_tick.
@@ -390,10 +405,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
-        // on_notify (synchronous).
+        // on_notify (synchronous). Set the executor's driver_state
+        // thread-local so user code that calls `ringline::spawn()` /
+        // wakers / `with_state` works from inside the handler. Raw
+        // pointers dodge the borrow conflict with `make_ctx()`.
         {
-            let mut ctx = self.driver.make_ctx();
-            self.handler.on_notify(&mut ctx);
+            let handler = &mut self.handler;
+            let driver_ptr = &mut self.driver as *mut Driver;
+            let executor_ptr = &mut self.executor as *mut crate::runtime::Executor;
+            let mut driver_state = DriverState {
+                driver: unsafe { NonNull::new_unchecked(driver_ptr) },
+                executor: unsafe { NonNull::new_unchecked(executor_ptr) },
+            };
+            unsafe { set_driver_state(&mut driver_state) };
+            {
+                let mut ctx = unsafe { (*driver_ptr).make_ctx() };
+                handler.on_notify(&mut ctx);
+            }
+            clear_driver_state();
         }
     }
 
