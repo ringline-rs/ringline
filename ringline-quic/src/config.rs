@@ -18,6 +18,18 @@ pub struct QuicConfig {
     pub client_config: Option<ClientConfig>,
     /// Maximum queued outgoing packets before dropping. Default: 4096.
     pub send_queue_capacity: usize,
+    /// Maximum number of datagrams quinn-proto may produce in a single
+    /// `poll_transmit` call.
+    ///
+    /// Higher values amortise the per-call state-machine overhead across
+    /// more packets, which is the easiest throughput win for sustained
+    /// transfers. When > 1 quinn may pack several segments into one
+    /// buffer with `Transmit::segment_size` set; ringline-quic splits
+    /// those into per-datagram outbound packets internally, so consumers
+    /// don't need GSO support to benefit.
+    ///
+    /// Default: 10 (matches the value quinn's high-level crate uses).
+    pub max_transmit_datagrams: usize,
     /// Allow path MTU discovery. Default: true.
     pub allow_mtud: bool,
     /// Deterministic RNG seed for testing. Default: `None` (random).
@@ -32,6 +44,7 @@ impl QuicConfig {
             server_config: Some(server_config),
             client_config: None,
             send_queue_capacity: 4096,
+            max_transmit_datagrams: 10,
             allow_mtud: true,
             rng_seed: None,
         }
@@ -44,6 +57,7 @@ impl QuicConfig {
             server_config: None,
             client_config: Some(client_config),
             send_queue_capacity: 4096,
+            max_transmit_datagrams: 10,
             allow_mtud: true,
             rng_seed: None,
         }

@@ -41,6 +41,7 @@ pub struct QuicEndpoint {
     local_addr: SocketAddr,
     client_config: Option<ClientConfig>,
     send_queue_capacity: usize,
+    max_transmit_datagrams: usize,
 }
 
 struct QuicConnection {
@@ -88,6 +89,7 @@ impl QuicEndpoint {
             local_addr,
             client_config: config.client_config,
             send_queue_capacity: config.send_queue_capacity,
+            max_transmit_datagrams: config.max_transmit_datagrams.max(1),
         }
     }
 
@@ -525,18 +527,45 @@ impl QuicEndpoint {
     }
 
     /// Drain all pending transmits from a connection into the send queue.
+    ///
+    /// Asks quinn-proto for up to `max_transmit_datagrams` per call and
+    /// fans out segmented buffers (`Transmit::segment_size = Some(s)`)
+    /// into individual outbound packets. The latter lets us still emit
+    /// one `sendmsg` per datagram on platforms without GSO support
+    /// while reaping the per-call state-machine amortisation that
+    /// drives sustained-throughput improvements.
     fn drain_transmits(&mut self, key: usize, now: Instant) {
+        let max_datagrams = self.max_transmit_datagrams;
         loop {
             self.transmit_buf.clear();
-            let transmit = self.connections[key]
-                .conn
-                .poll_transmit(now, 1, &mut self.transmit_buf);
+            let transmit = self.connections[key].conn.poll_transmit(
+                now,
+                max_datagrams,
+                &mut self.transmit_buf,
+            );
 
             match transmit {
-                Some(t) => {
-                    let data = self.transmit_buf[..t.size].to_vec();
-                    self.queue_packet(t.destination, data);
-                }
+                Some(t) => match t.segment_size {
+                    Some(seg_size) if seg_size < t.size => {
+                        // GSO-style packed buffer: split into individual
+                        // datagrams. Each becomes its own queued packet
+                        // so the runtime can emit one sendmsg per
+                        // segment. (Once we wire up UDP_SEGMENT we can
+                        // queue the whole buffer with the segment
+                        // hint.)
+                        let mut offset = 0;
+                        while offset < t.size {
+                            let end = (offset + seg_size).min(t.size);
+                            let data = self.transmit_buf[offset..end].to_vec();
+                            self.queue_packet(t.destination, data);
+                            offset = end;
+                        }
+                    }
+                    _ => {
+                        let data = self.transmit_buf[..t.size].to_vec();
+                        self.queue_packet(t.destination, data);
+                    }
+                },
                 None => break,
             }
         }

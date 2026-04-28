@@ -460,6 +460,7 @@ fn server_drops_incoming_when_no_server_config() {
         server_config: None,
         client_config: None,
         send_queue_capacity: 4096,
+        max_transmit_datagrams: 10,
         allow_mtud: false,
         rng_seed: None,
     };
@@ -1546,5 +1547,168 @@ fn migration_disabled_drops_packets_from_new_address() {
         server.remote_addr(sc),
         Some(ca1),
         "remote_addr should still be the original path"
+    );
+}
+
+// ── Sustained throughput regression ────────────────────────────────────
+
+/// Push a payload several times the per-stream flow-control window
+/// through one bidi stream and verify it round-trips intact.
+///
+/// This exercises:
+///
+/// - The `max_transmit_datagrams` path (the test peer can't make
+///   progress on a transfer this size unless we batch transmits).
+/// - GSO-style segmentation in `drain_transmits` — quinn-proto returns
+///   `Transmit::segment_size = Some(s)` once it has multiple datagrams
+///   to pack, and the splitter must produce per-segment outbound
+///   packets in the right order.
+/// - Stream + connection flow control: the default
+///   `stream_receive_window` is ~1.25 MB, so an 8 MiB transfer forces
+///   multiple `MAX_STREAM_DATA` round trips as the receiver drains.
+///
+/// We assert correctness of the bytes and a generous wall-clock cap to
+/// flag regressions that would *stall* the transfer (e.g. forgetting
+/// the segment_size split would leave the receiver unable to decrypt).
+#[test]
+fn quic_sustained_large_stream_round_trip() {
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
+
+    let stream = client.open_bi(cc).unwrap().expect("open_bi");
+    let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i & 0xFF) as u8).collect();
+
+    let started = Instant::now();
+    let mut written = 0usize;
+    let mut received: Vec<u8> = Vec::with_capacity(payload.len());
+    let mut server_stream: Option<quinn_proto::StreamId> = None;
+    let mut fin_seen = false;
+    let mut buf = vec![0u8; 64 * 1024];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut finished = false;
+
+    // Producer/consumer pump: push what flow control allows, ferry
+    // packets, drain on the server side, repeat. Each iteration moves
+    // either bytes into the stream, bytes out of it, or both.
+    while !(received.len() == payload.len() && fin_seen) {
+        assert!(
+            Instant::now() < deadline,
+            "stalled at written={written}/{}, received={}/{} (fin_seen={fin_seen})",
+            payload.len(),
+            received.len(),
+            payload.len()
+        );
+
+        // Try to push more bytes if we still have any.
+        if written < payload.len() {
+            match client.stream_send(cc, stream, &payload[written..]) {
+                Ok(n) => written += n,
+                Err(ringline_quic::Error::Write(quinn_proto::WriteError::Blocked)) => {
+                    // Window full — keep ferrying so the server can
+                    // ack/drain and reopen it.
+                }
+                Err(e) => panic!("unexpected stream_send error: {e:?}"),
+            }
+            if written == payload.len() && !finished {
+                client.stream_finish(cc, stream).expect("stream_finish");
+                finished = true;
+            }
+        }
+        client.flush(Instant::now());
+
+        drain(&mut client, &mut server, ca, sa);
+
+        // Server-side: identify our stream, then drain all available
+        // bytes (advancing flow control credit).
+        while let Some(ev) = server.poll_event() {
+            if let QuicEvent::StreamOpened { stream, .. } = ev {
+                server_stream = Some(stream);
+            }
+        }
+        if let Some(s) = server_stream {
+            loop {
+                match server.stream_recv(sc, s, &mut buf) {
+                    Ok((0, true)) => {
+                        fin_seen = true;
+                        break;
+                    }
+                    Ok((0, false)) => break,
+                    Ok((n, fin)) => {
+                        received.extend_from_slice(&buf[..n]);
+                        if fin {
+                            fin_seen = true;
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // The server's read may have produced MAX_STREAM_DATA
+            // frames; flush them out.
+            server.flush(Instant::now());
+        }
+    }
+
+    let elapsed = started.elapsed();
+
+    assert_eq!(received.len(), payload.len(), "received length must match");
+    assert_eq!(
+        received, payload,
+        "received payload should round-trip verbatim"
+    );
+    assert!(fin_seen, "server should have observed FIN");
+    // Generous cap to flag a stall regression. An 8 MiB in-process
+    // transfer over loopback completes in well under a second on a
+    // modern laptop; 30 seconds is for slow CI runners.
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "8 MiB transfer took {elapsed:?}; suggests a throughput regression"
+    );
+}
+
+#[test]
+fn quic_drain_transmits_splits_segmented_packet() {
+    // Direct white-box test of the segmentation path: configure a
+    // larger-than-default `max_transmit_datagrams` so quinn is more
+    // likely to use GSO segmentation, push enough data that quinn
+    // batches, and make sure each datagram lands in `send_queue` as
+    // its own (≤ MTU-bounded) packet.
+    let (certs, key) = self_signed();
+    let mut client_cfg = client_config(&certs);
+    client_cfg.max_transmit_datagrams = 16;
+    let mut server_cfg = server_config(certs, key);
+    server_cfg.max_transmit_datagrams = 16;
+
+    let ca: SocketAddr = "127.0.0.1:53400".parse().unwrap();
+    let sa: SocketAddr = "127.0.0.1:53401".parse().unwrap();
+    let mut client = QuicEndpoint::new(client_cfg, ca);
+    let mut server = QuicEndpoint::new(server_cfg, sa);
+    let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
+
+    // Push enough that the next flush produces multiple packets'
+    // worth of outbound traffic.
+    let stream = client.open_bi(cc).unwrap().expect("open_bi");
+    let payload = vec![0xABu8; 64 * 1024];
+    let _ = client
+        .stream_send(cc, stream, &payload)
+        .expect("stream_send");
+    client.flush(Instant::now());
+
+    // Inspect the queued outbound packets. None should exceed quinn's
+    // initial-MTU-ish path size — segmentation must have produced
+    // per-datagram packets, not one giant blob.
+    let initial_mtu_ceiling = 1500usize; // generous; INITIAL_MTU is 1200
+    let mut max_packet = 0usize;
+    while let Some((_dest, data)) = client.poll_send() {
+        max_packet = max_packet.max(data.len());
+    }
+    assert!(
+        max_packet > 0,
+        "client should have produced outbound packets after the flush"
+    );
+    assert!(
+        max_packet <= initial_mtu_ceiling,
+        "outbound packet size {max_packet} exceeds the per-datagram \
+         ceiling — `drain_transmits` is not splitting segmented buffers"
     );
 }
