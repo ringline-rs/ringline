@@ -986,11 +986,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.driver.send_copy_pool.release(pool_slot);
 
-            // One in-flight send finished; if the connection is in
-            // close-pending state and this was the last pending send,
-            // `note_send_finalized` will submit the deferred `Close`.
-            self.driver.note_send_finalized(conn_index);
+            // Pop the next queued send (if any) into the kernel,
+            // *then* check whether a deferred close should fire —
+            // submit_next_queued may have just emptied the queue and
+            // cleared `in_flight`, which is exactly when a
+            // close_pending connection is ready to actually close.
             self.driver.submit_next_queued(conn_index);
+            self.driver.note_send_finalized(conn_index);
 
             // Wake the send waiter.
             self.executor.wake_send(conn_index, Ok(total));

@@ -475,67 +475,46 @@ impl Driver {
         }
         // Cancel any active chain — per-SQE resources released as CQEs arrive.
         self.chain_table.cancel(conn_index);
-        // Defer the actual `Close` SQE until every send the
-        // application enqueued has had its chance to land in the
-        // kernel TCP buffer. Without the deferral, queued sends were
-        // silently dropped on handler exit and any sends still
-        // in-flight in the kernel had their CQEs racing with `Close`,
-        // truncating sustained transfers. We:
+        // Defer the actual `Close` SQE until every queued send has
+        // drained through the regular `submit_next_queued` cycle and
+        // its CQE has been handled. Two earlier mistakes are worth
+        // calling out:
         //
-        //   1. Note how many sends are already in flight (state.in_flight = 1).
-        //   2. Push every queued send into the SQ; bump the count for
-        //      each that submits successfully.
-        //   3. Mark `close_pending = true` and let `try_finalize_close`
-        //      submit the actual close SQE once `in_flight_count`
-        //      reaches zero.
-        let initial = if self.send_queues[conn_index as usize].in_flight {
-            1
-        } else {
-            0
-        };
-        let pushed = self.flush_queued_sends_or_release(conn_index);
+        //   (a) The original code called `drain_conn_send_queue`,
+        //       which freed slab/pool resources for queued sends
+        //       *without ever submitting them* — silently dropping
+        //       every byte queued behind the in-flight send.
+        //
+        //   (b) An interim attempt pushed all queued SQEs in parallel
+        //       at close time, but io_uring doesn't strictly order
+        //       independent SQEs, so the kernel could process them
+        //       out of order and scramble the byte stream. (Visible
+        //       in release mode where the SQEs land close together.)
+        //
+        // The current strategy preserves the queue's serialized
+        // drain: leave in_flight + queue alone, mark `close_pending`,
+        // and let `note_send_finalized` (called from `handle_send` /
+        // `handle_send_pollout` after each completion) submit the
+        // deferred `Close` once both `in_flight` is false and the
+        // queue is empty.
         let state = &mut self.send_queues[conn_index as usize];
         state.close_pending = true;
-        state.in_flight_count = initial + pushed;
-        self.try_finalize_close(conn_index);
-    }
-
-    /// Push every queued send for `conn_index` into the SQ, releasing
-    /// any whose `push_sqe` fails so we don't leak slab / pool slots.
-    /// Returns the number of SQEs successfully submitted — the caller
-    /// uses this to size the deferred-close countdown.
-    pub(crate) fn flush_queued_sends_or_release(&mut self, conn_index: u32) -> u32 {
-        let queue = std::mem::take(&mut self.send_queues[conn_index as usize].queue);
-        let mut pushed = 0;
-        for built in queue {
-            let pool_slot = built.pool_slot;
-            let slab_idx = built.slab_idx;
-            // Safety: BuiltSend was constructed via the same path as
-            // the in-flight one — same SQE shape, same lifetime
-            // requirements (the pool slot stays alive until the CQE
-            // releases it).
-            if unsafe { self.ring.push_sqe(built.entry) }.is_ok() {
-                pushed += 1;
-            } else {
-                Self::release_built_resources(
-                    &mut self.send_slab,
-                    &mut self.send_copy_pool,
-                    pool_slot,
-                    slab_idx,
-                );
-            }
+        // If there's nothing in flight or queued, fire the close
+        // immediately.
+        let nothing_pending = !state.in_flight && state.queue.is_empty();
+        if nothing_pending {
+            self.try_finalize_close(conn_index);
         }
-        self.send_queues[conn_index as usize].in_flight = false;
-        pushed
     }
 
     /// Submit the deferred `Close` SQE once every pending send for
     /// this connection has either completed or been finally given up
-    /// on. Called from `close_connection` (immediate path) and from
-    /// `handle_send`/`handle_send_pollout` after each decrement.
+    /// on. Called from `close_connection` (immediate-fast-path) and
+    /// from `note_send_finalized` after each per-send CQE.
     pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
         let state = &self.send_queues[conn_index as usize];
-        if !(state.close_pending && state.in_flight_count == 0) {
+        let drained = !state.in_flight && state.queue.is_empty();
+        if !(state.close_pending && drained) {
             return;
         }
         self.send_queues[conn_index as usize].close_pending = false;
@@ -545,15 +524,10 @@ impl Driver {
         }
     }
 
-    /// Decrement the per-connection deferred-close countdown after a
-    /// send-related CQE released its pool slot. Triggers the actual
-    /// `Close` SQE if the connection was waiting and the count just
-    /// reached zero.
+    /// Hook called from the send-path CQE handlers after the queue
+    /// state has been updated — submits a deferred `Close` if the
+    /// connection was waiting and the queue is now drained.
     pub(crate) fn note_send_finalized(&mut self, conn_index: u32) {
-        let state = &mut self.send_queues[conn_index as usize];
-        if state.in_flight_count > 0 {
-            state.in_flight_count -= 1;
-        }
         self.try_finalize_close(conn_index);
     }
 
