@@ -4,6 +4,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -39,54 +40,74 @@ pub enum ParseResult {
     NeedMore,
 }
 
-/// Raw pointer to the driver + executor state, set before polling each task.
+/// Driver + executor state pointer, set before polling each task.
 ///
-/// # Safety
-///
-/// This is safe because:
-/// 1. Single-threaded: each worker thread has its own driver/executor.
-/// 2. Scoped: set before poll, cleared after poll. The pointer is only
-///    dereferenced within a Future::poll call.
-/// 3. The pointed-to data lives on the worker thread's stack (in AsyncEventLoop::run).
+/// Using `NonNull` instead of raw pointers provides better type safety:
+/// 1. **Non-null guarantee**: `NonNull` is guaranteed non-null at runtime
+///    (enforced in debug builds), catching bugs earlier
+/// 2. **Zero overhead**: Same performance as raw pointers
+/// 3. **Clear ownership**: The pointer is set before poll and cleared after,
+///    in a single-threaded context (no concurrent access)
 pub(crate) struct DriverState {
-    pub(crate) driver: *mut Driver,
-    pub(crate) executor: *mut Executor,
+    pub(crate) driver: NonNull<Driver>,
+    pub(crate) executor: NonNull<Executor>,
 }
 
 thread_local! {
-    pub(crate) static CURRENT_DRIVER: Cell<*mut DriverState> =
-        const { Cell::new(std::ptr::null_mut()) };
+    /// Thread-local storage for the current driver state.
+    ///
+    /// # Safety
+    ///
+    /// This is safe because:
+    /// 1. Single-threaded: each worker thread has its own driver/executor.
+    /// 2. Scoped: set before poll, cleared after poll. The pointer is only
+    ///    dereferenced within a Future::poll call.
+    /// 3. The pointed-to data lives on the worker thread's stack (in AsyncEventLoop::run).
+    pub(crate) static CURRENT_DRIVER: Cell<Option<NonNull<DriverState>>> =
+        const { Cell::new(None) };
 }
 
 /// Set the thread-local driver pointer before polling a task.
-pub(crate) fn set_driver_state(state: *mut DriverState) {
-    CURRENT_DRIVER.with(|c| c.set(state));
+///
+/// # Safety
+///
+/// The caller must ensure `state` points to valid `DriverState` on the
+/// current thread's stack.
+pub(crate) unsafe fn set_driver_state(state: &mut DriverState) {
+    CURRENT_DRIVER.with(|c| c.set(Some(NonNull::from(state))));
 }
 
 /// Clear the thread-local driver pointer after polling a task.
 pub(crate) fn clear_driver_state() {
-    CURRENT_DRIVER.with(|c| c.set(std::ptr::null_mut()));
+    CURRENT_DRIVER.with(|c| c.set(None));
 }
 
 /// Access the thread-local driver state. Panics if called outside the executor.
+///
+/// # Safety
+///
+/// This function is safe to call because:
+/// 1. The pointer is always set before polling and cleared after
+/// 2. Single-threaded execution means no concurrent access
+/// 3. NonNull provides a runtime non-null check in debug builds
 pub(crate) fn with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R) -> R {
-    let ptr = CURRENT_DRIVER.with(|c| c.get());
-    assert!(!ptr.is_null(), "called outside executor");
-    let state = unsafe { &mut *ptr };
-    let driver = unsafe { &mut *state.driver };
-    let executor = unsafe { &mut *state.executor };
+    let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+    let mut non_null = opt_non_null.expect("called outside executor");
+
+    let state = unsafe { non_null.as_mut() };
+    let driver = unsafe { &mut *state.driver.as_ptr() };
+    let executor = unsafe { &mut *state.executor.as_ptr() };
     f(driver, executor)
 }
 
 /// Access the thread-local driver state, returning `None` if called outside the executor.
 pub(crate) fn try_with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R) -> Option<R> {
-    let ptr = CURRENT_DRIVER.with(|c| c.get());
-    if ptr.is_null() {
-        return None;
-    }
-    let state = unsafe { &mut *ptr };
-    let driver = unsafe { &mut *state.driver };
-    let executor = unsafe { &mut *state.executor };
+    let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+    let mut non_null = opt_non_null?;
+
+    let state = unsafe { non_null.as_mut() };
+    let driver = unsafe { &mut *state.driver.as_ptr() };
+    let executor = unsafe { &mut *state.executor.as_ptr() };
     Some(f(driver, executor))
 }
 
@@ -1148,12 +1169,13 @@ impl ConnCtx {
 
     /// Close this connection.
     pub fn close(&self) {
-        let ptr = CURRENT_DRIVER.with(|c| c.get());
-        if ptr.is_null() {
+        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+        if opt_non_null.is_none() {
             return;
         }
-        let state = unsafe { &mut *ptr };
-        let driver = unsafe { &mut *state.driver };
+        let mut non_null = opt_non_null.unwrap();
+        let state = unsafe { non_null.as_mut() };
+        let driver = unsafe { &mut *state.driver.as_ptr() };
         driver.close_connection(self.conn_index);
     }
 
@@ -1711,12 +1733,13 @@ impl Future for SendFuture {
 
 impl Drop for SendFuture {
     fn drop(&mut self) {
-        let ptr = CURRENT_DRIVER.with(|c| c.get());
-        if ptr.is_null() {
+        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+        if opt_non_null.is_none() {
             return;
         }
-        let state = unsafe { &mut *ptr };
-        let executor = unsafe { &mut *state.executor };
+        let mut non_null = opt_non_null.unwrap();
+        let state = unsafe { non_null.as_mut() };
+        let executor = unsafe { &mut *state.executor.as_ptr() };
         executor.send_waiters[self.conn_index as usize] = false;
     }
 }
@@ -1752,12 +1775,13 @@ impl Future for ConnectFuture {
 
 impl Drop for ConnectFuture {
     fn drop(&mut self) {
-        let ptr = CURRENT_DRIVER.with(|c| c.get());
-        if ptr.is_null() {
+        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+        if opt_non_null.is_none() {
             return;
         }
-        let state = unsafe { &mut *ptr };
-        let executor = unsafe { &mut *state.executor };
+        let mut non_null = opt_non_null.unwrap();
+        let state = unsafe { non_null.as_mut() };
+        let executor = unsafe { &mut *state.executor.as_ptr() };
         executor.connect_waiters[self.conn_index as usize] = false;
     }
 }
@@ -1867,14 +1891,15 @@ impl Drop for SleepFuture {
     fn drop(&mut self) {
         if let Some(slot) = self.timer_slot {
             // Timer was submitted but not yet fired — try to cancel it.
-            let ptr = CURRENT_DRIVER.with(|c| c.get());
-            if ptr.is_null() {
+            let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+            if opt_non_null.is_none() {
                 return;
             }
-            let state = unsafe { &mut *ptr };
+            let mut non_null = opt_non_null.unwrap();
+            let state = unsafe { non_null.as_mut() };
             #[cfg(has_io_uring)]
-            let driver = unsafe { &mut *state.driver };
-            let executor = unsafe { &mut *state.executor };
+            let driver = unsafe { &mut *state.driver.as_ptr() };
+            let executor = unsafe { &mut *state.executor.as_ptr() };
 
             if !executor.timer_pool.is_fired(slot) {
                 #[cfg(has_io_uring)]
@@ -2217,12 +2242,13 @@ impl Future for DiskIoFuture {
 
 impl Drop for DiskIoFuture {
     fn drop(&mut self) {
-        let ptr = CURRENT_DRIVER.with(|c| c.get());
-        if ptr.is_null() {
+        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+        if opt_non_null.is_none() {
             return;
         }
-        let state = unsafe { &mut *ptr };
-        let executor = unsafe { &mut *state.executor };
+        let mut non_null = opt_non_null.unwrap();
+        let state = unsafe { non_null.as_mut() };
+        let executor = unsafe { &mut *state.executor.as_ptr() };
         executor.disk_io_waiters.remove(&self.seq);
     }
 }

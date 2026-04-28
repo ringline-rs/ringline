@@ -4,6 +4,7 @@ use std::io;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::os::fd::{FromRawFd, RawFd};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Context;
@@ -791,8 +792,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let driver = &mut self.driver as *mut Driver;
         let executor = &mut self.executor as *mut Executor;
 
-        let mut driver_state = DriverState { driver, executor };
-        set_driver_state(&mut driver_state);
+        // Safety: We have valid mutable references to self.driver and self.executor
+        // that outlive this method. Creating NonNull from &mut is safe.
+        let mut driver_state = DriverState {
+            driver: unsafe { NonNull::new_unchecked(driver) },
+            executor: unsafe { NonNull::new_unchecked(executor) },
+        };
+        unsafe { set_driver_state(&mut driver_state) };
 
         // Safety: we have exclusive access to driver/executor via self, and
         // only access them through these raw pointers until clear_driver_state.

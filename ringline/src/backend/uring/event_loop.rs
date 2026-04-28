@@ -1,4 +1,5 @@
 use std::io;
+use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::time::Instant;
@@ -275,8 +276,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let driver = &mut self.driver as *mut Driver;
         let executor = &mut self.executor as *mut Executor;
 
-        let mut driver_state = DriverState { driver, executor };
-        set_driver_state(&mut driver_state);
+        // Safety: NonNull::new_unchecked is safe because we have valid pointers
+        // from &mut self.driver and &mut self.executor above.
+        let driver_state = DriverState {
+            driver: unsafe { NonNull::new_unchecked(driver) },
+            executor: unsafe { NonNull::new_unchecked(executor) },
+        };
+        unsafe { set_driver_state(&mut driver_state) };
 
         // Safety: we have exclusive access to driver/executor via self, and
         // only access them through these raw pointers until clear_driver_state.
@@ -2649,11 +2655,14 @@ mod tests {
         // Set up thread-local so DiskIoFuture::drop can access executor.
         let driver_ptr = &mut el.driver as *mut Driver;
         let executor_ptr = &mut el.executor as *mut Executor;
-        let mut driver_state = DriverState {
-            driver: driver_ptr,
-            executor: executor_ptr,
+
+        // Safety: NonNull::new_unchecked is safe because we have valid pointers
+        // from &mut el.driver and &mut el.executor above.
+        let driver_state = DriverState {
+            driver: unsafe { NonNull::new_unchecked(driver_ptr) },
+            executor: unsafe { NonNull::new_unchecked(executor_ptr) },
         };
-        set_driver_state(&mut driver_state);
+        unsafe { set_driver_state(&mut driver_state) };
 
         // Create and immediately drop a DiskIoFuture.
         {
