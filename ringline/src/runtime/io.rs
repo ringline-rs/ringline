@@ -95,8 +95,8 @@ pub(crate) fn with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R) -> 
     let mut non_null = opt_non_null.expect("called outside executor");
 
     let state = unsafe { non_null.as_mut() };
-    let driver = unsafe { &mut *state.driver.as_ptr() };
-    let executor = unsafe { &mut *state.executor.as_ptr() };
+    let driver = unsafe { &mut *state.driver.as_mut() };
+    let executor = unsafe { &mut *state.executor.as_mut() };
     f(driver, executor)
 }
 
@@ -106,8 +106,8 @@ pub(crate) fn try_with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R)
     let mut non_null = opt_non_null?;
 
     let state = unsafe { non_null.as_mut() };
-    let driver = unsafe { &mut *state.driver.as_ptr() };
-    let executor = unsafe { &mut *state.executor.as_ptr() };
+    let driver = unsafe { &mut *state.driver.as_mut() };
+    let executor = unsafe { &mut *state.executor.as_mut() };
     Some(f(driver, executor))
 }
 
@@ -1175,7 +1175,7 @@ impl ConnCtx {
         }
         let mut non_null = opt_non_null.unwrap();
         let state = unsafe { non_null.as_mut() };
-        let driver = unsafe { &mut *state.driver.as_ptr() };
+        let driver = unsafe { &mut *state.driver.as_mut() };
         driver.close_connection(self.conn_index);
     }
 
@@ -1739,7 +1739,7 @@ impl Drop for SendFuture {
         }
         let mut non_null = opt_non_null.unwrap();
         let state = unsafe { non_null.as_mut() };
-        let executor = unsafe { &mut *state.executor.as_ptr() };
+        let executor = unsafe { &mut *state.executor.as_mut() };
         executor.send_waiters[self.conn_index as usize] = false;
     }
 }
@@ -1781,7 +1781,7 @@ impl Drop for ConnectFuture {
         }
         let mut non_null = opt_non_null.unwrap();
         let state = unsafe { non_null.as_mut() };
-        let executor = unsafe { &mut *state.executor.as_ptr() };
+        let executor = unsafe { &mut *state.executor.as_mut() };
         executor.connect_waiters[self.conn_index as usize] = false;
     }
 }
@@ -1898,8 +1898,8 @@ impl Drop for SleepFuture {
             let mut non_null = opt_non_null.unwrap();
             let state = unsafe { non_null.as_mut() };
             #[cfg(has_io_uring)]
-            let driver = unsafe { &mut *state.driver.as_ptr() };
-            let executor = unsafe { &mut *state.executor.as_ptr() };
+            let driver = unsafe { &mut *state.driver.as_mut() };
+            let executor = unsafe { &mut *state.executor.as_mut() };
 
             if !executor.timer_pool.is_fired(slot) {
                 #[cfg(has_io_uring)]
@@ -2248,7 +2248,7 @@ impl Drop for DiskIoFuture {
         }
         let mut non_null = opt_non_null.unwrap();
         let state = unsafe { non_null.as_mut() };
-        let executor = unsafe { &mut *state.executor.as_ptr() };
+        let executor = unsafe { &mut *state.executor.as_mut() };
         executor.disk_io_waiters.remove(&self.seq);
     }
 }

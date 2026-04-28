@@ -378,7 +378,7 @@ impl Drop for OpenFuture {
         }
         let mut non_null = opt_non_null.unwrap();
         let state = unsafe { non_null.as_mut() };
-        let executor = unsafe { &mut *state.executor.as_ptr() };
+        let executor = unsafe { &mut *state.executor.as_mut() };
         executor.disk_io_waiters.remove(&self.seq);
     }
 }
@@ -645,7 +645,7 @@ fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
     }
     let mut non_null = opt_non_null.unwrap();
     let state = unsafe { non_null.as_mut() };
-    let executor = unsafe { &mut *state.executor.as_ptr() };
+    let executor = unsafe { &mut *state.executor.as_mut() };
     executor.disk_io_waiters.remove(&seq);
     if executor.disk_io_results.remove(&seq).is_some() {
         // CQE already arrived — kernel released the buffer. Drop normally.
@@ -656,7 +656,7 @@ fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
     executor.disk_io_graveyard.insert(seq, buf);
     #[cfg(has_io_uring)]
     {
-        let driver = unsafe { &mut *state.driver.as_ptr() };
+        let driver = unsafe { &mut *state.driver.as_mut() };
         let target = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file_index as u32,
@@ -765,7 +765,7 @@ impl Drop for StatFuture {
         }
         let mut non_null = opt_non_null.unwrap();
         let state = unsafe { non_null.as_mut() };
-        let executor = unsafe { &mut *state.executor.as_ptr() };
+        let executor = unsafe { &mut *state.executor.as_mut() };
         executor.disk_io_waiters.remove(&self.seq);
         executor.fs_stat_results.remove(&self.seq);
     }
