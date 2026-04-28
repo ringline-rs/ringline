@@ -59,15 +59,53 @@ impl Ring {
         })
     }
 
-    /// Register fixed buffers (user memory regions).
+    /// Register a sparse fixed-buffer table sized to the registry, then
+    /// fill in any occupied slots via `register_buffers_update`.
+    ///
+    /// The sparse path lets us add and remove regions dynamically after
+    /// launch without re-registering the entire table.
     pub fn register_buffers(&self, registry: &FixedBufferRegistry) -> io::Result<()> {
         let iovecs = registry.iovecs();
         if iovecs.is_empty() {
             return Ok(());
         }
-        // Safety: iovecs point to valid memory that outlives the registration.
+        let submitter = self.ring.submitter();
+        submitter.register_buffers_sparse(iovecs.len() as u32)?;
+
+        // Apply each occupied slot. Empty slots stay zeroed in the kernel.
+        for (slot, iov) in iovecs.iter().enumerate() {
+            if iov.iov_base.is_null() {
+                continue;
+            }
+            // Safety: the iovec points at user memory documented to outlive
+            // the runtime; tags are unused.
+            unsafe {
+                submitter.register_buffers_update(slot as u32, std::slice::from_ref(iov), None)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Update a single fixed-buffer slot with a new iovec.
+    ///
+    /// `iov.iov_base.is_null()` clears the slot.
+    ///
+    /// # Safety
+    ///
+    /// The memory described by `iov` must remain valid until either the slot
+    /// is cleared or the runtime shuts down. No SQE referencing the slot may
+    /// be in flight when this is called.
+    pub unsafe fn register_buffers_update_one(
+        &self,
+        slot: u16,
+        iov: libc::iovec,
+    ) -> io::Result<()> {
         unsafe {
-            self.ring.submitter().register_buffers(iovecs)?;
+            self.ring.submitter().register_buffers_update(
+                slot as u32,
+                std::slice::from_ref(&iov),
+                None,
+            )?;
         }
         Ok(())
     }

@@ -41,7 +41,22 @@ pub struct Config {
     /// `bgid` must differ from `recv_buffer.bgid` when UDP is in use.
     pub udp_recv_buffer: RecvBufferConfig,
     /// User-registered memory regions (e.g., mmap'd storage arenas).
+    ///
+    /// Regions listed here occupy slots `0..registered_regions.len()` at
+    /// startup. The remaining slots up to [`Config::max_registered_regions`] are
+    /// available for dynamic registration via
+    /// [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region).
     pub registered_regions: Vec<MemoryRegion>,
+    /// Maximum number of fixed-buffer slots to reserve in the io_uring
+    /// registered-buffer table. Must be `>= registered_regions.len()`.
+    ///
+    /// Slots beyond the initial regions are empty until filled by
+    /// [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region).
+    /// Cannot be grown after launch — io_uring's registered-buffer table is
+    /// fixed-size; expand by re-launching with a larger value.
+    ///
+    /// Default: 64.
+    pub max_registered_regions: u16,
     /// Worker/thread configuration.
     pub worker: WorkerConfig,
     /// TCP listen backlog.
@@ -171,6 +186,7 @@ impl Default for Config {
                 bgid: 1,
             },
             registered_regions: Vec::new(),
+            max_registered_regions: 64,
             worker: WorkerConfig::default(),
             backlog: 1024,
             max_connections: 16000,
@@ -244,6 +260,13 @@ impl Config {
             return Err(crate::error::Error::RingSetup(
                 "standalone_task_capacity must be < 2^31".into(),
             ));
+        }
+        if self.registered_regions.len() > self.max_registered_regions as usize {
+            return Err(crate::error::Error::RingSetup(format!(
+                "registered_regions ({}) exceed max_registered_regions ({})",
+                self.registered_regions.len(),
+                self.max_registered_regions,
+            )));
         }
         if !self.udp_bind.is_empty() && self.udp_send_slots == 0 {
             return Err(crate::error::Error::RingSetup(

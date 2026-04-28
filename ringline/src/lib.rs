@@ -149,6 +149,8 @@ pub mod metrics;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod nvme;
 pub mod process;
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+pub(crate) mod region_registry;
 pub(crate) mod resolver;
 pub(crate) mod runtime;
 pub(crate) mod spawner;

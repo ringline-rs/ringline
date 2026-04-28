@@ -146,6 +146,10 @@ pub(crate) struct Driver {
     pub(crate) blocking_tx: Option<crossbeam_channel::Sender<crate::blocking::BlockingResponse>>,
     /// Shared blocking pool (for submitting requests).
     pub(crate) blocking_pool: Option<std::sync::Arc<crate::blocking::BlockingPool>>,
+    /// Region-registry control channel — drained each tick to apply
+    /// dynamic fixed-buffer registrations from
+    /// [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region).
+    pub(crate) region_rx: crate::region_registry::RegionControlRx,
     /// Whether to set TCP_NODELAY on connections.
     pub(crate) tcp_nodelay: bool,
     /// Whether SO_TIMESTAMPING is enabled for connections.
@@ -219,11 +223,13 @@ impl Driver {
         blocking_rx: Option<crossbeam_channel::Receiver<crate::blocking::BlockingResponse>>,
         blocking_tx: Option<crossbeam_channel::Sender<crate::blocking::BlockingResponse>>,
         blocking_pool: Option<std::sync::Arc<crate::blocking::BlockingPool>>,
+        region_rx: crate::region_registry::RegionControlRx,
     ) -> Result<Self, crate::error::Error> {
         config.validate()?;
         let ring = Ring::setup(config)?;
 
-        let fixed_buffers = FixedBufferRegistry::new(&config.registered_regions);
+        let fixed_buffers =
+            FixedBufferRegistry::new(&config.registered_regions, config.max_registered_regions);
 
         let provided_bufs = ProvidedBufRing::new(
             config.recv_buffer.bgid,
@@ -410,6 +416,7 @@ impl Driver {
             blocking_rx,
             blocking_tx,
             blocking_pool,
+            region_rx,
         };
 
         // Arm multishot recvmsg for each UDP socket against the UDP buffer
