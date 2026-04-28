@@ -25,7 +25,7 @@ pub(crate) struct SpawnRequest {
     /// Per-worker response channel.
     pub(crate) response_tx: Sender<SpawnResponse>,
     /// Wake handle — used to wake the worker after sending the response.
-    pub(crate) wake_handle: crate::wakeup::WakeHandle,
+    pub(crate) wake_handle: crate::wakeup::WakeFd,
 }
 
 /// A response from the spawner pool to a worker.

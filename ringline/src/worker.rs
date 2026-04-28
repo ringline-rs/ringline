@@ -37,6 +37,23 @@ impl ShutdownHandle {
         self.bound_addr
     }
 
+    /// Number of worker threads launched.
+    pub fn worker_count(&self) -> usize {
+        self.worker_wake_handles.len()
+    }
+
+    /// Refcounted wake handle for the given worker, or `None` if `idx` is
+    /// out of range.
+    ///
+    /// The returned handle can be cloned and moved to other threads, and
+    /// stays valid past [`ShutdownHandle`] drop — the underlying fd is
+    /// reference-counted and closes only when the last clone is dropped.
+    /// After workers join, calling [`wake`](crate::WakeHandle::wake) is a
+    /// no-op write into an fd nobody is reading.
+    pub fn worker_wake_handle(&self, idx: usize) -> Option<crate::wakeup::WakeHandle> {
+        self.worker_wake_handles.get(idx).cloned()
+    }
+
     /// Block the calling thread until `SIGINT` or `SIGTERM` is received,
     /// then trigger graceful shutdown.
     ///
@@ -72,21 +89,11 @@ impl ShutdownHandle {
     }
 }
 
-impl Drop for ShutdownHandle {
-    fn drop(&mut self) {
-        // Close the wake fds. On the io_uring backend each `WakeHandle`
-        // holds the per-worker eventfd; on the mio backend each holds
-        // the write end of the worker's wake-pipe (the read end is
-        // closed by the worker's `Driver::Drop`). Without this the fds
-        // leaked across launches — visible as a +1 (uring) or +2 (mio)
-        // /proc/self/fd entry per launch cycle.
-        for wh in &self.worker_wake_handles {
-            unsafe {
-                libc::close(wh.as_raw_fd());
-            }
-        }
-    }
-}
+// `ShutdownHandle` no longer needs an explicit `Drop`: each `WakeHandle`
+// reference-counts the underlying fd via `Arc<WakeFdInner>`, and the fd
+// closes when the last clone is dropped. Users may keep clones from
+// `worker_wake_handle()` past `ShutdownHandle` drop without leaking the
+// fd — the runtime itself drops its clones when shutdown completes.
 
 /// Internal enum for the bound listen address.
 enum BindAddr {
@@ -395,10 +402,15 @@ impl RinglineBuilder {
 
         crate::metrics::init_metadata();
 
-        // Create per-worker channels and wake fds.
+        // Create per-worker channels and wake fds. `worker_wake_handles`
+        // (Arc-based) is what `ShutdownHandle` keeps and what
+        // `worker_wake_handle()` hands out to users; `worker_wake_fds`
+        // (Copy) is what the acceptor and internal request structs use on
+        // hot paths.
         let mut worker_txs = Vec::with_capacity(num_threads);
         let mut worker_rxs = Vec::with_capacity(num_threads);
         let mut worker_eventfds = Vec::with_capacity(num_threads);
+        let mut worker_wake_fds = Vec::with_capacity(num_threads);
         let mut worker_wake_handles = Vec::with_capacity(num_threads);
 
         for _ in 0..num_threads {
@@ -408,6 +420,7 @@ impl RinglineBuilder {
             worker_txs.push(tx);
             worker_rxs.push(rx);
             worker_eventfds.push(read_fd);
+            worker_wake_fds.push(wake_handle.as_wake_fd());
             worker_wake_handles.push(wake_handle);
         }
 
@@ -476,7 +489,7 @@ impl RinglineBuilder {
             let acceptor_config = AcceptorConfig {
                 listen_fd: fd,
                 worker_channels: worker_txs,
-                worker_wake_handles: worker_wake_handles.clone(),
+                worker_wake_handles: worker_wake_fds.clone(),
                 shutdown_flag: shutdown_flag.clone(),
                 tcp_nodelay: if is_unix {
                     false
@@ -609,7 +622,7 @@ impl RinglineBuilder {
             shutdown_flag.store(true, Ordering::SeqCst);
             // Wake workers that did successfully start so they observe
             // the shutdown flag and exit promptly.
-            for w in &worker_wake_handles {
+            for w in &worker_wake_fds {
                 w.wake();
             }
             // Tear down the listener if we created one; the acceptor

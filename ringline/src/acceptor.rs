@@ -12,7 +12,7 @@ pub struct AcceptorConfig {
     /// Per-worker channels to send accepted (fd, peer_addr) pairs.
     pub worker_channels: Vec<Sender<(RawFd, SocketAddr)>>,
     /// Per-worker wake handles to wake the event loop after sending a connection.
-    pub worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
+    pub worker_wake_handles: Vec<crate::wakeup::WakeFd>,
     /// Shared flag set by ShutdownHandle to signal the acceptor to stop.
     #[allow(dead_code)] // stored for future use; acceptor currently uses channel disconnect
     pub shutdown_flag: Arc<AtomicBool>,
