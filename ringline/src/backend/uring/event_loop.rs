@@ -278,7 +278,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Safety: NonNull::new_unchecked is safe because we have valid pointers
         // from &mut self.driver and &mut self.executor above.
-        let driver_state = DriverState {
+        let mut driver_state = DriverState {
             driver: unsafe { NonNull::new_unchecked(driver) },
             executor: unsafe { NonNull::new_unchecked(executor) },
         };
@@ -2658,7 +2658,7 @@ mod tests {
 
         // Safety: NonNull::new_unchecked is safe because we have valid pointers
         // from &mut el.driver and &mut el.executor above.
-        let driver_state = DriverState {
+        let mut driver_state = DriverState {
             driver: unsafe { NonNull::new_unchecked(driver_ptr) },
             executor: unsafe { NonNull::new_unchecked(executor_ptr) },
         };
