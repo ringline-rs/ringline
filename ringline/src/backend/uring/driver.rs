@@ -113,7 +113,7 @@ pub(crate) struct Driver {
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
     /// Wake handle for cross-thread wakeup (wraps the eventfd).
-    pub(crate) wake_handle: crate::wakeup::WakeHandle,
+    pub(crate) wake_handle: crate::wakeup::WakeFd,
     /// Deadline-based flush interval. None = disabled (SQPOLL or explicit 0).
     pub(crate) flush_interval: Option<Duration>,
     pub(crate) shutdown_flag: Arc<AtomicBool>,
@@ -334,7 +334,7 @@ impl Driver {
             accept_rx,
             eventfd,
             eventfd_buf: [0u8; 8],
-            wake_handle: crate::wakeup::WakeHandle::from_raw_fd(eventfd),
+            wake_handle: crate::wakeup::WakeFd::from_raw_fd(eventfd),
             flush_interval,
             shutdown_flag,
             shutdown_local: false,

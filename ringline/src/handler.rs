@@ -1726,7 +1726,7 @@ pub struct DriverCtx<'a> {
     pub(crate) disk_io_tx:
         &'a Option<crossbeam_channel::Sender<crate::disk_io_pool::DiskIoResponse>>,
     /// Wake handle for this worker (used to wake after disk I/O completion).
-    pub(crate) wake_handle: crate::wakeup::WakeHandle,
+    pub(crate) wake_handle: crate::wakeup::WakeFd,
     /// Monotonic sequence counter for disk I/O requests.
     pub(crate) next_disk_io_seq: &'a mut u32,
     /// Direct I/O file table.

@@ -24,7 +24,7 @@ pub(crate) struct DiskIoRequest {
     /// Per-worker response channel.
     pub(crate) response_tx: Sender<DiskIoResponse>,
     /// Wake handle — used to wake the worker after sending the response.
-    pub(crate) wake_handle: crate::wakeup::WakeHandle,
+    pub(crate) wake_handle: crate::wakeup::WakeFd,
 }
 
 /// Result from a disk I/O worker thread.

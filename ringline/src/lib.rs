@@ -397,6 +397,8 @@ pub use nvme::NvmeCompletion;
 pub use nvme::NvmeConfig;
 /// NVMe passthrough device handle.
 pub use nvme::NvmeDevice;
+/// Refcounted handle for waking a worker thread from any thread.
+pub use wakeup::WakeHandle;
 /// Builder for launching ringline workers.
 pub use worker::RinglineBuilder;
 /// Handle for triggering graceful shutdown.
