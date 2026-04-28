@@ -372,12 +372,13 @@ impl Future for OpenFuture {
 
 impl Drop for OpenFuture {
     fn drop(&mut self) {
-        let ptr = CURRENT_DRIVER.with(|c| c.get());
-        if ptr.is_null() {
+        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+        if opt_non_null.is_none() {
             return;
         }
-        let state = unsafe { &mut *ptr };
-        let executor = unsafe { &mut *state.executor };
+        let mut non_null = opt_non_null.unwrap();
+        let state = unsafe { non_null.as_mut() };
+        let executor = unsafe { &mut *state.executor.as_mut() };
         executor.disk_io_waiters.remove(&self.seq);
     }
 }
@@ -633,8 +634,8 @@ impl Drop for WriteFuture {
 /// (the syscall is already in-flight on a worker thread); the buffer just
 /// waits in the graveyard until the worker thread finishes.
 fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
-    let ptr = CURRENT_DRIVER.with(|c| c.get());
-    if ptr.is_null() {
+    let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+    if opt_non_null.is_none() {
         // Outside the executor — leak the buffer rather than risk freeing
         // memory the kernel may still write into. This shouldn't happen in
         // practice (futures are owned by tasks pinned to a worker thread),
@@ -642,8 +643,9 @@ fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
         std::mem::forget(buf);
         return;
     }
-    let state = unsafe { &mut *ptr };
-    let executor = unsafe { &mut *state.executor };
+    let mut non_null = opt_non_null.unwrap();
+    let state = unsafe { non_null.as_mut() };
+    let executor = unsafe { &mut *state.executor.as_mut() };
     executor.disk_io_waiters.remove(&seq);
     if executor.disk_io_results.remove(&seq).is_some() {
         // CQE already arrived — kernel released the buffer. Drop normally.
@@ -654,7 +656,7 @@ fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
     executor.disk_io_graveyard.insert(seq, buf);
     #[cfg(has_io_uring)]
     {
-        let driver = unsafe { &mut *state.driver };
+        let driver = unsafe { &mut *state.driver.as_mut() };
         let target = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file_index as u32,
@@ -757,12 +759,13 @@ impl Future for StatFuture {
 
 impl Drop for StatFuture {
     fn drop(&mut self) {
-        let ptr = CURRENT_DRIVER.with(|c| c.get());
-        if ptr.is_null() {
+        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+        if opt_non_null.is_none() {
             return;
         }
-        let state = unsafe { &mut *ptr };
-        let executor = unsafe { &mut *state.executor };
+        let mut non_null = opt_non_null.unwrap();
+        let state = unsafe { non_null.as_mut() };
+        let executor = unsafe { &mut *state.executor.as_mut() };
         executor.disk_io_waiters.remove(&self.seq);
         executor.fs_stat_results.remove(&self.seq);
     }
