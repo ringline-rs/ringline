@@ -44,6 +44,11 @@ proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
 
 [[bench]]
+name = "buffer"
+harness = false
+path = "benches/buffer.rs"
+
+[[bench]]
 name = "connect"
 harness = false
 path = "benches/connect.rs"
@@ -52,3 +57,8 @@ path = "benches/connect.rs"
 name = "echo"
 harness = false
 path = "benches/echo.rs"
+
+[[bench]]
+name = "timer"
+harness = false
+path = "benches/timer.rs"
