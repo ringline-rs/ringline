@@ -166,9 +166,18 @@ impl AsyncEventHandler for QuicEchoServer {
                     }
                 }
 
-                // Flush outgoing packets.
-                while let Some((dest, data)) = quic.poll_send() {
-                    let _ = udp.send_to(dest, &data);
+                // Flush outgoing packets. When quinn-proto produced a
+                // GSO-segmented buffer, hand the whole thing to the
+                // kernel in one syscall via UDP_SEGMENT.
+                while let Some(pkt) = quic.poll_send() {
+                    match pkt.segment_size {
+                        Some(seg) => {
+                            let _ = udp.send_to_gso(pkt.destination, &pkt.data, seg);
+                        }
+                        None => {
+                            let _ = udp.send_to(pkt.destination, &pkt.data);
+                        }
+                    }
                 }
             }
         }))

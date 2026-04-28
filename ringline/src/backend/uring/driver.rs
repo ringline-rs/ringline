@@ -28,7 +28,18 @@ pub(crate) struct UdpSendSlot {
     #[allow(dead_code)] // referenced via raw pointer in msghdr
     pub send_iov: Box<libc::iovec>,
     pub send_msghdr: Box<libc::msghdr>,
+    /// Pinned per-slot scratch for `UDP_SEGMENT` cmsg. Sized to hold
+    /// one `cmsghdr` + a `u16` segment size; only consulted when
+    /// `send_to_gso` is used. Heap-stable so the kernel's view (via
+    /// `msg_control`) stays valid until the CQE arrives.
+    pub send_cmsg_buf: Box<[u8; UDP_GSO_CMSG_LEN]>,
 }
+
+/// Size of the per-slot control-message buffer used for
+/// `UDP_SEGMENT` cmsgs. CMSG_SPACE(sizeof(u16)) on x86-64 is 24
+/// (cmsghdr is 16 bytes, payload aligned to 8). 32 is comfortable
+/// over-allocation that survives any reasonable cmsg layout change.
+pub(crate) const UDP_GSO_CMSG_LEN: usize = 32;
 
 /// Pack a UDP send slot index and copy-pool slot into a 32-bit CQE payload.
 /// High 16 bits = send-slot index; low 16 bits = copy-pool slot.
@@ -725,15 +736,21 @@ impl Driver {
                 iov_len: 0,
             });
             let mut send_msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+            let mut send_cmsg_buf: Box<[u8; UDP_GSO_CMSG_LEN]> = Box::new([0u8; UDP_GSO_CMSG_LEN]);
 
             send_msghdr.msg_name = &mut *send_addr as *mut _ as *mut libc::c_void;
             send_msghdr.msg_iov = &mut *send_iov as *mut libc::iovec;
             send_msghdr.msg_iovlen = 1;
+            // `msg_control` always points at our pinned cmsg buffer;
+            // `msg_controllen = 0` for non-GSO sends keeps it inert.
+            send_msghdr.msg_control = send_cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+            send_msghdr.msg_controllen = 0;
 
             slots.push(UdpSendSlot {
                 send_addr,
                 send_iov,
                 send_msghdr,
+                send_cmsg_buf,
             });
         }
         let send_slots_box = slots.into_boxed_slice();
@@ -755,11 +772,20 @@ impl Driver {
     /// `Config::udp_send_slots`) and submits a `sendmsg` SQE. Multiple sends
     /// can be in flight concurrently; returns `PoolExhausted` when no free
     /// send slot or copy-pool slot is available.
+    ///
+    /// When `gso_segment_size` is `Some(s)`, attaches a `UDP_SEGMENT`
+    /// control message: the kernel splits `data` into back-to-back
+    /// `s`-byte datagrams and emits each as a separate UDP packet from
+    /// the *same* `sendmsg` call. This is Linux's GSO offload — one
+    /// syscall, N datagrams. The pool slot still holds `data` end-to-
+    /// end, so the per-datagram cost is just an iovec entry plus
+    /// kernel-side segmentation work.
     pub(crate) fn udp_send_to(
         &mut self,
         udp_index: u32,
         peer: SocketAddr,
         data: &[u8],
+        gso_segment_size: Option<u16>,
     ) -> Result<(), crate::error::UdpSendError> {
         let idx = udp_index as usize;
         if idx >= self.udp_sockets.len() {
@@ -784,6 +810,18 @@ impl Driver {
                 ),
             )));
         }
+        if let Some(seg) = gso_segment_size
+            && (seg == 0 || (seg as usize) > data.len())
+        {
+            return Err(crate::error::UdpSendError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "GSO segment size {} invalid for {}-byte buffer",
+                    seg,
+                    data.len()
+                ),
+            )));
+        }
 
         let slot_idx = self.udp_sockets[idx]
             .send_freelist
@@ -805,6 +843,35 @@ impl Driver {
         slot.send_iov.iov_base = ptr as *mut libc::c_void;
         slot.send_iov.iov_len = len as usize;
         slot.send_msghdr.msg_namelen = addr_len;
+
+        // Wire up (or tear down) the `UDP_SEGMENT` control message in
+        // the pinned per-slot cmsg buffer. We do not touch
+        // `slot.send_cmsg_buf` for non-GSO sends — `msg_controllen = 0`
+        // tells the kernel to ignore it.
+        if let Some(seg_size) = gso_segment_size {
+            let cmsg_total = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) };
+            debug_assert!(
+                (cmsg_total as usize) <= UDP_GSO_CMSG_LEN,
+                "UDP_GSO_CMSG_LEN too small for cmsg_space"
+            );
+            let buf = slot.send_cmsg_buf.as_mut_ptr();
+            // SAFETY: `slot.send_cmsg_buf` is pinned in the slot
+            // (Box-allocated, lives until the slot is dropped). We
+            // populate exactly the bytes the kernel will read.
+            unsafe {
+                std::ptr::write_bytes(buf, 0, UDP_GSO_CMSG_LEN);
+                slot.send_msghdr.msg_control = buf as *mut libc::c_void;
+                slot.send_msghdr.msg_controllen = cmsg_total as _;
+                let cmsg = libc::CMSG_FIRSTHDR(&*slot.send_msghdr);
+                (*cmsg).cmsg_level = libc::IPPROTO_UDP;
+                (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
+                let data_ptr = libc::CMSG_DATA(cmsg) as *mut u16;
+                std::ptr::write_unaligned(data_ptr, seg_size);
+            }
+        } else {
+            slot.send_msghdr.msg_controllen = 0;
+        }
 
         let msghdr_ptr = &*slot.send_msghdr as *const libc::msghdr;
         let payload = encode_udp_send_payload(slot_idx, pool_slot);

@@ -61,9 +61,61 @@ struct QuicConnection {
     cached_remote: SocketAddr,
 }
 
-struct OutgoingPacket {
-    destination: SocketAddr,
-    data: Vec<u8>,
+/// One outbound UDP packet produced by the endpoint.
+///
+/// `data` may carry a single datagram or — when `segment_size` is
+/// `Some` — a Generic Segmentation Offload (GSO) buffer holding several
+/// equally-sized datagrams concatenated together (the last may be
+/// shorter). Runtime adapters that support `UDP_SEGMENT` should hand the
+/// whole buffer to the kernel in one syscall (e.g. via
+/// `UdpCtx::send_to_gso`); adapters without GSO support, or in-process
+/// tests that feed datagrams back into [`QuicEndpoint::handle_datagram`],
+/// can call [`datagrams()`](Self::datagrams) to iterate the per-datagram
+/// slices.
+pub struct OutgoingPacket {
+    pub destination: SocketAddr,
+    pub data: Vec<u8>,
+    pub segment_size: Option<u16>,
+}
+
+impl OutgoingPacket {
+    /// Iterate over the individual datagram slices contained in `data`.
+    ///
+    /// When `segment_size` is `None`, yields a single slice over the
+    /// whole buffer. When it's `Some(s)`, yields successive `s`-byte
+    /// slices (the last may be shorter).
+    pub fn datagrams(&self) -> Datagrams<'_> {
+        let seg = self
+            .segment_size
+            .map(|s| s as usize)
+            .unwrap_or(self.data.len().max(1));
+        Datagrams {
+            data: &self.data,
+            segment_size: seg,
+            offset: 0,
+        }
+    }
+}
+
+/// Iterator over the per-datagram slices of an [`OutgoingPacket`].
+pub struct Datagrams<'a> {
+    data: &'a [u8],
+    segment_size: usize,
+    offset: usize,
+}
+
+impl<'a> Iterator for Datagrams<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.offset >= self.data.len() {
+            return None;
+        }
+        let end = (self.offset + self.segment_size).min(self.data.len());
+        let chunk = &self.data[self.offset..end];
+        self.offset = end;
+        Some(chunk)
+    }
 }
 
 impl QuicEndpoint {
@@ -134,7 +186,7 @@ impl QuicEndpoint {
                         // failure). Forward it so the peer doesn't have to
                         // wait for its own handshake timeout.
                         let data = self.response_buf[..t.size].to_vec();
-                        self.queue_packet(t.destination, data);
+                        self.queue_packet(t.destination, data, None);
                     }
                     Err(_) => {
                         // No response packet — nothing to send back.
@@ -144,7 +196,7 @@ impl QuicEndpoint {
             Some(DatagramEvent::Response(transmit)) => {
                 // Stateless response (e.g. version negotiation, retry).
                 let data = self.response_buf[..transmit.size].to_vec();
-                self.queue_packet(transmit.destination, data);
+                self.queue_packet(transmit.destination, data, None);
             }
             None => {}
         }
@@ -179,12 +231,15 @@ impl QuicEndpoint {
 
     /// Poll the next outgoing UDP packet.
     ///
-    /// Returns `(destination, data)` or `None` when the send queue is empty.
-    /// The caller is responsible for sending the packet via their UDP socket.
-    pub fn poll_send(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
-        self.send_queue
-            .pop_front()
-            .map(|pkt| (pkt.destination, pkt.data))
+    /// Returns an [`OutgoingPacket`] (which may be a GSO-packed buffer
+    /// of several datagrams when `segment_size` is `Some`) or `None`
+    /// when the send queue is empty. The caller is responsible for
+    /// sending the packet via their UDP socket — runtime adapters with
+    /// GSO support should hand the whole buffer to the kernel in one
+    /// syscall; others should iterate via
+    /// [`OutgoingPacket::datagrams`].
+    pub fn poll_send(&mut self) -> Option<OutgoingPacket> {
+        self.send_queue.pop_front()
     }
 
     /// Drain pending transmits from every connection into the send queue.
@@ -528,12 +583,13 @@ impl QuicEndpoint {
 
     /// Drain all pending transmits from a connection into the send queue.
     ///
-    /// Asks quinn-proto for up to `max_transmit_datagrams` per call and
-    /// fans out segmented buffers (`Transmit::segment_size = Some(s)`)
-    /// into individual outbound packets. The latter lets us still emit
-    /// one `sendmsg` per datagram on platforms without GSO support
-    /// while reaping the per-call state-machine amortisation that
-    /// drives sustained-throughput improvements.
+    /// Asks quinn-proto for up to `max_transmit_datagrams` per call. If
+    /// quinn returns a GSO-segmented buffer
+    /// (`Transmit::segment_size = Some(s)` with `s < size`), it is
+    /// queued as a single [`OutgoingPacket`] with `segment_size: Some(s)`
+    /// — runtime adapters with `UDP_SEGMENT` (Linux GSO) support emit
+    /// the whole buffer in one syscall, while others split per-datagram
+    /// via [`OutgoingPacket::datagrams`].
     fn drain_transmits(&mut self, key: usize, now: Instant) {
         let max_datagrams = self.max_transmit_datagrams;
         loop {
@@ -545,27 +601,14 @@ impl QuicEndpoint {
             );
 
             match transmit {
-                Some(t) => match t.segment_size {
-                    Some(seg_size) if seg_size < t.size => {
-                        // GSO-style packed buffer: split into individual
-                        // datagrams. Each becomes its own queued packet
-                        // so the runtime can emit one sendmsg per
-                        // segment. (Once we wire up UDP_SEGMENT we can
-                        // queue the whole buffer with the segment
-                        // hint.)
-                        let mut offset = 0;
-                        while offset < t.size {
-                            let end = (offset + seg_size).min(t.size);
-                            let data = self.transmit_buf[offset..end].to_vec();
-                            self.queue_packet(t.destination, data);
-                            offset = end;
-                        }
-                    }
-                    _ => {
-                        let data = self.transmit_buf[..t.size].to_vec();
-                        self.queue_packet(t.destination, data);
-                    }
-                },
+                Some(t) => {
+                    let segment_size = match t.segment_size {
+                        Some(seg) if seg < t.size => u16::try_from(seg).ok(),
+                        _ => None,
+                    };
+                    let data = self.transmit_buf[..t.size].to_vec();
+                    self.queue_packet(t.destination, data, segment_size);
+                }
                 None => break,
             }
         }
@@ -722,10 +765,13 @@ impl QuicEndpoint {
         }
     }
 
-    fn queue_packet(&mut self, destination: SocketAddr, data: Vec<u8>) {
+    fn queue_packet(&mut self, destination: SocketAddr, data: Vec<u8>, segment_size: Option<u16>) {
         if self.send_queue.len() < self.send_queue_capacity {
-            self.send_queue
-                .push_back(OutgoingPacket { destination, data });
+            self.send_queue.push_back(OutgoingPacket {
+                destination,
+                data,
+                segment_size,
+            });
         }
         // Drop excess packets — QUIC handles retransmission.
     }

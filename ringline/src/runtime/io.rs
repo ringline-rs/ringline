@@ -2456,7 +2456,7 @@ impl UdpCtx {
     /// Only one send can be in-flight per UDP socket at a time.
     #[cfg(has_io_uring)]
     pub fn send_to(&self, peer: SocketAddr, data: &[u8]) -> Result<(), crate::error::UdpSendError> {
-        with_state(|driver, _executor| driver.udp_send_to(self.udp_index, peer, data))
+        with_state(|driver, _executor| driver.udp_send_to(self.udp_index, peer, data, None))
     }
 
     /// Send a datagram to the given peer (mio backend — synchronous non-blocking send).
@@ -2483,6 +2483,66 @@ impl UdpCtx {
                 Err(e) => Err(crate::error::UdpSendError::Io(e)),
             }
         })
+    }
+
+    /// Send `data` segmented into back-to-back `segment_size`-byte UDP
+    /// datagrams in a *single* `sendmsg` syscall, using Linux GSO
+    /// (`UDP_SEGMENT`).
+    ///
+    /// `data.len()` must be a positive multiple of `segment_size`, except
+    /// the final packet may be shorter — the kernel splits the buffer
+    /// at every `segment_size` boundary and sends a smaller trailing
+    /// packet for any remainder.
+    ///
+    /// On the io_uring backend this attaches the cmsg to the existing
+    /// per-slot `msghdr` and submits one SQE — at high packet rates
+    /// this is several times faster than calling `send_to` per
+    /// datagram. On the mio backend (which doesn't have a built-in
+    /// place to bolt on cmsgs), this falls back to calling the
+    /// underlying `send_to` once per `segment_size` chunk; the
+    /// observable behavior is identical to applications, just without
+    /// the syscall savings.
+    ///
+    /// Errors:
+    /// - `Io(InvalidInput)` if `data` is too large for the send pool
+    ///   slot, or if `segment_size` is zero or larger than `data`.
+    /// - `PoolExhausted` if no free slot is currently available — wait
+    ///   on [`send_ready`](Self::send_ready) and retry.
+    #[cfg(has_io_uring)]
+    pub fn send_to_gso(
+        &self,
+        peer: SocketAddr,
+        data: &[u8],
+        segment_size: u16,
+    ) -> Result<(), crate::error::UdpSendError> {
+        with_state(|driver, _executor| {
+            driver.udp_send_to(self.udp_index, peer, data, Some(segment_size))
+        })
+    }
+
+    /// mio fallback for [`send_to_gso`](Self::send_to_gso): emits
+    /// per-segment `send_to` calls. Same observable result, no syscall
+    /// batching benefit.
+    #[cfg(not(has_io_uring))]
+    pub fn send_to_gso(
+        &self,
+        peer: SocketAddr,
+        data: &[u8],
+        segment_size: u16,
+    ) -> Result<(), crate::error::UdpSendError> {
+        if segment_size == 0 || (segment_size as usize) > data.len() {
+            return Err(crate::error::UdpSendError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GSO segment_size invalid for data length",
+            )));
+        }
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = (offset + segment_size as usize).min(data.len());
+            self.send_to(peer, &data[offset..end])?;
+            offset = end;
+        }
+        Ok(())
     }
 }
 

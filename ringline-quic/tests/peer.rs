@@ -52,12 +52,16 @@ fn drain(client: &mut QuicEndpoint, server: &mut QuicEndpoint, ca: SocketAddr, s
     let now = Instant::now();
     for _ in 0..64 {
         let mut moved = false;
-        while let Some((_dest, data)) = client.poll_send() {
-            server.handle_datagram(now, &data, ca);
+        while let Some(pkt) = client.poll_send() {
+            for dgram in pkt.datagrams() {
+                server.handle_datagram(now, dgram, ca);
+            }
             moved = true;
         }
-        while let Some((_dest, data)) = server.poll_send() {
-            client.handle_datagram(now, &data, sa);
+        while let Some(pkt) = server.poll_send() {
+            for dgram in pkt.datagrams() {
+                client.handle_datagram(now, dgram, sa);
+            }
             moved = true;
         }
         client.drive_timers(now);
@@ -480,8 +484,10 @@ fn server_drops_incoming_when_no_server_config() {
     // server_config so accept() fails — should not crash, should not yield
     // a NewConnection event.
     let now = Instant::now();
-    while let Some((_dest, data)) = client.poll_send() {
-        server.handle_datagram(now, &data, "127.0.0.1:60101".parse().unwrap());
+    while let Some(pkt) = client.poll_send() {
+        for dgram in pkt.datagrams() {
+            server.handle_datagram(now, dgram, "127.0.0.1:60101".parse().unwrap());
+        }
     }
 
     // No NewConnection from server.
@@ -1401,15 +1407,19 @@ fn drain_with_apparent_client(
     let now = Instant::now();
     for _ in 0..64 {
         let mut moved = false;
-        while let Some((_dest, data)) = client.poll_send() {
-            server.handle_datagram(now, &data, apparent_client_addr);
+        while let Some(pkt) = client.poll_send() {
+            for dgram in pkt.datagrams() {
+                server.handle_datagram(now, dgram, apparent_client_addr);
+            }
             moved = true;
         }
-        while let Some((_dest, data)) = server.poll_send() {
+        while let Some(pkt) = server.poll_send() {
             // The server's PATH_CHALLENGE is destined for the new path
             // address; the client's QuicEndpoint routes packets by CID
             // regardless of `dest`, so we just hand it the bytes.
-            client.handle_datagram(now, &data, server_addr);
+            for dgram in pkt.datagrams() {
+                client.handle_datagram(now, dgram, server_addr);
+            }
             moved = true;
         }
         client.drive_timers(now);
@@ -1667,12 +1677,16 @@ fn quic_sustained_large_stream_round_trip() {
 }
 
 #[test]
-fn quic_drain_transmits_splits_segmented_packet() {
+fn quic_drain_transmits_preserves_gso_segments() {
     // Direct white-box test of the segmentation path: configure a
     // larger-than-default `max_transmit_datagrams` so quinn is more
     // likely to use GSO segmentation, push enough data that quinn
-    // batches, and make sure each datagram lands in `send_queue` as
-    // its own (≤ MTU-bounded) packet.
+    // batches, and verify that:
+    //   1. At least one queued packet carries a `segment_size` hint
+    //      (so runtimes with UDP_SEGMENT can hand the whole buffer
+    //      to the kernel in one syscall).
+    //   2. Every individual datagram (after iterating
+    //      `OutgoingPacket::datagrams`) stays under the MTU.
     let (certs, key) = self_signed();
     let mut client_cfg = client_config(&certs);
     client_cfg.max_transmit_datagrams = 16;
@@ -1694,21 +1708,31 @@ fn quic_drain_transmits_splits_segmented_packet() {
         .expect("stream_send");
     client.flush(Instant::now());
 
-    // Inspect the queued outbound packets. None should exceed quinn's
-    // initial-MTU-ish path size — segmentation must have produced
-    // per-datagram packets, not one giant blob.
     let initial_mtu_ceiling = 1500usize; // generous; INITIAL_MTU is 1200
-    let mut max_packet = 0usize;
-    while let Some((_dest, data)) = client.poll_send() {
-        max_packet = max_packet.max(data.len());
+    let mut max_datagram = 0usize;
+    let mut total_datagrams = 0usize;
+    let mut saw_segmented = false;
+    while let Some(pkt) = client.poll_send() {
+        if pkt.segment_size.is_some() {
+            saw_segmented = true;
+        }
+        for dgram in pkt.datagrams() {
+            max_datagram = max_datagram.max(dgram.len());
+            total_datagrams += 1;
+        }
     }
     assert!(
-        max_packet > 0,
-        "client should have produced outbound packets after the flush"
+        total_datagrams > 0,
+        "client should have produced outbound datagrams after the flush"
     );
     assert!(
-        max_packet <= initial_mtu_ceiling,
-        "outbound packet size {max_packet} exceeds the per-datagram \
-         ceiling — `drain_transmits` is not splitting segmented buffers"
+        max_datagram <= initial_mtu_ceiling,
+        "outbound datagram size {max_datagram} exceeds the per-datagram \
+         ceiling — `OutgoingPacket::datagrams` is not splitting correctly"
+    );
+    assert!(
+        saw_segmented,
+        "expected at least one queued packet to carry a GSO segment_size \
+         hint; got {total_datagrams} datagrams but none were segmented"
     );
 }
