@@ -1849,3 +1849,217 @@ fn udp_repeated_launch_does_not_leak_fds() {
          (baseline={baseline}, after={after}); suggests a UDP/io_uring fd leak"
     );
 }
+
+// ── UDP_SEGMENT (GSO) round-trip ───────────────────────────────────────
+
+/// Handler that, on the first received datagram, replies once with a
+/// `segment_size`-segmented buffer big enough that the kernel splits
+/// it into N datagrams. Lets the test verify the peer sees N
+/// distinct receives — proving the GSO cmsg actually took effect.
+struct GsoSendHandler {
+    started: Arc<AtomicUsize>,
+    sent: Arc<AtomicUsize>,
+    segment_size: u16,
+    segments: u16,
+}
+
+static GSO_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static GSO_SENT: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static GSO_SEG_SIZE: AtomicU64 = AtomicU64::new(0);
+static GSO_SEG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+impl AsyncEventHandler for GsoSendHandler {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        GsoSendHandler {
+            started: GSO_STARTED.get_or_init(Default::default).clone(),
+            sent: GSO_SENT.get_or_init(Default::default).clone(),
+            segment_size: GSO_SEG_SIZE.load(Ordering::SeqCst) as u16,
+            segments: GSO_SEG_COUNT.load(Ordering::SeqCst) as u16,
+        }
+    }
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        let sent = self.sent.clone();
+        let seg_size = self.segment_size;
+        let seg_count = self.segments;
+        Some(Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            // Drain the trigger datagram so we know the test peer's
+            // address; reply with `seg_count` datagrams of `seg_size`
+            // bytes each, packed into one buffer with the GSO
+            // segment_size cmsg.
+            let (_data, peer) = udp.recv_from().await;
+            let total = seg_size as usize * seg_count as usize;
+            let mut buf = vec![0u8; total];
+            // Tag each segment with its index so the receiver can
+            // verify ordering.
+            for i in 0..seg_count {
+                let off = (i as usize) * (seg_size as usize);
+                buf[off..off + 2].copy_from_slice(&i.to_le_bytes());
+            }
+            loop {
+                match udp.send_to_gso(peer, &buf, seg_size) {
+                    Ok(()) => {
+                        sent.fetch_add(1, Ordering::SeqCst);
+                        break;
+                    }
+                    Err(UdpSendError::PoolExhausted) | Err(UdpSendError::SubmissionQueueFull) => {
+                        udp.send_ready().await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }))
+    }
+}
+
+#[test]
+fn udp_gso_segments_one_send_into_many_datagrams() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    GSO_STARTED
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+    GSO_SENT
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+
+    let segment_size: u16 = 1000;
+    let segments: u16 = 5;
+    GSO_SEG_SIZE.store(segment_size as u64, Ordering::SeqCst);
+    GSO_SEG_COUNT.store(segments as u64, Ordering::SeqCst);
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let mut cfg = base_config();
+    cfg.send_copy_slot_size = 16384; // comfortably > 5 * 1000
+    let (shutdown, handles) = RinglineBuilder::new(cfg)
+        .bind_udp(addr)
+        .launch::<GsoSendHandler>()
+        .expect("launch");
+    await_handler_started(GSO_STARTED.get().unwrap());
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client.send_to(b"trigger", addr).unwrap();
+
+    // Recv exactly `segments` datagrams of `segment_size` bytes each.
+    let mut buf = vec![0u8; segment_size as usize + 64];
+    let mut received = Vec::with_capacity(segments as usize);
+    for _ in 0..segments {
+        let (n, src) = client
+            .recv_from(&mut buf)
+            .expect("expected one datagram per segment");
+        assert_eq!(
+            n as u16, segment_size,
+            "each GSO segment should land as a single {segment_size}-byte UDP datagram"
+        );
+        assert_eq!(src, addr, "datagram should come from the bound port");
+        let idx = u16::from_le_bytes([buf[0], buf[1]]);
+        received.push(idx);
+    }
+    // The kernel may interleave a tiny bit on loopback but in
+    // practice GSO segments arrive in order. We just check that all
+    // expected indices are present (multiset equality), not strict
+    // ordering, to keep the test robust to any kernel variability.
+    received.sort_unstable();
+    let expected: Vec<u16> = (0..segments).collect();
+    assert_eq!(
+        received, expected,
+        "kernel should have produced exactly the {segments} segments"
+    );
+
+    // Confirm only one logical send was issued by the handler.
+    assert_eq!(
+        GSO_SENT.get().unwrap().load(Ordering::SeqCst),
+        1,
+        "send_to_gso should issue a single sendmsg call"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn udp_gso_invalid_segment_size_returns_error() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_echo_started();
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // Use the standard echo handler — the test focuses on the API
+    // contract for invalid arguments.
+    struct GsoArgCheck {
+        started: Arc<AtomicUsize>,
+        sane_send_ok: Arc<AtomicUsize>,
+    }
+    static SANE_OK: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+    impl AsyncEventHandler for GsoArgCheck {
+        fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+            async move {}
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            GsoArgCheck {
+                started: ECHO_STARTED.get_or_init(Default::default).clone(),
+                sane_send_ok: SANE_OK.get_or_init(Default::default).clone(),
+            }
+        }
+        fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+            let started = self.started.clone();
+            let ok_count = self.sane_send_ok.clone();
+            Some(Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let (_data, peer) = udp.recv_from().await;
+                // segment_size = 0 must error.
+                assert!(udp.send_to_gso(peer, &[1, 2, 3], 0).is_err());
+                // segment_size larger than data must error.
+                assert!(udp.send_to_gso(peer, &[1, 2, 3], 100).is_err());
+                // A sane send should still succeed afterward — the
+                // earlier errors must not have leaked a slot.
+                if udp.send_to_gso(peer, &[0u8; 600], 200).is_ok() {
+                    ok_count.fetch_add(1, Ordering::SeqCst);
+                }
+            }))
+        }
+    }
+    SANE_OK
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+
+    let (shutdown, handles) = RinglineBuilder::new(base_config())
+        .bind_udp(addr)
+        .launch::<GsoArgCheck>()
+        .expect("launch");
+    await_handler_started(ECHO_STARTED.get().unwrap());
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client.send_to(b"trigger", addr).unwrap();
+
+    // Drain the 3-segment GSO send (3 × 200 = 600 bytes total).
+    let mut buf = [0u8; 256];
+    for _ in 0..3 {
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(n, 200);
+    }
+    assert_eq!(
+        SANE_OK.get().unwrap().load(Ordering::SeqCst),
+        1,
+        "follow-up send_to_gso must succeed after the invalid-arg errors"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
