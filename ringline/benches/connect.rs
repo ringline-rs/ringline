@@ -1,23 +1,25 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+//! TCP connect benchmarks against a ringline acceptor.
+//!
+//! Measures how fast ringline's centralized acceptor + worker handoff
+//! can absorb fresh inbound connections, both serial and concurrent.
+
+#![allow(clippy::manual_async_fn)]
+
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
 use std::net::{SocketAddr, TcpStream};
-// use std::sync::Arc;
-// use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
-
-// ── Echo server handler ──────────────────────────────────────────────
 
 struct EchoHandler;
 
-#[allow(clippy::manual_async_fn)]
 impl AsyncEventHandler for EchoHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
         async move {
             loop {
                 let n = conn
                     .with_data(|data| {
-                        conn.send_nowait(data).ok();
+                        let _ = conn.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -33,81 +35,56 @@ impl AsyncEventHandler for EchoHandler {
     }
 }
 
-fn start_server(addr: SocketAddr) -> thread::JoinHandle<()> {
-    let config = Config::default();
-    let (_shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr)
-        .launch::<EchoHandler>()
-        .unwrap();
-
-    thread::spawn(move || {
-        for h in handles {
-            h.join().ok();
-        }
+fn server_addr() -> SocketAddr {
+    static ADDR: OnceLock<SocketAddr> = OnceLock::new();
+    *ADDR.get_or_init(|| {
+        let mut config = Config::default();
+        config.worker.threads = 1;
+        config.worker.pin_to_core = false;
+        config.max_connections = 8192;
+        config.backlog = 4096;
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (shutdown, handles) = RinglineBuilder::new(config)
+            .bind(bind)
+            .launch::<EchoHandler>()
+            .expect("failed to launch ringline server");
+        let bound = shutdown.bound_addr().expect("bound");
+        std::mem::forget(shutdown);
+        std::mem::forget(handles);
+        bound
     })
 }
 
-// ── Connect benchmarks ───────────────────────────────────────────────
-
-fn bench_connect(c: &mut Criterion) {
-    let addr: SocketAddr = "127.0.0.1:29500".parse().unwrap();
-    let _server = start_server(addr);
-
-    // Warmup
-    for _ in 0..100 {
-        let _ = TcpStream::connect(addr).unwrap();
-    }
-
-    c.bench_function("connect", |b| {
+fn bench_connect_serial(c: &mut Criterion) {
+    let addr = server_addr();
+    c.bench_function("connect_serial", |b| {
         b.iter(|| {
-            let _ = TcpStream::connect(addr).unwrap();
-        });
-    });
-}
-
-fn bench_connect_with_timeout(c: &mut Criterion) {
-    let unreachable_addr: SocketAddr = "192.0.2.1:12345".parse().unwrap(); // TEST-NET-1
-
-    c.bench_function("connect_with_timeout", |b| {
-        b.iter(|| {
-            let _ = TcpStream::connect_timeout(&unreachable_addr, Duration::from_millis(100));
+            let _stream = TcpStream::connect(addr).expect("connect");
         });
     });
 }
 
 fn bench_connect_concurrent(c: &mut Criterion) {
-    let addr: SocketAddr = "127.0.0.1:29501".parse().unwrap();
-    let _server = start_server(addr);
-
+    let addr = server_addr();
     let mut group = c.benchmark_group("connect_concurrent");
-    for num_concurrent in [1, 10, 50, 100] {
-        group.bench_with_input(
-            BenchmarkId::new("connect_concurrent", num_concurrent),
-            &num_concurrent,
-            |b, &n| {
-                b.iter(|| {
-                    let mut handles = Vec::new();
-                    for _ in 0..n {
-                        let connect_addr = addr;
-                        let handle = thread::spawn(move || {
-                            let _ = TcpStream::connect(connect_addr);
-                        });
-                        handles.push(handle);
-                    }
-                    for h in handles {
-                        h.join().ok();
-                    }
-                });
-            },
-        );
+    for &fanout in &[1usize, 4, 16, 64] {
+        group.throughput(Throughput::Elements(fanout as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(fanout), &fanout, |b, &n| {
+            b.iter(|| {
+                let mut handles = Vec::with_capacity(n);
+                for _ in 0..n {
+                    handles.push(thread::spawn(move || {
+                        let _ = TcpStream::connect(addr).expect("connect");
+                    }));
+                }
+                for h in handles {
+                    h.join().ok();
+                }
+            });
+        });
     }
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_connect,
-    bench_connect_with_timeout,
-    bench_connect_concurrent
-);
+criterion_group!(benches, bench_connect_serial, bench_connect_concurrent);
 criterion_main!(benches);

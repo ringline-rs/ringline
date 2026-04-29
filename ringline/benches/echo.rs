@@ -1,25 +1,28 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+//! Echo round-trip benchmarks against a ringline server.
+//!
+//! All benches share a single in-process ringline echo server (started
+//! once via `OnceLock` and leaked for the lifetime of the process) and
+//! reuse a long-lived TCP client connection for measurement. This
+//! isolates per-message cost from `connect()` overhead and avoids
+//! TIME_WAIT exhaustion at high iteration counts.
+
+#![allow(clippy::manual_async_fn)]
+
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::OnceLock;
 
-// ── Ringline echo server handler ─────────────────────────────────────
-
-#[allow(clippy::manual_async_fn)]
 struct EchoHandler;
 
-#[allow(clippy::manual_async_fn)]
 impl AsyncEventHandler for EchoHandler {
     fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
         async move {
             loop {
                 let n = conn
                     .with_data(|data| {
-                        conn.send_nowait(data).ok();
+                        let _ = conn.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
                     .await;
@@ -35,389 +38,87 @@ impl AsyncEventHandler for EchoHandler {
     }
 }
 
-fn start_ringline_server(addr: SocketAddr) -> thread::JoinHandle<()> {
-    let config = Config::default();
-    let (_shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr)
-        .launch::<EchoHandler>()
-        .unwrap();
-
-    thread::spawn(move || {
-        for h in handles {
-            h.join().ok();
-        }
+fn echo_server_addr() -> SocketAddr {
+    static ADDR: OnceLock<SocketAddr> = OnceLock::new();
+    *ADDR.get_or_init(|| {
+        let mut config = Config::default();
+        config.worker.threads = 1;
+        config.worker.pin_to_core = false;
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (shutdown, handles) = RinglineBuilder::new(config)
+            .bind(bind)
+            .launch::<EchoHandler>()
+            .expect("failed to launch ringline echo server");
+        let bound = shutdown
+            .bound_addr()
+            .expect("server should have a bound address");
+        // Keep the server alive for the entire bench process. Workers
+        // never join — the OS reaps them at process exit.
+        std::mem::forget(shutdown);
+        std::mem::forget(handles);
+        bound
     })
 }
 
-fn start_tokio_server(addr: SocketAddr) -> thread::JoinHandle<()> {
-    let listener = TcpListener::bind(addr).unwrap();
-    let _addr = listener.local_addr().unwrap();
-    let running = Arc::new(AtomicBool::new(true));
-    let running_thread = running.clone();
-
-    thread::spawn(move || {
-        while running_thread.load(Ordering::Relaxed) {
-            if let Ok((mut stream, _)) = listener.accept() {
-                thread::spawn(move || {
-                    let mut buf = [0u8; 4096];
-                    while let Ok(n) = stream.read(&mut buf) {
-                        if n == 0 {
-                            break;
-                        }
-                        stream.write_all(&buf[..n]).ok();
-                    }
-                });
-            }
-        }
-    })
+fn open_client(addr: SocketAddr) -> TcpStream {
+    let stream = TcpStream::connect(addr).expect("connect to echo server");
+    stream.set_nodelay(true).ok();
+    // Single round-trip handshake to make sure the server is echoing.
+    let mut s = &stream;
+    s.write_all(b"x").unwrap();
+    let mut buf = [0u8; 1];
+    s.read_exact(&mut buf).unwrap();
+    stream
 }
 
-// ── Echo benchmarks (single connection) ──────────────────────────────
-
-fn bench_ringline_echo_64b(c: &mut Criterion) {
-    let addr: SocketAddr = "127.0.0.1:29600".parse().unwrap();
-    let _server = start_ringline_server(addr);
-
-    // Warmup
-    for _ in 0..100 {
-        let mut stream = TcpStream::connect(addr).unwrap();
-        let data = b"Hello, world!";
-        stream.write_all(data).unwrap();
-        let mut buf = [0u8; 1024];
-        stream.read_exact(&mut buf[..data.len()]).unwrap();
-    }
-
-    c.bench_function("ringline_echo_64b", |b| {
-        b.iter(|| {
-            let mut stream = TcpStream::connect(addr).unwrap();
-            let data = b"Hello, world!";
-            stream.write_all(data).unwrap();
-            let mut buf = [0u8; 1024];
-            stream.read_exact(&mut buf[..data.len()]).unwrap();
-            black_box(buf);
+/// Round-trip latency for a single message at varying payload sizes.
+fn bench_echo_roundtrip(c: &mut Criterion) {
+    let addr = echo_server_addr();
+    let mut group = c.benchmark_group("echo_roundtrip");
+    for &size in &[64usize, 256, 1024, 4096, 16384] {
+        let stream = open_client(addr);
+        let payload = vec![0xAB_u8; size];
+        let mut buf = vec![0u8; size];
+        // Throughput is request + response bytes.
+        group.throughput(Throughput::Bytes((size as u64) * 2));
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
+            b.iter(|| {
+                let mut s = &stream;
+                s.write_all(&payload).unwrap();
+                s.read_exact(&mut buf).unwrap();
+                black_box(buf[0]);
+            });
         });
-    });
-}
-
-fn bench_tokio_echo_64b(c: &mut Criterion) {
-    let addr: SocketAddr = "127.0.0.1:29601".parse().unwrap();
-    let _server = start_tokio_server(addr);
-
-    // Warmup
-    for _ in 0..100 {
-        let mut stream = TcpStream::connect(addr).unwrap();
-        let data = b"Hello, world!";
-        stream.write_all(data).unwrap();
-        let mut buf = [0u8; 1024];
-        stream.read_exact(&mut buf[..data.len()]).unwrap();
     }
-
-    c.bench_function("tokio_echo_64b", |b| {
-        b.iter(|| {
-            let mut stream = TcpStream::connect(addr).unwrap();
-            let data = b"Hello, world!";
-            stream.write_all(data).unwrap();
-            let mut buf = [0u8; 1024];
-            stream.read_exact(&mut buf[..data.len()]).unwrap();
-            black_box(buf);
-        });
-    });
+    group.finish();
 }
 
-fn bench_ringline_echo_4kb(c: &mut Criterion) {
-    let addr: SocketAddr = "127.0.0.1:29602".parse().unwrap();
-    let _server = start_ringline_server(addr);
-
-    let data = vec![0u8; 4096];
-
-    // Warmup
-    for _ in 0..100 {
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream.write_all(&data).unwrap();
-        let mut buf = vec![0u8; 4096];
-        stream.read_exact(&mut buf).unwrap();
-    }
-
-    c.bench_function("ringline_echo_4kb", |b| {
-        b.iter(|| {
-            let mut stream = TcpStream::connect(addr).unwrap();
-            stream.write_all(&data).unwrap();
-            let mut buf = vec![0u8; 4096];
-            stream.read_exact(&mut buf).unwrap();
-            black_box(buf);
-        });
-    });
-}
-
-fn bench_tokio_echo_4kb(c: &mut Criterion) {
-    let addr: SocketAddr = "127.0.0.1:29603".parse().unwrap();
-    let _server = start_tokio_server(addr);
-
-    let data = vec![0u8; 4096];
-
-    // Warmup
-    for _ in 0..100 {
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream.write_all(&data).unwrap();
-        let mut buf = vec![0u8; 4096];
-        stream.read_exact(&mut buf).unwrap();
-    }
-
-    c.bench_function("tokio_echo_4kb", |b| {
-        b.iter(|| {
-            let mut stream = TcpStream::connect(addr).unwrap();
-            stream.write_all(&data).unwrap();
-            let mut buf = vec![0u8; 4096];
-            stream.read_exact(&mut buf).unwrap();
-            black_box(buf);
-        });
-    });
-}
-
-// ── Pipeline benchmarks (multiple requests) ──────────────────────────
-
-fn bench_ringline_pipeline_100(c: &mut Criterion) {
-    let addr: SocketAddr = "127.0.0.1:29604".parse().unwrap();
-    let _server = start_ringline_server(addr);
-
-    let requests = vec![b"req1"; 100];
-
-    // Warmup
-    for _ in 0..10 {
-        let mut stream = TcpStream::connect(addr).unwrap();
-        for req in &requests {
-            stream.write_all(*req).unwrap();
-        }
-        let mut buf = [0u8; 1024];
-        for _ in 0..requests.len() {
-            let _ = stream.read(&mut buf).unwrap();
-        }
-    }
-
-    c.bench_function("ringline_pipeline_100", |b| {
-        b.iter(|| {
-            let mut stream = TcpStream::connect(addr).unwrap();
-            for req in &requests {
-                stream.write_all(*req).unwrap();
-            }
-            let mut buf = [0u8; 1024];
-            for _ in 0..requests.len() {
-                let _ = stream.read(&mut buf).unwrap();
-            }
-        });
-    });
-}
-
-fn bench_tokio_pipeline_100(c: &mut Criterion) {
-    let addr: SocketAddr = "127.0.0.1:29605".parse().unwrap();
-    let _server = start_tokio_server(addr);
-
-    let requests = vec![b"req1"; 100];
-
-    // Warmup
-    for _ in 0..10 {
-        let mut stream = TcpStream::connect(addr).unwrap();
-        for req in &requests {
-            stream.write_all(*req).unwrap();
-        }
-        let mut buf = [0u8; 1024];
-        for _ in 0..requests.len() {
-            let _ = stream.read(&mut buf).unwrap();
-        }
-    }
-
-    c.bench_function("tokio_pipeline_100", |b| {
-        b.iter(|| {
-            let mut stream = TcpStream::connect(addr).unwrap();
-            for req in &requests {
-                stream.write_all(*req).unwrap();
-            }
-            let mut buf = [0u8; 1024];
-            for _ in 0..requests.len() {
-                let _ = stream.read(&mut buf).unwrap();
-            }
-        });
-    });
-}
-
-// ── Throughput benchmarks (measuring ops/sec) ────────────────────────
-
-fn bench_ringline_throughput(c: &mut Criterion) {
-    let addr: SocketAddr = "127.0.0.1:29606".parse().unwrap();
-    let _server = start_ringline_server(addr);
-
-    let data = vec![0u8; 1024];
-    let stop = Arc::new(AtomicBool::new(false));
-    let ops = Arc::new(AtomicU64::new(0));
-
-    // Run a warmup client
-    let stop_warmup = stop.clone();
-    let ops_warmup = ops.clone();
-    let data_warmup = data.clone();
-    thread::spawn(move || {
-        while !stop_warmup.load(Ordering::Relaxed) {
-            if let Ok(mut stream) = TcpStream::connect(addr) {
-                let start = Instant::now();
-                let mut local_ops = 0u64;
-                while start.elapsed() < Duration::from_secs(1) {
-                    if stream.write_all(&data_warmup).is_err() {
-                        break;
-                    }
-                    let mut buf = vec![0u8; data_warmup.len()];
-                    if stream.read_exact(&mut buf).is_err() {
-                        break;
-                    }
-                    local_ops += 1;
+/// Pipelined throughput: send N requests back-to-back, then read N
+/// responses. Measures the runtime's ability to amortize syscall cost
+/// across multiple in-flight messages.
+fn bench_echo_pipeline(c: &mut Criterion) {
+    let addr = echo_server_addr();
+    let mut group = c.benchmark_group("echo_pipeline");
+    let payload_size = 64usize;
+    for &depth in &[1usize, 4, 16, 64, 256] {
+        let stream = open_client(addr);
+        let payload = vec![0xAB_u8; payload_size];
+        let mut buf = vec![0u8; payload_size];
+        group.throughput(Throughput::Elements(depth as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, &n| {
+            b.iter(|| {
+                let mut s = &stream;
+                for _ in 0..n {
+                    s.write_all(&payload).unwrap();
                 }
-                ops_warmup.fetch_add(local_ops, Ordering::Relaxed);
-            }
-        }
-    });
-
-    thread::sleep(Duration::from_secs(2));
-    ops.store(0, Ordering::Relaxed);
-    stop.store(true, Ordering::Relaxed);
-    thread::sleep(Duration::from_millis(100));
-
-    // Measure throughput
-    let stop_measure = stop.clone();
-    let ops_measure = ops.clone();
-    let data_measure = data.clone();
-
-    c.bench_function("ringline_throughput", |b| {
-        b.iter(|| {
-            stop_measure.store(false, Ordering::Relaxed);
-            ops_measure.store(0, Ordering::Relaxed);
-
-            let stop_clone = stop_measure.clone();
-            let ops_clone = ops_measure.clone();
-            let data_clone = data_measure.clone();
-
-            let handle = thread::spawn(move || {
-                while !stop_clone.load(Ordering::Relaxed) {
-                    if let Ok(mut stream) = TcpStream::connect(addr) {
-                        let mut local_ops = 0u64;
-                        while local_ops < 1000 {
-                            if stream.write_all(&data_clone).is_err() {
-                                break;
-                            }
-                            let mut buf = vec![0u8; data_clone.len()];
-                            if stream.read_exact(&mut buf).is_err() {
-                                break;
-                            }
-                            local_ops += 1;
-                        }
-                        ops_clone.fetch_add(local_ops, Ordering::Relaxed);
-                    }
+                for _ in 0..n {
+                    s.read_exact(&mut buf).unwrap();
                 }
             });
-
-            thread::sleep(Duration::from_secs(1));
-            stop_measure.store(true, Ordering::Relaxed);
-            handle.join().ok();
-
-            // Return ops/sec
-            let total_ops = ops_measure.load(Ordering::Relaxed) as f64;
-            black_box(total_ops);
         });
-    });
-
-    stop.store(true, Ordering::Relaxed);
+    }
+    group.finish();
 }
 
-fn bench_tokio_throughput(c: &mut Criterion) {
-    let addr: SocketAddr = "127.0.0.1:29607".parse().unwrap();
-    let _server = start_tokio_server(addr);
-
-    let data = vec![0u8; 1024];
-    let stop = Arc::new(AtomicBool::new(false));
-    let ops = Arc::new(AtomicU64::new(0));
-
-    // Run a warmup client
-    let stop_warmup = stop.clone();
-    let ops_warmup = ops.clone();
-    let data_warmup = data.clone();
-    thread::spawn(move || {
-        while !stop_warmup.load(Ordering::Relaxed) {
-            if let Ok(mut stream) = TcpStream::connect(addr) {
-                let start = Instant::now();
-                let mut local_ops = 0u64;
-                while start.elapsed() < Duration::from_secs(1) {
-                    if stream.write_all(&data_warmup).is_err() {
-                        break;
-                    }
-                    let mut buf = vec![0u8; data_warmup.len()];
-                    if stream.read_exact(&mut buf).is_err() {
-                        break;
-                    }
-                    local_ops += 1;
-                }
-                ops_warmup.fetch_add(local_ops, Ordering::Relaxed);
-            }
-        }
-    });
-
-    thread::sleep(Duration::from_secs(2));
-    ops.store(0, Ordering::Relaxed);
-    stop.store(true, Ordering::Relaxed);
-    thread::sleep(Duration::from_millis(100));
-
-    // Measure throughput
-    let stop_measure = stop.clone();
-    let ops_measure = ops.clone();
-    let data_measure = data.clone();
-
-    c.bench_function("tokio_throughput", |b| {
-        b.iter(|| {
-            stop_measure.store(false, Ordering::Relaxed);
-            ops_measure.store(0, Ordering::Relaxed);
-
-            let stop_clone = stop_measure.clone();
-            let ops_clone = ops_measure.clone();
-            let data_clone = data_measure.clone();
-
-            let handle = thread::spawn(move || {
-                while !stop_clone.load(Ordering::Relaxed) {
-                    if let Ok(mut stream) = TcpStream::connect(addr) {
-                        let mut local_ops = 0u64;
-                        while local_ops < 1000 {
-                            if stream.write_all(&data_clone).is_err() {
-                                break;
-                            }
-                            let mut buf = vec![0u8; data_clone.len()];
-                            if stream.read_exact(&mut buf).is_err() {
-                                break;
-                            }
-                            local_ops += 1;
-                        }
-                        ops_clone.fetch_add(local_ops, Ordering::Relaxed);
-                    }
-                }
-            });
-
-            thread::sleep(Duration::from_secs(1));
-            stop_measure.store(true, Ordering::Relaxed);
-            handle.join().ok();
-
-            // Return ops/sec
-            let total_ops = ops_measure.load(Ordering::Relaxed) as f64;
-            black_box(total_ops);
-        });
-    });
-
-    stop.store(true, Ordering::Relaxed);
-}
-
-criterion_group!(
-    benches,
-    bench_ringline_echo_64b,
-    bench_tokio_echo_64b,
-    bench_ringline_echo_4kb,
-    bench_tokio_echo_4kb,
-    bench_ringline_pipeline_100,
-    bench_tokio_pipeline_100,
-    bench_ringline_throughput,
-    bench_tokio_throughput
-);
-
+criterion_group!(benches, bench_echo_roundtrip, bench_echo_pipeline);
 criterion_main!(benches);
