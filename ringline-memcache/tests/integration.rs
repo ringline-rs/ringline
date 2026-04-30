@@ -112,7 +112,7 @@ fn memcache_version() {
                 .await
                 .map_err(|e| format!("version: {e}"))?;
             if version.is_empty() {
-                return Err("version returned empty string".to_string());
+                return Err("version returned empty string".into());
             }
             println!("memcached version: {version}");
             Ok(())

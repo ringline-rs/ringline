@@ -15,6 +15,7 @@ timestamps = ["ringline/timestamps", "dep:libc"]
 [dependencies]
 bytes = { workspace = true }
 histogram = { workspace = true, optional = true }
+itoa = { workspace = true }
 ketama = { workspace = true }
 libc = { workspace = true, optional = true }
 ringline = { workspace = true }
