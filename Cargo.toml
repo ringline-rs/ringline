@@ -31,6 +31,7 @@ ketama = "0.0.1"
 # External dependencies
 bytes = "1.11.1"
 histogram = "0.11"
+itoa = "1"
 libc = "0.2"
 thiserror = "2"
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }

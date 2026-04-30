@@ -380,7 +380,7 @@ impl ClientBuilder {
         Client {
             conn: self.conn,
             on_result: self.on_result,
-            pending: VecDeque::new(),
+            pending: VecDeque::with_capacity(16),
             last_rx_bytes: Cell::new(0),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
@@ -513,10 +513,22 @@ impl Client {
 
     #[inline]
     fn timing_start(&self) -> (u64, Option<Instant>) {
-        if self.is_instrumented() {
-            (self.send_timestamp(), Some(Instant::now()))
-        } else {
-            (0, None)
+        #[cfg(feature = "timestamps")]
+        {
+            if self.is_instrumented() {
+                (self.send_timestamp(), Some(Instant::now()))
+            } else {
+                (0, None)
+            }
+        }
+        #[cfg(not(feature = "timestamps"))]
+        {
+            // When timestamps feature is disabled, only use Instant::now() if callbacks are registered
+            if self.on_result.is_some() {
+                (0, Some(Instant::now()))
+            } else {
+                (0, None)
+            }
         }
     }
 
@@ -1100,11 +1112,11 @@ impl Client {
     }
 
     /// Get the server version string.
-    pub async fn version(&mut self) -> Result<String, Error> {
+    pub async fn version(&mut self) -> Result<Box<str>, Error> {
         let encoded = encode_request(&McRequest::version());
         let response = self.execute(&encoded).await?;
         match response {
-            McResponseBytes::Version(v) => Ok(String::from_utf8_lossy(&v).into_owned()),
+            McResponseBytes::Version(v) => Ok(Box::from(String::from_utf8_lossy(v.as_ref()))),
             _ => Err(Error::UnexpectedResponse),
         }
     }
