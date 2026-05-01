@@ -689,7 +689,7 @@ impl<'a> DriverCtx<'a> {
         }
 
         // Create TLS client state (buffers ClientHello internally).
-        let sni = rustls::pki_types::ServerName::try_from(server_name.to_owned()).map_err(|e| {
+        let sni: rustls::pki_types::ServerName<'static> = server_name.try_into().map_err(|e| {
             // Stale fixed file entry is overwritten when the slot is reused.
             let _ = self.ring.register_files_update(conn_index, &[-1]);
             self.connections.release(conn_index);
