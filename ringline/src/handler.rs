@@ -28,6 +28,16 @@ pub(crate) struct ConnSendState {
     /// silently truncated when the fd closed.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_pending: bool,
+    /// Count of queued sends pushed during close. Each CQE decrements
+    /// this; when it reaches zero, `try_finalize_close` fires.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    #[allow(dead_code)]
+    pub close_send_count: u32,
+    /// Deadline for close_notify completion. Set when close_notify is
+    /// sent via `flush_close_notify_linked`. If elapsed while
+    /// `close_pending` is true, the runtime force-closes the connection.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub close_notify_deadline: Option<std::time::Instant>,
 }
 
 impl ConnSendState {
@@ -37,6 +47,8 @@ impl ConnSendState {
             queue: VecDeque::new(),
             shutdown_pending: false,
             close_pending: false,
+            close_send_count: 0,
+            close_notify_deadline: None,
         }
     }
 }
@@ -140,7 +152,7 @@ pub struct DriverCtx<'a> {
     /// Base offset in the fixed file table for filesystem file fds.
     pub(crate) fs_fd_base: u32,
     /// Pending close retries from failed submit_close calls.
-    pub(crate) pending_close_retries: &'a mut Vec<u32>,
+    pub(crate) pending_close_retries: &'a mut Vec<(u32, u8)>,
 }
 
 #[cfg(has_io_uring)]
@@ -336,12 +348,18 @@ impl<'a> DriverCtx<'a> {
             // Graceful TLS shutdown: send close_notify before closing.
             if !self.tls_table.is_null() {
                 let tls_table = unsafe { &mut *self.tls_table };
-                tls_table.send_close_notify(conn.index, self.ring, self.send_copy_pool);
+                if tls_table.has(conn.index) {
+                    tls_table.send_close_notify(conn.index, self.ring, self.send_copy_pool);
+                    // Arm the close_notify deadline for timeout detection.
+                    let state = &mut self.send_queues[conn.index as usize];
+                    state.close_notify_deadline =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                }
             }
 
             if self.ring.submit_close(conn.index).is_err() {
                 crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
-                self.pending_close_retries.push(conn.index);
+                self.pending_close_retries.push((conn.index, 0));
             }
         }
     }
@@ -1798,8 +1816,53 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Close a connection.
-    pub fn close(&mut self, _conn: ConnToken) {
-        // TODO: implement mio close
+    pub fn close(&mut self, conn: ConnToken) {
+        let idx = conn.index as usize;
+        if let Some(cs) = self.connections.get_mut(conn.index) {
+            if cs.generation != conn.generation {
+                return;
+            }
+            cs.recv_mode = crate::connection::RecvMode::Closed;
+        } else {
+            return;
+        }
+
+        // Flush any pending send data before closing.
+        if let Some(ref mut stream) = self.tcp_streams[idx] {
+            use std::io::Write;
+            for (data, offset) in self.pending_sends[idx].drain(..) {
+                let _ = stream.write_all(&data[offset..]);
+            }
+            let _ = stream.flush();
+
+            // Send TLS close_notify if this is a TLS connection.
+            if !self.tls_table.is_null() {
+                let tls_table = unsafe { &mut *self.tls_table };
+                if tls_table.has(conn.index) {
+                    if let Some(tls_conn) = tls_table.get_mut(conn.index) {
+                        tls_conn.conn.send_close_notify();
+                    }
+                    crate::tls::flush_tls_output_mio(tls_table, stream, conn.index);
+                    tls_table.remove(conn.index);
+                }
+            }
+        }
+
+        // Deregister from poll and drop the stream.
+        if let Some(mut stream) = self.tcp_streams[idx].take() {
+            let _ = self.poll.registry().deregister(&mut stream);
+        }
+
+        // Clear per-connection state.
+        self.pending_sends[idx].clear();
+        self.writable[idx] = false;
+        self.connect_deadlines[idx] = None;
+        self.send_completions[idx].clear();
+
+        // Release the connection slot.
+        if self.connections.get(conn.index).is_some() {
+            self.connections.release(conn.index);
+        }
     }
 
     /// Get TLS session info for a connection.
@@ -1820,6 +1883,11 @@ impl<'a> DriverCtx<'a> {
     /// Flushes any buffered pending sends before issuing the TCP half-close.
     pub fn shutdown_write(&mut self, conn: ConnToken) {
         let idx = conn.index as usize;
+        if self.connections.get(conn.index).is_none()
+            || self.connections.get(conn.index).unwrap().generation != conn.generation
+        {
+            return;
+        }
         // Flush any pending send data before shutting down.
         if let Some(ref mut stream) = self.tcp_streams[idx] {
             use std::io::Write;
@@ -1833,8 +1901,10 @@ impl<'a> DriverCtx<'a> {
 
     /// Cancel an in-flight operation.
     pub fn cancel(&mut self, _conn: ConnToken) -> io::Result<()> {
-        // TODO: implement mio cancel
-        Ok(())
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cancel not supported on mio backend",
+        ))
     }
 
     /// Connect to a remote address.
