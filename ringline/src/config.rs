@@ -170,6 +170,12 @@ pub struct Config {
     /// 0 = disabled (filesystem/direct I/O operations return `Unsupported`).
     /// Default: 2.
     pub disk_io_threads: usize,
+    /// Maximum time in milliseconds to wait for a TLS close_notify send to
+    /// complete before force-closing the connection. When a TLS connection
+    /// sends close_notify but the send never completes (e.g., due to pool
+    /// exhaustion), this prevents the connection from hanging indefinitely.
+    /// Default: 5000.
+    pub close_notify_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -214,6 +220,7 @@ impl Default for Config {
             spawner_threads: 1,
             blocking_threads: 4,
             disk_io_threads: 2,
+            close_notify_timeout_ms: 5000,
         }
     }
 }
@@ -304,6 +311,11 @@ impl Config {
                     "udp_recv_buffer.bgid must differ from recv_buffer.bgid".into(),
                 ));
             }
+        }
+        if self.close_notify_timeout_ms == 0 || self.close_notify_timeout_ms > 60000 {
+            return Err(crate::error::Error::RingSetup(
+                "close_notify_timeout_ms must be > 0 and <= 60000".into(),
+            ));
         }
         Ok(())
     }
@@ -592,6 +604,12 @@ impl ConfigBuilder {
     /// Set the number of disk I/O threads (mio backend only). 0 = disabled.
     pub fn disk_io_threads(mut self, threads: usize) -> Self {
         self.config.disk_io_threads = threads;
+        self
+    }
+
+    /// Set the TLS close_notify timeout in milliseconds. Default: 5000.
+    pub fn close_notify_timeout_ms(mut self, ms: u64) -> Self {
+        self.config.close_notify_timeout_ms = ms;
         self
     }
 

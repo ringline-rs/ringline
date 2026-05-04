@@ -169,7 +169,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // (SQ was full). The SQ has been flushed by submit_and_wait above.
             if !self.driver.pending_zc_retries.is_empty() {
                 let retries: Vec<_> = self.driver.pending_zc_retries.drain(..).collect();
-                for (conn_index, generation, slab_idx) in retries {
+                for (conn_index, generation, slab_idx, retries) in retries {
+                    if retries >= 2 {
+                        // Max retries exceeded — release and drop.
+                        if self.driver.send_slab.in_use(slab_idx) {
+                            self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+                            if self.driver.send_slab.should_release(slab_idx) {
+                                let pool_slot = self.driver.send_slab.release(slab_idx);
+                                if pool_slot != u16::MAX {
+                                    self.driver.send_copy_pool.release(pool_slot);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if !self.driver.send_slab.in_use(slab_idx) {
                         continue; // slab was released in the meantime
                     }
@@ -178,11 +191,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         || self.driver.connections.generation(conn_index) != generation
                     {
                         // Connection closed or reused — release the slab.
-                        self.driver.send_slab.mark_awaiting_notifications(slab_idx);
-                        if self.driver.send_slab.should_release(slab_idx) {
-                            let pool_slot = self.driver.send_slab.release(slab_idx);
-                            if pool_slot != u16::MAX {
-                                self.driver.send_copy_pool.release(pool_slot);
+                        if self.driver.send_slab.in_use(slab_idx) {
+                            self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+                            if self.driver.send_slab.should_release(slab_idx) {
+                                let pool_slot = self.driver.send_slab.release(slab_idx);
+                                if pool_slot != u16::MAX {
+                                    self.driver.send_copy_pool.release(pool_slot);
+                                }
                             }
                         }
                         continue;
@@ -194,18 +209,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
                         .is_err()
                     {
-                        // Still failing — close the connection as last resort.
-                        self.driver.send_slab.mark_awaiting_notifications(slab_idx);
-                        if self.driver.send_slab.should_release(slab_idx) {
-                            let pool_slot = self.driver.send_slab.release(slab_idx);
-                            if pool_slot != u16::MAX {
-                                self.driver.send_copy_pool.release(pool_slot);
-                            }
-                        }
-                        self.driver.drain_conn_send_queue(conn_index);
-                        let err = io::Error::other("SQ full during partial ZC send resubmission");
-                        self.executor.wake_send(conn_index, Err(err));
-                        self.driver.close_connection(conn_index);
+                        // Still failing — re-queue with incremented count.
+                        self.driver.pending_zc_retries.push((
+                            conn_index,
+                            generation,
+                            slab_idx,
+                            retries + 1,
+                        ));
                     }
                 }
             }
@@ -213,7 +223,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Retry any copy send resubmissions that failed (SQ was full).
             if !self.driver.pending_copy_retries.is_empty() {
                 let retries: Vec<_> = self.driver.pending_copy_retries.drain(..).collect();
-                for (conn_index, generation, pool_slot) in retries {
+                for (conn_index, generation, pool_slot, retries) in retries {
+                    if retries >= 2 {
+                        // Max retries exceeded — release and drop.
+                        if self.driver.send_copy_pool.in_use(pool_slot) {
+                            self.driver.send_copy_pool.release(pool_slot);
+                        }
+                        continue;
+                    }
                     if !self.driver.send_copy_pool.in_use(pool_slot) {
                         continue;
                     }
@@ -221,7 +238,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     if self.driver.connections.get(conn_index).is_none()
                         || self.driver.connections.generation(conn_index) != generation
                     {
-                        self.driver.send_copy_pool.release(pool_slot);
+                        if self.driver.send_copy_pool.in_use(pool_slot) {
+                            self.driver.send_copy_pool.release(pool_slot);
+                        }
                         continue;
                     }
                     let (ptr, remaining) =
@@ -242,38 +261,71 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             .submit_send_copied(conn_index, ptr, remaining, pool_slot)
                     };
                     if result.is_err() {
-                        self.driver.send_copy_pool.release(pool_slot);
-                        self.driver.drain_conn_send_queue(conn_index);
-                        let err = io::Error::other("SQ full during partial copy send resubmission");
-                        self.executor.wake_send(conn_index, Err(err));
-                        self.driver.close_connection(conn_index);
+                        self.driver.pending_copy_retries.push((
+                            conn_index,
+                            generation,
+                            pool_slot,
+                            retries + 1,
+                        ));
                     }
                 }
             }
 
             // Retry any close submissions that failed (SQ was full).
+            // Max 5 retries with backoff: only re-queue every 4 ticks.
             if !self.driver.pending_close_retries.is_empty() {
                 let retries: Vec<_> = self.driver.pending_close_retries.drain(..).collect();
-                for conn_index in retries {
+                let tick_mod = self.driver.tick_count % 4;
+                for (conn_index, retry) in retries {
+                    if retry >= 5 {
+                        // Max retries exceeded — give up, finalize close.
+                        self.driver.try_finalize_close(conn_index);
+                        continue;
+                    }
+                    // Backoff: only re-queue every 4 ticks.
+                    if tick_mod != 0 {
+                        continue;
+                    }
                     if self.driver.ring.submit_close(conn_index).is_err() {
-                        // Still failing — re-queue for next tick.
-                        self.driver.pending_close_retries.push(conn_index);
+                        // Still failing — re-queue with incremented count.
+                        self.driver
+                            .pending_close_retries
+                            .push((conn_index, retry + 1));
                     }
                 }
             }
 
             // Retry any POLLOUT arming that failed at EAGAIN time
             // (the SQ was full when we received the EAGAIN CQE).
+            // Max 3 retries with backoff: only re-queue every 2 ticks.
             if !self.driver.pending_send_pollout_retries.is_empty() {
                 let retries: Vec<_> = self.driver.pending_send_pollout_retries.drain(..).collect();
-                for (conn_index, generation, pool_slot) in retries {
+                let tick_mod = self.driver.tick_count % 2;
+                for (conn_index, generation, pool_slot, retry) in retries {
+                    if retry >= 3 {
+                        // Max retries exceeded — release pool + drain queue + close.
+                        if self.driver.send_copy_pool.in_use(pool_slot) {
+                            self.driver.send_copy_pool.release(pool_slot);
+                        }
+                        self.driver.drain_conn_send_queue(conn_index);
+                        let err = io::Error::other("max retries during send pollout retry");
+                        self.executor.wake_send(conn_index, Err(err));
+                        self.driver.close_connection(conn_index);
+                        continue;
+                    }
+                    // Backoff: only re-queue every 2 ticks.
+                    if tick_mod != 0 {
+                        continue;
+                    }
                     if !self.driver.send_copy_pool.in_use(pool_slot) {
                         continue;
                     }
                     if self.driver.connections.get(conn_index).is_none()
                         || self.driver.connections.generation(conn_index) != generation
                     {
-                        self.driver.send_copy_pool.release(pool_slot);
+                        if self.driver.send_copy_pool.in_use(pool_slot) {
+                            self.driver.send_copy_pool.release(pool_slot);
+                        }
                         continue;
                     }
                     if self
@@ -282,12 +334,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         .submit_send_pollout(conn_index, pool_slot)
                         .is_err()
                     {
-                        self.driver
-                            .pending_send_pollout_retries
-                            .push((conn_index, generation, pool_slot));
+                        self.driver.pending_send_pollout_retries.push((
+                            conn_index,
+                            generation,
+                            pool_slot,
+                            retry + 1,
+                        ));
                     }
                 }
             }
+
+            self.driver.tick_count += 1;
+
+            // Check close_notify deadlines — force-close connections where
+            // close_notify was sent but the close CQE never arrived.
+            self.check_close_notify_deadlines();
 
             // Drain waker-based ready queue (from wakers fired during poll).
             self.executor.collect_wakeups();
@@ -1073,7 +1134,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let generation = self.driver.connections.generation(conn_index);
                     self.driver
                         .pending_copy_retries
-                        .push((conn_index, generation, pool_slot));
+                        .push((conn_index, generation, pool_slot, 0));
                 }
                 return;
             }
@@ -1112,7 +1173,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let generation = self.driver.connections.generation(conn_index);
                 self.driver
                     .pending_send_pollout_retries
-                    .push((conn_index, generation, pool_slot));
+                    .push((conn_index, generation, pool_slot, 0));
             }
             metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
             return;
@@ -1173,7 +1234,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let generation = self.driver.connections.generation(conn_index);
             self.driver
                 .pending_copy_retries
-                .push((conn_index, generation, pool_slot));
+                .push((conn_index, generation, pool_slot, 0));
         }
     }
 
@@ -1325,7 +1386,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let generation = self.driver.connections.generation(conn_index);
                 self.driver
                     .pending_zc_retries
-                    .push((conn_index, generation, slab_idx));
+                    .push((conn_index, generation, slab_idx, 0));
                 return;
             }
         }
@@ -1569,7 +1630,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let generation = self.driver.connections.generation(conn_index);
                 self.driver
                     .pending_copy_retries
-                    .push((conn_index, generation, pool_slot));
+                    .push((conn_index, generation, pool_slot, 0));
             }
             return;
         }
@@ -1939,14 +2000,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Copy retry drain — mirrors the logic in run().
         if !self.driver.pending_copy_retries.is_empty() {
             let retries: Vec<_> = self.driver.pending_copy_retries.drain(..).collect();
-            for (conn_index, generation, pool_slot) in retries {
+            for (conn_index, generation, pool_slot, retries) in retries {
+                if retries >= 2 {
+                    if self.driver.send_copy_pool.in_use(pool_slot) {
+                        self.driver.send_copy_pool.release(pool_slot);
+                    }
+                    continue;
+                }
                 if !self.driver.send_copy_pool.in_use(pool_slot) {
                     continue;
                 }
                 if self.driver.connections.get(conn_index).is_none()
                     || self.driver.connections.generation(conn_index) != generation
                 {
-                    self.driver.send_copy_pool.release(pool_slot);
+                    if self.driver.send_copy_pool.in_use(pool_slot) {
+                        self.driver.send_copy_pool.release(pool_slot);
+                    }
                     continue;
                 }
                 let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
@@ -1955,11 +2024,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .ring
                     .submit_send_copied(conn_index, ptr, remaining, pool_slot);
                 if result.is_err() {
-                    self.driver.send_copy_pool.release(pool_slot);
-                    self.driver.drain_conn_send_queue(conn_index);
-                    let err = io::Error::other("SQ full during partial copy send resubmission");
-                    self.executor.wake_send(conn_index, Err(err));
-                    self.driver.close_connection(conn_index);
+                    self.driver.pending_copy_retries.push((
+                        conn_index,
+                        generation,
+                        pool_slot,
+                        retries + 1,
+                    ));
                 }
             }
         }
@@ -1967,18 +2037,32 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // ZC retry drain.
         if !self.driver.pending_zc_retries.is_empty() {
             let retries: Vec<_> = self.driver.pending_zc_retries.drain(..).collect();
-            for (conn_index, generation, slab_idx) in retries {
+            for (conn_index, generation, slab_idx, retries) in retries {
+                if retries >= 2 {
+                    if self.driver.send_slab.in_use(slab_idx) {
+                        self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+                        if self.driver.send_slab.should_release(slab_idx) {
+                            let pool_slot = self.driver.send_slab.release(slab_idx);
+                            if pool_slot != u16::MAX {
+                                self.driver.send_copy_pool.release(pool_slot);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if !self.driver.send_slab.in_use(slab_idx) {
                     continue;
                 }
                 if self.driver.connections.get(conn_index).is_none()
                     || self.driver.connections.generation(conn_index) != generation
                 {
-                    self.driver.send_slab.mark_awaiting_notifications(slab_idx);
-                    if self.driver.send_slab.should_release(slab_idx) {
-                        let pool_slot = self.driver.send_slab.release(slab_idx);
-                        if pool_slot != u16::MAX {
-                            self.driver.send_copy_pool.release(pool_slot);
+                    if self.driver.send_slab.in_use(slab_idx) {
+                        self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+                        if self.driver.send_slab.should_release(slab_idx) {
+                            let pool_slot = self.driver.send_slab.release(slab_idx);
+                            if pool_slot != u16::MAX {
+                                self.driver.send_copy_pool.release(pool_slot);
+                            }
                         }
                     }
                     continue;
@@ -1990,17 +2074,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
                     .is_err()
                 {
-                    self.driver.send_slab.mark_awaiting_notifications(slab_idx);
-                    if self.driver.send_slab.should_release(slab_idx) {
-                        let pool_slot = self.driver.send_slab.release(slab_idx);
-                        if pool_slot != u16::MAX {
-                            self.driver.send_copy_pool.release(pool_slot);
-                        }
-                    }
-                    self.driver.drain_conn_send_queue(conn_index);
-                    let err = io::Error::other("SQ full during partial ZC send resubmission");
-                    self.executor.wake_send(conn_index, Err(err));
-                    self.driver.close_connection(conn_index);
+                    self.driver.pending_zc_retries.push((
+                        conn_index,
+                        generation,
+                        slab_idx,
+                        retries + 1,
+                    ));
                 }
             }
         }
@@ -2008,9 +2087,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Close retry drain.
         if !self.driver.pending_close_retries.is_empty() {
             let retries: Vec<_> = self.driver.pending_close_retries.drain(..).collect();
-            for conn_index in retries {
-                if self.driver.ring.submit_close(conn_index).is_err() {
-                    self.driver.pending_close_retries.push(conn_index);
+            for (conn_index, retry) in retries {
+                if self.driver.ring.submit_close(conn_index).is_err() && retry < 5 {
+                    self.driver
+                        .pending_close_retries
+                        .push((conn_index, retry + 1));
                 }
             }
         }
@@ -2060,6 +2141,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .submit_and_wait(cqes.len() as u32)
             .expect("submit_and_wait failed");
         self.drain_completions();
+    }
+
+    /// Check close_notify deadlines on all connections. If a connection
+    /// has `close_pending` and the `close_notify_deadline` has elapsed,
+    /// force-close it by calling `try_finalize_close`.
+    fn check_close_notify_deadlines(&mut self) {
+        let now = std::time::Instant::now();
+        let max = self.driver.send_queues.len();
+        // Collect timed-out indices first to avoid borrow conflict.
+        let mut timed_out: Vec<u32> = Vec::new();
+        for idx in 0..max {
+            let state = &self.driver.send_queues[idx];
+            if state.close_pending
+                && let Some(deadline) = state.close_notify_deadline
+                && now >= deadline
+            {
+                timed_out.push(idx as u32);
+            }
+        }
+        for idx in timed_out {
+            self.driver.try_finalize_close(idx);
+        }
     }
 }
 
@@ -3341,7 +3444,7 @@ mod tests {
         // Queue the retry.
         el.driver
             .pending_copy_retries
-            .push((conn_index, generation, slot));
+            .push((conn_index, generation, slot, 0));
 
         // Close the connection before the retry fires.
         el.driver.close_connection(conn_index);
@@ -3375,7 +3478,7 @@ mod tests {
         // Queue the retry with the old generation.
         el.driver
             .pending_copy_retries
-            .push((conn_index, old_generation, slot));
+            .push((conn_index, old_generation, slot, 0));
 
         // Close the connection.
         el.driver.close_connection(conn_index);
@@ -3426,7 +3529,7 @@ mod tests {
         // Queue the ZC retry.
         el.driver
             .pending_zc_retries
-            .push((conn_index, generation, slab_idx));
+            .push((conn_index, generation, slab_idx, 0));
 
         // Close the connection.
         el.driver.close_connection(conn_index);

@@ -170,19 +170,21 @@ pub(crate) struct Driver {
     pub(crate) tick_timeout_ts: Option<io_uring::types::Timespec>,
     /// Whether a tick timeout SQE is currently in-flight.
     pub(crate) tick_timeout_armed: bool,
+    /// Monotonic tick counter for backoff-based retry scheduling.
+    pub(crate) tick_count: u64,
     /// Whether the eventfd read SQE is currently armed.
     pub(crate) eventfd_armed: bool,
-    /// Pending ZC send retries: (conn_index, generation, slab_idx). Drained each tick.
-    pub(crate) pending_zc_retries: Vec<(u32, u32, u16)>,
-    /// Pending copy send retries: (conn_index, generation, pool_slot). Drained each tick.
-    pub(crate) pending_copy_retries: Vec<(u32, u32, u16)>,
+    /// Pending ZC send retries: (conn_index, generation, slab_idx, retries). Drained each tick.
+    pub(crate) pending_zc_retries: Vec<(u32, u32, u16, u8)>,
+    /// Pending copy send retries: (conn_index, generation, pool_slot, retries). Drained each tick.
+    pub(crate) pending_copy_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending PollAdd-on-POLLOUT retries from the EAGAIN backpressure
-    /// path: (conn_index, generation, pool_slot). Drained each tick.
+    /// path: (conn_index, generation, pool_slot, retries). Drained each tick.
     /// Only used when `submit_send_pollout` itself failed (SQ full at
     /// the time the EAGAIN CQE arrived).
-    pub(crate) pending_send_pollout_retries: Vec<(u32, u32, u16)>,
-    /// Pending close retries: conn_index values whose submit_close failed. Drained each tick.
-    pub(crate) pending_close_retries: Vec<u32>,
+    pub(crate) pending_send_pollout_retries: Vec<(u32, u32, u16, u8)>,
+    /// Pending close retries: (conn_index, retries). Drained each tick.
+    pub(crate) pending_close_retries: Vec<(u32, u8)>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
     /// NVMe device tracking table. `None` when NVMe is not configured.
@@ -374,6 +376,7 @@ impl Driver {
                 None
             },
             tick_timeout_armed: false,
+            tick_count: 0,
             eventfd_armed: false,
             pending_zc_retries: Vec::new(),
             pending_copy_retries: Vec::new(),
@@ -517,10 +520,20 @@ impl Driver {
         // queue is empty.
         let state = &mut self.send_queues[conn_index as usize];
         state.close_pending = true;
-        // If there's nothing in flight or queued, fire the close
-        // immediately.
-        let nothing_pending = !state.in_flight && state.queue.is_empty();
-        if nothing_pending {
+        if state.in_flight {
+            // Something is in-flight; wait for its CQE to drain the queue.
+            return;
+        }
+        // Nothing in-flight but queue has items — push them into the SQ
+        // so their CQEs can fire and continue the serialized drain cycle.
+        if !state.queue.is_empty() {
+            let pushed = self.flush_queued_sends_or_release(conn_index);
+            if pushed == 0 {
+                // SQ was full and we gave up — the queue was drained
+                // by flush_queued_sends_or_release, so finalize immediately.
+                self.try_finalize_close(conn_index);
+            }
+        } else {
             self.try_finalize_close(conn_index);
         }
     }
@@ -538,7 +551,17 @@ impl Driver {
         self.send_queues[conn_index as usize].close_pending = false;
         if self.ring.submit_close(conn_index).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
-            self.pending_close_retries.push(conn_index);
+            let retries = self
+                .pending_close_retries
+                .iter()
+                .map(|(idx, r)| (*idx, (*r + 1)))
+                .collect::<Vec<_>>();
+            self.pending_close_retries.clear();
+            for (idx, retry) in retries {
+                if retry < 5 {
+                    self.pending_close_retries.push((idx, retry));
+                }
+            }
         }
     }
 
@@ -547,6 +570,39 @@ impl Driver {
     /// connection was waiting and the queue is now drained.
     pub(crate) fn note_send_finalized(&mut self, conn_index: u32) {
         self.try_finalize_close(conn_index);
+    }
+
+    /// Push all queued sends for a connection into the SQ. Returns the
+    /// number of sends successfully submitted. On SQ full, drains the
+    /// remaining queue (releasing slab/pool resources) and sets
+    /// `in_flight = false`.
+    pub(crate) fn flush_queued_sends_or_release(&mut self, conn_index: u32) -> usize {
+        let state = &mut self.send_queues[conn_index as usize];
+        let mut pushed = 0usize;
+        while let Some(built) = state.queue.pop_front() {
+            match unsafe { self.ring.push_sqe(built.entry) } {
+                Ok(()) => {
+                    pushed += 1;
+                }
+                Err(_) => {
+                    // SQ full — release this entry and drain remaining queue.
+                    Self::release_built_resources(
+                        &mut self.send_slab,
+                        &mut self.send_copy_pool,
+                        built.pool_slot,
+                        built.slab_idx,
+                    );
+                    Self::release_queued_sends(
+                        &mut state.queue,
+                        &mut self.send_slab,
+                        &mut self.send_copy_pool,
+                    );
+                    state.in_flight = false;
+                    break;
+                }
+            }
+        }
+        pushed
     }
 
     /// Pop the next queued send for a connection and submit it to the ring.
@@ -575,6 +631,9 @@ impl Driver {
                         );
                         state.in_flight = false;
                         state.shutdown_pending = false;
+                        // If a deferred close was pending, fire it now that
+                        // the queue is drained.
+                        self.try_finalize_close(conn_index);
                         false
                     }
                 }

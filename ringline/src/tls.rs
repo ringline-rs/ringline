@@ -116,6 +116,9 @@ impl TlsConnKind {
 pub struct TlsConn {
     pub conn: TlsConnKind,
     pub handshake_complete: bool,
+    /// True when `send_close_notify` has been called. Used by the
+    /// close_notify timeout mechanism to detect stalled shutdowns.
+    pub close_notify_sent: bool,
 }
 
 /// Table of TLS connections, indexed by connection slot.
@@ -166,6 +169,7 @@ impl TlsTable {
         self.conns[conn_index as usize] = Some(TlsConn {
             conn: TlsConnKind::Server(conn),
             handshake_complete: false,
+            close_notify_sent: false,
         });
         Ok(())
     }
@@ -184,6 +188,7 @@ impl TlsTable {
         self.conns[conn_index as usize] = Some(TlsConn {
             conn: TlsConnKind::Client(conn),
             handshake_complete: false,
+            close_notify_sent: false,
         });
         Ok(())
     }
@@ -227,6 +232,7 @@ impl TlsTable {
         let (conn_slot, write_buf) = borrow_conn_and_buf(self, conn_index);
         if let Some(tls_conn) = conn_slot {
             tls_conn.conn.send_close_notify();
+            tls_conn.close_notify_sent = true;
             flush_close_notify_linked(tls_conn, write_buf, ring, send_copy_pool, conn_index);
         }
     }
