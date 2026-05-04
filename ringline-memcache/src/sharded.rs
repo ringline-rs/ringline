@@ -431,7 +431,7 @@ impl ShardedClient {
     }
 
     /// Get the version string from any connected shard.
-    pub async fn version(&mut self) -> Result<String, Error> {
+    pub async fn version(&mut self) -> Result<Box<str>, Error> {
         let opts = self.connect_opts();
         for shard in &mut self.shards {
             if let Ok(conn) = get_conn(shard, &opts).await {

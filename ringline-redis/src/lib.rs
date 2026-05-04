@@ -389,7 +389,7 @@ impl ClientBuilder {
         Client {
             conn: self.conn,
             on_result: self.on_result,
-            pending: VecDeque::new(),
+            pending: VecDeque::with_capacity(16),
             last_rx_bytes: Cell::new(0),
             write_buf: Vec::new(),
             write_guards: Vec::new(),
@@ -550,10 +550,22 @@ impl Client {
 
     #[inline]
     fn timing_start(&self) -> (u64, Option<Instant>) {
-        if self.is_instrumented() {
-            (self.send_timestamp(), Some(Instant::now()))
-        } else {
-            (0, None)
+        #[cfg(feature = "timestamps")]
+        {
+            if self.is_instrumented() {
+                (self.send_timestamp(), Some(Instant::now()))
+            } else {
+                (0, None)
+            }
+        }
+        #[cfg(not(feature = "timestamps"))]
+        {
+            // When timestamps feature is disabled, only use Instant::now() if callbacks are registered
+            if self.on_result.is_some() {
+                (0, Some(Instant::now()))
+            } else {
+                (0, None)
+            }
         }
     }
 
@@ -1261,9 +1273,11 @@ impl Client {
     /// Increment the integer value of a key by a given amount.
     pub async fn incrby(&mut self, key: impl AsRef<[u8]>, delta: i64) -> Result<i64, Error> {
         let key = key.as_ref();
-        let delta_str = delta.to_string();
+        let mut buf = itoa::Buffer::new();
         self.execute_int(&Self::encode_request(
-            &Request::cmd(b"INCRBY").arg(key).arg(delta_str.as_bytes()),
+            &Request::cmd(b"INCRBY")
+                .arg(key)
+                .arg(buf.format(delta).as_bytes()),
         ))
         .await
     }
@@ -1271,9 +1285,11 @@ impl Client {
     /// Decrement the integer value of a key by a given amount.
     pub async fn decrby(&mut self, key: impl AsRef<[u8]>, delta: i64) -> Result<i64, Error> {
         let key = key.as_ref();
-        let delta_str = delta.to_string();
+        let mut buf = itoa::Buffer::new();
         self.execute_int(&Self::encode_request(
-            &Request::cmd(b"DECRBY").arg(key).arg(delta_str.as_bytes()),
+            &Request::cmd(b"DECRBY")
+                .arg(key)
+                .arg(buf.format(delta).as_bytes()),
         ))
         .await
     }
@@ -1305,9 +1321,11 @@ impl Client {
     /// Set a timeout on a key in seconds.
     pub async fn expire(&mut self, key: impl AsRef<[u8]>, seconds: u64) -> Result<bool, Error> {
         let key = key.as_ref();
-        let secs_str = seconds.to_string();
+        let mut buf = itoa::Buffer::new();
         self.execute_int(&Self::encode_request(
-            &Request::cmd(b"EXPIRE").arg(key).arg(secs_str.as_bytes()),
+            &Request::cmd(b"EXPIRE")
+                .arg(key)
+                .arg(buf.format(seconds).as_bytes()),
         ))
         .await
         .map(|n| n == 1)
@@ -1606,14 +1624,14 @@ impl Client {
         stop: i64,
     ) -> Result<Vec<Bytes>, Error> {
         let key = key.as_ref();
-        let start_str = start.to_string();
-        let stop_str = stop.to_string();
+        let mut buf1 = itoa::Buffer::new();
+        let mut buf2 = itoa::Buffer::new();
         let value = self
             .execute(&Self::encode_request(
                 &Request::cmd(b"LRANGE")
                     .arg(key)
-                    .arg(start_str.as_bytes())
-                    .arg(stop_str.as_bytes()),
+                    .arg(buf1.format(start).as_bytes())
+                    .arg(buf2.format(stop).as_bytes()),
             ))
             .await?;
         parse_bytes_array(value)
@@ -1627,13 +1645,13 @@ impl Client {
         stop: i64,
     ) -> Result<(), Error> {
         let key = key.as_ref();
-        let start_str = start.to_string();
-        let stop_str = stop.to_string();
+        let mut buf1 = itoa::Buffer::new();
+        let mut buf2 = itoa::Buffer::new();
         self.execute_ok(&Self::encode_request(
             &Request::cmd(b"LTRIM")
                 .arg(key)
-                .arg(start_str.as_bytes())
-                .arg(stop_str.as_bytes()),
+                .arg(buf1.format(start).as_bytes())
+                .arg(buf2.format(stop).as_bytes()),
         ))
         .await
     }
@@ -1647,11 +1665,11 @@ impl Client {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let idx_str = index.to_string();
+        let mut buf = itoa::Buffer::new();
         self.execute_ok(&Self::encode_request(
             &Request::cmd(b"LSET")
                 .arg(key)
-                .arg(idx_str.as_bytes())
+                .arg(buf.format(index).as_bytes())
                 .arg(value),
         ))
         .await
@@ -2100,7 +2118,8 @@ fn encode_set_guard_prefix(key: &[u8], value_len: usize, _options: Option<()>) -
 /// - suffix: `\r\n$2\r\nEX\r\n${ttllen}\r\n{ttl}\r\n`
 fn encode_set_guard_prefix_ex(key: &[u8], value_len: usize, ttl_secs: u64) -> (Vec<u8>, Vec<u8>) {
     use std::io::Write;
-    let ttl_str = ttl_secs.to_string();
+    let mut buf = itoa::Buffer::new();
+    let ttl_str = buf.format(ttl_secs);
 
     let mut prefix = Vec::with_capacity(32 + key.len());
     prefix.extend_from_slice(b"*5\r\n$3\r\nSET\r\n");
