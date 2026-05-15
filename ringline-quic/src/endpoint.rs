@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use quinn_proto::{
-    ClientConfig, ConnectionHandle, DatagramEvent, Dir, Event, StreamEvent, StreamId,
+    ClientConfig, ConnectionError, ConnectionHandle, DatagramEvent, Dir, Event, StreamEvent,
+    StreamId,
 };
 use slab::Slab;
 
@@ -438,6 +439,16 @@ impl QuicEndpoint {
         // Drain the CONNECTION_CLOSE packet (and any final acks) so callers
         // don't have to remember to flush after closing.
         self.drain_transmits(key, now);
+        // Quinn-proto's graceful-close path never fires Event::ConnectionLost
+        // for the initiating side (the connection enters Draining without
+        // setting the error field that poll() checks). Emit the event here so
+        // higher-level layers (e.g. H3Connection) can clean up per-connection
+        // state without waiting for the 3×PTO drain timer.
+        let conn_id = QuicConnId(key as u32);
+        self.events.push_back(QuicEvent::ConnectionClosed {
+            conn: conn_id,
+            reason: ConnectionError::LocallyClosed,
+        });
     }
 
     /// Send an unreliable QUIC datagram (RFC 9221).
