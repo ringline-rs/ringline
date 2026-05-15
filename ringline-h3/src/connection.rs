@@ -270,8 +270,15 @@ impl H3Connection {
             }
             QuicEvent::ConnectionClosed { .. } => {
                 self.state = H3State::Closed;
+                // Drop all queued outbound bytes — the connection is gone and
+                // none of them will ever reach the peer.
+                self.pending_sends.clear();
+                // Signal the application that the connection is shutting down.
+                // GoAway rather than Error: callers waiting for graceful teardown
+                // see this as a clean termination; callers that also handle Error
+                // (e.g. the receiving side in a test) accept it too.
+                self.events.push_back(H3Event::GoAway { stream_id: 0 });
             }
-            // StreamFinished — not yet handled.
             _ => {}
         }
         Ok(())
