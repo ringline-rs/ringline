@@ -144,7 +144,12 @@ fn validate_headers(kind: HeaderKind, headers: &[HeaderField]) -> Result<(), H3E
 }
 
 /// Events produced by the HTTP/3 connection for the application.
+///
+/// Marked `#[non_exhaustive]` because we expect to grow this surface as
+/// the H3 layer adds extensions (server push, WebTransport, etc.).
+/// Downstream `match` blocks must include a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum H3Event {
     /// Received a complete request (headers, and optionally end of stream).
     Request {

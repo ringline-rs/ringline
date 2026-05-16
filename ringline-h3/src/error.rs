@@ -24,7 +24,11 @@ pub mod error_code {
 }
 
 /// Errors produced by the HTTP/3 framing layer.
+///
+/// Marked `#[non_exhaustive]` because new error kinds are expected as RFC
+/// coverage grows. Downstream `match` blocks must include a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum H3Error {
     /// QUIC transport error.
     Quic(ringline_quic::Error),
