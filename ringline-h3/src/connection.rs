@@ -69,6 +69,11 @@ pub enum H3Event {
         stream_id: StreamId,
         error_code: u64,
     },
+    /// The server rejected 0-RTT. Any requests issued before the handshake
+    /// completed were discarded by quinn-proto and the H3 layer has cleared
+    /// its per-stream tracking. The application is responsible for
+    /// re-issuing those requests over 1-RTT.
+    ZeroRttRejected,
     /// Connection-level error.
     Error(H3Error),
 }
@@ -211,6 +216,16 @@ impl H3Connection {
         headers: &[HeaderField],
         end_stream: bool,
     ) -> Result<StreamId, H3Error> {
+        // RFC 9114 §5.2: after sending or receiving GOAWAY, the client MUST
+        // NOT initiate new requests. Server may also be Closing for an
+        // explicit local shutdown. Bail out before opening the stream — the
+        // peer would reset it anyway, and the application gets a clear error.
+        if matches!(self.state, H3State::Closing | H3State::Closed) {
+            return Err(H3Error::Internal(
+                "connection is shutting down; cannot send new request".into(),
+            ));
+        }
+
         let conn = self
             .conn_id
             .ok_or(H3Error::Internal("no connection".into()))?;
@@ -279,6 +294,14 @@ impl H3Connection {
             }
             QuicEvent::StreamWritable { conn, stream } => {
                 self.drain_pending_stream(quic, *conn, *stream)?;
+            }
+            QuicEvent::ZeroRttRejected { .. } => {
+                // Quinn discarded everything we sent on 0-RTT keys. Our
+                // per-stream tracking now points at streams the server never
+                // saw. Drop it all and tell the application to re-issue.
+                self.pending_sends.clear();
+                self.request_streams.clear();
+                self.events.push_back(H3Event::ZeroRttRejected);
             }
             QuicEvent::StreamStopped {
                 stream, error_code, ..
@@ -779,8 +802,9 @@ impl H3Connection {
                             // Unknown frames on control stream are ignored.
                         }
                     }
-                    // Remove consumed bytes.
-                    self.control_recv_buf = self.control_recv_buf[consumed_bytes..].to_vec();
+                    // Remove consumed bytes in place — reallocating a fresh Vec
+                    // here was a per-frame O(n) tax on the control stream.
+                    self.control_recv_buf.drain(..consumed_bytes);
                 }
                 Ok(None) => break, // Incomplete frame, need more data.
                 Err(e) => {

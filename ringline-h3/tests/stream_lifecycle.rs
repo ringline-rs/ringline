@@ -429,3 +429,110 @@ fn peer_reset_drops_stream_state_and_emits_event() {
         "server should drop request_streams entry after RESET_STREAM",
     );
 }
+
+/// After the connection enters Closing (peer GOAWAY) or Closed (we closed),
+/// `send_request` must refuse new requests rather than opening a stream the
+/// peer would just reset.
+#[test]
+fn send_request_after_goaway_errors() {
+    let (
+        mut client_ep,
+        mut server_ep,
+        _client_conn,
+        server_conn,
+        mut client_h3,
+        mut server_h3,
+        client_addr,
+        server_addr,
+        _port,
+    ) = connected_pair();
+
+    // Server sends GOAWAY (stream id 4 — the next-expected client stream).
+    server_h3
+        .send_goaway(&mut server_ep, 4)
+        .expect("send_goaway");
+
+    // Push the GOAWAY through and let the client process it.
+    for _ in 0..8 {
+        shuffle(&mut client_ep, &mut server_ep, client_addr, server_addr);
+        pump_h3(&mut client_ep, &mut client_h3);
+    }
+    // Drain the GoAway event so we can observe the state change cleanly.
+    let saw_goaway = drain_h3(&mut client_h3)
+        .into_iter()
+        .any(|e| matches!(e, H3Event::GoAway { .. }));
+    assert!(saw_goaway, "client should see GoAway from server");
+
+    let err = client_h3
+        .send_request(
+            &mut client_ep,
+            &[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":path", b"/late"),
+                HeaderField::new(b":scheme", b"https"),
+                HeaderField::new(b":authority", b"localhost"),
+            ],
+            true,
+        )
+        .expect_err("send_request after GOAWAY must fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("shutting down"),
+        "expected shutdown error, got {msg:?}",
+    );
+
+    // Reference unused server connection to silence warning.
+    let _ = server_conn;
+}
+
+/// Feeding a synthetic `ZeroRttRejected` event must clear per-stream state
+/// and produce an `H3Event::ZeroRttRejected` so the app knows to re-issue.
+#[test]
+fn zero_rtt_rejected_clears_state_and_emits_event() {
+    let (
+        mut client_ep,
+        _server_ep,
+        client_conn,
+        _server_conn,
+        mut client_h3,
+        _server_h3,
+        _client_addr,
+        _server_addr,
+        _port,
+    ) = connected_pair();
+
+    // Open a request stream so there is per-stream state to discard.
+    let _req_stream = client_h3
+        .send_request(
+            &mut client_ep,
+            &[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":path", b"/"),
+                HeaderField::new(b":scheme", b"https"),
+                HeaderField::new(b":authority", b"localhost"),
+            ],
+            true,
+        )
+        .expect("send_request");
+    assert!(client_h3.tracked_stream_count() > 0);
+
+    // Synthesise a ZeroRttRejected event. (The QUIC layer's real
+    // emission path is exercised in zero_rtt_rejected_event_fires_when_*
+    // in ringline-quic; here we only need to verify the H3 handler.)
+    client_h3
+        .handle_quic_event(
+            &mut client_ep,
+            &QuicEvent::ZeroRttRejected { conn: client_conn },
+        )
+        .expect("handle ZeroRttRejected");
+
+    assert_eq!(
+        client_h3.tracked_stream_count(),
+        0,
+        "request_streams should be cleared after ZeroRttRejected",
+    );
+    let saw_event = drain_h3(&mut client_h3)
+        .into_iter()
+        .any(|e| matches!(e, H3Event::ZeroRttRejected));
+    assert!(saw_event, "client should emit H3Event::ZeroRttRejected");
+}

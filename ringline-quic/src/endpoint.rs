@@ -193,7 +193,10 @@ impl QuicEndpoint {
                         // failure). Forward it so the peer doesn't have to
                         // wait for its own handshake timeout.
                         let data = self.response_buf[..t.size].to_vec();
-                        self.queue_packet(t.destination, data, None);
+                        // Stateless close response: if the send queue is full
+                        // the peer just times out on its own handshake. Best
+                        // effort — no in-flight state to keep consistent.
+                        let _ = self.queue_packet(t.destination, data, None);
                     }
                     Err(_) => {
                         // No response packet — nothing to send back.
@@ -203,7 +206,7 @@ impl QuicEndpoint {
             Some(DatagramEvent::Response(transmit)) => {
                 // Stateless response (e.g. version negotiation, retry).
                 let data = self.response_buf[..transmit.size].to_vec();
-                self.queue_packet(transmit.destination, data, None);
+                let _ = self.queue_packet(transmit.destination, data, None);
             }
             None => {}
         }
@@ -335,11 +338,16 @@ impl QuicEndpoint {
         stream: StreamId,
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
-        let c = self.get_conn_mut(conn)?;
+        let key = conn.0 as usize;
+        if !self.connections.contains(key) {
+            return Err(Error::InvalidConnection);
+        }
+        let c = &mut self.connections[key];
         let mut recv = c.conn.recv_stream(stream);
         let mut chunks = recv.read(true)?;
         let mut total = 0;
         let mut finished = false;
+        let mut read_err: Option<quinn_proto::ReadError> = None;
 
         while total < buf.len() {
             match chunks.next(buf.len() - total) {
@@ -354,12 +362,23 @@ impl QuicEndpoint {
                 }
                 Err(quinn_proto::ReadError::Blocked) => break,
                 Err(e) => {
-                    let _ = chunks.finalize();
-                    return Err(Error::Read(e));
+                    read_err = Some(e);
+                    break;
                 }
             }
         }
-        let _ = chunks.finalize();
+        // `finalize` signals that MAX_DATA / MAX_STREAM_DATA frames are now
+        // queued and should be flushed soon. Without honoring the hint the
+        // peer waits an extra tick before its flow-control window opens —
+        // measurable on quiescent connections that don't hit `flush()` or
+        // receive other datagrams quickly.
+        let should_transmit = chunks.finalize().should_transmit();
+        if should_transmit {
+            self.drain_transmits(key, Instant::now());
+        }
+        if let Some(e) = read_err {
+            return Err(Error::Read(e));
+        }
         Ok((total, finished))
     }
 
@@ -612,6 +631,15 @@ impl QuicEndpoint {
     fn drain_transmits(&mut self, key: usize, now: Instant) {
         let max_datagrams = self.max_transmit_datagrams;
         loop {
+            // Stop pulling from quinn the moment the send queue is full.
+            // Earlier this method always called `poll_transmit` and silently
+            // dropped on overflow, which left quinn's `bytes_in_flight` /
+            // congestion-control state out of sync with what we'd actually
+            // sent and risked losing CONNECTION_CLOSE packets on heavy socket
+            // backpressure.
+            if self.send_queue.len() >= self.send_queue_capacity {
+                break;
+            }
             self.transmit_buf.clear();
             let transmit = self.connections[key].conn.poll_transmit(
                 now,
@@ -626,7 +654,12 @@ impl QuicEndpoint {
                         _ => None,
                     };
                     let data = self.transmit_buf[..t.size].to_vec();
-                    self.queue_packet(t.destination, data, segment_size);
+                    if !self.queue_packet(t.destination, data, segment_size) {
+                        // Capacity check above should keep us out of this
+                        // branch, but if a future change loosens it the
+                        // explicit break here keeps behavior safe.
+                        break;
+                    }
                 }
                 None => break,
             }
@@ -786,14 +819,25 @@ impl QuicEndpoint {
         }
     }
 
-    fn queue_packet(&mut self, destination: SocketAddr, data: Vec<u8>, segment_size: Option<u16>) {
-        if self.send_queue.len() < self.send_queue_capacity {
-            self.send_queue.push_back(OutgoingPacket {
-                destination,
-                data,
-                segment_size,
-            });
+    /// Append a packet to the outgoing queue. Returns `true` if it was queued,
+    /// `false` if the queue was already at `send_queue_capacity` and the
+    /// packet was dropped. Callers driving quinn-proto's `poll_transmit` loop
+    /// should stop pulling on `false`; one-shot stateless responses (which
+    /// don't track in-flight state) can ignore the return value.
+    fn queue_packet(
+        &mut self,
+        destination: SocketAddr,
+        data: Vec<u8>,
+        segment_size: Option<u16>,
+    ) -> bool {
+        if self.send_queue.len() >= self.send_queue_capacity {
+            return false;
         }
-        // Drop excess packets — QUIC handles retransmission.
+        self.send_queue.push_back(OutgoingPacket {
+            destination,
+            data,
+            segment_size,
+        });
+        true
     }
 }
