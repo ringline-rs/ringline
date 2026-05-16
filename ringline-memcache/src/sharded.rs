@@ -143,6 +143,13 @@ impl ShardedClient {
     }
 
     /// Get a [`Client`] for a specific shard by index (for node-level commands).
+    ///
+    /// The returned `Client` borrows a slot's connection but the
+    /// [`ShardedClient`] no longer observes its outcome — if the caller
+    /// hits [`Error::ConnectionClosed`] on that client, no slot is marked
+    /// dead, and subsequent calls (including via [`ShardedClient::get`])
+    /// may keep hitting the same broken slot until reconnected
+    /// explicitly. Prefer routed commands when possible.
     pub async fn shard_client(&mut self, index: usize) -> Result<Client, Error> {
         let opts = self.connect_opts();
         let shard = &mut self.shards[index];
@@ -153,6 +160,15 @@ impl ShardedClient {
     // -- Core routing --------------------------------------------------------
 
     /// Route an encoded command to the shard owning `key`.
+    ///
+    /// Transport failures (synchronous `send` errors, or `ConnectionClosed`
+    /// from the response read) mark the offending slot dead and fall
+    /// through to the next slot in the shard; only after every slot has
+    /// been tried does the call resolve to [`Error::AllConnectionsFailed`].
+    /// Server-level errors (`ERROR` / `CLIENT_ERROR` / `SERVER_ERROR`) and
+    /// parse failures are NOT retried — the connection is still healthy
+    /// from the kernel's perspective, and retrying a doomed command would
+    /// just amplify the failure across the pool.
     async fn route_command(
         &mut self,
         key: &[u8],
@@ -176,10 +192,15 @@ impl ShardedClient {
                 },
             };
 
-            if let Err(e) = conn.send(encoded) {
+            if conn.send(encoded).is_err() {
+                // Synchronous send failure (EPIPE, ECONNRESET, etc.) — the
+                // conn is dead. Previously this branch returned `Err(Io)`
+                // immediately, bypassing the rest of the pool. Mark the
+                // slot dead and try the next slot, matching the
+                // `ConnectionClosed` branch below.
                 shard.conns[idx] = ShardConn::Disconnected;
                 conn.close();
-                return Err(Error::Io(e));
+                continue;
             }
             match Client::new(conn).read_response().await {
                 Ok(response) => {
@@ -216,7 +237,7 @@ impl ShardedClient {
     /// Get the value of a key. Returns `None` on cache miss.
     pub async fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Value>, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&memcache_proto::Request::get(key));
+        let encoded = encode_request(&memcache_proto::Request::get(key))?;
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponseBytes::Values(mut values) => {
@@ -241,7 +262,7 @@ impl ShardedClient {
             return Ok(Vec::new());
         }
         self.require_same_shard(keys)?;
-        let encoded = encode_request(&McRequest::gets(keys));
+        let encoded = encode_request(&McRequest::gets(keys))?;
         let response = self.route_command(keys[0], &encoded).await?;
         match response {
             McResponseBytes::Values(values) => Ok(values
@@ -276,7 +297,7 @@ impl ShardedClient {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_set(key, value, flags, exptime);
+        let encoded = encode_set(key, value, flags, exptime)?;
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(()),
@@ -293,7 +314,7 @@ impl ShardedClient {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_add(key, value);
+        let encoded = encode_add(key, value)?;
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(true),
@@ -316,7 +337,7 @@ impl ShardedClient {
             value,
             flags: 0,
             exptime: 0,
-        });
+        })?;
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(true),
@@ -329,7 +350,7 @@ impl ShardedClient {
     /// Returns `None` if the key does not exist.
     pub async fn incr(&mut self, key: impl AsRef<[u8]>, delta: u64) -> Result<Option<u64>, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&McRequest::incr(key, delta));
+        let encoded = encode_request(&McRequest::incr(key, delta))?;
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponseBytes::Numeric(val) => Ok(Some(val)),
@@ -342,7 +363,7 @@ impl ShardedClient {
     /// Returns `None` if the key does not exist.
     pub async fn decr(&mut self, key: impl AsRef<[u8]>, delta: u64) -> Result<Option<u64>, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&McRequest::decr(key, delta));
+        let encoded = encode_request(&McRequest::decr(key, delta))?;
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponseBytes::Numeric(val) => Ok(Some(val)),
@@ -360,7 +381,7 @@ impl ShardedClient {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_request(&McRequest::append(key, value));
+        let encoded = encode_request(&McRequest::append(key, value))?;
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(true),
@@ -378,7 +399,7 @@ impl ShardedClient {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_request(&McRequest::prepend(key, value));
+        let encoded = encode_request(&McRequest::prepend(key, value))?;
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(true),
@@ -398,7 +419,7 @@ impl ShardedClient {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_request(&McRequest::cas(key, value, cas_unique));
+        let encoded = encode_request(&McRequest::cas(key, value, cas_unique))?;
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(true),
@@ -411,7 +432,7 @@ impl ShardedClient {
     /// Delete a key. Returns `true` if deleted, `false` if not found.
     pub async fn delete(&mut self, key: impl AsRef<[u8]>) -> Result<bool, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&McRequest::delete(key));
+        let encoded = encode_request(&McRequest::delete(key))?;
         let response = self.route_command(key, &encoded).await?;
         match response {
             McResponseBytes::Deleted => Ok(true),
@@ -421,25 +442,99 @@ impl ShardedClient {
     }
 
     /// Flush all items on all shards.
+    ///
+    /// On a shard whose currently selected slot returns
+    /// [`Error::ConnectionClosed`], the slot is marked disconnected and
+    /// the next slot is tried — the previous implementation called
+    /// `Client::new(conn).flush_all()` on a conn borrowed from
+    /// `get_conn` and never propagated the broken-conn signal back, so a
+    /// dead slot would remain `Connected` and every subsequent
+    /// `flush_all` (or any other op) would land on the same dead slot.
     pub async fn flush_all(&mut self) -> Result<(), Error> {
         let opts = self.connect_opts();
         for shard in &mut self.shards {
-            let conn = get_conn(shard, &opts).await?;
-            Client::new(conn).flush_all().await?;
+            flush_all_on_shard(shard, &opts).await?;
         }
         Ok(())
     }
 
     /// Get the version string from any connected shard.
+    ///
+    /// As with [`Self::flush_all`], a [`Error::ConnectionClosed`] from
+    /// the inner call marks the slot disconnected and falls through to
+    /// the next slot / shard rather than leaving a dead slot wedged in
+    /// the `Connected` state.
     pub async fn version(&mut self) -> Result<Box<str>, Error> {
         let opts = self.connect_opts();
         for shard in &mut self.shards {
-            if let Ok(conn) = get_conn(shard, &opts).await {
-                return Client::new(conn).version().await;
+            match version_on_shard(shard, &opts).await {
+                Ok(v) => return Ok(v),
+                Err(Error::AllConnectionsFailed) => continue,
+                Err(e) => return Err(e),
             }
         }
         Err(Error::AllConnectionsFailed)
     }
+}
+
+/// Run `flush_all` on `shard`, retrying on the next slot when a
+/// [`Error::ConnectionClosed`] surfaces and marking the broken slot
+/// disconnected so future calls reconnect.
+async fn flush_all_on_shard(shard: &mut Shard, opts: &ConnectOpts) -> Result<(), Error> {
+    let size = shard.conns.len();
+    for _ in 0..size {
+        let idx = shard.next;
+        shard.next = (shard.next + 1) % size;
+        let conn = match &shard.conns[idx] {
+            ShardConn::Connected(c) => *c,
+            ShardConn::Disconnected => match do_connect(shard.addr, opts).await {
+                Ok(c) => {
+                    shard.conns[idx] = ShardConn::Connected(c);
+                    c
+                }
+                Err(_) => continue,
+            },
+        };
+        match Client::new(conn).flush_all().await {
+            Ok(()) => return Ok(()),
+            Err(Error::ConnectionClosed) => {
+                shard.conns[idx] = ShardConn::Disconnected;
+                conn.close();
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::AllConnectionsFailed)
+}
+
+/// Run `version` on `shard`, marking broken slots disconnected.
+async fn version_on_shard(shard: &mut Shard, opts: &ConnectOpts) -> Result<Box<str>, Error> {
+    let size = shard.conns.len();
+    for _ in 0..size {
+        let idx = shard.next;
+        shard.next = (shard.next + 1) % size;
+        let conn = match &shard.conns[idx] {
+            ShardConn::Connected(c) => *c,
+            ShardConn::Disconnected => match do_connect(shard.addr, opts).await {
+                Ok(c) => {
+                    shard.conns[idx] = ShardConn::Connected(c);
+                    c
+                }
+                Err(_) => continue,
+            },
+        };
+        match Client::new(conn).version().await {
+            Ok(v) => return Ok(v),
+            Err(Error::ConnectionClosed) => {
+                shard.conns[idx] = ShardConn::Disconnected;
+                conn.close();
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::AllConnectionsFailed)
 }
 
 /// Connection options cloned from config to avoid borrow conflicts.
