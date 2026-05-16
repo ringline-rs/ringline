@@ -39,7 +39,10 @@ pub struct PoolConfig {
 }
 
 enum Slot {
-    Connected(Client),
+    // `Client` is large enough (≥ 200 bytes) that storing it directly in
+    // an enum variant trips `clippy::large_enum_variant`. Box it so all
+    // slots have the same small footprint.
+    Connected(Box<Client>),
     Disconnected,
 }
 
@@ -73,7 +76,7 @@ impl Pool {
     pub async fn connect_all(&mut self) -> Result<(), Error> {
         for i in 0..self.slots.len() {
             let client = self.do_connect().await?;
-            self.slots[i] = Slot::Connected(client);
+            self.slots[i] = Slot::Connected(Box::new(client));
         }
         Ok(())
     }
@@ -93,15 +96,15 @@ impl Pool {
                 Slot::Connected(_) => {
                     // Return a mutable reference to the existing client
                     if let Slot::Connected(client) = &mut self.slots[idx] {
-                        return Ok(client);
+                        return Ok(client.as_mut());
                     }
                     unreachable!();
                 }
                 Slot::Disconnected => {
                     if let Ok(client) = self.do_connect().await {
-                        self.slots[idx] = Slot::Connected(client);
+                        self.slots[idx] = Slot::Connected(Box::new(client));
                         if let Slot::Connected(client) = &mut self.slots[idx] {
-                            return Ok(client);
+                            return Ok(client.as_mut());
                         }
                         unreachable!();
                     }

@@ -36,7 +36,12 @@ use ringline::{ConnCtx, ParseResult};
 // -- Error -------------------------------------------------------------------
 
 /// Errors returned by the ringline Ping client.
+///
+/// Marked `#[non_exhaustive]` because the crate is still evolving and new
+/// transport / protocol error kinds are expected. Downstream `match`
+/// blocks must include a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The connection was closed before a response was received.
     #[error("connection closed")]
@@ -63,6 +68,7 @@ pub enum Error {
 
 /// The type of Ping command that completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CommandType {
     Ping,
 }

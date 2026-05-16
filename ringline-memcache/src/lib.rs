@@ -141,7 +141,12 @@ type ResultCallback = Box<dyn Fn(&CommandResult)>;
 // -- Error -------------------------------------------------------------------
 
 /// Errors returned by the ringline Memcache client.
+///
+/// Marked `#[non_exhaustive]` because the crate is still evolving and new
+/// transport / protocol error kinds are expected. Downstream `match`
+/// blocks must include a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The connection was closed before a response was received.
     #[error("connection closed")]
@@ -170,6 +175,12 @@ pub enum Error {
     /// `recv()` called with no pending fire operations.
     #[error("no pending operations")]
     NoPending,
+
+    /// The in-flight pending-op queue reached `max_in_flight`. Drain via
+    /// `recv()` before issuing more `fire_*` calls. Configurable via
+    /// [`ClientBuilder::max_in_flight`].
+    #[error("too many in-flight operations")]
+    TooManyInFlight,
 }
 
 // -- Value types -------------------------------------------------------------
@@ -200,6 +211,7 @@ pub struct GetValue {
 
 /// The type of Memcache command that completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CommandType {
     Get,
     Set,
@@ -310,6 +322,7 @@ struct PendingOp {
 }
 
 /// A completed fire/recv operation with its result.
+#[non_exhaustive]
 pub enum CompletedOp {
     /// GET completed.
     Get {
@@ -337,6 +350,7 @@ pub enum CompletedOp {
 pub struct ClientBuilder {
     conn: ConnCtx,
     on_result: Option<ResultCallback>,
+    max_in_flight: usize,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -348,11 +362,21 @@ impl ClientBuilder {
         Self {
             conn,
             on_result: None,
+            max_in_flight: usize::MAX,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             with_metrics: false,
         }
+    }
+
+    /// Configure the maximum number of in-flight `fire_*` operations.
+    /// `fire_*` returns [`Error::TooManyInFlight`] past it. Defaults to
+    /// `usize::MAX` (unbounded). Set a bounded value on any server that
+    /// issues `fire_*` faster than `recv()` consumes.
+    pub fn max_in_flight(mut self, n: usize) -> Self {
+        self.max_in_flight = n;
+        self
     }
 
     /// Register a callback invoked after each command completes.
@@ -382,6 +406,7 @@ impl ClientBuilder {
             on_result: self.on_result,
             pending: VecDeque::with_capacity(16),
             last_rx_bytes: Cell::new(0),
+            max_in_flight: self.max_in_flight,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
             #[cfg(feature = "metrics")]
@@ -406,6 +431,9 @@ pub struct Client {
     on_result: Option<ResultCallback>,
     pending: VecDeque<PendingOp>,
     last_rx_bytes: Cell<u32>,
+    /// Cap on `pending.len()`; `fire_*` returns `Error::TooManyInFlight`
+    /// past it. `usize::MAX` (default) disables.
+    max_in_flight: usize,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -422,6 +450,7 @@ impl Client {
             on_result: None,
             pending: VecDeque::new(),
             last_rx_bytes: Cell::new(0),
+            max_in_flight: usize::MAX,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -555,8 +584,21 @@ impl Client {
         self.pending.len()
     }
 
+    /// Returns `Err(TooManyInFlight)` if the pending queue has hit
+    /// `max_in_flight`. Called at the start of every `fire_*` to enforce
+    /// the cap and bail before doing any encode / send work.
+    #[inline]
+    fn check_in_flight(&self) -> Result<(), Error> {
+        if self.pending.len() >= self.max_in_flight {
+            Err(Error::TooManyInFlight)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Fire a GET request without waiting for the response.
     pub fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
+        self.check_in_flight()?;
         let encoded = encode_request(&McRequest::get(key));
         let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
@@ -580,6 +622,7 @@ impl Client {
         exptime: u32,
         user_data: u64,
     ) -> Result<(), Error> {
+        self.check_in_flight()?;
         let encoded = encode_set(key, value, flags, exptime);
         let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
@@ -603,6 +646,7 @@ impl Client {
         exptime: u32,
         user_data: u64,
     ) -> Result<(), Error> {
+        self.check_in_flight()?;
         let (_, value_len) = guard.as_ptr_len();
         let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime);
         let tx_bytes = (prefix.len() + value_len as usize + 2) as u32;
@@ -625,6 +669,7 @@ impl Client {
 
     /// Fire a DELETE request without waiting for the response.
     pub fn fire_delete(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
+        self.check_in_flight()?;
         let encoded = encode_request(&McRequest::delete(key));
         let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
