@@ -17,6 +17,15 @@ pub const FRAME_GOAWAY: u64 = 0x07;
 /// HTTP/2 frame types that MUST NOT appear in HTTP/3 (RFC 9114 Section 7.2.8).
 const RESERVED_H2_TYPES: &[u64] = &[0x02, 0x03, 0x06, 0x08, 0x09];
 
+/// Upper bound on the payload length we'll accept for a single HTTP/3 frame.
+///
+/// A QUIC varint can encode up to 2^62 − 1; without a ceiling, a malicious or
+/// buggy peer can declare an enormous frame length and force the decoder to
+/// buffer toward that size before we ever see the payload. 16 MiB comfortably
+/// fits the largest HEADERS / DATA frames we expect in practice while keeping
+/// per-stream and control-stream memory bounded.
+pub const MAX_FRAME_PAYLOAD: u64 = 16 * 1024 * 1024;
+
 // ── QUIC Variable-Length Integer (RFC 9000 Section 16) ──────────────
 
 /// Encode a QUIC variable-length integer into `buf`.
@@ -156,8 +165,17 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, H3Error> {
         None => return Ok(None),
     };
 
+    // Reject pathological lengths before we let them anywhere near a usize
+    // cast or an allocation. Without this a peer can declare a 2^62-byte frame
+    // and force us to grow a recv buffer toward that size before we'd ever
+    // notice.
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(H3Error::ExcessiveSize);
+    }
+    let payload_len = payload_len as usize; // safe: bounded by MAX_FRAME_PAYLOAD
+
     let header_len = type_len + len_len;
-    let total_len = header_len + payload_len as usize;
+    let total_len = header_len + payload_len;
 
     // Check if we have the full frame.
     if buf.len() < total_len {
@@ -302,6 +320,22 @@ mod tests {
         encode_varint(&mut buf, 5);
         buf.extend_from_slice(b"he");
         assert!(decode_frame(&buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn oversize_frame_rejected() {
+        // A peer-declared payload length above MAX_FRAME_PAYLOAD must be
+        // rejected before we look at (or buffer toward) the payload.
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, FRAME_DATA);
+        encode_varint(&mut buf, MAX_FRAME_PAYLOAD + 1);
+        assert!(matches!(decode_frame(&buf), Err(H3Error::ExcessiveSize)));
+
+        // The pathological 2^62 - 1 ceiling that a malicious peer might use.
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, FRAME_DATA);
+        encode_varint(&mut buf, (1u64 << 62) - 1);
+        assert!(matches!(decode_frame(&buf), Err(H3Error::ExcessiveSize)));
     }
 
     #[test]

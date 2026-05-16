@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
-use ringline_quic::{QuicConnId, QuicEndpoint, QuicEvent, StreamId, WriteError};
+use ringline_quic::{QuicConnId, QuicEndpoint, QuicEvent, ReadError, StreamId, WriteError};
 
 use crate::error::H3Error;
 use crate::frame::{self, Frame, encode_frame_header};
@@ -62,6 +62,13 @@ pub enum H3Event {
     },
     /// Peer sent GOAWAY frame.
     GoAway { stream_id: u64 },
+    /// The peer reset a stream (`RESET_STREAM`) or asked us to stop sending
+    /// on it (`STOP_SENDING`). All buffered state for `stream_id` has been
+    /// dropped — any further calls on that stream will fail.
+    StreamReset {
+        stream_id: StreamId,
+        error_code: u64,
+    },
     /// Connection-level error.
     Error(H3Error),
 }
@@ -273,11 +280,28 @@ impl H3Connection {
             QuicEvent::StreamWritable { conn, stream } => {
                 self.drain_pending_stream(quic, *conn, *stream)?;
             }
+            QuicEvent::StreamStopped {
+                stream, error_code, ..
+            } => {
+                // Peer sent STOP_SENDING. Any further writes will fail; the
+                // queued chunks in pending_sends will never reach the wire and
+                // would otherwise pin memory for the life of the connection.
+                self.cleanup_request_stream(*stream);
+                self.events.push_back(H3Event::StreamReset {
+                    stream_id: *stream,
+                    error_code: error_code.into_inner(),
+                });
+            }
             QuicEvent::ConnectionClosed { .. } => {
                 self.state = H3State::Closed;
-                // Drop all queued outbound bytes — the connection is gone and
-                // none of them will ever reach the peer.
+                // Drop everything keyed by the now-dead connection. Without
+                // this, long-lived endpoints accumulate per-stream state for
+                // every connection they ever had.
                 self.pending_sends.clear();
+                self.request_streams.clear();
+                self.partial_uni_type_bufs.clear();
+                self.pending_uni_streams.clear();
+                self.control_recv_buf.clear();
                 // Signal the application that the connection is shutting down.
                 // GoAway rather than Error: callers waiting for graceful teardown
                 // see this as a clean termination; callers that also handle Error
@@ -402,6 +426,22 @@ impl H3Connection {
         self.pending_sends
             .get(&u64::from(stream_id))
             .is_some_and(|p| !p.queue.is_empty() || p.pending_fin)
+    }
+
+    /// Returns `true` if the H3 layer is tracking per-stream state for
+    /// `stream_id` (i.e. it has a `RequestStream` entry). Cleared once both
+    /// directions FIN, or when the peer aborts the stream. Useful for
+    /// asserting that long-lived connections aren't accumulating stale
+    /// state.
+    pub fn has_request_stream(&self, stream_id: StreamId) -> bool {
+        self.request_streams.contains_key(&u64::from(stream_id))
+    }
+
+    /// Number of streams the H3 layer is currently tracking. Drops to zero
+    /// once every request has completed (either gracefully via two-sided FIN,
+    /// or because the peer reset / stopped the stream).
+    pub fn tracked_stream_count(&self) -> usize {
+        self.request_streams.len()
     }
 
     // ── Internal helpers ────────────────────────────────────────────
@@ -548,14 +588,40 @@ impl H3Connection {
 
     /// Advance the request-stream state machine when the local send side
     /// closes (either immediately after a successful write or later after the
-    /// queue drains).
+    /// queue drains). Removes the entry once both halves are closed.
     fn finalize_local_close(&mut self, stream_id: StreamId) {
-        if let Some(rs) = self.request_streams.get_mut(&u64::from(stream_id)) {
+        let key = u64::from(stream_id);
+        let now_closed = if let Some(rs) = self.request_streams.get_mut(&key) {
             rs.state = match rs.state {
-                StreamState::HalfClosedRemote => StreamState::Closed,
+                StreamState::HalfClosedRemote | StreamState::Closed => StreamState::Closed,
                 _ => StreamState::HalfClosedLocal,
             };
+            rs.state == StreamState::Closed
+        } else {
+            false
+        };
+        if now_closed {
+            self.request_streams.remove(&key);
         }
+    }
+
+    /// Advance the request-stream state machine when the remote send side
+    /// closes (peer FIN). Removes the entry once both halves are closed.
+    fn finalize_remote_close(&mut self, stream_id: StreamId) -> bool {
+        let key = u64::from(stream_id);
+        let now_closed = if let Some(rs) = self.request_streams.get_mut(&key) {
+            rs.state = match rs.state {
+                StreamState::HalfClosedLocal | StreamState::Closed => StreamState::Closed,
+                _ => StreamState::HalfClosedRemote,
+            };
+            rs.state == StreamState::Closed
+        } else {
+            false
+        };
+        if now_closed {
+            self.request_streams.remove(&key);
+        }
+        now_closed
     }
 
     fn handle_stream_readable(
@@ -738,6 +804,17 @@ impl H3Connection {
         loop {
             let (n, fin) = match quic.stream_recv(conn, stream, &mut self.read_buf) {
                 Ok(r) => r,
+                Err(ringline_quic::Error::Read(ReadError::Reset(code))) => {
+                    // Peer reset the stream. Without an explicit signal, the
+                    // application would sit forever awaiting body bytes that
+                    // will never come, and our per-stream state would linger.
+                    self.cleanup_request_stream(stream);
+                    self.events.push_back(H3Event::StreamReset {
+                        stream_id: stream,
+                        error_code: code.into_inner(),
+                    });
+                    return Ok(());
+                }
                 Err(_) => break,
             };
             if n > 0
@@ -755,6 +832,15 @@ impl H3Connection {
 
         // Process frames from the stream's recv_buf.
         self.process_request_frames(stream, fin_received)
+    }
+
+    /// Drop all per-stream state for `stream`. Used when the peer aborts the
+    /// stream (STOP_SENDING, RESET_STREAM) or when both directions are FINed.
+    fn cleanup_request_stream(&mut self, stream: StreamId) {
+        let key = u64::from(stream);
+        self.pending_sends.remove(&key);
+        self.request_streams.remove(&key);
+        self.partial_uni_type_bufs.remove(&key);
     }
 
     fn process_request_frames(
@@ -791,13 +877,18 @@ impl H3Connection {
                                 .get(&u64::from(stream))
                                 .is_some_and(|rs| rs.client_initiated);
 
-                            // Update stream state.
-                            if let Some(rs) = self.request_streams.get_mut(&u64::from(stream)) {
-                                rs.state = if at_end {
-                                    StreamState::HalfClosedRemote
-                                } else {
-                                    StreamState::Open
-                                };
+                            // Update stream state. If we already FINed the local
+                            // half, the peer FIN here closes the stream entirely
+                            // and `finalize_remote_close` drops the entry.
+                            // Otherwise advance into Open only from
+                            // WaitingHeaders — never clobber HalfClosedLocal.
+                            if at_end {
+                                self.finalize_remote_close(stream);
+                            } else if let Some(rs) =
+                                self.request_streams.get_mut(&u64::from(stream))
+                                && rs.state == StreamState::WaitingHeaders
+                            {
+                                rs.state = StreamState::Open;
                             }
 
                             if client_initiated {
@@ -817,10 +908,8 @@ impl H3Connection {
                         Frame::Data { payload } => {
                             let at_end = fin_received && offset == recv_buf.len();
 
-                            if at_end
-                                && let Some(rs) = self.request_streams.get_mut(&u64::from(stream))
-                            {
-                                rs.state = StreamState::HalfClosedRemote;
+                            if at_end {
+                                self.finalize_remote_close(stream);
                             }
 
                             self.events.push_back(H3Event::Data {
@@ -856,13 +945,16 @@ impl H3Connection {
 
         // Handle FIN with no remaining frames — the stream is done.
         if fin_received && offset == recv_buf.len() {
-            // If the stream was still WaitingHeaders when FIN arrived with no data,
-            // that's fine — the stream just closed without sending anything.
-            if let Some(rs) = self.request_streams.get_mut(&u64::from(stream))
-                && rs.state == StreamState::Open
-            {
-                rs.state = StreamState::HalfClosedRemote;
-                // Emit a Data event with empty body to signal end_stream.
+            // Synthesize an end-of-stream Data event for streams that received
+            // HEADERS but no DATA frame carrying the FIN. WaitingHeaders + FIN
+            // (peer cancelled before headers) or HalfClosedLocal + FIN (already
+            // FINed) just drive the state machine — no event.
+            let emit_empty_fin = self
+                .request_streams
+                .get(&u64::from(stream))
+                .is_some_and(|rs| rs.state == StreamState::Open);
+            self.finalize_remote_close(stream);
+            if emit_empty_fin {
                 self.events.push_back(H3Event::Data {
                     stream_id: stream,
                     data: Vec::new(),
@@ -871,7 +963,9 @@ impl H3Connection {
             }
         }
 
-        // Put unconsumed data back.
+        // Put unconsumed data back if the entry still exists. If
+        // finalize_remote_close removed the stream, we drop the (already fully
+        // consumed) buffer.
         if offset > 0 {
             recv_buf.drain(..offset);
         }

@@ -9,6 +9,8 @@ pub enum H3Error {
     MissingSettings,
     /// Frame decoding error (truncated varint, invalid payload, etc.).
     FrameError,
+    /// A frame's declared payload length exceeds the implementation limit.
+    ExcessiveSize,
     /// QPACK header block decoding failed.
     QpackDecodingFailed,
     /// A critical stream (control) was closed prematurely.
@@ -24,6 +26,7 @@ impl std::fmt::Display for H3Error {
             Self::FrameUnexpected => write!(f, "unexpected frame type"),
             Self::MissingSettings => write!(f, "missing SETTINGS on control stream"),
             Self::FrameError => write!(f, "frame error"),
+            Self::ExcessiveSize => write!(f, "frame payload exceeds size limit"),
             Self::QpackDecodingFailed => write!(f, "QPACK decoding failed"),
             Self::ClosedCriticalStream => write!(f, "critical stream closed"),
             Self::Internal(s) => write!(f, "internal: {s}"),
