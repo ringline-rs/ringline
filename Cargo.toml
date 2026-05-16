@@ -12,6 +12,7 @@ members = [
     "ringline-grpc",
     "ringline-http",
     "ringline-bench",
+    "ringline-benchmarks",
 ]
 
 [workspace.package]
@@ -23,6 +24,15 @@ repository = "https://github.com/brayniac/ringline"
 [workspace.dependencies]
 # Internal crates
 ringline = { path = "ringline", version = "0.1" }
+ringline-quic = { path = "ringline-quic" }
+ringline-http = { path = "ringline-http" }
+ringline-h2 = { path = "ringline-h2" }
+ringline-h3 = { path = "ringline-h3" }
+ringline-redis = { path = "ringline-redis" }
+ringline-memcache = { path = "ringline-memcache" }
+ringline-momento = { path = "ringline-momento" }
+ringline-grpc = { path = "ringline-grpc" }
+ringline-ping = { path = "ringline-ping" }
 resp-proto = "0.0.1"
 memcache-proto = "0.0.2"
 ping-proto = "0.0.1"

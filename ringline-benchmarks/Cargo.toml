@@ -1,0 +1,35 @@
+[package]
+name = "ringline-benchmarks"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "ringline-benchmarks"
+path = "src/main.rs"
+
+[dependencies]
+ringline = { workspace = true }
+ringline-quic = { workspace = true }
+ringline-http = { workspace = true }
+ringline-h2 = { workspace = true }
+ringline-h3 = { workspace = true }
+ringline-redis = { workspace = true }
+ringline-memcache = { workspace = true }
+ringline-momento = { workspace = true }
+ringline-grpc = { workspace = true }
+ringline-ping = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+quinn-proto = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }
+bytes = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = { workspace = true }
+crossbeam-channel = "0.5"
