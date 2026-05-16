@@ -1,6 +1,12 @@
 /// gRPC status codes (<https://grpc.github.io/grpc/core/md_doc_statuscodes.html>).
+///
+/// Marked `#[non_exhaustive]` because the gRPC status code list is
+/// occasionally extended (the IANA registry currently stops at 16, but
+/// new codes could be added). Downstream `match` blocks must include a
+/// wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum GrpcStatus {
     Ok = 0,
     Cancelled = 1,
@@ -72,7 +78,10 @@ impl std::fmt::Display for GrpcStatus {
 }
 
 /// Errors produced by the gRPC framing layer.
+///
+/// Marked `#[non_exhaustive]` because the crate is still evolving.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum GrpcError {
     /// Underlying HTTP/2 error.
     H2(ringline_h2::H2Error),

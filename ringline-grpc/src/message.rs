@@ -4,22 +4,53 @@
 /// arbitrarily large allocations by sending a fake length header.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
+/// Error returned when [`encode`] / [`encode_compressed`] receive a payload
+/// that wouldn't fit in gRPC's 32-bit length prefix.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EncodeTooLarge {
+    pub len: usize,
+}
+
+impl std::fmt::Display for EncodeTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gRPC message payload {} exceeds u32::MAX (4 GiB - 1)",
+            self.len,
+        )
+    }
+}
+
+impl std::error::Error for EncodeTooLarge {}
+
 /// Encode a gRPC length-prefixed message (uncompressed).
 ///
 /// Format: 1 byte compress flag (0 = uncompressed) + 4 byte big-endian length + payload.
-pub fn encode(payload: &[u8], out: &mut Vec<u8>) {
+/// Returns `Err(EncodeTooLarge)` if the payload exceeds `u32::MAX` bytes —
+/// without this guard the `as u32` cast truncates and produces a frame
+/// with a wrong-length prefix.
+pub fn encode(payload: &[u8], out: &mut Vec<u8>) -> Result<(), EncodeTooLarge> {
+    let len = u32::try_from(payload.len()).map_err(|_| EncodeTooLarge { len: payload.len() })?;
     out.push(0); // compress flag: uncompressed
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(payload);
+    Ok(())
 }
 
 /// Encode a gRPC length-prefixed message with compression.
 ///
 /// The payload should already be compressed. Sets the compress flag to 1.
-pub fn encode_compressed(compressed_payload: &[u8], out: &mut Vec<u8>) {
+pub fn encode_compressed(
+    compressed_payload: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeTooLarge> {
+    let len = u32::try_from(compressed_payload.len()).map_err(|_| EncodeTooLarge {
+        len: compressed_payload.len(),
+    })?;
     out.push(1); // compress flag: compressed
-    out.extend_from_slice(&(compressed_payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(compressed_payload);
+    Ok(())
 }
 
 /// Result of attempting to decode a gRPC length-prefixed message from a buffer.
@@ -145,7 +176,7 @@ mod tests {
     fn encode_decode_round_trip() {
         let payload = b"hello grpc";
         let mut buf = Vec::new();
-        encode(payload, &mut buf);
+        encode(payload, &mut buf).unwrap();
 
         assert_eq!(buf.len(), 5 + payload.len());
         assert_eq!(buf[0], 0); // no compression
@@ -181,7 +212,7 @@ mod tests {
     #[test]
     fn decode_incomplete_payload() {
         let mut buf = Vec::new();
-        encode(b"hello", &mut buf);
+        encode(b"hello", &mut buf).unwrap();
         // Truncate to just the header + 2 bytes of payload.
         buf.truncate(7);
         assert_eq!(decode(&buf, usize::MAX), DecodeResult::Incomplete(3));
@@ -190,7 +221,7 @@ mod tests {
     #[test]
     fn encode_empty_message() {
         let mut buf = Vec::new();
-        encode(b"", &mut buf);
+        encode(b"", &mut buf).unwrap();
         assert_eq!(buf, &[0, 0, 0, 0, 0]);
         match decode(&buf, usize::MAX) {
             DecodeResult::Complete {
@@ -211,10 +242,31 @@ mod tests {
     }
 
     #[test]
+    fn decode_u32_max_rejected() {
+        // The pathological case the audit flagged.
+        let mut buf = vec![0u8];
+        buf.extend_from_slice(&u32::MAX.to_be_bytes());
+        match decode(&buf, DEFAULT_MAX_MESSAGE_SIZE) {
+            DecodeResult::TooLarge(_) => {}
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_too_large_error() {
+        // 5 GiB payload would exceed u32::MAX.
+        let data = vec![0u8; 5 * 1024 * 1024 * 1024];
+        assert!(encode(&data, &mut Vec::new()).is_err());
+        // 3 GiB fits.
+        let data = vec![0u8; 3 * 1024 * 1024 * 1024];
+        assert!(encode(&data, &mut Vec::new()).is_ok());
+    }
+
+    #[test]
     fn message_buffer_reassembly() {
         let payload = b"reassembled message";
         let mut encoded = Vec::new();
-        encode(payload, &mut encoded);
+        encode(payload, &mut encoded).unwrap();
 
         let mut mb = MessageBuffer::default();
         assert!(mb.is_empty());
@@ -240,8 +292,8 @@ mod tests {
     #[test]
     fn message_buffer_multiple_messages() {
         let mut encoded = Vec::new();
-        encode(b"first", &mut encoded);
-        encode(b"second", &mut encoded);
+        encode(b"first", &mut encoded).unwrap();
+        encode(b"second", &mut encoded).unwrap();
 
         let mut mb = MessageBuffer::default();
         mb.push(&encoded).unwrap();
