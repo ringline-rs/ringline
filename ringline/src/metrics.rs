@@ -54,6 +54,10 @@ pub mod ring {
     pub const SQE_SUBMIT_FAILURES: usize = 1;
     pub const CLOSE_SUBMIT_FAILURES: usize = 2;
     pub const RECV_ARM_FAILURES: usize = 3;
+    /// A CQE arrived with an `OpTag` that `OpTag::from_u8` doesn't
+    /// recognise. Indicates either a corrupted user_data or a future
+    /// reorder of the `OpTag` enum that left a stale value in flight.
+    pub const CQE_UNKNOWN_TAG: usize = 4;
 }
 
 /// Counter slot indices for pool exhaustion metrics.
@@ -107,6 +111,7 @@ pub fn init_metadata() {
         "op".into(),
         "recv_arm_failures".into(),
     );
+    RING.insert_metadata(ring::CQE_UNKNOWN_TAG, "op".into(), "cqe_unknown_tag".into());
 
     POOL.insert_metadata(pool::SEND_EXHAUSTED, "op".into(), "send_exhausted".into());
     POOL.insert_metadata(pool::TIMER_EXHAUSTED, "op".into(), "timer_exhausted".into());

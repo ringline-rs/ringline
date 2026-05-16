@@ -71,7 +71,13 @@ impl SendChainTable {
     /// # Panics (debug)
     /// Panics if a chain is already active for this connection.
     pub fn start(&mut self, conn_index: u32, total_sqes: u16, total_bytes: u32) {
-        let slot = &mut self.chains[conn_index as usize];
+        let slot = match self.chains.get_mut(conn_index as usize) {
+            Some(s) => s,
+            None => {
+                debug_assert!(false, "chain start: conn_index {conn_index} out of range");
+                return;
+            }
+        };
         debug_assert!(
             slot.is_none(),
             "starting chain on conn {conn_index} with existing active chain"
@@ -98,9 +104,9 @@ impl SendChainTable {
 
     /// Record an operation CQE result. Returns the chain event.
     pub fn on_operation_cqe(&mut self, conn_index: u32, result: i32) -> ChainEvent {
-        let chain = match &mut self.chains[conn_index as usize] {
-            Some(c) => c,
-            None => return ChainEvent::Pending,
+        let chain = match self.chains.get_mut(conn_index as usize) {
+            Some(Some(c)) => c,
+            _ => return ChainEvent::Pending,
         };
 
         chain.cqes_received += 1;
@@ -120,16 +126,16 @@ impl SendChainTable {
 
     /// Increment expected ZC notifications for a chain.
     pub fn inc_zc_notif(&mut self, conn_index: u32) {
-        if let Some(ref mut chain) = self.chains[conn_index as usize] {
+        if let Some(Some(chain)) = self.chains.get_mut(conn_index as usize) {
             chain.zc_notifs_pending += 1;
         }
     }
 
     /// Record a ZC notification CQE. Returns the chain event.
     pub fn on_notif_cqe(&mut self, conn_index: u32) -> ChainEvent {
-        let chain = match &mut self.chains[conn_index as usize] {
-            Some(c) => c,
-            None => return ChainEvent::Pending,
+        let chain = match self.chains.get_mut(conn_index as usize) {
+            Some(Some(c)) => c,
+            _ => return ChainEvent::Pending,
         };
 
         debug_assert!(
@@ -142,19 +148,21 @@ impl SendChainTable {
     }
 
     /// Take and clear the chain state for a connection.
-    /// Returns `None` if no chain is active.
+    /// Returns `None` if no chain is active or the index is out of range.
     pub fn take(&mut self, conn_index: u32) -> Option<ChainState> {
-        self.chains[conn_index as usize].take()
+        self.chains
+            .get_mut(conn_index as usize)
+            .and_then(|s| s.take())
     }
 
     /// Force-cancel a chain (used on connection close).
     /// Returns the total bytes in the chain (for logging/metrics).
     pub fn cancel(&mut self, conn_index: u32) -> u32 {
-        if let Some(chain) = self.chains[conn_index as usize].take() {
-            chain.total_bytes
-        } else {
-            0
-        }
+        self.chains
+            .get_mut(conn_index as usize)
+            .and_then(|s| s.take())
+            .map(|chain| chain.total_bytes)
+            .unwrap_or(0)
     }
 }
 

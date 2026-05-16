@@ -576,7 +576,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let ud = UserData(user_data_raw);
         let tag = match ud.tag() {
             Some(t) => t,
-            None => return,
+            None => {
+                // Unknown OpTag — most likely a future enum reorder or a
+                // corrupted CQE. In debug builds, panic so the bug surfaces;
+                // in release, swallow but increment the metric so it's at
+                // least observable.
+                debug_assert!(
+                    false,
+                    "dispatch_cqe: unknown OpTag {:#x} in user_data {:#x}",
+                    (user_data_raw >> 56) & 0xFF,
+                    user_data_raw,
+                );
+                metrics::RING.increment(metrics::ring::CQE_UNKNOWN_TAG);
+                return;
+            }
         };
 
         match tag {
@@ -762,10 +775,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     sink.pos += to_sink;
                 }
                 // Overflow (trailing CRLF, next commands) goes to accumulator.
-                if to_sink < data.len() {
-                    self.driver
+                if to_sink < data.len()
+                    && !self
+                        .driver
                         .accumulators
-                        .append(conn_index, &data[to_sink..]);
+                        .append(conn_index, &data[to_sink..])
+                {
+                    self.executor.wake_recv(conn_index);
+                    self.driver.close_connection(conn_index);
+                    return;
                 }
             } else {
                 // Zero-copy fast path: if no pending buffer AND accumulator is
@@ -781,15 +799,29 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     });
                 } else {
                     // Flush any existing pending buffer to accumulator first.
+                    let mut accumulator_overflowed = false;
                     if let Some(pending) = slot.take() {
                         let pending_data = unsafe {
                             std::slice::from_raw_parts(pending.ptr, pending.len as usize)
                         };
-                        self.driver.accumulators.append(conn_index, pending_data);
+                        if !self.driver.accumulators.append(conn_index, pending_data) {
+                            accumulator_overflowed = true;
+                        }
                         self.driver.pending_replenish.push(pending.bid);
                     }
-                    self.driver.accumulators.append(conn_index, data);
+                    if !accumulator_overflowed && !self.driver.accumulators.append(conn_index, data)
+                    {
+                        accumulator_overflowed = true;
+                    }
                     self.driver.pending_replenish.push(bid);
+                    if accumulator_overflowed {
+                        // Handler kept returning NeedMore while the peer
+                        // streamed past `recv_accumulator_max`. Close the
+                        // connection rather than OOM the worker.
+                        self.executor.wake_recv(conn_index);
+                        self.driver.close_connection(conn_index);
+                        return;
+                    }
                 }
             }
             self.executor.wake_recv(conn_index);
@@ -908,13 +940,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 sink.pos += to_sink;
             }
-            if to_sink < payload.len() {
-                self.driver
+            if to_sink < payload.len()
+                && !self
+                    .driver
                     .accumulators
-                    .append(conn_index, &payload[to_sink..]);
+                    .append(conn_index, &payload[to_sink..])
+            {
+                self.executor.wake_recv(conn_index);
+                self.driver.close_connection(conn_index);
+                return;
             }
-        } else {
-            self.driver.accumulators.append(conn_index, payload);
+        } else if !self.driver.accumulators.append(conn_index, payload) {
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+            return;
         }
         self.executor.wake_recv(conn_index);
 
@@ -1513,6 +1552,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
+        // Orphaned-future guard: if the ConnectFuture was dropped while the
+        // SQE was in flight (e.g. `select!` with a timeout that won), no
+        // task will pick up this connection — and we don't have an
+        // `on_accept` path for outbound connects. Letting the slot go
+        // "established" would leak it until the peer closes (which may be
+        // never). Close it now instead.
+        if !self.executor.connect_waiters[conn_index as usize] {
+            if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
+                self.driver.pending_replenish.push(pending.bid);
+            }
+            self.driver.accumulators.reset(conn_index);
+            if let Some(ref mut tls_table) = self.driver.tls_table {
+                tls_table.remove(conn_index);
+            }
+            self.driver.close_connection(conn_index);
+            return;
+        }
+
         if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
             self.driver.pending_replenish.push(pending.bid);
         }
@@ -2075,10 +2132,34 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Spawn an async task for a newly accepted connection.
+    ///
+    /// The handler's `on_accept` future *constructor* (everything before
+    /// the first `.await`, including any async-block initializer code) runs
+    /// synchronously inside this method. `poll_ready_tasks` catches panics
+    /// from the future's `poll`, but a panic during construction would
+    /// otherwise tear down the worker thread along with every other
+    /// connection on it. We wrap construction in `catch_unwind` and close
+    /// the connection on panic instead.
     fn spawn_accept_task(&mut self, conn_index: u32) {
         let generation = self.driver.connections.generation(conn_index);
         let conn_ctx = ConnCtx::new(conn_index, generation);
-        let future = Box::pin(self.handler.on_accept(conn_ctx));
+        // SAFETY: `AssertUnwindSafe` is required because `self.handler` is
+        // not `UnwindSafe`. A panic here is treated like a fatal handler
+        // error — the connection is closed; the worker continues serving
+        // others.
+        let future_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Box::pin(self.handler.on_accept(conn_ctx))
+        }));
+        let future = match future_result {
+            Ok(f) => f,
+            Err(_) => {
+                // Handler panicked during async-block construction.
+                // Close the connection and skip task setup. Don't propagate
+                // — the worker keeps serving its other connections.
+                self.driver.close_connection(conn_index);
+                return;
+            }
+        };
         self.executor.owner_task[conn_index as usize] = Some(conn_index);
         self.executor.task_slab.spawn(conn_index, future);
         self.executor.ready_queue.push_back(conn_index);

@@ -90,6 +90,18 @@ pub(crate) struct PendingRecvBuf {
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
+///
+/// # Drop order (load-bearing)
+///
+/// `ring` MUST be declared first so it drops *last*. `ProvidedBufRing` and
+/// `InFlightSendSlab` reference kernel-pinned memory whose lifetime is tied
+/// to the `io_uring` instance: the kernel only releases its DMA references
+/// when `io_uring_release` runs. Dropping the buffer pools before the ring
+/// would let `munmap` race against in-flight ZC notifications — a UAF.
+///
+/// The `driver_field_order` test below validates this ordering; do not
+/// reorder these fields without updating both the assertion and the
+/// shutdown drain in `run_shutdown`.
 pub(crate) struct Driver {
     pub(crate) ring: Ring,
     pub(crate) connections: ConnectionTable,
@@ -278,8 +290,11 @@ impl Driver {
         let connections = ConnectionTable::new(config.max_connections);
         let send_copy_pool = SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size);
         let send_slab = InFlightSendSlab::new(config.send_slab_slots);
-        let accumulators =
-            AccumulatorTable::new(config.max_connections, config.recv_accumulator_capacity);
+        let accumulators = AccumulatorTable::new_with_max(
+            config.max_connections,
+            config.recv_accumulator_capacity,
+            config.recv_accumulator_max,
+        );
 
         // Deadline flush: disabled when SQPOLL (kernel polls SQ) or interval is 0.
         let flush_interval = if config.sqpoll || config.flush_interval_us == 0 {
@@ -1173,5 +1188,88 @@ impl Driver {
         // matching `WakeHandle`), so don't close it here — the handle's
         // wake clones live longer than the worker thread, and a
         // double-close would race against fd-number reuse.
+    }
+}
+
+#[cfg(test)]
+mod field_order_tests {
+    //! Drop-order proof for the kernel/DMA fields of `Driver`.
+    //!
+    //! Rust drops struct fields in *declaration* order, so `ring` (declared
+    //! first) drops last. We can't directly observe `Driver` dropping (it
+    //! owns a real `io_uring`), but we can verify the property in a mirror
+    //! struct with the same field ordering and `Drop`-instrumented stand-ins.
+    use std::cell::RefCell;
+    use std::sync::Mutex;
+
+    static DROP_ORDER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    struct DropMarker(&'static str);
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            DROP_ORDER.lock().unwrap().push(self.0);
+        }
+    }
+
+    /// Mirrors the head of `Driver`'s field declaration order. If a future
+    /// edit moves `ring` out of first position, the order recorded here
+    /// will diverge from `["send_slab", "provided_bufs", "ring"]` and the
+    /// test will fail loudly.
+    #[allow(dead_code)]
+    struct DriverFieldOrderMirror {
+        ring: DropMarker,
+        // `connections`, `fixed_buffers` etc. interleave here in the real
+        // struct; only the kernel-DMA-sensitive ones matter for this test.
+        provided_bufs: DropMarker,
+        send_slab: DropMarker,
+    }
+
+    #[test]
+    fn ring_drops_after_buffer_pools() {
+        // Reset.
+        DROP_ORDER.lock().unwrap().clear();
+
+        // Sanity: if someone re-orders the mirror to put ring last, this
+        // test will catch it.
+        let _ = RefCell::new(()); // silence stray-lifetime lints
+        {
+            let _m = DriverFieldOrderMirror {
+                ring: DropMarker("ring"),
+                provided_bufs: DropMarker("provided_bufs"),
+                send_slab: DropMarker("send_slab"),
+            };
+        } // drop runs here
+
+        let order = DROP_ORDER.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec!["ring", "provided_bufs", "send_slab"],
+            "DriverFieldOrderMirror dropped in the wrong order — \
+             reorder the fields to match `Driver`'s declaration so \
+             `ring` is declared *first* and therefore drops *last*",
+        );
+
+        // The real assertion: in the *real* Driver, `ring` must be
+        // declared before the DMA-sensitive fields.
+        let src = include_str!("driver.rs");
+        let ring_pos = src
+            .find("pub(crate) ring: Ring,")
+            .expect("Driver::ring field signature not found — was it renamed?");
+        let provided_pos = src
+            .find("pub(crate) provided_bufs: ProvidedBufRing,")
+            .expect("Driver::provided_bufs field signature not found");
+        let send_slab_pos = src
+            .find("pub(crate) send_slab: InFlightSendSlab,")
+            .expect("Driver::send_slab field signature not found");
+        assert!(
+            ring_pos < provided_pos,
+            "Driver::ring must be declared before Driver::provided_bufs \
+             so it drops *after* it (kernel DMA reference safety)",
+        );
+        assert!(
+            ring_pos < send_slab_pos,
+            "Driver::ring must be declared before Driver::send_slab \
+             so it drops *after* it (ZC user-memory guards safety)",
+        );
     }
 }

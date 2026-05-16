@@ -46,6 +46,14 @@ pub struct ConnectionState {
     /// Whether the connection is active.
     pub active: bool,
     /// Generation counter to detect stale ConnTokens.
+    ///
+    /// `u32` wraps after 2^32 close/reuse cycles on the same slot — at a
+    /// sustained 10 000 reuses per second per slot that's ~5 days, at
+    /// realistic per-slot reuse rates many years. Widening to `u64`
+    /// cascades into a clippy `large_enum_variant` warning in downstream
+    /// protocol crates whose `Client` structs carry a `ConnCtx` — if the
+    /// wrap risk becomes practical, widen *and* box the affected
+    /// downstream variants in the same change.
     pub generation: u32,
     /// Whether this is an outbound (connect) connection.
     pub outbound: bool,
@@ -251,7 +259,10 @@ mod tests {
         let mut table = ConnectionTable::new(1);
         let idx = table.allocate().unwrap();
 
-        // Manually set generation near max.
+        // Manually set generation near max. At realistic per-slot reuse
+        // rates this takes weeks to months to reach in practice; see the
+        // doc-comment on `ConnectionState::generation` for the trade-off
+        // with downstream protocol crate enum sizes.
         table.slots[idx as usize].generation = u32::MAX;
         table.release(idx);
         assert_eq!(table.generation(idx), 0); // wraps to 0

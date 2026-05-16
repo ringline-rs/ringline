@@ -170,9 +170,10 @@ impl Driver {
 
         Ok(Driver {
             connections: ConnectionTable::new(config.max_connections),
-            accumulators: AccumulatorTable::new(
+            accumulators: AccumulatorTable::new_with_max(
                 config.max_connections,
                 config.recv_buffer.buffer_size as usize,
+                config.recv_accumulator_max,
             ),
             send_copy_pool: SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size),
             send_queues: (0..max_conn).map(|_| ConnSendState::new()).collect(),

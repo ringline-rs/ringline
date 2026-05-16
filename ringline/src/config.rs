@@ -65,6 +65,23 @@ pub struct Config {
     pub max_connections: u32,
     /// Initial capacity for per-connection recv accumulators.
     pub recv_accumulator_capacity: usize,
+    /// Upper bound on a single per-connection recv accumulator. If the
+    /// application's parser keeps returning `NeedMore` while the peer
+    /// streams data, the accumulator grows indefinitely; setting this
+    /// closes the connection once the cap is exceeded, protecting the
+    /// worker from OOM.
+    ///
+    /// **Default: `usize::MAX` (disabled).** A bounded value should be set
+    /// for any server that accepts data from untrusted peers. Sensible
+    /// values are 4–16× the typical request size; setting it too low
+    /// will close legitimate slow-consumer workloads (where kernel recv
+    /// CQEs batch faster than the handler runs).
+    pub recv_accumulator_max: usize,
+    /// Bound on the per-worker accept channel. If a worker can't drain its
+    /// queue fast enough, the acceptor will skip past it (and possibly
+    /// close the incoming fd if every worker is full) rather than
+    /// accumulating fds without backpressure. Default: 1024.
+    pub accept_queue_capacity: usize,
     /// Number of copy-send pool slots. Each in-flight `send()` or copy part of a
     /// `send_parts()` call holds one slot until the kernel completes the send.
     /// Size this to cover your peak in-flight send count — exhaustion returns an
@@ -205,6 +222,8 @@ impl Default for Config {
             backlog: 1024,
             max_connections: 16000,
             recv_accumulator_capacity: 4096,
+            recv_accumulator_max: usize::MAX,
+            accept_queue_capacity: 1024,
             send_copy_count: 1024,
             send_copy_slot_size: 16384,
             send_slab_slots: 512,
@@ -242,7 +261,13 @@ impl Config {
                 "recv_buffer.ring_size must be a power of two".into(),
             ));
         }
-        if self.recv_buffer.buffer_size == 0 || self.recv_buffer.buffer_size > 65535 {
+        // Load-bearing upper bound: the `SendRecvBuf` user_data encoding in
+        // `runtime/io.rs` packs `pending.len` (== buffer fill) into the high
+        // 16 bits of the 32-bit payload. Lifting this past `u16::MAX` would
+        // silently truncate the encoded length on release builds.
+        const MAX_RECV_BUFFER_SIZE: u32 = u16::MAX as u32;
+        if self.recv_buffer.buffer_size == 0 || self.recv_buffer.buffer_size > MAX_RECV_BUFFER_SIZE
+        {
             return Err(crate::error::Error::RingSetup(
                 "recv_buffer.buffer_size must be > 0 and <= 65535".into(),
             ));
