@@ -78,6 +78,11 @@ pub enum GrpcError {
     H2(ringline_h2::H2Error),
     /// Invalid gRPC message framing (truncated prefix, etc.).
     InvalidMessage(String),
+    /// A configured resource cap was exceeded — e.g. a single gRPC message
+    /// claiming a length over `max_message_size`, decompressed output over
+    /// `max_decompressed_size`, or a per-stream reassembly buffer over the
+    /// max-message threshold.
+    MaxSizeExceeded(String),
     /// Connection is not ready (settings exchange incomplete).
     NotReady,
 }
@@ -87,6 +92,7 @@ impl std::fmt::Display for GrpcError {
         match self {
             Self::H2(e) => write!(f, "h2: {e}"),
             Self::InvalidMessage(s) => write!(f, "invalid grpc message: {s}"),
+            Self::MaxSizeExceeded(s) => write!(f, "max size exceeded: {s}"),
             Self::NotReady => write!(f, "connection not ready"),
         }
     }

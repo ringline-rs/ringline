@@ -1,3 +1,9 @@
+/// Default cap on a single gRPC message size. Mirrors the gRPC standard
+/// `grpc.max_receive_message_length` of 4 MiB. The length prefix is u32
+/// (up to 4 GiB) so without a cap a misbehaving peer can request
+/// arbitrarily large allocations by sending a fake length header.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
 /// Encode a gRPC length-prefixed message (uncompressed).
 ///
 /// Format: 1 byte compress flag (0 = uncompressed) + 4 byte big-endian length + payload.
@@ -27,19 +33,24 @@ pub enum DecodeResult {
     },
     /// Not enough data yet; need at least this many more bytes.
     Incomplete(usize),
+    /// The length prefix is larger than `max_message_size`. Caller must
+    /// fail the stream — there's no way to recover framing once we've
+    /// decided to skip a length that big.
+    TooLarge(usize),
 }
 
-/// Try to decode one gRPC length-prefixed message from the front of `buf`.
-///
-/// Returns `Complete` with the payload, compress flag, and total consumed bytes,
-/// or `Incomplete` with the number of additional bytes needed.
-pub fn decode(buf: &[u8]) -> DecodeResult {
+/// Try to decode one gRPC length-prefixed message from the front of `buf`,
+/// bounded at `max_size` bytes.
+pub fn decode(buf: &[u8], max_size: usize) -> DecodeResult {
     if buf.len() < 5 {
         return DecodeResult::Incomplete(5 - buf.len());
     }
 
     let compressed = buf[0] != 0;
     let length = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    if length > max_size {
+        return DecodeResult::TooLarge(length);
+    }
     let total = 5 + length;
 
     if buf.len() < total {
@@ -54,34 +65,69 @@ pub fn decode(buf: &[u8]) -> DecodeResult {
 }
 
 /// Per-stream buffer for reassembling gRPC messages from DATA frame chunks.
-#[derive(Debug, Default)]
+///
+/// The buffer is bounded — `push` returns an error once the accumulated
+/// bytes would exceed the configured `max_message_size + 5` (header), so a
+/// peer dribbling garbage into a never-decodable frame can't OOM us.
+#[derive(Debug)]
 pub struct MessageBuffer {
     buf: Vec<u8>,
+    max_message_size: usize,
+}
+
+impl Default for MessageBuffer {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_MESSAGE_SIZE)
+    }
+}
+
+/// Returned by `MessageBuffer::try_decode` for callers that need to
+/// distinguish a malformed frame (TooLarge) from a clean wait-for-more.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BufferDecode {
+    /// One complete message: `(payload, compressed_flag)`.
+    Complete(Vec<u8>, bool),
+    /// Not enough bytes for a complete message yet.
+    Incomplete,
+    /// The next message's length prefix exceeds `max_message_size`. The
+    /// caller must fail the stream.
+    TooLarge(usize),
 }
 
 impl MessageBuffer {
-    pub fn new() -> Self {
-        Self { buf: Vec::new() }
+    pub fn new(max_message_size: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max_message_size,
+        }
     }
 
-    /// Append data from a DATA frame.
-    pub fn push(&mut self, data: &[u8]) {
+    /// Append data from a DATA frame. Returns an error if accumulating
+    /// would exceed `max_message_size + 5` (the header).
+    pub fn push(&mut self, data: &[u8]) -> Result<(), crate::error::GrpcError> {
+        if self.buf.len().saturating_add(data.len()) > self.max_message_size.saturating_add(5) {
+            return Err(crate::error::GrpcError::MaxSizeExceeded(format!(
+                "message reassembly buffer exceeds {} bytes",
+                self.max_message_size + 5
+            )));
+        }
         self.buf.extend_from_slice(data);
+        Ok(())
     }
 
-    /// Try to drain one complete message. Returns `None` if incomplete.
-    /// The tuple is `(payload, compressed)`.
-    pub fn try_decode(&mut self) -> Option<(Vec<u8>, bool)> {
-        match decode(&self.buf) {
+    /// Try to drain one complete message.
+    pub fn try_decode(&mut self) -> BufferDecode {
+        match decode(&self.buf, self.max_message_size) {
             DecodeResult::Complete {
                 payload,
                 compressed,
                 consumed,
             } => {
                 self.buf.drain(..consumed);
-                Some((payload, compressed))
+                BufferDecode::Complete(payload, compressed)
             }
-            DecodeResult::Incomplete(_) => None,
+            DecodeResult::Incomplete(_) => BufferDecode::Incomplete,
+            DecodeResult::TooLarge(n) => BufferDecode::TooLarge(n),
         }
     }
 
@@ -108,7 +154,7 @@ mod tests {
             payload.len() as u32
         );
 
-        match decode(&buf) {
+        match decode(&buf, usize::MAX) {
             DecodeResult::Complete {
                 payload: decoded,
                 compressed,
@@ -124,9 +170,12 @@ mod tests {
 
     #[test]
     fn decode_incomplete_header() {
-        assert_eq!(decode(&[]), DecodeResult::Incomplete(5));
-        assert_eq!(decode(&[0, 0]), DecodeResult::Incomplete(3));
-        assert_eq!(decode(&[0, 0, 0, 0]), DecodeResult::Incomplete(1));
+        assert_eq!(decode(&[], usize::MAX), DecodeResult::Incomplete(5));
+        assert_eq!(decode(&[0, 0], usize::MAX), DecodeResult::Incomplete(3));
+        assert_eq!(
+            decode(&[0, 0, 0, 0], usize::MAX),
+            DecodeResult::Incomplete(1)
+        );
     }
 
     #[test]
@@ -135,7 +184,7 @@ mod tests {
         encode(b"hello", &mut buf);
         // Truncate to just the header + 2 bytes of payload.
         buf.truncate(7);
-        assert_eq!(decode(&buf), DecodeResult::Incomplete(3));
+        assert_eq!(decode(&buf, usize::MAX), DecodeResult::Incomplete(3));
     }
 
     #[test]
@@ -143,7 +192,7 @@ mod tests {
         let mut buf = Vec::new();
         encode(b"", &mut buf);
         assert_eq!(buf, &[0, 0, 0, 0, 0]);
-        match decode(&buf) {
+        match decode(&buf, usize::MAX) {
             DecodeResult::Complete {
                 payload, consumed, ..
             } => {
@@ -155,25 +204,36 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_oversize_length() {
+        // 1 MiB claimed but cap is 1024.
+        let header = [0u8, 0x00, 0x10, 0x00, 0x00]; // length = 0x100000 = 1 MiB
+        assert!(matches!(decode(&header, 1024), DecodeResult::TooLarge(_)));
+    }
+
+    #[test]
     fn message_buffer_reassembly() {
         let payload = b"reassembled message";
         let mut encoded = Vec::new();
         encode(payload, &mut encoded);
 
-        let mut mb = MessageBuffer::new();
+        let mut mb = MessageBuffer::default();
         assert!(mb.is_empty());
 
         // Feed in chunks.
-        mb.push(&encoded[..3]);
-        assert!(mb.try_decode().is_none());
+        mb.push(&encoded[..3]).unwrap();
+        assert_eq!(mb.try_decode(), BufferDecode::Incomplete);
 
-        mb.push(&encoded[3..8]);
-        assert!(mb.try_decode().is_none());
+        mb.push(&encoded[3..8]).unwrap();
+        assert_eq!(mb.try_decode(), BufferDecode::Incomplete);
 
-        mb.push(&encoded[8..]);
-        let (decoded, compressed) = mb.try_decode().unwrap();
-        assert_eq!(decoded, payload);
-        assert!(!compressed);
+        mb.push(&encoded[8..]).unwrap();
+        match mb.try_decode() {
+            BufferDecode::Complete(decoded, compressed) => {
+                assert_eq!(decoded, payload);
+                assert!(!compressed);
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
         assert!(mb.is_empty());
     }
 
@@ -183,12 +243,36 @@ mod tests {
         encode(b"first", &mut encoded);
         encode(b"second", &mut encoded);
 
-        let mut mb = MessageBuffer::new();
-        mb.push(&encoded);
+        let mut mb = MessageBuffer::default();
+        mb.push(&encoded).unwrap();
 
-        assert_eq!(mb.try_decode().unwrap().0, b"first");
-        assert_eq!(mb.try_decode().unwrap().0, b"second");
-        assert!(mb.try_decode().is_none());
+        assert_eq!(
+            mb.try_decode(),
+            BufferDecode::Complete(b"first".to_vec(), false)
+        );
+        assert_eq!(
+            mb.try_decode(),
+            BufferDecode::Complete(b"second".to_vec(), false)
+        );
+        assert_eq!(mb.try_decode(), BufferDecode::Incomplete);
         assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn message_buffer_push_capped() {
+        // Tiny cap; first push fits, second push overflows.
+        let mut mb = MessageBuffer::new(10);
+        mb.push(&[0u8; 15]).unwrap(); // 15 <= 10 + 5 header room
+        let err = mb.push(&[0u8; 1]).err().unwrap();
+        assert!(matches!(err, crate::error::GrpcError::MaxSizeExceeded(_)));
+    }
+
+    #[test]
+    fn message_buffer_try_decode_too_large() {
+        // Push a frame whose length prefix claims more than the cap.
+        let mut mb = MessageBuffer::new(100);
+        // Header: compressed=0, length=200 (over cap).
+        mb.push(&[0, 0, 0, 0, 200]).unwrap();
+        assert!(matches!(mb.try_decode(), BufferDecode::TooLarge(200)));
     }
 }

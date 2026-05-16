@@ -7,14 +7,27 @@
 
 use crate::error::GrpcError;
 
-/// Decompress a gRPC message payload.
-pub(crate) fn decompress(encoding: &str, data: &[u8]) -> Result<Vec<u8>, GrpcError> {
+/// Decompress a gRPC message payload. Output is capped at `max_size` bytes —
+/// additional bytes produced by the decoder cause [`GrpcError::MaxSizeExceeded`].
+pub(crate) fn decompress(
+    encoding: &str,
+    data: &[u8],
+    max_size: usize,
+) -> Result<Vec<u8>, GrpcError> {
     match encoding {
         #[cfg(feature = "gzip")]
-        "gzip" => decompress_gzip(data),
+        "gzip" => decompress_gzip(data, max_size),
         #[cfg(feature = "zstd")]
-        "zstd" => decompress_zstd(data),
-        "identity" => Ok(data.to_vec()),
+        "zstd" => decompress_zstd(data, max_size),
+        "identity" => {
+            if data.len() > max_size {
+                return Err(GrpcError::MaxSizeExceeded(format!(
+                    "identity message of {} bytes exceeds cap {max_size}",
+                    data.len()
+                )));
+            }
+            Ok(data.to_vec())
+        }
         other => Err(GrpcError::InvalidMessage(format!(
             "unsupported grpc-encoding: {other}"
         ))),
@@ -48,13 +61,19 @@ pub(crate) fn accept_encoding_value() -> Option<&'static str> {
 }
 
 #[cfg(feature = "gzip")]
-fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, GrpcError> {
+fn decompress_gzip(data: &[u8], max_size: usize) -> Result<Vec<u8>, GrpcError> {
     use std::io::Read;
-    let mut decoder = flate2::read::GzDecoder::new(data);
+    let decoder = flate2::read::GzDecoder::new(data);
+    let mut limited = decoder.take(max_size as u64 + 1);
     let mut buf = Vec::new();
-    decoder
+    limited
         .read_to_end(&mut buf)
         .map_err(|e| GrpcError::InvalidMessage(format!("gzip decompress: {e}")))?;
+    if buf.len() > max_size {
+        return Err(GrpcError::MaxSizeExceeded(format!(
+            "gzip decompression exceeds {max_size} bytes"
+        )));
+    }
     Ok(buf)
 }
 
@@ -71,8 +90,21 @@ fn compress_gzip(data: &[u8]) -> Result<Vec<u8>, GrpcError> {
 }
 
 #[cfg(feature = "zstd")]
-fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, GrpcError> {
-    zstd::decode_all(data).map_err(|e| GrpcError::InvalidMessage(format!("zstd decompress: {e}")))
+fn decompress_zstd(data: &[u8], max_size: usize) -> Result<Vec<u8>, GrpcError> {
+    use std::io::Read;
+    let decoder = zstd::Decoder::new(data)
+        .map_err(|e| GrpcError::InvalidMessage(format!("zstd decompress: {e}")))?;
+    let mut limited = decoder.take(max_size as u64 + 1);
+    let mut buf = Vec::new();
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|e| GrpcError::InvalidMessage(format!("zstd decompress: {e}")))?;
+    if buf.len() > max_size {
+        return Err(GrpcError::MaxSizeExceeded(format!(
+            "zstd decompression exceeds {max_size} bytes"
+        )));
+    }
+    Ok(buf)
 }
 
 #[cfg(feature = "zstd")]
@@ -87,7 +119,7 @@ mod tests {
     fn roundtrip_gzip() {
         let data = b"hello gRPC compression";
         let compressed = super::compress("gzip", data).unwrap();
-        let decompressed = super::decompress("gzip", &compressed).unwrap();
+        let decompressed = super::decompress("gzip", &compressed, usize::MAX).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -96,19 +128,31 @@ mod tests {
     fn roundtrip_zstd() {
         let data = b"hello gRPC zstd";
         let compressed = super::compress("zstd", data).unwrap();
-        let decompressed = super::decompress("zstd", &compressed).unwrap();
+        let decompressed = super::decompress("zstd", &compressed, usize::MAX).unwrap();
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn identity_passthrough() {
         let data = b"no compression";
-        let result = super::decompress("identity", data).unwrap();
+        let result = super::decompress("identity", data, usize::MAX).unwrap();
         assert_eq!(result, data);
     }
 
     #[test]
     fn unsupported_encoding() {
-        assert!(super::decompress("snappy", b"data").is_err());
+        assert!(super::decompress("snappy", b"data", usize::MAX).is_err());
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn decompression_bomb_rejected_at_cap() {
+        // 1 MiB of zeros gzips to a few KiB but expands back to 1 MiB.
+        // Cap to 1 KiB → MaxSizeExceeded.
+        let original = vec![0u8; 1024 * 1024];
+        let compressed = super::compress("gzip", &original).unwrap();
+        assert!(compressed.len() < 10_000);
+        let result = super::decompress("gzip", &compressed, 1024);
+        assert!(matches!(result, Err(crate::GrpcError::MaxSizeExceeded(_))));
     }
 }
