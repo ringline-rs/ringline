@@ -304,6 +304,13 @@ impl Client {
     // ── Internal I/O (unchanged) ────────────────────────────────────────
 
     /// Read and parse a single Ping response from the connection.
+    ///
+    /// On `Error::Protocol` (parse failure) the underlying connection is
+    /// closed: even though the parser advanced past the malformed bytes,
+    /// the request/response framing is now irrecoverably misaligned and
+    /// the next `ping()` would read garbage. Surfacing `Protocol` as a
+    /// terminal error matches the memcache client (PR #177) and avoids
+    /// silently desynced clients.
     pub(crate) async fn read_response(&self) -> Result<PingResponse, Error> {
         let mut result: Option<Result<PingResponse, Error>> = None;
         let n = self
@@ -324,7 +331,11 @@ impl Client {
         if n == 0 {
             return result.unwrap_or(Err(Error::ConnectionClosed));
         }
-        result.unwrap()
+        let r = result.unwrap();
+        if matches!(r, Err(Error::Protocol(_))) {
+            self.conn.close();
+        }
+        r
     }
 
     /// Send an encoded command and read the response.
