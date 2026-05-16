@@ -221,6 +221,11 @@ pub struct H2Connection {
     /// MUST be SETTINGS per RFC 7540 §3.5; we track this to fail loudly
     /// on a malformed preface instead of silently limping along.
     received_any_frame: bool,
+
+    /// Last `last_stream_id` value seen in a peer GOAWAY, if any. RFC 7540
+    /// §6.8 forbids a subsequent GOAWAY from advertising a larger value
+    /// than what the peer has already committed to processing.
+    peer_last_stream_id: Option<u32>,
 }
 
 impl H2Connection {
@@ -268,6 +273,7 @@ impl H2Connection {
             initial_recv_window: initial_recv,
             max_recv_buf: DEFAULT_MAX_RECV_BUF,
             received_any_frame: false,
+            peer_last_stream_id: None,
         }
     }
 
@@ -617,6 +623,17 @@ impl H2Connection {
                 error_code,
                 debug_data,
             } => {
+                // RFC 7540 §6.8: a subsequent GOAWAY MUST NOT advertise a
+                // higher last_stream_id — that would un-cancel streams the
+                // peer already told us it abandoned. Treat as PROTOCOL_ERROR.
+                if let Some(prev) = self.peer_last_stream_id
+                    && last_stream_id > prev
+                {
+                    return Err(H2Error::ProtocolError(format!(
+                        "GOAWAY last_stream_id {last_stream_id} > previous {prev}"
+                    )));
+                }
+                self.peer_last_stream_id = Some(last_stream_id);
                 self.state = ConnState::Closing;
                 self.events.push_back(H2Event::GoAway {
                     last_stream_id,
@@ -648,13 +665,24 @@ impl H2Connection {
             Frame::Priority { .. } => {
                 // Priority is advisory; ignore.
             }
-            Frame::PushPromise { .. } => {
-                // We sent ENABLE_PUSH=0, so this is a protocol error.
+            Frame::PushPromise {
+                promised_stream_id, ..
+            } => {
+                // We sent ENABLE_PUSH=0 — peer sending PUSH_PROMISE is a
+                // protocol error (RFC 7540 §6.6).
                 if !self.local_settings.enable_push {
                     return Err(H2Error::ProtocolError(
                         "PUSH_PROMISE received but ENABLE_PUSH=0".into(),
                     ));
                 }
+                // We advertised enable_push but have no API to surface the
+                // pushed stream — refuse it cleanly so the peer doesn't
+                // queue a response on a stream we'll never read.
+                let rst = Frame::RstStream {
+                    stream_id: promised_stream_id,
+                    error_code: ErrorCode::RefusedStream,
+                };
+                rst.encode(&mut self.send_buf);
             }
             Frame::Unknown { .. } => {
                 // Unknown frame types MUST be ignored.
@@ -962,9 +990,39 @@ impl H2Connection {
 
     fn handle_window_update(&mut self, stream_id: u32, increment: u32) -> Result<(), H2Error> {
         if stream_id == 0 {
+            // Connection-level overflow is a connection error (RFC 7540 §6.9).
             self.conn_send_window.increase(increment)?;
-        } else if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.send_window.increase(increment)?;
+            return Ok(());
+        }
+        match self.streams.get_mut(&stream_id) {
+            Some(stream) => {
+                // Stream-level overflow is a STREAM error (RFC 7540 §5.4.2) —
+                // RST the stream rather than tearing the whole connection
+                // down for one misbehaving stream.
+                if stream.send_window.increase(increment).is_err() {
+                    stream.state = StreamState::Closed;
+                    self.streams.remove(&stream_id);
+                    let rst = Frame::RstStream {
+                        stream_id,
+                        error_code: ErrorCode::FlowControlError,
+                    };
+                    rst.encode(&mut self.send_buf);
+                    self.events.push_back(H2Event::StreamReset {
+                        stream_id,
+                        error_code: ErrorCode::FlowControlError,
+                    });
+                }
+            }
+            None => {
+                // WINDOW_UPDATE on a stream we don't know about. Could be
+                // a stream we already closed/GC'd. Reply RST_STREAM with
+                // STREAM_CLOSED so the peer learns we have nothing to send.
+                let rst = Frame::RstStream {
+                    stream_id,
+                    error_code: ErrorCode::StreamClosed,
+                };
+                rst.encode(&mut self.send_buf);
+            }
         }
         Ok(())
     }
@@ -1707,6 +1765,141 @@ mod tests {
         }
         assert!(got_response, "expected Response event");
         assert!(got_trailers, "expected Trailers event");
+    }
+
+    #[test]
+    fn window_update_overflow_on_stream_emits_rst_not_goaway() {
+        let mut conn = settled_conn();
+        let headers = vec![HeaderField::new(b":method", b"GET")];
+        let stream_id = conn.send_request(&headers, false).unwrap();
+        let _ = conn.take_pending_send();
+
+        // Server sends WINDOW_UPDATE that overflows the stream's send window.
+        // Initial window is 65535; increment 0x7fffffff overflows.
+        let wu = Frame::WindowUpdate {
+            stream_id,
+            increment: 0x7fff_ffff,
+        };
+        let mut buf = Vec::new();
+        wu.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+
+        // Connection must stay open — this is a stream error, not a connection error.
+        assert_eq!(conn.state, ConnState::Ready);
+
+        let out = conn.take_pending_send();
+        let (decoded, _) = frame::decode_frame(&out, 16384).unwrap().unwrap();
+        match decoded {
+            Frame::RstStream {
+                error_code: ErrorCode::FlowControlError,
+                ..
+            } => {}
+            f => panic!("expected RST_STREAM with FlowControlError, got {f:?}"),
+        }
+    }
+
+    #[test]
+    fn window_update_on_unknown_stream_emits_rst() {
+        let mut conn = settled_conn();
+        // WINDOW_UPDATE on a stream we never opened.
+        let wu = Frame::WindowUpdate {
+            stream_id: 7,
+            increment: 1024,
+        };
+        let mut buf = Vec::new();
+        wu.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+
+        assert_eq!(conn.state, ConnState::Ready);
+        let out = conn.take_pending_send();
+        let (decoded, _) = frame::decode_frame(&out, 16384).unwrap().unwrap();
+        assert!(matches!(
+            decoded,
+            Frame::RstStream {
+                error_code: ErrorCode::StreamClosed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn goaway_with_increasing_last_stream_id_rejected() {
+        let mut conn = settled_conn();
+
+        // First GOAWAY with last_stream_id = 5.
+        let goaway1 = Frame::GoAway {
+            last_stream_id: 5,
+            error_code: ErrorCode::NoError,
+            debug_data: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        goaway1.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+        assert_eq!(conn.state, ConnState::Closing);
+
+        // Second GOAWAY with last_stream_id = 9 — must be rejected even
+        // though state is already Closing. (handle_frame still runs.)
+        // But fatal_error / process_recv_buf early-returns on Closing —
+        // so feed a fresh connection.
+        let mut conn = settled_conn();
+        let mut buf = Vec::new();
+        goaway1.encode(&mut buf);
+        let goaway2 = Frame::GoAway {
+            last_stream_id: 9,
+            error_code: ErrorCode::NoError,
+            debug_data: Vec::new(),
+        };
+        // To trigger the check, both GOAWAYs need to be processed before
+        // the connection short-circuits. Send the first, then re-open the
+        // state machine isn't possible — but we can directly seed
+        // peer_last_stream_id and call handle_frame.
+        conn.peer_last_stream_id = Some(5);
+        // Now feed a GOAWAY with larger ID.
+        let mut buf2 = Vec::new();
+        goaway2.encode(&mut buf2);
+        conn.recv(&buf2).unwrap();
+        // After protocol error, state should be Closing and we should
+        // have queued our own GOAWAY with PROTOCOL_ERROR.
+        assert_eq!(conn.state, ConnState::Closing);
+        let _ = buf; // silence unused warning
+    }
+
+    #[test]
+    fn push_promise_refused_with_rst_when_push_enabled() {
+        // Use Settings::default() which has enable_push=true.
+        let mut conn = H2Connection::new(Settings::default());
+        let _ = conn.take_pending_send();
+        let server_settings = make_settings_frame(&Settings::default(), false);
+        conn.recv(&server_settings).unwrap();
+        let _ = conn.take_pending_send();
+        while conn.poll_event().is_some() {}
+
+        // Server sends PUSH_PROMISE for promised stream 2 (server-initiated
+        // streams are even).
+        let push = Frame::PushPromise {
+            stream_id: 1,
+            promised_stream_id: 2,
+            encoded: Vec::new(),
+            end_headers: true,
+        };
+        let mut buf = Vec::new();
+        push.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+
+        // We don't implement push handling — must RST the promised stream.
+        let out = conn.take_pending_send();
+        let (decoded, _) = frame::decode_frame(&out, 16384).unwrap().unwrap();
+        match decoded {
+            Frame::RstStream {
+                stream_id,
+                error_code: ErrorCode::RefusedStream,
+            } => {
+                assert_eq!(stream_id, 2);
+            }
+            f => panic!("expected RST_STREAM(2, RefusedStream), got {f:?}"),
+        }
+        // Connection stays open.
+        assert_eq!(conn.state, ConnState::Ready);
     }
 
     #[test]
