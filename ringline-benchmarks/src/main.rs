@@ -213,46 +213,81 @@ fn main() {
         let port_manager = port_manager.clone();
         for &num_clients in &args.clients {
             for &msg_size in &args.sizes {
-                let (result, _) = udp::run_udp_echo(
-                    &port_manager,
-                    workers,
-                    num_clients,
-                    msg_size,
-                    warmup,
-                    duration,
-                    ClientRuntime::Ringline,
-                    ServerRuntime::Ringline,
-                );
+                let combos: &[(&str, ClientRuntime, &str, ServerRuntime)] = &[
+                    (
+                        "ringline",
+                        ClientRuntime::Ringline,
+                        "ringline",
+                        ServerRuntime::Ringline,
+                    ),
+                    (
+                        "ringline",
+                        ClientRuntime::Ringline,
+                        "tokio",
+                        ServerRuntime::Tokio,
+                    ),
+                    (
+                        "tokio",
+                        ClientRuntime::Tokio,
+                        "ringline",
+                        ServerRuntime::Ringline,
+                    ),
+                    ("tokio", ClientRuntime::Tokio, "tokio", ServerRuntime::Tokio),
+                ];
 
-                eprint!(
-                    "  {:>8} -> {:<8}  {:>4}c x {:>5}: ",
-                    "ringline",
-                    "ringline",
-                    num_clients,
-                    format_size(msg_size),
-                );
+                for &(client_name, client_rt, server_name, server_rt) in combos {
+                    if args.tokio_only && server_rt == ServerRuntime::Ringline {
+                        continue;
+                    }
+                    if args.ringline_only && server_rt == ServerRuntime::Tokio {
+                        continue;
+                    }
 
-                eprintln!(
-                    "{:>9.0} ops/s  p50: {}  p99: {}",
-                    result.ops_per_sec,
-                    format_ns(result.latency.p50_ns),
-                    format_ns(result.latency.p99_ns),
-                );
+                    let (result, _) = udp::run_udp_echo(
+                        &port_manager,
+                        workers,
+                        num_clients,
+                        msg_size,
+                        warmup,
+                        duration,
+                        client_rt,
+                        server_rt,
+                    );
 
-                all_results.push(ConfigResult {
-                    workers,
-                    clients: num_clients,
-                    msg_size,
-                    client_runtime: "ringline".to_string(),
-                    server_runtime: "ringline".to_string(),
-                    transport: "udp".to_string(),
-                    protocol: "echo".to_string(),
-                    tls: "none".to_string(),
-                    tokio_ringline: None,
-                    tokio_tokio: None,
-                    ringline_ringline: Some(result),
-                    ringline_tokio: None,
-                });
+                    eprintln!(
+                        "  {:>8} -> {:<8}  {:>4}c x {:>5}: {:>9.0} ops/s  p50: {}  p99: {}",
+                        client_name,
+                        server_name,
+                        num_clients,
+                        format_size(msg_size),
+                        result.ops_per_sec,
+                        format_ns(result.latency.p50_ns),
+                        format_ns(result.latency.p99_ns),
+                    );
+
+                    let (tokio_ringline, tokio_tokio, ringline_ringline, ringline_tokio) =
+                        match (client_name, server_name) {
+                            ("ringline", "ringline") => (None, None, Some(result), None),
+                            ("ringline", "tokio") => (None, None, None, Some(result)),
+                            ("tokio", "ringline") => (Some(result), None, None, None),
+                            _ => (None, Some(result), None, None),
+                        };
+
+                    all_results.push(ConfigResult {
+                        workers,
+                        clients: num_clients,
+                        msg_size,
+                        client_runtime: client_name.to_string(),
+                        server_runtime: server_name.to_string(),
+                        transport: "udp".to_string(),
+                        protocol: "echo".to_string(),
+                        tls: "none".to_string(),
+                        tokio_ringline,
+                        tokio_tokio,
+                        ringline_ringline,
+                        ringline_tokio,
+                    });
+                }
 
                 eprintln!();
             }
