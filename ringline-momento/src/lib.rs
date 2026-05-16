@@ -61,6 +61,15 @@ use crate::proto::{
     decode_length_delimited_message_bytes,
 };
 
+/// Maximum number of consecutive responses with unmatched `message_id`s
+/// the recv / authenticate loops will skip before poisoning the
+/// connection. The skip behavior exists so a single stale or duplicate
+/// response doesn't drop every in-flight op, but unbounded skipping lets
+/// a misbehaving server starve our in-flight ops indefinitely by
+/// streaming junk. 256 unmatched messages in a row is far past any
+/// reasonable retransmit / race window.
+pub const MAX_RECV_SKIPS: usize = 256;
+
 // ── Request tracking ────────────────────────────────────────────────────
 
 /// Identifies an in-flight request.
@@ -433,6 +442,16 @@ impl Client {
         self.pending.len()
     }
 
+    /// Mark the client as terminal: clear the pending map and close the
+    /// underlying connection. Called from every irrecoverable error path
+    /// in `recv()` and `authenticate()` so a stream-misaligned
+    /// accumulator can't leak through to a subsequent `fire_*`. Idempotent
+    /// — `ConnCtx::close` is a no-op for an already-closed conn.
+    fn poison(&mut self) {
+        self.pending.clear();
+        self.conn.close();
+    }
+
     // ── Multiplexed fire API ────────────────────────────────────────────
 
     /// Returns `Err(TooManyInFlight)` if the pending map has hit
@@ -572,16 +591,25 @@ impl Client {
     ///
     /// Uses zero-copy parsing via `with_bytes()`: response values are
     /// `Bytes::slice()` references into the accumulator buffer.
+    ///
+    /// Responses whose `message_id` doesn't match any pending op are
+    /// skipped (a stale or duplicate frame doesn't drop every other
+    /// in-flight op). Skipping is capped at [`MAX_RECV_SKIPS`]
+    /// consecutive misses: past that, the connection is poisoned (the
+    /// pending map cleared and the conn closed) and [`Error::Protocol`]
+    /// is returned. Without the cap a misbehaving server could starve
+    /// in-flight ops by streaming unmatched frames forever.
+    ///
+    /// On any poison path (`Oversize`, malformed protobuf, `n == 0`, or
+    /// skip-cap exceeded) the underlying connection is closed so a
+    /// stream-misaligned accumulator can't be reused for fresh
+    /// `fire_*` calls.
     pub async fn recv(&mut self) -> Result<CompletedOp, Error> {
         if self.pending.is_empty() {
             return Err(Error::NoPending);
         }
 
-        // Loop over inbound messages. We may receive a response whose
-        // `message_id` doesn't match any pending op (server bug, id
-        // re-use, or an op we already finalised) — in that case we
-        // *skip* it and wait for the next message rather than poisoning
-        // the connection (which used to drop every other in-flight op).
+        let mut skips = 0usize;
         let (dr, total_bytes) = loop {
             let pending = &mut self.pending;
             let mut dispatch_result: Option<DispatchResult> = None;
@@ -613,21 +641,23 @@ impl Client {
                 // Adversarial / broken peer — declared length exceeds the
                 // per-message cap. The accumulator can't progress past this
                 // message, so the connection is unusable from here on.
-                self.pending.clear();
+                self.poison();
                 return Err(Error::Protocol(
                     "inbound message exceeded MAX_MESSAGE_SIZE".into(),
                 ));
             }
             if n == 0 {
                 // Connection broken — clear pending so subsequent recv()
-                // returns NoPending instead of reading stale data.
-                self.pending.clear();
+                // returns NoPending instead of reading stale data. The
+                // conn close is harmless here (already dead) but keeps
+                // the poison path uniform.
+                self.poison();
                 return Err(Error::ConnectionClosed);
             }
             if malformed {
                 // Decoded a length-prefix but the inner protobuf was
                 // gibberish. Can't re-sync the stream — poison.
-                self.pending.clear();
+                self.poison();
                 return Err(Error::Protocol("failed to decode response".into()));
             }
             if let Some(dr) = dispatch_result {
@@ -639,6 +669,16 @@ impl Client {
             // bail out distinctly.
             if self.pending.is_empty() {
                 return Err(Error::NoPending);
+            }
+            skips += 1;
+            if skips > MAX_RECV_SKIPS {
+                // Server is streaming responses we can't match — either a
+                // protocol drift or hostile traffic. Poison so the next
+                // recv() / fire_* sees a clean error.
+                self.poison();
+                return Err(Error::Protocol(
+                    "too many consecutive unmatched responses".into(),
+                ));
             }
         };
         let n = total_bytes;
@@ -670,8 +710,28 @@ impl Client {
 
     // ── Sequential convenience API ──────────────────────────────────────
 
+    /// Reject sequential API calls while `fire_*` ops are still in
+    /// flight. Momento is multiplexed and `recv()` returns whatever
+    /// `message_id` arrives next; the convenience APIs discard the
+    /// id/key and would otherwise silently complete with data for the
+    /// wrong request.
+    #[inline]
+    fn check_no_pending(&self) -> Result<(), Error> {
+        if self.pending.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::PendingOpsInFlight)
+        }
+    }
+
     /// Sequential get: fire + recv.
+    ///
+    /// Returns [`Error::PendingOpsInFlight`] if any `fire_*` ops are
+    /// still in flight — without that guard, `recv()` could resolve the
+    /// other request's response and we'd return its value as if it
+    /// belonged to `key`.
     pub async fn get(&mut self, cache: &str, key: &[u8]) -> Result<Option<Bytes>, Error> {
+        self.check_no_pending()?;
         let _id = self.fire_get(cache, key, 0)?;
         match self.recv().await? {
             CompletedOp::Get { result, .. } => result,
@@ -679,7 +739,7 @@ impl Client {
         }
     }
 
-    /// Sequential set.
+    /// Sequential set. See [`Self::get`] for the in-flight-ops guard.
     pub async fn set(
         &mut self,
         cache: &str,
@@ -687,6 +747,7 @@ impl Client {
         value: &[u8],
         ttl_ms: u64,
     ) -> Result<(), Error> {
+        self.check_no_pending()?;
         let _id = self.fire_set(cache, key, value, ttl_ms, 0)?;
         match self.recv().await? {
             CompletedOp::Set { result, .. } => result,
@@ -694,8 +755,9 @@ impl Client {
         }
     }
 
-    /// Sequential delete.
+    /// Sequential delete. See [`Self::get`] for the in-flight-ops guard.
     pub async fn delete(&mut self, cache: &str, key: &[u8]) -> Result<(), Error> {
+        self.check_no_pending()?;
         let _id = self.fire_delete(cache, key, 0)?;
         match self.recv().await? {
             CompletedOp::Delete { result, .. } => result,
@@ -728,6 +790,17 @@ impl Client {
         Ok(())
     }
 
+    /// Send an `Authenticate` command and wait for the matching response.
+    ///
+    /// Loops over inbound messages — like [`Self::recv`], a message
+    /// whose `message_id` doesn't match the one we issued is skipped
+    /// rather than treated as a hard failure (previously a single
+    /// non-matching frame ate the auth response and produced a generic
+    /// "failed to decode" error). Skipping is bounded by
+    /// [`MAX_RECV_SKIPS`]; past the cap the connection is poisoned and
+    /// [`Error::Protocol`] is returned. On `Oversize` / malformed /
+    /// `n == 0` the conn is closed before returning so callers can't
+    /// reuse a desynced accumulator.
     async fn authenticate(&mut self, token: &str) -> Result<(), Error> {
         let message_id = self.next_id();
         let cmd = CacheCommand::new(
@@ -739,57 +812,81 @@ impl Client {
 
         self.send_buf.clear();
         cmd.encode_length_delimited_into(&mut self.send_buf);
-        self.conn.send_nowait(&self.send_buf)?;
+        if let Err(e) = self.conn.send_nowait(&self.send_buf) {
+            self.conn.close();
+            return Err(Error::Io(e));
+        }
 
-        // Wait for auth response
-        let mut auth_result: Option<Result<(), Error>> = None;
+        let mut skips = 0usize;
+        loop {
+            let mut auth_result: Option<Result<(), Error>> = None;
+            let mut malformed = false;
+            let mut oversize = false;
 
-        let mut oversize = false;
-        let n = self
-            .conn
-            .with_bytes(
-                |bytes| match decode_length_delimited_message_bytes(&bytes) {
-                    DecodedMessage::Message(consumed, msg_bytes) => {
-                        if let Some(response) = CacheResponse::decode_bytes(msg_bytes)
-                            && response.message_id == message_id
-                        {
-                            match response.result {
-                                CacheResponseResult::Authenticate => {
-                                    auth_result = Some(Ok(()));
+            let n = self
+                .conn
+                .with_bytes(
+                    |bytes| match decode_length_delimited_message_bytes(&bytes) {
+                        DecodedMessage::Message(consumed, msg_bytes) => {
+                            if let Some(response) = CacheResponse::decode_bytes(msg_bytes) {
+                                if response.message_id == message_id {
+                                    match response.result {
+                                        CacheResponseResult::Authenticate => {
+                                            auth_result = Some(Ok(()));
+                                        }
+                                        CacheResponseResult::Error(err) => {
+                                            auth_result = Some(Err(Error::AuthFailed(err.message)));
+                                        }
+                                        _ => {
+                                            auth_result = Some(Err(Error::Protocol(
+                                                "unexpected auth response type".into(),
+                                            )));
+                                        }
+                                    }
                                 }
-                                CacheResponseResult::Error(err) => {
-                                    auth_result = Some(Err(Error::AuthFailed(err.message)));
-                                }
-                                _ => {
-                                    auth_result = Some(Err(Error::Protocol(
-                                        "unexpected auth response type".into(),
-                                    )));
-                                }
+                            } else {
+                                malformed = true;
                             }
+                            ParseResult::Consumed(consumed)
                         }
-                        ParseResult::Consumed(consumed)
-                    }
-                    DecodedMessage::Incomplete => ParseResult::Consumed(0),
-                    DecodedMessage::Oversize => {
-                        oversize = true;
-                        ParseResult::Consumed(0)
-                    }
-                },
-            )
-            .await;
+                        DecodedMessage::Incomplete => ParseResult::Consumed(0),
+                        DecodedMessage::Oversize => {
+                            oversize = true;
+                            ParseResult::Consumed(0)
+                        }
+                    },
+                )
+                .await;
 
-        if oversize {
-            return Err(Error::Protocol(
-                "auth response exceeded MAX_MESSAGE_SIZE".into(),
-            ));
+            if oversize {
+                self.conn.close();
+                return Err(Error::Protocol(
+                    "auth response exceeded MAX_MESSAGE_SIZE".into(),
+                ));
+            }
+            if n == 0 {
+                self.conn.close();
+                return Err(Error::ConnectionClosed);
+            }
+            if malformed {
+                self.conn.close();
+                return Err(Error::Protocol("failed to decode auth response".into()));
+            }
+            if let Some(r) = auth_result {
+                return r;
+            }
+            // Decoded a well-formed message but it's not the auth response
+            // (mismatched message_id). Skip and wait for the next, with a
+            // hard cap mirroring recv() — otherwise a chatty / hostile
+            // server could deny us the auth response indefinitely.
+            skips += 1;
+            if skips > MAX_RECV_SKIPS {
+                self.conn.close();
+                return Err(Error::Protocol(
+                    "too many unmatched messages before auth response".into(),
+                ));
+            }
         }
-        if n == 0 {
-            return Err(Error::ConnectionClosed);
-        }
-
-        auth_result.unwrap_or(Err(Error::Protocol(
-            "failed to decode auth response".into(),
-        )))
     }
 
     fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr, Error> {
@@ -1005,4 +1102,74 @@ fn now_realtime_ns() -> u64 {
         libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
     }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::CacheResponse;
+
+    fn make_pending_get(key: &[u8]) -> PendingOp {
+        PendingOp {
+            kind: PendingOpKind::Get,
+            key: Bytes::copy_from_slice(key),
+            send_ts: 0,
+            start: None,
+            user_data: 42,
+            tx_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn max_recv_skips_is_positive() {
+        // Cap must be > 0; otherwise the very first unmatched message
+        // would poison and `recv()` would never recover from a single
+        // duplicate frame.
+        const { assert!(MAX_RECV_SKIPS > 0) };
+    }
+
+    #[test]
+    fn pending_ops_in_flight_display() {
+        let msg = format!("{}", Error::PendingOpsInFlight);
+        assert!(
+            msg.contains("fire_*"),
+            "PendingOpsInFlight display should mention fire_*, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dispatch_response_returns_some_on_match() {
+        let mut pending: HashMap<u64, PendingOp> = HashMap::new();
+        pending.insert(7, make_pending_get(b"k"));
+        let response = CacheResponse::get_hit(7, Bytes::from_static(b"v"));
+        let dr = dispatch_response(response, &mut pending);
+        assert!(dr.is_some(), "expected matched dispatch");
+        assert!(pending.is_empty(), "matched op should be drained");
+    }
+
+    #[test]
+    fn dispatch_response_returns_none_on_unmatched_id() {
+        let mut pending: HashMap<u64, PendingOp> = HashMap::new();
+        pending.insert(1, make_pending_get(b"k"));
+        // Response carries a message_id that isn't in pending.
+        let response = CacheResponse::get_hit(99, Bytes::from_static(b"v"));
+        let dr = dispatch_response(response, &mut pending);
+        assert!(dr.is_none(), "unmatched id must return None");
+        assert_eq!(pending.len(), 1, "pending must be unchanged on miss");
+    }
+
+    #[test]
+    fn dispatch_response_get_returns_protocol_error_on_wrong_kind() {
+        let mut pending: HashMap<u64, PendingOp> = HashMap::new();
+        pending.insert(3, make_pending_get(b"k"));
+        // Pending op is Get but server sent a Set response — kind mismatch.
+        let response = CacheResponse::set_ok(3);
+        let dr = dispatch_response(response, &mut pending).expect("matched id");
+        assert!(pending.is_empty());
+        assert!(!dr.success, "kind mismatch should mark op as failed");
+        match dr.op {
+            CompletedOp::Get { result, .. } => assert!(result.is_err()),
+            _ => panic!("expected Get op kind preserved"),
+        }
+    }
 }
