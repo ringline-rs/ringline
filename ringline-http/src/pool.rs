@@ -4,6 +4,7 @@
 //! Follows the `ringline-momento/src/pool.rs` pattern.
 
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 
 use crate::client::HttpClient;
 use crate::error::HttpError;
@@ -79,7 +80,12 @@ impl Pool {
     /// Advances the round-robin cursor. Disconnected slots are lazily
     /// reconnected. Returns [`HttpError::AllConnectionsFailed`] if all
     /// slots fail.
-    pub async fn client(&mut self) -> Result<&mut HttpClient, HttpError> {
+    ///
+    /// The returned [`PooledClient`] derefs to `&mut HttpClient` and, on
+    /// drop, recycles its slot if the peer signalled close
+    /// ([`HttpClient::peer_will_close`]). The next call to `client()`
+    /// will lazily reconnect that slot.
+    pub async fn client(&mut self) -> Result<PooledClient<'_>, HttpError> {
         let size = self.slots.len();
         for _ in 0..size {
             let idx = self.next;
@@ -87,18 +93,12 @@ impl Pool {
 
             match &self.slots[idx] {
                 Slot::Connected(_) => {
-                    if let Slot::Connected(client) = &mut self.slots[idx] {
-                        return Ok(client);
-                    }
-                    unreachable!();
+                    return Ok(PooledClient { pool: self, idx });
                 }
                 Slot::Disconnected => {
                     if let Ok(client) = self.do_connect().await {
                         self.slots[idx] = Slot::Connected(Box::new(client));
-                        if let Slot::Connected(client) = &mut self.slots[idx] {
-                            return Ok(client);
-                        }
-                        unreachable!();
+                        return Ok(PooledClient { pool: self, idx });
                     }
                 }
             }
@@ -155,6 +155,63 @@ impl Pool {
             }
             Protocol::H1 => HttpClient::connect_h1(self.addr, &self.host).await,
             Protocol::H1Plain => HttpClient::connect_h1_plain(self.addr, &self.host).await,
+        }
+    }
+}
+
+/// A pool-owned handle to an [`HttpClient`].
+///
+/// Borrows the pool exclusively while alive; derefs to `&mut HttpClient`.
+/// On drop, the guard inspects [`HttpClient::peer_will_close`] and
+/// recycles its slot (closes the underlying connection and marks the
+/// slot for lazy reconnect) when the peer has signalled close — avoiding
+/// the request-smuggling-class hazard of sending a fresh request on a
+/// connection the server is about to close.
+pub struct PooledClient<'a> {
+    pool: &'a mut Pool,
+    idx: usize,
+}
+
+impl PooledClient<'_> {
+    /// Index of the underlying slot in the pool. Useful for callers that
+    /// want to explicitly recycle (e.g., on an application-level error
+    /// the guard's `peer_will_close` check would not catch).
+    pub fn slot(&self) -> usize {
+        self.idx
+    }
+}
+
+impl Deref for PooledClient<'_> {
+    type Target = HttpClient;
+
+    fn deref(&self) -> &HttpClient {
+        match &self.pool.slots[self.idx] {
+            Slot::Connected(client) => client,
+            // `client()` only constructs `PooledClient` for a Connected
+            // slot, and we hold &mut Pool exclusively for the guard's
+            // lifetime, so the slot cannot transition under us.
+            Slot::Disconnected => unreachable!("PooledClient over Disconnected slot"),
+        }
+    }
+}
+
+impl DerefMut for PooledClient<'_> {
+    fn deref_mut(&mut self) -> &mut HttpClient {
+        match &mut self.pool.slots[self.idx] {
+            Slot::Connected(client) => client,
+            Slot::Disconnected => unreachable!("PooledClient over Disconnected slot"),
+        }
+    }
+}
+
+impl Drop for PooledClient<'_> {
+    fn drop(&mut self) {
+        let should_recycle = match &self.pool.slots[self.idx] {
+            Slot::Connected(client) => client.peer_will_close(),
+            Slot::Disconnected => false,
+        };
+        if should_recycle {
+            self.pool.mark_disconnected(self.idx);
         }
     }
 }
