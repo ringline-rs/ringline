@@ -256,6 +256,14 @@ pub fn encode(headers: &[HeaderField], buf: &mut Vec<u8>) {
 /// Decode a QPACK header block (static table only).
 ///
 /// Returns the list of decoded header fields or an error.
+/// Upper bound on the number of header fields we will produce from a single
+/// QPACK-decoded HEADERS frame. With a static-table-only decoder, an
+/// adversarial peer can pack the maximum-size HEADERS payload (16 MiB,
+/// `MAX_FRAME_PAYLOAD`) with 1-byte indexed references and expand each into
+/// a ~50-byte `HeaderField` — roughly a million allocations per frame. This
+/// cap stops that amplification well before normal traffic notices.
+pub const MAX_HEADER_FIELDS: usize = 256;
+
 pub fn decode(buf: &[u8]) -> Result<Vec<HeaderField>, H3Error> {
     if buf.is_empty() {
         return Err(H3Error::QpackDecodingFailed);
@@ -281,6 +289,9 @@ pub fn decode(buf: &[u8]) -> Result<Vec<HeaderField>, H3Error> {
     let mut headers = Vec::new();
 
     while pos < buf.len() {
+        if headers.len() >= MAX_HEADER_FIELDS {
+            return Err(H3Error::QpackDecodingFailed);
+        }
         let first = buf[pos];
 
         if first & 0x80 != 0 {
@@ -419,6 +430,21 @@ mod tests {
             let mask = !((1u8 << prefix_bits) - 1);
             assert_eq!(buf[0] & mask, pattern & mask);
         }
+    }
+
+    #[test]
+    fn too_many_indexed_literals_rejected() {
+        // Build a QPACK block with > MAX_HEADER_FIELDS indexed references.
+        // We use static-table index 17 (":method GET") repeated.
+        let mut buf = Vec::new();
+        // RIC=0, base-delta=0 prefix.
+        encode_prefix_int(&mut buf, 0, 8, 0x00);
+        encode_prefix_int(&mut buf, 0, 7, 0x00);
+        // Repeat indexed-field-line entries (pattern 11xxxxxx with index=17).
+        for _ in 0..(MAX_HEADER_FIELDS + 1) {
+            encode_prefix_int(&mut buf, 17, 6, 0xc0);
+        }
+        assert!(matches!(decode(&buf), Err(H3Error::QpackDecodingFailed)));
     }
 
     #[test]

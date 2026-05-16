@@ -23,6 +23,15 @@ pub(crate) struct RequestStream {
     pub recv_buf: Vec<u8>,
     /// Whether this stream was opened by us (client request) or the peer (server request).
     pub client_initiated: bool,
+    /// True once we have processed the initial HEADERS from the peer. A
+    /// HEADERS frame *after* this point is trailers (and must be the last
+    /// frame on the stream). Tracked independently of `state` because
+    /// `HalfClosedLocal` (we sent FIN) does not imply we've seen the peer's
+    /// initial HEADERS yet.
+    pub initial_headers_received: bool,
+    /// True once a trailing HEADERS frame has been processed. After that any
+    /// further frame on this stream is `H3_FRAME_UNEXPECTED`.
+    pub trailers_received: bool,
 }
 
 impl RequestStream {
@@ -31,6 +40,8 @@ impl RequestStream {
             state: StreamState::WaitingHeaders,
             recv_buf: Vec::new(),
             client_initiated,
+            initial_headers_received: false,
+            trailers_received: false,
         }
     }
 }

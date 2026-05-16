@@ -11,11 +11,18 @@ pub struct Settings {
     pub qpack_blocked_streams: u64,
 }
 
+/// Default `SETTINGS_MAX_FIELD_SECTION_SIZE`. Comfortably accommodates
+/// real-world request/response headers (cookies, large OAuth bearer tokens,
+/// CSP, etc.) while bounding the worst-case memory cost of decoding a single
+/// HEADERS frame. Applications that need more should override via
+/// `Settings::with_max_field_section_size`.
+pub const DEFAULT_MAX_FIELD_SECTION_SIZE: u64 = 256 * 1024;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             qpack_max_table_capacity: 0,
-            max_field_section_size: u64::MAX,
+            max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
             qpack_blocked_streams: 0,
         }
     }

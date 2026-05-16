@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
-use ringline_quic::{QuicConnId, QuicEndpoint, QuicEvent, ReadError, StreamId, WriteError};
+use ringline_quic::{QuicConnId, QuicEndpoint, QuicEvent, ReadError, StreamId, VarInt, WriteError};
 
 use crate::error::H3Error;
 use crate::frame::{self, Frame, encode_frame_header};
@@ -39,6 +39,110 @@ const STREAM_TYPE_CONTROL: u64 = 0x00;
 const STREAM_TYPE_QPACK_ENCODER: u64 = 0x02;
 const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
 
+/// Categorises a header section for the validator (RFC 9114 §4.3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderKind {
+    Request,
+    Response,
+    Trailer,
+}
+
+/// Sum of `name.len() + value.len() + 32` for every field, the
+/// "field section size" the peer is allowed to bound via
+/// `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2). Saturates
+/// rather than overflows.
+fn field_section_size(headers: &[HeaderField]) -> u64 {
+    let mut total: u64 = 0;
+    for f in headers {
+        let per = (f.name.len() as u64)
+            .saturating_add(f.value.len() as u64)
+            .saturating_add(32);
+        total = total.saturating_add(per);
+    }
+    total
+}
+
+/// Validate a decoded header section per RFC 9114 §4.2 + §4.3.1.1.
+///
+/// Returns `H3Error::MessageError` on any violation: pseudo-headers after a
+/// regular field, duplicate pseudo-header, unknown pseudo-header, missing
+/// required pseudo-header for the role, presence of a forbidden
+/// connection-specific field, or `TE` with anything other than `trailers`.
+/// Pseudo-headers are forbidden in trailers entirely.
+fn validate_headers(kind: HeaderKind, headers: &[HeaderField]) -> Result<(), H3Error> {
+    let mut seen_pseudo: Vec<&[u8]> = Vec::new();
+    let mut saw_regular = false;
+    let mut method: Option<&[u8]> = None;
+    let mut path: Option<&[u8]> = None;
+    let mut scheme: Option<&[u8]> = None;
+    let mut authority: Option<&[u8]> = None;
+    let mut status_seen = false;
+
+    for field in headers {
+        let name = field.name.as_slice();
+        let value = field.value.as_slice();
+        let is_pseudo = name.first() == Some(&b':');
+
+        if is_pseudo {
+            if saw_regular {
+                return Err(H3Error::MessageError);
+            }
+            if matches!(kind, HeaderKind::Trailer) {
+                return Err(H3Error::MessageError);
+            }
+            if seen_pseudo.contains(&name) {
+                return Err(H3Error::MessageError);
+            }
+            seen_pseudo.push(name);
+
+            match name {
+                b":method" => method = Some(value),
+                b":path" => path = Some(value),
+                b":scheme" => scheme = Some(value),
+                b":authority" => authority = Some(value),
+                b":status" => status_seen = true,
+                _ => return Err(H3Error::MessageError),
+            }
+        } else {
+            saw_regular = true;
+            match name {
+                b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
+                | b"upgrade" => return Err(H3Error::MessageError),
+                b"te" if value != b"trailers" => return Err(H3Error::MessageError),
+                _ => {}
+            }
+        }
+    }
+
+    match kind {
+        HeaderKind::Request => {
+            let m = method.ok_or(H3Error::MessageError)?;
+            if m == b"CONNECT" {
+                // :scheme and :path MUST be omitted for CONNECT (extended
+                // CONNECT in RFC 9220 is not yet supported by this stack).
+                if path.is_some() || scheme.is_some() {
+                    return Err(H3Error::MessageError);
+                }
+                if authority.is_none() {
+                    return Err(H3Error::MessageError);
+                }
+            } else if path.is_none() || scheme.is_none() || authority.is_none() {
+                return Err(H3Error::MessageError);
+            }
+        }
+        HeaderKind::Response => {
+            if !status_seen {
+                return Err(H3Error::MessageError);
+            }
+        }
+        HeaderKind::Trailer => {
+            // Trailers must contain no pseudo-headers — already checked.
+        }
+    }
+
+    Ok(())
+}
+
 /// Events produced by the HTTP/3 connection for the application.
 #[derive(Debug)]
 pub enum H3Event {
@@ -53,6 +157,14 @@ pub enum H3Event {
         stream_id: StreamId,
         headers: Vec<HeaderField>,
         end_stream: bool,
+    },
+    /// Received trailing HEADERS (trailers) on a request stream that had
+    /// already received the initial HEADERS. Per RFC 9114 §4.1 trailers must
+    /// be the last frame on the stream, so `end_stream` is always implied
+    /// `true` here.
+    Trailers {
+        stream_id: StreamId,
+        headers: Vec<HeaderField>,
     },
     /// Received request body data on a stream.
     Data {
@@ -89,6 +201,15 @@ enum H3State {
     Closing,
     /// Connection closed.
     Closed,
+}
+
+/// Whether this `H3Connection` is playing the client or server role.
+/// Determines how peer-opened bidi streams are interpreted (request vs
+/// illegal push) and which pseudo-headers are required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    Client,
+    Server,
 }
 
 /// HTTP/3 connection (client and server).
@@ -134,6 +255,17 @@ pub struct H3Connection {
     /// Per-stream buffered outbound bytes that didn't fit in the flow-control
     /// window at the time of the send. Drained on `QuicEvent::StreamWritable`.
     pending_sends: HashMap<u64, PendingStream>,
+
+    /// Cap on total bytes currently queued in `pending_sends`. When the next
+    /// `queue_send` would push the running total past this limit, the send
+    /// fails with `H3Error::BackpressureExceeded` instead of growing the
+    /// queue. `usize::MAX` (default) disables the cap.
+    max_pending_bytes: usize,
+
+    /// Whether we've seen our role for this connection. `Server` is set in
+    /// `accept`, `Client` in `initiate`. None means neither has been called
+    /// yet, in which case role-sensitive checks default to lenient.
+    role: Option<Role>,
 }
 
 impl H3Connection {
@@ -154,7 +286,43 @@ impl H3Connection {
             conn_id: None,
             read_buf: vec![0u8; 65536],
             pending_sends: HashMap::new(),
+            max_pending_bytes: usize::MAX,
+            role: None,
         }
+    }
+
+    /// Configure the maximum number of outbound bytes the connection will
+    /// hold in its per-stream queues while waiting for flow-control credit.
+    ///
+    /// When the running total of queued bytes would exceed `limit`,
+    /// `send_data` / `send_data_bytes` / `send_response` return
+    /// [`H3Error::BackpressureExceeded`] instead of growing the queue.
+    /// Callers should observe [`has_pending_writes`](Self::has_pending_writes)
+    /// (or wait for `StreamWritable` events) and retry once the queue drains.
+    ///
+    /// The default is `usize::MAX` (effectively unbounded). Set this on any
+    /// long-lived server / client that accepts user input feeding into the
+    /// send path — otherwise a hot loop or slow peer will eventually OOM the
+    /// process.
+    pub fn set_max_pending_bytes(&mut self, limit: usize) {
+        self.max_pending_bytes = limit;
+    }
+
+    /// Sum of bytes currently buffered for flow-control-blocked streams.
+    ///
+    /// Re-computed on demand from the per-stream queues; not cached. Cheap
+    /// for small workloads (handful of streams, handful of chunks each); if
+    /// you need to gate on this every hot-path call, prefer
+    /// `has_pending_writes`.
+    pub fn pending_bytes(&self) -> usize {
+        self.compute_pending_bytes()
+    }
+
+    fn compute_pending_bytes(&self) -> usize {
+        self.pending_sends
+            .values()
+            .map(|p| p.queue.iter().map(|b| b.len()).sum::<usize>())
+            .sum()
     }
 
     /// Initialize the HTTP/3 connection for a new QUIC connection.
@@ -162,6 +330,7 @@ impl H3Connection {
     /// Opens our control unidirectional stream and sends the SETTINGS frame.
     pub fn accept(&mut self, quic: &mut QuicEndpoint, conn: QuicConnId) -> Result<(), H3Error> {
         self.conn_id = Some(conn);
+        self.role = Some(Role::Server);
 
         // Open our control uni stream.
         let stream = quic
@@ -178,7 +347,10 @@ impl H3Connection {
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
         self.queue_send(quic, conn, stream, vec![Bytes::from(buf)], false)?;
 
-        self.settings_sent = true;
+        // Only mark SETTINGS as fully sent once nothing is queued behind it.
+        // If queue_send had to defer due to flow control, `drain_pending_stream`
+        // flips this when the bytes actually hit the wire.
+        self.settings_sent = !self.has_pending_writes(stream);
         Ok(())
     }
 
@@ -188,6 +360,7 @@ impl H3Connection {
     /// This is the client-side counterpart of [`accept()`](Self::accept).
     pub fn initiate(&mut self, quic: &mut QuicEndpoint, conn: QuicConnId) -> Result<(), H3Error> {
         self.conn_id = Some(conn);
+        self.role = Some(Role::Client);
 
         // Open our control uni stream.
         let stream = quic
@@ -201,7 +374,7 @@ impl H3Connection {
         Frame::Settings(self.local_settings.clone()).encode(&mut buf);
         self.queue_send(quic, conn, stream, vec![Bytes::from(buf)], false)?;
 
-        self.settings_sent = true;
+        self.settings_sent = !self.has_pending_writes(stream);
         Ok(())
     }
 
@@ -224,6 +397,16 @@ impl H3Connection {
             return Err(H3Error::Internal(
                 "connection is shutting down; cannot send new request".into(),
             ));
+        }
+
+        // Honour the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` if it has been
+        // received. Past it the peer will close the connection with
+        // H3_EXCESSIVE_LOAD — better to surface that as a local error than
+        // ship the bytes and discover the failure later.
+        if let Some(remote) = &self.remote_settings
+            && field_section_size(headers) > remote.max_field_section_size
+        {
+            return Err(H3Error::ExcessiveSize);
         }
 
         let conn = self
@@ -276,7 +459,22 @@ impl H3Connection {
             }
             QuicEvent::StreamOpened { conn, stream, bidi } => {
                 if *bidi {
-                    // New bidirectional stream from peer = new HTTP request.
+                    // On the server, a peer-opened bidi stream is a new HTTP
+                    // request. On the client, it would be a server-pushed
+                    // resource — but we never sent `MAX_PUSH_ID`, so the
+                    // server is not permitted to push (RFC 9114 §4.6 +
+                    // §7.2.4.1). Reject with H3_ID_ERROR rather than parsing
+                    // arbitrary frames the peer was never authorized to send.
+                    if self.role == Some(Role::Client) {
+                        // Best-effort reset + stop_sending; ignore errors —
+                        // the connection close that follows will tear
+                        // everything down anyway.
+                        let code = VarInt::from_u32(H3Error::IdError.code());
+                        let _ = quic.reset_stream(*conn, *stream, code);
+                        let _ = quic.stop_sending(*conn, *stream, code);
+                        self.fatal_error(quic, H3Error::IdError);
+                        return Ok(());
+                    }
                     self.request_streams
                         .insert(u64::from(*stream), RequestStream::new(false));
                     // Proactively try to read — data may have arrived in the
@@ -353,6 +551,12 @@ impl H3Connection {
         headers: &[HeaderField],
         end_stream: bool,
     ) -> Result<(), H3Error> {
+        if let Some(remote) = &self.remote_settings
+            && field_section_size(headers) > remote.max_field_section_size
+        {
+            return Err(H3Error::ExcessiveSize);
+        }
+
         let conn = self
             .conn_id
             .ok_or(H3Error::Internal("no connection".into()))?;
@@ -415,6 +619,40 @@ impl H3Connection {
         let chunks = vec![Bytes::from(header), data];
 
         self.queue_send(quic, conn, stream_id, chunks, end_stream)
+    }
+
+    /// Send trailing HEADERS (trailers) on a request stream and finish the
+    /// stream. Trailers per RFC 9114 §4.1 MUST be the last frame on the
+    /// stream, so this method always implies `end_stream = true`. The
+    /// trailer header section must not contain pseudo-headers; this is
+    /// enforced when the peer decodes them, and ideally the caller validates
+    /// up-front.
+    pub fn send_trailers(
+        &mut self,
+        quic: &mut QuicEndpoint,
+        stream_id: StreamId,
+        trailers: &[HeaderField],
+    ) -> Result<(), H3Error> {
+        if let Some(remote) = &self.remote_settings
+            && field_section_size(trailers) > remote.max_field_section_size
+        {
+            return Err(H3Error::ExcessiveSize);
+        }
+
+        let conn = self
+            .conn_id
+            .ok_or(H3Error::Internal("no connection".into()))?;
+
+        let mut encoded_headers = Vec::new();
+        qpack::encode(trailers, &mut encoded_headers);
+
+        let mut buf = Vec::new();
+        Frame::Headers {
+            encoded: encoded_headers,
+        }
+        .encode(&mut buf);
+
+        self.queue_send(quic, conn, stream_id, vec![Bytes::from(buf)], true)
     }
 
     /// Send a GOAWAY frame on the control stream (graceful shutdown).
@@ -484,6 +722,19 @@ impl H3Connection {
         fin: bool,
     ) -> Result<(), H3Error> {
         let key = u64::from(stream_id);
+
+        // Worst-case: if nothing fits in the peer's window right now, every
+        // byte we were handed will land in `pending_sends`. Reject the send
+        // up-front if that would push us past the configured cap, rather
+        // than partially sending and then failing — partial success would
+        // leave the caller unable to safely retry.
+        if self.max_pending_bytes != usize::MAX {
+            let incoming: usize = chunks.iter().map(|b| b.len()).sum();
+            let projected = self.compute_pending_bytes().saturating_add(incoming);
+            if projected > self.max_pending_bytes {
+                return Err(H3Error::BackpressureExceeded);
+            }
+        }
 
         // If this stream already has queued bytes, preserve FIFO ordering by
         // appending instead of racing the head. The queue drains on the next
@@ -605,8 +856,31 @@ impl H3Connection {
                 // Nothing queued and no deferred FIN → nothing left to track.
                 self.pending_sends.remove(&key);
             }
+            // If this was our control stream and SETTINGS was previously
+            // deferred (queued behind flow control), mark it sent now that
+            // it has actually reached the wire.
+            if Some(stream_id) == self.our_control_stream {
+                self.settings_sent = true;
+            }
         }
         Ok(())
+    }
+
+    /// Emit a connection-level H3 error and close the QUIC connection with
+    /// the corresponding wire error code (RFC 9114 §8.1). Should be used
+    /// instead of just `events.push_back(H3Event::Error(...))` whenever the
+    /// protocol invariants are violated — without closing, the H3 state
+    /// machine is corrupt yet the QUIC connection keeps running and the
+    /// peer is never told what went wrong.
+    fn fatal_error(&mut self, quic: &mut QuicEndpoint, err: H3Error) {
+        let code = err.code();
+        if let Some(conn) = self.conn_id
+            && !matches!(self.state, H3State::Closed)
+        {
+            quic.close_connection(conn, code, err.to_string().as_bytes());
+        }
+        self.state = H3State::Closed;
+        self.events.push_back(H3Event::Error(err));
     }
 
     /// Advance the request-stream state machine when the local send side
@@ -709,8 +983,7 @@ impl H3Connection {
             STREAM_TYPE_CONTROL => {
                 if self.control_stream_id.is_some() {
                     // Duplicate control stream is a connection error.
-                    self.events
-                        .push_back(H3Event::Error(H3Error::FrameUnexpected));
+                    self.fatal_error(quic, H3Error::FrameUnexpected);
                     return Ok(());
                 }
                 self.control_stream_id = Some(stream);
@@ -752,9 +1025,8 @@ impl H3Connection {
                 self.control_recv_buf.extend_from_slice(&self.read_buf[..n]);
             }
             if fin {
-                // Control stream closed — this is an error in HTTP/3.
-                self.events
-                    .push_back(H3Event::Error(H3Error::ClosedCriticalStream));
+                // Control stream closed — this is a fatal HTTP/3 error.
+                self.fatal_error(quic, H3Error::ClosedCriticalStream);
                 return Ok(());
             }
             if n == 0 {
@@ -763,10 +1035,10 @@ impl H3Connection {
         }
 
         // Process frames from the control stream buffer.
-        self.process_control_frames()
+        self.process_control_frames(quic)
     }
 
-    fn process_control_frames(&mut self) -> Result<(), H3Error> {
+    fn process_control_frames(&mut self, quic: &mut QuicEndpoint) -> Result<(), H3Error> {
         loop {
             let buf = &self.control_recv_buf;
             if buf.is_empty() {
@@ -775,12 +1047,19 @@ impl H3Connection {
             match frame::decode_frame(buf) {
                 Ok(Some((frame, consumed))) => {
                     let consumed_bytes = consumed;
+                    // RFC 9114 §7.2.4: the first frame on the control stream
+                    // MUST be SETTINGS. Anything else — including the unknown
+                    // (GREASE) frames that are normally ignored — is a
+                    // connection error of type H3_MISSING_SETTINGS.
+                    if self.remote_settings.is_none() && !matches!(frame, Frame::Settings(_)) {
+                        self.fatal_error(quic, H3Error::MissingSettings);
+                        return Ok(());
+                    }
                     match frame {
                         Frame::Settings(settings) => {
                             if self.remote_settings.is_some() {
                                 // Duplicate SETTINGS is a connection error.
-                                self.events
-                                    .push_back(H3Event::Error(H3Error::FrameUnexpected));
+                                self.fatal_error(quic, H3Error::FrameUnexpected);
                                 return Ok(());
                             }
                             self.remote_settings = Some(settings);
@@ -793,13 +1072,14 @@ impl H3Connection {
                             self.events.push_back(H3Event::GoAway { stream_id });
                         }
                         Frame::Data { .. } | Frame::Headers { .. } => {
-                            // DATA and HEADERS on control stream are errors.
-                            self.events
-                                .push_back(H3Event::Error(H3Error::FrameUnexpected));
+                            // DATA and HEADERS on the control stream are
+                            // connection errors.
+                            self.fatal_error(quic, H3Error::FrameUnexpected);
                             return Ok(());
                         }
                         Frame::Unknown { .. } => {
-                            // Unknown frames on control stream are ignored.
+                            // Unknown frames are ignored once SETTINGS has
+                            // been received (RFC 9114 §7.2.8).
                         }
                     }
                     // Remove consumed bytes in place — reallocating a fresh Vec
@@ -808,7 +1088,7 @@ impl H3Connection {
                 }
                 Ok(None) => break, // Incomplete frame, need more data.
                 Err(e) => {
-                    self.events.push_back(H3Event::Error(e));
+                    self.fatal_error(quic, e);
                     return Ok(());
                 }
             }
@@ -855,7 +1135,7 @@ impl H3Connection {
         }
 
         // Process frames from the stream's recv_buf.
-        self.process_request_frames(stream, fin_received)
+        self.process_request_frames(quic, stream, fin_received)
     }
 
     /// Drop all per-stream state for `stream`. Used when the peer aborts the
@@ -869,6 +1149,7 @@ impl H3Connection {
 
     fn process_request_frames(
         &mut self,
+        quic: &mut QuicEndpoint,
         stream: StreamId,
         fin_received: bool,
     ) -> Result<(), H3Error> {
@@ -880,6 +1161,7 @@ impl H3Connection {
         };
 
         let mut offset = 0;
+        let mut aborted = false;
 
         loop {
             let remaining = &recv_buf[offset..];
@@ -890,22 +1172,106 @@ impl H3Connection {
             match frame::decode_frame(remaining) {
                 Ok(Some((frame, consumed))) => {
                     offset += consumed;
+                    let at_end = fin_received && offset == recv_buf.len();
+
+                    // Snapshot the state machine before dispatching so we can
+                    // detect spec violations like DATA-before-HEADERS or
+                    // frames after trailers.
+                    let snapshot = self.request_streams.get(&u64::from(stream)).map(|rs| {
+                        (
+                            rs.client_initiated,
+                            rs.initial_headers_received,
+                            rs.trailers_received,
+                            rs.state == StreamState::WaitingHeaders,
+                        )
+                    });
 
                     match frame {
                         Frame::Headers { encoded } => {
-                            let headers = qpack::decode(&encoded)?;
-                            let at_end = fin_received && offset == recv_buf.len();
+                            let Some((client_initiated, initial_seen, already_trailed, _)) =
+                                snapshot
+                            else {
+                                break;
+                            };
+                            // After trailers we accept no further frames on
+                            // this stream.
+                            if already_trailed {
+                                self.fatal_error(quic, H3Error::FrameUnexpected);
+                                aborted = true;
+                                break;
+                            }
+                            // Initial vs trailing HEADERS is determined by
+                            // whether we've already processed an initial
+                            // HEADERS frame on this stream — *not* by the
+                            // local FIN state.
+                            let is_trailer = initial_seen;
+                            // Trailers MUST be the last frame on the stream.
+                            if is_trailer && !at_end {
+                                self.fatal_error(quic, H3Error::FrameUnexpected);
+                                aborted = true;
+                                break;
+                            }
 
-                            let client_initiated = self
-                                .request_streams
-                                .get(&u64::from(stream))
-                                .is_some_and(|rs| rs.client_initiated);
+                            // Pre-decode upper bound: the encoded HEADERS
+                            // payload can never be larger than the field
+                            // section size for fields that aren't QPACK
+                            // dynamic-table references (we don't use the
+                            // dynamic table). Reject obvious memory bombs
+                            // before we let QPACK allocate.
+                            let local_limit = self.local_settings.max_field_section_size;
+                            if (encoded.len() as u64) > local_limit {
+                                self.fatal_error(quic, H3Error::ExcessiveSize);
+                                aborted = true;
+                                break;
+                            }
+                            let headers = match qpack::decode(&encoded) {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    self.fatal_error(quic, e);
+                                    aborted = true;
+                                    break;
+                                }
+                            };
+                            // Post-decode authoritative check on the field
+                            // section size per RFC 9114 §4.2.2.
+                            if field_section_size(&headers) > local_limit {
+                                self.fatal_error(quic, H3Error::ExcessiveSize);
+                                aborted = true;
+                                break;
+                            }
 
-                            // Update stream state. If we already FINed the local
-                            // half, the peer FIN here closes the stream entirely
-                            // and `finalize_remote_close` drops the entry.
-                            // Otherwise advance into Open only from
-                            // WaitingHeaders — never clobber HalfClosedLocal.
+                            // Validate the header section per RFC 9114
+                            // §4.3.1.1 before exposing it to the application.
+                            let kind = if is_trailer {
+                                HeaderKind::Trailer
+                            } else if client_initiated {
+                                HeaderKind::Response
+                            } else {
+                                HeaderKind::Request
+                            };
+                            if let Err(e) = validate_headers(kind, &headers) {
+                                self.fatal_error(quic, e);
+                                aborted = true;
+                                break;
+                            }
+
+                            if is_trailer {
+                                if let Some(rs) = self.request_streams.get_mut(&u64::from(stream)) {
+                                    rs.trailers_received = true;
+                                }
+                                // Trailers always end the remote half.
+                                self.finalize_remote_close(stream);
+                                self.events.push_back(H3Event::Trailers {
+                                    stream_id: stream,
+                                    headers,
+                                });
+                                continue;
+                            }
+
+                            // Initial headers. Mark seen + advance state.
+                            if let Some(rs) = self.request_streams.get_mut(&u64::from(stream)) {
+                                rs.initial_headers_received = true;
+                            }
                             if at_end {
                                 self.finalize_remote_close(stream);
                             } else if let Some(rs) =
@@ -914,7 +1280,6 @@ impl H3Connection {
                             {
                                 rs.state = StreamState::Open;
                             }
-
                             if client_initiated {
                                 self.events.push_back(H3Event::Response {
                                     stream_id: stream,
@@ -930,7 +1295,16 @@ impl H3Connection {
                             }
                         }
                         Frame::Data { payload } => {
-                            let at_end = fin_received && offset == recv_buf.len();
+                            let Some((_, initial_seen, already_trailed, _)) = snapshot else {
+                                break;
+                            };
+                            // DATA before HEADERS, or DATA after trailers, is
+                            // an HTTP/3 message error.
+                            if !initial_seen || already_trailed {
+                                self.fatal_error(quic, H3Error::FrameUnexpected);
+                                aborted = true;
+                                break;
+                            }
 
                             if at_end {
                                 self.finalize_remote_close(stream);
@@ -942,33 +1316,34 @@ impl H3Connection {
                                 end_stream: at_end,
                             });
                         }
-                        Frame::Settings(_) => {
-                            // SETTINGS on a request stream is an error.
-                            self.events
-                                .push_back(H3Event::Error(H3Error::FrameUnexpected));
-                            break;
-                        }
-                        Frame::GoAway { .. } => {
-                            // GOAWAY on a request stream is an error.
-                            self.events
-                                .push_back(H3Event::Error(H3Error::FrameUnexpected));
+                        Frame::Settings(_) | Frame::GoAway { .. } => {
+                            // SETTINGS / GOAWAY are control-stream frames;
+                            // their appearance on a request stream is a
+                            // connection error.
+                            self.fatal_error(quic, H3Error::FrameUnexpected);
+                            aborted = true;
                             break;
                         }
                         Frame::Unknown { .. } => {
-                            // Unknown frames on request streams are ignored.
+                            // Unknown frames on request streams are ignored
+                            // post-HEADERS; pre-HEADERS they're still a
+                            // violation (RFC 9114 §4.1 is strict about the
+                            // first frame). We accept them lenient like
+                            // most stacks to avoid breaking GREASE.
                         }
                     }
                 }
                 Ok(None) => break, // Incomplete frame.
                 Err(e) => {
-                    self.events.push_back(H3Event::Error(e));
+                    self.fatal_error(quic, e);
+                    aborted = true;
                     break;
                 }
             }
         }
 
         // Handle FIN with no remaining frames — the stream is done.
-        if fin_received && offset == recv_buf.len() {
+        if !aborted && fin_received && offset == recv_buf.len() {
             // Synthesize an end-of-stream Data event for streams that received
             // HEADERS but no DATA frame carrying the FIN. WaitingHeaders + FIN
             // (peer cancelled before headers) or HalfClosedLocal + FIN (already
@@ -987,16 +1362,164 @@ impl H3Connection {
             }
         }
 
-        // Put unconsumed data back if the entry still exists. If
-        // finalize_remote_close removed the stream, we drop the (already fully
-        // consumed) buffer.
-        if offset > 0 {
-            recv_buf.drain(..offset);
-        }
-        if let Some(rs) = self.request_streams.get_mut(&u64::from(stream)) {
-            rs.recv_buf = recv_buf;
+        // Put unconsumed data back if the entry still exists. If we aborted
+        // or finalize_remote_close removed the stream, we drop the buffer.
+        if !aborted {
+            if offset > 0 {
+                recv_buf.drain(..offset);
+            }
+            if let Some(rs) = self.request_streams.get_mut(&u64::from(stream)) {
+                rs.recv_buf = recv_buf;
+            }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod validate_headers_tests {
+    use super::{HeaderKind, field_section_size, validate_headers};
+    use crate::qpack::HeaderField;
+
+    fn h(name: &[u8], value: &[u8]) -> HeaderField {
+        HeaderField::new(name, value)
+    }
+
+    #[test]
+    fn request_requires_method_path_scheme_authority() {
+        let ok = vec![
+            h(b":method", b"GET"),
+            h(b":path", b"/"),
+            h(b":scheme", b"https"),
+            h(b":authority", b"x"),
+        ];
+        assert!(validate_headers(HeaderKind::Request, &ok).is_ok());
+
+        // Missing :path.
+        let bad = vec![
+            h(b":method", b"GET"),
+            h(b":scheme", b"https"),
+            h(b":authority", b"x"),
+        ];
+        assert!(validate_headers(HeaderKind::Request, &bad).is_err());
+    }
+
+    #[test]
+    fn response_requires_status() {
+        let ok = vec![h(b":status", b"200")];
+        assert!(validate_headers(HeaderKind::Response, &ok).is_ok());
+        let bad: Vec<HeaderField> = vec![];
+        assert!(validate_headers(HeaderKind::Response, &bad).is_err());
+    }
+
+    #[test]
+    fn pseudo_after_regular_rejected() {
+        let bad = vec![
+            h(b":method", b"GET"),
+            h(b"user-agent", b"x"),
+            h(b":path", b"/"), // pseudo after regular
+            h(b":scheme", b"https"),
+            h(b":authority", b"x"),
+        ];
+        assert!(validate_headers(HeaderKind::Request, &bad).is_err());
+    }
+
+    #[test]
+    fn duplicate_pseudo_rejected() {
+        let bad = vec![
+            h(b":method", b"GET"),
+            h(b":method", b"POST"),
+            h(b":path", b"/"),
+            h(b":scheme", b"https"),
+            h(b":authority", b"x"),
+        ];
+        assert!(validate_headers(HeaderKind::Request, &bad).is_err());
+    }
+
+    #[test]
+    fn unknown_pseudo_rejected() {
+        let bad = vec![
+            h(b":method", b"GET"),
+            h(b":weird", b"x"),
+            h(b":path", b"/"),
+            h(b":scheme", b"https"),
+            h(b":authority", b"x"),
+        ];
+        assert!(validate_headers(HeaderKind::Request, &bad).is_err());
+    }
+
+    #[test]
+    fn forbidden_connection_specific_rejected() {
+        for forbidden in [
+            b"connection".as_ref(),
+            b"keep-alive".as_ref(),
+            b"proxy-connection".as_ref(),
+            b"transfer-encoding".as_ref(),
+            b"upgrade".as_ref(),
+        ] {
+            let bad = vec![
+                h(b":method", b"GET"),
+                h(b":path", b"/"),
+                h(b":scheme", b"https"),
+                h(b":authority", b"x"),
+                h(forbidden, b"value"),
+            ];
+            assert!(
+                validate_headers(HeaderKind::Request, &bad).is_err(),
+                "expected {} to be rejected",
+                std::str::from_utf8(forbidden).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn te_only_trailers_allowed() {
+        let bad = vec![
+            h(b":method", b"GET"),
+            h(b":path", b"/"),
+            h(b":scheme", b"https"),
+            h(b":authority", b"x"),
+            h(b"te", b"gzip"),
+        ];
+        assert!(validate_headers(HeaderKind::Request, &bad).is_err());
+
+        let ok = vec![
+            h(b":method", b"GET"),
+            h(b":path", b"/"),
+            h(b":scheme", b"https"),
+            h(b":authority", b"x"),
+            h(b"te", b"trailers"),
+        ];
+        assert!(validate_headers(HeaderKind::Request, &ok).is_ok());
+    }
+
+    #[test]
+    fn trailers_forbid_pseudo_headers() {
+        let bad = vec![h(b":status", b"200"), h(b"trailer-name", b"v")];
+        assert!(validate_headers(HeaderKind::Trailer, &bad).is_err());
+        let ok = vec![h(b"trailer-name", b"v")];
+        assert!(validate_headers(HeaderKind::Trailer, &ok).is_ok());
+    }
+
+    #[test]
+    fn connect_request_requires_authority_only() {
+        let ok = vec![h(b":method", b"CONNECT"), h(b":authority", b"x:443")];
+        assert!(validate_headers(HeaderKind::Request, &ok).is_ok());
+        // CONNECT with :path is invalid.
+        let bad = vec![
+            h(b":method", b"CONNECT"),
+            h(b":authority", b"x:443"),
+            h(b":path", b"/"),
+        ];
+        assert!(validate_headers(HeaderKind::Request, &bad).is_err());
+    }
+
+    #[test]
+    fn field_section_size_includes_per_field_overhead() {
+        // RFC 9114 §4.2.2: name.len() + value.len() + 32 per field.
+        let headers = vec![h(b"a", b"bc"), h(b"def", b"")];
+        // (1+2+32) + (3+0+32) = 35 + 35 = 70
+        assert_eq!(field_section_size(&headers), 70);
     }
 }

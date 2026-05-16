@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use quinn_proto::{ClientConfig, ServerConfig, TransportConfig, VarInt};
+use ringline_h3::error::H3Error;
 use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
 use ringline_quic::{QuicConfig, QuicConnId, QuicEndpoint, QuicEvent};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -535,4 +536,174 @@ fn zero_rtt_rejected_clears_state_and_emits_event() {
         .into_iter()
         .any(|e| matches!(e, H3Event::ZeroRttRejected));
     assert!(saw_event, "client should emit H3Event::ZeroRttRejected");
+}
+
+/// `set_max_pending_bytes` should cause `send_data` to fail when the queued
+/// bytes would otherwise grow without bound.
+#[test]
+fn pending_bytes_cap_returns_backpressure_exceeded() {
+    let (
+        mut client_ep,
+        _server_ep,
+        _client_conn,
+        _server_conn,
+        mut client_h3,
+        _server_h3,
+        _client_addr,
+        _server_addr,
+        _port,
+    ) = connected_pair();
+
+    // Cap the connection at 4 KiB of pending bytes.
+    client_h3.set_max_pending_bytes(4 * 1024);
+
+    let req_stream = client_h3
+        .send_request(
+            &mut client_ep,
+            &[
+                HeaderField::new(b":method", b"POST"),
+                HeaderField::new(b":path", b"/upload"),
+                HeaderField::new(b":scheme", b"https"),
+                HeaderField::new(b":authority", b"localhost"),
+            ],
+            false,
+        )
+        .expect("send_request");
+
+    // Without ferrying bytes to the server, sending a 32 KiB body will
+    // accumulate in `pending_sends` and immediately blow past the cap.
+    let body = vec![0u8; 32 * 1024];
+    let err = client_h3
+        .send_data(&mut client_ep, req_stream, &body, false)
+        .expect_err("send_data should fail past cap");
+    assert!(
+        matches!(err, H3Error::BackpressureExceeded),
+        "expected BackpressureExceeded, got {err:?}",
+    );
+
+    // `pending_bytes` reports what's actually queued.
+    assert!(client_h3.pending_bytes() <= 4 * 1024);
+}
+
+/// Trailers (HEADERS frame following an initial HEADERS + DATA) surface as
+/// a distinct `H3Event::Trailers` event with the same `stream_id`.
+#[test]
+fn trailers_emit_trailers_event() {
+    let (
+        mut client_ep,
+        mut server_ep,
+        _client_conn,
+        _server_conn,
+        mut client_h3,
+        mut server_h3,
+        client_addr,
+        server_addr,
+        _port,
+    ) = connected_pair();
+
+    let req_stream = client_h3
+        .send_request(
+            &mut client_ep,
+            &[
+                HeaderField::new(b":method", b"GET"),
+                HeaderField::new(b":path", b"/"),
+                HeaderField::new(b":scheme", b"https"),
+                HeaderField::new(b":authority", b"localhost"),
+            ],
+            true,
+        )
+        .expect("send_request");
+
+    shuffle(&mut client_ep, &mut server_ep, client_addr, server_addr);
+    pump_h3(&mut server_ep, &mut server_h3);
+    let resp_stream = drain_h3(&mut server_h3)
+        .into_iter()
+        .find_map(|e| match e {
+            H3Event::Request { stream_id, .. } => Some(stream_id),
+            _ => None,
+        })
+        .expect("server sees Request");
+
+    // Server: initial response HEADERS, a small DATA, then trailers.
+    server_h3
+        .send_response(
+            &mut server_ep,
+            resp_stream,
+            &[HeaderField::new(b":status", b"200")],
+            false,
+        )
+        .expect("send_response");
+    server_h3
+        .send_data(&mut server_ep, resp_stream, b"body", false)
+        .expect("send_data");
+    server_h3
+        .send_trailers(
+            &mut server_ep,
+            resp_stream,
+            &[HeaderField::new(b"x-trailer", b"v")],
+        )
+        .expect("send_trailers");
+
+    // Drive both sides until the client has seen the trailers.
+    let mut saw_response = false;
+    let mut saw_trailers = false;
+    for _ in 0..32 {
+        shuffle(&mut client_ep, &mut server_ep, client_addr, server_addr);
+        pump_h3(&mut client_ep, &mut client_h3);
+        pump_h3(&mut server_ep, &mut server_h3);
+        for ev in drain_h3(&mut client_h3) {
+            match ev {
+                H3Event::Response { .. } => saw_response = true,
+                H3Event::Trailers { stream_id, headers } => {
+                    assert_eq!(stream_id, req_stream);
+                    assert_eq!(headers.len(), 1);
+                    assert_eq!(headers[0].name, b"x-trailer");
+                    saw_trailers = true;
+                }
+                _ => {}
+            }
+        }
+        if saw_trailers {
+            break;
+        }
+    }
+    assert!(saw_response, "client should see Response");
+    assert!(saw_trailers, "client should see Trailers");
+}
+
+/// `send_request` rejects a header section larger than the peer's
+/// advertised `SETTINGS_MAX_FIELD_SECTION_SIZE`.
+#[test]
+fn send_request_rejects_oversize_headers_per_peer_settings() {
+    let (
+        mut client_ep,
+        mut server_ep,
+        _client_conn,
+        _server_conn,
+        mut client_h3,
+        mut server_h3,
+        client_addr,
+        server_addr,
+        _port,
+    ) = connected_pair();
+
+    // Discover what the server advertised — `connected_pair` already pumped
+    // SETTINGS across, so the client should know the server's value.
+    // Default is 256 KiB. Construct headers larger than that.
+    let huge_value = vec![b'a'; 300 * 1024];
+    let headers = vec![
+        HeaderField::new(b":method", b"GET"),
+        HeaderField::new(b":path", b"/"),
+        HeaderField::new(b":scheme", b"https"),
+        HeaderField::new(b":authority", b"localhost"),
+        HeaderField::new(b"x-huge", huge_value.as_slice()),
+    ];
+
+    let err = client_h3
+        .send_request(&mut client_ep, &headers, true)
+        .expect_err("expected ExcessiveSize from oversize headers");
+    assert!(matches!(err, H3Error::ExcessiveSize));
+
+    // Reference the server endpoint/h3 so they don't get warnings as unused.
+    let _ = (&mut server_ep, &mut server_h3, client_addr, server_addr);
 }
