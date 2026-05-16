@@ -50,4 +50,14 @@ pub enum Error {
     /// [`crate::ClientBuilder::max_in_flight`].
     #[error("too many in-flight operations")]
     TooManyInFlight,
+
+    /// A sequential API call ([`crate::Client::get`] / `set` / `delete`)
+    /// was issued while one or more `fire_*` ops were still in flight.
+    /// Momento is multiplexed and `recv()` returns whatever `message_id`
+    /// arrives first; the convenience APIs discard the id/key and would
+    /// silently return data for the wrong request. Drain `recv()` until
+    /// `pending_count() == 0` before calling the sequential API, or use
+    /// `fire_*` + `recv()` exclusively.
+    #[error("sequential API requires no in-flight fire_* ops; drain recv() first")]
+    PendingOpsInFlight,
 }
