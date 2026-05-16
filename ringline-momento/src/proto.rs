@@ -1018,19 +1018,43 @@ impl CacheResponse {
     }
 }
 
-/// Decode a length-delimited message from a `Bytes` handle.
-/// Returns (bytes_consumed, message_bytes) or None if incomplete.
-pub fn decode_length_delimited_message_bytes(buf: &Bytes) -> Option<(usize, Bytes)> {
+/// Upper bound on a single length-delimited protobuf message. Without this
+/// cap, an adversarial peer (or a buggy server) sending a varint length of
+/// e.g. `2^60` would park the recv accumulator indefinitely while it tries
+/// to gather that many bytes, growing unboundedly. 16 MiB comfortably fits
+/// realistic Momento responses while bounding the worst case.
+pub const MAX_MESSAGE_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Result of `decode_length_delimited_message_bytes`.
+#[derive(Debug)]
+pub enum DecodedMessage {
+    /// One full message decoded; `(bytes_consumed, message_bytes)`.
+    Message(usize, Bytes),
+    /// Buffer doesn't yet contain a full message — wait for more.
+    Incomplete,
+    /// The declared length is larger than [`MAX_MESSAGE_SIZE`]; the peer
+    /// is misbehaving or hostile. Callers should close the connection.
+    Oversize,
+}
+
+/// Decode a length-delimited message from a `Bytes` handle. Returns
+/// `Incomplete` if the buffer isn't full yet, `Oversize` if the declared
+/// length exceeds [`MAX_MESSAGE_SIZE`], or `Message(consumed, bytes)`.
+pub fn decode_length_delimited_message_bytes(buf: &Bytes) -> DecodedMessage {
     let mut offset = 0;
-    let len = decode_varint_bytes(buf, &mut offset)? as usize;
-
-    // Check if we have enough data
-    if buf.len() - offset < len {
-        return None;
+    let len = match decode_varint_bytes(buf, &mut offset) {
+        Some(v) => v,
+        None => return DecodedMessage::Incomplete,
+    };
+    if len > MAX_MESSAGE_SIZE {
+        return DecodedMessage::Oversize;
     }
-
+    let len = len as usize;
+    if buf.len() - offset < len {
+        return DecodedMessage::Incomplete;
+    }
     let message = buf.slice(offset..offset + len);
-    Some((offset + len, message))
+    DecodedMessage::Message(offset + len, message)
 }
 
 #[cfg(test)]
@@ -1495,5 +1519,58 @@ mod tests {
     fn test_decode_length_delimited_message_empty() {
         let result = decode_length_delimited_message(&[]);
         assert!(result.is_none());
+    }
+
+    // Bytes-handle (zero-copy) variant + size cap
+
+    #[test]
+    fn decode_length_delimited_bytes_message() {
+        let payload = b"hello world";
+        let mut buf = Vec::new();
+        encode_varint(payload.len() as u64, &mut buf);
+        buf.extend_from_slice(payload);
+        let bytes = Bytes::from(buf.clone());
+
+        match decode_length_delimited_message_bytes(&bytes) {
+            DecodedMessage::Message(consumed, msg) => {
+                assert_eq!(consumed, buf.len());
+                assert_eq!(&msg[..], payload);
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_length_delimited_bytes_incomplete() {
+        let mut buf = Vec::new();
+        encode_varint(100, &mut buf);
+        buf.extend_from_slice(b"only-5");
+        let bytes = Bytes::from(buf);
+        assert!(matches!(
+            decode_length_delimited_message_bytes(&bytes),
+            DecodedMessage::Incomplete
+        ));
+    }
+
+    #[test]
+    fn decode_length_delimited_bytes_oversize() {
+        // Declared length above MAX_MESSAGE_SIZE — must report Oversize so
+        // the caller can poison the connection instead of waiting forever.
+        let mut buf = Vec::new();
+        encode_varint(MAX_MESSAGE_SIZE + 1, &mut buf);
+        let bytes = Bytes::from(buf);
+        assert!(matches!(
+            decode_length_delimited_message_bytes(&bytes),
+            DecodedMessage::Oversize
+        ));
+
+        // A pathological 2^62 varint must also report Oversize, not panic.
+        let mut buf = Vec::new();
+        encode_varint(1u64 << 62, &mut buf);
+        let bytes = Bytes::from(buf);
+        assert!(matches!(
+            decode_length_delimited_message_bytes(&bytes),
+            DecodedMessage::Oversize
+        ));
     }
 }

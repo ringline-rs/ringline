@@ -151,7 +151,12 @@ const MAX_FLUSH_IOVECS: usize = 8;
 // ── Error ───────────────────────────────────────────────────────────────
 
 /// Errors returned by the ringline RESP client.
+///
+/// Marked `#[non_exhaustive]` because the crate is still evolving and new
+/// transport / protocol error kinds are expected. Downstream `match`
+/// blocks must include a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The connection was closed before a response was received.
     #[error("connection closed")]
@@ -184,12 +189,19 @@ pub enum Error {
     /// `recv()` called with no pending fire operations.
     #[error("no pending operations")]
     NoPending,
+
+    /// The in-flight pending-op queue reached `max_in_flight`. Drain via
+    /// `recv()` before issuing more `fire_*` calls. Configurable via
+    /// [`ClientBuilder::max_in_flight`].
+    #[error("too many in-flight operations")]
+    TooManyInFlight,
 }
 
 // ── Command types ───────────────────────────────────────────────────────
 
 /// The type of Redis command that completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CommandType {
     Get,
     Set,
@@ -301,6 +313,7 @@ struct PendingOp {
 }
 
 /// A completed fire/recv operation with its result.
+#[non_exhaustive]
 pub enum CompletedOp {
     /// GET completed.
     Get {
@@ -331,6 +344,7 @@ pub struct ClientBuilder {
     conn: ConnCtx,
     on_result: Option<ResultCallback>,
     max_batch_size: usize,
+    max_in_flight: usize,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -343,11 +357,25 @@ impl ClientBuilder {
             conn,
             on_result: None,
             max_batch_size: 1,
+            max_in_flight: usize::MAX,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             with_metrics: false,
         }
+    }
+
+    /// Configure the maximum number of in-flight `fire_*` operations
+    /// (the depth of the pending queue) before [`fire_*`] returns
+    /// [`Error::TooManyInFlight`]. Defaults to `usize::MAX` (unbounded).
+    ///
+    /// A bounded value should be set for any server / loop that issues
+    /// `fire_*` faster than `recv()` consumes — without a cap, a slow
+    /// or stalled consumer grows the queue without limit and eventually
+    /// OOMs the worker.
+    pub fn max_in_flight(mut self, n: usize) -> Self {
+        self.max_in_flight = n;
+        self
     }
 
     /// Register a callback invoked after each command completes.
@@ -395,6 +423,7 @@ impl ClientBuilder {
             write_guards: Vec::new(),
             flushed_count: 0,
             max_batch_size: self.max_batch_size,
+            max_in_flight: self.max_in_flight,
             buffered_ops: 0,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
@@ -433,6 +462,9 @@ pub struct Client {
     /// Maximum `fire_*` commands to coalesce before flushing. 1 = send each
     /// command immediately (default, matching pre-coalescing behavior).
     max_batch_size: usize,
+    /// Cap on `pending.len()`; `fire_*` returns `Error::TooManyInFlight`
+    /// past it. `usize::MAX` (default) disables.
+    max_in_flight: usize,
     /// Number of ops buffered in `write_buf` that have not yet been flushed.
     buffered_ops: usize,
     #[cfg(feature = "timestamps")]
@@ -456,6 +488,7 @@ impl Client {
             write_guards: Vec::new(),
             flushed_count: 0,
             max_batch_size: 1,
+            max_in_flight: usize::MAX,
             buffered_ops: 0,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
@@ -593,8 +626,13 @@ impl Client {
     }
 
     /// Flush before appending the next op if adding it would exceed
-    /// guard/iovec limits for scatter-gather sends.
+    /// guard/iovec limits for scatter-gather sends. Also enforces the
+    /// `max_in_flight` cap so adversarial / stalled callers can't grow
+    /// the pending queue without bound.
     fn pre_flush_if_needed(&mut self, has_guard: bool) -> Result<(), Error> {
+        if self.pending.len() >= self.max_in_flight {
+            return Err(Error::TooManyInFlight);
+        }
         if self.buffered_ops == 0 {
             return Ok(());
         }
@@ -626,12 +664,20 @@ impl Client {
             return Ok(());
         }
 
-        if self.write_guards.is_empty() {
-            // Fast path: no guards, single copy send.
-            self.conn.send_nowait(&self.write_buf)?;
+        // Send the batch. If the send itself errors (peer RST, kernel
+        // ENOBUFS, etc.), discard the bytes-in-progress and the pending
+        // ops we'd push_back'd for them. The previous behaviour returned
+        // the error but left `write_buf` / `write_guards` / `pending` /
+        // `flushed_count` inconsistent — the next `flush()` would re-send
+        // the same buffer, and `recv()` would pop a `PendingOp` for a
+        // request that was never on the wire and then hang forever
+        // awaiting a response that will never come.
+        let send_outcome: Result<(), Error> = if self.write_guards.is_empty() {
+            self.conn
+                .send_nowait(&self.write_buf)
+                .map(|_| ())
+                .map_err(Error::from)
         } else {
-            // Scatter-gather path: interleave copy slices and zero-copy guards.
-            // Build a Vec<SendPart> to avoid lifetime issues with the closure API.
             use ringline::SendPart;
             let mut parts: Vec<SendPart<'_>> = Vec::with_capacity(2 * MAX_FLUSH_GUARDS + 1);
             let mut pos = 0;
@@ -645,7 +691,24 @@ impl Client {
             if pos < self.write_buf.len() {
                 parts.push(SendPart::Copy(&self.write_buf[pos..]));
             }
-            self.conn.send_parts().submit_batch(parts)?;
+            self.conn
+                .send_parts()
+                .submit_batch(parts)
+                .map(|_| ())
+                .map_err(Error::from)
+        };
+
+        if let Err(e) = send_outcome {
+            // Discard everything that was buffered for this flush. The
+            // pending ops that haven't been finalised yet (i.e., those
+            // beyond `flushed_count`) correspond to commands that were
+            // pushed onto `pending` but never reached the wire — drop
+            // them so `recv()` doesn't try to read responses for them.
+            self.write_buf.clear();
+            self.write_guards.clear();
+            self.buffered_ops = 0;
+            self.pending.truncate(self.flushed_count);
+            return Err(e);
         }
 
         // Only rewrite send timestamps when batching multiple ops —
@@ -859,8 +922,12 @@ impl Client {
             Err(e) => {
                 // Connection is broken — clear remaining pending ops so
                 // subsequent recv() calls return NoPending instead of
-                // reading stale/misaligned responses.
+                // reading stale/misaligned responses. Reset
+                // `flushed_count` too — otherwise a stale count > 0 makes
+                // the next batched `flush()` skip the send_ts rewrite for
+                // newly-buffered ops.
                 self.pending.clear();
+                self.flushed_count = 0;
                 return Err(e);
             }
         };
@@ -2212,6 +2279,13 @@ impl Pipeline {
     }
 
     /// Execute all commands in the pipeline and return their results in order.
+    ///
+    /// On error mid-batch, the underlying connection is closed: pipeline
+    /// responses are positional, and there's no safe way to skip
+    /// remaining responses without parsing the full RESP value (which
+    /// might itself fail). Closing the conn surfaces the desync as a
+    /// `ConnectionClosed` to the next user instead of letting them read
+    /// the tail of this pipeline's responses.
     pub async fn execute(self) -> Result<Vec<Value>, Error> {
         if self.count == 0 {
             return Ok(Vec::new());
@@ -2222,9 +2296,29 @@ impl Pipeline {
         let client = Client::new(self.conn);
         let mut results = Vec::with_capacity(self.count);
         for _ in 0..self.count {
-            let value = client.read_value().await?;
+            let value = match client.read_value().await {
+                Ok(v) => v,
+                Err(e) => {
+                    self.conn.close();
+                    return Err(e);
+                }
+            };
             if let Value::Error(ref msg) = value {
-                return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+                // Drain any remaining responses we haven't read yet —
+                // we can't return early here because Redis already sent
+                // responses for every command we sent. A Value::Error
+                // for one command doesn't desync the stream; we
+                // continue reading the rest. (This matches the prior
+                // behaviour and is correct for pipelined Redis.)
+                let err = Error::Redis(String::from_utf8_lossy(msg).into_owned());
+                for _ in (results.len() + 1)..self.count {
+                    if client.read_value().await.is_err() {
+                        // *Now* the stream is broken — close.
+                        self.conn.close();
+                        return Err(err);
+                    }
+                }
+                return Err(err);
             }
             results.push(value);
         }

@@ -6,7 +6,12 @@ use std::io;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors that can occur when using the Momento client.
+///
+/// Marked `#[non_exhaustive]` because the crate is still evolving and new
+/// transport / protocol error kinds are expected. Downstream `match`
+/// blocks must include a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The connection was closed before a response was received.
     #[error("connection closed")]
@@ -39,4 +44,10 @@ pub enum Error {
     /// All connections in the pool are down and reconnection failed.
     #[error("all connections failed")]
     AllConnectionsFailed,
+
+    /// The in-flight pending-op map reached `max_in_flight`. Drain via
+    /// `recv()` before issuing more `fire_*` calls. Configurable via
+    /// [`crate::ClientBuilder::max_in_flight`].
+    #[error("too many in-flight operations")]
+    TooManyInFlight,
 }

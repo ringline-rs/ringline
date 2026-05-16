@@ -57,7 +57,7 @@ use bytes::Bytes;
 use ringline::{ConnCtx, ParseResult};
 
 use crate::proto::{
-    CacheCommand, CacheResponse, CacheResponseResult, StatusCode, UnaryCommand,
+    CacheCommand, CacheResponse, CacheResponseResult, DecodedMessage, StatusCode, UnaryCommand,
     decode_length_delimited_message_bytes,
 };
 
@@ -76,6 +76,7 @@ impl RequestId {
 
 /// The type of cache command that completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CommandType {
     Get,
     Set,
@@ -84,6 +85,7 @@ pub enum CommandType {
 
 /// A completed cache operation.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CompletedOp {
     /// Get operation completed.
     Get {
@@ -237,6 +239,7 @@ pub struct ClientBuilder {
     conn: ConnCtx,
     on_result: Option<ResultCallback>,
     namespace: Bytes,
+    max_in_flight: usize,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -249,11 +252,20 @@ impl ClientBuilder {
             conn,
             on_result: None,
             namespace: Bytes::new(),
+            max_in_flight: usize::MAX,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             with_metrics: false,
         }
+    }
+
+    /// Maximum number of in-flight `fire_*` requests (depth of the
+    /// pending map). `fire_*` returns [`Error::TooManyInFlight`] past it.
+    /// Defaults to `usize::MAX` (unbounded).
+    pub fn max_in_flight(mut self, n: usize) -> Self {
+        self.max_in_flight = n;
+        self
     }
 
     /// Pre-set the cache namespace. When set, `fire_*` methods use an O(1)
@@ -292,6 +304,7 @@ impl ClientBuilder {
             send_buf: Vec::with_capacity(4096),
             on_result: self.on_result,
             namespace: self.namespace,
+            max_in_flight: self.max_in_flight,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
             #[cfg(feature = "metrics")]
@@ -318,6 +331,9 @@ pub struct Client {
     send_buf: Vec<u8>,
     on_result: Option<ResultCallback>,
     namespace: Bytes,
+    /// Cap on `pending.len()`; `fire_*` returns `Error::TooManyInFlight`
+    /// past it. `usize::MAX` (default) disables.
+    max_in_flight: usize,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -341,6 +357,7 @@ impl Client {
             send_buf: Vec::with_capacity(4096),
             on_result: None,
             namespace: Bytes::new(),
+            max_in_flight: usize::MAX,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -370,6 +387,7 @@ impl Client {
             send_buf: Vec::with_capacity(4096),
             on_result: None,
             namespace: Bytes::new(),
+            max_in_flight: usize::MAX,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -417,6 +435,18 @@ impl Client {
 
     // ── Multiplexed fire API ────────────────────────────────────────────
 
+    /// Returns `Err(TooManyInFlight)` if the pending map has hit
+    /// `max_in_flight`. Called at the start of every `fire_*` to bail
+    /// before doing any encode / send work.
+    #[inline]
+    fn check_in_flight(&self) -> Result<(), Error> {
+        if self.pending.len() >= self.max_in_flight {
+            Err(Error::TooManyInFlight)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Fire a GET request. Returns immediately with a RequestId.
     pub fn fire_get(
         &mut self,
@@ -424,6 +454,7 @@ impl Client {
         key: &[u8],
         user_data: u64,
     ) -> Result<RequestId, Error> {
+        self.check_in_flight()?;
         let message_id = self.next_id();
         let ns = self.namespace_for(cache);
         let key = Bytes::copy_from_slice(key);
@@ -463,6 +494,7 @@ impl Client {
         ttl_ms: u64,
         user_data: u64,
     ) -> Result<RequestId, Error> {
+        self.check_in_flight()?;
         let message_id = self.next_id();
         let ns = self.namespace_for(cache);
         let key = Bytes::copy_from_slice(key);
@@ -502,6 +534,7 @@ impl Client {
         key: &[u8],
         user_data: u64,
     ) -> Result<RequestId, Error> {
+        self.check_in_flight()?;
         let message_id = self.next_id();
         let ns = self.namespace_for(cache);
         let key = Bytes::copy_from_slice(key);
@@ -544,38 +577,71 @@ impl Client {
             return Err(Error::NoPending);
         }
 
-        let pending = &mut self.pending;
-        let mut dispatch_result: Option<DispatchResult> = None;
+        // Loop over inbound messages. We may receive a response whose
+        // `message_id` doesn't match any pending op (server bug, id
+        // re-use, or an op we already finalised) — in that case we
+        // *skip* it and wait for the next message rather than poisoning
+        // the connection (which used to drop every other in-flight op).
+        let (dr, total_bytes) = loop {
+            let pending = &mut self.pending;
+            let mut dispatch_result: Option<DispatchResult> = None;
+            let mut malformed = false;
+            let mut oversize = false;
 
-        let n = self
-            .conn
-            .with_bytes(|bytes| {
-                match decode_length_delimited_message_bytes(&bytes) {
-                    Some((consumed, msg_bytes)) => {
-                        if let Some(response) = CacheResponse::decode_bytes(msg_bytes) {
-                            dispatch_result = dispatch_response(response, pending);
+            let n = self
+                .conn
+                .with_bytes(
+                    |bytes| match decode_length_delimited_message_bytes(&bytes) {
+                        DecodedMessage::Message(consumed, msg_bytes) => {
+                            if let Some(response) = CacheResponse::decode_bytes(msg_bytes) {
+                                dispatch_result = dispatch_response(response, pending);
+                            } else {
+                                malformed = true;
+                            }
+                            ParseResult::Consumed(consumed)
                         }
-                        ParseResult::Consumed(consumed)
-                    }
-                    None => ParseResult::Consumed(0), // need more data
-                }
-            })
-            .await;
+                        DecodedMessage::Incomplete => ParseResult::Consumed(0),
+                        DecodedMessage::Oversize => {
+                            oversize = true;
+                            ParseResult::Consumed(0)
+                        }
+                    },
+                )
+                .await;
 
-        if n == 0 {
-            // Connection broken — clear pending so subsequent recv() returns
-            // NoPending instead of reading stale/misaligned responses.
-            self.pending.clear();
-            return Err(Error::ConnectionClosed);
-        }
-
-        let dr = match dispatch_result {
-            Some(dr) => dr,
-            None => {
+            if oversize {
+                // Adversarial / broken peer — declared length exceeds the
+                // per-message cap. The accumulator can't progress past this
+                // message, so the connection is unusable from here on.
+                self.pending.clear();
+                return Err(Error::Protocol(
+                    "inbound message exceeded MAX_MESSAGE_SIZE".into(),
+                ));
+            }
+            if n == 0 {
+                // Connection broken — clear pending so subsequent recv()
+                // returns NoPending instead of reading stale data.
+                self.pending.clear();
+                return Err(Error::ConnectionClosed);
+            }
+            if malformed {
+                // Decoded a length-prefix but the inner protobuf was
+                // gibberish. Can't re-sync the stream — poison.
                 self.pending.clear();
                 return Err(Error::Protocol("failed to decode response".into()));
             }
+            if let Some(dr) = dispatch_result {
+                break (dr, n);
+            }
+            // Unknown / unmatched message_id: response was decoded fine,
+            // but no pending op claimed it. Skip and wait for the next.
+            // If the pending queue is now empty (e.g. caller raced),
+            // bail out distinctly.
+            if self.pending.is_empty() {
+                return Err(Error::NoPending);
+            }
         };
+        let n = total_bytes;
 
         // Read recv_timestamp once, after with_bytes completes, so the
         // kernel timestamp reflects the CQE that delivered this response.
@@ -678,11 +744,12 @@ impl Client {
         // Wait for auth response
         let mut auth_result: Option<Result<(), Error>> = None;
 
+        let mut oversize = false;
         let n = self
             .conn
             .with_bytes(
                 |bytes| match decode_length_delimited_message_bytes(&bytes) {
-                    Some((consumed, msg_bytes)) => {
+                    DecodedMessage::Message(consumed, msg_bytes) => {
                         if let Some(response) = CacheResponse::decode_bytes(msg_bytes)
                             && response.message_id == message_id
                         {
@@ -702,11 +769,20 @@ impl Client {
                         }
                         ParseResult::Consumed(consumed)
                     }
-                    None => ParseResult::Consumed(0),
+                    DecodedMessage::Incomplete => ParseResult::Consumed(0),
+                    DecodedMessage::Oversize => {
+                        oversize = true;
+                        ParseResult::Consumed(0)
+                    }
                 },
             )
             .await;
 
+        if oversize {
+            return Err(Error::Protocol(
+                "auth response exceeded MAX_MESSAGE_SIZE".into(),
+            ));
+        }
         if n == 0 {
             return Err(Error::ConnectionClosed);
         }
