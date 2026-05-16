@@ -181,6 +181,52 @@ pub enum Error {
     /// [`ClientBuilder::max_in_flight`].
     #[error("too many in-flight operations")]
     TooManyInFlight,
+
+    /// Key exceeds memcache's 250-byte cap ([`MAX_KEY_LEN`]). The request
+    /// is rejected client-side instead of being transmitted; otherwise the
+    /// server would reply with `CLIENT_ERROR` after consuming pool /
+    /// pending-queue capacity for a doomed command.
+    #[error("key too long (max 250 bytes)")]
+    KeyTooLong,
+
+    /// Value exceeds memcache's default `-I` 1 MiB cap ([`MAX_VALUE_LEN`]).
+    /// Same rationale as [`Error::KeyTooLong`].
+    #[error("value too long (max 1048576 bytes)")]
+    ValueTooLong,
+}
+
+/// Maximum key length per memcache text-protocol spec.
+pub const MAX_KEY_LEN: usize = 250;
+
+/// Maximum value length matching the parser cap in `memcache-proto`
+/// (`MAX_VALUE_DATA_LEN`) and memcached's default `-I` 1 MiB item size.
+pub const MAX_VALUE_LEN: usize = 1024 * 1024;
+
+#[inline]
+fn validate_key(key: &[u8]) -> Result<(), Error> {
+    if key.len() > MAX_KEY_LEN {
+        Err(Error::KeyTooLong)
+    } else {
+        Ok(())
+    }
+}
+
+#[inline]
+fn validate_value(value: &[u8]) -> Result<(), Error> {
+    if value.len() > MAX_VALUE_LEN {
+        Err(Error::ValueTooLong)
+    } else {
+        Ok(())
+    }
+}
+
+#[inline]
+fn validate_value_len(value_len: usize) -> Result<(), Error> {
+    if value_len > MAX_VALUE_LEN {
+        Err(Error::ValueTooLong)
+    } else {
+        Ok(())
+    }
 }
 
 // -- Value types -------------------------------------------------------------
@@ -599,7 +645,7 @@ impl Client {
     /// Fire a GET request without waiting for the response.
     pub fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         self.check_in_flight()?;
-        let encoded = encode_request(&McRequest::get(key));
+        let encoded = encode_request(&McRequest::get(key))?;
         let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
         let (send_ts, start) = self.timing_start();
@@ -623,7 +669,7 @@ impl Client {
         user_data: u64,
     ) -> Result<(), Error> {
         self.check_in_flight()?;
-        let encoded = encode_set(key, value, flags, exptime);
+        let encoded = encode_set(key, value, flags, exptime)?;
         let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
         let (send_ts, start) = self.timing_start();
@@ -648,7 +694,7 @@ impl Client {
     ) -> Result<(), Error> {
         self.check_in_flight()?;
         let (_, value_len) = guard.as_ptr_len();
-        let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime);
+        let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime)?;
         let tx_bytes = (prefix.len() + value_len as usize + 2) as u32;
         self.conn.send_parts().build(move |b| {
             b.copy(&prefix)
@@ -670,7 +716,7 @@ impl Client {
     /// Fire a DELETE request without waiting for the response.
     pub fn fire_delete(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         self.check_in_flight()?;
-        let encoded = encode_request(&McRequest::delete(key));
+        let encoded = encode_request(&McRequest::delete(key))?;
         let tx_bytes = encoded.len() as u32;
         self.conn.send_nowait(&encoded)?;
         let (send_ts, start) = self.timing_start();
@@ -809,6 +855,13 @@ impl Client {
     /// Uses zero-copy parsing via `with_bytes` + `ResponseBytes::parse`:
     /// value data are `Bytes::slice()` references into the accumulator's
     /// buffer rather than freshly allocated `Vec<u8>`.
+    ///
+    /// On `Error::Protocol` (parse failure) the underlying connection is
+    /// closed: even though the parser advanced past the malformed bytes,
+    /// the request/response framing is now irrecoverably misaligned and
+    /// any further command would read garbage. Surfacing `Protocol` as a
+    /// terminal error matches the recv() pending-queue clear and avoids
+    /// silently desynced clients.
     pub(crate) async fn read_response(&self) -> Result<McResponseBytes, Error> {
         let mut result: Option<Result<McResponseBytes, Error>> = None;
         let n = self
@@ -832,7 +885,11 @@ impl Client {
         if n == 0 {
             return result.unwrap_or(Err(Error::ConnectionClosed));
         }
-        result.unwrap()
+        let r = result.unwrap();
+        if matches!(r, Err(Error::Protocol(_))) {
+            self.conn.close();
+        }
+        r
     }
 
     /// Send an encoded command and read the response, converting error
@@ -849,7 +906,7 @@ impl Client {
     /// Get the value of a key. Returns `None` on cache miss.
     pub async fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Value>, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&McRequest::get(key));
+        let encoded = encode_request(&McRequest::get(key))?;
 
         if !self.is_instrumented() {
             let response = self.execute(&encoded).await?;
@@ -914,7 +971,7 @@ impl Client {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let encoded = encode_request(&McRequest::gets(keys));
+        let encoded = encode_request(&McRequest::gets(keys))?;
         let response = self.execute(&encoded).await?;
         match response {
             McResponseBytes::Values(values) => Ok(values
@@ -949,7 +1006,7 @@ impl Client {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_set(key, value, flags, exptime);
+        let encoded = encode_set(key, value, flags, exptime)?;
 
         if !self.is_instrumented() {
             let response = self.execute(&encoded).await?;
@@ -992,7 +1049,7 @@ impl Client {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_add(key, value);
+        let encoded = encode_add(key, value)?;
         let response = self.execute(&encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(true),
@@ -1015,7 +1072,7 @@ impl Client {
             value,
             flags: 0,
             exptime: 0,
-        });
+        })?;
         let response = self.execute(&encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(true),
@@ -1028,7 +1085,7 @@ impl Client {
     /// Returns `None` if the key does not exist.
     pub async fn incr(&mut self, key: impl AsRef<[u8]>, delta: u64) -> Result<Option<u64>, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&McRequest::incr(key, delta));
+        let encoded = encode_request(&McRequest::incr(key, delta))?;
         let response = self.execute(&encoded).await?;
         match response {
             McResponseBytes::Numeric(val) => Ok(Some(val)),
@@ -1041,7 +1098,7 @@ impl Client {
     /// Returns `None` if the key does not exist.
     pub async fn decr(&mut self, key: impl AsRef<[u8]>, delta: u64) -> Result<Option<u64>, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&McRequest::decr(key, delta));
+        let encoded = encode_request(&McRequest::decr(key, delta))?;
         let response = self.execute(&encoded).await?;
         match response {
             McResponseBytes::Numeric(val) => Ok(Some(val)),
@@ -1059,7 +1116,7 @@ impl Client {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_request(&McRequest::append(key, value));
+        let encoded = encode_request(&McRequest::append(key, value))?;
         let response = self.execute(&encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(true),
@@ -1077,7 +1134,7 @@ impl Client {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_request(&McRequest::prepend(key, value));
+        let encoded = encode_request(&McRequest::prepend(key, value))?;
         let response = self.execute(&encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(true),
@@ -1097,7 +1154,7 @@ impl Client {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_request(&McRequest::cas(key, value, cas_unique));
+        let encoded = encode_request(&McRequest::cas(key, value, cas_unique))?;
         let response = self.execute(&encoded).await?;
         match response {
             McResponseBytes::Stored => Ok(true),
@@ -1110,7 +1167,7 @@ impl Client {
     /// Delete a key. Returns `true` if deleted, `false` if not found.
     pub async fn delete(&mut self, key: impl AsRef<[u8]>) -> Result<bool, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&McRequest::delete(key));
+        let encoded = encode_request(&McRequest::delete(key))?;
 
         if !self.is_instrumented() {
             let response = self.execute(&encoded).await?;
@@ -1148,7 +1205,7 @@ impl Client {
 
     /// Flush all items from the cache.
     pub async fn flush_all(&mut self) -> Result<(), Error> {
-        let encoded = encode_request(&McRequest::flush_all());
+        let encoded = encode_request(&McRequest::flush_all())?;
         let response = self.execute(&encoded).await?;
         match response {
             McResponseBytes::Ok => Ok(()),
@@ -1158,7 +1215,7 @@ impl Client {
 
     /// Get the server version string.
     pub async fn version(&mut self) -> Result<Box<str>, Error> {
-        let encoded = encode_request(&McRequest::version());
+        let encoded = encode_request(&McRequest::version())?;
         let response = self.execute(&encoded).await?;
         match response {
             McResponseBytes::Version(v) => Ok(Box::from(String::from_utf8_lossy(v.as_ref()))),
@@ -1179,7 +1236,7 @@ impl Client {
     ) -> Result<(), Error> {
         if !self.is_instrumented() {
             let (_, value_len) = guard.as_ptr_len();
-            let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime);
+            let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime)?;
 
             self.conn.send_parts().build(move |b| {
                 b.copy(&prefix)
@@ -1197,7 +1254,7 @@ impl Client {
         }
 
         let (_, value_len) = guard.as_ptr_len();
-        let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime);
+        let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime)?;
         let tx_bytes = (prefix.len() + value_len as usize + 2) as u32;
 
         let send_ts = self.send_timestamp();
@@ -1243,19 +1300,58 @@ impl Client {
 ///
 /// Returns: `set {key} {flags} {exptime} {valuelen}\r\n`
 /// The caller must append value bytes (via guard) + `\r\n` suffix.
-fn encode_set_guard_prefix(key: &[u8], value_len: usize, flags: u32, exptime: u32) -> Vec<u8> {
+///
+/// Validates `key` (≤ [`MAX_KEY_LEN`]) and `value_len` (≤ [`MAX_VALUE_LEN`]);
+/// returns the corresponding `Error` variant if either bound is exceeded so
+/// that no bytes hit the wire for a request the server will reject.
+fn encode_set_guard_prefix(
+    key: &[u8],
+    value_len: usize,
+    flags: u32,
+    exptime: u32,
+) -> Result<Vec<u8>, Error> {
     use std::io::Write;
+    validate_key(key)?;
+    validate_value_len(value_len)?;
     let mut buf = Vec::with_capacity(32 + key.len());
     buf.extend_from_slice(b"set ");
     buf.extend_from_slice(key);
     write!(buf, " {} {} {}\r\n", flags, exptime, value_len).unwrap();
-    buf
+    Ok(buf)
 }
 
 // -- Encoding helpers --------------------------------------------------------
 
-/// Encode a `McRequest` into a `Vec<u8>`.
-pub(crate) fn encode_request(req: &McRequest<'_>) -> Vec<u8> {
+/// Reject requests whose key or value exceeds the protocol-defined caps.
+fn validate_request(req: &McRequest<'_>) -> Result<(), Error> {
+    match req {
+        McRequest::Get { key }
+        | McRequest::Incr { key, .. }
+        | McRequest::Decr { key, .. }
+        | McRequest::Delete { key } => validate_key(key),
+        McRequest::Gets { keys } => {
+            for k in keys.iter() {
+                validate_key(k)?;
+            }
+            Ok(())
+        }
+        McRequest::Set { key, value, .. }
+        | McRequest::Add { key, value, .. }
+        | McRequest::Replace { key, value, .. }
+        | McRequest::Append { key, value }
+        | McRequest::Prepend { key, value }
+        | McRequest::Cas { key, value, .. } => {
+            validate_key(key)?;
+            validate_value(value)
+        }
+        McRequest::FlushAll | McRequest::Version | McRequest::Quit => Ok(()),
+    }
+}
+
+/// Encode a `McRequest` into a `Vec<u8>`, rejecting oversized keys/values
+/// up-front (see [`validate_request`]).
+pub(crate) fn encode_request(req: &McRequest<'_>) -> Result<Vec<u8>, Error> {
+    validate_request(req)?;
     let size = match req {
         McRequest::Get { key } => 6 + key.len(),
         McRequest::Gets { keys } => 6 + keys.iter().map(|k| 1 + k.len()).sum::<usize>(),
@@ -1275,11 +1371,16 @@ pub(crate) fn encode_request(req: &McRequest<'_>) -> Vec<u8> {
     let mut buf = vec![0u8; size];
     let len = req.encode(&mut buf);
     buf.truncate(len);
-    buf
+    Ok(buf)
 }
 
 /// Encode a SET command into a `Vec<u8>`.
-pub(crate) fn encode_set(key: &[u8], value: &[u8], flags: u32, exptime: u32) -> Vec<u8> {
+pub(crate) fn encode_set(
+    key: &[u8],
+    value: &[u8],
+    flags: u32,
+    exptime: u32,
+) -> Result<Vec<u8>, Error> {
     encode_request(&McRequest::Set {
         key,
         value,
@@ -1289,7 +1390,7 @@ pub(crate) fn encode_set(key: &[u8], value: &[u8], flags: u32, exptime: u32) -> 
 }
 
 /// Encode an ADD command into a `Vec<u8>`.
-pub(crate) fn encode_add(key: &[u8], value: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_add(key: &[u8], value: &[u8]) -> Result<Vec<u8>, Error> {
     encode_request(&McRequest::Add {
         key,
         value,
@@ -1326,4 +1427,97 @@ fn now_realtime_ns() -> u64 {
         libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
     }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_key_accepts_max_len() {
+        let key = vec![b'k'; MAX_KEY_LEN];
+        assert!(validate_key(&key).is_ok());
+    }
+
+    #[test]
+    fn validate_key_rejects_oversized() {
+        let key = vec![b'k'; MAX_KEY_LEN + 1];
+        assert!(matches!(validate_key(&key), Err(Error::KeyTooLong)));
+    }
+
+    #[test]
+    fn validate_value_accepts_max_len() {
+        let v = vec![0u8; MAX_VALUE_LEN];
+        assert!(validate_value(&v).is_ok());
+    }
+
+    #[test]
+    fn validate_value_rejects_oversized() {
+        let v = vec![0u8; MAX_VALUE_LEN + 1];
+        assert!(matches!(validate_value(&v), Err(Error::ValueTooLong)));
+    }
+
+    #[test]
+    fn encode_request_get_rejects_long_key() {
+        let key = vec![b'k'; MAX_KEY_LEN + 1];
+        let r = encode_request(&McRequest::get(&key));
+        assert!(matches!(r, Err(Error::KeyTooLong)));
+    }
+
+    #[test]
+    fn encode_request_set_rejects_long_value() {
+        let key = b"k";
+        let value = vec![0u8; MAX_VALUE_LEN + 1];
+        let r = encode_request(&McRequest::Set {
+            key,
+            value: &value,
+            flags: 0,
+            exptime: 0,
+        });
+        assert!(matches!(r, Err(Error::ValueTooLong)));
+    }
+
+    #[test]
+    fn encode_request_gets_rejects_any_long_key() {
+        let ok = vec![b'k'; MAX_KEY_LEN];
+        let bad = vec![b'k'; MAX_KEY_LEN + 1];
+        let keys: &[&[u8]] = &[&ok, &bad];
+        let r = encode_request(&McRequest::gets(keys));
+        assert!(matches!(r, Err(Error::KeyTooLong)));
+    }
+
+    #[test]
+    fn encode_set_guard_prefix_rejects_long_key() {
+        let key = vec![b'k'; MAX_KEY_LEN + 1];
+        let r = encode_set_guard_prefix(&key, 16, 0, 0);
+        assert!(matches!(r, Err(Error::KeyTooLong)));
+    }
+
+    #[test]
+    fn encode_set_guard_prefix_rejects_long_value_len() {
+        let r = encode_set_guard_prefix(b"k", MAX_VALUE_LEN + 1, 0, 0);
+        assert!(matches!(r, Err(Error::ValueTooLong)));
+    }
+
+    #[test]
+    fn encode_set_guard_prefix_accepts_max_value_len() {
+        let r = encode_set_guard_prefix(b"k", MAX_VALUE_LEN, 0, 0);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn encode_request_passes_through_at_caps() {
+        let key = vec![b'k'; MAX_KEY_LEN];
+        let value = vec![0u8; MAX_VALUE_LEN];
+        let r = encode_request(&McRequest::Set {
+            key: &key,
+            value: &value,
+            flags: 0,
+            exptime: 0,
+        });
+        assert!(r.is_ok());
+        let buf = r.unwrap();
+        // Sanity: encoded buffer starts with "set ".
+        assert!(buf.starts_with(b"set "));
+    }
 }
