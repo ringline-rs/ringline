@@ -366,8 +366,9 @@ impl ClientBuilder {
     }
 
     /// Configure the maximum number of in-flight `fire_*` operations
-    /// (the depth of the pending queue) before [`fire_*`] returns
-    /// [`Error::TooManyInFlight`]. Defaults to `usize::MAX` (unbounded).
+    /// (the depth of the pending queue) before the next `fire_*` call
+    /// returns [`Error::TooManyInFlight`]. Defaults to `usize::MAX`
+    /// (unbounded).
     ///
     /// A bounded value should be set for any server / loop that issues
     /// `fire_*` faster than `recv()` consumes — without a cap, a slow
