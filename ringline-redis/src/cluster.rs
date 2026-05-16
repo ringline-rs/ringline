@@ -39,6 +39,15 @@ use crate::{Client, Error, parse_bytes_array};
 /// Maximum number of MOVED/ASK redirect hops before giving up.
 const MAX_REDIRECTS: usize = 5;
 
+/// Maximum number of transient (LOADING / BUSY / TRYAGAIN) retries on the
+/// same node before surfacing the error.
+const MAX_TRANSIENT_RETRIES: usize = 3;
+
+/// Backoff between transient retries (50 ms). Short enough that a brief
+/// LOADING window doesn't burn the request, long enough that we don't
+/// hammer a busy server.
+const TRANSIENT_BACKOFF_MS: u64 = 50;
+
 /// Configuration for a cluster client.
 #[derive(Clone)]
 pub struct ClusterConfig {
@@ -57,6 +66,14 @@ pub struct ClusterConfig {
 enum NodeState {
     Connected(ConnCtx),
     Disconnected,
+}
+
+/// What an `ASKING` + command exchange yielded — either a real response
+/// to surface to the caller, or another redirect to chase from the outer
+/// routing loop.
+enum AskOutcome {
+    Final(Value),
+    Followup(resp_proto::Redirect),
 }
 
 /// A Redis Cluster client that routes commands by hash slot.
@@ -270,7 +287,8 @@ impl ClusterClient {
 
     // ── Core routing ────────────────────────────────────────────────────
 
-    /// Route an encoded command to the node owning `key`, handling redirects.
+    /// Route an encoded command to the node owning `key`, handling redirects
+    /// and transient `-LOADING` / `-BUSY` / `-TRYAGAIN` errors.
     async fn route_command(&mut self, key: &[u8], encoded: &[u8]) -> Result<Value, Error> {
         let slot = hash_slot(key);
 
@@ -283,6 +301,7 @@ impl ClusterClient {
 
         let mut target_addr = initial_addr;
         let mut retried_after_refresh = false;
+        let mut transient_retries = 0usize;
 
         for _ in 0..MAX_REDIRECTS {
             let conn = match self.conn_for_addr(&target_addr).await {
@@ -328,7 +347,7 @@ impl ClusterClient {
                 Err(e) => return Err(e),
             };
 
-            // Check for redirects.
+            // Check for cluster redirects.
             if let Some(redirect) = parse_redirect(&value) {
                 match redirect.kind {
                     RedirectKind::Moved => {
@@ -343,33 +362,83 @@ impl ClusterClient {
                     }
                     RedirectKind::Ask => {
                         // One-time redirect: send ASKING then retry on target.
-                        let ask_addr = redirect.address;
-                        let ask_conn = self.conn_for_addr(&ask_addr).await?;
-                        let asking_cmd = Client::encode_request(&Request::cmd(b"ASKING"));
-                        ask_conn.send(&asking_cmd)?;
-                        // Read and discard the ASKING response.
-                        let _ = Client::new(ask_conn).read_value().await?;
-                        // Send the actual command.
-                        ask_conn.send(encoded)?;
-                        let ask_value = Client::new(ask_conn).read_value().await?;
-                        // Check the ASK target's response for errors.
-                        if let Value::Error(ref msg) = ask_value {
-                            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+                        // If the ASK target responds with another redirect
+                        // (slot migration completed mid-redirect), feed that
+                        // back into the outer loop so we MOVE or follow ASK
+                        // again instead of returning a misleading error.
+                        match self.execute_with_asking(&redirect.address, encoded).await? {
+                            AskOutcome::Final(v) => return Ok(v),
+                            AskOutcome::Followup(next) => {
+                                match next.kind {
+                                    RedirectKind::Moved => {
+                                        self.refresh_topology().await?;
+                                        target_addr = self
+                                            .slot_map
+                                            .lookup(slot)
+                                            .map(|r| r.primary.address.clone())
+                                            .ok_or_else(|| {
+                                                Error::Redis(format!("no node for slot {slot}"))
+                                            })?;
+                                    }
+                                    RedirectKind::Ask => {
+                                        target_addr = next.address;
+                                    }
+                                }
+                                continue;
+                            }
                         }
-                        return Ok(ask_value);
                     }
                 }
             }
 
-            // Non-redirect error.
+            // Non-redirect error. Transient codes (LOADING / BUSY / TRYAGAIN)
+            // get a bounded retry on the same node with a short backoff
+            // rather than being surfaced — these are expected during node
+            // startup, blocking SCRIPT execution, or slot migration.
             if let Value::Error(ref msg) = value {
-                return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+                let err = Error::Redis(String::from_utf8_lossy(msg).into_owned());
+                if err.is_transient() && transient_retries < MAX_TRANSIENT_RETRIES {
+                    transient_retries += 1;
+                    ringline::sleep(std::time::Duration::from_millis(TRANSIENT_BACKOFF_MS)).await;
+                    continue;
+                }
+                return Err(err);
             }
 
             return Ok(value);
         }
 
         Err(Error::TooManyRedirects)
+    }
+
+    /// Send `ASKING` then the user's command to an ASK-target node, and
+    /// classify the response: either it's a final value/error, or it's
+    /// another redirect we have to chase.
+    async fn execute_with_asking(
+        &mut self,
+        ask_addr: &str,
+        encoded: &[u8],
+    ) -> Result<AskOutcome, Error> {
+        let ask_conn = self.conn_for_addr(ask_addr).await?;
+        let asking_cmd = Client::encode_request(&Request::cmd(b"ASKING"));
+        ask_conn.send(&asking_cmd)?;
+        // Validate the ASKING response — if the server replies with an
+        // error here, propagate it instead of silently moving on to send
+        // the real command on a misconfigured connection.
+        let asking_resp = Client::new(ask_conn).read_value().await?;
+        if let Value::Error(ref msg) = asking_resp {
+            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+        }
+
+        ask_conn.send(encoded)?;
+        let ask_value = Client::new(ask_conn).read_value().await?;
+        if let Some(redirect) = parse_redirect(&ask_value) {
+            return Ok(AskOutcome::Followup(redirect));
+        }
+        if let Value::Error(ref msg) = ask_value {
+            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+        }
+        Ok(AskOutcome::Final(ask_value))
     }
 
     /// Route and expect +OK.

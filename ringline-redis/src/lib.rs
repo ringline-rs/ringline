@@ -197,6 +197,39 @@ pub enum Error {
     TooManyInFlight,
 }
 
+impl Error {
+    /// `true` for transient server-side conditions where the same command
+    /// is expected to succeed if retried after a short delay:
+    ///
+    /// - `LOADING` — node is starting up and loading its RDB/AOF file
+    /// - `BUSY` — a `SCRIPT` is running and blocking the server
+    /// - `TRYAGAIN` — cluster slot is migrating and the migrating node
+    ///   wants the client to retry after the migration finishes
+    ///
+    /// `ClusterClient`'s routing uses this to retry on the same node a
+    /// few times before giving up. Application code can also use it to
+    /// build its own retry policy on a [`Client`] not going through
+    /// cluster routing.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Error::Redis(msg) => {
+                let bytes = msg.as_bytes();
+                starts_with_token(bytes, b"LOADING")
+                    || starts_with_token(bytes, b"BUSY")
+                    || starts_with_token(bytes, b"TRYAGAIN")
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `true` if `msg` starts with `prefix` and either ends there or is followed
+/// by ASCII whitespace — matches the Redis convention of `-CODE message`.
+fn starts_with_token(msg: &[u8], prefix: &[u8]) -> bool {
+    msg.starts_with(prefix)
+        && (msg.len() == prefix.len() || msg[prefix.len()].is_ascii_whitespace())
+}
+
 // ── Command types ───────────────────────────────────────────────────────
 
 /// The type of Redis command that completed.
@@ -2342,5 +2375,50 @@ pub(crate) fn parse_bytes_array(value: Value) -> Result<Vec<Bytes>, Error> {
             Ok(result)
         }
         _ => Err(Error::UnexpectedResponse),
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn is_transient_recognises_loading() {
+        let e = Error::Redis("LOADING Redis is loading the dataset in memory".into());
+        assert!(e.is_transient());
+    }
+
+    #[test]
+    fn is_transient_recognises_busy() {
+        let e = Error::Redis("BUSY Redis is busy running a script".into());
+        assert!(e.is_transient());
+    }
+
+    #[test]
+    fn is_transient_recognises_tryagain() {
+        let e = Error::Redis("TRYAGAIN slot migration in progress".into());
+        assert!(e.is_transient());
+    }
+
+    #[test]
+    fn is_transient_does_not_match_loadinga() {
+        // The whole-word check stops `LOADINGSOMETHING` from being treated
+        // as `LOADING` followed by junk.
+        let e = Error::Redis("LOADINGSOMETHING fake error".into());
+        assert!(!e.is_transient());
+    }
+
+    #[test]
+    fn is_transient_false_for_non_redis_errors() {
+        assert!(!Error::ConnectionClosed.is_transient());
+        assert!(!Error::UnexpectedResponse.is_transient());
+        assert!(!Error::TooManyRedirects.is_transient());
+    }
+
+    #[test]
+    fn is_transient_false_for_other_redis_errors() {
+        assert!(!Error::Redis("ERR wrong number of arguments".into()).is_transient());
+        assert!(!Error::Redis("MOVED 1234 127.0.0.1:7000".into()).is_transient());
+        assert!(!Error::Redis("WRONGTYPE Operation against a key".into()).is_transient());
     }
 }
