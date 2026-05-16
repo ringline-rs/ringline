@@ -395,6 +395,10 @@ impl H1Conn {
         let mut connection_close = false;
         let mut headers_done = false;
         let mut body_leftover = BytesMut::new();
+        // Cursor past which `\r\n\r\n` has already been searched. Each
+        // recv only rescans the trailing 3 bytes plus newly arrived data,
+        // making header-end discovery O(total bytes) instead of O(n²).
+        let mut scanned: usize = 0;
 
         while !headers_done {
             let n = self
@@ -407,7 +411,8 @@ impl H1Conn {
                         )));
                         return ParseResult::Consumed(data.len());
                     }
-                    if let Some(end) = find_header_end(data) {
+                    let scan_from = scanned.saturating_sub(3);
+                    if let Some(end) = find_header_end(data, scan_from) {
                         let header_bytes = &data[..end];
                         match parse_response_headers(header_bytes) {
                             Ok(parsed) => {
@@ -430,6 +435,11 @@ impl H1Conn {
                         }
                         ParseResult::Consumed(data.len())
                     } else {
+                        // No header terminator yet — remember how far we
+                        // scanned so the next pass picks up where we left
+                        // off (minus the 3-byte overlap to catch a CRLF
+                        // pair straddling the boundary).
+                        scanned = data.len();
                         ParseResult::Consumed(0)
                     }
                 })
@@ -620,9 +630,15 @@ impl<'a> H1StreamingResponse<'a> {
     }
 }
 
-/// Find the position of `\r\n\r\n` in data, returns index of the first `\r`.
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    (0..data.len().saturating_sub(3)).find(|&i| {
+/// Find the position of `\r\n\r\n` in `data` starting at byte offset
+/// `start`. Returns the index of the first `\r` if found.
+///
+/// `start` is the cursor from previous scans; the caller is responsible
+/// for backing it up far enough (typically 3 bytes) to catch a sequence
+/// whose first byte sits in a previously scanned region.
+fn find_header_end(data: &[u8], start: usize) -> Option<usize> {
+    let end = data.len().saturating_sub(3);
+    (start..end).find(|&i| {
         data[i] == b'\r' && data[i + 1] == b'\n' && data[i + 2] == b'\r' && data[i + 3] == b'\n'
     })
 }
@@ -857,6 +873,34 @@ fn validate_token(s: &str) -> Result<(), ()> {
     Ok(())
 }
 
+/// Validate a single trailer field-line (everything between two CRLFs in
+/// the chunked-encoding trailer section). RFC 9112 §7.1.2: trailer fields
+/// are field-lines, same syntax as headers. We reject the same set of
+/// smuggling-relevant defects: non-UTF-8 bytes, missing colon, malformed
+/// field-name, CR/LF/NUL inside the value, and obs-fold continuation
+/// lines (leading SP/HT).
+fn validate_trailer_line(line: &[u8]) -> Result<(), &'static str> {
+    // obs-fold: any continuation line (starts with SP or HT) is
+    // deprecated and a smuggling vector — reject before UTF-8 decode.
+    if matches!(line.first(), Some(b' ' | b'\t')) {
+        return Err("trailer contains obs-fold continuation");
+    }
+    let text = std::str::from_utf8(line).map_err(|_| "non-UTF-8 trailer line")?;
+    let (name, value) = text.split_once(':').ok_or("trailer missing colon")?;
+    let name = name.trim();
+    if name.is_empty() || name.bytes().any(|b| !is_token_char(b)) {
+        return Err("trailer field-name is not a token");
+    }
+    // Strip the optional OWS around the value, then check for any
+    // remaining CR/LF/NUL (the terminating CRLF was already consumed by
+    // `find_crlf`, so anything left would be smuggled).
+    let value = value.trim();
+    if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Err("trailer value contains CR/LF/NUL");
+    }
+    Ok(())
+}
+
 enum ChunkResult<'a> {
     Complete {
         data: &'a [u8],
@@ -901,7 +945,8 @@ fn decode_chunk(data: &[u8], max_chunk_size: usize, max_trailer_section: usize) 
 
     if size == 0 {
         // Last chunk: 0\r\n followed by optional trailer headers and
-        // a final \r\n. Scan past any trailers to find the empty line.
+        // a final \r\n. Walk each trailer line, validating it as a
+        // field-line (RFC 9112 §7.1.2 — same syntax as headers).
         let after_zero = crlf + 2;
         let mut pos = after_zero;
         loop {
@@ -918,7 +963,10 @@ fn decode_chunk(data: &[u8], max_chunk_size: usize, max_trailer_section: usize) 
                     };
                 }
                 Some(next_crlf) => {
-                    // Trailer header line — skip it.
+                    let line = &data[pos..pos + next_crlf];
+                    if let Err(reason) = validate_trailer_line(line) {
+                        return ChunkResult::Invalid(reason);
+                    }
                     pos += next_crlf + 2;
                 }
                 None => return ChunkResult::NeedMore,
@@ -977,13 +1025,45 @@ mod tests {
     #[test]
     fn find_header_end_found() {
         let data = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\nbody";
-        assert_eq!(find_header_end(data), Some(34));
+        assert_eq!(find_header_end(data, 0), Some(34));
     }
 
     #[test]
     fn find_header_end_not_found() {
         let data = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n";
-        assert_eq!(find_header_end(data), None);
+        assert_eq!(find_header_end(data, 0), None);
+    }
+
+    #[test]
+    fn find_header_end_resumes_from_cursor_with_boundary_overlap() {
+        // Simulate the recv loop: the terminator `\r\n\r\n` straddles
+        // chunks 3 and 4. After scanning chunks 1+2 (no terminator), we
+        // resume with `start = scanned.saturating_sub(3)` and must still
+        // find the boundary.
+        let mut buf: Vec<u8> = b"GET / HTTP/1.1\r\nhost: x\r".to_vec();
+        // After scanning these 24 bytes with start=0, no terminator yet.
+        assert_eq!(find_header_end(&buf, 0), None);
+        let scanned = buf.len();
+        // Next chunk arrives — completes the `\r\n\r\n` boundary.
+        buf.extend_from_slice(b"\n\r\nbody");
+        let start = scanned.saturating_sub(3);
+        let pos = find_header_end(&buf, start).expect("must find boundary");
+        assert_eq!(&buf[pos..pos + 4], b"\r\n\r\n");
+    }
+
+    #[test]
+    fn find_header_end_cursor_skips_already_scanned_region() {
+        // A `\r\n\r\n` that appears before `start` must not be returned —
+        // it would be in the body, not the header section. The cursor
+        // contract is "we already checked these bytes".
+        let data = b"HTTP/1.1 200 OK\r\n\r\nbody-with-\r\n\r\n-inside";
+        // With start=0 we find the real header boundary.
+        assert_eq!(find_header_end(data, 0), Some(15));
+        // With start past the header boundary, we'd find the body one —
+        // contract is the caller never moves start past a real boundary
+        // because they consume it. This just checks the cursor is honored.
+        let after = 19; // past the first \r\n\r\n
+        assert_eq!(find_header_end(data, after), Some(29));
     }
 
     #[test]
@@ -1202,6 +1282,66 @@ mod tests {
         assert!(validate_field_value("value\r\nx: y").is_err());
         assert!(validate_field_value("value\nx: y").is_err());
         assert!(validate_field_value("normal").is_ok());
+    }
+
+    #[test]
+    fn decode_chunk_accepts_valid_trailer() {
+        // Terminal chunk with a single well-formed trailer field-line.
+        let data = b"0\r\nx-checksum: abc123\r\n\r\n";
+        match decode_chunk(data, usize::MAX, usize::MAX) {
+            ChunkResult::Complete { is_last, .. } => assert!(is_last),
+            other => panic!("expected Complete, got {:?}", chunk_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn decode_chunk_rejects_trailer_without_colon() {
+        let data = b"0\r\nno-colon-here\r\n\r\n";
+        assert!(matches!(
+            decode_chunk(data, usize::MAX, usize::MAX),
+            ChunkResult::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn decode_chunk_rejects_trailer_with_invalid_field_name() {
+        // Space is not a valid token character.
+        let data = b"0\r\nbad name: value\r\n\r\n";
+        assert!(matches!(
+            decode_chunk(data, usize::MAX, usize::MAX),
+            ChunkResult::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn decode_chunk_rejects_trailer_value_with_embedded_nul() {
+        // A NUL byte mid-value would let an attacker smuggle past
+        // downstream parsers. find_crlf does not stop on NUL, so we
+        // catch it in validate_trailer_line.
+        let data = b"0\r\nx-evil: bad\x00stuff\r\n\r\n";
+        assert!(matches!(
+            decode_chunk(data, usize::MAX, usize::MAX),
+            ChunkResult::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn decode_chunk_rejects_trailer_obs_fold_continuation() {
+        // RFC 9112 §5.2 deprecates obs-fold (continuation line starting
+        // with whitespace). Treat as smuggling vector.
+        let data = b"0\r\n trailer-continuation\r\n\r\n";
+        assert!(matches!(
+            decode_chunk(data, usize::MAX, usize::MAX),
+            ChunkResult::Invalid(_)
+        ));
+    }
+
+    fn chunk_kind(r: &ChunkResult<'_>) -> &'static str {
+        match r {
+            ChunkResult::Complete { .. } => "Complete",
+            ChunkResult::NeedMore => "NeedMore",
+            ChunkResult::Invalid(_) => "Invalid",
+        }
     }
 
     #[test]

@@ -137,4 +137,16 @@ impl HttpClient {
             ConnectionInner::H1(h1) => h1.close(),
         }
     }
+
+    /// Whether the peer has signalled the connection will close. For H1
+    /// this reflects `Connection: close` on the most recent response (or
+    /// the HTTP/1.0 default); for H2 this reflects a GOAWAY frame. The
+    /// [`Pool`](crate::pool::Pool) honours this automatically via the
+    /// guard returned by [`Pool::client`](crate::pool::Pool::client).
+    pub fn peer_will_close(&self) -> bool {
+        match &self.inner {
+            ConnectionInner::H2(h2) => h2.peer_will_close(),
+            ConnectionInner::H1(h1) => h1.peer_will_close(),
+        }
+    }
 }

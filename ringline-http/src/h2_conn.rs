@@ -22,12 +22,21 @@ struct PendingStream {
     headers: Vec<(String, String)>,
     body: BytesMut,
     done: bool,
+    /// Terminal error for this stream — set when validation fails or the
+    /// peer violates protocol. Surfaced as the stream's completion result.
+    error: Option<HttpError>,
     /// When true, DATA payloads are pushed to `chunks` instead of `body`.
     streaming: bool,
     /// Buffered chunks for streaming responses.
     chunks: VecDeque<Bytes>,
     /// Content-Encoding from response headers (for decompression).
     content_encoding: Option<String>,
+    /// Running total of header bytes (name + value) accepted so far,
+    /// bounded by `H2AsyncConn::max_header_section`.
+    header_bytes: usize,
+    /// Running total of body bytes accepted so far, bounded by
+    /// `H2AsyncConn::max_body_size`.
+    body_bytes: usize,
 }
 
 impl PendingStream {
@@ -37,10 +46,22 @@ impl PendingStream {
             headers: Vec::new(),
             body: BytesMut::new(),
             done: false,
+            error: None,
             streaming: false,
             chunks: VecDeque::new(),
             content_encoding: None,
+            header_bytes: 0,
+            body_bytes: 0,
         }
+    }
+
+    /// Mark the stream terminally failed with `err`. First error wins —
+    /// later errors are ignored so the caller sees the underlying cause.
+    fn fail(&mut self, err: HttpError) {
+        if self.error.is_none() {
+            self.error = Some(err);
+        }
+        self.done = true;
     }
 
     #[cfg_attr(
@@ -48,20 +69,153 @@ impl PendingStream {
         allow(unused_variables)
     )]
     fn into_response(self, max_decompressed_size: usize) -> Result<Response, HttpError> {
-        let body = self.body.freeze();
+        if let Some(err) = self.error {
+            return Err(err);
+        }
+        // :status must have been set and validated before the stream
+        // completes — into_response should only run for non-error
+        // completions, and the parser sets `error` when :status is bad.
+        let status = self
+            .status
+            .ok_or_else(|| HttpError::InvalidMessage("response missing :status".into()))?;
 
         // Decompress body if Content-Encoding is set.
-        #[cfg(any(feature = "gzip", feature = "zstd", feature = "brotli"))]
-        if let Some(ref encoding) = self.content_encoding {
-            let decompressed = crate::compress::decompress(encoding, &body, max_decompressed_size)?;
-            return Ok(Response::new(
-                self.status.unwrap_or(0),
-                self.headers,
-                Bytes::from(decompressed),
-            ));
+        if let Some(ref encoding) = self.content_encoding
+            && !is_identity_encoding(encoding)
+        {
+            #[cfg(any(feature = "gzip", feature = "zstd", feature = "brotli"))]
+            {
+                let decompressed =
+                    crate::compress::decompress(encoding, &self.body, max_decompressed_size)?;
+                return Ok(Response::new(
+                    status,
+                    self.headers,
+                    Bytes::from(decompressed),
+                ));
+            }
+            // Compression features off — we cannot validate the body
+            // matches the declared encoding. Refusing to silently hand a
+            // gzipped payload to the caller as plaintext (silent data
+            // corruption class). Mirrors ringline-grpc PR #174 finding 4.
+            #[cfg(not(any(feature = "gzip", feature = "zstd", feature = "brotli")))]
+            {
+                return Err(HttpError::InvalidMessage(format!(
+                    "unsupported content-encoding `{encoding}` (no decompressor compiled in)"
+                )));
+            }
         }
 
-        Ok(Response::new(self.status.unwrap_or(0), self.headers, body))
+        Ok(Response::new(status, self.headers, self.body.freeze()))
+    }
+}
+
+/// `true` when the Content-Encoding is empty/`identity`, meaning the
+/// body is delivered as-is and no decompression is required.
+fn is_identity_encoding(encoding: &str) -> bool {
+    let e = encoding.trim();
+    e.is_empty() || e.eq_ignore_ascii_case("identity")
+}
+
+/// Parse and validate an HTTP/2 `:status` pseudo-header value per RFC
+/// 9110 §15: exactly three ASCII digits, value 100–999. Anything else
+/// (missing, non-numeric, wrong length, out of range) is a protocol
+/// violation — returning `None` lets the caller fail the stream with a
+/// specific error instead of silently substituting 0 (a real HTTP status
+/// code does not exist outside this range).
+fn parse_status(value: &[u8]) -> Option<u16> {
+    if value.len() != 3 {
+        return None;
+    }
+    if !value.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let s = std::str::from_utf8(value).ok()?;
+    let n: u16 = s.parse().ok()?;
+    if (100..=999).contains(&n) {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Apply a HEADERS event to a pending stream, validating `:status` and
+/// enforcing the per-stream header-section cap.
+fn handle_response_headers(
+    ps: &mut PendingStream,
+    headers: &[HeaderField],
+    end_stream: bool,
+    max_header_section: usize,
+) {
+    for h in headers {
+        if h.name == b":status" {
+            match parse_status(&h.value) {
+                Some(n) => ps.status = Some(n),
+                None => {
+                    ps.fail(HttpError::InvalidMessage(format!(
+                        "invalid :status `{}`",
+                        String::from_utf8_lossy(&h.value)
+                    )));
+                    return;
+                }
+            }
+            continue;
+        }
+
+        // Track the running header-section size. Counting name + value
+        // bytes (no per-entry overhead) mirrors HPACK accounting and
+        // keeps the cap interpretable for callers configuring it.
+        let add = h.name.len().saturating_add(h.value.len());
+        ps.header_bytes = ps.header_bytes.saturating_add(add);
+        if ps.header_bytes > max_header_section {
+            ps.fail(HttpError::MaxSizeExceeded(format!(
+                "response header section exceeds {max_header_section} bytes"
+            )));
+            return;
+        }
+
+        let name = String::from_utf8_lossy(&h.name).into_owned();
+        let value = String::from_utf8_lossy(&h.value).into_owned();
+        if name.eq_ignore_ascii_case("content-encoding") {
+            ps.content_encoding = Some(value.clone());
+        }
+        ps.headers.push((name, value));
+    }
+    if end_stream {
+        // If end_stream arrives without `:status`, surface it now so the
+        // caller doesn't get a successful response with status 0.
+        if ps.status.is_none() && ps.error.is_none() {
+            ps.fail(HttpError::InvalidMessage(
+                "response HEADERS missing :status".into(),
+            ));
+        } else {
+            ps.done = true;
+        }
+    }
+}
+
+/// Apply a DATA event to a pending stream, enforcing the per-stream
+/// body-size cap.
+fn handle_response_data(
+    ps: &mut PendingStream,
+    payload: Vec<u8>,
+    end_stream: bool,
+    max_body_size: usize,
+) {
+    let new_total = ps.body_bytes.saturating_add(payload.len());
+    if new_total > max_body_size {
+        ps.fail(HttpError::MaxSizeExceeded(format!(
+            "response body exceeds {max_body_size} bytes"
+        )));
+        return;
+    }
+    ps.body_bytes = new_total;
+    if ps.streaming {
+        ps.chunks.push_back(Bytes::from(payload));
+    } else {
+        ps.body.extend_from_slice(&payload);
+    }
+    if end_stream {
+        ps.done = true;
     }
 }
 
@@ -82,10 +236,21 @@ pub struct H2AsyncConn {
     pending_streams: HashMap<u32, PendingStream>,
     blocked_sends: VecDeque<BlockedSend>,
     /// Streams that completed during a pump cycle, ready for pickup.
-    completed: VecDeque<(u32, Response)>,
+    /// Each entry carries either a successful response or a per-stream
+    /// error (bad `:status`, oversize headers/body, unsupported encoding).
+    completed: VecDeque<(u32, Result<Response, HttpError>)>,
     settings_acked: bool,
     /// Cap on a decompressed response body. Defaults to 64 MiB.
     max_decompressed_size: usize,
+    /// Cap on the total bytes (name + value) accumulated per stream's
+    /// response header section. Defaults to 64 KiB.
+    max_header_section: usize,
+    /// Cap on a single stream's accumulated response body. Defaults to
+    /// 16 MiB.
+    max_body_size: usize,
+    /// Set once the peer has sent GOAWAY — this connection must not be
+    /// used for further requests.
+    goaway_received: bool,
 }
 
 impl H2AsyncConn {
@@ -93,6 +258,25 @@ impl H2AsyncConn {
     /// defends against decompression bombs.
     pub fn set_max_decompressed_size(&mut self, n: usize) {
         self.max_decompressed_size = n;
+    }
+
+    /// Override the cap on the total response header bytes (sum of name +
+    /// value lengths) collected per stream. Default 64 KiB.
+    pub fn set_max_header_section(&mut self, n: usize) {
+        self.max_header_section = n;
+    }
+
+    /// Override the cap on a single stream's accumulated response body.
+    /// Default 16 MiB.
+    pub fn set_max_body_size(&mut self, n: usize) {
+        self.max_body_size = n;
+    }
+
+    /// Whether the peer has signalled it will not accept further requests
+    /// (GOAWAY received). When `true`, callers should reconnect rather
+    /// than reuse this connection.
+    pub fn peer_will_close(&self) -> bool {
+        self.goaway_received
     }
 }
 
@@ -130,6 +314,9 @@ impl H2AsyncConn {
             completed: VecDeque::new(),
             settings_acked: false,
             max_decompressed_size: crate::compress::DEFAULT_MAX_DECOMPRESSED_SIZE,
+            max_header_section: crate::h1_conn::DEFAULT_MAX_HEADER_SECTION,
+            max_body_size: crate::h1_conn::DEFAULT_MAX_BODY_SIZE,
+            goaway_received: false,
         };
 
         // Send the connection preface (magic + SETTINGS).
@@ -237,18 +424,19 @@ impl H2AsyncConn {
 
     // ── Multiplexed recv API ───────────────────────────────────────────
 
-    /// Pump until any stream completes. Returns `(stream_id, Response)`.
+    /// Pump until any stream completes. Returns `(stream_id, Response)`,
+    /// or surfaces a per-stream `HttpError` for that stream.
     pub async fn recv(&mut self) -> Result<(u32, Response), HttpError> {
         // Check if we already have a completed response queued.
-        if let Some(completed) = self.completed.pop_front() {
-            return Ok(completed);
+        if let Some((id, result)) = self.completed.pop_front() {
+            return result.map(|r| (id, r));
         }
 
         loop {
             self.pump_once().await?;
 
-            if let Some(completed) = self.completed.pop_front() {
-                return Ok(completed);
+            if let Some((id, result)) = self.completed.pop_front() {
+                return result.map(|r| (id, r));
             }
         }
     }
@@ -257,8 +445,8 @@ impl H2AsyncConn {
     pub async fn recv_stream(&mut self, stream_id: u32) -> Result<Response, HttpError> {
         // Check completed queue first.
         if let Some(idx) = self.completed.iter().position(|(sid, _)| *sid == stream_id) {
-            let (_, resp) = self.completed.remove(idx).unwrap();
-            return Ok(resp);
+            let (_, result) = self.completed.remove(idx).unwrap();
+            return result;
         }
 
         loop {
@@ -266,8 +454,8 @@ impl H2AsyncConn {
 
             // Check if our target stream completed.
             if let Some(idx) = self.completed.iter().position(|(sid, _)| *sid == stream_id) {
-                let (_, resp) = self.completed.remove(idx).unwrap();
-                return Ok(resp);
+                let (_, result) = self.completed.remove(idx).unwrap();
+                return result;
             }
         }
     }
@@ -289,12 +477,20 @@ impl H2AsyncConn {
         let pending = &mut self.pending_streams;
         let blocked = &mut self.blocked_sends;
         let settings_acked = &mut self.settings_acked;
+        let goaway_received = &mut self.goaway_received;
+        let max_header_section = self.max_header_section;
+        let max_body_size = self.max_body_size;
+        // Connection-level error captured during dispatch (recv error,
+        // unrecoverable send error, H2Event::Error). The pump returns
+        // this once the closure unwinds.
+        let mut connection_error: Option<HttpError> = None;
 
         let n = self
             .conn
             .with_data(|data| {
                 // Feed bytes to H2.
-                if let Err(_e) = h2.recv(data) {
+                if let Err(e) = h2.recv(data) {
+                    connection_error = Some(HttpError::H2(e));
                     return ParseResult::Consumed(data.len());
                 }
 
@@ -310,24 +506,12 @@ impl H2AsyncConn {
                             end_stream,
                         } => {
                             if let Some(ps) = pending.get_mut(&stream_id) {
-                                // Extract :status pseudo-header.
-                                for h in &headers {
-                                    if h.name == b":status" {
-                                        if let Ok(s) = std::str::from_utf8(&h.value) {
-                                            ps.status = s.parse().ok();
-                                        }
-                                    } else {
-                                        let name = String::from_utf8_lossy(&h.name).into_owned();
-                                        let value = String::from_utf8_lossy(&h.value).into_owned();
-                                        if name.eq_ignore_ascii_case("content-encoding") {
-                                            ps.content_encoding = Some(value.clone());
-                                        }
-                                        ps.headers.push((name, value));
-                                    }
-                                }
-                                if end_stream {
-                                    ps.done = true;
-                                }
+                                handle_response_headers(
+                                    ps,
+                                    &headers,
+                                    end_stream,
+                                    max_header_section,
+                                );
                             }
                         }
                         H2Event::Data {
@@ -336,14 +520,7 @@ impl H2AsyncConn {
                             end_stream,
                         } => {
                             if let Some(ps) = pending.get_mut(&stream_id) {
-                                if ps.streaming {
-                                    ps.chunks.push_back(Bytes::from(payload));
-                                } else {
-                                    ps.body.extend_from_slice(&payload);
-                                }
-                                if end_stream {
-                                    ps.done = true;
-                                }
+                                handle_response_data(ps, payload, end_stream, max_body_size);
                             }
                         }
                         H2Event::Trailers { stream_id, .. } => {
@@ -351,18 +528,35 @@ impl H2AsyncConn {
                                 ps.done = true;
                             }
                         }
-                        H2Event::StreamReset { stream_id, .. } => {
+                        H2Event::StreamReset {
+                            stream_id,
+                            error_code,
+                        } => {
                             if let Some(ps) = pending.get_mut(&stream_id) {
-                                ps.done = true;
+                                ps.fail(HttpError::H2(ringline_h2::H2Error::StreamError(
+                                    stream_id, error_code,
+                                )));
                             }
                         }
                         H2Event::GoAway { .. } => {
-                            // Mark all pending streams as done.
+                            *goaway_received = true;
+                            // Mark all pending streams as done. Streams
+                            // that already received complete responses
+                            // resolve normally; streams still mid-response
+                            // surface a ConnectionClosed-shaped error
+                            // when into_response runs (missing :status →
+                            // InvalidMessage).
                             for ps in pending.values_mut() {
                                 ps.done = true;
                             }
                         }
-                        H2Event::Error(_) => {}
+                        H2Event::Error(e) => {
+                            // Connection-level protocol error from the
+                            // sans-IO state machine. The connection is
+                            // dead; surface to the caller instead of
+                            // silently hanging.
+                            connection_error = Some(HttpError::H2(e));
+                        }
                         H2Event::PingAcknowledged { .. } => {}
                     }
                 }
@@ -371,9 +565,20 @@ impl H2AsyncConn {
                 let mut retry = VecDeque::new();
                 std::mem::swap(blocked, &mut retry);
                 for bs in retry {
-                    if let Err(_e) = h2.send_data(bs.stream_id, &bs.data, bs.end_stream) {
-                        // Still blocked, re-queue.
-                        blocked.push_back(bs);
+                    match h2.send_data(bs.stream_id, &bs.data, bs.end_stream) {
+                        Ok(()) => {}
+                        Err(ringline_h2::H2Error::FlowControlError) => {
+                            // Still blocked, re-queue.
+                            blocked.push_back(bs);
+                        }
+                        Err(e) => {
+                            // Stream gone or other unrecoverable send
+                            // failure — fail the originating stream so
+                            // the caller learns the request didn't ship.
+                            if let Some(ps) = pending.get_mut(&bs.stream_id) {
+                                ps.fail(HttpError::H2(e));
+                            }
+                        }
                     }
                 }
 
@@ -382,6 +587,9 @@ impl H2AsyncConn {
             })
             .await;
 
+        if let Some(e) = connection_error {
+            return Err(e);
+        }
         if n == 0 {
             return Err(HttpError::ConnectionClosed);
         }
@@ -395,8 +603,8 @@ impl H2AsyncConn {
             .collect();
         for id in done_ids {
             if let Some(ps) = self.pending_streams.remove(&id) {
-                self.completed
-                    .push_back((id, ps.into_response(self.max_decompressed_size)?));
+                let result = ps.into_response(self.max_decompressed_size);
+                self.completed.push_back((id, result));
             }
         }
 
@@ -427,9 +635,13 @@ impl H2AsyncConn {
             ps.streaming = true;
         }
 
-        // Pump until headers arrive for this stream.
+        // Pump until headers arrive for this stream — or it errors.
         loop {
-            if let Some(ps) = self.pending_streams.get(&stream_id) {
+            if let Some(ps) = self.pending_streams.get_mut(&stream_id) {
+                if let Some(err) = ps.error.take() {
+                    self.pending_streams.remove(&stream_id);
+                    return Err(err);
+                }
                 if ps.status.is_some() {
                     break;
                 }
@@ -498,6 +710,13 @@ impl<'a> H2StreamingResponse<'a> {
     pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, HttpError> {
         loop {
             if let Some(ps) = self.conn.pending_streams.get_mut(&self.stream_id) {
+                // Surface a deferred per-stream error (body cap exceeded,
+                // unrecoverable send-data failure) before yielding more
+                // bytes. Take it so we only report it once.
+                if let Some(err) = ps.error.take() {
+                    self.conn.pending_streams.remove(&self.stream_id);
+                    return Err(err);
+                }
                 // Return a buffered chunk if available.
                 if let Some(chunk) = ps.chunks.pop_front() {
                     return Ok(Some(chunk));
@@ -520,5 +739,165 @@ impl<'a> H2StreamingResponse<'a> {
 impl Drop for H2StreamingResponse<'_> {
     fn drop(&mut self) {
         self.conn.pending_streams.remove(&self.stream_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the I/O-free helpers and `PendingStream` state
+    //! machine. The full pump loop is exercised by the public-servers
+    //! integration tests (`tests/public_servers.rs`).
+
+    use super::*;
+
+    fn header(name: &[u8], value: &[u8]) -> HeaderField {
+        HeaderField::new(name, value)
+    }
+
+    // ── parse_status ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_status_accepts_three_digit_codes() {
+        assert_eq!(parse_status(b"200"), Some(200));
+        assert_eq!(parse_status(b"404"), Some(404));
+        assert_eq!(parse_status(b"100"), Some(100));
+        assert_eq!(parse_status(b"599"), Some(599));
+        assert_eq!(parse_status(b"999"), Some(999));
+    }
+
+    #[test]
+    fn parse_status_rejects_wrong_length() {
+        assert_eq!(parse_status(b""), None);
+        assert_eq!(parse_status(b"2"), None);
+        assert_eq!(parse_status(b"20"), None);
+        assert_eq!(parse_status(b"2000"), None);
+    }
+
+    #[test]
+    fn parse_status_rejects_non_digits() {
+        assert_eq!(parse_status(b"abc"), None);
+        assert_eq!(parse_status(b"2x0"), None);
+        assert_eq!(parse_status(b"-10"), None);
+    }
+
+    #[test]
+    fn parse_status_rejects_out_of_range() {
+        // 099 fails the >= 100 check.
+        assert_eq!(parse_status(b"099"), None);
+        // No real HTTP status sits below 100 per RFC 9110 §15.
+    }
+
+    // ── handle_response_headers (4a, 4f) ───────────────────────────────
+
+    #[test]
+    fn invalid_status_fails_stream() {
+        let mut ps = PendingStream::new();
+        let headers = vec![header(b":status", b"oops")];
+        handle_response_headers(&mut ps, &headers, true, 64 * 1024);
+        assert!(ps.error.is_some());
+        match ps.error.unwrap() {
+            HttpError::InvalidMessage(_) => {}
+            other => panic!("expected InvalidMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_status_with_end_stream_fails() {
+        let mut ps = PendingStream::new();
+        let headers = vec![header(b"content-type", b"text/plain")];
+        handle_response_headers(&mut ps, &headers, true, 64 * 1024);
+        assert!(matches!(ps.error, Some(HttpError::InvalidMessage(_))));
+    }
+
+    #[test]
+    fn oversize_header_section_fails_stream() {
+        let mut ps = PendingStream::new();
+        // 200 bytes of value plus a small name pushes past the 100-byte cap.
+        let big_value = vec![b'x'; 200];
+        let headers = vec![header(b":status", b"200"), header(b"x", &big_value)];
+        handle_response_headers(&mut ps, &headers, false, 100);
+        assert!(matches!(ps.error, Some(HttpError::MaxSizeExceeded(_))));
+    }
+
+    #[test]
+    fn valid_status_accepts_and_collects_headers() {
+        let mut ps = PendingStream::new();
+        let headers = vec![header(b":status", b"204"), header(b"x-custom", b"value")];
+        handle_response_headers(&mut ps, &headers, true, 64 * 1024);
+        assert_eq!(ps.status, Some(204));
+        assert!(ps.error.is_none());
+        assert!(ps.done);
+        assert_eq!(
+            ps.headers,
+            vec![("x-custom".to_string(), "value".to_string())]
+        );
+    }
+
+    // ── handle_response_data (4f) ──────────────────────────────────────
+
+    #[test]
+    fn oversize_body_fails_stream() {
+        let mut ps = PendingStream::new();
+        let payload = vec![0u8; 200];
+        handle_response_data(&mut ps, payload, false, 100);
+        assert!(matches!(ps.error, Some(HttpError::MaxSizeExceeded(_))));
+    }
+
+    #[test]
+    fn body_within_cap_accumulates() {
+        let mut ps = PendingStream::new();
+        handle_response_data(&mut ps, vec![1, 2, 3], false, 100);
+        handle_response_data(&mut ps, vec![4, 5], true, 100);
+        assert!(ps.error.is_none());
+        assert!(ps.done);
+        assert_eq!(&ps.body[..], &[1, 2, 3, 4, 5]);
+    }
+
+    // ── into_response (4a, 4e) ─────────────────────────────────────────
+
+    #[test]
+    fn into_response_surfaces_stream_error() {
+        let mut ps = PendingStream::new();
+        ps.fail(HttpError::InvalidMessage("test".into()));
+        let res = ps.into_response(usize::MAX);
+        assert!(matches!(res, Err(HttpError::InvalidMessage(_))));
+    }
+
+    #[cfg(not(any(feature = "gzip", feature = "zstd", feature = "brotli")))]
+    #[test]
+    fn into_response_rejects_unsupported_content_encoding_without_features() {
+        let mut ps = PendingStream::new();
+        ps.status = Some(200);
+        ps.content_encoding = Some("gzip".into());
+        ps.body.extend_from_slice(&[1, 2, 3]);
+        let res = ps.into_response(usize::MAX);
+        match res {
+            Err(HttpError::InvalidMessage(msg)) => assert!(msg.contains("gzip")),
+            other => panic!("expected InvalidMessage for gzip without features, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_response_identity_encoding_returns_body_as_is() {
+        let mut ps = PendingStream::new();
+        ps.status = Some(200);
+        ps.content_encoding = Some("identity".into());
+        ps.body.extend_from_slice(&[1, 2, 3]);
+        let res = ps.into_response(usize::MAX);
+        let resp = res.expect("identity encoding must not error");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.bytes().as_ref(), &[1, 2, 3]);
+    }
+
+    // ── is_identity_encoding ───────────────────────────────────────────
+
+    #[test]
+    fn is_identity_encoding_recognises_variants() {
+        assert!(is_identity_encoding(""));
+        assert!(is_identity_encoding("identity"));
+        assert!(is_identity_encoding("Identity"));
+        assert!(is_identity_encoding("  identity  "));
+        assert!(!is_identity_encoding("gzip"));
+        assert!(!is_identity_encoding("br"));
     }
 }
