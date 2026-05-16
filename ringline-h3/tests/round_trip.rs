@@ -170,7 +170,8 @@ impl AsyncEventHandler for H3Server {
                         H3Event::Response { .. }
                         | H3Event::GoAway { .. }
                         | H3Event::Error(_)
-                        | H3Event::StreamReset { .. } => {}
+                        | H3Event::StreamReset { .. }
+                        | H3Event::ZeroRttRejected => {}
                     }
                 }
 

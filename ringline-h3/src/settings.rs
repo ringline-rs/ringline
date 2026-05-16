@@ -40,13 +40,24 @@ impl Settings {
     }
 
     /// Decode settings from a byte buffer containing (identifier, value) varint pairs.
+    ///
+    /// Returns `None` if the buffer is malformed or if any setting identifier
+    /// appears more than once (RFC 9114 §7.2.4 makes duplicates an
+    /// `H3_SETTINGS_ERROR`).
     pub fn decode(mut buf: &[u8]) -> Option<Self> {
         let mut settings = Settings::default();
+        let mut seen: Vec<u64> = Vec::new();
         while !buf.is_empty() {
             let (id, n) = decode_varint(buf)?;
             buf = &buf[n..];
             let (value, n) = decode_varint(buf)?;
             buf = &buf[n..];
+            // Duplicate identifier (including duplicate-unknown) is a settings
+            // error.  Keep the seen list inline — settings frames are small.
+            if seen.contains(&id) {
+                return None;
+            }
+            seen.push(id);
             match id {
                 0x01 => settings.qpack_max_table_capacity = value,
                 0x06 => settings.max_field_section_size = value,
@@ -71,5 +82,44 @@ impl Settings {
             len += varint_len(0x07) + varint_len(self.qpack_blocked_streams);
         }
         len
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_setting_id_rejected() {
+        // (0x01, 100) twice — RFC 9114 §7.2.4 H3_SETTINGS_ERROR.
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 0x01);
+        encode_varint(&mut buf, 100);
+        encode_varint(&mut buf, 0x01);
+        encode_varint(&mut buf, 200);
+        assert!(Settings::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn duplicate_unknown_setting_id_rejected() {
+        // Duplicate unknown id is still a settings error.
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 0x42);
+        encode_varint(&mut buf, 1);
+        encode_varint(&mut buf, 0x42);
+        encode_varint(&mut buf, 2);
+        assert!(Settings::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn distinct_settings_accepted() {
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 0x01);
+        encode_varint(&mut buf, 100);
+        encode_varint(&mut buf, 0x07);
+        encode_varint(&mut buf, 5);
+        let s = Settings::decode(&buf).expect("decode");
+        assert_eq!(s.qpack_max_table_capacity, 100);
+        assert_eq!(s.qpack_blocked_streams, 5);
     }
 }
