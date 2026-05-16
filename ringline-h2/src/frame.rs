@@ -339,8 +339,11 @@ pub fn decode_frame(buf: &[u8], max_frame_size: u32) -> Result<Option<(Frame, us
         return Ok(None);
     }
 
-    // Check frame size limit (except SETTINGS, which can be up to 6*N).
-    if header.length > max_frame_size && header.frame_type != FRAME_SETTINGS {
+    // Check frame size limit. RFC 7540 §4.2 applies to all frame types
+    // including SETTINGS — without this, a peer can send arbitrarily large
+    // (multiple-of-6) SETTINGS frames containing only unknown identifiers,
+    // and we'd buffer the whole thing in `recv_buf` before parsing.
+    if header.length > max_frame_size {
         return Err(H2Error::FrameSizeError);
     }
 
@@ -831,6 +834,24 @@ mod tests {
         assert!(matches!(
             decode_frame(&buf, 16384),
             Err(H2Error::ProtocolError(_))
+        ));
+    }
+
+    #[test]
+    fn settings_frame_subject_to_max_frame_size() {
+        // 30-byte SETTINGS frame (5 settings × 6 bytes) submitted with
+        // max_frame_size = 16. Must be rejected — the SETTINGS-specific
+        // bypass was a DoS vector before this audit.
+        let mut buf = Vec::new();
+        encode_frame_header(&mut buf, 30, FRAME_SETTINGS, 0, 0);
+        for _ in 0..5 {
+            // ID=0xFF (unknown), value 0 — accepted but unused; the frame
+            // size is what we're testing.
+            buf.extend_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0]);
+        }
+        assert!(matches!(
+            decode_frame(&buf, 16),
+            Err(H2Error::FrameSizeError)
         ));
     }
 

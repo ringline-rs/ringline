@@ -57,8 +57,35 @@ pub enum H2Error {
     ConnectionError(ErrorCode),
     /// Stream-level error with an error code.
     StreamError(u32, ErrorCode),
+    /// HTTP message semantic error (malformed pseudo-headers, forbidden
+    /// connection-specific headers, uppercase header names, etc. —
+    /// RFC 9113 §8.1, §8.2).
+    MessageError(String),
+    /// A resource cap configured by `Settings` (`max_header_list_size`,
+    /// `max_recv_buf`, etc.) or by the H2 implementation's hard ceilings
+    /// (HPACK literal count, dynamic table size) was exceeded.
+    MaxSizeExceeded(String),
     /// Internal error with a description.
     Internal(String),
+}
+
+impl H2Error {
+    /// The connection-level error code that this error should be reported as
+    /// in a GOAWAY frame (RFC 7540 §7).
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::FrameError | Self::ProtocolError(_) | Self::MessageError(_) => {
+                ErrorCode::ProtocolError
+            }
+            Self::CompressionError => ErrorCode::CompressionError,
+            Self::FlowControlError => ErrorCode::FlowControlError,
+            Self::FrameSizeError => ErrorCode::FrameSizeError,
+            Self::ConnectionError(code) => *code,
+            Self::StreamError(_, code) => *code,
+            Self::MaxSizeExceeded(_) => ErrorCode::EnhanceYourCalm,
+            Self::Internal(_) => ErrorCode::InternalError,
+        }
+    }
 }
 
 impl std::fmt::Display for H2Error {
@@ -71,6 +98,8 @@ impl std::fmt::Display for H2Error {
             Self::FrameSizeError => write!(f, "frame size error"),
             Self::ConnectionError(code) => write!(f, "connection error: {code:?}"),
             Self::StreamError(id, code) => write!(f, "stream {id} error: {code:?}"),
+            Self::MessageError(s) => write!(f, "message error: {s}"),
+            Self::MaxSizeExceeded(s) => write!(f, "max size exceeded: {s}"),
             Self::Internal(s) => write!(f, "internal: {s}"),
         }
     }
