@@ -94,8 +94,9 @@ impl H1Conn {
         self.max_body_size = n;
     }
 
-    /// Override the cap on a decompressed response body. Default
-    /// [`crate::compress::DEFAULT_MAX_DECOMPRESSED_SIZE`].
+    /// Override the cap on a decompressed response body. Default 64 MiB —
+    /// defends against decompression bombs where a small compressed input
+    /// expands to many GiB of zeros.
     pub fn set_max_decompressed_size(&mut self, n: usize) {
         self.max_decompressed_size = n;
     }
