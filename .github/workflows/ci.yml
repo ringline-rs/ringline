@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
   workflow_call:
+  schedule:
+    # Daily at 13:17 UTC so the RustSec advisory database catches
+    # vulnerabilities published against our pinned deps even when nothing
+    # in-tree changes.
+    - cron: '17 13 * * *'
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,7 +75,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-audit
-      - run: cargo audit
+      # `--deny warnings` promotes informational advisories
+      # (unmaintained, unsound, notice) to errors. Downstream consumers
+      # pulling ringline transitives get caught by their own audits, so
+      # we hold the same bar here.
+      - run: cargo audit --deny warnings
 
   test:
     name: Test
