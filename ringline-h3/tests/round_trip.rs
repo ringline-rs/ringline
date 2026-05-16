@@ -173,6 +173,7 @@ impl AsyncEventHandler for H3Server {
                         | H3Event::Error(_)
                         | H3Event::StreamReset { .. }
                         | H3Event::ZeroRttRejected => {}
+                        _ => {}
                     }
                 }
 

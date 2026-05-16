@@ -4,7 +4,12 @@ use bytes::Bytes;
 use quinn_proto::{ConnectError, ConnectionError, ReadError, ReadableError, VarInt, WriteError};
 
 /// Errors returned by ringline-quic operations.
+///
+/// Marked `#[non_exhaustive]` because the crate is still evolving and new
+/// transport-layer error kinds are expected. Downstream `match` blocks must
+/// include a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("connection closed")]
     ConnectionClosed,

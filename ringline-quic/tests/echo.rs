@@ -165,6 +165,7 @@ impl AsyncEventHandler for QuicEchoServer {
                         | QuicEvent::DatagramsUnblocked { .. }
                         | QuicEvent::HandshakeDataReady { .. }
                         | QuicEvent::ConnectionClosed { .. } => {}
+                        _ => {}
                     }
                 }
 

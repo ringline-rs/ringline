@@ -20,7 +20,12 @@ impl QuicConnId {
 /// Application-facing events produced by [`QuicEndpoint`](crate::QuicEndpoint).
 ///
 /// Poll these via [`QuicEndpoint::poll_event()`](crate::QuicEndpoint::poll_event).
+///
+/// Marked `#[non_exhaustive]` because the crate is still evolving and new
+/// quinn-proto events get plumbed through over time. Downstream `match`
+/// blocks must include a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum QuicEvent {
     /// An inbound QUIC connection completed its handshake.
     NewConnection(QuicConnId),
