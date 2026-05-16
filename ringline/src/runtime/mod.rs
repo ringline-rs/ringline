@@ -90,6 +90,10 @@ pub(crate) enum PendingUdpBuf {
 
 impl PendingUdpDatagram {
     /// Borrow the payload bytes. Valid until the buffer is released.
+    // On mio-only builds the enum has a single variant, so these matches are
+    // infallible. clippy complains; cfg-gating the lint avoids contorting
+    // the code with `if let` chains that only exist to please mio builds.
+    #[cfg_attr(not(has_io_uring), allow(clippy::infallible_destructuring_match))]
     pub(crate) fn data(&self) -> &[u8] {
         match &self.buf {
             PendingUdpBuf::Owned(v) => v.as_slice(),
@@ -103,6 +107,7 @@ impl PendingUdpDatagram {
     /// If this entry holds a kernel-provided buffer, return the bid so the
     /// caller can push it to `udp_pending_replenish`. Returns `None` for
     /// owned-buffer entries (mio).
+    #[cfg_attr(not(has_io_uring), allow(clippy::match_single_binding))]
     pub(crate) fn bid_to_release(&self) -> Option<u16> {
         match &self.buf {
             PendingUdpBuf::Owned(_) => None,
@@ -115,6 +120,7 @@ impl PendingUdpDatagram {
     /// fresh `Vec` for the kernel-buffer variant; the caller must still push
     /// `bid_to_release()` to `udp_pending_replenish` to free the kernel
     /// buffer.
+    #[cfg_attr(not(has_io_uring), allow(clippy::infallible_destructuring_match))]
     pub(crate) fn into_owned(self) -> (Vec<u8>, std::net::SocketAddr) {
         let peer = self.peer;
         let v = match self.buf {
