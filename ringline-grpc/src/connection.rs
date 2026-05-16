@@ -13,11 +13,20 @@ use crate::error::{GrpcError, GrpcStatus};
 use crate::message::{self, MessageBuffer};
 
 /// Per-stream state for tracking the server's chosen encoding.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct StreamState {
     buffer: MessageBuffer,
     /// The encoding advertised by the server for this stream (from `grpc-encoding` header).
     encoding: Option<String>,
+}
+
+impl StreamState {
+    fn new(max_message_size: usize) -> Self {
+        Self {
+            buffer: MessageBuffer::new(max_message_size),
+            encoding: None,
+        }
+    }
 }
 
 /// Events produced by the gRPC connection for the application.
@@ -57,6 +66,10 @@ pub struct GrpcConnection {
     buffers: HashMap<u32, StreamState>,
     /// Pending gRPC events.
     events: VecDeque<GrpcEvent>,
+    /// Cap on a single received gRPC message's size, both pre-decompression
+    /// (header length prefix) and post-decompression. Defaults to 4 MiB
+    /// per the gRPC standard `max_receive_message_length`.
+    max_message_size: usize,
 }
 
 impl GrpcConnection {
@@ -67,7 +80,15 @@ impl GrpcConnection {
             ready: false,
             buffers: HashMap::new(),
             events: VecDeque::new(),
+            max_message_size: crate::message::DEFAULT_MAX_MESSAGE_SIZE,
         }
+    }
+
+    /// Override the cap on a single received gRPC message. Defaults to
+    /// 4 MiB. Applied to the length-prefix decode (raw frame size) and to
+    /// the decompressed output if `grpc-encoding` is set.
+    pub fn set_max_message_size(&mut self, n: usize) {
+        self.max_message_size = n;
     }
 
     /// Feed received bytes from the transport.
@@ -111,7 +132,8 @@ impl GrpcConnection {
         self.h2.send_data(stream_id, &framed, true)?;
 
         // Allocate a message buffer for the response.
-        self.buffers.insert(stream_id, StreamState::default());
+        self.buffers
+            .insert(stream_id, StreamState::new(self.max_message_size));
 
         Ok(stream_id)
     }
@@ -126,7 +148,8 @@ impl GrpcConnection {
         metadata: &[HeaderField],
     ) -> Result<u32, GrpcError> {
         let stream_id = self.send_headers(service, method, metadata, false)?;
-        self.buffers.insert(stream_id, StreamState::default());
+        self.buffers
+            .insert(stream_id, StreamState::new(self.max_message_size));
         Ok(stream_id)
     }
 
@@ -188,7 +211,10 @@ impl GrpcConnection {
                     end_stream,
                 } => {
                     // Ensure we have a buffer even for server-push scenarios.
-                    self.buffers.entry(stream_id).or_default();
+                    let max = self.max_message_size;
+                    self.buffers
+                        .entry(stream_id)
+                        .or_insert_with(|| StreamState::new(max));
 
                     if end_stream {
                         // Trailers-only response: HEADERS with END_STREAM carries
@@ -227,23 +253,70 @@ impl GrpcConnection {
                     data,
                     end_stream,
                 } => {
+                    let max = self.max_message_size;
                     if let Some(state) = self.buffers.get_mut(&stream_id) {
-                        state.buffer.push(&data);
-                        while let Some((payload, compressed)) = state.buffer.try_decode() {
-                            let data = if compressed {
-                                if let Some(ref enc) = state.encoding {
-                                    match crate::compress::decompress(enc, &payload) {
-                                        Ok(decompressed) => decompressed,
-                                        Err(_) => payload, // fallback to raw on error
-                                    }
-                                } else {
-                                    payload // compressed flag set but no encoding header
+                        // If the per-stream buffer fills up — the peer is
+                        // sending data faster than message boundaries
+                        // arrive — fail the stream rather than OOM.
+                        if let Err(e) = state.buffer.push(&data) {
+                            self.fail_stream(
+                                stream_id,
+                                GrpcStatus::ResourceExhausted,
+                                e.to_string(),
+                            );
+                            continue;
+                        }
+                        loop {
+                            match state.buffer.try_decode() {
+                                crate::message::BufferDecode::Complete(payload, compressed) => {
+                                    let data = if compressed {
+                                        match &state.encoding {
+                                            // Compressed flag set with a known encoding — decompress
+                                            // or fail the stream with INTERNAL (do NOT silently fall
+                                            // back to raw bytes; the application can't tell the
+                                            // difference between a real message and our garbage).
+                                            Some(enc) => match crate::compress::decompress(
+                                                enc, &payload, max,
+                                            ) {
+                                                Ok(d) => d,
+                                                Err(e) => {
+                                                    self.fail_stream(
+                                                        stream_id,
+                                                        GrpcStatus::Internal,
+                                                        format!("decompression failed: {e}"),
+                                                    );
+                                                    break;
+                                                }
+                                            },
+                                            // Compressed flag set but no grpc-encoding header — peer
+                                            // is malformed; treat as INTERNAL rather than silently
+                                            // delivering raw compressed bytes as the message.
+                                            None => {
+                                                self.fail_stream(
+                                                    stream_id,
+                                                    GrpcStatus::Internal,
+                                                    "compressed flag set but no grpc-encoding header"
+                                                        .into(),
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        payload
+                                    };
+                                    self.events
+                                        .push_back(GrpcEvent::Message { stream_id, data });
                                 }
-                            } else {
-                                payload
-                            };
-                            self.events
-                                .push_back(GrpcEvent::Message { stream_id, data });
+                                crate::message::BufferDecode::Incomplete => break,
+                                crate::message::BufferDecode::TooLarge(n) => {
+                                    self.fail_stream(
+                                        stream_id,
+                                        GrpcStatus::ResourceExhausted,
+                                        format!("message length {n} exceeds cap {max}"),
+                                    );
+                                    break;
+                                }
+                            }
                         }
                     }
 
@@ -252,14 +325,24 @@ impl GrpcConnection {
                     }
                 }
                 H2Event::Trailers { stream_id, headers } => {
-                    // Drain any remaining buffered messages.
+                    // Drain any remaining buffered messages. Decompression
+                    // failures on these final messages fall through to the
+                    // status emission below (we'd want to surface them but
+                    // the trailer arrival is the authoritative end signal).
+                    let max = self.max_message_size;
                     if let Some(state) = self.buffers.get_mut(&stream_id) {
-                        while let Some((payload, compressed)) = state.buffer.try_decode() {
+                        while let crate::message::BufferDecode::Complete(payload, compressed) =
+                            state.buffer.try_decode()
+                        {
                             let data = if compressed {
-                                if let Some(ref enc) = state.encoding {
-                                    crate::compress::decompress(enc, &payload).unwrap_or(payload)
-                                } else {
-                                    payload
+                                match &state.encoding {
+                                    Some(enc) => {
+                                        match crate::compress::decompress(enc, &payload, max) {
+                                            Ok(d) => d,
+                                            Err(_) => break, // surfaced via grpc-status below
+                                        }
+                                    }
+                                    None => break,
                                 }
                             } else {
                                 payload
@@ -329,9 +412,27 @@ impl GrpcConnection {
             metadata: Vec::new(),
         });
     }
+
+    /// Reset a stream from the gRPC layer with an explicit status and
+    /// reason. Sends RST_STREAM(CANCEL) at the H2 layer, removes the
+    /// per-stream buffer, and emits a Status event so the caller learns
+    /// the RPC outcome.
+    fn fail_stream(&mut self, stream_id: u32, status: GrpcStatus, message: String) {
+        self.h2.reset_stream(stream_id, ErrorCode::Cancel);
+        self.buffers.remove(&stream_id);
+        self.events.push_back(GrpcEvent::Status {
+            stream_id,
+            status,
+            message,
+            metadata: Vec::new(),
+        });
+    }
 }
 
-/// Extract `grpc-status` from trailer headers, defaulting to `Ok` if absent.
+/// Extract `grpc-status` from trailer headers. A missing or malformed
+/// status is treated as `Unknown` — defaulting to `Ok` would let a
+/// misbehaving server's incomplete trailers look like a successful RPC.
+/// The gRPC spec requires every response to carry a `grpc-status` trailer.
 fn extract_grpc_status(headers: &[HeaderField]) -> GrpcStatus {
     headers
         .iter()
@@ -339,7 +440,7 @@ fn extract_grpc_status(headers: &[HeaderField]) -> GrpcStatus {
         .and_then(|h| std::str::from_utf8(&h.value).ok())
         .and_then(|s| s.parse::<u8>().ok())
         .map(GrpcStatus::from_u8)
-        .unwrap_or(GrpcStatus::Ok)
+        .unwrap_or(GrpcStatus::Unknown)
 }
 
 /// Extract `grpc-message` from trailer headers, defaulting to empty string.
@@ -373,9 +474,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_status_missing() {
+    fn extract_status_missing_defaults_to_unknown() {
+        // Audit: G8. Missing grpc-status used to default to Ok, hiding
+        // misbehaving servers under a successful-looking RPC.
         let headers = vec![];
-        assert_eq!(extract_grpc_status(&headers), GrpcStatus::Ok);
+        assert_eq!(extract_grpc_status(&headers), GrpcStatus::Unknown);
         assert_eq!(extract_grpc_message(&headers), "");
     }
 
