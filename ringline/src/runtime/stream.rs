@@ -29,6 +29,7 @@ use std::task::{Context, Poll};
 
 use super::io::{ConnCtx, with_state};
 use crate::connection::RecvMode;
+use crate::runtime::CURRENT_TASK_ID;
 
 /// Wraps a [`ConnCtx`] and implements [`AsyncRead`], [`AsyncWrite`], and
 /// [`AsyncBufRead`].
@@ -134,6 +135,7 @@ impl AsyncRead for ConnStream {
                 return Poll::Ready(Ok(0));
             }
 
+            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[conn_index as usize] = true;
             Poll::Pending
         })
@@ -167,6 +169,7 @@ impl AsyncBufRead for ConnStream {
                 return Ok(None); // EOF
             }
 
+            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[conn_index as usize] = true;
             Err(()) // Pending
         });
