@@ -289,15 +289,20 @@ fn decode_string_literal(buf: &[u8]) -> Result<(Vec<u8>, usize), H2Error> {
 /// HPACK encoder with dynamic table.
 pub struct Encoder {
     dynamic_table: DynamicTable,
-    /// Pending table size update to emit at the start of the next header block.
-    pending_table_size_update: Option<usize>,
+    /// Pending table size updates to emit at the start of the next header
+    /// block. RFC 7541 §4.2: when multiple updates occur between header
+    /// blocks, the smallest value seen MUST be signaled, and the final
+    /// value MUST be signaled — at most two updates per block.
+    pending_min: Option<usize>,
+    pending_latest: Option<usize>,
 }
 
 impl Encoder {
     pub fn new(max_table_size: usize) -> Self {
         Encoder {
             dynamic_table: DynamicTable::new(max_table_size),
-            pending_table_size_update: None,
+            pending_min: None,
+            pending_latest: None,
         }
     }
 
@@ -311,18 +316,30 @@ impl Encoder {
     }
 
     /// Update the encoder's maximum table size from a SETTINGS change.
-    /// The size update will be emitted at the start of the next `encode()` call.
+    /// The size update will be emitted at the start of the next `encode()`
+    /// call. Multiple updates between encodes collapse to (min, final) per
+    /// RFC 7541 §4.2.
     pub fn update_max_table_size(&mut self, new_size: usize) {
-        self.pending_table_size_update = Some(new_size);
+        self.pending_min = Some(match self.pending_min {
+            Some(m) => m.min(new_size),
+            None => new_size,
+        });
+        self.pending_latest = Some(new_size);
     }
 
     /// Encode a list of headers into an HPACK header block.
     pub fn encode(&mut self, headers: &[HeaderField], buf: &mut Vec<u8>) {
-        // Emit pending table size update at the start of the header block
-        // (RFC 7541 Section 4.2).
-        if let Some(new_size) = self.pending_table_size_update.take() {
-            self.dynamic_table.set_max_size(new_size);
-            encode_prefix_int(buf, new_size as u64, 5, 0x20);
+        // Emit pending table size update(s) at the start of the header
+        // block (RFC 7541 §4.2). When the latest value matches the min,
+        // a single update suffices.
+        if let Some(latest) = self.pending_latest.take() {
+            let min = self.pending_min.take().unwrap_or(latest);
+            if min != latest {
+                self.dynamic_table.set_max_size(min);
+                encode_prefix_int(buf, min as u64, 5, 0x20);
+            }
+            self.dynamic_table.set_max_size(latest);
+            encode_prefix_int(buf, latest as u64, 5, 0x20);
         }
         for header in headers {
             self.encode_header(header, buf);
@@ -713,6 +730,43 @@ mod tests {
         encoder.encode(&[HeaderField::new(b":method", b"GET")], &mut buf);
         let decoded = decoder.decode(&buf).unwrap();
         assert_eq!(decoded, vec![HeaderField::new(b":method", b"GET")]);
+    }
+
+    #[test]
+    fn encoder_emits_min_then_latest_when_multiple_updates_pending() {
+        // RFC 7541 §4.2: when multiple table size updates happen between
+        // header blocks, the encoder must signal the minimum value seen
+        // followed by the final value.
+        let mut encoder = Encoder::new(4096);
+        encoder.update_max_table_size(4096);
+        encoder.update_max_table_size(1024); // min
+        encoder.update_max_table_size(2048); // latest
+
+        let mut buf = Vec::new();
+        encoder.encode(&[HeaderField::new(b":method", b"GET")], &mut buf);
+
+        // Decode the two size updates that should appear at the start.
+        let (first, n) = decode_prefix_int(&buf, 5).unwrap();
+        assert_eq!(first, 1024, "expected min (1024) first");
+        let (second, _) = decode_prefix_int(&buf[n..], 5).unwrap();
+        assert_eq!(second, 2048, "expected latest (2048) second");
+    }
+
+    #[test]
+    fn encoder_single_update_when_min_equals_latest() {
+        let mut encoder = Encoder::new(4096);
+        encoder.update_max_table_size(2048);
+        encoder.update_max_table_size(2048); // same, no min/latest gap
+
+        let mut buf = Vec::new();
+        encoder.encode(&[HeaderField::new(b":method", b"GET")], &mut buf);
+
+        // Only one size update should be emitted before the header.
+        let (size, n) = decode_prefix_int(&buf, 5).unwrap();
+        assert_eq!(size, 2048);
+        // Next byte should be the header (0x82 = :method GET), not another
+        // size update (0x20 prefix).
+        assert_eq!(buf[n], 0x82);
     }
 
     #[test]
