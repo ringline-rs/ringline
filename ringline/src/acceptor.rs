@@ -101,6 +101,11 @@ pub fn run_acceptor(config: AcceptorConfig) {
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
 
         // Round-robin pick a live worker. Try up to num_workers times.
+        // `try_send` lets us distinguish a full queue (skip to next worker)
+        // from a disconnected channel (mark dead). Closing the fd when all
+        // workers are full or dead lets the kernel deliver a clean
+        // connection-refused to the peer instead of growing an unbounded
+        // backlog inside the channel.
         let mut sent = false;
         for _ in 0..num_workers {
             let worker_idx = next_worker % num_workers;
@@ -110,30 +115,34 @@ pub fn run_acceptor(config: AcceptorConfig) {
                 continue;
             }
 
-            if config.worker_channels[worker_idx]
-                .send((fd, peer_addr))
-                .is_err()
-            {
-                // Worker has exited — mark dead.
-                alive[worker_idx] = false;
-                alive_count -= 1;
-                if alive_count == 0 {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                    return;
+            match config.worker_channels[worker_idx].try_send((fd, peer_addr)) {
+                Ok(()) => {
+                    config.worker_wake_handles[worker_idx].wake();
+                    sent = true;
+                    break;
                 }
-                continue;
+                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                    // Worker is backlogged — try the next one.
+                    continue;
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    // Worker has exited — mark dead.
+                    alive[worker_idx] = false;
+                    alive_count -= 1;
+                    if alive_count == 0 {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                        return;
+                    }
+                    continue;
+                }
             }
-
-            // Wake the worker's event loop.
-            config.worker_wake_handles[worker_idx].wake();
-            sent = true;
-            break;
         }
 
         if !sent {
-            // All workers dead.
+            // Every live worker is either dead or backlogged. Drop the
+            // connection rather than block the acceptor.
             unsafe {
                 libc::close(fd);
             }
@@ -142,10 +151,17 @@ pub fn run_acceptor(config: AcceptorConfig) {
     }
 }
 
-/// Accept a connection and set it to non-blocking + close-on-exec.
+/// Accept a connection and set the **returned** fd to non-blocking +
+/// close-on-exec. The call itself blocks on the listen socket until a
+/// connection arrives — only the resulting accepted fd is non-blocking.
 ///
-/// On Linux, uses `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)` for a single syscall.
-/// On other platforms, falls back to `accept()` + `fcntl()`.
+/// On Linux, uses `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)` for a single
+/// syscall. On other platforms, falls back to `accept()` + `fcntl()`.
+///
+/// Because this blocks, the acceptor thread can only be unblocked at
+/// shutdown by closing the listen fd (the syscall then returns `EBADF`).
+/// On a quiet listener the thread will sit in `accept4` until a peer
+/// connects or the listen fd is closed.
 fn accept_nonblock(
     listen_fd: libc::c_int,
     addr: &mut libc::sockaddr_storage,

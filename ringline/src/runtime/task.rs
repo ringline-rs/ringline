@@ -177,11 +177,18 @@ impl StandaloneTaskSlab {
         }
     }
 
-    /// Remove a completed or cancelled task, returning its slot to the free list.
+    /// Remove a completed or cancelled task, returning its slot to the free
+    /// list. Idempotent: a second call on an already-Empty slot is a no-op
+    /// (the slot's index is *not* pushed onto the free list again, which
+    /// would otherwise allow two future spawns to collide on the same slot
+    /// and silently drop one of the two futures).
     pub(crate) fn remove(&mut self, task_idx: u32) {
         let idx = task_idx as usize;
-        if idx < self.tasks.len() {
-            self.tasks[idx] = TaskSlot::Empty;
+        if idx >= self.tasks.len() {
+            return;
+        }
+        let prev = std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty);
+        if !matches!(prev, TaskSlot::Empty) {
             self.free_list.push(task_idx);
         }
     }
@@ -317,6 +324,25 @@ mod tests {
     fn standalone_full_slab() {
         let mut slab = StandaloneTaskSlab::new(1);
         assert!(slab.spawn(Box::pin(CountdownFuture(0))).is_some());
+        assert!(slab.spawn(Box::pin(CountdownFuture(0))).is_none());
+    }
+
+    #[test]
+    fn standalone_remove_is_idempotent() {
+        // Regression: removing an already-Empty slot must not push its index
+        // onto the free list a second time, or two subsequent spawns will
+        // return the same slot and silently overwrite the first future.
+        let mut slab = StandaloneTaskSlab::new(2);
+        let a = slab.spawn(Box::pin(CountdownFuture(0))).unwrap();
+        slab.remove(a);
+        slab.remove(a); // second remove is a no-op
+        let b = slab.spawn(Box::pin(CountdownFuture(0))).unwrap();
+        let c = slab.spawn(Box::pin(CountdownFuture(0))).unwrap();
+        assert_ne!(
+            b, c,
+            "spawn must hand out distinct slots after redundant remove"
+        );
+        // Slab is now full — a 3rd spawn must fail.
         assert!(slab.spawn(Box::pin(CountdownFuture(0))).is_none());
     }
 }

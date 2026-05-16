@@ -441,6 +441,24 @@ impl Executor {
         }
         self.task_slab.remove(conn_index);
         if idx < self.recv_waiters.len() {
+            // If a *standalone* task was awaiting recv/send/connect on this
+            // connection, it isn't removed by `task_slab.remove`. Push it
+            // back onto the ready queue so its future polls once more and
+            // sees the new generation via the `ConnCtx`-stored gen check
+            // — at which point it returns `ConnectionAborted` instead of
+            // sitting parked forever. (Connection-bound tasks have already
+            // been dropped by `task_slab.remove`.)
+            let any_waiter =
+                self.recv_waiters[idx] || self.send_waiters[idx] || self.connect_waiters[idx];
+            if any_waiter
+                && let Some(task_id) = self.owner_task[idx]
+                && task_id & waker::STANDALONE_BIT != 0
+            {
+                // Push to the ready queue; the standalone task slab still
+                // holds the future, and the next poll will short-circuit on
+                // the generation mismatch.
+                let _ = self.wake_task(task_id);
+            }
             self.recv_waiters[idx] = false;
             self.send_waiters[idx] = false;
             self.connect_waiters[idx] = false;

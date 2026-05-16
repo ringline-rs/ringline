@@ -745,6 +745,7 @@ impl ConnCtx {
     pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&self, f: F) -> WithDataFuture<F> {
         WithDataFuture {
             conn_index: self.conn_index,
+            generation: self.generation,
             f: Some(f),
         }
     }
@@ -760,6 +761,7 @@ impl ConnCtx {
     pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&self, f: F) -> WithBytesFuture<F> {
         WithBytesFuture {
             conn_index: self.conn_index,
+            generation: self.generation,
             f: Some(f),
         }
     }
@@ -804,6 +806,7 @@ impl ConnCtx {
     pub fn recv_ready(&self) -> RecvReadyFuture {
         RecvReadyFuture {
             conn_index: self.conn_index,
+            generation: self.generation,
         }
     }
 
@@ -871,9 +874,17 @@ impl ConnCtx {
                         // Submit send SQE from the recv buffer. The bid is replenished
                         // on send completion via handle_send_recv_buf.
                         // Payload: bid in low 16 bits, remaining_len in high 16 bits.
-                        debug_assert!(
+                        //
+                        // The encoding is tied to the config validation cap
+                        // `recv_buffer.buffer_size <= 65535` in `config.rs`;
+                        // if that cap is ever raised this must be widened too.
+                        // Guard at runtime in release builds — silent
+                        // truncation here causes wrong-length completions.
+                        assert!(
                             pending.len <= 0xFFFF,
-                            "forward_recv_buf: data length {} exceeds 16-bit payload capacity",
+                            "forward_recv_buf: data length {} exceeds 16-bit payload capacity \
+                             — `Config::recv_buffer::buffer_size` cap diverged from the \
+                             `SendRecvBuf` user_data encoding",
                             pending.len,
                         );
                         let payload = (pending.bid as u32) | ((pending.len) << 16);
@@ -958,6 +969,7 @@ impl ConnCtx {
             }
             Ok(SendFuture {
                 conn_index: self.conn_index,
+                generation: self.generation,
             })
         })
     }
@@ -1067,6 +1079,7 @@ impl ConnCtx {
             executor.send_waiters[self.conn_index as usize] = true;
             Ok(SendFuture {
                 conn_index: self.conn_index,
+                generation: self.generation,
             })
         })
     }
@@ -1260,7 +1273,10 @@ impl AsyncSendBuilder {
             let conn_index = self.token.index;
             executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.send_waiters[conn_index as usize] = true;
-            Ok(SendFuture { conn_index })
+            Ok(SendFuture {
+                conn_index,
+                generation: self.token.generation,
+            })
         })
     }
 
@@ -1325,7 +1341,13 @@ impl AsyncSendBuilder {
             let conn_index = self.token.index;
             executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.send_waiters[conn_index as usize] = true;
-            Ok((consumed, SendFuture { conn_index }))
+            Ok((
+                consumed,
+                SendFuture {
+                    conn_index,
+                    generation: self.token.generation,
+                },
+            ))
         })
     }
 }
@@ -1416,7 +1438,10 @@ impl AsyncSendBuilder {
             let conn_index = self.token.index;
             executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.send_waiters[conn_index as usize] = true;
-            Ok(SendFuture { conn_index })
+            Ok(SendFuture {
+                conn_index,
+                generation: self.token.generation,
+            })
         })
     }
 }
@@ -1454,6 +1479,10 @@ impl<'a> MioSendBuilder<'a> {
 /// Future returned by [`ConnCtx::with_data`].
 pub struct WithDataFuture<F> {
     conn_index: u32,
+    /// Generation snapshot from `ConnCtx` at construction time. Compared on
+    /// poll / drop so a stale future that survived a slot-reuse cycle
+    /// doesn't read or wake the *new* connection's state.
+    generation: u32,
     f: Option<F>,
 }
 
@@ -1462,6 +1491,16 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
         with_state(|driver, executor| {
+            // Reject stale futures that survived a slot-reuse cycle. A
+            // standalone task holding a `ConnCtx` whose underlying
+            // connection has closed-then-been-reused would otherwise read
+            // the new connection's accumulator. Return Poll::Ready(0)
+            // (EOF-equivalent) so the caller's read loop terminates
+            // gracefully.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                self.f.take();
+                return Poll::Ready(0);
+            }
             // Zero-copy fast path: check pending recv buffer before accumulator.
             // Only available on io_uring where kernel-provided buffers are used.
             #[cfg(has_io_uring)]
@@ -1588,6 +1627,8 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
 /// Future returned by [`ConnCtx::with_bytes`].
 pub struct WithBytesFuture<F> {
     conn_index: u32,
+    /// See `WithDataFuture` for the role of `generation`.
+    generation: u32,
     f: Option<F>,
 }
 
@@ -1596,6 +1637,11 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
         with_state(|driver, executor| {
+            // See `WithDataFuture::poll` for the rationale.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                self.f.take();
+                return Poll::Ready(0);
+            }
             // Flush any pending zero-copy recv buffer to accumulator so
             // take_frozen() will include it (io_uring only).
             #[cfg(has_io_uring)]
@@ -1680,6 +1726,8 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 /// 3. The connection is closed.
 pub struct RecvReadyFuture {
     conn_index: u32,
+    /// See `WithDataFuture` for the role of `generation`.
+    generation: u32,
 }
 
 impl Future for RecvReadyFuture {
@@ -1687,6 +1735,11 @@ impl Future for RecvReadyFuture {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
         with_state(|driver, executor| {
+            // Stale future from a reused slot — synthesize "ready" so the
+            // caller's loop sees the closure and terminates.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return Poll::Ready(());
+            }
             // Check recv sink.
             if let Some(sink) = &executor.recv_sinks[self.conn_index as usize]
                 && sink.pos > 0
@@ -1724,13 +1777,23 @@ impl Future for RecvReadyFuture {
 /// No data stored in the future. No allocation.
 pub struct SendFuture {
     conn_index: u32,
+    /// See `WithDataFuture` for the role of `generation`.
+    generation: u32,
 }
 
 impl Future for SendFuture {
     type Output = io::Result<u32>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u32>> {
-        with_state(|_driver, executor| {
+        with_state(|driver, executor| {
+            // Slot-reuse safety: don't observe another connection's send
+            // completions. Treat as ConnectionAborted.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "connection closed",
+                )));
+            }
             match executor.io_results[self.conn_index as usize].take() {
                 Some(IoResult::Send(result)) => Poll::Ready(result),
                 _ => {
@@ -1753,6 +1816,17 @@ impl Drop for SendFuture {
         }
         let mut non_null = opt_non_null.unwrap();
         let state = unsafe { non_null.as_mut() };
+        // Verify the connection slot still belongs to us before touching
+        // its waiter flag. After a close/reuse cycle the same `conn_index`
+        // can be a *different* connection with its own send_waiter, which
+        // this Drop must not clear.
+        #[cfg(has_io_uring)]
+        let driver = unsafe { &mut *state.driver.as_mut() };
+        #[cfg(not(has_io_uring))]
+        let driver = unsafe { &mut *state.driver.as_mut() };
+        if driver.connections.generation(self.conn_index) != self.generation {
+            return;
+        }
         let executor = unsafe { &mut *state.executor.as_mut() };
         executor.send_waiters[self.conn_index as usize] = false;
     }
@@ -1771,7 +1845,14 @@ impl Future for ConnectFuture {
     type Output = io::Result<ConnCtx>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<ConnCtx>> {
-        with_state(|_driver, executor| {
+        with_state(|driver, executor| {
+            // Slot-reuse safety.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "connection closed",
+                )));
+            }
             match executor.io_results[self.conn_index as usize].take() {
                 Some(IoResult::Connect(result)) => match result {
                     Ok(()) => Poll::Ready(Ok(ConnCtx::new(self.conn_index, self.generation))),
@@ -1795,6 +1876,14 @@ impl Drop for ConnectFuture {
         }
         let mut non_null = opt_non_null.unwrap();
         let state = unsafe { non_null.as_mut() };
+        let driver = unsafe { &mut *state.driver.as_mut() };
+        // Don't clear another connection's waiter flag if the slot has
+        // already been reused. (Quite rare for connect: drop usually
+        // happens before any close/reuse cycle on the same slot, but
+        // belt-and-suspenders.)
+        if driver.connections.generation(self.conn_index) != self.generation {
+            return;
+        }
         let executor = unsafe { &mut *state.executor.as_mut() };
         executor.connect_waiters[self.conn_index as usize] = false;
     }
@@ -1905,6 +1994,14 @@ impl Drop for SleepFuture {
     fn drop(&mut self) {
         if let Some(slot) = self.timer_slot {
             // Timer was submitted but not yet fired — try to cancel it.
+            //
+            // If `CURRENT_DRIVER` is unset, the future is being dropped
+            // outside an active executor poll. This happens during normal
+            // worker teardown (the slab is dropped after the event loop
+            // exits, so `CURRENT_DRIVER` is no longer installed) and we
+            // can't do anything useful here — the io_uring instance is
+            // gone too. The timer slot is leaked from this worker's pool
+            // but the pool itself is being dropped, so no real leak.
             let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
             if opt_non_null.is_none() {
                 return;

@@ -519,7 +519,14 @@ impl RinglineBuilder {
         let mut worker_wake_handles = Vec::with_capacity(num_threads);
 
         for _ in 0..num_threads {
-            let (tx, rx) = crossbeam_channel::unbounded::<(RawFd, SocketAddr)>();
+            // Bounded so a slow worker applies backpressure on the acceptor
+            // rather than queuing fds indefinitely. On full, the acceptor
+            // tries the next worker; if every worker is full, the incoming
+            // fd is closed so the kernel can signal connection-refused to
+            // the peer instead of letting the listen queue overflow.
+            let (tx, rx) = crossbeam_channel::bounded::<(RawFd, SocketAddr)>(
+                self.config.accept_queue_capacity,
+            );
             let (read_fd, wake_handle) =
                 crate::wakeup::create_wake_fd().map_err(crate::error::Error::Io)?;
             worker_txs.push(tx);
