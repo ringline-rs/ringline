@@ -155,4 +155,22 @@ mod tests {
         let result = super::decompress("gzip", &compressed, 1024);
         assert!(matches!(result, Err(crate::GrpcError::MaxSizeExceeded(_))));
     }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn decompression_bomb_rejected_at_cap_zstd() {
+        // 1 MiB of zeros zstd-compresses to ~100 bytes but expands back.
+        // Cap to 1 KiB → MaxSizeExceeded.
+        let original = vec![0u8; 1024 * 1024];
+        let compressed = super::compress("zstd", &original).unwrap();
+        assert!(compressed.len() < 10_000);
+        let result = super::decompress("zstd", &compressed, 1024);
+        assert!(matches!(result, Err(crate::GrpcError::MaxSizeExceeded(_))));
+    }
+
+    #[test]
+    fn identity_too_large_rejected() {
+        let data = vec![0u8; 100];
+        assert!(super::decompress("identity", &data, 50).is_err());
+    }
 }
