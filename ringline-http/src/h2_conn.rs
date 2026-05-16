@@ -53,8 +53,7 @@ impl PendingStream {
         // Decompress body if Content-Encoding is set.
         #[cfg(any(feature = "gzip", feature = "zstd", feature = "brotli"))]
         if let Some(ref encoding) = self.content_encoding {
-            let decompressed =
-                crate::compress::decompress(encoding, &body, max_decompressed_size)?;
+            let decompressed = crate::compress::decompress(encoding, &body, max_decompressed_size)?;
             return Ok(Response::new(
                 self.status.unwrap_or(0),
                 self.headers,
