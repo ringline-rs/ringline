@@ -103,6 +103,10 @@ pub struct H3Connection {
     /// Pending uni streams that we've seen open but haven't read the type byte yet.
     pending_uni_streams: Vec<StreamId>,
 
+    /// Partial type-varint bytes buffered for streams whose type varint arrived
+    /// split across QUIC packets.  Keyed by stream ID bits.
+    partial_uni_type_bufs: HashMap<u64, Vec<u8>>,
+
     /// Application-visible event queue.
     events: VecDeque<H3Event>,
 
@@ -132,6 +136,7 @@ impl H3Connection {
             our_control_stream: None,
             control_recv_buf: Vec::new(),
             pending_uni_streams: Vec::new(),
+            partial_uni_type_bufs: HashMap::new(),
             events: VecDeque::new(),
             settings_sent: false,
             conn_id: None,
@@ -585,19 +590,27 @@ impl H3Connection {
         conn: QuicConnId,
         stream: StreamId,
     ) -> Result<(), H3Error> {
-        // Read the stream type byte.
-        let mut type_buf = [0u8; 8]; // varints up to 8 bytes
-        let (n, _fin) = quic.stream_recv(conn, stream, &mut type_buf)?;
-        if n == 0 {
-            // No data yet — re-add to pending.
+        let sid = u64::from(stream);
+
+        // Restore any bytes from a previous partial read.
+        let mut accumulated: Vec<u8> = self.partial_uni_type_bufs.remove(&sid).unwrap_or_default();
+
+        // Read more bytes into the remainder of an 8-byte scratch space.
+        let mut scratch = [0u8; 8];
+        let want = 8usize.saturating_sub(accumulated.len());
+        let (n, _fin) = quic.stream_recv(conn, stream, &mut scratch[..want])?;
+        if n == 0 && accumulated.is_empty() {
+            // No data at all yet — re-add to pending.
             self.pending_uni_streams.push(stream);
             return Ok(());
         }
+        accumulated.extend_from_slice(&scratch[..n]);
 
-        let (stream_type, _consumed) = match frame::decode_varint(&type_buf[..n]) {
+        let (stream_type, _consumed) = match frame::decode_varint(&accumulated) {
             Some(v) => v,
             None => {
-                // Incomplete varint — re-add to pending.
+                // Still incomplete — save what we have and retry later.
+                self.partial_uni_type_bufs.insert(sid, accumulated);
                 self.pending_uni_streams.push(stream);
                 return Ok(());
             }
@@ -612,14 +625,14 @@ impl H3Connection {
                     return Ok(());
                 }
                 self.control_stream_id = Some(stream);
-                // There may be data already available — try reading.
-                // Any remaining bytes after the type varint go into control_recv_buf.
-                let consumed = frame::decode_varint(&type_buf[..n])
+                // Any bytes after the type varint in our accumulated buffer
+                // belong to the first control-stream frame — seed the recv buf.
+                let consumed = frame::decode_varint(&accumulated)
                     .map(|(_, c)| c)
                     .unwrap_or(0);
-                if consumed < n {
+                if consumed < accumulated.len() {
                     self.control_recv_buf
-                        .extend_from_slice(&type_buf[consumed..n]);
+                        .extend_from_slice(&accumulated[consumed..]);
                 }
                 self.read_control_stream(quic, conn, stream)?;
             }

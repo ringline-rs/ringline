@@ -60,6 +60,12 @@ struct QuicConnection {
     /// `conn.remote_address()` after each `poll_connection` round so we
     /// can emit `QuicEvent::PeerAddressChanged` on path migration.
     cached_remote: SocketAddr,
+    /// Set to true once we have emitted `QuicEvent::ConnectionClosed` for
+    /// this connection.  Guards against a second emission if quinn-proto
+    /// somehow fires `Event::ConnectionLost` after `close_connection()` has
+    /// already injected the event (defensive — the drain path should prevent
+    /// this, but belt-and-suspenders).
+    close_event_emitted: bool,
 }
 
 /// One outbound UDP packet produced by the endpoint.
@@ -445,6 +451,7 @@ impl QuicEndpoint {
         // higher-level layers (e.g. H3Connection) can clean up per-connection
         // state without waiting for the 3×PTO drain timer.
         let conn_id = QuicConnId(key as u32);
+        self.connections[key].close_event_emitted = true;
         self.events.push_back(QuicEvent::ConnectionClosed {
             conn: conn_id,
             reason: ConnectionError::LocallyClosed,
@@ -574,6 +581,7 @@ impl QuicEndpoint {
             outbound,
             zero_rtt_attempted,
             cached_remote,
+            close_event_emitted: false,
         });
 
         // Grow handle_map if needed.
@@ -662,10 +670,12 @@ impl QuicEndpoint {
                     }
                 }
                 Event::ConnectionLost { reason } => {
-                    self.events.push_back(QuicEvent::ConnectionClosed {
-                        conn: conn_id,
-                        reason,
-                    });
+                    if !self.connections[key].close_event_emitted {
+                        self.events.push_back(QuicEvent::ConnectionClosed {
+                            conn: conn_id,
+                            reason,
+                        });
+                    }
                     self.remove_connection(key);
                     return; // Connection is gone, stop polling.
                 }
