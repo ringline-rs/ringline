@@ -10,6 +10,19 @@ const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
 const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
 const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x6;
 
+/// Hard ceiling on `header_table_size` we accept from a peer's SETTINGS,
+/// even if the peer advertises a larger value. The HPACK dynamic table
+/// uses ~32 bytes of accounting per entry plus the entry bytes themselves,
+/// so unbounded growth here is a DoS vector. 64 KiB lets `4096`-sized
+/// tables (the default) keep working while bounding worst case.
+pub const MAX_PEER_HEADER_TABLE_SIZE: u32 = 65536;
+
+/// Default value for `max_header_list_size` (RFC 7540 §6.5.2 leaves this
+/// unbounded by default, but advertising a finite value is the only way to
+/// stop a peer from amplifying small encoded frames into multi-megabyte
+/// decoded header lists). 256 KiB matches the H3 default in ringline-h3.
+pub const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 262_144;
+
 /// HTTP/2 SETTINGS parameters.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -35,7 +48,7 @@ impl Default for Settings {
             max_concurrent_streams: None,
             initial_window_size: 65535,
             max_frame_size: 16384,
-            max_header_list_size: None,
+            max_header_list_size: Some(DEFAULT_MAX_HEADER_LIST_SIZE),
         }
     }
 }
@@ -89,7 +102,12 @@ impl Settings {
                 | u32::from(buf[pos + 5]);
             pos += 6;
             match id {
-                SETTINGS_HEADER_TABLE_SIZE => settings.header_table_size = value,
+                SETTINGS_HEADER_TABLE_SIZE => {
+                    // Cap what we actually honour at MAX_PEER_HEADER_TABLE_SIZE,
+                    // regardless of what the peer advertised. The peer can't
+                    // force us to allocate an arbitrarily large HPACK table.
+                    settings.header_table_size = value.min(MAX_PEER_HEADER_TABLE_SIZE);
+                }
                 SETTINGS_ENABLE_PUSH => {
                     if value > 1 {
                         return Err(H2Error::ProtocolError("ENABLE_PUSH must be 0 or 1".into()));

@@ -15,8 +15,110 @@ use crate::stream::{H2Stream, StreamState};
 /// HTTP/2 connection preface (RFC 7540 Section 3.5).
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// Validate response header section per RFC 9113 §8.3 and §8.2:
+/// exactly one `:status`, pseudo-headers before regular headers, no
+/// connection-specific headers, lowercase names, `TE: trailers` only.
+fn validate_response(headers: &[HeaderField]) -> Result<(), H2Error> {
+    let mut seen_regular = false;
+    let mut status_count = 0;
+    for h in headers {
+        if h.name.is_empty() {
+            return Err(H2Error::MessageError("empty header name".into()));
+        }
+        let is_pseudo = h.name[0] == b':';
+        if is_pseudo {
+            if seen_regular {
+                return Err(H2Error::MessageError(
+                    "pseudo-header after regular header".into(),
+                ));
+            }
+            // Responses may only have :status; client doesn't send back :method etc.
+            if h.name.as_slice() != b":status" {
+                return Err(H2Error::MessageError(format!(
+                    "unexpected pseudo-header in response: {}",
+                    String::from_utf8_lossy(&h.name)
+                )));
+            }
+            status_count += 1;
+            if status_count > 1 {
+                return Err(H2Error::MessageError("duplicate :status".into()));
+            }
+        } else {
+            seen_regular = true;
+            validate_regular_header(h)?;
+        }
+    }
+    if status_count == 0 {
+        return Err(H2Error::MessageError(
+            "missing :status pseudo-header".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a trailers header section per RFC 9113 §8.1: no pseudo-headers
+/// allowed, plus the usual regular-header rules.
+fn validate_trailers(headers: &[HeaderField]) -> Result<(), H2Error> {
+    for h in headers {
+        if h.name.is_empty() {
+            return Err(H2Error::MessageError("empty header name".into()));
+        }
+        if h.name[0] == b':' {
+            return Err(H2Error::MessageError("pseudo-header in trailers".into()));
+        }
+        validate_regular_header(h)?;
+    }
+    Ok(())
+}
+
+fn validate_regular_header(h: &HeaderField) -> Result<(), H2Error> {
+    // RFC 9113 §8.2.1: header names must be lowercase (excluding pseudo
+    // names, handled above).
+    for &b in &h.name {
+        if b.is_ascii_uppercase() {
+            return Err(H2Error::MessageError(format!(
+                "uppercase header name: {}",
+                String::from_utf8_lossy(&h.name)
+            )));
+        }
+    }
+    // RFC 9113 §8.2.2: connection-specific headers are forbidden in HTTP/2.
+    let forbidden: &[&[u8]] = &[
+        b"connection",
+        b"proxy-connection",
+        b"keep-alive",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+    if forbidden.contains(&h.name.as_slice()) {
+        return Err(H2Error::MessageError(format!(
+            "connection-specific header forbidden in HTTP/2: {}",
+            String::from_utf8_lossy(&h.name)
+        )));
+    }
+    // RFC 9113 §8.2.2: `TE` header may only contain `trailers`.
+    if h.name.as_slice() == b"te" && h.value.as_slice() != b"trailers" {
+        return Err(H2Error::MessageError(
+            "TE header may only contain `trailers` in HTTP/2".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Auto WINDOW_UPDATE threshold: send update when half the window is consumed.
 const WINDOW_UPDATE_THRESHOLD: i64 = 32768;
+
+/// Maximum stream identifier (RFC 7540 §5.1.1). When `next_stream_id`
+/// would exceed this, `send_request` fails — the connection must be
+/// recycled.
+const MAX_STREAM_ID: u32 = 0x7fff_ffff;
+
+/// Default cap on the in-process recv buffer. A peer can dribble in
+/// partial frames; without a cap, ringline would buffer everything before
+/// having a chance to detect the protocol error. 256 KiB is large enough
+/// for several default-sized (16 KiB) frames in flight while bounding the
+/// worst case. Configurable via `H2Connection::set_max_recv_buf`.
+pub const DEFAULT_MAX_RECV_BUF: usize = 262_144;
 
 /// Events produced by the HTTP/2 connection for the application.
 #[derive(Debug)]
@@ -109,6 +211,16 @@ pub struct H2Connection {
 
     /// Track initial recv window to calculate WINDOW_UPDATE.
     initial_recv_window: i64,
+
+    /// Cap on `recv_buf` size — guards against a peer dribbling in partial
+    /// frames to exhaust memory before we get a chance to detect the
+    /// protocol violation.
+    max_recv_buf: usize,
+
+    /// Have we received any frame yet? The first frame from the server
+    /// MUST be SETTINGS per RFC 7540 §3.5; we track this to fail loudly
+    /// on a malformed preface instead of silently limping along.
+    received_any_frame: bool,
 }
 
 impl H2Connection {
@@ -154,7 +266,18 @@ impl H2Connection {
             send_buf,
             events: VecDeque::new(),
             initial_recv_window: initial_recv,
+            max_recv_buf: DEFAULT_MAX_RECV_BUF,
+            received_any_frame: false,
         }
+    }
+
+    /// Set the maximum number of bytes the connection will hold in its
+    /// receive buffer awaiting frame parsing. Defaults to
+    /// [`DEFAULT_MAX_RECV_BUF`]. The cap protects against a peer that
+    /// dribbles in arbitrarily many partial frames before the framing layer
+    /// can detect a protocol error.
+    pub fn set_max_recv_buf(&mut self, n: usize) {
+        self.max_recv_buf = n;
     }
 
     /// Feed received bytes from the transport.
@@ -162,8 +285,39 @@ impl H2Connection {
         if matches!(self.state, ConnState::Closing | ConnState::Closed) {
             return Ok(());
         }
+        if self.recv_buf.len().saturating_add(data.len()) > self.max_recv_buf {
+            // The peer is sending more data than we can buffer waiting for a
+            // complete frame. Close the connection cleanly so the peer learns
+            // that we have given up on it (instead of an OS-level RST when
+            // we eventually run out of memory).
+            self.fatal_error(H2Error::MaxSizeExceeded(format!(
+                "recv_buf would exceed {} bytes",
+                self.max_recv_buf
+            )));
+            return Ok(());
+        }
         self.recv_buf.extend_from_slice(data);
         self.process_recv_buf()
+    }
+
+    /// Send a GOAWAY with the appropriate error code, transition to
+    /// `Closing`, and emit an `Error` event. RFC 7540 §5.4.1: an endpoint
+    /// that encounters a connection error SHOULD send a GOAWAY before
+    /// closing.
+    fn fatal_error(&mut self, err: H2Error) {
+        if matches!(self.state, ConnState::Closing | ConnState::Closed) {
+            return;
+        }
+        let code = err.code();
+        let last_stream_id = self.next_stream_id.saturating_sub(2);
+        let goaway = Frame::GoAway {
+            last_stream_id,
+            error_code: code,
+            debug_data: Vec::new(),
+        };
+        goaway.encode(&mut self.send_buf);
+        self.state = ConnState::Closing;
+        self.events.push_back(H2Event::Error(err));
     }
 
     /// Poll the next event, if any.
@@ -205,8 +359,15 @@ impl H2Connection {
             }
         }
 
+        // RFC 7540 §5.1.1: stream IDs are 31-bit. Once we've exhausted
+        // the space, the connection must be recycled — silent wrap to small
+        // IDs would violate the "monotonically increasing" requirement.
+        if self.next_stream_id > MAX_STREAM_ID {
+            return Err(H2Error::ConnectionError(ErrorCode::RefusedStream));
+        }
+
         let stream_id = self.next_stream_id;
-        self.next_stream_id += 2;
+        self.next_stream_id = self.next_stream_id.saturating_add(2);
 
         // Encode headers with HPACK.
         let mut encoded = Vec::new();
@@ -340,19 +501,21 @@ impl H2Connection {
 
     fn process_recv_buf(&mut self) -> Result<(), H2Error> {
         loop {
+            if matches!(self.state, ConnState::Closing | ConnState::Closed) {
+                break;
+            }
             let max_frame = self.local_settings.max_frame_size;
             match frame::decode_frame(&self.recv_buf, max_frame) {
                 Ok(Some((frame, consumed))) => {
                     self.recv_buf.drain(..consumed);
-                    self.handle_frame(frame)?;
+                    if let Err(e) = self.handle_frame(frame) {
+                        self.fatal_error(e);
+                    }
                 }
                 Ok(None) => break,
                 Err(e) => {
                     self.recv_buf.clear();
-                    self.state = ConnState::Closing;
-                    self.events
-                        .push_back(H2Event::Error(H2Error::ProtocolError(format!("{e}"))));
-                    break;
+                    self.fatal_error(e);
                 }
             }
         }
@@ -360,8 +523,26 @@ impl H2Connection {
     }
 
     fn handle_frame(&mut self, frame: Frame) -> Result<(), H2Error> {
+        // RFC 7540 §3.5: the first frame from the server MUST be a SETTINGS
+        // frame (potentially empty, never ACK). Reject anything else as a
+        // PROTOCOL_ERROR rather than silently letting the connection limp
+        // along until something stream-related blows up.
+        if !self.received_any_frame {
+            match &frame {
+                Frame::Settings { ack: false, .. } => {}
+                _ => {
+                    return Err(H2Error::ProtocolError(
+                        "first server frame must be SETTINGS".into(),
+                    ));
+                }
+            }
+        }
+        self.received_any_frame = true;
+
         // CONTINUATION enforcement: if we're in a header block, only
-        // CONTINUATION frames for that stream are allowed.
+        // CONTINUATION frames for that stream are allowed. And conversely,
+        // a CONTINUATION outside of an active header block is a PROTOCOL_ERROR
+        // (RFC 7540 §6.10).
         if let Some(expected_sid) = self.continuation_stream {
             match &frame {
                 Frame::Continuation { stream_id, .. } if *stream_id == expected_sid => {
@@ -371,6 +552,10 @@ impl H2Connection {
                     return Err(H2Error::ProtocolError("expected CONTINUATION frame".into()));
                 }
             }
+        } else if matches!(frame, Frame::Continuation { .. }) {
+            return Err(H2Error::ProtocolError(
+                "CONTINUATION without preceding HEADERS without END_HEADERS".into(),
+            ));
         }
 
         match frame {
@@ -404,9 +589,11 @@ impl H2Connection {
                 stream_id,
                 error_code,
             } => {
-                if let Some(stream) = self.streams.get_mut(&stream_id) {
-                    stream.state = StreamState::Closed;
-                }
+                // Remove the stream rather than just marking it closed —
+                // ringline never sends frames on a stream we've reset, and
+                // keeping the entry around forever leaks per-stream state
+                // for the lifetime of the connection.
+                self.streams.remove(&stream_id);
                 self.events.push_back(H2Event::StreamReset {
                     stream_id,
                     error_code,
@@ -530,8 +717,15 @@ impl H2Connection {
         let stream = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
             None => {
-                // Unknown stream -- could be a server-initiated stream or stale.
-                return Ok(());
+                // We're a client. Streams we initiated are odd; HEADERS on
+                // an unknown odd stream means the peer is referring to a
+                // stream we never opened (or already GC'd) — RFC 7540
+                // §5.1.1: PROTOCOL_ERROR. Even-numbered HEADERS would be a
+                // server push, which we don't implement, so reject those
+                // too. The peer has misbehaved either way.
+                return Err(H2Error::ProtocolError(format!(
+                    "HEADERS on unknown stream {stream_id}"
+                )));
             }
         };
 
@@ -588,28 +782,73 @@ impl H2Connection {
         encoded: &[u8],
         end_stream: bool,
     ) -> Result<(), H2Error> {
+        // Enforce SETTINGS_MAX_HEADER_LIST_SIZE on the *encoded* bytes too —
+        // a malformed peer can otherwise force us to run HPACK decode over
+        // an oversize buffer before we'd notice the post-decode total.
+        if let Some(max) = self.local_settings.max_header_list_size
+            && (encoded.len() as u64) > u64::from(max)
+        {
+            return Err(H2Error::MaxSizeExceeded(format!(
+                "header block ({} bytes) exceeds SETTINGS_MAX_HEADER_LIST_SIZE ({max})",
+                encoded.len()
+            )));
+        }
+
         let headers = self.decoder.decode(encoded)?;
 
+        // Decoded header-list-size check (RFC 7541 §4.1: 32 bytes per
+        // entry + name/value sizes).
+        if let Some(max) = self.local_settings.max_header_list_size {
+            let total: u64 = headers
+                .iter()
+                .map(|h| (h.name.len() + h.value.len() + 32) as u64)
+                .sum();
+            if total > u64::from(max) {
+                return Err(H2Error::MaxSizeExceeded(format!(
+                    "decoded header list size {total} exceeds SETTINGS_MAX_HEADER_LIST_SIZE ({max})"
+                )));
+            }
+        }
+
+        // `handle_headers` rejects unknown streams up-front, so by the time
+        // we land here the stream is known (or it was GC'd between frames
+        // of a multi-CONTINUATION block; in that race we silently drop).
         let stream = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
             None => return Ok(()),
         };
 
-        // Determine if this is a response or trailers.
-        let is_initial_response =
-            stream.state == StreamState::Open || stream.state == StreamState::HalfClosedLocal;
+        // Once we've delivered the initial response HEADERS on this stream,
+        // any subsequent HEADERS is trailers. Stream state alone can't
+        // disambiguate: an initial HEADERS without END_STREAM leaves the
+        // state in HalfClosedLocal, and the trailing HEADERS arrives with
+        // the state still HalfClosedLocal — the two look identical to the
+        // state machine.
+        let is_initial_response = !stream.received_initial_response;
 
+        // Validate header section semantics before mutating any state.
+        if is_initial_response {
+            validate_response(&headers)?;
+        } else {
+            validate_trailers(&headers)?;
+            if !end_stream {
+                // Trailers must close the stream (RFC 9113 §8.1).
+                return Err(H2Error::ProtocolError("trailers without END_STREAM".into()));
+            }
+        }
+
+        if is_initial_response {
+            stream.received_initial_response = true;
+        }
         if end_stream {
             stream.state = match stream.state {
                 StreamState::HalfClosedLocal => StreamState::Closed,
                 _ => StreamState::HalfClosedRemote,
             };
         }
+        let stream_closed = stream.state == StreamState::Closed;
 
-        // Check if headers contain :status (response) or not (trailers).
-        let has_status = headers.iter().any(|h| h.name == b":status");
-
-        if has_status && is_initial_response {
+        if is_initial_response {
             self.events.push_back(H2Event::Response {
                 stream_id,
                 headers,
@@ -618,6 +857,10 @@ impl H2Connection {
         } else {
             self.events
                 .push_back(H2Event::Trailers { stream_id, headers });
+        }
+
+        if stream_closed {
+            self.streams.remove(&stream_id);
         }
 
         Ok(())
@@ -631,26 +874,74 @@ impl H2Connection {
     ) -> Result<(), H2Error> {
         let data_len = payload.len() as u32;
 
-        // Update connection-level receive window.
+        // Update connection-level receive window. The peer's flow-control
+        // accounting requires us to debit it regardless of whether we know
+        // about the stream; otherwise the two views diverge.
         if data_len > 0 {
             self.conn_recv_window.consume(data_len)?;
         }
 
         let stream = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
-            None => return Ok(()),
+            None => {
+                // Unknown / already-closed stream — reply with RST_STREAM
+                // per RFC 7540 §5.1, and replenish the connection window we
+                // just debited so we don't starve ourselves on garbage.
+                if data_len > 0 {
+                    let _ = self.conn_recv_window.increase(data_len);
+                    let wu = Frame::WindowUpdate {
+                        stream_id: 0,
+                        increment: data_len,
+                    };
+                    wu.encode(&mut self.send_buf);
+                }
+                let rst = Frame::RstStream {
+                    stream_id,
+                    error_code: ErrorCode::StreamClosed,
+                };
+                rst.encode(&mut self.send_buf);
+                return Ok(());
+            }
         };
+
+        // RFC 7540 §5.1: receiving DATA on a fully-closed or half-closed-remote
+        // stream is a STREAM_CLOSED stream error.
+        if matches!(
+            stream.state,
+            StreamState::Closed | StreamState::HalfClosedRemote
+        ) {
+            // Replenish connection window — peer was wrong, but we still
+            // accounted for the bytes.
+            if data_len > 0 {
+                let _ = self.conn_recv_window.increase(data_len);
+                let wu = Frame::WindowUpdate {
+                    stream_id: 0,
+                    increment: data_len,
+                };
+                wu.encode(&mut self.send_buf);
+            }
+            let rst = Frame::RstStream {
+                stream_id,
+                error_code: ErrorCode::StreamClosed,
+            };
+            rst.encode(&mut self.send_buf);
+            stream.state = StreamState::Closed;
+            self.streams.remove(&stream_id);
+            return Ok(());
+        }
 
         // Update stream-level receive window.
         if data_len > 0 {
             stream.recv_window.consume(data_len)?;
         }
 
+        let mut stream_closed = false;
         if end_stream {
             stream.state = match stream.state {
                 StreamState::HalfClosedLocal => StreamState::Closed,
                 _ => StreamState::HalfClosedRemote,
             };
+            stream_closed = stream.state == StreamState::Closed;
         }
 
         self.events.push_back(H2Event::Data {
@@ -661,6 +952,10 @@ impl H2Connection {
 
         // Auto-send WINDOW_UPDATE when significant data consumed.
         self.maybe_send_window_updates(stream_id, data_len);
+
+        if stream_closed {
+            self.streams.remove(&stream_id);
+        }
 
         Ok(())
     }
@@ -1071,6 +1366,359 @@ mod tests {
             vec![3, 5],
             "expected streams 3 and 5 to be reset"
         );
+    }
+
+    // -- Audit tests: RFC conformance + robustness --
+
+    fn settled_conn() -> H2Connection {
+        let mut conn = H2Connection::new(Settings::client_default());
+        let _ = conn.take_pending_send();
+        let server_settings = make_settings_frame(&Settings::default(), false);
+        conn.recv(&server_settings).unwrap();
+        let _ = conn.take_pending_send();
+        while conn.poll_event().is_some() {}
+        conn
+    }
+
+    #[test]
+    fn first_frame_must_be_settings() {
+        let mut conn = H2Connection::new(Settings::client_default());
+        let _ = conn.take_pending_send();
+
+        // Server "preface" is actually a PING — must be rejected.
+        let ping = Frame::Ping {
+            ack: false,
+            opaque_data: [0; 8],
+        };
+        let mut buf = Vec::new();
+        ping.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+
+        assert_eq!(conn.state, ConnState::Closing);
+        // GOAWAY should have been queued in send_buf.
+        let out = conn.take_pending_send();
+        let (decoded, _) = frame::decode_frame(&out, 16384).unwrap().unwrap();
+        assert!(matches!(decoded, Frame::GoAway { .. }));
+    }
+
+    #[test]
+    fn protocol_error_sends_goaway() {
+        let mut conn = settled_conn();
+        // Spurious CONTINUATION — invalid without a preceding HEADERS.
+        let cont = Frame::Continuation {
+            stream_id: 1,
+            encoded: vec![0x82],
+            end_headers: true,
+        };
+        let mut buf = Vec::new();
+        cont.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+
+        assert_eq!(conn.state, ConnState::Closing);
+        let out = conn.take_pending_send();
+        let (decoded, _) = frame::decode_frame(&out, 16384).unwrap().unwrap();
+        match decoded {
+            Frame::GoAway { error_code, .. } => {
+                assert_eq!(error_code, ErrorCode::ProtocolError);
+            }
+            f => panic!("expected GOAWAY, got {f:?}"),
+        }
+    }
+
+    #[test]
+    fn response_missing_status_rejected() {
+        let mut conn = settled_conn();
+        let headers = vec![HeaderField::new(b":method", b"GET")];
+        let _ = conn.send_request(&headers, true).unwrap();
+        let _ = conn.take_pending_send();
+
+        // Server returns "headers" without :status.
+        let mut enc = Encoder::new(4096);
+        let mut encoded = Vec::new();
+        enc.encode(
+            &[HeaderField::new(b"content-type", b"text/plain")],
+            &mut encoded,
+        );
+        let resp = Frame::Headers {
+            stream_id: 1,
+            encoded,
+            end_stream: false,
+            end_headers: true,
+            priority: None,
+        };
+        let mut buf = Vec::new();
+        resp.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+
+        assert_eq!(conn.state, ConnState::Closing);
+        let mut got_error = false;
+        while let Some(ev) = conn.poll_event() {
+            if let H2Event::Error(H2Error::MessageError(_)) = ev {
+                got_error = true;
+            }
+        }
+        assert!(got_error, "expected MessageError event");
+    }
+
+    #[test]
+    fn response_uppercase_header_rejected() {
+        let mut conn = settled_conn();
+        let headers = vec![HeaderField::new(b":method", b"GET")];
+        let _ = conn.send_request(&headers, true).unwrap();
+        let _ = conn.take_pending_send();
+
+        let mut enc = Encoder::new(4096);
+        let mut encoded = Vec::new();
+        enc.encode(
+            &[
+                HeaderField::new(b":status", b"200"),
+                HeaderField::new(b"Content-Type", b"text/plain"),
+            ],
+            &mut encoded,
+        );
+        let resp = Frame::Headers {
+            stream_id: 1,
+            encoded,
+            end_stream: false,
+            end_headers: true,
+            priority: None,
+        };
+        let mut buf = Vec::new();
+        resp.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+        assert_eq!(conn.state, ConnState::Closing);
+    }
+
+    #[test]
+    fn response_connection_specific_header_rejected() {
+        let mut conn = settled_conn();
+        let headers = vec![HeaderField::new(b":method", b"GET")];
+        let _ = conn.send_request(&headers, true).unwrap();
+        let _ = conn.take_pending_send();
+
+        let mut enc = Encoder::new(4096);
+        let mut encoded = Vec::new();
+        enc.encode(
+            &[
+                HeaderField::new(b":status", b"200"),
+                HeaderField::new(b"connection", b"close"),
+            ],
+            &mut encoded,
+        );
+        let resp = Frame::Headers {
+            stream_id: 1,
+            encoded,
+            end_stream: false,
+            end_headers: true,
+            priority: None,
+        };
+        let mut buf = Vec::new();
+        resp.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+        assert_eq!(conn.state, ConnState::Closing);
+    }
+
+    #[test]
+    fn spurious_continuation_rejected() {
+        let mut conn = settled_conn();
+        let cont = Frame::Continuation {
+            stream_id: 1,
+            encoded: vec![0x82],
+            end_headers: true,
+        };
+        let mut buf = Vec::new();
+        cont.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+        assert_eq!(conn.state, ConnState::Closing);
+    }
+
+    #[test]
+    fn data_on_closed_stream_emits_rst() {
+        let mut conn = settled_conn();
+        let headers = vec![HeaderField::new(b":method", b"GET")];
+        let stream_id = conn.send_request(&headers, true).unwrap();
+        let _ = conn.take_pending_send();
+
+        // Server sends response with END_STREAM, closing the stream.
+        let mut enc = Encoder::new(4096);
+        let mut encoded = Vec::new();
+        enc.encode(&[HeaderField::new(b":status", b"200")], &mut encoded);
+        let resp = Frame::Headers {
+            stream_id,
+            encoded,
+            end_stream: true,
+            end_headers: true,
+            priority: None,
+        };
+        let mut buf = Vec::new();
+        resp.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+        let _ = conn.take_pending_send();
+        while conn.poll_event().is_some() {}
+
+        // Stream is now closed and GC'd. Server sends DATA — should get RST.
+        let data = Frame::Data {
+            stream_id,
+            payload: b"surprise".to_vec(),
+            end_stream: false,
+        };
+        let mut buf = Vec::new();
+        data.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+
+        let out = conn.take_pending_send();
+        // Find RST_STREAM in the output.
+        let mut found_rst = false;
+        let mut pos = 0;
+        while pos < out.len() {
+            let (frame, consumed) = frame::decode_frame(&out[pos..], 16384).unwrap().unwrap();
+            if matches!(
+                frame,
+                Frame::RstStream {
+                    error_code: ErrorCode::StreamClosed,
+                    ..
+                }
+            ) {
+                found_rst = true;
+            }
+            pos += consumed;
+        }
+        assert!(found_rst, "expected RST_STREAM with StreamClosed");
+    }
+
+    #[test]
+    fn streams_gc_after_close() {
+        let mut conn = settled_conn();
+        let headers = vec![HeaderField::new(b":method", b"GET")];
+        let stream_id = conn.send_request(&headers, true).unwrap();
+        let _ = conn.take_pending_send();
+
+        // Stream is HalfClosedLocal (we sent END_STREAM). Server responds with END_STREAM.
+        let mut enc = Encoder::new(4096);
+        let mut encoded = Vec::new();
+        enc.encode(&[HeaderField::new(b":status", b"200")], &mut encoded);
+        let resp = Frame::Headers {
+            stream_id,
+            encoded,
+            end_stream: true,
+            end_headers: true,
+            priority: None,
+        };
+        let mut buf = Vec::new();
+        resp.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+        while conn.poll_event().is_some() {}
+
+        // Stream should be GC'd.
+        assert!(!conn.streams.contains_key(&stream_id));
+    }
+
+    #[test]
+    fn recv_buf_capped() {
+        let mut conn = settled_conn();
+        conn.set_max_recv_buf(64);
+
+        // Push 100 bytes (one byte at a time would also trigger, but bulk is fine).
+        conn.recv(&[0u8; 100]).unwrap();
+        assert_eq!(conn.state, ConnState::Closing);
+        // GOAWAY should be queued.
+        let out = conn.take_pending_send();
+        let (decoded, _) = frame::decode_frame(&out, 16384).unwrap().unwrap();
+        assert!(matches!(decoded, Frame::GoAway { .. }));
+    }
+
+    #[test]
+    fn unknown_odd_stream_rejected() {
+        let mut conn = settled_conn();
+        // Server sends HEADERS on stream 7 (odd, never allocated by us).
+        let mut enc = Encoder::new(4096);
+        let mut encoded = Vec::new();
+        enc.encode(&[HeaderField::new(b":status", b"200")], &mut encoded);
+        let resp = Frame::Headers {
+            stream_id: 7,
+            encoded,
+            end_stream: true,
+            end_headers: true,
+            priority: None,
+        };
+        let mut buf = Vec::new();
+        resp.encode(&mut buf);
+        conn.recv(&buf).unwrap();
+        assert_eq!(conn.state, ConnState::Closing);
+    }
+
+    #[test]
+    fn trailers_after_initial_headers_emits_trailers_event() {
+        // Regression: an initial HEADERS without END_STREAM leaves the
+        // stream in HalfClosedLocal; the trailing HEADERS arrives with the
+        // state unchanged. The second HEADERS must be classified as
+        // trailers (no `:status` required), not as a second response.
+        let mut conn = settled_conn();
+        let headers = vec![HeaderField::new(b":method", b"GET")];
+        let stream_id = conn.send_request(&headers, true).unwrap();
+        let _ = conn.take_pending_send();
+
+        // 1) Initial response HEADERS without END_STREAM.
+        let mut enc = Encoder::new(4096);
+        let mut buf = Vec::new();
+        let mut encoded = Vec::new();
+        enc.encode(
+            &[
+                HeaderField::new(b":status", b"200"),
+                HeaderField::new(b"content-type", b"application/grpc"),
+            ],
+            &mut encoded,
+        );
+        Frame::Headers {
+            stream_id,
+            encoded,
+            end_stream: false,
+            end_headers: true,
+            priority: None,
+        }
+        .encode(&mut buf);
+
+        // 2) Trailers (no `:status`, must end the stream).
+        let mut encoded_t = Vec::new();
+        enc.encode(&[HeaderField::new(b"grpc-status", b"0")], &mut encoded_t);
+        Frame::Headers {
+            stream_id,
+            encoded: encoded_t,
+            end_stream: true,
+            end_headers: true,
+            priority: None,
+        }
+        .encode(&mut buf);
+
+        conn.recv(&buf).unwrap();
+        assert_eq!(conn.state, ConnState::Ready, "should not close");
+
+        let mut got_response = false;
+        let mut got_trailers = false;
+        while let Some(ev) = conn.poll_event() {
+            match ev {
+                H2Event::Response { .. } => got_response = true,
+                H2Event::Trailers { headers, .. } => {
+                    got_trailers = true;
+                    assert_eq!(headers[0].name, b"grpc-status");
+                }
+                _ => {}
+            }
+        }
+        assert!(got_response, "expected Response event");
+        assert!(got_trailers, "expected Trailers event");
+    }
+
+    #[test]
+    fn stream_id_overflow_returns_error() {
+        let mut conn = settled_conn();
+        conn.next_stream_id = MAX_STREAM_ID + 2; // already past the limit
+        let headers = vec![HeaderField::new(b":method", b"GET")];
+        let err = conn.send_request(&headers, true).err().unwrap();
+        assert!(matches!(
+            err,
+            H2Error::ConnectionError(ErrorCode::RefusedStream)
+        ));
     }
 
     #[test]

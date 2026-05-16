@@ -10,6 +10,13 @@ use std::collections::VecDeque;
 
 use crate::error::H2Error;
 
+/// Hard cap on the number of header fields decoded from a single HPACK
+/// block. Defends against the indexed-literal amplification attack: a 16 KiB
+/// block of all-indexed entries (1 byte each) would otherwise produce ~16k
+/// `HeaderField` allocations at ≥32 bytes each (the HPACK accounting size),
+/// for ~500 KiB of heap per frame. 256 is generous for real HTTP traffic.
+pub const MAX_HEADER_FIELDS: usize = 256;
+
 /// A single header name-value pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderField {
@@ -386,6 +393,10 @@ impl Decoder {
     pub fn decode(&mut self, buf: &[u8]) -> Result<Vec<HeaderField>, H2Error> {
         let mut headers = Vec::new();
         let mut pos = 0;
+        // RFC 7541 §4.2: dynamic table size updates MUST occur at the
+        // beginning of the first header block; once any header has been
+        // processed, a subsequent size update is a compression error.
+        let mut seen_header = false;
 
         while pos < buf.len() {
             let first = buf[pos];
@@ -395,8 +406,14 @@ impl Decoder {
                 let (index, n) =
                     decode_prefix_int(&buf[pos..], 7).ok_or(H2Error::CompressionError)?;
                 pos += n;
+                if headers.len() >= MAX_HEADER_FIELDS {
+                    return Err(H2Error::MaxSizeExceeded(format!(
+                        "HPACK block exceeds MAX_HEADER_FIELDS ({MAX_HEADER_FIELDS})"
+                    )));
+                }
                 let field = self.get_indexed(index as usize)?;
                 headers.push(field);
+                seen_header = true;
             } else if first & 0x40 != 0 {
                 // Literal with incremental indexing (Section 6.2.1): pattern 01xxxxxx.
                 let (name_index, n) =
@@ -411,14 +428,23 @@ impl Decoder {
                 };
                 let (value, consumed) = decode_string_literal(&buf[pos..])?;
                 pos += consumed;
+                if headers.len() >= MAX_HEADER_FIELDS {
+                    return Err(H2Error::MaxSizeExceeded(format!(
+                        "HPACK block exceeds MAX_HEADER_FIELDS ({MAX_HEADER_FIELDS})"
+                    )));
+                }
                 let field = HeaderField {
                     name: name.clone(),
                     value,
                 };
                 self.dynamic_table.insert(field.clone());
                 headers.push(field);
+                seen_header = true;
             } else if first & 0x20 != 0 {
                 // Dynamic table size update (Section 6.3): pattern 001xxxxx.
+                if seen_header {
+                    return Err(H2Error::CompressionError);
+                }
                 let (new_size, n) =
                     decode_prefix_int(&buf[pos..], 5).ok_or(H2Error::CompressionError)?;
                 pos += n;
@@ -441,7 +467,13 @@ impl Decoder {
                 };
                 let (value, consumed) = decode_string_literal(&buf[pos..])?;
                 pos += consumed;
+                if headers.len() >= MAX_HEADER_FIELDS {
+                    return Err(H2Error::MaxSizeExceeded(format!(
+                        "HPACK block exceeds MAX_HEADER_FIELDS ({MAX_HEADER_FIELDS})"
+                    )));
+                }
                 headers.push(HeaderField { name, value });
+                seen_header = true;
                 // Never indexed: do NOT add to dynamic table.
             } else {
                 // Literal without indexing (Section 6.2.2): pattern 0000xxxx.
@@ -457,7 +489,13 @@ impl Decoder {
                 };
                 let (value, consumed) = decode_string_literal(&buf[pos..])?;
                 pos += consumed;
+                if headers.len() >= MAX_HEADER_FIELDS {
+                    return Err(H2Error::MaxSizeExceeded(format!(
+                        "HPACK block exceeds MAX_HEADER_FIELDS ({MAX_HEADER_FIELDS})"
+                    )));
+                }
                 headers.push(HeaderField { name, value });
+                seen_header = true;
                 // Without indexing: do NOT add to dynamic table.
             }
         }
@@ -675,6 +713,35 @@ mod tests {
         encoder.encode(&[HeaderField::new(b":method", b"GET")], &mut buf);
         let decoded = decoder.decode(&buf).unwrap();
         assert_eq!(decoded, vec![HeaderField::new(b":method", b"GET")]);
+    }
+
+    #[test]
+    fn decoder_caps_at_max_header_fields() {
+        // Craft a block of >MAX_HEADER_FIELDS indexed entries (single byte
+        // each — :method GET is static index 2 → 0x82).
+        let mut decoder = Decoder::new(4096);
+        let block: Vec<u8> = std::iter::repeat_n(0x82u8, MAX_HEADER_FIELDS + 1).collect();
+        let err = decoder.decode(&block).err().unwrap();
+        assert!(matches!(err, H2Error::MaxSizeExceeded(_)));
+    }
+
+    #[test]
+    fn decoder_rejects_table_size_update_after_header() {
+        // First a header (indexed :method GET = 0x82), then a dynamic table
+        // size update (pattern 001xxxxx) — must be rejected.
+        let mut decoder = Decoder::new(4096);
+        let block = vec![0x82, 0x20]; // header, then size update = 0
+        let err = decoder.decode(&block).err().unwrap();
+        assert!(matches!(err, H2Error::CompressionError));
+    }
+
+    #[test]
+    fn decoder_accepts_table_size_update_before_header() {
+        // Size update first, then header — must succeed.
+        let mut decoder = Decoder::new(4096);
+        let block = vec![0x20, 0x82]; // size update = 0, then :method GET
+        let headers = decoder.decode(&block).unwrap();
+        assert_eq!(headers.len(), 1);
     }
 
     #[test]
