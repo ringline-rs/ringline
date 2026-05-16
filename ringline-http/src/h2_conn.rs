@@ -43,13 +43,17 @@ impl PendingStream {
         }
     }
 
-    fn into_response(self) -> Result<Response, HttpError> {
+    #[cfg_attr(
+        not(any(feature = "gzip", feature = "zstd", feature = "brotli")),
+        allow(unused_variables)
+    )]
+    fn into_response(self, max_decompressed_size: usize) -> Result<Response, HttpError> {
         let body = self.body.freeze();
 
         // Decompress body if Content-Encoding is set.
         #[cfg(any(feature = "gzip", feature = "zstd", feature = "brotli"))]
         if let Some(ref encoding) = self.content_encoding {
-            let decompressed = crate::compress::decompress(encoding, &body)?;
+            let decompressed = crate::compress::decompress(encoding, &body, max_decompressed_size)?;
             return Ok(Response::new(
                 self.status.unwrap_or(0),
                 self.headers,
@@ -80,6 +84,16 @@ pub struct H2AsyncConn {
     /// Streams that completed during a pump cycle, ready for pickup.
     completed: VecDeque<(u32, Response)>,
     settings_acked: bool,
+    /// Cap on a decompressed response body. Defaults to 64 MiB.
+    max_decompressed_size: usize,
+}
+
+impl H2AsyncConn {
+    /// Override the cap on a decompressed response body. Default 64 MiB —
+    /// defends against decompression bombs.
+    pub fn set_max_decompressed_size(&mut self, n: usize) {
+        self.max_decompressed_size = n;
+    }
 }
 
 impl H2AsyncConn {
@@ -115,6 +129,7 @@ impl H2AsyncConn {
             blocked_sends: VecDeque::new(),
             completed: VecDeque::new(),
             settings_acked: false,
+            max_decompressed_size: crate::compress::DEFAULT_MAX_DECOMPRESSED_SIZE,
         };
 
         // Send the connection preface (magic + SETTINGS).
@@ -380,7 +395,8 @@ impl H2AsyncConn {
             .collect();
         for id in done_ids {
             if let Some(ps) = self.pending_streams.remove(&id) {
-                self.completed.push_back((id, ps.into_response()?));
+                self.completed
+                    .push_back((id, ps.into_response(self.max_decompressed_size)?));
             }
         }
 
