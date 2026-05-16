@@ -168,6 +168,7 @@ impl AsyncEventHandler for H3Server {
                             }
                         }
                         H3Event::Response { .. }
+                        | H3Event::Trailers { .. }
                         | H3Event::GoAway { .. }
                         | H3Event::Error(_)
                         | H3Event::StreamReset { .. }
