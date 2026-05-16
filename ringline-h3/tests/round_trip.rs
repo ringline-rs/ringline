@@ -154,18 +154,16 @@ impl AsyncEventHandler for H3Server {
                         H3Event::Data {
                             stream_id,
                             data,
-                            end_stream,
+                            end_stream: true,
                         } => {
-                            if end_stream {
-                                let response_headers = vec![HeaderField::new(b":status", b"200")];
-                                let _ = h3.send_response(
-                                    &mut quic,
-                                    stream_id,
-                                    &response_headers,
-                                    false,
-                                );
-                                let _ = h3.send_data(&mut quic, stream_id, &data, true);
-                            }
+                            let response_headers = vec![HeaderField::new(b":status", b"200")];
+                            let _ = h3.send_response(
+                                &mut quic,
+                                stream_id,
+                                &response_headers,
+                                false,
+                            );
+                            let _ = h3.send_data(&mut quic, stream_id, &data, true);
                         }
                         H3Event::Response { .. }
                         | H3Event::Trailers { .. }
