@@ -818,9 +818,13 @@ impl H2Connection {
             None => return Ok(()),
         };
 
-        // Determine if this is a response or trailers based on stream state.
-        let is_initial_response =
-            stream.state == StreamState::Open || stream.state == StreamState::HalfClosedLocal;
+        // Once we've delivered the initial response HEADERS on this stream,
+        // any subsequent HEADERS is trailers. Stream state alone can't
+        // disambiguate: an initial HEADERS without END_STREAM leaves the
+        // state in HalfClosedLocal, and the trailing HEADERS arrives with
+        // the state still HalfClosedLocal — the two look identical to the
+        // state machine.
+        let is_initial_response = !stream.received_initial_response;
 
         // Validate header section semantics before mutating any state.
         if is_initial_response {
@@ -833,6 +837,9 @@ impl H2Connection {
             }
         }
 
+        if is_initial_response {
+            stream.received_initial_response = true;
+        }
         if end_stream {
             stream.state = match stream.state {
                 StreamState::HalfClosedLocal => StreamState::Closed,
@@ -1638,6 +1645,68 @@ mod tests {
         resp.encode(&mut buf);
         conn.recv(&buf).unwrap();
         assert_eq!(conn.state, ConnState::Closing);
+    }
+
+    #[test]
+    fn trailers_after_initial_headers_emits_trailers_event() {
+        // Regression: an initial HEADERS without END_STREAM leaves the
+        // stream in HalfClosedLocal; the trailing HEADERS arrives with the
+        // state unchanged. The second HEADERS must be classified as
+        // trailers (no `:status` required), not as a second response.
+        let mut conn = settled_conn();
+        let headers = vec![HeaderField::new(b":method", b"GET")];
+        let stream_id = conn.send_request(&headers, true).unwrap();
+        let _ = conn.take_pending_send();
+
+        // 1) Initial response HEADERS without END_STREAM.
+        let mut enc = Encoder::new(4096);
+        let mut buf = Vec::new();
+        let mut encoded = Vec::new();
+        enc.encode(
+            &[
+                HeaderField::new(b":status", b"200"),
+                HeaderField::new(b"content-type", b"application/grpc"),
+            ],
+            &mut encoded,
+        );
+        Frame::Headers {
+            stream_id,
+            encoded,
+            end_stream: false,
+            end_headers: true,
+            priority: None,
+        }
+        .encode(&mut buf);
+
+        // 2) Trailers (no `:status`, must end the stream).
+        let mut encoded_t = Vec::new();
+        enc.encode(&[HeaderField::new(b"grpc-status", b"0")], &mut encoded_t);
+        Frame::Headers {
+            stream_id,
+            encoded: encoded_t,
+            end_stream: true,
+            end_headers: true,
+            priority: None,
+        }
+        .encode(&mut buf);
+
+        conn.recv(&buf).unwrap();
+        assert_eq!(conn.state, ConnState::Ready, "should not close");
+
+        let mut got_response = false;
+        let mut got_trailers = false;
+        while let Some(ev) = conn.poll_event() {
+            match ev {
+                H2Event::Response { .. } => got_response = true,
+                H2Event::Trailers { headers, .. } => {
+                    got_trailers = true;
+                    assert_eq!(headers[0].name, b"grpc-status");
+                }
+                _ => {}
+            }
+        }
+        assert!(got_response, "expected Response event");
+        assert!(got_trailers, "expected Trailers event");
     }
 
     #[test]

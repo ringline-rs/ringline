@@ -30,6 +30,12 @@ pub(crate) struct H2Stream {
     /// Whether the HEADERS/CONTINUATION that started this header block
     /// had END_STREAM set.
     pub headers_end_stream: bool,
+    /// Whether the initial response HEADERS have already been delivered
+    /// for this stream. A second HEADERS frame on the same stream is then
+    /// the trailers — independent of stream state, which doesn't change
+    /// between an initial HEADERS without END_STREAM and the trailing
+    /// HEADERS with END_STREAM.
+    pub received_initial_response: bool,
 }
 
 impl H2Stream {
@@ -41,6 +47,7 @@ impl H2Stream {
             header_buf: Vec::new(),
             receiving_headers: false,
             headers_end_stream: false,
+            received_initial_response: false,
         }
     }
 }
