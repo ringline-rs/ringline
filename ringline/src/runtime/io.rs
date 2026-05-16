@@ -947,6 +947,7 @@ impl ConnCtx {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), data)?;
+            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.send_waiters[self.conn_index as usize] = true;
             // On mio, the send is buffered synchronously — record a pending
             // completion so the event loop can deliver wake_send for each
@@ -1062,6 +1063,7 @@ impl ConnCtx {
             let token = ConnToken::new(self.conn_index, self.generation);
             let builder = ctx.send_chain(token);
             f(builder)?;
+            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.send_waiters[self.conn_index as usize] = true;
             Ok(SendFuture {
                 conn_index: self.conn_index,
@@ -1256,6 +1258,7 @@ impl AsyncSendBuilder {
             let builder = ctx.send_parts(self.token);
             f(builder)?;
             let conn_index = self.token.index;
+            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.send_waiters[conn_index as usize] = true;
             Ok(SendFuture { conn_index })
         })
@@ -1320,6 +1323,7 @@ impl AsyncSendBuilder {
             }
             builder.submit()?;
             let conn_index = self.token.index;
+            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.send_waiters[conn_index as usize] = true;
             Ok((consumed, SendFuture { conn_index }))
         })
@@ -1410,6 +1414,7 @@ impl AsyncSendBuilder {
                 ctx.send(self.token, &buf)?;
             }
             let conn_index = self.token.index;
+            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.send_waiters[conn_index as usize] = true;
             Ok(SendFuture { conn_index })
         })
@@ -1540,6 +1545,8 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                 }
 
                 // No data available — register as recv waiter and park.
+                executor.owner_task[self.conn_index as usize] =
+                    Some(CURRENT_TASK_ID.with(|c| c.get()));
                 executor.recv_waiters[self.conn_index as usize] = true;
                 return Poll::Pending;
             }
@@ -1569,6 +1576,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
             }
 
             // Connection still open — wait for more data before retrying.
+            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })
@@ -1616,6 +1624,8 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
                     });
                 }
 
+                executor.owner_task[self.conn_index as usize] =
+                    Some(CURRENT_TASK_ID.with(|c| c.get()));
                 executor.recv_waiters[self.conn_index as usize] = true;
                 return Poll::Pending;
             }
@@ -1655,6 +1665,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
                 return Poll::Ready(0);
             }
 
+            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })
@@ -1699,6 +1710,7 @@ impl Future for RecvReadyFuture {
             }
 
             // Not ready — register as recv waiter and park.
+            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })
@@ -1723,6 +1735,8 @@ impl Future for SendFuture {
                 Some(IoResult::Send(result)) => Poll::Ready(result),
                 _ => {
                     // Not ready yet — re-register waiter.
+                    executor.owner_task[self.conn_index as usize] =
+                        Some(CURRENT_TASK_ID.with(|c| c.get()));
                     executor.send_waiters[self.conn_index as usize] = true;
                     Poll::Pending
                 }
