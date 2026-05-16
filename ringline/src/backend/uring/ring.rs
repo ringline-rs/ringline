@@ -391,6 +391,44 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a multishot Recv (no peer info, kernel uses the socket's
+    /// connected peer) for a UDP socket. Lighter than `RecvMsgMulti` —
+    /// the CQE buffer contains only the payload, no `io_uring_recvmsg_out`
+    /// header or sockaddr. The socket must already be `connect(2)`ed.
+    pub fn submit_multishot_recv_udp(
+        &mut self,
+        fd_index: u32,
+        bgid: u16,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::RecvMulti::new(Fixed(fd_index), bgid)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Submit a single-shot Send for a connected UDP socket. The data lives
+    /// in a `send_copy_pool` slot; the slot index is in the payload of
+    /// `user_data` so the CQE handler can release it.
+    pub fn submit_send_udp(
+        &mut self,
+        fd_index: u32,
+        ptr: *const u8,
+        len: u32,
+        user_data: UserData,
+    ) -> io::Result<()> {
+        let entry = opcode::Send::new(Fixed(fd_index), ptr, len)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit a PollAdd for a raw file descriptor (e.g., pidfd for process exit).
     pub fn submit_poll_add(&mut self, fd: RawFd, mask: u32, ud: u64) -> io::Result<()> {
         let entry = opcode::PollAdd::new(Fd(fd), mask).build().user_data(ud);

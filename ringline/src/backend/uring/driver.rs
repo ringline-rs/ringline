@@ -61,6 +61,10 @@ pub(crate) struct UdpSocketState {
     /// Bound address.
     #[allow(dead_code)] // stored for diagnostics
     pub local_addr: SocketAddr,
+    /// If `Some`, the socket has been `connect(2)`ed to this peer at setup
+    /// time and the runtime uses the lighter `RecvUdp`/`SendUdp` opcodes
+    /// instead of `RecvMsgUdp`/`SendMsgUdp`.
+    pub connected_peer: Option<SocketAddr>,
     /// `msghdr` template used by `IORING_OP_RECVMSG_MULTISHOT`. The kernel
     /// reads its `msg_namelen`/`msg_controllen`/etc. to decide how to carve
     /// up each provided buffer into `[io_uring_recvmsg_out][name][control]
@@ -322,7 +326,14 @@ impl Driver {
         let mut udp_sockets = Vec::with_capacity(config.udp_bind.len());
         for (udp_idx, bind_addr) in config.udp_bind.iter().enumerate() {
             let fd_index = config.max_connections + udp_idx as u32;
-            let state = Self::setup_udp_socket(&ring, *bind_addr, fd_index, config.udp_send_slots)?;
+            let connect_peer = config.udp_connect_peers.get(udp_idx).copied().flatten();
+            let state = Self::setup_udp_socket(
+                &ring,
+                *bind_addr,
+                connect_peer,
+                fd_index,
+                config.udp_send_slots,
+            )?;
             udp_sockets.push(state);
         }
 
@@ -422,22 +433,32 @@ impl Driver {
             region_rx,
         };
 
-        // Arm multishot recvmsg for each UDP socket against the UDP buffer
+        // Arm multishot recv for each UDP socket against the UDP buffer
         // group. One SQE per socket stays live in the kernel and fans out a
-        // CQE per datagram until the buffer ring is exhausted.
+        // CQE per datagram until the buffer ring is exhausted. Connected
+        // sockets use the lighter `RecvUdp` opcode (no recvmsg metadata);
+        // unconnected sockets use `RecvMsgUdp` so the kernel returns the
+        // peer address in each CQE buffer.
         let udp_bgid = config.udp_recv_buffer.bgid;
         for udp_idx in 0..driver.udp_sockets.len() {
-            let ud = UserData::encode(OpTag::RecvMsgUdp, udp_idx as u32, 0);
-            let msghdr_ptr = &*driver.udp_sockets[udp_idx].recv_msghdr as *const libc::msghdr;
             let fd_index = driver.udp_sockets[udp_idx].fd_index;
-            driver
-                .ring
-                .submit_recvmsg_multishot(fd_index, msghdr_ptr, udp_bgid, ud)
-                .map_err(|e| {
-                    crate::error::Error::RingSetup(format!(
-                        "failed to submit initial UDP multishot recvmsg: {e}"
-                    ))
-                })?;
+            let result = if driver.udp_sockets[udp_idx].connected_peer.is_some() {
+                let ud = UserData::encode(OpTag::RecvUdp, udp_idx as u32, 0);
+                driver
+                    .ring
+                    .submit_multishot_recv_udp(fd_index, udp_bgid, ud)
+            } else {
+                let ud = UserData::encode(OpTag::RecvMsgUdp, udp_idx as u32, 0);
+                let msghdr_ptr = &*driver.udp_sockets[udp_idx].recv_msghdr as *const libc::msghdr;
+                driver
+                    .ring
+                    .submit_recvmsg_multishot(fd_index, msghdr_ptr, udp_bgid, ud)
+            };
+            result.map_err(|e| {
+                crate::error::Error::RingSetup(format!(
+                    "failed to submit initial UDP multishot recv: {e}"
+                ))
+            })?;
         }
 
         Ok(driver)
@@ -735,6 +756,7 @@ impl Driver {
     fn setup_udp_socket(
         ring: &Ring,
         bind_addr: SocketAddr,
+        connect_peer: Option<SocketAddr>,
         fd_index: u32,
         send_slots: u16,
     ) -> Result<UdpSocketState, crate::error::Error> {
@@ -772,6 +794,28 @@ impl Driver {
                 libc::close(fd);
             }
             return Err(crate::error::Error::Io(err));
+        }
+
+        // If a peer was supplied, connect(2) the socket before registering
+        // the fd. The kernel will filter incoming datagrams to this peer and
+        // we can use the lighter Recv/Send opcodes for this socket.
+        if let Some(peer) = connect_peer {
+            let mut peer_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let peer_len = crate::backend::socket_addr_to_sockaddr(peer, &mut peer_storage);
+            let ret = unsafe {
+                libc::connect(
+                    fd,
+                    &peer_storage as *const _ as *const libc::sockaddr,
+                    peer_len,
+                )
+            };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(crate::error::Error::Io(err));
+            }
         }
 
         // Register in the fixed file table, then close the original fd.
@@ -826,6 +870,7 @@ impl Driver {
         Ok(UdpSocketState {
             fd_index,
             local_addr: bind_addr,
+            connected_peer: connect_peer,
             recv_msghdr,
             send_slots: send_slots_box,
             send_freelist,
@@ -904,6 +949,33 @@ impl Driver {
         };
 
         let fd_index = self.udp_sockets[idx].fd_index;
+
+        // Fast path: if the socket is connect(2)ed to this peer and there is
+        // no GSO segmenting, skip msghdr setup and submit the lighter `Send`
+        // opcode. The kernel uses the socket's connected peer and the SQE
+        // carries no sockaddr / iovec / cmsg. Saves a kernel msghdr
+        // copy_from_user per send.
+        let use_send_fast_path = gso_segment_size.is_none()
+            && self.udp_sockets[idx]
+                .connected_peer
+                .is_some_and(|p| p == peer);
+
+        if use_send_fast_path {
+            let payload = encode_udp_send_payload(slot_idx, pool_slot);
+            let ud = UserData::encode(OpTag::SendUdp, udp_index, payload);
+            return match self.ring.submit_send_udp(fd_index, ptr, len, ud) {
+                Ok(()) => {
+                    crate::metrics::UDP.increment(crate::metrics::udp::DATAGRAMS_SENT);
+                    Ok(())
+                }
+                Err(_) => {
+                    self.send_copy_pool.release(pool_slot);
+                    self.udp_sockets[idx].send_freelist.push(slot_idx);
+                    Err(crate::error::UdpSendError::SubmissionQueueFull)
+                }
+            };
+        }
+
         let slot = &mut self.udp_sockets[idx].send_slots[slot_idx as usize];
         let addr_len = crate::backend::socket_addr_to_sockaddr(peer, &mut slot.send_addr);
         slot.send_iov.iov_base = ptr as *mut libc::c_void;
@@ -968,14 +1040,17 @@ impl Driver {
         // Reset msg_namelen in case the kernel cleared it during teardown.
         self.udp_sockets[idx].recv_msghdr.msg_namelen =
             std::mem::size_of::<libc::sockaddr_storage>() as u32;
-        let ud = UserData::encode(OpTag::RecvMsgUdp, udp_index, 0);
-        let msghdr_ptr = &*self.udp_sockets[idx].recv_msghdr as *const libc::msghdr;
         let fd_index = self.udp_sockets[idx].fd_index;
-        if self
-            .ring
-            .submit_recvmsg_multishot(fd_index, msghdr_ptr, bgid, ud)
-            .is_err()
-        {
+        let result = if self.udp_sockets[idx].connected_peer.is_some() {
+            let ud = UserData::encode(OpTag::RecvUdp, udp_index, 0);
+            self.ring.submit_multishot_recv_udp(fd_index, bgid, ud)
+        } else {
+            let ud = UserData::encode(OpTag::RecvMsgUdp, udp_index, 0);
+            let msghdr_ptr = &*self.udp_sockets[idx].recv_msghdr as *const libc::msghdr;
+            self.ring
+                .submit_recvmsg_multishot(fd_index, msghdr_ptr, bgid, ud)
+        };
+        if result.is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
         }
     }

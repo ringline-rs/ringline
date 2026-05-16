@@ -694,7 +694,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         metrics::UDP.increment(metrics::udp::DATAGRAMS_DROPPED);
                     } else {
                         let data = buf[..n].to_vec();
-                        self.executor.udp_recv_queues[idx].push_back((data, peer));
+                        self.executor.udp_recv_queues[idx].push_back(
+                            crate::runtime::PendingUdpDatagram {
+                                peer,
+                                buf: crate::runtime::PendingUdpBuf::Owned(data),
+                            },
+                        );
                         self.executor.wake_udp_recv(udp_index);
                     }
                 }

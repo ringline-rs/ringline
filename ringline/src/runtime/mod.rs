@@ -57,6 +57,77 @@ pub(crate) struct RecvSink {
     pub(crate) pos: usize,
 }
 
+/// A queued UDP datagram waiting for an async consumer.
+///
+/// On the io_uring backend the buffer is borrowed from the kernel-provided buffer
+/// ring (`Kernel` variant) and the consumer must push the `bid` to the driver's
+/// `udp_pending_replenish` after reading the data so the buffer goes back to the
+/// kernel. On the mio backend the buffer is owned (`Owned` variant) and the
+/// `Vec<u8>` is dropped normally.
+pub(crate) struct PendingUdpDatagram {
+    pub(crate) peer: std::net::SocketAddr,
+    pub(crate) buf: PendingUdpBuf,
+}
+
+pub(crate) enum PendingUdpBuf {
+    /// User-owned buffer (mio backend or any path that needed to copy).
+    /// Only constructed by the mio backend; on io_uring this variant is dead
+    /// code (the kernel-buffer path is always used).
+    #[cfg_attr(has_io_uring, allow(dead_code))]
+    Owned(Vec<u8>),
+    /// Reference into a kernel-provided buffer (io_uring backend, zero-copy).
+    ///
+    /// The pointer is into `ProvidedBufRing::buf_backing`, which is allocated
+    /// once and not resized, so it remains valid until `bid` is replenished.
+    /// `payload_len` is the datagram payload length (excludes recvmsg header).
+    #[cfg(has_io_uring)]
+    Kernel {
+        bid: u16,
+        ptr: *const u8,
+        payload_len: u32,
+    },
+}
+
+impl PendingUdpDatagram {
+    /// Borrow the payload bytes. Valid until the buffer is released.
+    pub(crate) fn data(&self) -> &[u8] {
+        match &self.buf {
+            PendingUdpBuf::Owned(v) => v.as_slice(),
+            #[cfg(has_io_uring)]
+            PendingUdpBuf::Kernel {
+                ptr, payload_len, ..
+            } => unsafe { std::slice::from_raw_parts(*ptr, *payload_len as usize) },
+        }
+    }
+
+    /// If this entry holds a kernel-provided buffer, return the bid so the
+    /// caller can push it to `udp_pending_replenish`. Returns `None` for
+    /// owned-buffer entries (mio).
+    pub(crate) fn bid_to_release(&self) -> Option<u16> {
+        match &self.buf {
+            PendingUdpBuf::Owned(_) => None,
+            #[cfg(has_io_uring)]
+            PendingUdpBuf::Kernel { bid, .. } => Some(*bid),
+        }
+    }
+
+    /// Consume the entry as an owned `(Vec<u8>, SocketAddr)` pair. Allocates a
+    /// fresh `Vec` for the kernel-buffer variant; the caller must still push
+    /// `bid_to_release()` to `udp_pending_replenish` to free the kernel
+    /// buffer.
+    pub(crate) fn into_owned(self) -> (Vec<u8>, std::net::SocketAddr) {
+        let peer = self.peer;
+        let v = match self.buf {
+            PendingUdpBuf::Owned(v) => v,
+            #[cfg(has_io_uring)]
+            PendingUdpBuf::Kernel {
+                ptr, payload_len, ..
+            } => unsafe { std::slice::from_raw_parts(ptr, payload_len as usize).to_vec() },
+        };
+        (v, peer)
+    }
+}
+
 thread_local! {
     /// The current task ID being polled. Set by the executor before each poll.
     /// Connection tasks: conn_index (bits 0..23).
@@ -243,7 +314,12 @@ pub(crate) struct Executor {
     /// Per-connection recv sink for direct-to-buffer writes.
     pub(crate) recv_sinks: Vec<Option<RecvSink>>,
     /// Per-UDP-socket datagram recv queue for async tasks.
-    pub(crate) udp_recv_queues: Vec<VecDeque<(Vec<u8>, std::net::SocketAddr)>>,
+    ///
+    /// Holds buffer references into the kernel-provided UDP recv ring (zero-copy)
+    /// rather than owned `Vec<u8>`s. The consumer pops, reads the slice, and
+    /// pushes the `bid` to `Driver::udp_pending_replenish` to return the buffer
+    /// to the kernel ring.
+    pub(crate) udp_recv_queues: Vec<VecDeque<PendingUdpDatagram>>,
     /// Hard cap on each `udp_recv_queues[i]`. Datagrams arriving when the
     /// queue is full are dropped (`udp::DATAGRAMS_DROPPED` is incremented).
     /// This prevents unbounded memory growth when the consumer future
