@@ -5,7 +5,7 @@ use std::time::Instant;
 use bytes::BytesMut;
 use quinn_proto::{
     ClientConfig, ConnectionError, ConnectionHandle, DatagramEvent, Dir, Event, StreamEvent,
-    StreamId,
+    StreamId, WriteError,
 };
 use slab::Slab;
 
@@ -302,8 +302,17 @@ impl QuicEndpoint {
         data: &[u8],
     ) -> Result<usize, Error> {
         let c = self.get_conn_mut(conn)?;
-        let n = c.conn.send_stream(stream).write(data)?;
-        Ok(n)
+        match c.conn.send_stream(stream).write(data) {
+            Ok(n) => Ok(n),
+            Err(WriteError::Blocked) if c.conn.is_closed() => {
+                // quinn-proto's `write_source` short-circuits to `Blocked`
+                // once the connection is in Closed/Draining — but no
+                // `StreamWritable` event will ever fire to unblock us.
+                // Translate to a distinct error so callers don't retry.
+                Err(Error::ConnectionClosing)
+            }
+            Err(e) => Err(Error::Write(e)),
+        }
     }
 
     /// Send scatter-gather data on a QUIC stream without copying.
@@ -324,8 +333,11 @@ impl QuicEndpoint {
         chunks: &mut [bytes::Bytes],
     ) -> Result<usize, Error> {
         let c = self.get_conn_mut(conn)?;
-        let written = c.conn.send_stream(stream).write_chunks(chunks)?;
-        Ok(written.bytes)
+        match c.conn.send_stream(stream).write_chunks(chunks) {
+            Ok(written) => Ok(written.bytes),
+            Err(WriteError::Blocked) if c.conn.is_closed() => Err(Error::ConnectionClosing),
+            Err(e) => Err(Error::Write(e)),
+        }
     }
 
     /// Read data from a QUIC stream into `buf`.
@@ -339,7 +351,7 @@ impl QuicEndpoint {
         buf: &mut [u8],
     ) -> Result<(usize, bool), Error> {
         let key = conn.0 as usize;
-        if !self.connections.contains(key) {
+        if !self.connections.contains(key) || self.connections[key].close_event_emitted {
             return Err(Error::InvalidConnection);
         }
         let c = &mut self.connections[key];
@@ -383,12 +395,20 @@ impl QuicEndpoint {
     }
 
     /// Send FIN on a stream, indicating no more data will be sent.
+    ///
+    /// Returns `Err(StreamStopped(code))` if the peer issued STOP_SENDING
+    /// with `code` before we finished, `Err(StreamClosed)` if the stream
+    /// was already finished or reset locally. The frame is queued
+    /// immediately — callers don't need to `flush()`.
     pub fn stream_finish(&mut self, conn: QuicConnId, stream: StreamId) -> Result<(), Error> {
+        let key = conn.0 as usize;
         let c = self.get_conn_mut(conn)?;
-        c.conn
-            .send_stream(stream)
-            .finish()
-            .map_err(|_| Error::ConnectionClosed)?;
+        match c.conn.send_stream(stream).finish() {
+            Ok(()) => {}
+            Err(quinn_proto::FinishError::Stopped(code)) => return Err(Error::StreamStopped(code)),
+            Err(quinn_proto::FinishError::ClosedStream) => return Err(Error::StreamClosed),
+        }
+        self.drain_transmits(key, Instant::now());
         Ok(())
     }
 
@@ -397,34 +417,41 @@ impl QuicEndpoint {
     /// On the peer the corresponding send stream will surface a
     /// [`QuicEvent::StreamStopped`] with the supplied `error_code`. Locally,
     /// the recv side of `stream` is considered done once this returns.
+    /// Returns `Err(StreamClosed)` if the recv side was already finished.
     pub fn stop_sending(
         &mut self,
         conn: QuicConnId,
         stream: StreamId,
         error_code: quinn_proto::VarInt,
     ) -> Result<(), Error> {
+        let key = conn.0 as usize;
         let c = self.get_conn_mut(conn)?;
-        c.conn
-            .recv_stream(stream)
-            .stop(error_code)
-            .map_err(|_| Error::ConnectionClosed)?;
+        match c.conn.recv_stream(stream).stop(error_code) {
+            Ok(()) => {}
+            Err(quinn_proto::ClosedStream { .. }) => return Err(Error::StreamClosed),
+        }
+        self.drain_transmits(key, Instant::now());
         Ok(())
     }
 
     /// Reset `stream`, indicating to the peer that no more data will be
     /// sent. The peer's recv side will surface a
     /// [`quinn_proto::ReadError::Reset`] on its next `stream_recv`.
+    /// Returns `Err(StreamClosed)` if the send side was already finished
+    /// or reset.
     pub fn reset_stream(
         &mut self,
         conn: QuicConnId,
         stream: StreamId,
         error_code: quinn_proto::VarInt,
     ) -> Result<(), Error> {
+        let key = conn.0 as usize;
         let c = self.get_conn_mut(conn)?;
-        c.conn
-            .send_stream(stream)
-            .reset(error_code)
-            .map_err(|_| Error::ConnectionClosed)?;
+        match c.conn.send_stream(stream).reset(error_code) {
+            Ok(()) => {}
+            Err(quinn_proto::ClosedStream { .. }) => return Err(Error::StreamClosed),
+        }
+        self.drain_transmits(key, Instant::now());
         Ok(())
     }
 
@@ -453,6 +480,13 @@ impl QuicEndpoint {
     pub fn close_connection(&mut self, conn: QuicConnId, code: u32, reason: &[u8]) {
         let key = conn.0 as usize;
         if !self.connections.contains(key) {
+            return;
+        }
+        // Repeat calls are a no-op — quinn-proto's `close` is itself a no-op
+        // once the connection has been closed, and emitting `ConnectionClosed`
+        // twice tears the bookkeeping in higher layers (h3 in particular
+        // would clear `pending_sends` / `request_streams` again).
+        if self.connections[key].close_event_emitted {
             return;
         }
         let now = Instant::now();
@@ -488,9 +522,16 @@ impl QuicEndpoint {
     /// returns an error and the caller should wait for the buffer to
     /// drain (peer acks clear queued datagrams) before retrying.
     ///
-    /// Returns `Err(ConnectionClosed)` if the connection has been torn
-    /// down. Returns `Err(...)` from quinn-proto for buffer-full or
-    /// peer-doesn't-support-datagrams cases.
+    /// Returns:
+    /// - `Err(InvalidConnection)` if the connection id is unknown.
+    /// - `Err(DatagramDisabled)` if local config has datagrams off.
+    /// - `Err(DatagramUnsupportedByPeer)` if the peer didn't enable them.
+    /// - `Err(DatagramTooLarge)` if `data` exceeds the peer's
+    ///   `max_datagram_size`.
+    /// - `Err(DatagramBlocked(data))` if the outgoing buffer is full and
+    ///   `drop_old_when_full` is false — the payload is returned so the
+    ///   caller can retry on `QuicEvent::DatagramsUnblocked` without an
+    ///   extra clone / allocation.
     pub fn send_datagram(
         &mut self,
         conn: QuicConnId,
@@ -498,10 +539,17 @@ impl QuicEndpoint {
         drop_old_when_full: bool,
     ) -> Result<(), Error> {
         let c = self.get_conn_mut(conn)?;
-        c.conn
-            .datagrams()
-            .send(data, drop_old_when_full)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("send_datagram: {e}"))))?;
+        match c.conn.datagrams().send(data, drop_old_when_full) {
+            Ok(()) => {}
+            Err(quinn_proto::SendDatagramError::Disabled) => return Err(Error::DatagramDisabled),
+            Err(quinn_proto::SendDatagramError::UnsupportedByPeer) => {
+                return Err(Error::DatagramUnsupportedByPeer);
+            }
+            Err(quinn_proto::SendDatagramError::TooLarge) => return Err(Error::DatagramTooLarge),
+            Err(quinn_proto::SendDatagramError::Blocked(b)) => {
+                return Err(Error::DatagramBlocked(b));
+            }
+        }
         // Make sure the resulting DATAGRAM frame actually leaves the
         // connection — see `close_connection` for the same lesson.
         let key = conn.0 as usize;
@@ -573,8 +621,12 @@ impl QuicEndpoint {
 
     /// Peer address for a connection, if it exists.
     pub fn remote_addr(&self, conn: QuicConnId) -> Option<SocketAddr> {
+        // A connection in drain (post-`ConnectionClosed`) is no longer
+        // application-addressable even though the slab slot still exists
+        // for quinn-proto's drain bookkeeping.
         self.connections
             .get(conn.0 as usize)
+            .filter(|c| !c.close_event_emitted)
             .map(|c| c.conn.remote_address())
     }
 
@@ -614,9 +666,19 @@ impl QuicEndpoint {
     }
 
     fn get_conn_mut(&mut self, conn: QuicConnId) -> Result<&mut QuicConnection, Error> {
-        self.connections
+        let c = self
+            .connections
             .get_mut(conn.0 as usize)
-            .ok_or(Error::InvalidConnection)
+            .ok_or(Error::InvalidConnection)?;
+        // Treat a connection that's mid-drain (post-`ConnectionClosed`) as
+        // invalid for application operations: quinn-proto still owns the
+        // slot for its 3×PTO drain window, but every stream op would either
+        // fail or no-op, and callers should observe a clean error rather
+        // than a confusing `Blocked` / `ClosedStream` return.
+        if c.close_event_emitted {
+            return Err(Error::InvalidConnection);
+        }
+        Ok(c)
     }
 
     /// Drain all pending transmits from a connection into the send queue.
@@ -708,9 +770,18 @@ impl QuicEndpoint {
                             conn: conn_id,
                             reason,
                         });
+                        self.connections[key].close_event_emitted = true;
                     }
-                    self.remove_connection(key);
-                    return; // Connection is gone, stop polling.
+                    // Do *not* remove the slot yet. quinn-proto's `Endpoint`
+                    // still has CID-index and connection-slab entries that
+                    // are only cleaned when the per-connection state machine
+                    // emits `EndpointEventInner::Drained` via
+                    // `poll_endpoint_events`. That happens once the 3×PTO
+                    // drain timer fires and `is_drained()` becomes true; the
+                    // reap path at step 6 below handles it. Dropping the
+                    // wrapper-side connection here would orphan those quinn
+                    // index entries for the lifetime of the endpoint.
+                    return;
                 }
                 Event::Stream(stream_event) => match stream_event {
                     StreamEvent::Opened { dir } => {
@@ -776,8 +847,13 @@ impl QuicEndpoint {
                         });
                     }
                 }
-                Event::HandshakeDataReady | Event::DatagramsUnblocked => {
-                    // Not surfaced.
+                Event::DatagramsUnblocked => {
+                    self.events
+                        .push_back(QuicEvent::DatagramsUnblocked { conn: conn_id });
+                }
+                Event::HandshakeDataReady => {
+                    self.events
+                        .push_back(QuicEvent::HandshakeDataReady { conn: conn_id });
                 }
             }
         }

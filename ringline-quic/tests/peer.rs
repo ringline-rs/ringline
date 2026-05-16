@@ -1736,3 +1736,113 @@ fn quic_drain_transmits_preserves_gso_segments() {
          hint; got {total_datagrams} datagrams but none were segmented"
     );
 }
+
+#[test]
+fn close_connection_called_twice_is_idempotent() {
+    // Two back-to-back close_connection calls used to emit two
+    // ConnectionClosed events — wiring up double cleanup in h3.
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
+
+    client.close_connection(cc, 0, b"first");
+    client.close_connection(cc, 0, b"second");
+
+    let mut close_events = 0;
+    while let Some(ev) = client.poll_event() {
+        if matches!(ev, QuicEvent::ConnectionClosed { .. }) {
+            close_events += 1;
+        }
+    }
+    assert_eq!(
+        close_events, 1,
+        "double close_connection must emit ConnectionClosed once",
+    );
+}
+
+#[test]
+fn stream_finish_surfaces_peer_stop_sending_error_code() {
+    use ringline_quic::Error;
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, sc) = handshake(&mut client, &mut server, ca, sa);
+
+    let stream = client.open_bi(cc).unwrap().unwrap();
+    client.stream_send(cc, stream, b"hi").unwrap();
+    client.flush(Instant::now());
+    drain(&mut client, &mut server, ca, sa);
+
+    // Wait for the server to learn about the stream so it can stop it.
+    let mut server_stream = None;
+    for _ in 0..16 {
+        while let Some(ev) = server.poll_event() {
+            if let QuicEvent::StreamOpened { stream, .. } = ev {
+                server_stream = Some(stream);
+            }
+        }
+        if server_stream.is_some() {
+            break;
+        }
+        drain(&mut client, &mut server, ca, sa);
+    }
+    let server_stream = server_stream.expect("server saw stream");
+    server
+        .stop_sending(sc, server_stream, quinn_proto::VarInt::from_u32(0xc0de))
+        .expect("stop_sending");
+    server.flush(Instant::now());
+    drain(&mut client, &mut server, ca, sa);
+
+    // Client's stream_finish should learn about the peer's stop with the
+    // exact error code.
+    let err = client
+        .stream_finish(cc, stream)
+        .expect_err("expected error");
+    match err {
+        Error::StreamStopped(code) => assert_eq!(code.into_inner(), 0xc0de),
+        other => panic!("expected StreamStopped, got {other:?}"),
+    }
+}
+
+#[test]
+fn datagram_blocked_returns_original_payload() {
+    use ringline_quic::Error;
+    // Use the default datagram buffer sizes — we just need to push enough
+    // payload that the buffer fills before any packet ferries to the peer.
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
+
+    let payload = bytes::Bytes::from(vec![0u8; 1100]);
+    let mut blocked = None;
+    for _ in 0..4096 {
+        match client.send_datagram(cc, payload.clone(), false) {
+            Ok(()) => continue,
+            Err(Error::DatagramBlocked(b)) => {
+                blocked = Some(b);
+                break;
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+    let returned = blocked.expect("expected DatagramBlocked within 4096 sends");
+    assert_eq!(
+        returned, payload,
+        "blocked datagram must return original payload"
+    );
+}
+
+#[test]
+fn stream_send_on_closing_connection_returns_connection_closing() {
+    use ringline_quic::Error;
+    let (mut client, mut server, ca, sa, _) = make_pair();
+    let (cc, _sc) = handshake(&mut client, &mut server, ca, sa);
+    let stream = client.open_bi(cc).unwrap().unwrap();
+
+    client.close_connection(cc, 0, b"done");
+    // Now the connection is closed locally — `get_conn_mut` rejects
+    // application operations with `InvalidConnection`.
+    let err = client
+        .stream_send(cc, stream, b"hi")
+        .expect_err("send after close must fail");
+    assert!(
+        matches!(err, Error::InvalidConnection),
+        "expected InvalidConnection after close_connection, got {err:?}",
+    );
+}

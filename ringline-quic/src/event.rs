@@ -66,6 +66,20 @@ pub enum QuicEvent {
     /// An unreliable QUIC datagram (RFC 9221) was received from the peer.
     DatagramReceived { conn: QuicConnId, data: Bytes },
 
+    /// The outgoing datagram buffer for this connection has space again
+    /// after a previous `Error::DatagramBlocked(Bytes)`. The application
+    /// should retry whatever payload it was holding.
+    DatagramsUnblocked { conn: QuicConnId },
+
+    /// The server has parsed enough of the client's ClientHello to answer
+    /// questions about ALPN / SNI / cert selection — but the full handshake
+    /// has not yet completed (no `NewConnection` event yet).
+    ///
+    /// Servers that need per-SNI dispatch or per-ALPN routing inspect
+    /// `quinn_proto::Connection::crypto_session().handshake_data()` from
+    /// this event. Fires once per inbound connection.
+    HandshakeDataReady { conn: QuicConnId },
+
     /// 0-RTT was attempted on this outbound connection but the peer
     /// rejected it. Anything sent before the handshake completed has
     /// been discarded by quinn-proto and must be re-sent over 1-RTT.
@@ -76,13 +90,20 @@ pub enum QuicEvent {
     /// don't generate the event.
     ZeroRttRejected { conn: QuicConnId },
 
-    /// The peer's address changed and the new path was successfully
-    /// validated (NAT rebinding, mobile network handoff, etc.).
+    /// The peer's address changed (NAT rebinding, mobile network handoff,
+    /// etc.) and quinn-proto has *initiated* path migration. This event
+    /// fires the moment quinn updates `Connection::remote_address()` —
+    /// which happens synchronously when a non-probing packet arrives from
+    /// a new source address — **not** after PATH_CHALLENGE / PATH_RESPONSE
+    /// validation completes. Until validation finishes the new path is
+    /// still on probation: quinn caps bytes-in-flight to roughly 3× the
+    /// validated amount, and will fall back to the previous path if the
+    /// challenge fails.
     ///
-    /// Quinn handles the path validation handshake (PATH_CHALLENGE /
-    /// PATH_RESPONSE) internally; this event surfaces *after* the new
-    /// path is confirmed, so the application can update logging,
-    /// rate limits keyed on peer address, or per-connection state.
+    /// Applications that key per-peer state on the source address (logs,
+    /// abuse rate limits) should treat this as "the peer *claims* to be at
+    /// `current` now"; the path is unsafe to trust for unbounded data
+    /// until validation completes.
     ///
     /// Server-side migration is gated on
     /// [`quinn_proto::ServerConfig::migration`] (default true). If
