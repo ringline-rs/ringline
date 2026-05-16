@@ -348,10 +348,14 @@ impl ringline::AsyncEventHandler for RinglineUdpClient {
         Some(Box::pin(async move {
             let msg = vec![0xABu8; state.msg_size];
             let mut local_ops: u64 = 0;
+            let expected_len = state.msg_size;
 
             while !state.stop.load(Ordering::Relaxed) {
                 let t0 = Instant::now();
 
+                // Send_to with the connected peer hits the lighter
+                // `IORING_OP_SEND` path inside ringline; no per-send msghdr
+                // setup, no kernel copy_from_user of msghdr/iovec/sockaddr.
                 loop {
                     match udp.send_to(state.server_addr, &msg) {
                         Ok(()) => break,
@@ -366,8 +370,12 @@ impl ringline::AsyncEventHandler for RinglineUdpClient {
                     }
                 }
 
-                let (data, _peer) = udp.recv_from().await;
-                if data.len() != state.msg_size {
+                // with_datagram() runs the callback over the kernel-provided
+                // buffer directly — no Vec allocation per RTT.
+                let ok = udp
+                    .with_datagram(|data, _peer| data.len() == expected_len)
+                    .await;
+                if !ok {
                     state.ops.fetch_add(local_ops & 0xFF, Ordering::Relaxed);
                     return;
                 }
@@ -422,9 +430,13 @@ fn run_bench_ringline(
     config.send_copy_slot_size = msg_size.next_power_of_two().max(16384) as u32;
     config.standalone_task_capacity = (num_clients + 4).next_power_of_two().max(64) as u32;
 
+    let server_addr: SocketAddr = addr.parse().expect("invalid server addr");
     let mut builder = ringline::RinglineBuilder::new(config);
     for _ in 0..num_clients {
-        builder = builder.bind_udp(port_manager.next_addr());
+        // Each client binds an ephemeral local port and `connect()`s to the
+        // server. Connected sockets get the lighter RecvUdp/SendUdp opcode
+        // path inside the runtime.
+        builder = builder.bind_udp_connected(port_manager.next_addr(), server_addr);
     }
 
     let (shutdown, handles) = match builder.launch::<RinglineUdpClient>() {

@@ -596,6 +596,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Timer => self.handle_timer(ud, result),
             OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result, flags),
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
+            OpTag::RecvUdp => self.handle_recv_udp(ud, result, flags),
+            OpTag::SendUdp => self.handle_send_udp(ud, result),
             OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
             OpTag::DirectIo => self.handle_direct_io(ud, result),
             OpTag::Fs => self.handle_fs(ud, result),
@@ -1756,12 +1758,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             unsafe { std::slice::from_raw_parts(buf_ptr, buf_len as usize) }
         };
 
-        // Hand the buffer back unconditionally — even on parse error — so the
-        // ring doesn't bleed.
+        // Parse the recvmsg header out of the kernel buffer. If parsing fails
+        // (or the datagram is truncated, or the queue is full) the bid is
+        // returned to the ring immediately. Otherwise the bid travels with the
+        // queue entry and is replenished when the consumer reads it — that's
+        // what makes the recv path zero-copy.
         let parse_result =
             io_uring::types::RecvMsgOut::parse(buf, &self.driver.udp_sockets[idx].recv_msghdr);
-        self.driver.udp_pending_replenish.push(bid);
 
+        let mut handed_to_queue = false;
         if let Ok(msg_out) = parse_result
             && !msg_out.is_name_data_truncated()
             && !msg_out.is_payload_truncated()
@@ -1777,11 +1782,31 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     // it for operators.
                     metrics::UDP.increment(metrics::udp::DATAGRAMS_DROPPED);
                 } else {
-                    let payload = msg_out.payload_data().to_vec();
-                    self.executor.udp_recv_queues[idx].push_back((payload, peer));
+                    let payload = msg_out.payload_data();
+                    // SAFETY: `payload` is a slice borrowed from the kernel
+                    // buffer at `(buf_ptr, buf_len)`. The buffer remains valid
+                    // until `bid` is pushed to `udp_pending_replenish` (which
+                    // happens when the consumer reads the queue entry).
+                    let payload_ptr = payload.as_ptr();
+                    let payload_len = payload.len() as u32;
+                    self.executor.udp_recv_queues[idx].push_back(
+                        crate::runtime::PendingUdpDatagram {
+                            peer,
+                            buf: crate::runtime::PendingUdpBuf::Kernel {
+                                bid,
+                                ptr: payload_ptr,
+                                payload_len,
+                            },
+                        },
+                    );
+                    handed_to_queue = true;
                     self.executor.wake_udp_recv(udp_index);
                 }
             }
+        }
+
+        if !handed_to_queue {
+            self.driver.udp_pending_replenish.push(bid);
         }
 
         if !has_more {
@@ -1813,6 +1838,98 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         if result < 0 {
             metrics::UDP.increment(metrics::udp::SEND_ERRORS);
+        }
+    }
+
+    /// Handle a CQE for a `Send` issued on a connected UDP socket (the
+    /// `RecvMsgUdp` fast-path counterpart). Same bookkeeping as
+    /// `handle_send_msg_udp`: release the pool slot and per-socket send
+    /// slot, wake any task awaiting `send_ready`.
+    fn handle_send_udp(&mut self, ud: UserData, result: i32) {
+        // Send completion bookkeeping is identical to the sendmsg path —
+        // only the SQE opcode differed. Delegate.
+        self.handle_send_msg_udp(ud, result);
+    }
+
+    /// Handle a multishot `Recv` CQE for a connected UDP socket. The buffer
+    /// contains only the payload (no `io_uring_recvmsg_out` header / sockaddr,
+    /// since we used `IORING_OP_RECV` rather than `RECVMSG`). The peer is
+    /// known from `UdpSocketState::connected_peer`.
+    fn handle_recv_udp(&mut self, ud: UserData, result: i32, flags: u32) {
+        let udp_index = ud.conn_index();
+        let idx = udp_index as usize;
+        let has_more = cqueue::more(flags);
+
+        if idx >= self.driver.udp_sockets.len() {
+            if result > 0
+                && let Some(bid) = cqueue::buffer_select(flags)
+            {
+                self.driver.udp_pending_replenish.push(bid);
+            }
+            return;
+        }
+
+        let udp_bgid = match self.driver.udp_provided_bufs.as_ref() {
+            Some(r) => r.bgid(),
+            None => return,
+        };
+
+        if result <= 0 {
+            let errno = -result;
+            if !has_more && errno != libc::ECANCELED {
+                if errno == libc::ENOBUFS {
+                    metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
+                }
+                self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
+            }
+            return;
+        }
+
+        let bid = match cqueue::buffer_select(flags) {
+            Some(b) => b,
+            None => {
+                if !has_more {
+                    self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
+                }
+                return;
+            }
+        };
+
+        let payload_len = result as u32;
+        let buf_ptr = {
+            let udp_bufs = self.driver.udp_provided_bufs.as_ref().unwrap();
+            let (p, _) = udp_bufs.get_buffer(bid);
+            p
+        };
+
+        metrics::UDP.increment(metrics::udp::DATAGRAMS_RECEIVED);
+
+        let mut handed_to_queue = false;
+        if let Some(peer) = self.driver.udp_sockets[idx].connected_peer
+            && idx < self.executor.udp_recv_queues.len()
+        {
+            if self.executor.udp_recv_queues[idx].len() >= self.executor.udp_recv_queue_capacity {
+                metrics::UDP.increment(metrics::udp::DATAGRAMS_DROPPED);
+            } else {
+                self.executor.udp_recv_queues[idx].push_back(crate::runtime::PendingUdpDatagram {
+                    peer,
+                    buf: crate::runtime::PendingUdpBuf::Kernel {
+                        bid,
+                        ptr: buf_ptr,
+                        payload_len,
+                    },
+                });
+                handed_to_queue = true;
+                self.executor.wake_udp_recv(udp_index);
+            }
+        }
+
+        if !handed_to_queue {
+            self.driver.udp_pending_replenish.push(bid);
+        }
+
+        if !has_more {
+            self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
         }
     }
 

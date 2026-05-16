@@ -41,6 +41,12 @@ pub enum OpTag {
     /// returned `-EAGAIN` (the kernel send buffer was full). Payload =
     /// pool_slot to resubmit when the poll fires.
     SendPollOut = 21,
+    /// Multishot recv on a connected UDP socket (no peer info in CQE,
+    /// kernel filters to the connected peer). Lighter than `RecvMsgUdp`.
+    RecvUdp = 22,
+    /// Single-shot send on a connected UDP socket (no msghdr, uses the
+    /// socket's connected peer). Lighter than `SendMsgUdp`.
+    SendUdp = 23,
 }
 
 impl OpTag {
@@ -68,6 +74,8 @@ impl OpTag {
             19 => Some(OpTag::PidfdPoll),
             20 => Some(OpTag::SendRecvBuf),
             21 => Some(OpTag::SendPollOut),
+            22 => Some(OpTag::RecvUdp),
+            23 => Some(OpTag::SendUdp),
             _ => None,
         }
     }

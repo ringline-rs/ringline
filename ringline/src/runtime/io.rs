@@ -2472,6 +2472,27 @@ impl UdpCtx {
         }
     }
 
+    /// Receive the next datagram and invoke `f(payload, peer)` zero-copy.
+    ///
+    /// Unlike [`recv_from()`](Self::recv_from), this does not allocate a `Vec`
+    /// for the payload. On the io_uring backend the callback runs over the
+    /// kernel-provided buffer directly; on the mio backend it runs over the
+    /// per-socket recv buffer. Either way, the buffer is released as soon as
+    /// the callback returns, so any data the caller wants to keep must be
+    /// copied out inside `f`.
+    ///
+    /// Same single-consumer semantics as [`recv_from()`](Self::recv_from).
+    pub fn with_datagram<F, R>(&self, f: F) -> UdpWithDatagramFuture<F, R>
+    where
+        F: FnMut(&[u8], SocketAddr) -> R + Unpin,
+    {
+        UdpWithDatagramFuture {
+            udp_index: self.udp_index,
+            f: Some(f),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// Resolve when at least one UDP send slot is available on this socket.
     ///
     /// Use this to back off when [`UdpCtx::send_to`] returns
@@ -2595,12 +2616,20 @@ impl Future for UdpRecvFuture {
     type Output = (Vec<u8>, SocketAddr);
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        with_state(|_driver, executor| {
+        with_state(|driver, executor| {
             let idx = self.udp_index as usize;
             if idx < executor.udp_recv_queues.len()
-                && let Some(datagram) = executor.udp_recv_queues[idx].pop_front()
+                && let Some(entry) = executor.udp_recv_queues[idx].pop_front()
             {
-                return Poll::Ready(datagram);
+                let bid = entry.bid_to_release();
+                let owned = entry.into_owned();
+                #[cfg(has_io_uring)]
+                if let Some(bid) = bid {
+                    driver.udp_pending_replenish.push(bid);
+                }
+                #[cfg(not(has_io_uring))]
+                let _ = (bid, driver);
+                return Poll::Ready(owned);
             }
             // Register as waiter so the CQE handler wakes us. There is
             // only one waiter slot per socket; if a different task
@@ -2614,6 +2643,64 @@ impl Future for UdpRecvFuture {
                     executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
                     "two distinct tasks awaiting recv_from on UdpCtx index {idx}; \
                      UdpCtx::recv_from supports a single consumer per socket"
+                );
+                executor.udp_recv_waiters[idx] = Some(task_id);
+            }
+            Poll::Pending
+        })
+    }
+}
+
+/// Future returned by [`UdpCtx::with_datagram()`].
+///
+/// Zero-copy alternative to [`UdpCtx::recv_from()`]: the callback is invoked
+/// over a borrowed slice into the kernel-provided buffer (io_uring) or the
+/// owned recv buffer (mio), without ever allocating a `Vec` for the payload.
+/// The buffer is released back to the kernel once the callback returns.
+pub struct UdpWithDatagramFuture<F, R>
+where
+    F: FnMut(&[u8], SocketAddr) -> R + Unpin,
+{
+    udp_index: u32,
+    f: Option<F>,
+    _marker: std::marker::PhantomData<fn() -> R>,
+}
+
+impl<F, R> Future for UdpWithDatagramFuture<F, R>
+where
+    F: FnMut(&[u8], SocketAddr) -> R + Unpin,
+{
+    type Output = R;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<R> {
+        let this = self.get_mut();
+        with_state(|driver, executor| {
+            let idx = this.udp_index as usize;
+            if idx < executor.udp_recv_queues.len()
+                && let Some(entry) = executor.udp_recv_queues[idx].pop_front()
+            {
+                let bid = entry.bid_to_release();
+                let f = this
+                    .f
+                    .as_mut()
+                    .expect("UdpWithDatagramFuture polled after Ready");
+                let r = f(entry.data(), entry.peer);
+                this.f.take();
+                drop(entry);
+                #[cfg(has_io_uring)]
+                if let Some(bid) = bid {
+                    driver.udp_pending_replenish.push(bid);
+                }
+                #[cfg(not(has_io_uring))]
+                let _ = (bid, driver);
+                return Poll::Ready(r);
+            }
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            if idx < executor.udp_recv_waiters.len() {
+                debug_assert!(
+                    executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
+                    "two distinct tasks awaiting recv on UdpCtx index {idx}; \
+                     UdpCtx::with_datagram supports a single consumer per socket"
                 );
                 executor.udp_recv_waiters[idx] = Some(task_id);
             }
