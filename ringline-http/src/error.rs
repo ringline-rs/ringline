@@ -25,6 +25,19 @@ pub enum HttpError {
     #[error("parse error")]
     Parse,
 
+    /// Parsed message is syntactically valid but rejected on semantic
+    /// grounds — e.g., conflicting `Transfer-Encoding` + `Content-Length`
+    /// (RFC 9112 §6.3 request smuggling defense), multiple `Content-Length`
+    /// headers with different values, header values containing CR/LF/NUL,
+    /// or unsupported transfer codings.
+    #[error("invalid message: {0}")]
+    InvalidMessage(String),
+
+    /// A configured resource cap (max header section, max body, max chunk,
+    /// max trailer, max decompressed size) was exceeded.
+    #[error("max size exceeded: {0}")]
+    MaxSizeExceeded(String),
+
     /// Request timed out.
     #[error("timeout")]
     Timeout,
