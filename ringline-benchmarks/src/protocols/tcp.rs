@@ -229,7 +229,7 @@ fn run_bench_tokio(
     wait_for_server(addr);
 
     let client_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(1)
         .enable_all()
         .build()
         .expect("failed to build client runtime");
