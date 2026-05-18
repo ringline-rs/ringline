@@ -126,6 +126,29 @@ Workload: each client loops `get k`. The server is a tokio TCP listener speaking
 
 Same broad shape as the Redis numbers: ringline wins single-conn-per-client and high-concurrency-small-payload cells, ties at moderate concurrency × larger payloads. `ringline-memcache::Client::get` and the hand-rolled tokio client both parse the variable-length memcache response.
 
+## HTTP/1.1 (GET against a synthetic server)
+
+Workload: each client loops `GET /` over a keep-alive connection. The server is a tokio TCP listener that recognises `\r\n\r\n` request termination and emits a pre-computed `HTTP/1.1 200 OK\r\nContent-Length: <msg\_size>\r\n...` response with a `msg\_size`-byte body. Both clients hit the same server.
+
+The reference client is **reqwest** — the de-facto tokio HTTP client — built with `.http1_only().tcp_nodelay(true)` and one pooled connection per host. Both clients do real HTTP work: build a request via a builder, send it over a keep-alive connection, parse a structured response with status / headers / body. This is the apples-to-apples comparison; the earlier version compared against a hand-rolled byte loop that skipped parsing entirely.
+
+| Clients × Size | ringline-http | reqwest | ringline vs reqwest |
+|:---|---:|---:|---:|
+| 1c × 64 B   |  38 k |  22 k | **+69 %** |
+| 1c × 512 B  |  38 k |  23 k | +69 % |
+| 1c × 4 KiB  |  37 k |  21 k | +73 % |
+| 10c × 64 B  | 165 k |  54 k | **+208 %** |
+| 10c × 512 B | 162 k |  54 k | +202 % |
+| 10c × 4 KiB | 148 k |  50 k | +194 % |
+| 50c × 64 B  | 172 k |  53 k | **+224 %** |
+| 50c × 512 B | 169 k |  55 k | +209 % |
+| 50c × 4 KiB | 161 k |  52 k | +211 % |
+| 200c × 64 B | 174 k |  58 k | +201 % |
+| 200c × 512 B | 174 k |  60 k | +189 % |
+| 200c × 4 KiB | 164 k |  53 k | +210 % |
+
+`ringline-http::HttpClient::get("/").send()` runs roughly **2-3× the throughput** of `reqwest::Client::get(url).send()` on the same wire format and the same server. Both paths allocate a builder, encode the request, send over keep-alive, and parse a typed response — the gap is purely in what the runtimes and protocol stacks do underneath.
+
 ## Highlights & history
 
 ### `perf(bench): zero-allocation recv in UDP echo server` (PR #186)

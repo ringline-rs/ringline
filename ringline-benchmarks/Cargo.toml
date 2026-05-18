@@ -22,6 +22,11 @@ ringline-momento = { workspace = true }
 ringline-grpc = { workspace = true }
 ringline-ping = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+# Reference HTTP client for the HTTP/1.1 bench — used so the
+# "ringline vs tokio" cell measures `ringline_http::HttpClient` vs a
+# realistic tokio HTTP client (request builder + structured response
+# parsing) rather than a hand-rolled fastest-possible byte loop.
+reqwest = { version = "0.12", default-features = false, features = ["http2"] }
 quinn-proto = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
