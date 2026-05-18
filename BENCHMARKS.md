@@ -126,6 +126,27 @@ Workload: each client loops `get k`. The server is a tokio TCP listener speaking
 
 Same broad shape as the Redis numbers: ringline wins single-conn-per-client and high-concurrency-small-payload cells, ties at moderate concurrency × larger payloads. `ringline-memcache::Client::get` and the hand-rolled tokio client both parse the variable-length memcache response.
 
+## HTTP/1.1 (GET against a synthetic server)
+
+Workload: each client loops `GET /` over a keep-alive connection. The server is a tokio TCP listener that recognises `\r\n\r\n` request termination and emits a pre-computed `HTTP/1.1 200 OK\r\nContent-Length: <msg\_size>\r\n...` response with a `msg\_size`-byte body. Both clients hit the same server.
+
+| Clients × Size | ringline-http | tokio (hand-rolled) | ringline vs tokio |
+|:---|---:|---:|---:|
+| 1c × 64 B   |  39 k |  37 k | **+5 %** |
+| 1c × 512 B  |  38 k |  36 k | +6 % |
+| 1c × 4 KiB  |  36 k |  36 k | tie |
+| 10c × 64 B  | 165 k | 178 k | −7 % |
+| 10c × 512 B | 159 k | 176 k | −10 % |
+| 10c × 4 KiB | 154 k | 163 k | −6 % |
+| 50c × 64 B  | 168 k | 178 k | −6 % |
+| 50c × 512 B | 171 k | 179 k | −5 % |
+| 50c × 4 KiB | 156 k | 154 k | +1 % |
+| 200c × 64 B | 174 k | 181 k | −4 % |
+| 200c × 512 B | 174 k | 175 k | tie |
+| 200c × 4 KiB | 154 k | 168 k | −9 % |
+
+The hand-rolled tokio client is unfairly favoured here — it knows the exact response shape and uses fixed-size reads. `ringline-http::HttpClient::get(\"/\").send()` allocates a `RequestBuilder`, encodes a header set, and parses the full structured response (status, headers, body) on every call. Useful as the cost-of-ergonomics number; not directly comparable to the raw-bytes baseline.
+
 ## Highlights & history
 
 ### `perf(bench): zero-allocation recv in UDP echo server` (PR #186)
