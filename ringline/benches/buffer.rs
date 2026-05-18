@@ -36,13 +36,31 @@ impl AsyncEventHandler for EchoHandler {
 // ── Buffer size benchmarks ───────────────────────────────────────────
 
 fn bench_ringline_buffer_sizes(c: &mut Criterion) {
-    // Use a unique port range for buffer benchmarks
-    let base_port = 32000;
+    // Server ports must stay BELOW Linux's default ephemeral-port range
+    // (/proc/sys/net/ipv4/ip_local_port_range, typically 32768-60999).
+    // Each iteration does tens of thousands of client TCP connects from
+    // this same process; their source ports get drawn from the
+    // ephemeral range and linger in TIME_WAIT for ~60s after close. If
+    // a server port happens to fall in that range, a later iteration
+    // trying to bind() it sees EADDRINUSE — Linux's SO_REUSEADDR
+    // doesn't help here because the conflicting TIME_WAIT sockets are
+    // owned by the client side (`TcpStream::connect`), which doesn't
+    // set the option.
+    //
+    // The previous scheme `base_port + size` put four of six ports
+    // inside the ephemeral range (33024, 36096, 48384, and the
+    // wrap-to-32000 case at size=65536), and the bench reliably hung
+    // at iteration 3 once #181 unblocked the underlying shutdown.
+    //
+    // 29800..29806 keeps every port well below the ephemeral range and
+    // doesn't collide with the ports used by connect.rs (29500-29501)
+    // or echo.rs (29600-29607).
     let sizes = [64, 256, 1024, 4096, 16384, 65536];
+    const PORT_BASE: u16 = 29800;
 
-    for size in sizes {
+    for (idx, size) in sizes.iter().copied().enumerate() {
         let data = vec![0u8; size];
-        let port = base_port + size as u16;
+        let port = PORT_BASE + idx as u16;
         let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
         // ── Ringline server benchmark ──────────────────────────────
@@ -50,7 +68,7 @@ fn bench_ringline_buffer_sizes(c: &mut Criterion) {
         let (shutdown, handles) = RinglineBuilder::new(config)
             .bind(addr)
             .launch::<EchoHandler>()
-            .unwrap_or_else(|_| panic!("Failed to start server on {}", addr));
+            .unwrap_or_else(|e| panic!("Failed to start server on {}: {:?}", addr, e));
 
         // Give server time to start
         thread::sleep(Duration::from_millis(500));
