@@ -69,24 +69,24 @@ ringline leads tokio across most of the matrix; the 32 KiB cells where it trails
 
 | Clients × Size | ringline → ringline | tokio → tokio | ringline vs tokio | p50 (ringline) | p99 (ringline) |
 |:---|---:|---:|---:|---:|---:|
-| 1c × 64 B   |  48 k |  38 k | **+27 %** | 18 µs |  33 µs |
-| 1c × 512 B  |  51 k |  37 k | +37 % | 18 µs |  32 µs |
-| 1c × 4 KiB  |  45 k |  31 k | +45 % | 21 µs |  35 µs |
-| 1c × 32 KiB |  30 k |  27 k | +11 % | 30 µs |  50 µs |
-| 10c × 64 B  | 266 k | 195 k | **+36 %** | 36 µs |  59 µs |
-| 10c × 512 B | 263 k | 185 k | +42 % | 37 µs |  55 µs |
-| 10c × 4 KiB | 201 k | 149 k | +35 % | 49 µs |  74 µs |
-| 10c × 32 KiB |  61 k |  75 k | −19 % | 112 µs | 249 µs |
-| 50c × 64 B  | 264 k | 205 k | **+29 %** | 187 µs | 255 µs |
-| 50c × 512 B | 279 k | 200 k | +40 % | 179 µs | 223 µs |
-| 50c × 4 KiB | 181 k | 147 k | +23 % | 138 µs | 212 µs |
-| 50c × 32 KiB|  56 k |  74 k | −25 % | 120 µs | 267 µs |
-| 200c × 64 B | 292 k | 209 k | **+40 %** | 598 µs | 758 µs |
-| 200c × 512 B | 262 k | 200 k | +31 % | 513 µs | 727 µs |
-| 200c × 4 KiB | 192 k | 144 k | +33 % | 135 µs | 335 µs |
-| 200c × 32 KiB|  51 k |  72 k | −30 % | 127 µs | 324 µs |
+| 1c × 64 B   |  50 k |  39 k | **+29 %** | 18 µs |  34 µs |
+| 1c × 512 B  |  51 k |  39 k | +32 % | 18 µs |  33 µs |
+| 1c × 4 KiB  |  44 k |  35 k | +25 % | 21 µs |  38 µs |
+| 1c × 32 KiB |  33 k |  29 k | +12 % | 29 µs |  49 µs |
+| 10c × 64 B  | 273 k | 193 k | **+42 %** | 35 µs |  59 µs |
+| 10c × 512 B | 250 k | 191 k | +31 % | 38 µs |  64 µs |
+| 10c × 4 KiB | 204 k | 146 k | +39 % | 47 µs |  78 µs |
+| 10c × 32 KiB |  73 k |  86 k | −14 % | 92 µs | 152 µs |
+| 50c × 64 B  | 284 k | 203 k | **+40 %** | 172 µs | 240 µs |
+| 50c × 512 B | 259 k | 196 k | +32 % | 190 µs | 268 µs |
+| 50c × 4 KiB | 190 k | 153 k | +25 % | 133 µs | 197 µs |
+| 50c × 32 KiB|  72 k |  83 k | −13 % | 97 µs | 169 µs |
+| 200c × 64 B | 286 k | 208 k | **+38 %** | 583 µs | 863 µs |
+| 200c × 512 B | 283 k | 197 k | +43 % | 462 µs | 724 µs |
+| 200c × 4 KiB | 197 k | 152 k | +30 % | 132 µs | 424 µs |
+| 200c × 32 KiB|  62 k |  80 k | −23 % | 115 µs | 226 µs |
 
-UDP is where ringline pulls farthest ahead — at 10c × 64 B the gap is +36 %; at 1c × 4 KiB it's +45 %. The 32 KiB rows trail tokio for the same reason as the TCP 32 KiB ones (see *Caveats*).
+UDP is where ringline pulls farthest ahead — at 10c × 64 B the gap is +42 %; at 50c × 64 B it's +40 %. The 32 KiB rows still trail tokio at higher concurrency; with the bench's zero-allocation recv path now in place (PR #186), the residual gap is the unavoidable userspace memcpy into ringline's send copy pool (tokio's `send_to` syscall reads userland memory directly).
 
 ## Redis (GET against a synthetic RESP server)
 
@@ -106,6 +106,30 @@ Workload: each client loops `GET k`. The server is a tokio TCP listener speaking
 The hand-rolled tokio client uses fixed-size reads (it knows the response length up front); `ringline-redis::Client::get` walks the full RESP parser on every response. Despite that extra work, ringline-redis still leads in most cells, and the largest deficits are small.
 
 ## Highlights & history
+
+### `perf(bench): zero-allocation recv in UDP echo server` (PR #186)
+
+The bench's ringline UDP server used `udp.recv_from().await`, which
+allocates a fresh `Vec<u8>` for every datagram. At 32 KiB messages
+this cost ~10-20 % throughput vs the tokio server (which echoes
+out of a single stack buffer).
+
+Switched the bench server to `udp.with_datagram(...)` — the
+callback exposes the kernel-provided recv buffer directly, and the
+common case calls `send_to` inside the closure so the only
+userspace copy is the unavoidable one into ringline's send copy
+pool. A reusable scratch `Vec` handles the rare retry-on-pool-
+exhausted path.
+
+| Bench (UDP, ringline → ringline) | Before | After | Δ |
+|:---|---:|---:|---:|
+| 10c × 32 KiB  | 61 k | 73 k | **+20 %** |
+| 50c × 32 KiB  | 56 k | 72 k | +28 % |
+| 200c × 32 KiB | 51 k | 62 k | +21 % |
+
+Smaller sizes unchanged within noise. The residual gap to tokio at
+32 KiB is now the send-pool memcpy; closing it further would need a
+new `forward_recv_buf`-style zero-copy UDP send path on `UdpCtx`.
 
 ### `perf(runtime): skip close_notify deadline walk when nothing is armed` (PR #184)
 
