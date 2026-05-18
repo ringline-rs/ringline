@@ -131,6 +131,11 @@ pub struct DriverCtx<'a> {
     pub(crate) max_chain_length: u16,
     /// Per-connection send queues for serializing sends.
     pub(crate) send_queues: &'a mut Vec<ConnSendState>,
+    /// Connection indices with armed `close_notify_deadline`s. See the
+    /// matching field on `backend::uring::driver::Driver` — the event
+    /// loop's deadline check iterates this instead of all send queues
+    /// so non-TLS workloads pay zero per-iteration cost.
+    pub(crate) close_notify_armed: &'a mut Vec<u32>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: &'a mut Vec<crate::backend::UdpSocketState>,
     /// NVMe device table. `None` when NVMe is not configured.
@@ -350,10 +355,18 @@ impl<'a> DriverCtx<'a> {
                 let tls_table = unsafe { &mut *self.tls_table };
                 if tls_table.has(conn.index) {
                     tls_table.send_close_notify(conn.index, self.ring, self.send_copy_pool);
-                    // Arm the close_notify deadline for timeout detection.
+                    // Arm the close_notify deadline for timeout detection
+                    // and register this index in the armed set so the
+                    // event loop's `check_close_notify_deadlines` will
+                    // examine it. Avoids the full O(N) send_queues walk
+                    // for non-TLS workloads, which previously dominated
+                    // worker CPU at high request rates.
                     let state = &mut self.send_queues[conn.index as usize];
                     state.close_notify_deadline =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                    if !self.close_notify_armed.contains(&conn.index) {
+                        self.close_notify_armed.push(conn.index);
+                    }
                 }
             }
 
