@@ -145,17 +145,53 @@ impl ringline::AsyncEventHandler for RinglineUdpEchoHandler {
         &self,
         udp: ringline::UdpCtx,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>> {
+        // Echo each datagram with the minimum number of userspace
+        // memcpys.
+        //
+        // The fast path: `with_datagram` exposes the kernel-provided
+        // recv buffer directly, and `send_to` synchronously copies it
+        // into a send-pool slot. The kernel buffer is released as
+        // soon as the closure returns, so there's no recv-side
+        // userspace copy on this path — just the single send-pool
+        // copy that ringline's UDP send architecture requires.
+        //
+        // The slow path: if the send pool / SQ is full, we can't
+        // retry inside the synchronous closure because the kernel
+        // buffer would be released first. Save the payload into a
+        // reusable scratch `Vec` and retry-loop outside the closure.
+        // Pre-sized to the max UDP datagram so the scratch path
+        // never reallocates.
+        //
+        // The previous version of this bench used
+        // `udp.recv_from().await` (which allocates a fresh `Vec<u8>`
+        // per datagram inside the runtime) on every iteration,
+        // contributing ~10-15% server-side throughput loss vs the
+        // tokio reference at 32 KiB messages.
         Some(Box::pin(async move {
+            let mut scratch: Vec<u8> = Vec::with_capacity(65535);
             loop {
-                let (data, peer) = udp.recv_from().await;
-                loop {
-                    match udp.send_to(peer, &data) {
-                        Ok(()) => break,
+                let retry_target = udp
+                    .with_datagram(|data, peer| match udp.send_to(peer, data) {
+                        Ok(()) => None,
                         Err(ringline::UdpSendError::PoolExhausted)
                         | Err(ringline::UdpSendError::SubmissionQueueFull) => {
-                            udp.send_ready().await;
+                            scratch.clear();
+                            scratch.extend_from_slice(data);
+                            Some(peer)
                         }
-                        Err(_) => break,
+                        Err(_) => None,
+                    })
+                    .await;
+                if let Some(peer) = retry_target {
+                    loop {
+                        match udp.send_to(peer, &scratch) {
+                            Ok(()) => break,
+                            Err(ringline::UdpSendError::PoolExhausted)
+                            | Err(ringline::UdpSendError::SubmissionQueueFull) => {
+                                udp.send_ready().await;
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
             }
