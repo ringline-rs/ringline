@@ -105,6 +105,27 @@ Workload: each client loops `GET k`. The server is a tokio TCP listener speaking
 
 The hand-rolled tokio client uses fixed-size reads (it knows the response length up front); `ringline-redis::Client::get` walks the full RESP parser on every response. Despite that extra work, ringline-redis still leads in most cells, and the largest deficits are small.
 
+## Memcache (GET against a synthetic text-protocol server)
+
+Workload: each client loops `get k`. The server is a tokio TCP listener speaking memcache's text protocol — responds `VALUE k 0 <msg\_size>\r\n<msg\_size B>\r\nEND\r\n` to any GET, `STORED\r\n` to SET (with a body-aware parser), `DELETED\r\n` to DELETE. Both clients hit the same server.
+
+| Clients × Size | ringline-memcache | tokio (hand-rolled) | ringline vs tokio |
+|:---|---:|---:|---:|
+| 1c × 64 B   |  39 k |  37 k | **+5 %** |
+| 1c × 512 B  |  39 k |  36 k | +9 % |
+| 1c × 4 KiB  |  38 k |  35 k | +9 % |
+| 10c × 64 B  | 189 k | 177 k | +7 % |
+| 10c × 512 B | 186 k | 169 k | +10 % |
+| 10c × 4 KiB | 160 k | 160 k | tie |
+| 50c × 64 B  | 192 k | 179 k | +7 % |
+| 50c × 512 B | 195 k | 170 k | **+15 %** |
+| 50c × 4 KiB | 161 k | 166 k | −3 % |
+| 200c × 64 B | 205 k | 175 k | **+17 %** |
+| 200c × 512 B | 184 k | 176 k | +5 % |
+| 200c × 4 KiB | 164 k | 168 k | −2 % |
+
+Same broad shape as the Redis numbers: ringline wins single-conn-per-client and high-concurrency-small-payload cells, ties at moderate concurrency × larger payloads. `ringline-memcache::Client::get` and the hand-rolled tokio client both parse the variable-length memcache response.
+
 ## Highlights & history
 
 ### `perf(bench): zero-allocation recv in UDP echo server` (PR #186)
