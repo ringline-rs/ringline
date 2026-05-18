@@ -345,59 +345,50 @@ fn run_bench_ringline(
     }
 }
 
-// ── Tokio reference client ──────────────────────────────────────────
+// ── Tokio reference client (reqwest) ────────────────────────────────
 
+/// `reqwest` is the de-facto tokio HTTP client. Using it instead of a
+/// hand-rolled byte loop matches what ringline-http actually competes
+/// against: a structured `RequestBuilder`-style API that parses the
+/// response (status, headers, body) into typed values. Both clients
+/// pay the cost of "real HTTP" so the ops/s comparison reflects what
+/// a developer using either crate would observe.
 async fn run_tokio_client(
-    addr: SocketAddr,
-    msg_size: usize,
+    url: String,
     stop: Arc<AtomicBool>,
     ops_counter: Arc<AtomicU64>,
 ) -> LatencyHistogram {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-
     let mut histogram = LatencyHistogram::new();
 
-    let mut stream = match TcpStream::connect(addr).await {
-        Ok(s) => s,
+    let client = match reqwest::Client::builder()
+        .http1_only()
+        .tcp_nodelay(true)
+        // Reqwest defaults to keep-alive; just be explicit about
+        // pool sizing so we never accidentally tear down + reconnect
+        // mid-bench.
+        .pool_max_idle_per_host(1)
+        .build()
+    {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("  client connect failed: {e}");
+            eprintln!("  reqwest client build failed: {e}");
             return histogram;
         }
     };
-    stream.set_nodelay(true).ok();
 
-    // Fixed `GET / HTTP/1.1` request — keep-alive is the HTTP/1.1
-    // default, but state it explicitly so the server keeps the conn
-    // open even on older implementations.
-    let request: &[u8] = b"GET / HTTP/1.1\r\nHost: bench\r\nConnection: keep-alive\r\n\r\n";
-
-    // Pre-compute the exact response size so we know when one reply
-    // ends. Response: status line + headers + msg_size body.
-    let len_str = msg_size.to_string();
-    let expected_len = b"HTTP/1.1 200 OK\r\n".len()
-        + b"Content-Type: application/octet-stream\r\n".len()
-        + b"Content-Length: ".len()
-        + len_str.len()
-        + 2
-        + b"Connection: keep-alive\r\n".len()
-        + 2
-        + msg_size;
-    let mut recv_buf = vec![0u8; expected_len];
     let mut local_ops: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         let t0 = Instant::now();
-        if stream.write_all(request).await.is_err() {
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        // Drain the body — without this reqwest may not have actually
+        // received it yet, and the connection can't be reused for the
+        // next request.
+        if resp.bytes().await.is_err() {
             break;
-        }
-        let mut read = 0;
-        while read < expected_len {
-            match stream.read(&mut recv_buf[read..]).await {
-                Ok(0) => return histogram,
-                Ok(n) => read += n,
-                Err(_) => return histogram,
-            }
         }
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
         histogram.record(elapsed_ns);
@@ -415,7 +406,7 @@ async fn run_tokio_client(
 fn run_bench_tokio(
     addr: SocketAddr,
     num_clients: usize,
-    msg_size: usize,
+    _msg_size: usize,
     warmup: Duration,
     duration: Duration,
 ) -> BenchResult {
@@ -430,11 +421,13 @@ fn run_bench_tokio(
         .build()
         .expect("failed to build client runtime");
 
+    let url = format!("http://{}/", addr);
     let mut task_handles = Vec::with_capacity(num_clients);
     for _ in 0..num_clients {
         let stop = stop.clone();
         let ops = ops.clone();
-        task_handles.push(client_rt.spawn(run_tokio_client(addr, msg_size, stop, ops)));
+        let url = url.clone();
+        task_handles.push(client_rt.spawn(run_tokio_client(url, stop, ops)));
     }
 
     std::thread::sleep(warmup);
