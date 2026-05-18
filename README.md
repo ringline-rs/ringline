@@ -146,6 +146,12 @@ cargo run --example connect_echo
 cargo run --example echo_tls_server
 ```
 
+## Benchmarks
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the current TCP / UDP / Redis
+numbers (ringline vs tokio on a single ringline worker), how to
+reproduce them, and a history of perf-relevant changes.
+
 ## License
 
 MIT OR Apache-2.0
