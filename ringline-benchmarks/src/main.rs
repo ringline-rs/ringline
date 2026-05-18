@@ -574,52 +574,65 @@ fn main() {
     }
 
     // ── Memcache benchmarks ────────────────────────────────────────
+    //
+    // Same shape as the Redis bench: a single tokio server is the
+    // target; we drive it with both a ringline-memcache client and a
+    // hand-rolled tokio TCP client so the per-cell row pair shows
+    // which client runtime wins on the same wire format.
     if do_memcache || do_all {
         eprintln!("\n=== Memcache Benchmarks ===\n");
 
         let port_manager = port_manager.clone();
         for &num_clients in &args.clients {
             for &msg_size in &args.sizes {
-                let result = memcache::run_memcache(
-                    &port_manager,
-                    workers,
-                    num_clients,
-                    msg_size,
-                    warmup,
-                    duration,
-                    ClientRuntime::Ringline,
-                    ServerRuntime::Ringline,
-                );
+                let combos: &[(&str, ClientRuntime)] = &[
+                    ("ringline", ClientRuntime::Ringline),
+                    ("tokio", ClientRuntime::Tokio),
+                ];
 
-                eprint!(
-                    "  {:>8} -> {:<8}  {:>4}c x {:>5}: ",
-                    "ringline",
-                    "ringline",
-                    num_clients,
-                    format_size(msg_size),
-                );
+                for &(client_name, client_rt) in combos {
+                    let result = memcache::run_memcache(
+                        &port_manager,
+                        workers,
+                        num_clients,
+                        msg_size,
+                        warmup,
+                        duration,
+                        client_rt,
+                        ServerRuntime::Ringline,
+                    );
 
-                eprintln!(
-                    "{:>9.0} ops/s  p50: {}  p99: {}",
-                    result.ops_per_sec,
-                    format_ns(result.latency.p50_ns),
-                    format_ns(result.latency.p99_ns),
-                );
+                    eprintln!(
+                        "  {:>8} -> {:<8}  {:>4}c x {:>5}: {:>9.0} ops/s  p50: {}  p99: {}",
+                        client_name,
+                        "tokio",
+                        num_clients,
+                        format_size(msg_size),
+                        result.ops_per_sec,
+                        format_ns(result.latency.p50_ns),
+                        format_ns(result.latency.p99_ns),
+                    );
 
-                all_results.push(ConfigResult {
-                    workers,
-                    clients: num_clients,
-                    msg_size,
-                    client_runtime: "ringline".to_string(),
-                    server_runtime: "ringline".to_string(),
-                    transport: "memcache".to_string(),
-                    protocol: "echo".to_string(),
-                    tls: "none".to_string(),
-                    tokio_ringline: None,
-                    tokio_tokio: None,
-                    ringline_ringline: Some(result),
-                    ringline_tokio: None,
-                });
+                    let (ringline_tokio, tokio_tokio) = match client_name {
+                        "ringline" => (Some(result), None),
+                        _ => (None, Some(result)),
+                    };
+
+                    all_results.push(ConfigResult {
+                        workers,
+                        clients: num_clients,
+                        msg_size,
+                        client_runtime: client_name.to_string(),
+                        server_runtime: "tokio".to_string(),
+                        transport: "memcache".to_string(),
+                        protocol: "get".to_string(),
+                        tls: "none".to_string(),
+                        tokio_ringline: None,
+                        tokio_tokio,
+                        ringline_ringline: None,
+                        ringline_tokio,
+                    });
+                }
 
                 eprintln!();
             }
