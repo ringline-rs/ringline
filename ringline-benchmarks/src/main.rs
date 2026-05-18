@@ -507,52 +507,66 @@ fn main() {
     }
 
     // ── Redis benchmarks ───────────────────────────────────────────
+    //
+    // The redis bench has a single server implementation (a tokio
+    // RESP responder in `redis::run_redis`), so the meaningful axis
+    // is *client* runtime: ringline-redis::Client vs a hand-rolled
+    // tokio RESP client. Both go over the same wire format against
+    // the same server.
     if do_redis || do_all {
         eprintln!("\n=== Redis Benchmarks ===\n");
 
         let port_manager = port_manager.clone();
         for &num_clients in &args.clients {
             for &msg_size in &args.sizes {
-                let result = redis::run_redis(
-                    &port_manager,
-                    workers,
-                    num_clients,
-                    msg_size,
-                    warmup,
-                    duration,
-                    ClientRuntime::Ringline,
-                    ServerRuntime::Ringline,
-                );
+                let combos: &[(&str, ClientRuntime)] = &[
+                    ("ringline", ClientRuntime::Ringline),
+                    ("tokio", ClientRuntime::Tokio),
+                ];
 
-                eprint!(
-                    "  {:>8} -> {:<8}  {:>4}c x {:>5}: ",
-                    "ringline",
-                    "ringline",
-                    num_clients,
-                    format_size(msg_size),
-                );
+                for &(client_name, client_rt) in combos {
+                    let result = redis::run_redis(
+                        &port_manager,
+                        workers,
+                        num_clients,
+                        msg_size,
+                        warmup,
+                        duration,
+                        client_rt,
+                        ServerRuntime::Ringline,
+                    );
 
-                eprintln!(
-                    "{:>9.0} ops/s  p50: {}  p99: {}",
-                    result.ops_per_sec,
-                    format_ns(result.latency.p50_ns),
-                    format_ns(result.latency.p99_ns),
-                );
+                    eprintln!(
+                        "  {:>8} -> {:<8}  {:>4}c x {:>5}: {:>9.0} ops/s  p50: {}  p99: {}",
+                        client_name,
+                        "tokio",
+                        num_clients,
+                        format_size(msg_size),
+                        result.ops_per_sec,
+                        format_ns(result.latency.p50_ns),
+                        format_ns(result.latency.p99_ns),
+                    );
 
-                all_results.push(ConfigResult {
-                    workers,
-                    clients: num_clients,
-                    msg_size,
-                    client_runtime: "ringline".to_string(),
-                    server_runtime: "ringline".to_string(),
-                    transport: "redis".to_string(),
-                    protocol: "echo".to_string(),
-                    tls: "none".to_string(),
-                    tokio_ringline: None,
-                    tokio_tokio: None,
-                    ringline_ringline: Some(result),
-                    ringline_tokio: None,
-                });
+                    let (ringline_tokio, tokio_tokio) = match client_name {
+                        "ringline" => (Some(result), None),
+                        _ => (None, Some(result)),
+                    };
+
+                    all_results.push(ConfigResult {
+                        workers,
+                        clients: num_clients,
+                        msg_size,
+                        client_runtime: client_name.to_string(),
+                        server_runtime: "tokio".to_string(),
+                        transport: "redis".to_string(),
+                        protocol: "get".to_string(),
+                        tls: "none".to_string(),
+                        tokio_ringline: None,
+                        tokio_tokio,
+                        ringline_ringline: None,
+                        ringline_tokio,
+                    });
+                }
 
                 eprintln!();
             }
