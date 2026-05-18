@@ -181,6 +181,13 @@ pub(crate) struct Driver {
     pub(crate) max_chain_length: u16,
     /// Per-connection send queues for serializing sends (one in-flight at a time).
     pub(crate) send_queues: Vec<ConnSendState>,
+    /// Connection indices that currently have a `close_notify_deadline`
+    /// armed (TLS graceful-shutdown timeout). The event loop's
+    /// `check_close_notify_deadlines` iterates this set instead of
+    /// walking every entry in `send_queues`, which is critical for
+    /// non-TLS workloads — without this, the per-iteration deadline
+    /// scan dominates worker CPU at high request rates.
+    pub(crate) close_notify_armed: Vec<u32>,
     /// Tick timeout duration. When set, a timeout SQE ensures the event loop
     /// wakes periodically even when no I/O completions are pending.
     pub(crate) tick_timeout_ts: Option<io_uring::types::Timespec>,
@@ -392,6 +399,7 @@ impl Driver {
             chain_table: SendChainTable::new(config.max_connections),
             max_chain_length: config.max_chain_length,
             send_queues,
+            close_notify_armed: Vec::new(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
                     io_uring::types::Timespec::new()
@@ -507,6 +515,7 @@ impl Driver {
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
             send_queues: &mut self.send_queues,
+            close_notify_armed: &mut self.close_notify_armed,
             udp_sockets: &mut self.udp_sockets,
             nvme_devices: &mut self.nvme_devices,
             nvme_cmd_slab: &mut self.nvme_cmd_slab,
@@ -585,6 +594,18 @@ impl Driver {
             return;
         }
         self.send_queues[conn_index as usize].close_pending = false;
+        // Disarm from the close_notify deadline set. swap_remove is
+        // O(n) but the set is bounded by concurrent TLS shutdowns
+        // (typically 0 or single digits) — well below the cost we just
+        // saved by not walking every connection slot in the deadline
+        // check.
+        if let Some(pos) = self
+            .close_notify_armed
+            .iter()
+            .position(|&i| i == conn_index)
+        {
+            self.close_notify_armed.swap_remove(pos);
+        }
         if self.ring.submit_close(conn_index).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
             let retries = self

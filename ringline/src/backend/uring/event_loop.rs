@@ -2341,21 +2341,36 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.drain_completions();
     }
 
-    /// Check close_notify deadlines on all connections. If a connection
+    /// Check close_notify deadlines on the armed set. If a connection
     /// has `close_pending` and the `close_notify_deadline` has elapsed,
     /// force-close it by calling `try_finalize_close`.
+    ///
+    /// Iterates only the indices in `driver.close_notify_armed`, not
+    /// every entry in `driver.send_queues`. For non-TLS workloads the
+    /// armed set is permanently empty and this method is a single
+    /// `Vec::is_empty()` check; for TLS workloads the set is bounded
+    /// by the number of concurrent in-flight TLS graceful shutdowns
+    /// (typically 0 or single digits).
+    ///
+    /// Profiling the redis bench at 1 client × 64 B (i.e. plain TCP)
+    /// showed the previous O(N over all slots) walk at ~25 % of
+    /// worker CPU because it ran on every event-loop iteration; the
+    /// armed-set version drops that to noise.
     fn check_close_notify_deadlines(&mut self) {
+        if self.driver.close_notify_armed.is_empty() {
+            return;
+        }
         let now = std::time::Instant::now();
-        let max = self.driver.send_queues.len();
-        // Collect timed-out indices first to avoid borrow conflict.
+        // Collect timed-out indices first to avoid borrow conflict
+        // with `try_finalize_close`, which mutates `close_notify_armed`.
         let mut timed_out: Vec<u32> = Vec::new();
-        for idx in 0..max {
-            let state = &self.driver.send_queues[idx];
+        for &idx in self.driver.close_notify_armed.iter() {
+            let state = &self.driver.send_queues[idx as usize];
             if state.close_pending
                 && let Some(deadline) = state.close_notify_deadline
                 && now >= deadline
             {
-                timed_out.push(idx as u32);
+                timed_out.push(idx);
             }
         }
         for idx in timed_out {
