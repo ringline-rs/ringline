@@ -158,11 +158,38 @@ impl ShutdownHandle {
     }
 }
 
-// `ShutdownHandle` no longer needs an explicit `Drop`: each `WakeHandle`
-// reference-counts the underlying fd via `Arc<WakeFdInner>`, and the fd
-// closes when the last clone is dropped. Users may keep clones from
-// `worker_wake_handle()` past `ShutdownHandle` drop without leaking the
-// fd — the runtime itself drops its clones when shutdown completes.
+// The wake-fd lifetime no longer needs an explicit `Drop`: each
+// `WakeHandle` reference-counts the underlying fd via `Arc<WakeFdInner>`
+// and closes it when the last clone is dropped. Users may keep clones
+// from `worker_wake_handle()` past `ShutdownHandle` drop without
+// leaking the fd — the runtime itself drops its clones when shutdown
+// completes.
+//
+// However, dropping the handle without ever calling `shutdown()` used
+// to leave workers running forever: the shutdown flag was never set,
+// the listen fd was never closed, and no wake-up was delivered, so the
+// RAII idiom `drop(shutdown); for h in handles { h.join() }` hung
+// indefinitely (reproducer: `cargo bench -p ringline --bench buffer`,
+// which iterates several sizes and depends on each previous server
+// shutting down between iterations). We restore the RAII contract by
+// having `Drop` call `shutdown()` — it's safe to call regardless of
+// whether the caller has already invoked it.
+impl Drop for ShutdownHandle {
+    fn drop(&mut self) {
+        // `shutdown()` is idempotent:
+        //   * `shutdown_flag.store(true)` is monotonic — a second store
+        //     is a no-op.
+        //   * The listen-fd close is gated by an `AtomicBool::swap`, so
+        //     a double-close is impossible whether `Drop` runs before
+        //     or after an explicit `shutdown()`.
+        //   * `WakeHandle::wake` is documented as a no-op write into
+        //     an fd nobody is reading once workers have joined; the
+        //     write either delivers a real wake or returns harmlessly.
+        // Calling it unconditionally here makes the RAII idiom work
+        // while leaving the explicit `.shutdown()` path unchanged.
+        self.shutdown();
+    }
+}
 
 /// Internal enum for the bound listen address.
 enum BindAddr {
