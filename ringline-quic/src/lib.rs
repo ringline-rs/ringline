@@ -41,4 +41,6 @@ pub use error::Error;
 pub use event::{QuicConnId, QuicEvent};
 
 // Re-export commonly used quinn-proto types for convenience.
-pub use quinn_proto::{Dir, ReadError, StreamId, VarInt, WriteError};
+pub use quinn_proto::{
+    ConnectionStats, Dir, FrameStats, PathStats, ReadError, StreamId, UdpStats, VarInt, WriteError,
+};
