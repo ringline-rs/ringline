@@ -149,7 +149,62 @@ The reference client is **reqwest** — the de-facto tokio HTTP client — built
 
 `ringline-http::HttpClient::get("/").send()` runs roughly **2-3× the throughput** of `reqwest::Client::get(url).send()` on the same wire format and the same server. Both paths allocate a builder, encode the request, send over keep-alive, and parse a typed response — the gap is purely in what the runtimes and protocol stacks do underneath.
 
+## HTTP/2 (GET against a synthetic TLS server)
+
+Workload: each client loops `GET /` over a single multiplexed HTTP/2 connection. HTTP/2 is TLS-only in `ringline-http`, so the bench server is hyper + tokio-rustls + a self-signed cert generated at startup; both clients trust it explicitly via `add_root_certificate`. The reference client is reqwest built with `.http2_prior_knowledge().tcp_nodelay(true)` and one pooled connection per host — both sides do a real TLS handshake, build a structured request, parse a structured response.
+
+| Clients × Size | ringline-http | reqwest | ringline vs reqwest |
+|:---|---:|---:|---:|
+| 1c × 64 B   |  25 k |  17 k | **+49 %** |
+| 1c × 512 B  |  25 k |  17 k | +52 % |
+| 1c × 4 KiB  |  22 k |  15 k | +47 % |
+| 1c × 32 KiB |  14 k |  10 k | +35 % |
+| 10c × 64 B  |  88 k |  50 k | **+75 %** |
+| 10c × 512 B |  85 k |  49 k | +71 % |
+| 10c × 4 KiB |  68 k |  43 k | +58 % |
+| 10c × 32 KiB |  28 k |  23 k | +23 % |
+| 50c × 64 B  |  92 k |  51 k | **+80 %** |
+| 50c × 512 B |  87 k |  55 k | +59 % |
+| 50c × 4 KiB |  72 k |  47 k | +52 % |
+| 50c × 32 KiB|  26 k |  24 k | +7 % |
+| 200c × 64 B |  82 k |  54 k | +52 % |
+| 200c × 512 B |  82 k |  52 k | +57 % |
+| 200c × 4 KiB | 72 k |  41 k | +75 % |
+| 200c × 32 KiB|  20 k |  24 k | −15 % |
+
+`ringline-http` HTTP/2 over TLS runs **1.5–1.8× the throughput** of reqwest doing the equivalent work, widening at moderate concurrency (10–50 c) where HTTP/2 multiplexing benefits the runtime's batching most. ringline trails reqwest only at the 200 c × 32 KiB cell, where the bench's ringline send path bottlenecks on the userspace memcpy into the send copy pool — the same shape we see at 32 KiB on TCP and UDP.
+
 ## Highlights & history
+
+### `fix(tls): drain ciphertext fully on recv` (PR #189)
+
+`feed_tls_recv` called `Connection::read_tls` exactly once per CQE
+and then drove the state machine. rustls's `read_tls` reads from
+the supplied `io::Read` in 4 KiB chunks bounded by its own internal
+input buffer; if the buffer can't be drained without first
+producing plaintext (which it can't until we drain it via
+`reader()`), the call stops mid-slice and we silently drop the
+trailing bytes. For HTTP/2 over TLS this manifested as an
+indefinite hang at message sizes ≥ 4 KiB — the response's
+ciphertext arrived in one CQE but only the first 4 KiB ever made
+it into rustls.
+
+Fix: feed in a loop. After each `read_tls` call, run
+`process_new_packets` and drain plaintext via `reader().read()`
+so rustls has buffer room for the next chunk. Loop until the
+cursor is fully consumed or `read_tls` returns 0.
+
+| Bench (ringline → tokio) | Before | After |
+|:---|---:|---:|
+| HTTP/2 1c × 4 KiB | hung at 0 ops/s | 22 k |
+| HTTP/2 10c × 4 KiB | hung at 0 ops/s | 68 k |
+| HTTP/2 50c × 32 KiB | hung at 0 ops/s | 26 k |
+
+Smaller sizes are unaffected: TCP/UDP echo, redis, memcache, and
+HTTP/1.1 numbers all moved within run-to-run noise (the bug only
+triggers when a single TLS record's ciphertext exceeds the rustls
+internal read buffer, which in practice means HTTP/2 large-body
+responses).
 
 ### `perf(bench): zero-allocation recv in UDP echo server` (PR #186)
 
