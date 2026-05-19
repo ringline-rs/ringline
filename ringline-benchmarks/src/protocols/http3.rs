@@ -176,12 +176,22 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
 
         Some(Box::pin(async move {
             loop {
-                // Zero-allocation recv: the kernel-provided buffer is
-                // borrowed for the duration of the callback. At 32 KiB
-                // bodies the bench drives ~5 K packets/sec; the
-                // `Vec<u8>` per packet that `recv_from` allocates is
-                // measurable churn at that rate.
-                let recv_fut = udp.with_datagram(|data, peer| {
+                // Drain every queued UDP datagram in one poll rather
+                // than one wake-cycle per packet. io_uring multishot
+                // recv pushes a CQE per datagram into our queue, but
+                // at 32 KiB body sizes there can be dozens of
+                // datagrams queued by the time the task is polled —
+                // the prior `with_datagram` (one-at-a-time) path
+                // turned that into N executor wake/poll cycles
+                // instead of one, capping pps far below what the
+                // kernel could supply. Same zero-copy semantics: the
+                // callback borrows each kernel buffer for its
+                // duration and the bid is released right after.
+                // Cap the batch at 8: enough to amortise the per-poll
+                // overhead at thousands of pps without delaying ACK /
+                // MAX_STREAM_DATA emission long enough to stall the
+                // peer's congestion window.
+                let recv_fut = udp.recv_batch(8, |data, peer| {
                     quic.handle_datagram(Instant::now(), data, peer);
                 });
                 ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
@@ -371,14 +381,15 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
                     break;
                 }
 
-                match ringline::select(udp.recv_from(), ringline::sleep(Duration::from_millis(1)))
-                    .await
-                {
-                    ringline::Either::Left((data, peer)) => {
-                        quic.handle_datagram(Instant::now(), &data, peer);
-                    }
-                    ringline::Either::Right(()) => {}
-                }
+                // Same batched-drain rationale as the H3 server above.
+                // Cap the batch at 8: enough to amortise the per-poll
+                // overhead at thousands of pps without delaying ACK /
+                // MAX_STREAM_DATA emission long enough to stall the
+                // peer's congestion window.
+                let recv_fut = udp.recv_batch(8, |data, peer| {
+                    quic.handle_datagram(Instant::now(), data, peer);
+                });
+                ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
                 quic.drive_timers(Instant::now());
 
                 while let Some(event) = quic.poll_event() {
