@@ -190,6 +190,13 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                     let _ = h3.handle_quic_event(&mut quic, &event);
                 }
 
+                // Drain H3 events inside a single `quic.batch()` scope so
+                // each completing request's send_response + send_data don't
+                // each trigger their own `drain_transmits` — without this,
+                // every echo response emits ~2 small `sendmsg` calls,
+                // killing GSO coalescing at 50 c × 32 KiB and pricing in
+                // the per-call drain overhead.
+                let mut batch = quic.batch();
                 while let Some(event) = h3.poll_event() {
                     match event {
                         ringline_h3::H3Event::Request {
@@ -200,8 +207,13 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                             if end_stream {
                                 // GET-style: empty body, reply with empty body.
                                 let resp = vec![ringline_h3::HeaderField::new(b":status", b"200")];
-                                let _ = h3.send_response(&mut quic, stream_id, &resp, false);
-                                let _ = h3.send_data(&mut quic, stream_id, b"", true);
+                                let _ = h3.send_response(&mut batch, stream_id, &resp, false);
+                                let _ = h3.send_data_bytes(
+                                    &mut batch,
+                                    stream_id,
+                                    bytes::Bytes::new(),
+                                    true,
+                                );
                             } else {
                                 bodies.insert(u64::from(stream_id), Vec::new());
                             }
@@ -217,8 +229,16 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                             if end_stream {
                                 let body = bodies.remove(&key).unwrap_or_default();
                                 let resp = vec![ringline_h3::HeaderField::new(b":status", b"200")];
-                                let _ = h3.send_response(&mut quic, stream_id, &resp, false);
-                                let _ = h3.send_data(&mut quic, stream_id, &body, true);
+                                let _ = h3.send_response(&mut batch, stream_id, &resp, false);
+                                // `Bytes::from(Vec<u8>)` is O(1) — takes
+                                // ownership of the Vec's buffer without
+                                // copying the body bytes.
+                                let _ = h3.send_data_bytes(
+                                    &mut batch,
+                                    stream_id,
+                                    bytes::Bytes::from(body),
+                                    true,
+                                );
                             }
                         }
                         ringline_h3::H3Event::StreamReset { stream_id, .. } => {
@@ -227,6 +247,7 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                         _ => {}
                     }
                 }
+                drop(batch);
 
                 while let Some(pkt) = quic.poll_send() {
                     match pkt.segment_size {
@@ -336,7 +357,11 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
             }
 
             let mut in_flight: HashMap<u64, PendingReq> = HashMap::new();
-            let payload: Vec<u8> = vec![0xCDu8; state.msg_size];
+            // Cache the payload as a refcounted `Bytes` once.
+            // `send_data_bytes` clones the refcount (O(1)) instead of
+            // copying msg_size bytes per call like `send_data` would
+            // — critical at 32 KiB × hundreds of in-flight streams.
+            let payload = bytes::Bytes::from(vec![0xCDu8; state.msg_size]);
             let mut local_ops: u64 = 0;
             let mut connected = false;
 
@@ -432,10 +457,15 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
                             Ok(s) => s,
                             Err(_) => break,
                         };
-                        // Send body + FIN. If this fails the stream is
-                        // already registered with h3 — best-effort
-                        // skip and try again next tick.
-                        if h3.send_data(&mut batch, stream, &payload, true).is_err() {
+                        // Zero-copy body send: cloning the Bytes is
+                        // an O(1) refcount bump, so the same `payload`
+                        // is shared across every in-flight stream
+                        // instead of a fresh 32 KiB memcpy per call
+                        // like `send_data` would do.
+                        if h3
+                            .send_data_bytes(&mut batch, stream, payload.clone(), true)
+                            .is_err()
+                        {
                             break;
                         }
                         in_flight.insert(

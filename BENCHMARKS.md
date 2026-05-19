@@ -205,24 +205,26 @@ The tokio reference client is **`h3` + `h3-quinn`** — the canonical tokio HTTP
 
 | Clients × Size | ringline-h3 | tokio (h3 + h3-quinn) | ringline vs tokio |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  23 k |  20 k | **+14 %** |
-| 1c × 512 B  |  22 k |  20 k | +14 % |
+| 1c × 64 B   |  22 k |  20 k | +11 % |
+| 1c × 512 B  |  22 k |  20 k | +12 % |
 | 1c × 4 KiB  |  13 k |  13 k | tie |
-| 1c × 32 KiB |   3 k |   4 k | −27 % |
-| 10c × 64 B  |  81 k |  64 k | **+27 %** |
-| 10c × 512 B |  77 k |  71 k | +9 % |
-| 10c × 4 KiB |  34 k |  37 k | −8 % |
-| 10c × 32 KiB |  6 k |   7 k | −12 % |
-| 50c × 64 B  |  78 k |  86 k | −9 % |
-| 50c × 512 B |  81 k |  83 k | −3 % |
-| 50c × 4 KiB |  36 k |  41 k | −13 % |
-| 50c × 32 KiB |  1 k |   8 k | −88 % |
-| 200c × 64 B |  98 k |  94 k | +4 % |
-| 200c × 512 B | 114 k |  91 k | **+26 %** |
-| 200c × 4 KiB | 37 k |  45 k | −17 % |
-| 200c × 32 KiB |  2 k |   8 k | −76 % |
+| 1c × 32 KiB |   3 k |   4 k | −25 % |
+| 10c × 64 B  | 111 k |  70 k | **+59 %** |
+| 10c × 512 B | 114 k |  61 k | **+85 %** |
+| 10c × 4 KiB |  31 k |  35 k | −14 % |
+| 10c × 32 KiB |  6 k |   7 k | −11 % |
+| 50c × 64 B  | 269 k |  79 k | **+239 %** |
+| 50c × 512 B | 104 k |  77 k | **+35 %** |
+| 50c × 4 KiB |  35 k |  41 k | −13 % |
+| 50c × 32 KiB |  2 k |   9 k | −82 % |
+| 200c × 64 B | 285 k |  92 k | **+210 %** |
+| 200c × 512 B | 136 k |  93 k | **+46 %** |
+| 200c × 4 KiB | 34 k |  44 k | −22 % |
+| 200c × 32 KiB |  1 k |   8 k | −87 % |
 
-ringline-h3 leads tokio at low concurrency × small payloads (1 c, 10 c × ≤ 512 B) and at 200 c × 512 B, where the GSO batching pays off. It trails at 32 KiB and from 50 c upward at larger payloads — there the bench client queues a full 32 KiB body per in-flight stream into `H3Connection::pending_sends` and lets the framing layer drain it as flow control opens; the tokio reference instead awaits per-stream flow-control credit at the `send_data` call site (h3-quinn semantics), giving fairer interleaving across streams. Closing that gap is a separate piece of follow-up work — the protocol stack itself is the same on both sides of this row.
+ringline-h3 leads tokio by 1.4–3.3× across small-payload rows (≤ 512 B from 10 c upward). The big wins came from batching the bench server's response path: wrapping the H3 event-drain loop in a `QuicEndpoint::batch()` scope and switching `send_data` → `send_data_bytes` so each echo's body is sent zero-copy from the accumulated `Vec<u8>` (`Bytes::from(Vec<u8>)` is an O(1) ownership transfer). Before the fix, every response triggered its own `drain_transmits` and copied the body into a freshly allocated `Bytes` — at 50 c × 64 B that capped throughput at ~78 k ops/s; after, 269 k.
+
+At 4 KiB and above ringline trails by 11–87 %. The bottleneck there is in the H3 receive path, not the send path: each incoming DATA frame is currently memcpy'd 4× (kernel buffer → io\_uring accumulator → ringline-quic `read_buf` → per-stream `recv_buf` → `Frame::Data { payload: payload.to_vec() }`), which dominates at 32 KiB. Closing that gap requires reworking `H3Connection` to use `Bytes` slices throughout the receive path — a separate piece of work tracked for follow-up.
 
 ## Highlights & history
 
