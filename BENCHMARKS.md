@@ -227,9 +227,27 @@ ringline-h3 leads tokio by 1.4–3× across the entire small-payload zone (≤ 5
   1. **Server-side response batching** (PR #191): wrapping the H3 event-drain in a `QuicEndpoint::batch()` scope and using `send_data_bytes(Bytes::from(body))` instead of `send_data(&body)` collapsed per-response `drain_transmits` calls and eliminated a per-echo body memcpy.
   2. **`UdpCtx::recv_batch()`** (this PR): drains up to N queued UDP datagrams per task poll instead of one. At thousands of packets per second the per-packet executor wake/poll overhead was the bottleneck — that's where the additional 50 c–200 c × 64 B / 512 B headroom came from.
 
-At 32 KiB ringline still trails by ~88 %. The 32 KiB cells are bottlenecked on protocol-layer concerns (ACK pacing under deep flow-control windows on a single QUIC connection) rather than the recv pipeline itself — the bench keeps `num\_clients` × 32 KiB worth of bodies in flight per request and the connection-level credit grants serialize through a single ACK timer. Closing that gap is a future piece of work in `ringline-quic` (per-stream `MAX_STREAM_DATA` eager emission, perhaps via a dedicated send-side credit driver) — not in the recv path.
+At 32 KiB ringline still trails by ~88 %. A focused investigation (see *Highlights — investigation: 32 KiB cell*) pinned this on bursty traffic + RTT variance interacting with quinn-proto's congestion control. The runtime is not CPU-bound (workers idle at ~26 %); the gap is structural to how the loop wakes and processes packet bursts on a single connection. Two diagnostic APIs landed during the investigation (`QuicEndpoint::connection_stats()` and `next_timer_deadline()`) — building blocks for callers that want adaptive scheduling or to react to CC state.
 
 ## Highlights & history
+
+### Investigation: 32 KiB H3 cell — what we found, what to ship next
+
+The 50 c × 32 KiB and 200 c × 32 KiB rows trail tokio by ~6×. A focused profile + instrumentation pass ruled out the obvious suspects and pointed at a structural issue:
+
+  - **Not CPU-bound.** Worker threads idle at ~26 % each during the run; there is ample headroom to do more work.
+  - **Kernel UDP socket buffer is tight on this rig** (`net.core.rmem_max` = 208 KB). Both columns produce kernel `RcvbufErrors`, but tokio produces ~10× *more* drops than ringline and still wins by 6× — drops aren't the gap.
+  - **quinn-proto reports 1–2 % loss** during the ringline column even on localhost. RTT samples range 400 µs – 1.2 ms (large variance). Together these keep CWND oscillating around ~150 KB — with 50 streams × 32 KiB in flight per request batch, only ~150 KB of body data can ever be on the wire at once.
+  - **Iter-gap histogram on the bench client loop** shows ~15 % of iterations sit idle for 1–5 ms between wakes — the natural burst-then-idle shape of a single QUIC connection under flow control. Adaptive sleep using `next_timer_deadline()` collapsed that bucket from ~1500 to ~60 occurrences per 2 s window but did not move throughput materially — the idle time was a *symptom* of the bursty arrival pattern, not the cause.
+
+So the gap isn't "ringline wakes too slowly" — wakes are fast. It's that ringline-quic's CWND can't grow because something in the pipeline produces RTT measurements that quinn-proto's cubic interprets as congestion. Tokio's quinn endpoint, hitting the same ringline server, doesn't trigger that same feedback loop. The fix lives inside the QUIC layer (loss/RTT detection thresholds, or a less variance-sensitive controller like BBR), not in the runtime or the bench.
+
+Two new public APIs landed during the investigation, both small enough to ship as building blocks even though they don't move the bench by themselves:
+
+  - **`QuicEndpoint::connection_stats(conn) -> ConnectionStats`** — quinn-proto's full stats snapshot (RTT, CWND, frame counts, loss). Required for the diagnostic instrumentation above; useful for any caller that wants to react to congestion-control state or build observability into a long-running endpoint.
+  - **`QuicEndpoint::next_timer_deadline() -> Option<Instant>`** — earliest pending QUIC timer across all live connections. The bench's adaptive-sleep loop uses this to wake on the right tick instead of polling every 1 ms; for users with non-bursty workloads, this is a real latency-floor win.
+
+`ConnectionStats`, `PathStats`, `FrameStats`, and `UdpStats` are now re-exported from `ringline_quic::` for ergonomic access. The 32 KiB cells themselves did not improve in this pass — closing that gap is queued as future QUIC-layer work.
 
 ### `perf(runtime): UdpCtx::recv_batch() drain-style UDP recv`
 

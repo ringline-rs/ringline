@@ -553,6 +553,50 @@ impl QuicEndpoint {
         Ok(c.conn.streams().open(Dir::Bi))
     }
 
+    /// Earliest quinn-proto timer deadline across all live connections,
+    /// or `None` if no connection currently has a pending timer.
+    ///
+    /// Use this to size an adaptive sleep: callers that select between
+    /// "next datagram" and "wake periodically to service timers" should
+    /// sleep until this deadline rather than picking an arbitrary
+    /// interval. Sleeping longer than the deadline lets quinn-proto
+    /// fall behind on PTO / loss-recovery timers and stalls the
+    /// connection; sleeping much shorter wastes wake cycles when no
+    /// packets are flowing.
+    pub fn next_timer_deadline(&mut self) -> Option<Instant> {
+        let mut earliest: Option<Instant> = None;
+        for key in 0..self.connections.capacity() {
+            if !self.connections.contains(key) {
+                continue;
+            }
+            if let Some(t) = self.connections[key].conn.poll_timeout() {
+                earliest = Some(match earliest {
+                    Some(prev) => prev.min(t),
+                    None => t,
+                });
+            }
+        }
+        earliest
+    }
+
+    /// Snapshot of quinn-proto connection statistics (RTT, CWND, frame
+    /// counts, loss). Useful for diagnostics and for adaptive policies
+    /// that want to react to congestion-control state.
+    ///
+    /// The returned [`quinn_proto::ConnectionStats`] is a `Copy` value
+    /// — callers can hold it indefinitely without keeping a borrow on
+    /// the endpoint.
+    pub fn connection_stats(
+        &self,
+        conn: QuicConnId,
+    ) -> Result<quinn_proto::ConnectionStats, Error> {
+        let key = conn.0 as usize;
+        if !self.connections.contains(key) {
+            return Err(Error::InvalidConnection);
+        }
+        Ok(self.connections[key].conn.stats())
+    }
+
     /// Open a unidirectional stream.
     ///
     /// Returns `None` if the peer's stream concurrency limit has been reached.
