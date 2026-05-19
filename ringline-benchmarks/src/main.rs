@@ -295,52 +295,67 @@ fn main() {
     }
 
     // ── QUIC echo benchmarks ──────────────────────────────────────
+    //
+    // Same shape as the HTTP/2 bench. The server is a ringline QUIC
+    // echo built on `ringline_quic::QuicEndpoint`; the bench varies
+    // the client runtime. ringline-quic is sans-IO so the ringline
+    // client is a single async task that drives the QUIC state
+    // machine and keeps `num_clients` bidirectional streams in flight
+    // at a time. The tokio reference uses quinn.
     if do_quic || do_all {
         eprintln!("\n=== QUIC Echo Benchmarks ===\n");
 
         let port_manager = port_manager.clone();
         for &num_clients in &args.clients {
             for &msg_size in &args.sizes {
-                let result = quic::run_quic(
-                    &port_manager,
-                    workers,
-                    num_clients,
-                    msg_size,
-                    warmup,
-                    duration,
-                    ClientRuntime::Ringline,
-                    ServerRuntime::Ringline,
-                );
+                let combos: &[(&str, ClientRuntime)] = &[
+                    ("ringline", ClientRuntime::Ringline),
+                    ("tokio", ClientRuntime::Tokio),
+                ];
 
-                eprint!(
-                    "  {:>8} -> {:<8}  {:>4}c x {:>5}: ",
-                    "ringline",
-                    "ringline",
-                    num_clients,
-                    format_size(msg_size),
-                );
+                for &(client_name, client_rt) in combos {
+                    let result = quic::run_quic(
+                        &port_manager,
+                        workers,
+                        num_clients,
+                        msg_size,
+                        warmup,
+                        duration,
+                        client_rt,
+                        ServerRuntime::Ringline,
+                    );
 
-                eprintln!(
-                    "{:>9.0} ops/s  p50: {}  p99: {}",
-                    result.ops_per_sec,
-                    format_ns(result.latency.p50_ns),
-                    format_ns(result.latency.p99_ns),
-                );
+                    eprintln!(
+                        "  {:>8} -> {:<8}  {:>4}c x {:>5}: {:>9.0} ops/s  p50: {}  p99: {}",
+                        client_name,
+                        "ringline",
+                        num_clients,
+                        format_size(msg_size),
+                        result.ops_per_sec,
+                        format_ns(result.latency.p50_ns),
+                        format_ns(result.latency.p99_ns),
+                    );
 
-                all_results.push(ConfigResult {
-                    workers,
-                    clients: num_clients,
-                    msg_size,
-                    client_runtime: "ringline".to_string(),
-                    server_runtime: "ringline".to_string(),
-                    transport: "quic".to_string(),
-                    protocol: "echo".to_string(),
-                    tls: "none".to_string(),
-                    tokio_ringline: None,
-                    tokio_tokio: None,
-                    ringline_ringline: Some(result),
-                    ringline_tokio: None,
-                });
+                    let (ringline_ringline, tokio_ringline) = match client_name {
+                        "ringline" => (Some(result), None),
+                        _ => (None, Some(result)),
+                    };
+
+                    all_results.push(ConfigResult {
+                        workers,
+                        clients: num_clients,
+                        msg_size,
+                        client_runtime: client_name.to_string(),
+                        server_runtime: "ringline".to_string(),
+                        transport: "quic".to_string(),
+                        protocol: "echo".to_string(),
+                        tls: "rustls".to_string(),
+                        tokio_ringline,
+                        tokio_tokio: None,
+                        ringline_ringline,
+                        ringline_tokio: None,
+                    });
+                }
 
                 eprintln!();
             }
