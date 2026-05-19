@@ -199,30 +199,30 @@ ringline-quic pulls ahead at 1 c and at high concurrency (200 c); quinn keeps a 
 
 ## HTTP/3 (POST echo against a ringline server)
 
-Workload: a single QUIC connection multiplexes `num\_clients` concurrent bidirectional HTTP/3 request streams. Each iteration is a `POST /echo` with an `msg\_size`-byte body; the server echoes the body back in a DATA frame with FIN. As soon as one request completes the client opens a replacement so there are always `num\_clients` requests in flight. Both client and server drive `ringline_h3::H3Connection` on top of `ringline_quic::QuicEndpoint` from a `ringline` worker task — the client wraps `send_request` + `send_data` in `QuicEndpoint::batch()` for the same GSO-coalescing benefit as the raw QUIC bench.
+Workload: a single QUIC connection multiplexes `num\_clients` concurrent bidirectional HTTP/3 request streams. Each iteration is a `POST /echo` with an `msg\_size`-byte body; the server echoes the body back in a DATA frame with FIN. As soon as one request completes the client opens a replacement so there are always `num\_clients` requests in flight. The server is a ringline `AsyncEventHandler` driving `ringline_h3::H3Connection` on top of `ringline_quic::QuicEndpoint`. The ringline client uses the same stack from another worker task and wraps `send_request` + `send_data` in `QuicEndpoint::batch()` for GSO coalescing.
 
-There is no tokio reference cell for HTTP/3 yet: the canonical tokio H3 stack (`h3` + `h3-quinn`) pulls in a sizeable extra dependency set and the QUIC bench already covers the quinn transport path.
+The tokio reference client is **`h3` + `h3-quinn`** — the canonical tokio HTTP/3 stack — running on quinn for the transport. Both clients hit the same ringline server and negotiate ALPN `h3` over TLS 1.3 against the same self-signed cert.
 
-| Clients × Size | ringline-h3 → ringline-h3 | p50 | p99 |
+| Clients × Size | ringline-h3 | tokio (h3 + h3-quinn) | ringline vs tokio |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  21 k | 40 µs | 80 µs |
-| 1c × 512 B  |  23 k | 41 µs | 80 µs |
-| 1c × 4 KiB  |  13 k | 72 µs | 124 µs |
-| 1c × 32 KiB |   3 k | 309 µs | 436 µs |
-| 10c × 64 B  |  81 k | 113 µs | 193 µs |
-| 10c × 512 B |  80 k | 120 µs | 194 µs |
-| 10c × 4 KiB |  32 k | 293 µs | 460 µs |
-| 10c × 32 KiB |  6 k | 1.66 ms | 2.57 ms |
-| 50c × 64 B  |  94 k | 521 µs | 694 µs |
-| 50c × 512 B |  77 k | 570 µs | 885 µs |
-| 50c × 4 KiB |  37 k | 1.30 ms | 2.09 ms |
-| 50c × 32 KiB |  1 k | 13.8 ms | 174 ms |
-| 200c × 64 B |  91 k | 2.18 ms | 3.35 ms |
-| 200c × 512 B | 116 k | 1.70 ms | 2.69 ms |
-| 200c × 4 KiB | 37 k | 5.28 ms | 9.77 ms |
-| 200c × 32 KiB |  2 k | 60.8 ms | 372 ms |
+| 1c × 64 B   |  23 k |  20 k | **+14 %** |
+| 1c × 512 B  |  22 k |  20 k | +14 % |
+| 1c × 4 KiB  |  13 k |  13 k | tie |
+| 1c × 32 KiB |   3 k |   4 k | −27 % |
+| 10c × 64 B  |  81 k |  64 k | **+27 %** |
+| 10c × 512 B |  77 k |  71 k | +9 % |
+| 10c × 4 KiB |  34 k |  37 k | −8 % |
+| 10c × 32 KiB |  6 k |   7 k | −12 % |
+| 50c × 64 B  |  78 k |  86 k | −9 % |
+| 50c × 512 B |  81 k |  83 k | −3 % |
+| 50c × 4 KiB |  36 k |  41 k | −13 % |
+| 50c × 32 KiB |  1 k |   8 k | −88 % |
+| 200c × 64 B |  98 k |  94 k | +4 % |
+| 200c × 512 B | 114 k |  91 k | **+26 %** |
+| 200c × 4 KiB | 37 k |  45 k | −17 % |
+| 200c × 32 KiB |  2 k |   8 k | −76 % |
 
-At small payloads HTTP/3 lands within roughly 70-90 % of the raw QUIC bench at matching concurrency — the gap is QPACK encoding/decoding and HTTP/3 framing on top of the same transport. The 32 KiB rows fall off sharply as the test enters tail-dominated territory: with one QUIC connection's flow-control window shared across `num\_clients` streams, each in-flight 32 KiB body queues behind credit grants and the round-trip latency stretches into the milliseconds.
+ringline-h3 leads tokio at low concurrency × small payloads (1 c, 10 c × ≤ 512 B) and at 200 c × 512 B, where the GSO batching pays off. It trails at 32 KiB and from 50 c upward at larger payloads — there the bench client queues a full 32 KiB body per in-flight stream into `H3Connection::pending_sends` and lets the framing layer drain it as flow control opens; the tokio reference instead awaits per-stream flow-control credit at the `send_data` call site (h3-quinn semantics), giving fairer interleaving across streams. Closing that gap is a separate piece of follow-up work — the protocol stack itself is the same on both sides of this row.
 
 ## Highlights & history
 

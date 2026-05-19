@@ -54,3 +54,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = { workspace = true }
 crossbeam-channel = "0.5"
+# Tokio HTTP/3 reference for the H3 bench — `h3` is the protocol
+# layer, `h3-quinn` plugs it into `quinn`. Same shape as the QUIC
+# bench's tokio cell: quinn for the transport, h3 stacked on top
+# for HTTP/3 framing.
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"

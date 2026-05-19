@@ -18,11 +18,13 @@ use crate::stats::{BenchResult, LatencyHistogram, LatencyStats, process_cpu_time
 /// with FIN. As soon as a stream completes the client opens a
 /// replacement so the in-flight count stays at `num_clients`.
 ///
-/// Both sides drive `ringline_h3::H3Connection` on top of
-/// `ringline_quic::QuicEndpoint` from a `ringline` worker task.
-/// There is no tokio reference cell here: HTTP/3 client crates that
-/// fit the tokio model (`h3` + `h3-quinn`) are heavyweight extra
-/// dependencies and the QUIC bench already covers the quinn path.
+/// The server is a `ringline` `AsyncEventHandler` driving
+/// `ringline_h3::H3Connection` on top of `ringline_quic::QuicEndpoint`.
+/// The ringline client uses the same stack from another worker task;
+/// the tokio reference client is `h3` + `h3-quinn` — the canonical
+/// tokio HTTP/3 stack — running on quinn for the transport. Both
+/// sides do a real TLS 1.3 + ALPN (`h3`) handshake against the same
+/// self-signed cert.
 #[allow(clippy::too_many_arguments)]
 pub fn run_http3(
     port_manager: &PortManager,
@@ -31,7 +33,7 @@ pub fn run_http3(
     msg_size: usize,
     warmup: Duration,
     duration: Duration,
-    _client_runtime: ClientRuntime,
+    client_runtime: ClientRuntime,
     _server_runtime: ServerRuntime,
 ) -> BenchResult {
     let (certs, key) = generate_self_signed();
@@ -45,7 +47,12 @@ pub fn run_http3(
         }
     };
 
-    let result = run_bench_ringline(server_addr, certs, num_clients, msg_size, warmup, duration);
+    let result = match client_runtime {
+        ClientRuntime::Tokio => {
+            run_bench_tokio(server_addr, &certs, num_clients, msg_size, warmup, duration)
+        }
+        _ => run_bench_ringline(server_addr, certs, num_clients, msg_size, warmup, duration),
+    };
 
     server.stop();
     std::thread::sleep(Duration::from_millis(100));
@@ -77,11 +84,23 @@ fn generate_self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'stati
     (vec![CertificateDer::from(cert.cert)], key.into())
 }
 
+const H3_ALPN: &[u8] = b"h3";
+
 fn quinn_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Arc<quinn_proto::ServerConfig> {
-    let mut sc = quinn_proto::ServerConfig::with_single_cert(certs, key).expect("server config");
+    // Build a rustls ServerConfig directly so we can advertise the
+    // `h3` ALPN. `h3-quinn` (the tokio reference) requires this for
+    // the handshake to complete.
+    let mut tls_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("server cert");
+    tls_cfg.alpn_protocols = vec![H3_ALPN.to_vec()];
+    let qsc =
+        quinn_proto::crypto::rustls::QuicServerConfig::try_from(tls_cfg).expect("quic server tls");
+    let mut sc = quinn_proto::ServerConfig::with_crypto(Arc::new(qsc));
     let transport = Arc::get_mut(&mut sc.transport).unwrap();
     transport.max_concurrent_bidi_streams(1024u32.into());
     transport.max_concurrent_uni_streams(1024u32.into());
@@ -93,13 +112,13 @@ fn quinn_client_config(certs: &[CertificateDer<'static>]) -> quinn_proto::Client
     for cert in certs {
         roots.add(cert.clone()).expect("add cert");
     }
-    let crypto = rustls::ClientConfig::builder()
+    let mut tls_cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let mut cc = quinn_proto::ClientConfig::new(Arc::new(
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(crypto)
-            .expect("quic client config"),
-    ));
+    tls_cfg.alpn_protocols = vec![H3_ALPN.to_vec()];
+    let qcc =
+        quinn_proto::crypto::rustls::QuicClientConfig::try_from(tls_cfg).expect("quic client tls");
+    let mut cc = quinn_proto::ClientConfig::new(Arc::new(qcc));
     let mut tp = quinn_proto::TransportConfig::default();
     tp.max_concurrent_bidi_streams(1024u32.into());
     tp.max_concurrent_uni_streams(1024u32.into());
@@ -520,6 +539,164 @@ fn run_bench_ringline(
     }
 
     RINGLINE_H3_CFG.lock().unwrap().take();
+
+    let total_ops = ops.load(Ordering::Relaxed);
+    let ops_per_sec = total_ops as f64 / elapsed.as_secs_f64();
+
+    let mut histogram = LatencyHistogram::new();
+    while let Ok(sample) = sample_rx.try_recv() {
+        histogram.record(sample);
+    }
+
+    BenchResult {
+        ops_per_sec,
+        latency: histogram.finalize(),
+        cpu_ns: cpu_after.saturating_sub(cpu_before),
+    }
+}
+
+// ── Tokio reference client (h3 + h3-quinn) ──────────────────────────
+
+async fn run_h3_request_loop(
+    send_request: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+    msg_size: usize,
+    stop: Arc<AtomicBool>,
+    ops_counter: Arc<AtomicU64>,
+    sample_tx: crossbeam_channel::Sender<u64>,
+) {
+    let payload = bytes::Bytes::from(vec![0xCDu8; msg_size]);
+    let mut local_ops: u64 = 0;
+    let mut send_request = send_request;
+
+    while !stop.load(Ordering::Relaxed) {
+        let req = match http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/echo")
+            .body(())
+        {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        let t0 = Instant::now();
+        let mut stream = match send_request.send_request(req).await {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        if stream.send_data(payload.clone()).await.is_err() {
+            break;
+        }
+        if stream.finish().await.is_err() {
+            break;
+        }
+        if stream.recv_response().await.is_err() {
+            break;
+        }
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(_chunk)) => {}
+                Ok(None) => break,
+                Err(_) => return,
+            }
+        }
+        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        sample_tx.try_send(elapsed_ns).ok();
+
+        local_ops += 1;
+        if local_ops & 0xFF == 0 {
+            ops_counter.fetch_add(256, Ordering::Relaxed);
+        }
+    }
+    ops_counter.fetch_add(local_ops & 0xFF, Ordering::Relaxed);
+}
+
+fn run_bench_tokio(
+    server_addr: SocketAddr,
+    certs: &[CertificateDer<'static>],
+    num_clients: usize,
+    msg_size: usize,
+    warmup: Duration,
+    duration: Duration,
+) -> BenchResult {
+    let stop = Arc::new(AtomicBool::new(false));
+    let ops = Arc::new(AtomicU64::new(0));
+    let (sample_tx, sample_rx) = crossbeam_channel::unbounded::<u64>();
+
+    let client_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("failed to build client runtime");
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert.clone()).expect("add cert");
+    }
+    let mut tls_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_cfg.alpn_protocols = vec![H3_ALPN.to_vec()];
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(
+        quinn_proto::crypto::rustls::QuicClientConfig::try_from(tls_cfg).expect("quic tls"),
+    ));
+    let mut tp = quinn_proto::TransportConfig::default();
+    tp.max_concurrent_bidi_streams(1024u32.into());
+    tp.max_concurrent_uni_streams(1024u32.into());
+    client_cfg.transport_config(Arc::new(tp));
+
+    // Set up quinn endpoint + connect, then layer h3 on top.
+    let (driver_handle, send_request) = client_rt.block_on(async {
+        let mut endpoint =
+            quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).expect("quinn endpoint");
+        endpoint.set_default_client_config(client_cfg);
+        let conn = endpoint
+            .connect(server_addr, "localhost")
+            .expect("connect submit")
+            .await
+            .expect("connect await");
+        let quinn_conn = h3_quinn::Connection::new(conn);
+        let (mut driver, send_request) = h3::client::new(quinn_conn).await.expect("h3 client");
+        // The driver future drains the H3 connection until close; spawn
+        // and ignore — same pattern as the official h3 example.
+        let driver_handle = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        (driver_handle, send_request)
+    });
+
+    let mut task_handles = Vec::with_capacity(num_clients);
+    for _ in 0..num_clients {
+        // h3's SendRequest is Clone; each cloned handle issues
+        // requests on its own bidirectional stream multiplexed over
+        // the shared QUIC connection.
+        let sr = send_request.clone();
+        let stop = stop.clone();
+        let ops = ops.clone();
+        let sample_tx = sample_tx.clone();
+        task_handles.push(client_rt.spawn(run_h3_request_loop(sr, msg_size, stop, ops, sample_tx)));
+    }
+    // The driver only closes once every SendRequest is dropped — drop
+    // our copy now so it dies cleanly with the spawned workers.
+    drop(send_request);
+
+    std::thread::sleep(warmup);
+    ops.store(0, Ordering::Relaxed);
+
+    let cpu_before = process_cpu_time_ns();
+    let start = Instant::now();
+    std::thread::sleep(duration);
+    let elapsed = start.elapsed();
+    let cpu_after = process_cpu_time_ns();
+    stop.store(true, Ordering::Relaxed);
+
+    client_rt.block_on(async {
+        for handle in task_handles {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), driver_handle).await;
+    });
+
+    client_rt.shutdown_timeout(Duration::from_secs(1));
 
     let total_ops = ops.load(Ordering::Relaxed);
     let ops_per_sec = total_ops as f64 / elapsed.as_secs_f64();
