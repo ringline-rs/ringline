@@ -37,6 +37,10 @@ hyper-util = { version = "0.1", features = ["tokio", "server"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 http-body-util = "0.1"
 quinn-proto = { workspace = true }
+# The QUIC bench's tokio reference client is built on `quinn` — the
+# tokio-friendly wrapper around `quinn-proto`. ringline-benchmarks
+# only needs the runtime side; rustls comes from the workspace.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 # `ring` crypto provider is what tokio-rustls's `ring` feature
 # selects; matching it here lets `ServerConfig::builder()` find a
 # default provider without explicit `install_default()`.

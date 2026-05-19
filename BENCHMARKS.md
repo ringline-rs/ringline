@@ -174,7 +174,60 @@ Workload: each client loops `GET /` over a single multiplexed HTTP/2 connection.
 
 `ringline-http` HTTP/2 over TLS runs **1.5–1.8× the throughput** of reqwest doing the equivalent work, widening at moderate concurrency (10–50 c) where HTTP/2 multiplexing benefits the runtime's batching most. ringline trails reqwest only at the 200 c × 32 KiB cell, where the bench's ringline send path bottlenecks on the userspace memcpy into the send copy pool — the same shape we see at 32 KiB on TCP and UDP.
 
+## QUIC (stream echo against a ringline server)
+
+Workload: a single QUIC connection multiplexes `num\_clients` concurrent bidirectional streams. Each stream writes `msg\_size` bytes + FIN, reads the echoed `msg\_size` bytes, and is replaced by a fresh stream as soon as it completes — so there are always `num\_clients` streams in flight at steady state. The server is a ringline `AsyncEventHandler` that drives `ringline_quic::QuicEndpoint` from `on_udp_bind`; same TLS 1.3 + ALPN handshake against a self-signed cert as the HTTP/2 bench. Both clients hit this same server.
+
+The tokio reference client is **quinn** — the de-facto tokio QUIC stack — also built on `quinn-proto`.
+
+| Clients × Size | ringline-quic | quinn | ringline vs quinn |
+|:---|---:|---:|---:|
+| 1c × 64 B   |  27 k |  25 k | +10 % |
+| 1c × 512 B  |  27 k |  25 k | +9 % |
+| 1c × 4 KiB  |  14 k |  16 k | −14 % |
+| 10c × 64 B  |  98 k | 108 k | −9 % |
+| 10c × 512 B |  87 k |  87 k | tie |
+| 10c × 4 KiB |  32 k |  36 k | −13 % |
+| 50c × 64 B  | 111 k | 121 k | −8 % |
+| 50c × 512 B |  95 k | 103 k | −8 % |
+| 50c × 4 KiB |  33 k |  35 k | −6 % |
+| 200c × 64 B | 162 k | 124 k | **+31 %** |
+| 200c × 512 B | 148 k | 128 k | **+16 %** |
+| 200c × 4 KiB |  38 k |  38 k | tie |
+
+ringline-quic pulls ahead at 1 c and at high concurrency (200 c); quinn keeps a small edge at moderate concurrency × small payloads. The high-concurrency wins came from the GSO batching API (PR #190) — wrapping stream operations in `QuicEndpoint::batch()` lets quinn-proto coalesce multiple per-stream packets into one GSO segment, turning N small `sendmsg` syscalls into one. At lower concurrency the batch isn't big enough to fill a GSO segment so the underlying work is unchanged.
+
 ## Highlights & history
+
+### `perf(quic): batched stream operations for GSO coalescing` (PR #190)
+
+`ringline-quic`'s `stream_send` / `stream_finish` / `open_bi` /
+related entry points each called the internal `drain_transmits`
+inline. That made quinn-proto's `poll_transmit` produce ~one UDP
+datagram per stream operation, so a tight loop opening N streams
+and writing a request on each would emit ~3N small `sendmsg`
+syscalls instead of one GSO segment.
+
+Profiling the bench at 50 c × 512 B showed **~21 % of CPU in the
+kernel UDP sendmsg path**; instrumenting the bench's send loop
+confirmed that 95 %+ of outgoing packets were non-GSO.
+
+New API: `QuicEndpoint::batch()` returns a `BatchGuard` that
+suppresses per-op drains for the duration of the scope. On drop
+the guard performs one `flush()`, giving quinn-proto a single
+opportunity to coalesce the batched work into a GSO segment that
+runtime adapters with `UDP_SEGMENT` support can hand to the
+kernel in one syscall.
+
+| Bench (QUIC, ringline → ringline) | Before | After | Δ |
+|:---|---:|---:|---:|
+| 200c × 64 B  | 139 k | **162 k** | **+17 %** |
+| 200c × 512 B | 139 k | 148 k | +6 % |
+| 200c × 4 KiB |  34 k |  38 k | +13 % |
+
+Below 200 c the batch isn't big enough to fill a GSO segment so
+the underlying work is unchanged; cells at 1 c / 10 c / 50 c
+moved within run-to-run noise.
 
 ### `fix(tls): drain ciphertext fully on recv` (PR #189)
 

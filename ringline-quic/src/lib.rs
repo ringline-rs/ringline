@@ -36,7 +36,7 @@ pub mod error;
 pub mod event;
 
 pub use config::QuicConfig;
-pub use endpoint::{Datagrams, OutgoingPacket, QuicEndpoint};
+pub use endpoint::{BatchGuard, Datagrams, OutgoingPacket, QuicEndpoint};
 pub use error::Error;
 pub use event::{QuicConnId, QuicEvent};
 
