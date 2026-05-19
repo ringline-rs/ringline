@@ -176,14 +176,15 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
 
         Some(Box::pin(async move {
             loop {
-                match ringline::select(udp.recv_from(), ringline::sleep(Duration::from_millis(1)))
-                    .await
-                {
-                    ringline::Either::Left((data, peer)) => {
-                        quic.handle_datagram(Instant::now(), &data, peer);
-                    }
-                    ringline::Either::Right(()) => {}
-                }
+                // Zero-allocation recv: the kernel-provided buffer is
+                // borrowed for the duration of the callback. At 32 KiB
+                // bodies the bench drives ~5 K packets/sec; the
+                // `Vec<u8>` per packet that `recv_from` allocates is
+                // measurable churn at that rate.
+                let recv_fut = udp.with_datagram(|data, peer| {
+                    quic.handle_datagram(Instant::now(), data, peer);
+                });
+                ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
                 quic.drive_timers(Instant::now());
 
                 while let Some(event) = quic.poll_event() {
