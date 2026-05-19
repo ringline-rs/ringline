@@ -348,7 +348,7 @@ impl H3TestClient {
         // Encode DATA frame if body present.
         if let Some(body) = body {
             ringline_h3::Frame::Data {
-                payload: body.to_vec(),
+                payload: bytes::Bytes::copy_from_slice(body),
             }
             .encode(&mut frame_buf);
         }

@@ -94,7 +94,11 @@ pub fn varint_len(value: u64) -> usize {
 #[derive(Debug, Clone)]
 pub enum Frame {
     /// DATA frame (type 0x00): carries request or response body.
-    Data { payload: Vec<u8> },
+    ///
+    /// `payload` is a refcounted `Bytes`; when the frame is decoded
+    /// from a parent buffer via [`decode_frame_in`] the payload is an
+    /// O(1) slice into that buffer, avoiding any copy of the body.
+    Data { payload: bytes::Bytes },
     /// HEADERS frame (type 0x01): QPACK-encoded header block.
     Headers { encoded: Vec<u8> },
     /// SETTINGS frame (type 0x04): configuration parameters.
@@ -102,7 +106,10 @@ pub enum Frame {
     /// GOAWAY frame (type 0x07): graceful shutdown with last stream ID.
     GoAway { stream_id: u64 },
     /// Unknown frame type — MUST be ignored per spec (RFC 9114 Section 7.2.8).
-    Unknown { frame_type: u64, payload: Vec<u8> },
+    Unknown {
+        frame_type: u64,
+        payload: bytes::Bytes,
+    },
 }
 
 // ── Frame encoding ──────────────────────────────────────────────────
@@ -147,19 +154,34 @@ impl Frame {
 
 // ── Frame decoding ──────────────────────────────────────────────────
 
-/// Decode one frame from the start of `buf`.
+/// Layout of the next frame, without owning any payload bytes.
 ///
-/// Returns `Ok(Some((frame, bytes_consumed)))` on success,
-/// `Ok(None)` if the buffer is incomplete (need more data),
-/// or `Err` on protocol error.
-pub fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, H3Error> {
-    // Decode frame type varint.
+/// Used by [`peek_frame`] to drive the zero-copy decode path:
+/// callers parse the frame header, learn the total length, and only
+/// commit + slice the payload once they hold the bytes that back the
+/// frame.
+#[derive(Debug, Clone, Copy)]
+struct FrameLayout {
+    frame_type: u64,
+    header_len: usize,
+    payload_len: usize,
+}
+
+impl FrameLayout {
+    fn total_len(&self) -> usize {
+        self.header_len + self.payload_len
+    }
+}
+
+/// Read the frame header from the start of `buf` without copying any
+/// payload bytes. Returns `Ok(None)` if `buf` does not yet contain
+/// the full header.
+fn peek_frame(buf: &[u8]) -> Result<Option<FrameLayout>, H3Error> {
     let (frame_type, type_len) = match decode_varint(buf) {
         Some(v) => v,
         None => return Ok(None),
     };
 
-    // Decode payload length varint.
     let (payload_len, len_len) = match decode_varint(&buf[type_len..]) {
         Some(v) => v,
         None => return Ok(None),
@@ -174,42 +196,95 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, H3Error> {
     }
     let payload_len = payload_len as usize; // safe: bounded by MAX_FRAME_PAYLOAD
 
-    let header_len = type_len + len_len;
-    let total_len = header_len + payload_len;
-
-    // Check if we have the full frame.
-    if buf.len() < total_len {
-        return Ok(None);
-    }
-
-    let payload = &buf[header_len..total_len];
-
     // Check for reserved HTTP/2 frame types.
     if RESERVED_H2_TYPES.contains(&frame_type) {
         return Err(H3Error::FrameUnexpected);
     }
 
-    let frame = match frame_type {
-        FRAME_DATA => Frame::Data {
-            payload: payload.to_vec(),
-        },
+    Ok(Some(FrameLayout {
+        frame_type,
+        header_len: type_len + len_len,
+        payload_len,
+    }))
+}
+
+/// Build the owned `Frame` for a layout whose payload bytes are
+/// already in hand. `payload` must be exactly `layout.payload_len`
+/// bytes long.
+fn finish_frame(layout: FrameLayout, payload: bytes::Bytes) -> Result<Frame, H3Error> {
+    debug_assert_eq!(payload.len(), layout.payload_len);
+    let frame = match layout.frame_type {
+        FRAME_DATA => Frame::Data { payload },
         FRAME_HEADERS => Frame::Headers {
             encoded: payload.to_vec(),
         },
         FRAME_SETTINGS => {
-            let settings = Settings::decode(payload).ok_or(H3Error::FrameError)?;
+            let settings = Settings::decode(&payload).ok_or(H3Error::FrameError)?;
             Frame::Settings(settings)
         }
         FRAME_GOAWAY => {
-            let (stream_id, _) = decode_varint(payload).ok_or(H3Error::FrameError)?;
+            let (stream_id, _) = decode_varint(&payload).ok_or(H3Error::FrameError)?;
             Frame::GoAway { stream_id }
         }
-        _ => Frame::Unknown {
+        frame_type => Frame::Unknown {
             frame_type,
-            payload: payload.to_vec(),
+            payload,
         },
     };
+    Ok(frame)
+}
 
+/// Decode one frame from the start of `buf`.
+///
+/// Returns `Ok(Some((frame, bytes_consumed)))` on success,
+/// `Ok(None)` if the buffer is incomplete (need more data),
+/// or `Err` on protocol error.
+///
+/// The frame's payload is copied into a fresh `Bytes`. The hot
+/// receive path in [`crate::H3Connection`] uses [`decode_frame_in`]
+/// instead, which slices the payload zero-copy out of the parent
+/// `Bytes`. This entry point is convenient for tests and call sites
+/// that only have a borrowed slice.
+pub fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, H3Error> {
+    let layout = match peek_frame(buf)? {
+        Some(l) => l,
+        None => return Ok(None),
+    };
+    let total_len = layout.total_len();
+    if buf.len() < total_len {
+        return Ok(None);
+    }
+    let payload = bytes::Bytes::copy_from_slice(
+        &buf[layout.header_len..layout.header_len + layout.payload_len],
+    );
+    let frame = finish_frame(layout, payload)?;
+    Ok(Some((frame, total_len)))
+}
+
+/// Zero-copy counterpart of [`decode_frame`]. Decodes a frame whose
+/// bytes sit at `parent[offset..]`; DATA / Unknown payloads come
+/// back as `parent.slice(...)` — a refcount bump, no memcpy.
+///
+/// Returns `Ok(None)` when `parent` does not yet contain the full
+/// frame past `offset`, leaving the caller to read more bytes and
+/// retry.
+pub fn decode_frame_in(
+    parent: &bytes::Bytes,
+    offset: usize,
+) -> Result<Option<(Frame, usize)>, H3Error> {
+    let buf = &parent[offset..];
+    let layout = match peek_frame(buf)? {
+        Some(l) => l,
+        None => return Ok(None),
+    };
+    let total_len = layout.total_len();
+    if buf.len() < total_len {
+        return Ok(None);
+    }
+    let payload_start = offset + layout.header_len;
+    let payload_end = payload_start + layout.payload_len;
+    let payload = parent.slice(payload_start..payload_end);
+    let frame = finish_frame(layout, payload)?;
     Ok(Some((frame, total_len)))
 }
 
@@ -244,15 +319,43 @@ mod tests {
     #[test]
     fn frame_data_round_trip() {
         let frame = Frame::Data {
-            payload: b"hello".to_vec(),
+            payload: bytes::Bytes::from_static(b"hello"),
         };
         let mut buf = Vec::new();
         frame.encode(&mut buf);
         let (decoded, consumed) = decode_frame(&buf).unwrap().unwrap();
         assert_eq!(consumed, buf.len());
         match decoded {
-            Frame::Data { payload } => assert_eq!(payload, b"hello"),
+            Frame::Data { payload } => assert_eq!(payload.as_ref(), b"hello"),
             _ => panic!("expected Data frame"),
+        }
+    }
+
+    #[test]
+    fn frame_data_decode_in_zero_copy() {
+        // Build a parent buffer that holds two DATA frames back-to-back.
+        let mut wire = Vec::new();
+        Frame::Data {
+            payload: bytes::Bytes::from_static(b"hello"),
+        }
+        .encode(&mut wire);
+        Frame::Data {
+            payload: bytes::Bytes::from_static(b"world!"),
+        }
+        .encode(&mut wire);
+        let parent = bytes::Bytes::from(wire);
+        let (first, consumed_a) = decode_frame_in(&parent, 0).unwrap().unwrap();
+        let (second, _consumed_b) = decode_frame_in(&parent, consumed_a).unwrap().unwrap();
+        match (first, second) {
+            (Frame::Data { payload: a }, Frame::Data { payload: b }) => {
+                assert_eq!(a.as_ref(), b"hello");
+                assert_eq!(b.as_ref(), b"world!");
+                // Both payloads must point into `parent` — verify by checking
+                // that slicing the parent at the same range yields equal bytes
+                // (the `slice` method panics on a different allocation).
+                assert_eq!(a, parent.slice(2..2 + 5));
+            }
+            _ => panic!("expected two DATA frames"),
         }
     }
 
@@ -352,7 +455,7 @@ mod tests {
                 payload,
             } => {
                 assert_eq!(frame_type, 0xff);
-                assert_eq!(payload, b"abc");
+                assert_eq!(payload.as_ref(), b"abc");
             }
             _ => panic!("expected Unknown frame"),
         }

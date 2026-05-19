@@ -19,8 +19,11 @@ pub(crate) enum StreamState {
 pub(crate) struct RequestStream {
     /// Current stream state.
     pub state: StreamState,
-    /// Accumulates partial frame data between reads.
-    pub recv_buf: Vec<u8>,
+    /// Accumulates partial frame data between reads. `BytesMut` (rather
+    /// than `Vec<u8>`) lets us freeze a consumed prefix into a `Bytes`
+    /// and slice DATA payloads zero-copy out of it instead of memcpy'ing
+    /// the body into a fresh `Vec` in the frame decoder.
+    pub recv_buf: bytes::BytesMut,
     /// Whether this stream was opened by us (client request) or the peer (server request).
     pub client_initiated: bool,
     /// True once we have processed the initial HEADERS from the peer. A
@@ -38,7 +41,7 @@ impl RequestStream {
     pub fn new(client_initiated: bool) -> Self {
         Self {
             state: StreamState::WaitingHeaders,
-            recv_buf: Vec::new(),
+            recv_buf: bytes::BytesMut::new(),
             client_initiated,
             initial_headers_received: false,
             trailers_received: false,

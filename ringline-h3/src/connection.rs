@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use ringline_quic::{QuicConnId, QuicEndpoint, QuicEvent, ReadError, StreamId, VarInt, WriteError};
 
 use crate::error::H3Error;
@@ -171,10 +171,12 @@ pub enum H3Event {
         stream_id: StreamId,
         headers: Vec<HeaderField>,
     },
-    /// Received request body data on a stream.
+    /// Received request body data on a stream. `data` is a refcounted
+    /// `Bytes` slice into the per-stream recv accumulator — O(1) clone,
+    /// no payload memcpy, even at 32 KiB+ body sizes.
     Data {
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Bytes,
         end_stream: bool,
     },
     /// Peer sent GOAWAY frame.
@@ -1109,10 +1111,29 @@ impl H3Connection {
     ) -> Result<(), H3Error> {
         let mut fin_received = false;
 
-        // Read available data into the stream's recv_buf.
-        loop {
-            let (n, fin) = match quic.stream_recv(conn, stream, &mut self.read_buf) {
-                Ok(r) => r,
+        // Per-call cap on how many bytes we'll append to the
+        // per-stream buffer before handing off to the frame parser.
+        // Mirrors the old `read_buf` size; chosen large enough to
+        // soak a single large body without re-entering the read loop
+        // but small enough that we don't let the recv buffer grow
+        // unbounded ahead of the parser.
+        const READ_CHUNK: usize = 65536;
+
+        // Read available data straight into the stream's per-stream
+        // BytesMut. Skips the prior `self.read_buf` indirection
+        // (kernel buffer → scratch slice → recv_buf), saving one
+        // memcpy per call. At 32 KiB body sizes this is meaningful.
+        while let Some(rs) = self.request_streams.get_mut(&u64::from(stream)) {
+            let res = quic.stream_recv_into(conn, stream, &mut rs.recv_buf, READ_CHUNK);
+            match res {
+                Ok((n, fin)) => {
+                    if fin {
+                        fin_received = true;
+                    }
+                    if n == 0 || fin {
+                        break;
+                    }
+                }
                 Err(ringline_quic::Error::Read(ReadError::Reset(code))) => {
                     // Peer reset the stream. Without an explicit signal, the
                     // application would sit forever awaiting body bytes that
@@ -1125,17 +1146,6 @@ impl H3Connection {
                     return Ok(());
                 }
                 Err(_) => break,
-            };
-            if n > 0
-                && let Some(rs) = self.request_streams.get_mut(&u64::from(stream))
-            {
-                rs.recv_buf.extend_from_slice(&self.read_buf[..n]);
-            }
-            if fin {
-                fin_received = true;
-            }
-            if n == 0 || fin {
-                break;
             }
         }
 
@@ -1165,19 +1175,28 @@ impl H3Connection {
             None => return Ok(()),
         };
 
+        // Freeze the accumulator into a `Bytes` view so DATA payloads
+        // can be sliced out as refcount-bumping subranges instead of
+        // copied. `BytesMut::freeze` is O(1); the caller takes the
+        // `BytesMut` back at the end of this function by splitting off
+        // any unconsumed tail and re-converting (also O(1)). At 32 KiB
+        // body sizes this is the difference between a per-frame memcpy
+        // and a single refcount increment.
+        let total_len = recv_buf.len();
+        let recv_bytes = std::mem::take(&mut recv_buf).freeze();
+
         let mut offset = 0;
         let mut aborted = false;
 
         loop {
-            let remaining = &recv_buf[offset..];
-            if remaining.is_empty() {
+            if offset >= total_len {
                 break;
             }
 
-            match frame::decode_frame(remaining) {
+            match frame::decode_frame_in(&recv_bytes, offset) {
                 Ok(Some((frame, consumed))) => {
                     offset += consumed;
-                    let at_end = fin_received && offset == recv_buf.len();
+                    let at_end = fin_received && offset == total_len;
 
                     // Snapshot the state machine before dispatching so we can
                     // detect spec violations like DATA-before-HEADERS or
@@ -1348,7 +1367,7 @@ impl H3Connection {
         }
 
         // Handle FIN with no remaining frames — the stream is done.
-        if !aborted && fin_received && offset == recv_buf.len() {
+        if !aborted && fin_received && offset == total_len {
             // Synthesize an end-of-stream Data event for streams that received
             // HEADERS but no DATA frame carrying the FIN. WaitingHeaders + FIN
             // (peer cancelled before headers) or HalfClosedLocal + FIN (already
@@ -1361,7 +1380,7 @@ impl H3Connection {
             if emit_empty_fin {
                 self.events.push_back(H3Event::Data {
                     stream_id: stream,
-                    data: Vec::new(),
+                    data: Bytes::new(),
                     end_stream: true,
                 });
             }
@@ -1369,13 +1388,28 @@ impl H3Connection {
 
         // Put unconsumed data back if the entry still exists. If we aborted
         // or finalize_remote_close removed the stream, we drop the buffer.
-        if !aborted {
-            if offset > 0 {
-                recv_buf.drain(..offset);
-            }
-            if let Some(rs) = self.request_streams.get_mut(&u64::from(stream)) {
-                rs.recv_buf = recv_buf;
-            }
+        if !aborted && let Some(rs) = self.request_streams.get_mut(&u64::from(stream)) {
+            // Three reclaim paths after parsing:
+            // 1. Everything consumed — drop `recv_bytes` and reset to
+            //    a fresh BytesMut. Common case once a request finishes.
+            // 2. Nothing consumed (incomplete header at the start) —
+            //    try_into_mut to reclaim the allocation. Succeeds when
+            //    no DATA payload was sliced, falls back to a copy
+            //    otherwise.
+            // 3. Partial — copy the small unconsumed tail. The sliced
+            //    DATA payloads keep refcounts into the parent so
+            //    try_into_mut can't return here, but the tail is
+            //    typically just an incomplete varint or frame header
+            //    so the copy is bounded.
+            rs.recv_buf = if offset == total_len {
+                BytesMut::new()
+            } else if offset == 0 {
+                recv_bytes
+                    .try_into_mut()
+                    .unwrap_or_else(|b| BytesMut::from(b.as_ref()))
+            } else {
+                BytesMut::from(recv_bytes.slice(offset..total_len).as_ref())
+            };
         }
 
         Ok(())

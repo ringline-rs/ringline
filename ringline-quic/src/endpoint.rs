@@ -429,6 +429,61 @@ impl QuicEndpoint {
         Ok((total, finished))
     }
 
+    /// Read stream data, appending up to `max` bytes onto `buf`.
+    ///
+    /// Returns `(bytes_appended, is_finished)`. Identical semantics to
+    /// [`stream_recv`](Self::stream_recv) but writes directly into the
+    /// caller's `BytesMut` instead of a `&mut [u8]` scratch slice,
+    /// saving one memcpy per call on hot paths that accumulate into a
+    /// `BytesMut` anyway (e.g. ringline-h3's per-stream frame
+    /// reassembly buffer). The freshly-appended region can be
+    /// `freeze()`d and sliced as refcounted `Bytes` for zero-copy
+    /// frame payload extraction.
+    pub fn stream_recv_into(
+        &mut self,
+        conn: QuicConnId,
+        stream: StreamId,
+        buf: &mut BytesMut,
+        max: usize,
+    ) -> Result<(usize, bool), Error> {
+        let key = conn.0 as usize;
+        if !self.connections.contains(key) || self.connections[key].close_event_emitted {
+            return Err(Error::InvalidConnection);
+        }
+        let c = &mut self.connections[key];
+        let mut recv = c.conn.recv_stream(stream);
+        let mut chunks = recv.read(true)?;
+        let mut total = 0;
+        let mut finished = false;
+        let mut read_err: Option<quinn_proto::ReadError> = None;
+
+        while total < max {
+            match chunks.next(max - total) {
+                Ok(Some(chunk)) => {
+                    total += chunk.bytes.len();
+                    buf.extend_from_slice(&chunk.bytes);
+                }
+                Ok(None) => {
+                    finished = true;
+                    break;
+                }
+                Err(quinn_proto::ReadError::Blocked) => break,
+                Err(e) => {
+                    read_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let should_transmit = chunks.finalize().should_transmit();
+        if should_transmit {
+            self.drain_transmits(key, Instant::now());
+        }
+        if let Some(e) = read_err {
+            return Err(Error::Read(e));
+        }
+        Ok((total, finished))
+    }
+
     /// Send FIN on a stream, indicating no more data will be sent.
     ///
     /// Returns `Err(StreamStopped(code))` if the peer issued STOP_SENDING
