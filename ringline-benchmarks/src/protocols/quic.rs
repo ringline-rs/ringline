@@ -154,8 +154,13 @@ impl ringline::AsyncEventHandler for QuicEchoHandler {
                 // executor overhead at high pps without delaying ACK /
                 // MAX_STREAM_DATA emission long enough to stall the
                 // peer's congestion window.
-                let recv_fut = udp.recv_batch(8, |data, peer| {
-                    quic.handle_datagram(Instant::now(), data, peer);
+                // `recv_batch_timed` passes the driver-captured rx
+                // timestamp through so quinn-proto's RTT samples are
+                // taken at actual arrival, not at user-space dispatch
+                // — eliminates the executor wake + task poll latency
+                // from CC's view of RTT.
+                let recv_fut = udp.recv_batch_timed(8, |data, peer, recv_at| {
+                    quic.handle_datagram(recv_at, data, peer);
                 });
                 ringline::select(recv_fut, ringline::sleep(Duration::from_millis(10))).await;
                 quic.drive_timers(Instant::now());
@@ -304,8 +309,13 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
                 }
 
                 // Same batched-drain rationale as the QUIC server above.
-                let recv_fut = udp.recv_batch(8, |data, peer| {
-                    quic.handle_datagram(Instant::now(), data, peer);
+                // `recv_batch_timed` passes the driver-captured rx
+                // timestamp through so quinn-proto's RTT samples are
+                // taken at actual arrival, not at user-space dispatch
+                // — eliminates the executor wake + task poll latency
+                // from CC's view of RTT.
+                let recv_fut = udp.recv_batch_timed(8, |data, peer, recv_at| {
+                    quic.handle_datagram(recv_at, data, peer);
                 });
                 ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
                 quic.drive_timers(Instant::now());

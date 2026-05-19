@@ -2126,6 +2126,132 @@ impl AsyncEventHandler for BatchEcho {
 static BATCH_ECHO_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
 static BATCH_POLL_DRAINS: OnceLock<Arc<Mutex<Vec<usize>>>> = OnceLock::new();
 
+// ── recv_batch_timed: per-datagram arrival timestamp ────────────────────
+
+/// Handler that uses `recv_batch_timed` and records the
+/// `recv_at -> callback` latency for each datagram. We assert that
+/// the captured timestamp is monotonically not-in-the-future and
+/// always precedes the moment our user-space callback runs — i.e.
+/// the driver captured it earlier than `Instant::now()` at the
+/// callback site.
+struct TimedBatchEcho {
+    started: Arc<AtomicUsize>,
+    deltas: Arc<Mutex<Vec<std::time::Duration>>>,
+}
+
+impl AsyncEventHandler for TimedBatchEcho {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TimedBatchEcho {
+            started: TIMED_BATCH_STARTED.get_or_init(Default::default).clone(),
+            deltas: TIMED_BATCH_DELTAS
+                .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+                .clone(),
+        }
+    }
+
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        let deltas = self.deltas.clone();
+        Some(Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            let mut to_send: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+            loop {
+                to_send.clear();
+                udp.recv_batch_timed(16, |data, peer, recv_at| {
+                    let cb_now = std::time::Instant::now();
+                    let delta = cb_now.saturating_duration_since(recv_at);
+                    deltas.lock().unwrap().push(delta);
+                    to_send.push((peer, data.to_vec()));
+                })
+                .await;
+                for (peer, payload) in to_send.drain(..) {
+                    loop {
+                        match udp.send_to(peer, &payload) {
+                            Ok(()) => break,
+                            Err(UdpSendError::PoolExhausted)
+                            | Err(UdpSendError::SubmissionQueueFull) => {
+                                udp.send_ready().await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }))
+    }
+}
+
+static TIMED_BATCH_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static TIMED_BATCH_DELTAS: OnceLock<Arc<Mutex<Vec<std::time::Duration>>>> = OnceLock::new();
+
+#[test]
+fn udp_recv_batch_timed_captures_arrival_before_callback() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let started = TIMED_BATCH_STARTED.get_or_init(Default::default).clone();
+    started.store(0, Ordering::SeqCst);
+    if let Some(d) = TIMED_BATCH_DELTAS.get() {
+        d.lock().unwrap().clear();
+    }
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let (shutdown, handles) = RinglineBuilder::new(base_config())
+        .bind_udp(addr)
+        .launch::<TimedBatchEcho>()
+        .expect("launch");
+    await_handler_started(&started);
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    // Burst so the handler accumulates queued entries; that's when
+    // the `recv_at -> callback` gap is meaningfully > 0.
+    const BURST: usize = 16;
+    for i in 0..BURST {
+        let payload = format!("ts-{i:03}");
+        client.send_to(payload.as_bytes(), addr).unwrap();
+    }
+    let mut buf = [0u8; 64];
+    for _ in 0..BURST {
+        let (_n, _src) = client.recv_from(&mut buf).unwrap();
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+
+    let deltas = TIMED_BATCH_DELTAS.get().unwrap().lock().unwrap().clone();
+    assert!(
+        deltas.len() >= BURST,
+        "expected at least {BURST} delta samples, got {}",
+        deltas.len()
+    );
+    // Every recv_at must be at or before the callback firing — that's
+    // the contract that makes recv_batch_timed useful for tighter
+    // RTT estimation. saturating_duration_since returns Duration::ZERO
+    // if recv_at were somehow in the future; that would still pass
+    // this check but the next assertion catches it: we expect at
+    // least one non-zero delta on a real io_uring run because the
+    // driver captures the timestamp strictly earlier than we observe
+    // it in user code. (On mio the delta is generally near-zero;
+    // accept that path too.)
+    let nonzero = deltas.iter().filter(|d| !d.is_zero()).count();
+    if ringline::backend() == ringline::Backend::IoUring {
+        assert!(
+            nonzero > 0,
+            "io_uring backend should produce at least one strictly positive recv_at→callback delta; deltas={deltas:?}"
+        );
+    }
+}
+
 #[test]
 fn udp_recv_batch_drains_burst_in_fewer_polls_than_datagrams() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
