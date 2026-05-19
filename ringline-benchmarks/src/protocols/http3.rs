@@ -104,6 +104,12 @@ fn quinn_server_config(
     let transport = Arc::get_mut(&mut sc.transport).unwrap();
     transport.max_concurrent_bidi_streams(1024u32.into());
     transport.max_concurrent_uni_streams(1024u32.into());
+    // Default 333 ms initial RTT comes from RFC 9002. On localhost
+    // it makes the pacer wildly over-conservative during the
+    // pre-first-ACK phase. 1 ms is closer to reality and lets the
+    // first burst of packets actually use the available bandwidth
+    // instead of being throttled.
+    transport.initial_rtt(Duration::from_millis(1));
     Arc::new(sc)
 }
 
@@ -122,6 +128,7 @@ fn quinn_client_config(certs: &[CertificateDer<'static>]) -> quinn_proto::Client
     let mut tp = quinn_proto::TransportConfig::default();
     tp.max_concurrent_bidi_streams(1024u32.into());
     tp.max_concurrent_uni_streams(1024u32.into());
+    tp.initial_rtt(Duration::from_millis(1));
     cc.transport_config(Arc::new(tp));
     cc
 }
@@ -472,8 +479,26 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
                         ringline_h3::HeaderField::new(b":authority", b"localhost"),
                     ];
 
+                    // Cap streams opened per loop iteration. With large
+                    // payloads, opening many streams in one tick floods
+                    // quinn-proto's send buffer before we get a chance
+                    // to drain recv (which carries the ACKs that grow
+                    // CWND). With small payloads the open-cost is tiny
+                    // and batching is fine. Heuristic: about 32 KiB
+                    // of body per tick — 1 stream at 32 KiB, 8 at 4 KiB,
+                    // unbounded at ≤ 512 B. Override via env var for
+                    // experimentation.
+                    let default_cap = (32 * 1024 / state.msg_size.max(1)).max(1);
+                    let topup_cap = std::env::var("RINGLINE_BENCH_TOPUP_CAP")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(default_cap);
+                    let mut opened_this_tick = 0usize;
                     let mut batch = quic.batch();
                     while in_flight.len() < state.num_clients {
+                        if topup_cap > 0 && opened_this_tick >= topup_cap {
+                            break;
+                        }
                         let now = Instant::now();
                         let stream = match h3.send_request(&mut batch, &request_headers, false) {
                             Ok(s) => s,
@@ -490,6 +515,7 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
                         {
                             break;
                         }
+                        opened_this_tick += 1;
                         in_flight.insert(
                             u64::from(stream),
                             PendingReq {
