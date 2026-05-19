@@ -698,6 +698,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             crate::runtime::PendingUdpDatagram {
                                 peer,
                                 buf: crate::runtime::PendingUdpBuf::Owned(data),
+                                recv_at: std::time::Instant::now(),
                             },
                         );
                         self.executor.wake_udp_recv(udp_index);

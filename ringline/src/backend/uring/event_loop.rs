@@ -1854,6 +1854,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                                 ptr: payload_ptr,
                                 payload_len,
                             },
+                            recv_at: std::time::Instant::now(),
                         },
                     );
                     handed_to_queue = true;
@@ -1975,6 +1976,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         ptr: buf_ptr,
                         payload_len,
                     },
+                    recv_at: std::time::Instant::now(),
                 });
                 handed_to_queue = true;
                 self.executor.wake_udp_recv(udp_index);

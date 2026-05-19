@@ -205,31 +205,52 @@ The tokio reference client is **`h3` + `h3-quinn`** — the canonical tokio HTTP
 
 | Clients × Size | ringline-h3 | tokio (h3 + h3-quinn) | ringline vs tokio |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  23 k |  21 k | +9 % |
-| 1c × 512 B  |  23 k |  21 k | +10 % |
+| 1c × 64 B   |  23 k |  20 k | +14 % |
+| 1c × 512 B  |  22 k |  19 k | +16 % |
 | 1c × 4 KiB  |  13 k |  13 k | tie |
-| 1c × 32 KiB |   3 k |   4 k | −27 % |
-| 10c × 64 B  | 116 k |  83 k | **+40 %** |
-| 10c × 512 B | 106 k |  74 k | **+43 %** |
-| 10c × 4 KiB |  36 k |  43 k | −16 % |
+| 1c × 32 KiB |   3 k |   4 k | −25 % |
+| 10c × 64 B  | 114 k |  69 k | **+65 %** |
+| 10c × 512 B | 104 k |  76 k | +37 % |
+| 10c × 4 KiB |  31 k |  36 k | −15 % |
 | 10c × 32 KiB |  6 k |   6 k | tie |
-| 50c × 64 B  | 256 k |  93 k | **+175 %** |
-| 50c × 512 B | 155 k |  86 k | **+80 %** |
-| 50c × 4 KiB |  41 k |  41 k | tie |
-| 50c × 32 KiB |  1 k |   9 k | −88 % |
-| 200c × 64 B | 297 k | 101 k | **+194 %** |
-| 200c × 512 B | 160 k |  97 k | **+65 %** |
-| 200c × 4 KiB | 39 k |  49 k | −20 % |
-| 200c × 32 KiB |  1 k |   8 k | −89 % |
+| 50c × 64 B  | 255 k |  89 k | **+187 %** |
+| 50c × 512 B | 163 k |  87 k | **+88 %** |
+| 50c × 4 KiB |  41 k |  44 k | −8 % |
+| 50c × 32 KiB |  1 k |   9 k | −85 % |
+| 200c × 64 B | 304 k |  96 k | **+216 %** |
+| 200c × 512 B | 158 k |  94 k | **+68 %** |
+| 200c × 4 KiB | 40 k |  50 k | −20 % |
+| 200c × 32 KiB |  1 k |   8 k | −88 % |
 
-ringline-h3 leads tokio by 1.4–3× across the entire small-payload zone (≤ 512 B from 10 c upward) and pulls within range at 4 KiB cells. Two stacked perf changes drove the wins:
+ringline-h3 leads tokio by 1.4–3× across the entire small-payload zone (≤ 512 B from 10 c upward) and pulls within range at 4 KiB cells. Three stacked perf changes drove the wins:
 
   1. **Server-side response batching** (PR #191): wrapping the H3 event-drain in a `QuicEndpoint::batch()` scope and using `send_data_bytes(Bytes::from(body))` instead of `send_data(&body)` collapsed per-response `drain_transmits` calls and eliminated a per-echo body memcpy.
-  2. **`UdpCtx::recv_batch()`** (this PR): drains up to N queued UDP datagrams per task poll instead of one. At thousands of packets per second the per-packet executor wake/poll overhead was the bottleneck — that's where the additional 50 c–200 c × 64 B / 512 B headroom came from.
+  2. **`UdpCtx::recv_batch()`** (PR #193): drains up to N queued UDP datagrams per task poll instead of one. At thousands of packets per second the per-packet executor wake/poll overhead was the bottleneck — that's where the additional 50 c–200 c × 64 B / 512 B headroom came from.
+  3. **`UdpCtx::recv_batch_timed()`** (this PR): threads the driver-captured rx timestamp through to the callback so quinn-proto's RTT samples are taken at actual arrival, not at user-space dispatch. Worth ~25-30 % at the 32 KiB cell (the worst case) but a structural correctness fix as well: feeding accurate timing into the congestion controller prevents executor wake + task poll latency from being charged to the network path.
 
-At 32 KiB ringline still trails by ~88 %. A focused investigation (see *Highlights — investigation: 32 KiB cell*) pinned this on bursty traffic + RTT variance interacting with quinn-proto's congestion control. The runtime is not CPU-bound (workers idle at ~26 %); the gap is structural to how the loop wakes and processes packet bursts on a single connection. Two diagnostic APIs landed during the investigation (`QuicEndpoint::connection_stats()` and `next_timer_deadline()`) — building blocks for callers that want adaptive scheduling or to react to CC state.
+At 32 KiB ringline still trails by ~85 %. The 32 KiB cells are bottlenecked at a layer the recv_batch_timed fix can only partially address: there's additional latency *before* the driver captures `recv_at` (kernel scheduling → io_uring CQE generation → `submit_and_wait` wake → `drain_completions`) that's not visible in user space. Closing the remaining gap would need kernel rx timestamps via `SO_TIMESTAMPING` parsed from `recvmsg` cmsgs — significantly bigger work than this PR.
 
 ## Highlights & history
+
+### `perf(runtime): UdpCtx::recv_batch_timed() — feed actual arrival time to protocol drivers`
+
+A follow-up to the 32 KiB investigation. The cubic CC in quinn-proto reads RTT measurements from the `now: Instant` we pass to `handle_datagram(now, ...)`. With the prior `recv_batch` callback, that `now` was `Instant::now()` at the moment our bench code ran the callback — which lags actual arrival by the executor wake + task poll path (measured at avg 65 µs, max 400 µs at 50 c × 32 KiB).
+
+That gap was being charged to the network: quinn-proto's smoothed RTT inflated, cubic interpreted the variance as congestion, CWND oscillated around ~150 KB instead of growing. Switching to BBR moves the 50 c × 32 KiB cell from 1.1 k → 3.0 k ops/s but regresses 4 KiB cells 10–20 %, and Tokio also regresses at 32 K with BBR — so BBR is *not* a strict win on localhost. The structurally correct fix is feeding accurate timestamps to the CC instead.
+
+New API: `UdpCtx::recv_batch_timed(max, |data, peer, recv_at| {...})`. The `recv_at` is captured in the io_uring CQE handler (or in the mio `recv_from` poll), before any user-space dispatch latency. Same zero-copy, single-consumer, configurable `max` as `recv_batch`.
+
+Impact on the bench cells, vs `recv_batch` baseline (PR #193):
+
+| Bench | Cell | Before | After | Δ |
+|:---|:---|---:|---:|---:|
+| HTTP/3, ringline → ringline | 50 c × 32 KiB | 1.1 k | 1.4 k | +27 % |
+| HTTP/3, ringline → ringline | 200 c × 32 KiB | 1.0 k | 1.3 k | +30 % |
+| HTTP/3, ringline → ringline | 50 c × 512 B  | 155 k | 163 k | +5 % |
+| HTTP/3, ringline → ringline | 200 c × 64 B  | 297 k | 304 k | +2 % |
+| Other cells | various | — | — | within run-to-run noise |
+
+The remaining 32 KiB gap (still ~85 % behind tokio) comes from latency *before* `recv_at` is captured — kernel scheduling and io_uring CQE generation that's invisible in user space. Closing that needs `SO_TIMESTAMPING` + cmsg parsing on every `recvmsg`, which is significantly more work.
 
 ### Investigation: 32 KiB H3 cell — what we found, what to ship next
 

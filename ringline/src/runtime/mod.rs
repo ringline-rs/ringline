@@ -67,6 +67,13 @@ pub(crate) struct RecvSink {
 pub(crate) struct PendingUdpDatagram {
     pub(crate) peer: std::net::SocketAddr,
     pub(crate) buf: PendingUdpBuf,
+    /// Wall-clock instant the driver first observed this datagram in
+    /// the CQE drain (io_uring) or `recv_from` poll (mio). Used by
+    /// `recv_batch_timed` callers (typically protocol drivers like
+    /// `quinn-proto`) so RTT measurements don't include the executor
+    /// wake + task poll latency that elapses between arrival and the
+    /// callback firing.
+    pub(crate) recv_at: std::time::Instant,
 }
 
 pub(crate) enum PendingUdpBuf {

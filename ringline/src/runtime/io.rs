@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -2590,6 +2590,32 @@ impl UdpCtx {
         }
     }
 
+    /// Timestamped counterpart of
+    /// [`recv_batch`](Self::recv_batch) — each invocation of `f`
+    /// receives a third argument: the [`Instant`] the driver first
+    /// observed the datagram in user space (in the io_uring CQE
+    /// handler on the io_uring backend, or in the `recv_from` poll
+    /// on the mio backend). Use this to feed protocol drivers that
+    /// measure RTT (like quinn-proto's `handle_datagram(now, ...)`)
+    /// without including executor wake + task poll latency in the
+    /// measurement — that latency would otherwise be charged to the
+    /// network path and trigger spurious loss / congestion signals
+    /// at high pps.
+    ///
+    /// All other semantics — single-consumer, zero-copy borrow,
+    /// `max` trade-off — match [`recv_batch`](Self::recv_batch).
+    pub fn recv_batch_timed<F>(&self, max: usize, f: F) -> UdpRecvBatchTimedFuture<F>
+    where
+        F: FnMut(&[u8], SocketAddr, Instant) + Unpin,
+    {
+        debug_assert!(max > 0, "recv_batch_timed max must be at least 1");
+        UdpRecvBatchTimedFuture {
+            udp_index: self.udp_index,
+            max,
+            f: Some(f),
+        }
+    }
+
     /// Drain up to `max` currently-queued datagrams in a single poll.
     ///
     /// Resolves once at least one datagram is available. On poll-Ready,
@@ -2910,6 +2936,71 @@ where
                 // `let _ = bid;` here to silence the per-iteration unused
                 // warning without moving `driver` (which the loop will
                 // touch again on the next iteration).
+                #[cfg(not(has_io_uring))]
+                let _ = bid;
+                drained += 1;
+            }
+            this.f.take();
+            #[cfg(not(has_io_uring))]
+            let _ = driver;
+            Poll::Ready(drained)
+        })
+    }
+}
+
+/// Future returned by [`UdpCtx::recv_batch_timed()`].
+///
+/// Identical to [`UdpRecvBatchFuture`] except the callback receives
+/// the driver-captured arrival timestamp as a third argument.
+pub struct UdpRecvBatchTimedFuture<F>
+where
+    F: FnMut(&[u8], SocketAddr, Instant) + Unpin,
+{
+    udp_index: u32,
+    max: usize,
+    f: Option<F>,
+}
+
+impl<F> Future for UdpRecvBatchTimedFuture<F>
+where
+    F: FnMut(&[u8], SocketAddr, Instant) + Unpin,
+{
+    type Output = usize;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
+        let this = self.get_mut();
+        with_state(|driver, executor| {
+            let idx = this.udp_index as usize;
+            if idx >= executor.udp_recv_queues.len() || executor.udp_recv_queues[idx].is_empty() {
+                let task_id = CURRENT_TASK_ID.with(|c| c.get());
+                if idx < executor.udp_recv_waiters.len() {
+                    debug_assert!(
+                        executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
+                        "two distinct tasks awaiting recv on UdpCtx index {idx}; \
+                         UdpCtx::recv_batch_timed supports a single consumer per socket"
+                    );
+                    executor.udp_recv_waiters[idx] = Some(task_id);
+                }
+                return Poll::Pending;
+            }
+
+            let f = this
+                .f
+                .as_mut()
+                .expect("UdpRecvBatchTimedFuture polled after Ready");
+
+            let mut drained: usize = 0;
+            while drained < this.max
+                && let Some(entry) = executor.udp_recv_queues[idx].pop_front()
+            {
+                let bid = entry.bid_to_release();
+                let recv_at = entry.recv_at;
+                f(entry.data(), entry.peer, recv_at);
+                drop(entry);
+                #[cfg(has_io_uring)]
+                if let Some(bid) = bid {
+                    driver.udp_pending_replenish.push(bid);
+                }
                 #[cfg(not(has_io_uring))]
                 let _ = bid;
                 drained += 1;
