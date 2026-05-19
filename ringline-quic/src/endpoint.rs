@@ -43,6 +43,14 @@ pub struct QuicEndpoint {
     client_config: Option<ClientConfig>,
     send_queue_capacity: usize,
     max_transmit_datagrams: usize,
+    /// When > 0, `drain_transmits` is a no-op. Set by [`BatchGuard`]
+    /// during a batched run so quinn-proto can accumulate multiple
+    /// packets before being asked to transmit — without this, each
+    /// `stream_send` / `stream_finish` / `open_bi` triggers an
+    /// immediate `poll_transmit` which produces one datagram and
+    /// defeats GSO coalescing on the way out to the kernel. Nested
+    /// so re-entrant batches still work correctly.
+    batch_depth: u32,
 }
 
 struct QuicConnection {
@@ -149,7 +157,34 @@ impl QuicEndpoint {
             client_config: config.client_config,
             send_queue_capacity: config.send_queue_capacity,
             max_transmit_datagrams: config.max_transmit_datagrams.max(1),
+            batch_depth: 0,
         }
+    }
+
+    /// Enter a batched-send scope.
+    ///
+    /// While the returned [`BatchGuard`] is alive, calls to
+    /// `stream_send` / `stream_finish` / `open_bi` / etc. **do not**
+    /// trigger an internal `drain_transmits` — quinn-proto's
+    /// `poll_transmit` is not invoked for each individual operation.
+    /// On guard drop the deferred work is flushed in one shot via
+    /// [`flush`](Self::flush), giving quinn-proto a chance to coalesce
+    /// the batch's outgoing datagrams into a single GSO segment (which
+    /// runtime adapters with `UDP_SEGMENT` support can hand to the
+    /// kernel in one syscall).
+    ///
+    /// Without batching, every stream-altering call produces ~one UDP
+    /// datagram on the wire, defeating GSO coalescing entirely. With
+    /// batching, a tight loop that opens N streams, sends a request
+    /// on each, and finishes can produce a single GSO buffer
+    /// containing the resulting N initial packets — turning N small
+    /// `sendmsg` syscalls into one.
+    ///
+    /// Nested batches compose: only the outermost guard's drop
+    /// performs the flush.
+    pub fn batch(&mut self) -> BatchGuard<'_> {
+        self.batch_depth = self.batch_depth.saturating_add(1);
+        BatchGuard { endpoint: self }
     }
 
     /// Feed an incoming UDP datagram to the QUIC state machine.
@@ -691,6 +726,14 @@ impl QuicEndpoint {
     /// the whole buffer in one syscall, while others split per-datagram
     /// via [`OutgoingPacket::datagrams`].
     fn drain_transmits(&mut self, key: usize, now: Instant) {
+        // Inside a `batch()` scope, defer until the guard's drop calls
+        // `flush()`. This is what lets quinn-proto coalesce a batch of
+        // stream operations into a single GSO segment instead of
+        // emitting one datagram per stream_send / stream_finish /
+        // open_bi.
+        if self.batch_depth > 0 {
+            return;
+        }
         let max_datagrams = self.max_transmit_datagrams;
         loop {
             // Stop pulling from quinn the moment the send queue is full.
@@ -915,5 +958,59 @@ impl QuicEndpoint {
             segment_size,
         });
         true
+    }
+}
+
+/// RAII guard returned by [`QuicEndpoint::batch`]. Suppresses the
+/// internal `drain_transmits` calls that normally fire after each
+/// stream operation so quinn-proto can coalesce a whole batch into a
+/// single GSO buffer. On drop, flushes the connections so the
+/// accumulated work goes out as one burst.
+///
+/// Construct via `let g = endpoint.batch();` and dereference through
+/// the guard to issue stream operations:
+///
+/// ```rust,ignore
+/// {
+///     let mut g = endpoint.batch();
+///     for _ in 0..n {
+///         let stream = g.open_bi(conn)?.unwrap();
+///         g.stream_send(conn, stream, payload)?;
+///         g.stream_finish(conn, stream)?;
+///     }
+///     // Drop here triggers a single flush — quinn-proto can
+///     // coalesce the n datagrams into one GSO segment.
+/// }
+/// ```
+pub struct BatchGuard<'a> {
+    endpoint: &'a mut QuicEndpoint,
+}
+
+impl<'a> std::ops::Deref for BatchGuard<'a> {
+    type Target = QuicEndpoint;
+    fn deref(&self) -> &QuicEndpoint {
+        self.endpoint
+    }
+}
+
+impl<'a> std::ops::DerefMut for BatchGuard<'a> {
+    fn deref_mut(&mut self) -> &mut QuicEndpoint {
+        self.endpoint
+    }
+}
+
+impl<'a> Drop for BatchGuard<'a> {
+    fn drop(&mut self) {
+        // Decrement first so the flush below actually performs the
+        // drain. saturating_sub keeps the field correct even if a
+        // future bug double-drops (it can't today — `BatchGuard` is
+        // !Copy and constructed only by `batch()`).
+        self.endpoint.batch_depth = self.endpoint.batch_depth.saturating_sub(1);
+        if self.endpoint.batch_depth == 0 {
+            // Use a single fresh `Instant::now` for the whole flush
+            // so quinn-proto's transmission accounting sees one
+            // consistent timestamp for the batch.
+            self.endpoint.flush(std::time::Instant::now());
+        }
     }
 }
