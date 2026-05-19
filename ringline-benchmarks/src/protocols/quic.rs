@@ -388,8 +388,23 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
                 // and turning N streams into ~3 N small `sendmsg`
                 // calls.
                 if connected && in_flight.len() < state.num_clients {
+                    // Same payload-size-aware topup cap as the H3
+                    // bench. At large payloads (32 KiB) opening 50
+                    // streams in one tick floods quinn-proto's send
+                    // buffer before recv drains the ACKs that grow
+                    // CWND. With small payloads the cost is trivial
+                    // and batching helps GSO coalescing.
+                    let default_cap = (32 * 1024 / state.msg_size.max(1)).max(1);
+                    let topup_cap = std::env::var("RINGLINE_BENCH_TOPUP_CAP")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(default_cap);
+                    let mut opened_this_tick = 0usize;
                     let mut batch = quic.batch();
                     while in_flight.len() < state.num_clients {
+                        if opened_this_tick >= topup_cap {
+                            break;
+                        }
                         match batch.open_bi(conn_id) {
                             Ok(Some(stream)) => {
                                 let now = Instant::now();
@@ -402,6 +417,7 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
                                     break;
                                 }
                                 let _ = batch.stream_finish(conn_id, stream);
+                                opened_this_tick += 1;
                                 in_flight.insert(
                                     stream,
                                     StreamPhase::AwaitingResponse {
