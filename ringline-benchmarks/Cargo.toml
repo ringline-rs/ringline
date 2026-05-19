@@ -22,13 +22,25 @@ ringline-momento = { workspace = true }
 ringline-grpc = { workspace = true }
 ringline-ping = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
-# Reference HTTP client for the HTTP/1.1 bench — used so the
-# "ringline vs tokio" cell measures `ringline_http::HttpClient` vs a
-# realistic tokio HTTP client (request builder + structured response
-# parsing) rather than a hand-rolled fastest-possible byte loop.
-reqwest = { version = "0.12", default-features = false, features = ["http2"] }
+# Reference HTTP client for the HTTP/1.1 and HTTP/2 benches — used
+# so the "ringline vs tokio" cell measures `ringline_http::HttpClient`
+# against a realistic tokio HTTP client (request builder + structured
+# response parsing) rather than a hand-rolled fastest-possible byte
+# loop. `rustls-tls` lets reqwest trust the bench's self-signed cert
+# via `add_root_certificate` without pulling in native-tls.
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
+# HTTP/2 needs a real h2 server. The bench server is hyper +
+# tokio-rustls + a self-signed cert generated at startup — same
+# pattern as `ringline-h2/tests/round_trip.rs`.
+hyper = { version = "1", features = ["server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+http-body-util = "0.1"
 quinn-proto = { workspace = true }
-rustls = { workspace = true }
+# `ring` crypto provider is what tokio-rustls's `ring` feature
+# selects; matching it here lets `ServerConfig::builder()` find a
+# default provider without explicit `install_default()`.
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
 rcgen = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots = { workspace = true }

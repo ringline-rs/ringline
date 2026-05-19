@@ -415,52 +415,66 @@ fn main() {
     }
 
     // ── HTTP/2 benchmarks ─────────────────────────────────────────
+    //
+    // Same shape as HTTP/1.1, but the bench server is hyper-over-TLS
+    // (HTTP/2 requires TLS as far as ringline-http is concerned —
+    // there is no h2c path). Self-signed cert at startup, both
+    // clients trust it explicitly. Reqwest is the reference; same
+    // builder + structured response as ringline-http.
     if do_http2 || do_all {
         eprintln!("\n=== HTTP/2 Benchmarks ===\n");
 
         let port_manager = port_manager.clone();
         for &num_clients in &args.clients {
             for &msg_size in &args.sizes {
-                let result = http2::run_http2(
-                    &port_manager,
-                    workers,
-                    num_clients,
-                    msg_size,
-                    warmup,
-                    duration,
-                    ClientRuntime::Ringline,
-                    ServerRuntime::Ringline,
-                );
+                let combos: &[(&str, ClientRuntime)] = &[
+                    ("ringline", ClientRuntime::Ringline),
+                    ("tokio", ClientRuntime::Tokio),
+                ];
 
-                eprint!(
-                    "  {:>8} -> {:<8}  {:>4}c x {:>5}: ",
-                    "ringline",
-                    "ringline",
-                    num_clients,
-                    format_size(msg_size),
-                );
+                for &(client_name, client_rt) in combos {
+                    let result = http2::run_http2(
+                        &port_manager,
+                        workers,
+                        num_clients,
+                        msg_size,
+                        warmup,
+                        duration,
+                        client_rt,
+                        ServerRuntime::Ringline,
+                    );
 
-                eprintln!(
-                    "{:>9.0} ops/s  p50: {}  p99: {}",
-                    result.ops_per_sec,
-                    format_ns(result.latency.p50_ns),
-                    format_ns(result.latency.p99_ns),
-                );
+                    eprintln!(
+                        "  {:>8} -> {:<8}  {:>4}c x {:>5}: {:>9.0} ops/s  p50: {}  p99: {}",
+                        client_name,
+                        "tokio",
+                        num_clients,
+                        format_size(msg_size),
+                        result.ops_per_sec,
+                        format_ns(result.latency.p50_ns),
+                        format_ns(result.latency.p99_ns),
+                    );
 
-                all_results.push(ConfigResult {
-                    workers,
-                    clients: num_clients,
-                    msg_size,
-                    client_runtime: "ringline".to_string(),
-                    server_runtime: "ringline".to_string(),
-                    transport: "http2".to_string(),
-                    protocol: "echo".to_string(),
-                    tls: "none".to_string(),
-                    tokio_ringline: None,
-                    tokio_tokio: None,
-                    ringline_ringline: Some(result),
-                    ringline_tokio: None,
-                });
+                    let (ringline_tokio, tokio_tokio) = match client_name {
+                        "ringline" => (Some(result), None),
+                        _ => (None, Some(result)),
+                    };
+
+                    all_results.push(ConfigResult {
+                        workers,
+                        clients: num_clients,
+                        msg_size,
+                        client_runtime: client_name.to_string(),
+                        server_runtime: "tokio".to_string(),
+                        transport: "http2".to_string(),
+                        protocol: "get".to_string(),
+                        tls: "rustls".to_string(),
+                        tokio_ringline: None,
+                        tokio_tokio,
+                        ringline_ringline: None,
+                        ringline_tokio,
+                    });
+                }
 
                 eprintln!();
             }
