@@ -232,6 +232,27 @@ At 32 KiB ringline still trails by ~85 %. The 32 KiB cells are bottlenecked at a
 
 ## Highlights & history
 
+### Investigation: SO_TIMESTAMPING for kernel-accurate rx times (didn't help)
+
+Follow-up to `recv_batch_timed`. The CQE-drain timestamp threaded through in PR #195 still lags actual kernel arrival by the io_uring CQE generation + `submit_and_wait` wake path. The natural next step was to read the kernel's own software timestamp via `SO_TIMESTAMPING` + `SCM_TIMESTAMPING` cmsg and surface *that* as `recv_at`.
+
+Built it end to end: setsockopt at UDP socket setup, `msg_controllen = 64` on the recv msghdr template, cmsg parsing in `handle_recv_msg_udp`, wall-clock-to-`Instant` conversion via `SystemTime::now()` delta. Confirmed end-to-end: control regions arrived with the expected size, timestamps parsed to plausible CLOCK_REALTIME nanoseconds-since-epoch.
+
+Then A/B'd at the H3 32 KiB cell, five runs each side:
+
+| Cell | CQE-drain TS (PR #195) | Kernel TS | Δ |
+|:---|---:|---:|---:|
+| 50 c × 32 KiB, mean | 1.12 k | 1.02 k | −9 % |
+| 50 c × 32 KiB, range | 1075–1178 | 819–1280 | wider |
+| 200 c × 32 KiB, mean | 1.36 k | 1.25 k | −8 % |
+| 200 c × 32 KiB, range | 1229–1485 | 1126–1382 | wider |
+
+Loss rate, CWND distribution, and RTT shape are statistically identical between the two modes — the kernel-accurate timestamp doesn't change quinn-proto's congestion-control state, it just adds per-packet overhead (cmsg parse + `SystemTime::now()` clock read + arithmetic). The earlier "+70 %" 200 c × 32 KiB result was within-run noise; later runs reverted to the same ~1.36 k mean as the CQE-drain baseline.
+
+**Why kernel timestamps don't actually help:** quinn-proto's RTT machinery uses the receiver's `recv_at` to compute the *ack_delay* it reports back to the sender (so the sender can subtract local processing time from its RTT measurement). The CQE-drain timestamp correctly charges quinn-proto's ack_delay with our kernel→drain latency — that *is* processing time, and the sender's CC algorithm expects to see it included. Moving to a true kernel-arrival timestamp removes that legitimate charge from ack_delay, but the wire RTT itself doesn't change, so the sender's smoothed RTT just skews slightly tighter without any behavioral improvement.
+
+The remaining ~85 % 32 KiB gap behind tokio is something else entirely. Not shipping the SO_TIMESTAMPING patch; recording the investigation here so we don't reach for it again.
+
 ### `perf(runtime): UdpCtx::recv_batch_timed() — feed actual arrival time to protocol drivers`
 
 A follow-up to the 32 KiB investigation. The cubic CC in quinn-proto reads RTT measurements from the `now: Instant` we pass to `handle_datagram(now, ...)`. With the prior `recv_batch` callback, that `now` was `Instant::now()` at the moment our bench code ran the callback — which lags actual arrival by the executor wake + task poll path (measured at avg 65 µs, max 400 µs at 50 c × 32 KiB).
