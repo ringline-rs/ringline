@@ -2905,11 +2905,18 @@ where
                 if let Some(bid) = bid {
                     driver.udp_pending_replenish.push(bid);
                 }
+                // On mio the bid is always `None` (no kernel buf ring) and
+                // `driver` is borrowed but never read inside the loop. Keep
+                // `let _ = bid;` here to silence the per-iteration unused
+                // warning without moving `driver` (which the loop will
+                // touch again on the next iteration).
                 #[cfg(not(has_io_uring))]
-                let _ = (bid, driver);
+                let _ = bid;
                 drained += 1;
             }
             this.f.take();
+            #[cfg(not(has_io_uring))]
+            let _ = driver;
             Poll::Ready(drained)
         })
     }
