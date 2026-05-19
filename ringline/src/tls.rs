@@ -270,17 +270,66 @@ pub fn feed_tls_recv(
 
     let was_handshaking = !tls_conn.handshake_complete;
 
-    // Feed ciphertext into rustls.
+    // Feed ciphertext into rustls. Loop until rustls has consumed the
+    // entire ciphertext slice, OR a single `read_tls` call returned
+    // 0 (meaning rustls's internal buffer is full and refuses more
+    // bytes until we drain plaintext). rustls's `read_tls` reads in
+    // chunks bounded by its internal buffer size (4 KiB at the time
+    // of writing); a single ciphertext slice that crosses that
+    // boundary — common for any TLS record carrying ≥ ~4 KiB of
+    // plaintext, since rustls hasn't decrypted enough yet to free
+    // buffer space — would otherwise leave the tail unfed,
+    // permanently desynchronising the application from the wire.
     let mut cursor = io::Cursor::new(ciphertext);
-    if let Err(e) = tls_conn.conn.read_tls(&mut cursor) {
-        return TlsRecvResult::Error(rustls::Error::General(e.to_string()));
+    while cursor.position() < ciphertext.len() as u64 {
+        match tls_conn.conn.read_tls(&mut cursor) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                return TlsRecvResult::Error(rustls::Error::General(e.to_string()));
+            }
+        }
+        // Drive the state machine after each chunk so rustls can
+        // free buffer space (by decrypting+queueing plaintext) and
+        // accept the next chunk on the following iteration.
+        let state = match tls_conn.conn.process_new_packets() {
+            Ok(state) => state,
+            Err(e) => {
+                if tls_conn.conn.wants_write() {
+                    flush_tls_output_inner(
+                        tls_conn,
+                        &mut tls_table.write_buf,
+                        ring,
+                        send_copy_pool,
+                        conn_index,
+                    );
+                }
+                return TlsRecvResult::Error(e);
+            }
+        };
+
+        // Drain plaintext after each call so rustls's internal
+        // buffer has room for the next `read_tls`.
+        if state.plaintext_bytes_to_read() > 0 {
+            let mut reader = tls_conn.conn.reader();
+            loop {
+                match reader.read(scratch.as_mut_slice()) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        accumulators.append(conn_index, &scratch[..n]);
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
     }
 
-    // Drive the TLS state machine.
+    // Final state read for the wants_write / handshake / closed
+    // checks below.
     let state = match tls_conn.conn.process_new_packets() {
         Ok(state) => state,
         Err(e) => {
-            // Try to flush alert before returning error.
             if tls_conn.conn.wants_write() {
                 flush_tls_output_inner(
                     tls_conn,
@@ -294,7 +343,9 @@ pub fn feed_tls_recv(
         }
     };
 
-    // Read decrypted plaintext into accumulator.
+    // Drain any remaining plaintext that the final state machine
+    // tick produced (e.g. from a record whose ciphertext was
+    // entirely buffered earlier in the loop).
     if state.plaintext_bytes_to_read() > 0 {
         let mut reader = tls_conn.conn.reader();
         loop {
