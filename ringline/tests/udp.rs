@@ -2063,3 +2063,132 @@ fn udp_gso_invalid_segment_size_returns_error() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── recv_batch: drain multiple queued datagrams in one poll ─────────────
+
+struct BatchEcho {
+    started: Arc<AtomicUsize>,
+    /// Records how many datagrams each `recv_batch` poll drained, so the
+    /// test can assert that batching actually fired (i.e. more than one
+    /// datagram was popped in at least one poll).
+    poll_drains: Arc<Mutex<Vec<usize>>>,
+}
+
+impl AsyncEventHandler for BatchEcho {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BatchEcho {
+            started: BATCH_ECHO_STARTED.get_or_init(Default::default).clone(),
+            poll_drains: BATCH_POLL_DRAINS
+                .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+                .clone(),
+        }
+    }
+
+    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        let poll_drains = self.poll_drains.clone();
+        Some(Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            // Per-iteration scratch: collected `(peer, payload)` pairs
+            // captured by the recv_batch callback, replayed after the
+            // future returns so we test the drain semantics, not
+            // send-from-inside-callback.
+            let mut to_send: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+            loop {
+                to_send.clear();
+                let drained = udp
+                    .recv_batch(16, |data, peer| {
+                        to_send.push((peer, data.to_vec()));
+                    })
+                    .await;
+                poll_drains.lock().unwrap().push(drained);
+                for (peer, payload) in to_send.drain(..) {
+                    loop {
+                        match udp.send_to(peer, &payload) {
+                            Ok(()) => break,
+                            Err(UdpSendError::PoolExhausted)
+                            | Err(UdpSendError::SubmissionQueueFull) => {
+                                udp.send_ready().await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }))
+    }
+}
+
+static BATCH_ECHO_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static BATCH_POLL_DRAINS: OnceLock<Arc<Mutex<Vec<usize>>>> = OnceLock::new();
+
+#[test]
+fn udp_recv_batch_drains_burst_in_fewer_polls_than_datagrams() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let started = BATCH_ECHO_STARTED.get_or_init(Default::default).clone();
+    started.store(0, Ordering::SeqCst);
+    if let Some(d) = BATCH_POLL_DRAINS.get() {
+        d.lock().unwrap().clear();
+    }
+
+    let port = free_udp_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let (shutdown, handles) = RinglineBuilder::new(base_config())
+        .bind_udp(addr)
+        .launch::<BatchEcho>()
+        .expect("launch");
+    await_handler_started(&started);
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    // Fire a burst of datagrams back-to-back so the handler's recv
+    // queue accumulates more than one entry per poll.
+    const BURST: usize = 32;
+    for i in 0..BURST {
+        let payload = format!("batch-{i:04}");
+        client.send_to(payload.as_bytes(), addr).unwrap();
+    }
+
+    // Collect all echoes.
+    let mut got = HashSet::new();
+    let mut buf = [0u8; 64];
+    for _ in 0..BURST {
+        let (n, _src) = client.recv_from(&mut buf).unwrap();
+        got.insert(std::str::from_utf8(&buf[..n]).unwrap().to_string());
+    }
+    assert_eq!(got.len(), BURST, "every datagram must be echoed back");
+
+    // Now assert the handler actually drained more than one datagram
+    // per poll on at least one iteration — that's the contract that
+    // makes recv_batch different from with_datagram.
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+
+    let drains = BATCH_POLL_DRAINS.get().unwrap().lock().unwrap().clone();
+    let total: usize = drains.iter().sum();
+    assert!(
+        total >= BURST,
+        "handler must have observed at least BURST datagrams (got {total})"
+    );
+    // Either: at least one poll drained multiple datagrams, OR the
+    // poll count is strictly less than BURST (proving the kernel
+    // delivered multiple per CQE batch). The first form is the more
+    // common case; both are acceptable evidence that batching took
+    // effect.
+    let max_drain = drains.iter().copied().max().unwrap_or(0);
+    assert!(
+        max_drain > 1 || drains.len() < BURST,
+        "expected at least one multi-datagram drain or fewer polls than datagrams; \
+         got drains={drains:?}"
+    );
+}

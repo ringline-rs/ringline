@@ -182,20 +182,20 @@ The tokio reference client is **quinn** — the de-facto tokio QUIC stack — al
 
 | Clients × Size | ringline-quic | quinn | ringline vs quinn |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  27 k |  25 k | +10 % |
-| 1c × 512 B  |  27 k |  25 k | +9 % |
-| 1c × 4 KiB  |  14 k |  16 k | −14 % |
-| 10c × 64 B  |  98 k | 108 k | −9 % |
-| 10c × 512 B |  87 k |  87 k | tie |
-| 10c × 4 KiB |  32 k |  36 k | −13 % |
-| 50c × 64 B  | 111 k | 121 k | −8 % |
-| 50c × 512 B |  95 k | 103 k | −8 % |
-| 50c × 4 KiB |  33 k |  35 k | −6 % |
-| 200c × 64 B | 162 k | 124 k | **+31 %** |
-| 200c × 512 B | 148 k | 128 k | **+16 %** |
-| 200c × 4 KiB |  38 k |  38 k | tie |
+| 1c × 64 B   |  27 k |  24 k | +11 % |
+| 1c × 512 B  |  26 k |  25 k | +5 % |
+| 1c × 4 KiB  |  15 k |  17 k | −12 % |
+| 10c × 64 B  | 129 k | 101 k | **+28 %** |
+| 10c × 512 B | 104 k | 100 k | +5 % |
+| 10c × 4 KiB |  35 k |  42 k | −17 % |
+| 50c × 64 B  | 155 k | 120 k | **+29 %** |
+| 50c × 512 B | 123 k | 116 k | +6 % |
+| 50c × 4 KiB |  39 k |  43 k | −9 % |
+| 200c × 64 B | 167 k | 121 k | **+38 %** |
+| 200c × 512 B | 140 k | 125 k | +13 % |
+| 200c × 4 KiB |  41 k |  47 k | −12 % |
 
-ringline-quic pulls ahead at 1 c and at high concurrency (200 c); quinn keeps a small edge at moderate concurrency × small payloads. The high-concurrency wins came from the GSO batching API (PR #190) — wrapping stream operations in `QuicEndpoint::batch()` lets quinn-proto coalesce multiple per-stream packets into one GSO segment, turning N small `sendmsg` syscalls into one. At lower concurrency the batch isn't big enough to fill a GSO segment so the underlying work is unchanged.
+ringline-quic leads at small payloads (≤ 512 B) and at high concurrency × 64 B. The moderate-concurrency × small-payload rows used to trail quinn by 8–9 %; that flipped to a 28–29 % lead when the bench moved to `UdpCtx::recv_batch()` (see *Highlights*) which drains up to N queued datagrams in one task poll. The 4 KiB rows still trail by 9–17 %: there the bench is bottlenecked on the server-side body memcpy into the QUIC stream rather than the recv path.
 
 ## HTTP/3 (POST echo against a ringline server)
 
@@ -205,28 +205,50 @@ The tokio reference client is **`h3` + `h3-quinn`** — the canonical tokio HTTP
 
 | Clients × Size | ringline-h3 | tokio (h3 + h3-quinn) | ringline vs tokio |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  22 k |  20 k | +11 % |
-| 1c × 512 B  |  22 k |  20 k | +12 % |
+| 1c × 64 B   |  23 k |  21 k | +9 % |
+| 1c × 512 B  |  23 k |  21 k | +10 % |
 | 1c × 4 KiB  |  13 k |  13 k | tie |
-| 1c × 32 KiB |   3 k |   4 k | −25 % |
-| 10c × 64 B  | 111 k |  70 k | **+59 %** |
-| 10c × 512 B | 114 k |  61 k | **+85 %** |
-| 10c × 4 KiB |  31 k |  35 k | −14 % |
-| 10c × 32 KiB |  6 k |   7 k | −11 % |
-| 50c × 64 B  | 269 k |  79 k | **+239 %** |
-| 50c × 512 B | 104 k |  77 k | **+35 %** |
-| 50c × 4 KiB |  35 k |  41 k | −13 % |
-| 50c × 32 KiB |  2 k |   9 k | −82 % |
-| 200c × 64 B | 285 k |  92 k | **+210 %** |
-| 200c × 512 B | 136 k |  93 k | **+46 %** |
-| 200c × 4 KiB | 34 k |  44 k | −22 % |
-| 200c × 32 KiB |  1 k |   8 k | −87 % |
+| 1c × 32 KiB |   3 k |   4 k | −27 % |
+| 10c × 64 B  | 116 k |  83 k | **+40 %** |
+| 10c × 512 B | 106 k |  74 k | **+43 %** |
+| 10c × 4 KiB |  36 k |  43 k | −16 % |
+| 10c × 32 KiB |  6 k |   6 k | tie |
+| 50c × 64 B  | 256 k |  93 k | **+175 %** |
+| 50c × 512 B | 155 k |  86 k | **+80 %** |
+| 50c × 4 KiB |  41 k |  41 k | tie |
+| 50c × 32 KiB |  1 k |   9 k | −88 % |
+| 200c × 64 B | 297 k | 101 k | **+194 %** |
+| 200c × 512 B | 160 k |  97 k | **+65 %** |
+| 200c × 4 KiB | 39 k |  49 k | −20 % |
+| 200c × 32 KiB |  1 k |   8 k | −89 % |
 
-ringline-h3 leads tokio by 1.4–3.3× across small-payload rows (≤ 512 B from 10 c upward). The big wins came from batching the bench server's response path: wrapping the H3 event-drain loop in a `QuicEndpoint::batch()` scope and switching `send_data` → `send_data_bytes` so each echo's body is sent zero-copy from the accumulated `Vec<u8>` (`Bytes::from(Vec<u8>)` is an O(1) ownership transfer). Before the fix, every response triggered its own `drain_transmits` and copied the body into a freshly allocated `Bytes` — at 50 c × 64 B that capped throughput at ~78 k ops/s; after, 269 k.
+ringline-h3 leads tokio by 1.4–3× across the entire small-payload zone (≤ 512 B from 10 c upward) and pulls within range at 4 KiB cells. Two stacked perf changes drove the wins:
 
-At 4 KiB and above ringline trails by 11–87 %. The bottleneck there is in the H3 receive path, not the send path: each incoming DATA frame is currently memcpy'd 4× (kernel buffer → io\_uring accumulator → ringline-quic `read_buf` → per-stream `recv_buf` → `Frame::Data { payload: payload.to_vec() }`), which dominates at 32 KiB. Closing that gap requires reworking `H3Connection` to use `Bytes` slices throughout the receive path — a separate piece of work tracked for follow-up.
+  1. **Server-side response batching** (PR #191): wrapping the H3 event-drain in a `QuicEndpoint::batch()` scope and using `send_data_bytes(Bytes::from(body))` instead of `send_data(&body)` collapsed per-response `drain_transmits` calls and eliminated a per-echo body memcpy.
+  2. **`UdpCtx::recv_batch()`** (this PR): drains up to N queued UDP datagrams per task poll instead of one. At thousands of packets per second the per-packet executor wake/poll overhead was the bottleneck — that's where the additional 50 c–200 c × 64 B / 512 B headroom came from.
+
+At 32 KiB ringline still trails by ~88 %. The 32 KiB cells are bottlenecked on protocol-layer concerns (ACK pacing under deep flow-control windows on a single QUIC connection) rather than the recv pipeline itself — the bench keeps `num\_clients` × 32 KiB worth of bodies in flight per request and the connection-level credit grants serialize through a single ACK timer. Closing that gap is a future piece of work in `ringline-quic` (per-stream `MAX_STREAM_DATA` eager emission, perhaps via a dedicated send-side credit driver) — not in the recv path.
 
 ## Highlights & history
+
+### `perf(runtime): UdpCtx::recv_batch() drain-style UDP recv`
+
+io_uring's multishot recv pushes one CQE per UDP datagram; the prior `recv_from()` / `with_datagram()` futures dequeued one entry per poll, so at high pps the task woke N times to drain N datagrams. Per-packet executor wake + future-poll overhead capped throughput long before the kernel ran out of CQE capacity. Tokio's quinn endpoint avoids the equivalent via `recvmmsg` (multi-datagram per syscall); io_uring doesn't expose multi-datagram-per-CQE semantics, but the user-space queue accumulated datagrams between event-loop iterations regardless — what we needed was a future that drains that queue.
+
+New API: `UdpCtx::recv_batch(max, |data, peer| {...})` resolves once at least one datagram is available and drains up to `max` queued datagrams in a single poll. Same zero-copy semantics as `with_datagram` (each invocation borrows the kernel buffer for its scope, bid released right after).
+
+`max` is the lever between batching efficiency and ACK-pacing latency. Larger values amortise more wake overhead; smaller values keep the loop's `poll_send` call site running often enough that QUIC ACK / `MAX_STREAM_DATA` frames don't queue up behind the recv pile. The QUIC + H3 benches use `max = 8`.
+
+| Bench | Cell | Before | After | Δ |
+|:---|:---|---:|---:|---:|
+| QUIC echo, ringline → ringline | 10 c × 64 B   |  98 k | **129 k** | **+32 %** |
+| QUIC echo, ringline → ringline | 50 c × 64 B   | 111 k | **155 k** | **+40 %** |
+| QUIC echo, ringline → ringline | 50 c × 512 B  |  95 k | 123 k | +29 % |
+| HTTP/3, ringline → ringline    | 50 c × 512 B  | 104 k | **155 k** | **+49 %** |
+| HTTP/3, ringline → ringline    | 200 c × 512 B | 136 k | 160 k | +18 % |
+| HTTP/3, ringline → ringline    | 200 c × 4 KiB |  34 k |  39 k | +13 % |
+
+The 32 KiB rows didn't move (and slightly regressed at extreme concurrency before tuning `max` down to 8). Those cells aren't gated by per-packet overhead — they're gated by ACK pacing through a single QUIC connection with deep send credit windows. That's a `ringline-quic` concern, not a runtime one.
 
 ### `perf(quic): batched stream operations for GSO coalescing` (PR #190)
 

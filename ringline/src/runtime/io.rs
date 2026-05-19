@@ -2590,6 +2590,51 @@ impl UdpCtx {
         }
     }
 
+    /// Drain up to `max` currently-queued datagrams in a single poll.
+    ///
+    /// Resolves once at least one datagram is available. On poll-Ready,
+    /// the callback is invoked up to `max` times — once per queued
+    /// datagram — before the future returns the count drained. This
+    /// collapses what would otherwise be N task wake-cycles into one
+    /// and is the high-throughput counterpart to
+    /// [`with_datagram()`](Self::with_datagram).
+    ///
+    /// **Pick `max` carefully.** A larger value reduces executor
+    /// overhead at high pps but delays the next trip through your
+    /// recv→handle→send loop, which on protocol drivers like QUIC
+    /// translates into delayed ACK / `MAX_STREAM_DATA` emission and
+    /// can stall the peer's congestion window. As a rule of thumb,
+    /// 4–16 is a reasonable starting point: enough to amortise the
+    /// per-poll overhead at thousands of pps without buffering more
+    /// than a few millisecond's worth of inbound traffic before the
+    /// next send-side flush. `max = 0` is invalid and panics in debug
+    /// builds.
+    ///
+    /// io_uring multishot recv keeps writing CQEs into our recv queue
+    /// between event-loop iterations, so by the time a task is polled
+    /// the queue may already hold several datagrams. Draining several
+    /// at once avoids the per-packet executor wake/poll overhead that
+    /// becomes the bottleneck at packet rates approaching the upper
+    /// end of what a single core can process (5K+ pps).
+    ///
+    /// Same zero-copy semantics as [`with_datagram()`](Self::with_datagram):
+    /// each invocation of `f` borrows directly from the kernel-provided
+    /// buffer; the buffer is released back to the kernel after `f`
+    /// returns and before the next datagram is dispatched.
+    ///
+    /// Same single-consumer semantics as [`recv_from()`](Self::recv_from).
+    pub fn recv_batch<F>(&self, max: usize, f: F) -> UdpRecvBatchFuture<F>
+    where
+        F: FnMut(&[u8], SocketAddr) + Unpin,
+    {
+        debug_assert!(max > 0, "recv_batch max must be at least 1");
+        UdpRecvBatchFuture {
+            udp_index: self.udp_index,
+            max,
+            f: Some(f),
+        }
+    }
+
     /// Resolve when at least one UDP send slot is available on this socket.
     ///
     /// Use this to back off when [`UdpCtx::send_to`] returns
@@ -2802,6 +2847,77 @@ where
                 executor.udp_recv_waiters[idx] = Some(task_id);
             }
             Poll::Pending
+        })
+    }
+}
+
+/// Future returned by [`UdpCtx::recv_batch()`].
+///
+/// Drains up to `max` queued datagrams on the first poll where at
+/// least one is available. Returns the count of datagrams drained
+/// (between 1 and `max`). See [`UdpCtx::recv_batch`] for the rationale
+/// on choosing `max`.
+pub struct UdpRecvBatchFuture<F>
+where
+    F: FnMut(&[u8], SocketAddr) + Unpin,
+{
+    udp_index: u32,
+    max: usize,
+    f: Option<F>,
+}
+
+impl<F> Future for UdpRecvBatchFuture<F>
+where
+    F: FnMut(&[u8], SocketAddr) + Unpin,
+{
+    type Output = usize;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
+        let this = self.get_mut();
+        with_state(|driver, executor| {
+            let idx = this.udp_index as usize;
+            if idx >= executor.udp_recv_queues.len() || executor.udp_recv_queues[idx].is_empty() {
+                let task_id = CURRENT_TASK_ID.with(|c| c.get());
+                if idx < executor.udp_recv_waiters.len() {
+                    debug_assert!(
+                        executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
+                        "two distinct tasks awaiting recv on UdpCtx index {idx}; \
+                         UdpCtx::recv_batch supports a single consumer per socket"
+                    );
+                    executor.udp_recv_waiters[idx] = Some(task_id);
+                }
+                return Poll::Pending;
+            }
+
+            let f = this
+                .f
+                .as_mut()
+                .expect("UdpRecvBatchFuture polled after Ready");
+
+            let mut drained: usize = 0;
+            while drained < this.max
+                && let Some(entry) = executor.udp_recv_queues[idx].pop_front()
+            {
+                let bid = entry.bid_to_release();
+                f(entry.data(), entry.peer);
+                drop(entry);
+                #[cfg(has_io_uring)]
+                if let Some(bid) = bid {
+                    driver.udp_pending_replenish.push(bid);
+                }
+                // On mio the bid is always `None` (no kernel buf ring) and
+                // `driver` is borrowed but never read inside the loop. Keep
+                // `let _ = bid;` here to silence the per-iteration unused
+                // warning without moving `driver` (which the loop will
+                // touch again on the next iteration).
+                #[cfg(not(has_io_uring))]
+                let _ = bid;
+                drained += 1;
+            }
+            this.f.take();
+            #[cfg(not(has_io_uring))]
+            let _ = driver;
+            Poll::Ready(drained)
         })
     }
 }

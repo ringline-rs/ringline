@@ -150,14 +150,14 @@ impl ringline::AsyncEventHandler for QuicEchoHandler {
 
         Some(Box::pin(async move {
             loop {
-                match ringline::select(udp.recv_from(), ringline::sleep(Duration::from_millis(10)))
-                    .await
-                {
-                    ringline::Either::Left((data, peer)) => {
-                        quic.handle_datagram(Instant::now(), &data, peer);
-                    }
-                    ringline::Either::Right(()) => {}
-                }
+                // Drain up to 8 queued datagrams per wake to amortise
+                // executor overhead at high pps without delaying ACK /
+                // MAX_STREAM_DATA emission long enough to stall the
+                // peer's congestion window.
+                let recv_fut = udp.recv_batch(8, |data, peer| {
+                    quic.handle_datagram(Instant::now(), data, peer);
+                });
+                ringline::select(recv_fut, ringline::sleep(Duration::from_millis(10))).await;
                 quic.drive_timers(Instant::now());
 
                 while let Some(event) = quic.poll_event() {
@@ -303,14 +303,11 @@ impl ringline::AsyncEventHandler for RinglineQuicBench {
                     break;
                 }
 
-                match ringline::select(udp.recv_from(), ringline::sleep(Duration::from_millis(1)))
-                    .await
-                {
-                    ringline::Either::Left((data, peer)) => {
-                        quic.handle_datagram(Instant::now(), &data, peer);
-                    }
-                    ringline::Either::Right(()) => {}
-                }
+                // Same batched-drain rationale as the QUIC server above.
+                let recv_fut = udp.recv_batch(8, |data, peer| {
+                    quic.handle_datagram(Instant::now(), data, peer);
+                });
+                ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
                 quic.drive_timers(Instant::now());
 
                 while let Some(event) = quic.poll_event() {
