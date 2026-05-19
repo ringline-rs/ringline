@@ -197,6 +197,33 @@ The tokio reference client is **quinn** — the de-facto tokio QUIC stack — al
 
 ringline-quic pulls ahead at 1 c and at high concurrency (200 c); quinn keeps a small edge at moderate concurrency × small payloads. The high-concurrency wins came from the GSO batching API (PR #190) — wrapping stream operations in `QuicEndpoint::batch()` lets quinn-proto coalesce multiple per-stream packets into one GSO segment, turning N small `sendmsg` syscalls into one. At lower concurrency the batch isn't big enough to fill a GSO segment so the underlying work is unchanged.
 
+## HTTP/3 (POST echo against a ringline server)
+
+Workload: a single QUIC connection multiplexes `num\_clients` concurrent bidirectional HTTP/3 request streams. Each iteration is a `POST /echo` with an `msg\_size`-byte body; the server echoes the body back in a DATA frame with FIN. As soon as one request completes the client opens a replacement so there are always `num\_clients` requests in flight. Both client and server drive `ringline_h3::H3Connection` on top of `ringline_quic::QuicEndpoint` from a `ringline` worker task — the client wraps `send_request` + `send_data` in `QuicEndpoint::batch()` for the same GSO-coalescing benefit as the raw QUIC bench.
+
+There is no tokio reference cell for HTTP/3 yet: the canonical tokio H3 stack (`h3` + `h3-quinn`) pulls in a sizeable extra dependency set and the QUIC bench already covers the quinn transport path.
+
+| Clients × Size | ringline-h3 → ringline-h3 | p50 | p99 |
+|:---|---:|---:|---:|
+| 1c × 64 B   |  21 k | 40 µs | 80 µs |
+| 1c × 512 B  |  23 k | 41 µs | 80 µs |
+| 1c × 4 KiB  |  13 k | 72 µs | 124 µs |
+| 1c × 32 KiB |   3 k | 309 µs | 436 µs |
+| 10c × 64 B  |  81 k | 113 µs | 193 µs |
+| 10c × 512 B |  80 k | 120 µs | 194 µs |
+| 10c × 4 KiB |  32 k | 293 µs | 460 µs |
+| 10c × 32 KiB |  6 k | 1.66 ms | 2.57 ms |
+| 50c × 64 B  |  94 k | 521 µs | 694 µs |
+| 50c × 512 B |  77 k | 570 µs | 885 µs |
+| 50c × 4 KiB |  37 k | 1.30 ms | 2.09 ms |
+| 50c × 32 KiB |  1 k | 13.8 ms | 174 ms |
+| 200c × 64 B |  91 k | 2.18 ms | 3.35 ms |
+| 200c × 512 B | 116 k | 1.70 ms | 2.69 ms |
+| 200c × 4 KiB | 37 k | 5.28 ms | 9.77 ms |
+| 200c × 32 KiB |  2 k | 60.8 ms | 372 ms |
+
+At small payloads HTTP/3 lands within roughly 70-90 % of the raw QUIC bench at matching concurrency — the gap is QPACK encoding/decoding and HTTP/3 framing on top of the same transport. The 32 KiB rows fall off sharply as the test enters tail-dominated territory: with one QUIC connection's flow-control window shared across `num\_clients` streams, each in-flight 32 KiB body queues behind credit grants and the round-trip latency stretches into the milliseconds.
+
 ## Highlights & history
 
 ### `perf(quic): batched stream operations for GSO coalescing` (PR #190)
@@ -305,7 +332,7 @@ Before this fix, every event-loop iteration ran a TLS-only `check_close_notify_d
 - **TCP/UDP "ringline → ringline" actually uses a tokio server today.** `protocols/tcp.rs` and `protocols/udp.rs` both call into a tokio-based echo server for both columns; see the `// Use tokio server for now — ringline server requires TLS setup` comment in `tcp.rs`. So the "vs tokio" rows really compare the **client** side; both have the same server CPU cost included. A native ringline echo server would likely widen ringline's lead on those rows.
 - **Bench's ringline client at 32 KiB is the bottleneck for the −10 %..−30 % rows.** It uses `with_data` with a single buffered echo per round trip, and at 32 KiB the recv-buffer churn dominates. Improving that path is its own piece of work and unrelated to runtime perf.
 - **Redis bench server is synthetic.** It does not implement a real Redis storage layer; the response size is fixed by `msg_size`. The numbers are an upper bound on what the wire+parser combo can do, not what a real Redis backend would deliver.
-- **`ringline-memcache`, `ringline-momento`, HTTP/1/2/3, gRPC, QUIC bench stubs are still TODO.** `cargo run -p ringline-benchmarks --only memcache,http1,…` currently returns `0 ops/s` for those — they're not measured here.
+- **`ringline-momento` and gRPC bench stubs are still TODO.** `cargo run -p ringline-benchmarks --only momento,grpc` currently returns `0 ops/s` for those — they're not measured here.
 - **Numbers reflect what's available to a single user-space process.** Under load from other tenants, especially on cloud VMs, ranks can flip.
 
 ## Updating this file
