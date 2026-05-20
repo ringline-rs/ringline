@@ -39,6 +39,10 @@ pub fn run_http3(
     let (certs, key) = generate_self_signed();
     let server_addr = port_manager.next_addr();
 
+    // Publish the body size so the echo server can size its
+    // per-iteration response cap to match the workload.
+    SERVER_MSG_SIZE.store(msg_size as u64, Ordering::Relaxed);
+
     let server = match start_h3_server(server_addr, certs.clone(), key) {
         Ok(s) => s,
         Err(e) => {
@@ -152,6 +156,10 @@ impl BenchmarkServer {
 }
 
 static SERVER_CFG: Mutex<Option<ringline_quic::QuicConfig>> = Mutex::new(None);
+/// Body size for the current bench config, published so the echo
+/// server can size its per-iteration response cap (same payload-aware
+/// heuristic as the client's topup cap).
+static SERVER_MSG_SIZE: AtomicU64 = AtomicU64::new(0);
 
 struct H3EchoHandler;
 
@@ -219,8 +227,25 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                 // every echo response emits ~2 small `sendmsg` calls,
                 // killing GSO coalescing at 50 c × 32 KiB and pricing in
                 // the per-call drain overhead.
+                // Cap responses generated per loop iteration. Mirrors
+                // the client's topup cap: at 32 KiB, echoing 50
+                // responses in one drain dumps 1.6 MiB into
+                // quinn-proto's send buffer and stalls recv (so the
+                // ACKs growing the server's CWND don't get processed).
+                // Leave un-responded events queued in H3Connection for
+                // the next iteration. Override via env var.
+                let resp_cap = std::env::var("RINGLINE_BENCH_RESP_CAP")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or_else(|| {
+                        let msg = SERVER_MSG_SIZE.load(Ordering::Relaxed).max(1) as usize;
+                        (32 * 1024 / msg).max(1)
+                    });
+                let mut responded = 0usize;
                 let mut batch = quic.batch();
-                while let Some(event) = h3.poll_event() {
+                while responded < resp_cap
+                    && let Some(event) = h3.poll_event()
+                {
                     match event {
                         ringline_h3::H3Event::Request {
                             stream_id,
@@ -237,6 +262,7 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                                     bytes::Bytes::new(),
                                     true,
                                 );
+                                responded += 1;
                             } else {
                                 bodies.insert(u64::from(stream_id), Vec::new());
                             }
@@ -262,6 +288,7 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                                     bytes::Bytes::from(body),
                                     true,
                                 );
+                                responded += 1;
                             }
                         }
                         ringline_h3::H3Event::StreamReset { stream_id, .. } => {

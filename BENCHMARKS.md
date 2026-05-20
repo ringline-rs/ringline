@@ -216,43 +216,49 @@ The tokio reference client is **`h3` + `h3-quinn`** — the canonical tokio HTTP
 | 50c × 64 B  | 254 k |  95 k | **+167 %** |
 | 50c × 512 B | 157 k |  89 k | **+76 %** |
 | 50c × 4 KiB |  41 k |  46 k | −11 % |
-| 50c × 32 KiB | **4 k** |   9 k | −52 % |
+| 50c × 32 KiB | **6 k** |   9 k | −31 % |
 | 200c × 64 B | 293 k | 101 k | **+190 %** |
 | 200c × 512 B | 167 k |  99 k | **+69 %** |
 | 200c × 4 KiB | 42 k |  49 k | −13 % |
-| 200c × 32 KiB | **3 k** |   8 k | −71 % |
+| 200c × 32 KiB | **4 k** |   8 k | −49 % |
 
-ringline-h3 leads tokio by 1.4–3× across the entire small-payload zone (≤ 512 B from 10 c upward) and pulls within range at 4 KiB cells. The 32 KiB cells used to trail by ~85 %; that's now down to 52–71 % after a bench-level fix described below.
+ringline-h3 leads tokio by 1.4–3× across the entire small-payload zone (≤ 512 B from 10 c upward) and pulls within range at 4 KiB cells. The 32 KiB cells used to trail by ~85–88 %; that's now down to 31–49 % after two bench-level fixes (client *and* server) described below.
 
-Four stacked perf changes drove the wins:
+Five stacked perf changes drove the wins:
 
   1. **Server-side response batching** (PR #191): wrapping the H3 event-drain in a `QuicEndpoint::batch()` scope and using `send_data_bytes(Bytes::from(body))` instead of `send_data(&body)` collapsed per-response `drain_transmits` calls and eliminated a per-echo body memcpy.
   2. **`UdpCtx::recv_batch()`** (PR #193): drains up to N queued UDP datagrams per task poll instead of one.
   3. **`UdpCtx::recv_batch_timed()`** (PR #195): threads the driver-captured rx timestamp through to the callback so quinn-proto's RTT samples are taken at actual arrival, not at user-space dispatch.
-  4. **Payload-size-aware client topup cap** (this PR): the bench was self-DoSing at 32 KiB by opening all `num_clients` streams in one tick — that flooded quinn-proto's send buffer with `num_clients × msg_size` bytes before the recv side got a chance to drain the ACKs that grow CWND. Capping streams opened per loop iteration at ~`32 KiB / msg_size` (one stream per tick at 32 KiB, ~8 at 4 KiB, effectively unbounded at ≤ 512 B) interleaves send and recv work the way tokio's per-stream task design does implicitly. Worth +177 % at 50 c × 32 KiB and +119 % at 200 c × 32 KiB; no regressions at smaller payloads.
+  4. **Payload-size-aware client topup cap** (PR #197): the bench was self-DoSing at 32 KiB by opening all `num_clients` streams in one tick — flooding quinn-proto's send buffer with `num_clients × msg_size` bytes before the recv side drained the ACKs that grow CWND. Capping streams opened per loop iteration at ~`32 KiB / msg_size` interleaves send and recv work the way tokio's per-stream task design does implicitly.
+  5. **Server-side response cap** (this PR): the *server* had the mirror-image bug — echoing all completed requests' bodies in one event-drain dumped `num_clients × msg_size` of response data into its send buffer before draining recv (the ACKs growing the server's send CWND). Same payload-aware cap on responses generated per loop iteration. This was the larger of the two: 50 c × 32 KiB went 4.2 k → 6.1 k on top of the client cap, with p99 latency dropping from ~120 ms to ~17 ms.
 
-At 32 KiB ringline still trails by 50–70 %. The gap is now bounded by quinn-proto's congestion control responding to RTT signals that ringline's loop produces — not by the bench's send-burst pattern. Closing the rest needs deeper QUIC-layer work.
+Combined client+server effect vs the pre-fix baseline: **50 c × 32 KiB 1.4 k → 6.1 k (+335 %)**, **200 c × 32 KiB 1.0 k → 4.3 k (+330 %)**, no regressions at smaller payloads.
+
+At 32 KiB ringline still trails by 31–49 %. The remaining gap is bounded by quinn-proto's congestion control responding to RTT signals ringline's loop produces — not by either side's send-burst pattern any more. Closing the rest needs deeper QUIC-layer work.
 
 ## Highlights & history
 
-### `perf(bench/http3+quic): payload-size-aware topup cap`
+### `perf(bench/http3): interleave send-generation with recv (client topup + server response caps)`
 
-Both QUIC and H3 bench clients used to top up to `num_clients` in-flight streams in a tight per-loop-iteration loop. At small payloads that's fine — the open-cost is trivial and batching opens lets `quic.batch()` coalesce them into one GSO segment. At large payloads it's catastrophic: 50 streams × 32 KiB = 1.6 MiB of body data dumped into quinn-proto's send buffer in one tick, before the recv side has any chance to drain the ACKs that grow CWND. The bench was effectively self-DoSing.
+Both sides of the H3 bench had the same self-DoS bug at large payloads: generating a tick's worth of stream work all at once, dumping `num_clients × msg_size` bytes into quinn-proto's send buffer before the recv side drained the ACKs that grow the connection's CWND. quinn-proto's cubic CC mistook the buffer pressure for the network ceiling and pinned CWND at ~150 KB. The fix on both sides is the same shape tokio's per-stream-task design gets implicitly: spread send-generation across many loop iterations, interleaved with recv.
 
-Same lesson tokio's quinn-endpoint design teaches: per-stream tokio tasks are independent, so opens get sprinkled across many runtime ticks rather than bunched into one.
+**Client topup cap** (PR #197): cap streams opened per loop iteration at `max(1, 32 KiB / msg_size)`. One stream per tick at 32 KiB, ~8 at 4 KiB, unbounded at ≤ 512 B.
 
-Fix: cap streams opened per loop iteration at `max(1, 32 KiB / msg_size)`. One stream per tick at 32 KiB, ~8 at 4 KiB, unbounded at ≤ 512 B.
+**Server response cap** (this PR): the server echoing all completed requests' bodies in one event-drain is the mirror-image bug — it floods the *server's* send buffer and stalls processing of the ACKs growing the server's CWND. Same payload-aware cap on responses generated per loop iteration. This was the larger of the two effects.
 
-| Bench | Cell | Before | After | Δ |
-|:---|:---|---:|---:|---:|
-| HTTP/3 | 50 c × 32 KiB  | 1.4 k | **4.2 k** | **+200 %** |
-| HTTP/3 | 200 c × 32 KiB | 1.0 k | **2.5 k** | **+150 %** |
-| HTTP/3 | 10 c × 4 KiB   |  31 k |  35 k | +13 % |
-| HTTP/3 | 200 c × 4 KiB  |  40 k |  42 k | +6 % |
-| HTTP/3 | 200 c × 512 B  | 158 k | 167 k | +6 % |
-| Other  | various        | — | — | within run-to-run noise |
+| Bench cell | baseline | + client cap | + server cap | total Δ |
+|:---|---:|---:|---:|---:|
+| 50 c × 32 KiB  | 1.4 k | 4.2 k | **6.1 k** | **+335 %** |
+| 200 c × 32 KiB | 1.0 k | 2.5 k | **4.3 k** | **+330 %** |
+| 10 c × 4 KiB   |  31 k |  35 k |  35 k | +13 % |
+| 200 c × 512 B  | 158 k | 167 k | 167 k | +6 % |
+| smaller cells  | — | — | — | within run-to-run noise |
 
-Override the heuristic with `RINGLINE_BENCH_TOPUP_CAP=<n>` for experimentation; `n = 0` keeps the prior unbounded behavior.
+p99 latency at 50 c × 32 KiB also dropped from ~120 ms to ~17 ms with the server cap — the bursty send pattern had been producing long tail stalls.
+
+Override the heuristics with `RINGLINE_BENCH_TOPUP_CAP=<n>` (client) and `RINGLINE_BENCH_RESP_CAP=<n>` (server) for experimentation.
+
+The general lesson, applicable to any ringline app driving QUIC-style protocols: at payload sizes where each stream op carries significant data, generate a bounded amount of send work per event-loop iteration and let recv interleave — don't batch all of it into one tick.
 
 ### Investigation: SO_TIMESTAMPING for kernel-accurate rx times (didn't help)
 
