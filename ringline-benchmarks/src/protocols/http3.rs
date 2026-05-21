@@ -39,6 +39,10 @@ pub fn run_http3(
     let (certs, key) = generate_self_signed();
     let server_addr = port_manager.next_addr();
 
+    // Publish the body size so the echo server can size its
+    // per-iteration response cap to match the workload.
+    SERVER_MSG_SIZE.store(msg_size as u64, Ordering::Relaxed);
+
     let server = match start_h3_server(server_addr, certs.clone(), key) {
         Ok(s) => s,
         Err(e) => {
@@ -104,6 +108,12 @@ fn quinn_server_config(
     let transport = Arc::get_mut(&mut sc.transport).unwrap();
     transport.max_concurrent_bidi_streams(1024u32.into());
     transport.max_concurrent_uni_streams(1024u32.into());
+    // Default 333 ms initial RTT comes from RFC 9002. On localhost
+    // it makes the pacer wildly over-conservative during the
+    // pre-first-ACK phase. 1 ms is closer to reality and lets the
+    // first burst of packets actually use the available bandwidth
+    // instead of being throttled.
+    transport.initial_rtt(Duration::from_millis(1));
     Arc::new(sc)
 }
 
@@ -122,6 +132,7 @@ fn quinn_client_config(certs: &[CertificateDer<'static>]) -> quinn_proto::Client
     let mut tp = quinn_proto::TransportConfig::default();
     tp.max_concurrent_bidi_streams(1024u32.into());
     tp.max_concurrent_uni_streams(1024u32.into());
+    tp.initial_rtt(Duration::from_millis(1));
     cc.transport_config(Arc::new(tp));
     cc
 }
@@ -145,6 +156,10 @@ impl BenchmarkServer {
 }
 
 static SERVER_CFG: Mutex<Option<ringline_quic::QuicConfig>> = Mutex::new(None);
+/// Body size for the current bench config, published so the echo
+/// server can size its per-iteration response cap (same payload-aware
+/// heuristic as the client's topup cap).
+static SERVER_MSG_SIZE: AtomicU64 = AtomicU64::new(0);
 
 struct H3EchoHandler;
 
@@ -212,8 +227,25 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                 // every echo response emits ~2 small `sendmsg` calls,
                 // killing GSO coalescing at 50 c × 32 KiB and pricing in
                 // the per-call drain overhead.
+                // Cap responses generated per loop iteration. Mirrors
+                // the client's topup cap: at 32 KiB, echoing 50
+                // responses in one drain dumps 1.6 MiB into
+                // quinn-proto's send buffer and stalls recv (so the
+                // ACKs growing the server's CWND don't get processed).
+                // Leave un-responded events queued in H3Connection for
+                // the next iteration. Override via env var.
+                let resp_cap = std::env::var("RINGLINE_BENCH_RESP_CAP")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or_else(|| {
+                        let msg = SERVER_MSG_SIZE.load(Ordering::Relaxed).max(1) as usize;
+                        (32 * 1024 / msg).max(1)
+                    });
+                let mut responded = 0usize;
                 let mut batch = quic.batch();
-                while let Some(event) = h3.poll_event() {
+                while responded < resp_cap
+                    && let Some(event) = h3.poll_event()
+                {
                     match event {
                         ringline_h3::H3Event::Request {
                             stream_id,
@@ -230,6 +262,7 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                                     bytes::Bytes::new(),
                                     true,
                                 );
+                                responded += 1;
                             } else {
                                 bodies.insert(u64::from(stream_id), Vec::new());
                             }
@@ -255,6 +288,7 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                                     bytes::Bytes::from(body),
                                     true,
                                 );
+                                responded += 1;
                             }
                         }
                         ringline_h3::H3Event::StreamReset { stream_id, .. } => {
@@ -472,8 +506,26 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
                         ringline_h3::HeaderField::new(b":authority", b"localhost"),
                     ];
 
+                    // Cap streams opened per loop iteration. With large
+                    // payloads, opening many streams in one tick floods
+                    // quinn-proto's send buffer before we get a chance
+                    // to drain recv (which carries the ACKs that grow
+                    // CWND). With small payloads the open-cost is tiny
+                    // and batching is fine. Heuristic: about 32 KiB
+                    // of body per tick — 1 stream at 32 KiB, 8 at 4 KiB,
+                    // unbounded at ≤ 512 B. Override via env var for
+                    // experimentation.
+                    let default_cap = (32 * 1024 / state.msg_size.max(1)).max(1);
+                    let topup_cap = std::env::var("RINGLINE_BENCH_TOPUP_CAP")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(default_cap);
+                    let mut opened_this_tick = 0usize;
                     let mut batch = quic.batch();
                     while in_flight.len() < state.num_clients {
+                        if topup_cap > 0 && opened_this_tick >= topup_cap {
+                            break;
+                        }
                         let now = Instant::now();
                         let stream = match h3.send_request(&mut batch, &request_headers, false) {
                             Ok(s) => s,
@@ -490,6 +542,7 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
                         {
                             break;
                         }
+                        opened_this_tick += 1;
                         in_flight.insert(
                             u64::from(stream),
                             PendingReq {
