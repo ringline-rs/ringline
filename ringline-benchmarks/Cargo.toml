@@ -10,6 +10,11 @@ publish = false
 name = "ringline-benchmarks"
 path = "src/main.rs"
 
+[features]
+# Forward to ringline's mio fallback backend so the bench can A/B
+# the io_uring vs mio recv/send path on the same workload.
+force-mio = ["ringline/force-mio"]
+
 [dependencies]
 ringline = { workspace = true }
 ringline-quic = { workspace = true }

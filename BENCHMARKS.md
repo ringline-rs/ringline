@@ -234,7 +234,16 @@ Five stacked perf changes drove the wins:
 
 Combined client+server effect vs the pre-fix baseline: **50 c × 32 KiB 1.4 k → 6.1 k (+335 %)**, **200 c × 32 KiB 1.0 k → 4.3 k (+330 %)**, no regressions at smaller payloads.
 
-At 32 KiB ringline still trails by 31–49 %. The remaining gap is bounded by quinn-proto's congestion control responding to RTT signals ringline's loop produces — not by either side's send-burst pattern any more. Closing the rest needs deeper QUIC-layer work.
+At 32 KiB ringline still trails by 31–49 %. The remaining gap is bounded by quinn-proto's congestion control responding to RTT signals ringline's loop produces — not by either side's send-burst pattern any more.
+
+**Is the residual gap an io\_uring artifact?** No — a differential test rules it out. Building the bench with `--features force-mio` (ringline's epoll fallback backend) and re-running 50 c × 32 KiB:
+
+| Server backend | ringline-h3 | tokio (h3+h3-quinn) | ratio |
+|:---|---:|---:|---:|
+| io\_uring | 6.1 k | 8.8 k | 0.70 |
+| mio (epoll) | 3.8 k | 5.6 k | 0.67 |
+
+The backend sets the *absolute* ceiling (the mio server is slower across the board), but the ringline-client ÷ tokio-client *ratio* is essentially identical on both. So the residual gap isn't a CQE-drain / batched-wakeup io\_uring artifact — it's backend-independent, which localises it to the single-task loop structure or the way we feed quinn-proto, both shared across backends. Replacing quinn-proto wouldn't help (the framing/crypto isn't the issue); the lever is the loop, and the obvious loop knobs (recv-batch size, topup cap, server response cap, rx timestamp source) have all been swept. Further gains would need a tokio-style split into a dedicated connection-driver task plus per-stream tasks so the scheduler can interleave recv with stream-level work at await granularity — a substantial bench rewrite with uncertain payoff on a single worker thread.
 
 ## Highlights & history
 
