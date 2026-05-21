@@ -63,6 +63,175 @@ pub fn run_http3(
     result
 }
 
+/// Drain completed H3 responses on the client, recording latency samples
+/// and op counts. Returns true if the loop should stop (GoAway / Error).
+fn drain_client_h3_events(
+    h3: &mut ringline_h3::H3Connection,
+    in_flight: &mut HashMap<u64, PendingReq>,
+    local_ops: &mut u64,
+    state: &RinglineH3State,
+) -> bool {
+    while let Some(event) = h3.poll_event() {
+        match event {
+            ringline_h3::H3Event::Response {
+                stream_id,
+                end_stream,
+                ..
+            } => {
+                let key = u64::from(stream_id);
+                if let Some(req) = in_flight.get_mut(&key) {
+                    req.got_response_headers = true;
+                    if end_stream {
+                        let elapsed_ns = req.start.elapsed().as_nanos() as u64;
+                        state.sample_tx.try_send(elapsed_ns).ok();
+                        *local_ops += 1;
+                        if *local_ops & 0xFF == 0 {
+                            state.ops.fetch_add(256, Ordering::Relaxed);
+                        }
+                        in_flight.remove(&key);
+                    }
+                }
+            }
+            ringline_h3::H3Event::Data {
+                stream_id,
+                data,
+                end_stream,
+            } => {
+                let key = u64::from(stream_id);
+                if let Some(req) = in_flight.get_mut(&key) {
+                    req.bytes_read += data.len();
+                    if end_stream {
+                        let elapsed_ns = req.start.elapsed().as_nanos() as u64;
+                        state.sample_tx.try_send(elapsed_ns).ok();
+                        *local_ops += 1;
+                        if *local_ops & 0xFF == 0 {
+                            state.ops.fetch_add(256, Ordering::Relaxed);
+                        }
+                        in_flight.remove(&key);
+                    }
+                }
+            }
+            ringline_h3::H3Event::StreamReset { stream_id, .. } => {
+                in_flight.remove(&u64::from(stream_id));
+            }
+            ringline_h3::H3Event::GoAway { .. } | ringline_h3::H3Event::Error(_) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Open replacement request streams up to `num_clients` in flight. Send
+/// generation goes through `quic` — a `BatchGuard` via deref coercion, so
+/// the resulting transmits are deferred to the batch's flush.
+#[allow(clippy::too_many_arguments)]
+fn topup_requests(
+    h3: &mut ringline_h3::H3Connection,
+    quic: &mut ringline_quic::QuicEndpoint,
+    in_flight: &mut HashMap<u64, PendingReq>,
+    payload: &bytes::Bytes,
+    num_clients: usize,
+    msg_size: usize,
+    connected: bool,
+) {
+    if !connected || in_flight.len() >= num_clients {
+        return;
+    }
+    let request_headers = [
+        ringline_h3::HeaderField::new(b":method", b"POST"),
+        ringline_h3::HeaderField::new(b":path", b"/echo"),
+        ringline_h3::HeaderField::new(b":scheme", b"https"),
+        ringline_h3::HeaderField::new(b":authority", b"localhost"),
+    ];
+    let default_cap = (32 * 1024 / msg_size.max(1)).max(1);
+    let topup_cap = std::env::var("RINGLINE_BENCH_TOPUP_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(default_cap);
+    let mut opened_this_tick = 0usize;
+    while in_flight.len() < num_clients {
+        if topup_cap > 0 && opened_this_tick >= topup_cap {
+            break;
+        }
+        let now = Instant::now();
+        let stream = match h3.send_request(quic, &request_headers, false) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        if h3
+            .send_data_bytes(quic, stream, payload.clone(), true)
+            .is_err()
+        {
+            break;
+        }
+        opened_this_tick += 1;
+        in_flight.insert(
+            u64::from(stream),
+            PendingReq {
+                start: now,
+                bytes_read: 0,
+                got_response_headers: false,
+            },
+        );
+    }
+}
+
+/// Echo completed H3 request bodies back to the client, up to `resp_cap`
+/// responses per call. Send generation goes through `quic` (a
+/// `BatchGuard` via deref coercion).
+fn echo_responses(
+    h3: &mut ringline_h3::H3Connection,
+    quic: &mut ringline_quic::QuicEndpoint,
+    bodies: &mut HashMap<u64, Vec<u8>>,
+    resp_cap: usize,
+) {
+    let mut responded = 0usize;
+    while responded < resp_cap
+        && let Some(event) = h3.poll_event()
+    {
+        match event {
+            ringline_h3::H3Event::Request {
+                stream_id,
+                end_stream,
+                ..
+            } => {
+                if end_stream {
+                    let resp = vec![ringline_h3::HeaderField::new(b":status", b"200")];
+                    let _ = h3.send_response(quic, stream_id, &resp, false);
+                    let _ = h3.send_data_bytes(quic, stream_id, bytes::Bytes::new(), true);
+                    responded += 1;
+                } else {
+                    bodies.insert(u64::from(stream_id), Vec::new());
+                }
+            }
+            ringline_h3::H3Event::Data {
+                stream_id,
+                data,
+                end_stream,
+            } => {
+                let key = u64::from(stream_id);
+                let entry = bodies.entry(key).or_default();
+                entry.extend_from_slice(&data);
+                if end_stream {
+                    let body = bodies.remove(&key).unwrap_or_default();
+                    let resp = vec![ringline_h3::HeaderField::new(b":status", b"200")];
+                    let _ = h3.send_response(quic, stream_id, &resp, false);
+                    // `Bytes::from(Vec<u8>)` is O(1) — takes ownership of
+                    // the Vec's buffer without copying the body bytes.
+                    let _ = h3.send_data_bytes(quic, stream_id, bytes::Bytes::from(body), true);
+                    responded += 1;
+                }
+            }
+            ringline_h3::H3Event::StreamReset { stream_id, .. } => {
+                bodies.remove(&u64::from(stream_id));
+            }
+            _ => {}
+        }
+    }
+}
+
 fn empty_result() -> BenchResult {
     BenchResult {
         ops_per_sec: 0.0,
@@ -191,49 +360,12 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
 
         Some(Box::pin(async move {
             loop {
-                // Drain every queued UDP datagram in one poll rather
-                // than one wake-cycle per packet. io_uring multishot
-                // recv pushes a CQE per datagram into our queue, but
-                // at 32 KiB body sizes there can be dozens of
-                // datagrams queued by the time the task is polled —
-                // the prior `with_datagram` (one-at-a-time) path
-                // turned that into N executor wake/poll cycles
-                // instead of one, capping pps far below what the
-                // kernel could supply. Same zero-copy semantics: the
-                // callback borrows each kernel buffer for its
-                // duration and the bid is released right after.
-                // Cap the batch at 8: enough to amortise the per-poll
-                // overhead at thousands of pps without delaying ACK /
-                // MAX_STREAM_DATA emission long enough to stall the
-                // peer's congestion window.
-                // `recv_batch_timed` passes the driver-captured rx
-                // timestamp through so quinn-proto's RTT samples are
-                // taken at actual arrival, not at user-space dispatch
-                // — eliminates the executor wake + task poll latency
-                // from CC's view of RTT.
-                let recv_fut = udp.recv_batch_timed(8, |data, peer, recv_at| {
-                    quic.handle_datagram(recv_at, data, peer);
-                });
-                ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
-                quic.drive_timers(Instant::now());
-
-                while let Some(event) = quic.poll_event() {
-                    let _ = h3.handle_quic_event(&mut quic, &event);
-                }
-
-                // Drain H3 events inside a single `quic.batch()` scope so
-                // each completing request's send_response + send_data don't
-                // each trigger their own `drain_transmits` — without this,
-                // every echo response emits ~2 small `sendmsg` calls,
-                // killing GSO coalescing at 50 c × 32 KiB and pricing in
-                // the per-call drain overhead.
-                // Cap responses generated per loop iteration. Mirrors
-                // the client's topup cap: at 32 KiB, echoing 50
-                // responses in one drain dumps 1.6 MiB into
-                // quinn-proto's send buffer and stalls recv (so the
-                // ACKs growing the server's CWND don't get processed).
-                // Leave un-responded events queued in H3Connection for
-                // the next iteration. Override via env var.
+                // Cap responses generated per loop iteration. At 32 KiB,
+                // echoing 50 responses in one drain dumps 1.6 MiB into
+                // quinn-proto's send buffer and stalls recv (so the ACKs
+                // growing the server's CWND don't get processed). Leave
+                // un-responded events queued in H3Connection for the next
+                // iteration. Override via RINGLINE_BENCH_RESP_CAP.
                 let resp_cap = std::env::var("RINGLINE_BENCH_RESP_CAP")
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
@@ -241,63 +373,33 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
                         let msg = SERVER_MSG_SIZE.load(Ordering::Relaxed).max(1) as usize;
                         (32 * 1024 / msg).max(1)
                     });
-                let mut responded = 0usize;
-                let mut batch = quic.batch();
-                while responded < resp_cap
-                    && let Some(event) = h3.poll_event()
+
+                // Hold one `quic.batch()` across the whole recv → process
+                // → echo phase. This defers quinn-proto's `poll_transmit`
+                // to a single pass at batch-drop time — coalescing the
+                // iteration's entire send backlog into max-size GSO
+                // super-packets — instead of running it once per received
+                // datagram inside `handle_datagram` (which, with only an
+                // ACK or two queued each time, produced 3-4-segment GSO
+                // buffers and ~10× the `sendmsg` syscalls). At 32 KiB the
+                // per-datagram drain spent ~20% of CPU in `io_sendmsg`.
+                // The recv callback reaches `handle_datagram` through the
+                // guard's `DerefMut`, so the batch stays open across recv.
                 {
-                    match event {
-                        ringline_h3::H3Event::Request {
-                            stream_id,
-                            end_stream,
-                            ..
-                        } => {
-                            if end_stream {
-                                // GET-style: empty body, reply with empty body.
-                                let resp = vec![ringline_h3::HeaderField::new(b":status", b"200")];
-                                let _ = h3.send_response(&mut batch, stream_id, &resp, false);
-                                let _ = h3.send_data_bytes(
-                                    &mut batch,
-                                    stream_id,
-                                    bytes::Bytes::new(),
-                                    true,
-                                );
-                                responded += 1;
-                            } else {
-                                bodies.insert(u64::from(stream_id), Vec::new());
-                            }
-                        }
-                        ringline_h3::H3Event::Data {
-                            stream_id,
-                            data,
-                            end_stream,
-                        } => {
-                            let key = u64::from(stream_id);
-                            let entry = bodies.entry(key).or_default();
-                            entry.extend_from_slice(&data);
-                            if end_stream {
-                                let body = bodies.remove(&key).unwrap_or_default();
-                                let resp = vec![ringline_h3::HeaderField::new(b":status", b"200")];
-                                let _ = h3.send_response(&mut batch, stream_id, &resp, false);
-                                // `Bytes::from(Vec<u8>)` is O(1) — takes
-                                // ownership of the Vec's buffer without
-                                // copying the body bytes.
-                                let _ = h3.send_data_bytes(
-                                    &mut batch,
-                                    stream_id,
-                                    bytes::Bytes::from(body),
-                                    true,
-                                );
-                                responded += 1;
-                            }
-                        }
-                        ringline_h3::H3Event::StreamReset { stream_id, .. } => {
-                            bodies.remove(&u64::from(stream_id));
-                        }
-                        _ => {}
+                    let mut batch = quic.batch();
+                    let recv_fut = udp.recv_batch_timed(8, |data, peer, recv_at| {
+                        batch.handle_datagram(recv_at, data, peer);
+                    });
+                    ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
+                    batch.drive_timers(Instant::now());
+
+                    while let Some(event) = batch.poll_event() {
+                        let _ = h3.handle_quic_event(&mut batch, &event);
                     }
+
+                    echo_responses(&mut h3, &mut batch, &mut bodies, resp_cap);
+                    // drop(batch) flushes deferred transmits as GSO.
                 }
-                drop(batch);
 
                 while let Some(pkt) = quic.poll_send() {
                     match pkt.segment_size {
@@ -420,139 +522,50 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
                     break;
                 }
 
-                // Same batched-drain rationale as the H3 server above.
-                // Cap the batch at 8: enough to amortise the per-poll
-                // overhead at thousands of pps without delaying ACK /
-                // MAX_STREAM_DATA emission long enough to stall the
-                // peer's congestion window.
-                // `recv_batch_timed` passes the driver-captured rx
-                // timestamp through so quinn-proto's RTT samples are
-                // taken at actual arrival, not at user-space dispatch
-                // — eliminates the executor wake + task poll latency
-                // from CC's view of RTT.
-                let recv_fut = udp.recv_batch_timed(8, |data, peer, recv_at| {
-                    quic.handle_datagram(recv_at, data, peer);
-                });
-                ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
-                quic.drive_timers(Instant::now());
-
-                while let Some(event) = quic.poll_event() {
-                    if let ringline_quic::QuicEvent::Connected(_) = event {
-                        connected = true;
-                    }
-                    let _ = h3.handle_quic_event(&mut quic, &event);
-                }
-
-                while let Some(event) = h3.poll_event() {
-                    match event {
-                        ringline_h3::H3Event::Response {
-                            stream_id,
-                            end_stream,
-                            ..
-                        } => {
-                            let key = u64::from(stream_id);
-                            if let Some(req) = in_flight.get_mut(&key) {
-                                req.got_response_headers = true;
-                                if end_stream {
-                                    let elapsed_ns = req.start.elapsed().as_nanos() as u64;
-                                    state.sample_tx.try_send(elapsed_ns).ok();
-                                    local_ops += 1;
-                                    if local_ops & 0xFF == 0 {
-                                        state.ops.fetch_add(256, Ordering::Relaxed);
-                                    }
-                                    in_flight.remove(&key);
-                                }
-                            }
-                        }
-                        ringline_h3::H3Event::Data {
-                            stream_id,
-                            data,
-                            end_stream,
-                        } => {
-                            let key = u64::from(stream_id);
-                            if let Some(req) = in_flight.get_mut(&key) {
-                                req.bytes_read += data.len();
-                                if end_stream {
-                                    let elapsed_ns = req.start.elapsed().as_nanos() as u64;
-                                    state.sample_tx.try_send(elapsed_ns).ok();
-                                    local_ops += 1;
-                                    if local_ops & 0xFF == 0 {
-                                        state.ops.fetch_add(256, Ordering::Relaxed);
-                                    }
-                                    in_flight.remove(&key);
-                                }
-                            }
-                        }
-                        ringline_h3::H3Event::StreamReset { stream_id, .. } => {
-                            in_flight.remove(&u64::from(stream_id));
-                        }
-                        ringline_h3::H3Event::GoAway { .. } | ringline_h3::H3Event::Error(_) => {
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Top up to num_clients in-flight requests. Wrap the
-                // open + send_request + send_data sequence in a
-                // ringline-quic batch so quinn-proto can coalesce all
-                // of them into a single GSO segment instead of one
-                // sendmsg per call. Same trick as the QUIC bench.
-                if connected && in_flight.len() < state.num_clients {
-                    let request_headers = [
-                        ringline_h3::HeaderField::new(b":method", b"POST"),
-                        ringline_h3::HeaderField::new(b":path", b"/echo"),
-                        ringline_h3::HeaderField::new(b":scheme", b"https"),
-                        ringline_h3::HeaderField::new(b":authority", b"localhost"),
-                    ];
-
-                    // Cap streams opened per loop iteration. With large
-                    // payloads, opening many streams in one tick floods
-                    // quinn-proto's send buffer before we get a chance
-                    // to drain recv (which carries the ACKs that grow
-                    // CWND). With small payloads the open-cost is tiny
-                    // and batching is fine. Heuristic: about 32 KiB
-                    // of body per tick — 1 stream at 32 KiB, 8 at 4 KiB,
-                    // unbounded at ≤ 512 B. Override via env var for
-                    // experimentation.
-                    let default_cap = (32 * 1024 / state.msg_size.max(1)).max(1);
-                    let topup_cap = std::env::var("RINGLINE_BENCH_TOPUP_CAP")
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .unwrap_or(default_cap);
-                    let mut opened_this_tick = 0usize;
+                // Hold a single `quic.batch()` across the whole recv →
+                // process → topup phase so quinn-proto's `poll_transmit`
+                // runs once per loop iteration (coalescing the iteration's
+                // entire send backlog into max-size GSO super-packets)
+                // instead of once per received datagram inside
+                // `handle_datagram` — which, with only an ACK or two queued
+                // each time, produced 3-4-segment GSO buffers and ~10× the
+                // `sendmsg` syscalls (~20% of CPU in `io_sendmsg` at
+                // 32 KiB). The recv callback reaches `handle_datagram`
+                // through the guard's `DerefMut`. See the H3 server above
+                // for the matching change; both ends needed it.
+                let mut stop = false;
+                {
                     let mut batch = quic.batch();
-                    while in_flight.len() < state.num_clients {
-                        if topup_cap > 0 && opened_this_tick >= topup_cap {
-                            break;
+                    let recv_fut = udp.recv_batch_timed(8, |data, peer, recv_at| {
+                        batch.handle_datagram(recv_at, data, peer);
+                    });
+                    ringline::select(recv_fut, ringline::sleep(Duration::from_millis(1))).await;
+                    batch.drive_timers(Instant::now());
+
+                    while let Some(event) = batch.poll_event() {
+                        if let ringline_quic::QuicEvent::Connected(_) = event {
+                            connected = true;
                         }
-                        let now = Instant::now();
-                        let stream = match h3.send_request(&mut batch, &request_headers, false) {
-                            Ok(s) => s,
-                            Err(_) => break,
-                        };
-                        // Zero-copy body send: cloning the Bytes is
-                        // an O(1) refcount bump, so the same `payload`
-                        // is shared across every in-flight stream
-                        // instead of a fresh 32 KiB memcpy per call
-                        // like `send_data` would do.
-                        if h3
-                            .send_data_bytes(&mut batch, stream, payload.clone(), true)
-                            .is_err()
-                        {
-                            break;
-                        }
-                        opened_this_tick += 1;
-                        in_flight.insert(
-                            u64::from(stream),
-                            PendingReq {
-                                start: now,
-                                bytes_read: 0,
-                                got_response_headers: false,
-                            },
+                        let _ = h3.handle_quic_event(&mut batch, &event);
+                    }
+
+                    if drain_client_h3_events(&mut h3, &mut in_flight, &mut local_ops, &state) {
+                        stop = true;
+                    } else {
+                        topup_requests(
+                            &mut h3,
+                            &mut batch,
+                            &mut in_flight,
+                            &payload,
+                            state.num_clients,
+                            state.msg_size,
+                            connected,
                         );
                     }
-                    // drop(batch) flushes deferred QUIC transmits.
+                    // drop(batch) flushes deferred QUIC transmits as GSO.
+                }
+                if stop {
+                    break;
                 }
 
                 while let Some(pkt) = quic.poll_send() {
