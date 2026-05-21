@@ -157,6 +157,25 @@ pub struct Config {
     ///
     /// Default: 1024.
     pub udp_recv_queue_capacity: usize,
+    /// Enable UDP Generic Receive Offload (GRO) on bound UDP sockets.
+    ///
+    /// When set, the runtime calls `setsockopt(SOL_UDP, UDP_GRO)` so the
+    /// kernel coalesces consecutive same-flow datagrams into one `recvmsg`
+    /// delivery, carrying the per-segment size in a control message. The
+    /// runtime splits the coalesced payload back into individual datagrams
+    /// transparently, so [`UdpCtx::recv_batch`](crate::UdpCtx::recv_batch) /
+    /// [`recv_batch_timed`](crate::UdpCtx::recv_batch_timed) callbacks still
+    /// fire once per datagram. This cuts per-datagram syscall / wake overhead
+    /// dramatically for high-pps flows (e.g. QUIC at large payloads).
+    ///
+    /// A coalesced datagram can be up to ~64 KiB, and on io_uring the
+    /// recvmsg header + sockaddr + control + payload share one provided
+    /// buffer, so enabling GRO requires `udp_recv_buffer.buffer_size` to be
+    /// large enough to hold a full coalesced datagram (validated at startup);
+    /// otherwise the kernel truncates and the datagram is dropped. Has no
+    /// effect on `connect(2)`-ed UDP sockets (they use the lighter `recv`
+    /// path, which carries no control message). Default: false.
+    pub udp_gro: bool,
     /// Optional NVMe passthrough configuration. When set, enables NVMe device
     /// management and `IORING_OP_URING_CMD` submission for direct NVMe I/O.
     pub nvme: Option<crate::nvme::NvmeConfig>,
@@ -241,6 +260,7 @@ impl Default for Config {
             udp_connect_peers: Vec::new(),
             udp_send_slots: 64,
             udp_recv_queue_capacity: 1024,
+            udp_gro: false,
             nvme: None,
             direct_io: None,
             fs: Some(crate::fs::FsConfig::default()),
@@ -331,9 +351,14 @@ impl Config {
                     "udp_recv_buffer.ring_size must be a power of two".into(),
                 ));
             }
-            if self.udp_recv_buffer.buffer_size == 0 || self.udp_recv_buffer.buffer_size > 65535 {
+            // Ceiling is 256 KiB so UDP GRO (which coalesces up to ~64 KiB of
+            // payload plus the recvmsg header / sockaddr / control region into
+            // one provided buffer) can be sized to fit. Non-GRO callers
+            // typically stay near a single MTU.
+            if self.udp_recv_buffer.buffer_size == 0 || self.udp_recv_buffer.buffer_size > (1 << 18)
+            {
                 return Err(crate::error::Error::RingSetup(
-                    "udp_recv_buffer.buffer_size must be > 0 and <= 65535".into(),
+                    "udp_recv_buffer.buffer_size must be > 0 and <= 262144".into(),
                 ));
             }
             // Each datagram occupies one buffer that also holds the
@@ -343,6 +368,17 @@ impl Config {
             if self.udp_recv_buffer.buffer_size < 160 {
                 return Err(crate::error::Error::RingSetup(
                     "udp_recv_buffer.buffer_size must be >= 160 to hold recvmsg header + sockaddr"
+                        .into(),
+                ));
+            }
+            // GRO coalesces up to ~64 KiB into a single delivery; the buffer
+            // must hold that plus the recvmsg header (16) + sockaddr (128) +
+            // control region, or the kernel truncates and the datagram is
+            // dropped silently. Require headroom past 64 KiB.
+            if self.udp_gro && self.udp_recv_buffer.buffer_size < (1 << 16) + 512 {
+                return Err(crate::error::Error::RingSetup(
+                    "udp_recv_buffer.buffer_size must be >= 66048 when udp_gro is enabled \
+                     (a coalesced GRO datagram is up to ~64 KiB plus recvmsg metadata)"
                         .into(),
                 ));
             }
@@ -615,6 +651,13 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable UDP GRO on bound UDP sockets. See [`Config::udp_gro`]. Remember
+    /// to size `udp_recv_buffer` to hold a full coalesced datagram (~64 KiB).
+    pub fn udp_gro(mut self, enabled: bool) -> Self {
+        self.config.udp_gro = enabled;
+        self
+    }
+
     // ── Optional subsystems ──────────────────────────────────────────
 
     /// Set NVMe passthrough configuration.
@@ -747,6 +790,45 @@ mod tests {
     fn validate_buffer_size_large_rejected() {
         assert!(
             config_with(|c| c.recv_buffer.buffer_size = 131072)
+                .validate()
+                .is_err()
+        );
+    }
+
+    fn udp_config_with(f: impl FnOnce(&mut Config)) -> Config {
+        config_with(|c| {
+            c.udp_bind = vec!["127.0.0.1:0".parse().unwrap()];
+            f(c);
+        })
+    }
+
+    #[test]
+    fn validate_udp_gro_requires_large_buffer() {
+        // Default udp buffer (2048) is far too small for a coalesced datagram.
+        let err = udp_config_with(|c| c.udp_gro = true)
+            .validate()
+            .unwrap_err();
+        assert!(format!("{err}").contains("udp_gro"));
+    }
+
+    #[test]
+    fn validate_udp_gro_accepts_large_buffer() {
+        udp_config_with(|c| {
+            c.udp_gro = true;
+            c.udp_recv_buffer.buffer_size = 1 << 17;
+        })
+        .validate()
+        .expect("udp_gro with a 128 KiB buffer should be valid");
+    }
+
+    #[test]
+    fn validate_udp_buffer_ceiling_raised() {
+        // The ceiling moved from 64 KiB to 256 KiB to accommodate GRO.
+        udp_config_with(|c| c.udp_recv_buffer.buffer_size = 1 << 18)
+            .validate()
+            .expect("256 KiB udp buffer should be accepted");
+        assert!(
+            udp_config_with(|c| c.udp_recv_buffer.buffer_size = (1 << 18) + 1)
                 .validate()
                 .is_err()
         );

@@ -74,6 +74,11 @@ pub(crate) struct PendingUdpDatagram {
     /// wake + task poll latency that elapses between arrival and the
     /// callback firing.
     pub(crate) recv_at: std::time::Instant,
+    /// UDP GRO segment size. When non-zero, `buf` holds several datagrams
+    /// coalesced by the kernel and the drain path splits it into chunks of
+    /// this size (the last chunk may be shorter), invoking the recv callback
+    /// once per chunk. Zero means a single, un-coalesced datagram.
+    pub(crate) segment_size: u32,
 }
 
 pub(crate) enum PendingUdpBuf {
@@ -108,6 +113,21 @@ impl PendingUdpDatagram {
             PendingUdpBuf::Kernel {
                 ptr, payload_len, ..
             } => unsafe { std::slice::from_raw_parts(*ptr, *payload_len as usize) },
+        }
+    }
+
+    /// Invoke `f` once per contained datagram: once for an un-coalesced
+    /// entry, or once per `segment_size` chunk (last chunk possibly shorter)
+    /// for a GRO-coalesced entry. Centralises the split so both drain loops
+    /// share it and neither risks a `chunks(0)` panic.
+    pub(crate) fn for_each_segment<F: FnMut(&[u8])>(&self, mut f: F) {
+        let data = self.data();
+        if self.segment_size == 0 {
+            f(data);
+        } else {
+            for chunk in data.chunks(self.segment_size as usize) {
+                f(chunk);
+            }
         }
     }
 
@@ -623,6 +643,43 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn owned_datagram(payload: Vec<u8>, segment_size: u32) -> PendingUdpDatagram {
+        PendingUdpDatagram {
+            peer: "127.0.0.1:0".parse().unwrap(),
+            buf: PendingUdpBuf::Owned(payload),
+            recv_at: std::time::Instant::now(),
+            segment_size,
+        }
+    }
+
+    #[test]
+    fn for_each_segment_no_gro_yields_whole_payload() {
+        let entry = owned_datagram(vec![7u8; 1200], 0);
+        let mut lens = Vec::new();
+        entry.for_each_segment(|s| lens.push(s.len()));
+        assert_eq!(lens, vec![1200]);
+    }
+
+    #[test]
+    fn for_each_segment_splits_coalesced_payload() {
+        // 2.5 segments of 1000 → chunks 1000, 1000, 500.
+        let entry = owned_datagram(vec![0u8; 2500], 1000);
+        let mut lens = Vec::new();
+        entry.for_each_segment(|s| lens.push(s.len()));
+        assert_eq!(lens, vec![1000, 1000, 500]);
+    }
+
+    #[test]
+    fn for_each_segment_exact_multiple() {
+        let entry = owned_datagram(vec![0u8; 3000], 1500);
+        let mut count = 0;
+        entry.for_each_segment(|s| {
+            assert_eq!(s.len(), 1500);
+            count += 1;
+        });
+        assert_eq!(count, 2);
+    }
 
     #[test]
     fn executor_new() {

@@ -71,6 +71,10 @@ pub(crate) struct UdpSocketState {
     /// [payload]`. `RecvMsgOut::parse` reads the same template on the CQE
     /// side. Must stay heap-stable for the lifetime of the multishot.
     pub recv_msghdr: Box<libc::msghdr>,
+    /// Whether `UDP_GRO` was enabled on this socket. When true, each recvmsg
+    /// delivery may carry a `UDP_GRO` control message whose value is the
+    /// segment size used to split the coalesced payload back into datagrams.
+    pub gro: bool,
     // ── Send state: fixed-size ring of per-SQE slots + a stack-freelist ──
     pub send_slots: Box<[UdpSendSlot]>,
     pub send_freelist: Vec<u16>,
@@ -355,6 +359,7 @@ impl Driver {
                 connect_peer,
                 fd_index,
                 config.udp_send_slots,
+                config.udp_gro,
             )?;
             udp_sockets.push(state);
         }
@@ -795,6 +800,7 @@ impl Driver {
         connect_peer: Option<SocketAddr>,
         fd_index: u32,
         send_slots: u16,
+        udp_gro: bool,
     ) -> Result<UdpSocketState, crate::error::Error> {
         let domain = if bind_addr.is_ipv4() {
             libc::AF_INET
@@ -817,6 +823,27 @@ impl Driver {
                 &optval as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
+        }
+
+        // Enable UDP GRO. Opt-in, so a failure is hard rather than silent —
+        // the caller has deliberately enlarged recv buffers expecting
+        // coalescing, and quietly running without it would mislead.
+        if udp_gro {
+            let on: libc::c_int = 1;
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_UDP,
+                    crate::backend::udp_gro::UDP_GRO,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(crate::error::Error::Io(err));
+            }
         }
 
         // Bind.
@@ -867,7 +894,16 @@ impl Driver {
         // control + payload). No iov is needed for multishot.
         let mut recv_msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
         recv_msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-        recv_msghdr.msg_controllen = 0;
+        // When GRO is on, reserve control space so the kernel can attach the
+        // UDP_GRO cmsg (segment size) inside each provided buffer. The kernel
+        // reads this length off the template; `rearm_udp_recvmsg` only resets
+        // `msg_namelen`, so this reservation survives re-arming. 0 keeps the
+        // control region inert for non-GRO sockets.
+        recv_msghdr.msg_controllen = if udp_gro {
+            crate::backend::udp_gro::UDP_GRO_CMSG_LEN
+        } else {
+            0
+        };
         recv_msghdr.msg_iov = std::ptr::null_mut();
         recv_msghdr.msg_iovlen = 0;
 
@@ -908,6 +944,7 @@ impl Driver {
             local_addr: bind_addr,
             connected_peer: connect_peer,
             recv_msghdr,
+            gro: udp_gro,
             send_slots: send_slots_box,
             send_freelist,
         })

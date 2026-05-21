@@ -232,6 +232,20 @@ fn echo_responses(
     }
 }
 
+/// Enable UDP GRO on the runtime config when the payload size is large
+/// enough to benefit. GRO coalesces many datagrams per recvmsg — a large win
+/// for bulk flows (4 KiB+), but the kernel's coalescing adds latency that
+/// regresses tiny high-concurrency payloads (64–512 B), where ringline is
+/// already far ahead. A real QUIC app would make the same per-workload
+/// choice; the bench mirrors it by `msg_size`. When enabled, recv buffers
+/// are grown to hold a full ~64 KiB coalesced datagram.
+fn apply_gro_config(config: &mut ringline::Config, msg_size: usize) {
+    if msg_size >= 4096 {
+        config.udp_gro = true;
+        config.udp_recv_buffer.buffer_size = 68 * 1024;
+    }
+}
+
 fn empty_result() -> BenchResult {
     BenchResult {
         ops_per_sec: 0.0,
@@ -444,6 +458,10 @@ fn start_h3_server(
     config.send_copy_count = 1024;
     config.send_copy_slot_size = 65536;
     config.standalone_task_capacity = 64;
+    apply_gro_config(
+        &mut config,
+        SERVER_MSG_SIZE.load(Ordering::Relaxed).max(1) as usize,
+    );
 
     let (shutdown, handles) = ringline::RinglineBuilder::new(config)
         .bind_udp(addr)
@@ -628,6 +646,7 @@ fn run_bench_ringline(
     config.send_copy_count = 1024;
     config.send_copy_slot_size = 65536;
     config.standalone_task_capacity = 64;
+    apply_gro_config(&mut config, msg_size);
 
     let (shutdown, handles) = match ringline::RinglineBuilder::new(config)
         .bind_udp(client_bind)

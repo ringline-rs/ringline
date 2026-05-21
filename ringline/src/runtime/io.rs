@@ -2925,7 +2925,12 @@ where
                 && let Some(entry) = executor.udp_recv_queues[idx].pop_front()
             {
                 let bid = entry.bid_to_release();
-                f(entry.data(), entry.peer);
+                let peer = entry.peer;
+                // One callback per datagram: GRO-coalesced entries fan out
+                // into per-segment slices here. `drained` counts entries
+                // (kernel recv completions), so the bid lifetime stays simple
+                // — released once after the whole entry is consumed.
+                entry.for_each_segment(|seg| f(seg, peer));
                 drop(entry);
                 #[cfg(has_io_uring)]
                 if let Some(bid) = bid {
@@ -2995,7 +3000,11 @@ where
             {
                 let bid = entry.bid_to_release();
                 let recv_at = entry.recv_at;
-                f(entry.data(), entry.peer, recv_at);
+                let peer = entry.peer;
+                // One callback per datagram; GRO-coalesced entries fan out
+                // into per-segment slices, all sharing this entry's arrival
+                // timestamp. `drained` counts entries, not segments.
+                entry.for_each_segment(|seg| f(seg, peer, recv_at));
                 drop(entry);
                 #[cfg(has_io_uring)]
                 if let Some(bid) = bid {

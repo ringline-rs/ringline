@@ -1840,6 +1840,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     metrics::UDP.increment(metrics::udp::DATAGRAMS_DROPPED);
                 } else {
                     let payload = msg_out.payload_data();
+                    // When GRO is on, the kernel may have coalesced several
+                    // datagrams into this payload; the UDP_GRO cmsg carries
+                    // the per-segment size used to split them back apart at
+                    // drain time. `is_control_data_truncated()` (MSG_CTRUNC)
+                    // means we lost the cmsg but the payload is intact —
+                    // treat it as a single datagram (segment_size 0) rather
+                    // than dropping it.
+                    let segment_size = if self.driver.udp_sockets[idx].gro
+                        && !msg_out.is_control_data_truncated()
+                    {
+                        crate::backend::udp_gro::parse_segment_size(msg_out.control_data())
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
                     // SAFETY: `payload` is a slice borrowed from the kernel
                     // buffer at `(buf_ptr, buf_len)`. The buffer remains valid
                     // until `bid` is pushed to `udp_pending_replenish` (which
@@ -1855,6 +1870,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                                 payload_len,
                             },
                             recv_at: std::time::Instant::now(),
+                            segment_size,
                         },
                     );
                     handed_to_queue = true;
@@ -1977,6 +1993,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         payload_len,
                     },
                     recv_at: std::time::Instant::now(),
+                    // Connected sockets use the plain `recv` path with no
+                    // msghdr/control region, so GRO never applies here.
+                    segment_size: 0,
                 });
                 handed_to_queue = true;
                 self.executor.wake_udp_recv(udp_index);

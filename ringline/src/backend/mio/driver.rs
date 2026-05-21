@@ -72,6 +72,9 @@ pub(crate) struct Driver {
     pub(crate) send_completions: Vec<VecDeque<u32>>,
     /// Bound UDP sockets (one per `config.udp_bind` address).
     pub(crate) udp_sockets: Vec<mio::net::UdpSocket>,
+    /// Whether UDP GRO was requested; when set, the readable handler uses
+    /// `recvmsg` with a control buffer to read the `UDP_GRO` segment size.
+    pub(crate) udp_gro: bool,
     /// First mio token used for UDP sockets. UDP socket `i` has token
     /// `udp_token_base + i`. Tokens below this are WAKE_TOKEN (0) and
     /// TCP connections (1..=max_connections).
@@ -156,7 +159,7 @@ impl Driver {
         // address).
         let mut udp_sockets = Vec::with_capacity(config.udp_bind.len());
         for (i, addr) in config.udp_bind.iter().enumerate() {
-            let std_socket = bind_udp_with_reuseport(*addr)
+            let std_socket = bind_udp_with_reuseport(*addr, config.udp_gro)
                 .map_err(|e| io::Error::new(e.kind(), format!("UDP bind {addr}: {e}")))?;
             std_socket.set_nonblocking(true)?;
             let mut mio_socket = mio::net::UdpSocket::from_std(std_socket);
@@ -203,6 +206,7 @@ impl Driver {
             tcp_nodelay: config.tcp_nodelay,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
             udp_sockets,
+            udp_gro: config.udp_gro,
             udp_token_base,
             disk_io_rx,
             disk_io_tx,
@@ -453,7 +457,7 @@ impl Drop for Driver {
 /// `std::net::UdpSocket::bind` binds before any setsockopt can run, so it
 /// can't be used here — multi-worker setups bind every worker to the same
 /// port and need `SO_REUSEPORT` set before bind.
-fn bind_udp_with_reuseport(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+fn bind_udp_with_reuseport(addr: SocketAddr, udp_gro: bool) -> io::Result<std::net::UdpSocket> {
     use std::os::fd::FromRawFd;
 
     let domain = if addr.is_ipv4() {
@@ -495,6 +499,25 @@ fn bind_udp_with_reuseport(addr: SocketAddr) -> io::Result<std::net::UdpSocket> 
         let err = io::Error::last_os_error();
         unsafe { libc::close(fd) };
         return Err(err);
+    }
+
+    // Enable UDP GRO (opt-in → hard-fail, mirroring the io_uring backend).
+    if udp_gro {
+        let on: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_UDP,
+                crate::backend::udp_gro::UDP_GRO,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
     }
 
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };

@@ -205,28 +205,30 @@ The tokio reference client is **`h3` + `h3-quinn`** — the canonical tokio HTTP
 
 | Clients × Size | ringline-h3 | tokio (h3 + h3-quinn) | ringline vs tokio |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  25 k |  21 k | +18 % |
-| 1c × 512 B  |  24 k |  20 k | +21 % |
-| 1c × 4 KiB  |  16 k |  14 k | +10 % |
-| 1c × 32 KiB |   4 k |   5 k | −14 % |
-| 10c × 64 B  | 118 k |  86 k | **+37 %** |
-| 10c × 512 B | 112 k |  79 k | +41 % |
-| 10c × 4 KiB |  54 k |  45 k | +21 % |
-| 10c × 32 KiB |  8 k |   9 k | −15 % |
-| 50c × 64 B  | 242 k |  93 k | **+161 %** |
-| 50c × 512 B | 192 k |  95 k | **+103 %** |
-| 50c × 4 KiB |  52 k |  53 k | −1 % |
-| 50c × 32 KiB | **7.6 k** | 9.4 k | −20 % |
-| 200c × 64 B | 319 k | 104 k | **+207 %** |
-| 200c × 512 B | 206 k |  94 k | **+119 %** |
-| 200c × 4 KiB | 50 k |  57 k | −12 % |
-| 200c × 32 KiB | **7.0 k** | 11 k | −38 % |
+| 1c × 64 B   |  25 k |  21 k | +17 % |
+| 1c × 512 B  |  24 k |  20 k | +18 % |
+| 1c × 4 KiB  |  17 k |  15 k | +15 % |
+| 1c × 32 KiB |  5.3 k | 5.8 k | −8 % |
+| 10c × 64 B  | 118 k |  87 k | **+36 %** |
+| 10c × 512 B | 113 k |  83 k | +36 % |
+| 10c × 4 KiB |  56 k |  51 k | +12 % |
+| 10c × 32 KiB | 10.6 k | 10.5 k | +1 % |
+| 50c × 64 B  | 235 k |  94 k | **+151 %** |
+| 50c × 512 B | 192 k |  96 k | **+101 %** |
+| 50c × 4 KiB |  65 k |  57 k | +14 % |
+| 50c × 32 KiB | **10.1 k** | 11.0 k | −9 % |
+| 200c × 64 B | 318 k | 103 k | **+208 %** |
+| 200c × 512 B | 206 k |  98 k | **+111 %** |
+| 200c × 4 KiB | 67 k |  61 k | +9 % |
+| 200c × 32 KiB | **9.9 k** | 13 k | −25 % |
 
-ringline-h3 leads tokio across the small-payload zone (≤ 512 B at every concurrency, by 2–3×) and now leads or ties through 4 KiB. The 32 KiB cells still trail, but the gap has roughly halved — 50 c × 32 KiB from −31 % to −20 %, 200 c × 32 KiB from −49 % to −38 % — after the **single-batch per-iteration drive** fix described below, on top of four earlier stacked changes:
+ringline-h3 leads tokio across the small-payload zone (≤ 512 B by 2–3×) and now **leads through 4 KiB at every concurrency**. The 32 KiB cells are within −8 % to −25 % (10 c is a tie) — down from −14 % to −38 % — after **UDP GRO on the receive path**, on top of the single-batch drive and four earlier stacked changes:
 
   1. **Server-side response batching** (PR #191): `QuicEndpoint::batch()` around the H3 event-drain + `send_data_bytes(Bytes::from(body))`, collapsing per-response `drain_transmits` and a per-echo body memcpy.
   2. **`UdpCtx::recv_batch()` / `recv_batch_timed()`** (PR #193 / #195): drain up to N queued UDP datagrams per task poll, with the driver-captured rx timestamp threaded through for accurate RTT samples.
   3. **Payload-size-aware client topup + server response caps** (PR #197): bound the streams opened / responses echoed per loop iteration so neither side floods quinn-proto's send buffer with `num_clients × msg_size` bytes before recv drains the ACKs that grow CWND.
+  4. **Single-batch per-iteration drive**: one `QuicEndpoint::batch()` across each loop's recv → process → send phase, so `poll_transmit` runs once per iteration and coalesces the backlog into max-size GSO super-packets instead of per-datagram dribbles (details below).
+  5. **UDP GRO on recv** (`Config::udp_gro`): the kernel coalesces inbound datagrams so ringline pays one recvmsg + decrypt-dispatch per *batch* instead of per packet — the recv-side mirror of GSO (details below).
 
 ### Why the 32 KiB cells trailed: CPU, not congestion control
 
@@ -247,9 +249,41 @@ The fix is bench-level: hold a single `QuicEndpoint::batch()` across each loop i
 
 p99 at 200 c × 32 KiB fell from ~340 ms to ~55 ms. Smaller payloads improved too (50 c × 4 KiB +44 %, 200 c × 512 B +30 %, ≤ 512 B +4–14 %) with no regressions — fewer syscalls help at every size. Because the server change also speeds up the shared ringline server, the *tokio*-client column rose as well (its 32 KiB numbers went up too), which is why the gap narrows rather than closes.
 
-**Is the gap an io\_uring artifact?** No — a `--features force-mio` (epoll backend) differential showed the ringline-client ÷ tokio-client ratio is essentially identical on both backends, so it's not a CQE-drain / batched-wakeup artifact. The residual gap is the ringline client stack's remaining single-thread CPU overhead versus quinn's recvmmsg/GRO + sendmmsg/GSO batching, which amortises syscalls more aggressively than ringline's per-iteration `recv_batch` + `poll_send` loop. Closing it further is a runtime-level recv/transmit-batching question (GRO on recv, multi-packet `sendmmsg` send), not a bench tuning knob.
+**Is the gap an io\_uring artifact?** No — a `--features force-mio` (epoll backend) differential showed the ringline-client ÷ tokio-client ratio is essentially identical on both backends, so it's not a CQE-drain / batched-wakeup artifact. After the single-batch fix the residual gap was the ringline stack's remaining per-packet *receive* overhead versus quinn's recvmmsg/GRO — which the next change tackles directly.
+
+### Closing the rest: UDP GRO on recv
+
+The single-batch fix coalesced the *send* side (GSO); the receive side still paid one io_uring CQE + provided-buffer + `handle_datagram` (decrypt-dispatch) per ~1400 B datagram — ~160k/s at 32 KiB, enough to keep the worker core saturated. quinn avoids this with `UDP_GRO`, which the runtime now supports via `Config::udp_gro`: the kernel coalesces consecutive same-flow datagrams into one `recvmsg` delivery and reports the segment size in a control message; the runtime splits the coalesced payload back into individual datagrams transparently, so `recv_batch` / `recv_batch_timed` callbacks still fire once per datagram and quinn-proto is fed exactly as before. On this host GRO coalesces 2–10 segments per delivery at 32 KiB.
+
+GRO is a per-endpoint opt-in (`udp_gro`, default off) because a coalesced datagram is up to ~64 KiB and the recv buffer must be sized to hold it, and because the kernel's coalescing adds a little latency that *regresses* tiny high-concurrency payloads (64–512 B lost ~20 % when GRO was forced on globally) even as it lifts bulk flows. The bench therefore enables it only for `msg_size >= 4 KiB`, the same per-workload choice a real app would make. Impact on the large-payload cells, on top of the single-batch drive:
+
+| Cell | single-batch | + GRO | tokio | gap: was → now |
+|:---|---:|---:|---:|:---|
+| 10 c × 32 KiB | 8 k | **10.6 k** | 10.5 k | −15 % → **+1 %** |
+| 50 c × 32 KiB | 7.6 k | **10.1 k** | 11.0 k | −20 % → −9 % |
+| 200 c × 32 KiB | 7.0 k | **9.9 k** | 13 k | −38 % → −25 % |
+| 50 c × 4 KiB | 52 k | **65 k** | 57 k | −1 % → **+14 %** |
+| 200 c × 4 KiB | 50 k | **67 k** | 61 k | −12 % → **+9 %** |
+
+The 4 KiB cells flipped from trailing to leading; the 32 KiB gap roughly halved again (and 10 c is now a tie). Small-payload cells are unchanged (GRO off there). The remaining 32 KiB deficit narrows but doesn't vanish because the same GRO-enabled server also speeds up the tokio-client column (tokio's quinn already used GRO; now both receivers do). Implemented for both the io_uring and mio backends (`backend::udp_gro`); connected UDP sockets are GRO-blind (they use the plain `recv` path with no control message). What's left is the ringline client's residual single-thread send/scheduling overhead versus quinn's per-stream-task design — a structural difference, not a tunable.
 
 ## Highlights & history
+
+### `feat(runtime): UDP GRO on the receive path (Config::udp_gro)`
+
+The single-batch drive coalesced the send side (GSO); the receive side still paid one io_uring CQE + provided-buffer + `handle_datagram` per ~1400 B datagram (~160k/s at 32 KiB), keeping the worker core saturated. quinn avoids this with `UDP_GRO`. New runtime capability `Config::udp_gro` (default off): `setsockopt(SOL_UDP, UDP_GRO)` on bound UDP sockets, reserve a control region on the recvmsg path, parse the `UDP_GRO` cmsg for the segment size, and split the coalesced payload back into individual datagrams at drain time — so `recv_batch` / `recv_batch_timed` callbacks still fire once per datagram (no consumer changes; quinn-proto is fed exactly as before). `PendingUdpDatagram` carries a `segment_size`; the shared drain loop fans each entry out per-segment, with the kernel-buffer bid released once after the whole entry. Implemented on both backends (io_uring multishot recvmsg with a control region; mio via `recvmsg`); shared cmsg parsing lives in `backend::udp_gro`.
+
+Opt-in because a coalesced datagram is up to ~64 KiB (the recv buffer must be sized to hold it, validated at startup) and because coalescing adds latency that regresses tiny high-concurrency payloads — 64–512 B dropped ~20 % when GRO was forced on globally. The H3 bench enables it only for `msg_size >= 4 KiB`.
+
+| Cell | before (single-batch) | after (GRO) | Δ |
+|:---|---:|---:|---:|
+| 10 c × 32 KiB  | 8 k | **10.6 k** | +33 % |
+| 50 c × 32 KiB  | 7.6 k | **10.1 k** | +33 % |
+| 200 c × 32 KiB | 7.0 k | **9.9 k** | +41 % |
+| 50 c × 4 KiB   | 52 k | **65 k** | +25 % |
+| 200 c × 4 KiB  | 50 k | **67 k** | +34 % |
+
+The 4 KiB cells flipped from trailing tokio to leading it (+9–14 %); the 32 KiB gap roughly halved (10 c now a tie, 50 c −9 %, 200 c −25 %). ≤ 512 B cells unchanged (GRO off). On this host GRO coalesces 2–10 segments per delivery at 32 KiB. Confirmed end-to-end on both backends; `cargo test --all` and clippy pass with and without `--features force-mio`.
 
 ### `perf(bench/http3): single-batch per-iteration drive — defer transmits to one GSO flush`
 

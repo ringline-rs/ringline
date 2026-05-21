@@ -1,6 +1,9 @@
 // Shared sockaddr helpers used by both backends.
 pub(crate) mod sockaddr;
 
+// Shared UDP GRO helpers (cmsg parsing + constants) used by both backends.
+pub(crate) mod udp_gro;
+
 #[allow(unused_imports)]
 pub(crate) use sockaddr::sockaddr_to_peer_addr;
 #[allow(unused_imports)]
