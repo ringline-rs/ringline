@@ -678,6 +678,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Handle a UDP socket becoming readable: drain datagrams into the
     /// executor's recv queue and wake the waiting task.
     fn handle_udp_readable(&mut self, udp_index: u32) {
+        // GRO is Linux-only; elsewhere `udp_gro` is inert and we always take
+        // the plain `recv_from` path below.
+        #[cfg(target_os = "linux")]
+        if self.driver.udp_gro {
+            self.handle_udp_readable_gro(udp_index);
+            return;
+        }
         let idx = udp_index as usize;
         let socket = &self.driver.udp_sockets[idx];
         let mut buf = [0u8; 65536];
@@ -699,6 +706,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                                 peer,
                                 buf: crate::runtime::PendingUdpBuf::Owned(data),
                                 recv_at: std::time::Instant::now(),
+                                segment_size: 0,
                             },
                         );
                         self.executor.wake_udp_recv(udp_index);
@@ -707,6 +715,66 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
+        }
+    }
+
+    /// GRO variant of [`handle_udp_readable`]: `recvmsg` with a control
+    /// buffer so the kernel can report the `UDP_GRO` segment size. The
+    /// coalesced payload is stored whole; the shared drain path splits it.
+    #[cfg(target_os = "linux")]
+    fn handle_udp_readable_gro(&mut self, udp_index: u32) {
+        use std::os::fd::AsRawFd;
+        let idx = udp_index as usize;
+        let fd = self.driver.udp_sockets[idx].as_raw_fd();
+        // Hold a full coalesced datagram (~64 KiB) plus headroom.
+        let mut buf = [0u8; 1 << 16];
+        let mut control = [0u8; crate::backend::udp_gro::UDP_GRO_CMSG_LEN];
+
+        loop {
+            let mut name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = &mut name as *mut _ as *mut libc::c_void;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = control.len() as _;
+
+            let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+            if n < 0 {
+                // EWOULDBLOCK / EAGAIN ends the drain; other errors too.
+                break;
+            }
+            let n = n as usize;
+            let peer = match crate::backend::sockaddr_to_socket_addr(&name, msg.msg_namelen) {
+                Some(p) => p,
+                None => continue,
+            };
+            metrics::UDP.increment(metrics::udp::DATAGRAMS_RECEIVED);
+            if self.executor.udp_recv_queues[idx].len() >= self.executor.udp_recv_queue_capacity {
+                metrics::UDP.increment(metrics::udp::DATAGRAMS_DROPPED);
+                continue;
+            }
+            // MSG_CTRUNC means we lost the cmsg but the payload is intact —
+            // treat it as a single datagram rather than dropping it.
+            let segment_size = if msg.msg_flags & libc::MSG_CTRUNC == 0 && msg.msg_controllen > 0 {
+                let clen = msg.msg_controllen as usize;
+                crate::backend::udp_gro::parse_segment_size(&control[..clen]).unwrap_or(0)
+            } else {
+                0
+            };
+            let data = buf[..n].to_vec();
+            self.executor.udp_recv_queues[idx].push_back(crate::runtime::PendingUdpDatagram {
+                peer,
+                buf: crate::runtime::PendingUdpBuf::Owned(data),
+                recv_at: std::time::Instant::now(),
+                segment_size,
+            });
+            self.executor.wake_udp_recv(udp_index);
         }
     }
 
