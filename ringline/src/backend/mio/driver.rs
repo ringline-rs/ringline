@@ -74,6 +74,8 @@ pub(crate) struct Driver {
     pub(crate) udp_sockets: Vec<mio::net::UdpSocket>,
     /// Whether UDP GRO was requested; when set, the readable handler uses
     /// `recvmsg` with a control buffer to read the `UDP_GRO` segment size.
+    /// Only consulted on Linux (GRO is a Linux feature).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) udp_gro: bool,
     /// First mio token used for UDP sockets. UDP socket `i` has token
     /// `udp_token_base + i`. Tokens below this are WAKE_TOKEN (0) and
@@ -502,6 +504,8 @@ fn bind_udp_with_reuseport(addr: SocketAddr, udp_gro: bool) -> io::Result<std::n
     }
 
     // Enable UDP GRO (opt-in → hard-fail, mirroring the io_uring backend).
+    // GRO is Linux-only; on other platforms `udp_gro` is a no-op.
+    #[cfg(target_os = "linux")]
     if udp_gro {
         let on: libc::c_int = 1;
         let rc = unsafe {
@@ -519,6 +523,8 @@ fn bind_udp_with_reuseport(addr: SocketAddr, udp_gro: bool) -> io::Result<std::n
             return Err(err);
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = udp_gro;
 
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let addr_len = crate::backend::socket_addr_to_sockaddr(addr, &mut storage);

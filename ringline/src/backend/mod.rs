@@ -2,6 +2,8 @@
 pub(crate) mod sockaddr;
 
 // Shared UDP GRO helpers (cmsg parsing + constants) used by both backends.
+// GRO is a Linux UDP feature (`UDP_GRO`); the module is Linux-only.
+#[cfg(target_os = "linux")]
 pub(crate) mod udp_gro;
 
 #[allow(unused_imports)]

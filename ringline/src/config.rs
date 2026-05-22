@@ -174,7 +174,8 @@ pub struct Config {
     /// large enough to hold a full coalesced datagram (validated at startup);
     /// otherwise the kernel truncates and the datagram is dropped. Has no
     /// effect on `connect(2)`-ed UDP sockets (they use the lighter `recv`
-    /// path, which carries no control message). Default: false.
+    /// path, which carries no control message). Linux-only — a no-op on
+    /// other platforms. Default: false.
     pub udp_gro: bool,
     /// Optional NVMe passthrough configuration. When set, enables NVMe device
     /// management and `IORING_OP_URING_CMD` submission for direct NVMe I/O.

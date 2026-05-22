@@ -678,6 +678,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Handle a UDP socket becoming readable: drain datagrams into the
     /// executor's recv queue and wake the waiting task.
     fn handle_udp_readable(&mut self, udp_index: u32) {
+        // GRO is Linux-only; elsewhere `udp_gro` is inert and we always take
+        // the plain `recv_from` path below.
+        #[cfg(target_os = "linux")]
         if self.driver.udp_gro {
             self.handle_udp_readable_gro(udp_index);
             return;
@@ -718,6 +721,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// GRO variant of [`handle_udp_readable`]: `recvmsg` with a control
     /// buffer so the kernel can report the `UDP_GRO` segment size. The
     /// coalesced payload is stored whole; the shared drain path splits it.
+    #[cfg(target_os = "linux")]
     fn handle_udp_readable_gro(&mut self, udp_index: u32) {
         use std::os::fd::AsRawFd;
         let idx = udp_index as usize;
