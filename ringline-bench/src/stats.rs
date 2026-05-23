@@ -5,6 +5,12 @@ pub struct LatencyHistogram {
     samples: Vec<u64>, // nanoseconds per op
 }
 
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LatencyHistogram {
     pub fn new() -> Self {
         LatencyHistogram {
@@ -60,6 +66,7 @@ pub struct LatencyStats {
 #[derive(Clone, Serialize)]
 pub struct BenchResult {
     pub ops_per_sec: f64,
+    pub total_ops: u64,
     pub latency: LatencyStats,
     pub cpu_ns: u64,
 }

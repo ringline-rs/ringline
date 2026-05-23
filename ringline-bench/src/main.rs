@@ -1,14 +1,10 @@
-mod client;
-mod output;
-mod servers;
-mod stats;
-
 use std::time::Duration;
 
 use clap::Parser;
 
-use crate::output::{BenchReport, ConfigResult};
-use crate::stats::format_size;
+use ringline_bench::output::{BenchReport, ConfigResult};
+use ringline_bench::stats::format_size;
+use ringline_bench::{client, output, servers, stats};
 
 #[derive(Parser)]
 #[command(
@@ -53,6 +49,7 @@ struct Args {
     tokio_only: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_server_bench(
     addr: &str,
     num_clients: usize,
@@ -61,6 +58,7 @@ fn run_server_bench(
     duration: Duration,
     server_label: &str,
     ringline_client: bool,
+    workers: usize,
 ) -> stats::BenchResult {
     let client_label = if ringline_client { "ringline" } else { "tokio" };
     eprint!(
@@ -78,6 +76,7 @@ fn run_server_bench(
         warmup,
         duration,
         ringline_client,
+        workers,
     );
 
     eprintln!(
@@ -169,6 +168,7 @@ fn main() {
                                 duration,
                                 "ringline",
                                 false,
+                                w,
                             ));
                             config.ringline_ringline = Some(run_server_bench(
                                 &addr_str,
@@ -178,6 +178,7 @@ fn main() {
                                 duration,
                                 "ringline",
                                 true,
+                                w,
                             ));
 
                             server.stop();
@@ -206,6 +207,7 @@ fn main() {
                         duration,
                         "tokio",
                         false,
+                        w,
                     ));
                     config.ringline_tokio = Some(run_server_bench(
                         &addr_str,
@@ -215,6 +217,7 @@ fn main() {
                         duration,
                         "tokio",
                         true,
+                        w,
                     ));
 
                     server.stop();

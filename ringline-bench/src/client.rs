@@ -67,7 +67,7 @@ mod ringline_client {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Instant;
 
     use ringline::{
@@ -79,7 +79,10 @@ mod ringline_client {
     pub struct ClientState {
         pub target: std::net::SocketAddr,
         pub msg_size: usize,
-        pub clients_per_worker: usize,
+        /// Total connections still to be opened. Each worker's `on_start`
+        /// drains this counter, so connections are distributed across workers
+        /// and the total is exactly the requested client count.
+        pub remaining: Arc<AtomicUsize>,
         pub stop: Arc<AtomicBool>,
         pub ops: Arc<AtomicU64>,
         pub histograms: Arc<Mutex<Vec<Vec<u64>>>>,
@@ -98,12 +101,23 @@ mod ringline_client {
         fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
             let state = self.state.clone();
             Some(Box::pin(async move {
-                for _ in 0..state.clients_per_worker {
-                    let s = state.clone();
-                    spawn(async move {
-                        run_ringline_client(s).await;
-                    })
-                    .ok();
+                // Claim connection slots from the shared counter until drained.
+                loop {
+                    let prev = state.remaining.load(Ordering::Relaxed);
+                    if prev == 0 {
+                        break;
+                    }
+                    if state
+                        .remaining
+                        .compare_exchange_weak(prev, prev - 1, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        let s = state.clone();
+                        spawn(async move {
+                            run_ringline_client(s).await;
+                        })
+                        .ok();
+                    }
                 }
             }))
         }
@@ -238,6 +252,7 @@ fn wait_for_server(addr: &str) {
 }
 
 /// Run a benchmark against a server already listening on `addr`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_bench(
     addr: &str,
     num_clients: usize,
@@ -245,6 +260,7 @@ pub fn run_bench(
     warmup: Duration,
     duration: Duration,
     ringline_client: bool,
+    workers: usize,
 ) -> BenchResult {
     let stop = Arc::new(AtomicBool::new(false));
     let ops = Arc::new(AtomicU64::new(0));
@@ -252,12 +268,31 @@ pub fn run_bench(
     wait_for_server(addr);
 
     if ringline_client {
-        run_bench_ringline(addr, num_clients, msg_size, warmup, duration, stop, ops)
+        run_bench_ringline(
+            addr,
+            num_clients,
+            msg_size,
+            warmup,
+            duration,
+            stop,
+            ops,
+            workers,
+        )
     } else {
-        run_bench_tokio(addr, num_clients, msg_size, warmup, duration, stop, ops)
+        run_bench_tokio(
+            addr,
+            num_clients,
+            msg_size,
+            warmup,
+            duration,
+            stop,
+            ops,
+            workers,
+        )
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bench_tokio(
     addr: &str,
     num_clients: usize,
@@ -266,9 +301,10 @@ fn run_bench_tokio(
     duration: Duration,
     stop: Arc<AtomicBool>,
     ops: Arc<AtomicU64>,
+    workers: usize,
 ) -> BenchResult {
     let client_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(workers.max(1))
         .enable_all()
         .build()
         .expect("failed to build client runtime");
@@ -313,11 +349,13 @@ fn run_bench_tokio(
 
     BenchResult {
         ops_per_sec,
+        total_ops,
         latency: merged.finalize(),
         cpu_ns: cpu_after.saturating_sub(cpu_before),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bench_ringline(
     addr: &str,
     num_clients: usize,
@@ -326,24 +364,29 @@ fn run_bench_ringline(
     duration: Duration,
     stop: Arc<AtomicBool>,
     ops: Arc<AtomicU64>,
+    workers: usize,
 ) -> BenchResult {
     let histograms = Arc::new(Mutex::new(Vec::new()));
 
     let state = Arc::new(ringline_client::ClientState {
         target: addr.parse().expect("invalid addr for ringline client"),
         msg_size,
-        clients_per_worker: num_clients,
+        // Total connections to open, distributed across workers (each worker's
+        // on_start drains this counter so the total is exact regardless of
+        // worker count).
+        remaining: Arc::new(std::sync::atomic::AtomicUsize::new(num_clients)),
         stop: stop.clone(),
         ops: ops.clone(),
         histograms: histograms.clone(),
     });
 
-    let client_rt = match ringline_client::RinglineClientRuntime::start(state, 1) {
+    let client_rt = match ringline_client::RinglineClientRuntime::start(state, workers.max(1)) {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("  ringline client failed to start: {e}");
             return BenchResult {
                 ops_per_sec: 0.0,
+                total_ops: 0,
                 latency: LatencyHistogram::new().finalize(),
                 cpu_ns: 0,
             };
@@ -377,6 +420,7 @@ fn run_bench_ringline(
 
     BenchResult {
         ops_per_sec,
+        total_ops,
         latency: merged.finalize(),
         cpu_ns: cpu_after.saturating_sub(cpu_before),
     }
