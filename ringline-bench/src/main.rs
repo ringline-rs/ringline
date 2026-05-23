@@ -77,6 +77,7 @@ fn run_server_bench(
         duration,
         ringline_client,
         workers,
+        None, // in-process matrix is closed-loop
     );
 
     eprintln!(

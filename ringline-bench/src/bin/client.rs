@@ -13,7 +13,7 @@ use std::time::Duration;
 use clap::Parser;
 use serde::Serialize;
 
-use ringline_bench::client::run_bench;
+use ringline_bench::client::{OpenLoop, run_bench};
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Runtime {
@@ -55,12 +55,28 @@ struct Args {
     /// connections are distributed across them)
     #[arg(long, default_value_t = 8)]
     threads: usize,
+
+    /// Open-loop mode: offer requests at a fixed rate instead of one in-flight
+    /// per connection (closed loop). Requires --rate.
+    #[arg(long)]
+    open: bool,
+
+    /// Aggregate offered requests/sec (open-loop only), split across connections.
+    #[arg(long, default_value_t = 0)]
+    rate: u64,
+
+    /// Max outstanding requests per connection in open-loop mode. When reached
+    /// the sender stalls and falls behind schedule (coordinated-omission-free).
+    #[arg(long, default_value_t = 1024)]
+    max_inflight: usize,
 }
 
 #[derive(Serialize)]
 struct ClientReport {
     addr: String,
     runtime: String,
+    mode: String,
+    offered_rate: u64,
     clients: usize,
     msg_size: usize,
     duration_secs: u64,
@@ -83,9 +99,34 @@ fn main() {
         Runtime::Tokio => "tokio",
     };
 
+    if args.open && args.rate == 0 {
+        eprintln!("error: --open requires --rate > 0");
+        std::process::exit(2);
+    }
+    let open = if args.open {
+        Some(OpenLoop {
+            rate: args.rate,
+            max_inflight: args.max_inflight,
+        })
+    } else {
+        None
+    };
+    let mode = if args.open { "open" } else { "closed" };
+
     eprintln!(
-        "bench-client: {} runtime, {} clients, {}B messages, {}s warmup + {}s test -> {}",
-        runtime_name, args.clients, args.msg_size, args.warmup, args.duration, args.addr,
+        "bench-client: {} runtime, {} mode{}, {} clients, {}B messages, {}s warmup + {}s test -> {}",
+        runtime_name,
+        mode,
+        if args.open {
+            format!(" @ {} rps", args.rate)
+        } else {
+            String::new()
+        },
+        args.clients,
+        args.msg_size,
+        args.warmup,
+        args.duration,
+        args.addr,
     );
 
     let result = run_bench(
@@ -96,11 +137,14 @@ fn main() {
         Duration::from_secs(args.duration),
         args.runtime == Runtime::Ringline,
         args.threads,
+        open,
     );
 
     let report = ClientReport {
         addr: args.addr,
         runtime: runtime_name.to_string(),
+        mode: mode.to_string(),
+        offered_rate: args.rate,
         clients: args.clients,
         msg_size: args.msg_size,
         duration_secs: args.duration,
