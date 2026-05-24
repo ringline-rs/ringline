@@ -385,19 +385,25 @@ mod ringline_client {
         let mut local_ops: u64 = 0;
 
         'outer: loop {
-            if state.stop.load(Ordering::Relaxed) && fifo.is_empty() {
+            // Exit promptly once stopped — the measurement window is over, so
+            // there's no value in draining in-flight responses, and waiting to
+            // drain risks the task being force-dropped at shutdown before it can
+            // flush its recorded samples.
+            if state.stop.load(Ordering::Relaxed) {
                 break;
             }
 
             // Send all currently-due requests, bounded by in-flight and a burst
             // cap so we return to recv frequently.
             let mut burst = 0;
+            let mut pool_full = false;
             while fifo.len() < ol.max_inflight && burst < SEND_BURST {
                 let target = start + Duration::from_secs_f64(interval * sent as f64);
                 if Instant::now() < target {
                     break; // next request not due yet
                 }
                 if conn.send_nowait(&msg).is_err() {
+                    pool_full = true;
                     break; // send pool full; drain responses first
                 }
                 fifo.push_back(target);
@@ -405,12 +411,23 @@ mod ringline_client {
                 burst += 1;
             }
 
-            // Nothing in flight: sleep until the next request is due.
             if fifo.is_empty() {
-                let target = start + Duration::from_secs_f64(interval * sent as f64);
-                let now = Instant::now();
-                if now < target {
-                    sleep(target - now).await;
+                if pool_full {
+                    // Behind but the send pool is exhausted with nothing of ours
+                    // in flight to recv. Yield so in-flight sends (other conns)
+                    // complete and free the pool — without this the loop
+                    // busy-spins on failed sends and starves completion
+                    // processing, so the pool never drains (overload collapse).
+                    sleep(Duration::from_micros(50)).await;
+                } else {
+                    // Caught up: sleep until the next request is due.
+                    let target = start + Duration::from_secs_f64(interval * sent as f64);
+                    let now = Instant::now();
+                    if now < target {
+                        sleep(target - now).await;
+                    } else {
+                        sleep(Duration::from_micros(10)).await; // spin guard
+                    }
                 }
                 continue;
             }
@@ -435,7 +452,6 @@ mod ringline_client {
             if eof {
                 break 'outer;
             }
-
             if let Some(sched) = fifo.pop_front()
                 && state.measure.load(Ordering::Relaxed)
             {
@@ -468,8 +484,12 @@ mod ringline_client {
             config.recv_buffer.ring_size = 4096;
             config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
             config.max_connections = 4096;
-            config.send_copy_count = 8192;
-            config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
+            // The send-copy pool is the open-loop in-flight ceiling: it must
+            // comfortably exceed max_inflight * (conns per worker), or sends fail
+            // below capacity. Keep a generous slot count; don't reserve 4 KiB per
+            // slot for tiny messages.
+            config.send_copy_count = 32768;
+            config.send_copy_slot_size = msg_size.next_power_of_two().max(256) as u32;
 
             // Client-only mode: no bind address.
             let (shutdown, handles) = RinglineBuilder::new(config).launch::<ClientHandler>()?;
