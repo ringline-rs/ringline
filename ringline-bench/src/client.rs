@@ -377,12 +377,15 @@ mod ringline_client {
         // the reader on the same worker, so we keep both in one task. `fifo`
         // holds scheduled send-instants for in-flight requests (FIFO = echo
         // response order).
-        const SEND_BURST: usize = 32;
+        const SEND_BURST: usize = 256;
         let start = Instant::now();
         let mut sent: u64 = 0;
         let mut fifo: VecDeque<Instant> = VecDeque::new();
         let mut samples: Vec<u64> = Vec::with_capacity(1_000_000);
         let mut local_ops: u64 = 0;
+        // Bytes received toward the next not-yet-complete response, carried
+        // across recv wakes (responses are a fixed msg_size byte stream).
+        let mut partial: usize = 0;
 
         'outer: loop {
             // Exit promptly once stopped — the measurement window is over, so
@@ -432,33 +435,32 @@ mod ringline_client {
                 continue;
             }
 
-            // Block on one full response (the await is this task's yield point).
-            // We only sent requests that are already due, so reading responses
-            // here keeps pacing: a request that comes due during this wait is
-            // sent on the next iteration (at steady state the wait ≈ one
-            // inter-response gap, so the added latency is ~one RTT).
-            let mut remaining = msg_size;
-            let mut eof = false;
-            while remaining > 0 {
-                let n = conn
-                    .with_data(|data| ParseResult::Consumed(data.len().min(remaining)))
-                    .await;
-                if n == 0 {
-                    eof = true;
-                    break;
-                }
-                remaining -= n;
+            // Drain every complete response available in one wake (blocks for at
+            // least one byte; the await is this task's yield point). Consuming
+            // the whole accumulator per wake — instead of one response per loop
+            // iteration — is what lets the generator keep up at high rates. With
+            // a fixed msg_size, the number of newly-complete responses is
+            // (partial + consumed) / msg_size; the leftover is carried in
+            // `partial`.
+            let consumed = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if consumed == 0 {
+                break 'outer; // EOF
             }
-            if eof {
-                break 'outer;
-            }
-            if let Some(sched) = fifo.pop_front()
-                && state.measure.load(Ordering::Relaxed)
-            {
-                samples.push(sched.elapsed().as_nanos() as u64);
-                local_ops += 1;
-                if local_ops & 0xFF == 0 {
-                    state.ops.fetch_add(256, Ordering::Relaxed);
+            partial += consumed;
+            let completed = partial / msg_size;
+            partial -= completed * msg_size;
+            let measuring = state.measure.load(Ordering::Relaxed);
+            for _ in 0..completed {
+                if let Some(sched) = fifo.pop_front()
+                    && measuring
+                {
+                    samples.push(sched.elapsed().as_nanos() as u64);
+                    local_ops += 1;
+                    if local_ops & 0xFF == 0 {
+                        state.ops.fetch_add(256, Ordering::Relaxed);
+                    }
                 }
             }
         }
