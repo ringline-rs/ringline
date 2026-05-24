@@ -161,7 +161,8 @@ async fn run_tokio_open_client(
     // coordinated-omission-free latency). Messages are a constant byte, so one
     // preallocated buffer serves any batch.
     const TOKIO_SEND_BATCH: usize = 32;
-    let batch_buf = vec![0xABu8; msg_size * TOKIO_SEND_BATCH];
+    let src_msg = vec![0xABu8; msg_size];
+    let mut batch_buf = vec![0u8; msg_size * TOKIO_SEND_BATCH];
     let start = Instant::now();
     let mut sent: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
@@ -183,6 +184,14 @@ async fn run_tokio_open_client(
                 }
             }
             continue;
+        }
+        // Copy each message into the send buffer before writing — fair vs the
+        // ringline client, whose send_nowait copies each message into the send
+        // pool. (Measured: this does not move throughput at any payload size, so
+        // the copy is not what differentiates the runtimes — but it removes the
+        // confound so the comparison is defensible.)
+        for k in 0..want {
+            batch_buf[k * msg_size..(k + 1) * msg_size].copy_from_slice(&src_msg);
         }
         if wr.write_all(&batch_buf[..want * msg_size]).await.is_err() {
             stop.store(true, Ordering::Relaxed);
