@@ -153,33 +153,54 @@ async fn run_tokio_open_client(
         })
     };
 
-    // Sender: pace to each request's scheduled time. When keeping up we sleep
-    // until the scheduled instant (tight latency); when behind we send back to
-    // back to catch up, bounded by in-flight (overload → fall behind → climbing
-    // coordinated-omission-free latency).
-    let msg = vec![0xABu8; msg_size];
+    // Sender: pace to each request's scheduled time, coalescing all currently-due
+    // requests into ONE write to match ringline's send coalescing (so the two
+    // clients are syscall-for-syscall comparable). When keeping up we sleep until
+    // the next request is due; when behind we send a full batch to catch up,
+    // bounded by in-flight (overload → fall behind → climbing
+    // coordinated-omission-free latency). Messages are a constant byte, so one
+    // preallocated buffer serves any batch.
+    const TOKIO_SEND_BATCH: usize = 32;
+    let batch_buf = vec![0xABu8; msg_size * TOKIO_SEND_BATCH];
     let start = Instant::now();
     let mut sent: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
-        let target = start + Duration::from_secs_f64(interval * sent as f64);
-        let now = Instant::now();
-        if now < target {
-            tokio::time::sleep(target - now).await;
-        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let due = (elapsed / interval) as u64;
         let inflight = sent.saturating_sub(received.load(Ordering::Relaxed));
-        if (inflight as usize) >= max_inflight {
-            tokio::time::sleep(Duration::from_micros(50)).await; // stall (do not advance)
+        let room = max_inflight.saturating_sub(inflight as usize) as u64;
+        let want = due.saturating_sub(sent).min(room).min(TOKIO_SEND_BATCH as u64) as usize;
+        if want == 0 {
+            if (inflight as usize) >= max_inflight {
+                tokio::time::sleep(Duration::from_micros(50)).await; // in-flight full
+            } else {
+                let target = start + Duration::from_secs_f64(interval * sent as f64);
+                let now = Instant::now();
+                if now < target {
+                    tokio::time::sleep(target - now).await;
+                } else {
+                    tokio::time::sleep(Duration::from_micros(10)).await; // spin guard
+                }
+            }
             continue;
         }
-        if wr.write_all(&msg).await.is_err() {
+        if wr.write_all(&batch_buf[..want * msg_size]).await.is_err() {
             stop.store(true, Ordering::Relaxed);
             break;
         }
-        if tx.send(target).is_err() {
-            stop.store(true, Ordering::Relaxed);
+        let mut failed = false;
+        for k in 0..want as u64 {
+            let sched = start + Duration::from_secs_f64(interval * (sent + k) as f64);
+            if tx.send(sched).is_err() {
+                stop.store(true, Ordering::Relaxed);
+                failed = true;
+                break;
+            }
+        }
+        if failed {
             break;
         }
-        sent += 1;
+        sent += want as u64;
     }
     drop(tx);
     reader.await.unwrap_or_else(|_| LatencyHistogram::new())
