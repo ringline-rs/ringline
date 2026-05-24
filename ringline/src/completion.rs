@@ -47,6 +47,13 @@ pub enum OpTag {
     /// Single-shot send on a connected UDP socket (no msghdr, uses the
     /// socket's connected peer). Lighter than `SendMsgUdp`.
     SendUdp = 23,
+    /// Coalesced plaintext send: one non-ZC `sendmsg` whose iovecs gather
+    /// several queued per-connection sends. Payload = InFlightSendSlab index;
+    /// the slab entry holds the backing pool slots, released on completion.
+    SendMsgCoalesced = 24,
+    /// PollAdd for POLLOUT after a coalesced send returned `-EAGAIN`.
+    /// Payload = InFlightSendSlab index to resubmit when writable.
+    SendMsgCoalescedPollOut = 25,
 }
 
 impl OpTag {
@@ -76,6 +83,8 @@ impl OpTag {
             21 => Some(OpTag::SendPollOut),
             22 => Some(OpTag::RecvUdp),
             23 => Some(OpTag::SendUdp),
+            24 => Some(OpTag::SendMsgCoalesced),
+            25 => Some(OpTag::SendMsgCoalescedPollOut),
             _ => None,
         }
     }

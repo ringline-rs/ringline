@@ -38,6 +38,42 @@ impl AsyncEventHandler for AsyncEcho {
     }
 }
 
+// ── Burst sender (exercises the coalesced send path) ───────────────
+
+const BURST_N: u32 = 100;
+const BURST_MSG: usize = 64;
+
+/// On accept, fires `BURST_N` distinct small messages back-to-back without
+/// awaiting between them, so they queue on the connection and drain through the
+/// coalesced `sendmsg` path. Message `i` is `BURST_MSG` bytes all set to
+/// `(i % 251)`, so the client can verify order and detect any reordering or
+/// truncation.
+struct BurstSender;
+
+impl AsyncEventHandler for BurstSender {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            for i in 0..BURST_N {
+                let msg = [(i % 251) as u8; BURST_MSG];
+                // Retry only if the copy pool is transiently exhausted.
+                while conn.send_nowait(&msg).is_err() {
+                    ringline::sleep(Duration::from_micros(50)).await;
+                }
+            }
+            // Keep the connection open until the client finishes reading.
+            loop {
+                let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        BurstSender
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn test_config() -> Config {
@@ -92,6 +128,54 @@ fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
+
+#[test]
+fn coalesced_sends_preserve_order() {
+    // Many small sends queued on one connection drain through the coalesced
+    // sendmsg path; verify they arrive in order, byte-for-byte, none dropped.
+    let mut config = test_config();
+    config.send_copy_count = 512;
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BurstSender>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let total = BURST_N as usize * BURST_MSG;
+    let mut buf = vec![0u8; total];
+    let mut read = 0;
+    while read < total {
+        match stream.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+    assert_eq!(read, total, "received {read} of {total} bytes");
+    for i in 0..BURST_N {
+        let off = i as usize * BURST_MSG;
+        let expected = (i % 251) as u8;
+        for (j, &b) in buf[off..off + BURST_MSG].iter().enumerate() {
+            assert_eq!(
+                b, expected,
+                "message {i} byte {j}: got {b}, expected {expected} (reordering or corruption)"
+            );
+        }
+    }
+
+    drop(stream);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
 
 #[test]
 fn shutdown_handle_reports_bound_addr() {
