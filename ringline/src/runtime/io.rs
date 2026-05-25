@@ -1043,8 +1043,9 @@ impl ConnCtx {
     /// Enable the recv-forward path for this connection.
     ///
     /// mio fallback: no-op. There is no provided-buffer ring to hold, so recv
-    /// data flows through the accumulator as usual and [`forward_held`] drains +
-    /// copy-sends it (no zero-copy). Keeps the API portable across backends.
+    /// data flows through the accumulator as usual and
+    /// [`forward_held`](Self::forward_held) drains + copy-sends it (no
+    /// zero-copy). Keeps the API portable across backends.
     #[cfg(not(has_io_uring))]
     pub fn enable_recv_forward(&self) {}
 
