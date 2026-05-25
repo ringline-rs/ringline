@@ -1040,6 +1040,54 @@ impl ConnCtx {
         })
     }
 
+    /// Enable the recv-forward path for this connection.
+    ///
+    /// mio fallback: no-op. There is no provided-buffer ring to hold, so recv
+    /// data flows through the accumulator as usual and [`forward_held`] drains +
+    /// copy-sends it (no zero-copy). Keeps the API portable across backends.
+    #[cfg(not(has_io_uring))]
+    pub fn enable_recv_forward(&self) {}
+
+    /// Forward currently-buffered recv data back to the peer.
+    ///
+    /// mio fallback: drains the accumulator and copy-sends it, returning a
+    /// [`SendFuture`] that resolves with the bytes sent (`0` when empty). Gate
+    /// calls on [`recv_ready`](Self::recv_ready) as on the io_uring backend.
+    #[cfg(not(has_io_uring))]
+    pub fn forward_held(&self) -> io::Result<SendFuture> {
+        with_state(|driver, executor| {
+            let conn_index = self.conn_index;
+            if driver.connections.generation(conn_index) != self.generation {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "stale connection",
+                ));
+            }
+            // Copy out the accumulated bytes (releases the accumulator borrow so
+            // we can take a DriverCtx), then consume them once the send is queued.
+            let data = driver.accumulators.data(conn_index).to_vec();
+            if data.is_empty() {
+                executor.io_results[conn_index as usize] = Some(IoResult::Send(Ok(0)));
+                executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                executor.send_waiters[conn_index as usize] = true;
+                return Ok(SendFuture {
+                    conn_index,
+                    generation: self.generation,
+                });
+            }
+            let mut ctx = driver.make_ctx();
+            ctx.send(self.token(), &data)?;
+            driver.accumulators.consume(conn_index, data.len());
+            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.send_waiters[conn_index as usize] = true;
+            driver.send_completions[conn_index as usize].push_back(data.len() as u32);
+            Ok(SendFuture {
+                conn_index,
+                generation: self.generation,
+            })
+        })
+    }
+
     /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
     ///
     /// This mirrors `DriverCtx::send_parts()` — use `.copy(data)` for copied parts
