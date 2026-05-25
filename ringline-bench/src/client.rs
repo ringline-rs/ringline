@@ -170,7 +170,10 @@ async fn run_tokio_open_client(
         let due = (elapsed / interval) as u64;
         let inflight = sent.saturating_sub(received.load(Ordering::Relaxed));
         let room = max_inflight.saturating_sub(inflight as usize) as u64;
-        let want = due.saturating_sub(sent).min(room).min(TOKIO_SEND_BATCH as u64) as usize;
+        let want = due
+            .saturating_sub(sent)
+            .min(room)
+            .min(TOKIO_SEND_BATCH as u64) as usize;
         if want == 0 {
             if (inflight as usize) >= max_inflight {
                 tokio::time::sleep(Duration::from_micros(50)).await; // in-flight full
