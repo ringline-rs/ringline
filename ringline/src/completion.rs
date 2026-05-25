@@ -54,6 +54,14 @@ pub enum OpTag {
     /// PollAdd for POLLOUT after a coalesced send returned `-EAGAIN`.
     /// Payload = InFlightSendSlab index to resubmit when writable.
     SendMsgCoalescedPollOut = 25,
+    /// Zero-copy recv-forward: one `sendmsg` whose iovecs point directly into
+    /// held provided recv buffers (no accumulator copy). Payload =
+    /// InFlightSendSlab index; the slab entry holds the bids to replenish on
+    /// completion.
+    SendRecvBufsCoalesced = 26,
+    /// PollAdd for POLLOUT after a recv-forward send returned `-EAGAIN`.
+    /// Payload = InFlightSendSlab index to resubmit when writable.
+    SendRecvBufsCoalescedPollOut = 27,
 }
 
 impl OpTag {
@@ -85,6 +93,8 @@ impl OpTag {
             23 => Some(OpTag::SendUdp),
             24 => Some(OpTag::SendMsgCoalesced),
             25 => Some(OpTag::SendMsgCoalescedPollOut),
+            26 => Some(OpTag::SendRecvBufsCoalesced),
+            27 => Some(OpTag::SendRecvBufsCoalescedPollOut),
             _ => None,
         }
     }

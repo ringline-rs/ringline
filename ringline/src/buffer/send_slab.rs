@@ -26,6 +26,12 @@ struct InFlightSendEntry {
     /// ZC-guard path (which uses `pool_slot` + `guards`).
     pool_slots: [u16; MAX_IOVECS],
     pool_slot_count: u8,
+    /// Provided-buffer ids backing a zero-copy recv-forward send — one per
+    /// held recv buffer gathered into the coalesced `sendmsg`. Replenished
+    /// into the `ProvidedBufRing` together on the operation CQE. Empty for all
+    /// other send paths (which use `pool_slot`/`pool_slots`/`guards`).
+    bids: [u16; MAX_IOVECS],
+    bid_count: u8,
     guards: [Option<GuardBox>; MAX_GUARDS],
     guard_count: u8,
     conn_index: u32,
@@ -51,6 +57,8 @@ impl InFlightSendSlab {
                 pool_slot: u16::MAX,
                 pool_slots: [u16::MAX; MAX_IOVECS],
                 pool_slot_count: 0,
+                bids: [u16::MAX; MAX_IOVECS],
+                bid_count: 0,
                 guards: [None, None, None, None],
                 guard_count: 0,
                 conn_index: 0,
@@ -154,6 +162,54 @@ impl InFlightSendSlab {
         &entry.pool_slots[..entry.pool_slot_count as usize]
     }
 
+    /// Allocate a slot for a zero-copy recv-forward send: one `sendmsg` whose
+    /// iovecs point directly into held provided recv buffers (no copy). `bids`
+    /// are the provided-buffer ids to replenish together on the operation CQE.
+    /// `iovecs_slice` and `bids` must be the same length and <= MAX_IOVECS.
+    pub fn allocate_recv_forward(
+        &mut self,
+        conn_index: u32,
+        iovecs_slice: &[libc::iovec],
+        bids: &[u16],
+        total_len: u32,
+    ) -> Option<(u16, *const libc::msghdr)> {
+        debug_assert!(iovecs_slice.len() <= MAX_IOVECS);
+        debug_assert_eq!(iovecs_slice.len(), bids.len());
+        let idx = self.free_list.pop()?;
+        let entry = &mut self.entries[idx as usize];
+
+        for (i, iov) in iovecs_slice.iter().enumerate() {
+            entry.iovecs[i] = *iov;
+        }
+        entry.iov_count = iovecs_slice.len() as u8;
+        entry.iov_start = 0;
+        entry.pool_slot = u16::MAX;
+        entry.pool_slot_count = 0;
+        for (i, &bid) in bids.iter().enumerate() {
+            entry.bids[i] = bid;
+        }
+        entry.bid_count = bids.len() as u8;
+        entry.guard_count = 0;
+        entry.conn_index = conn_index;
+        entry.total_len = total_len;
+        entry.pending_notifs = 0;
+        entry.awaiting_notifications = false;
+        entry.in_use = true;
+
+        entry.msghdr = unsafe { std::mem::zeroed() };
+        entry.msghdr.msg_iov = entry.iovecs.as_mut_ptr();
+        entry.msghdr.msg_iovlen = entry.iov_count as _;
+
+        Some((idx, &entry.msghdr as *const libc::msghdr))
+    }
+
+    /// The provided-buffer ids backing a recv-forward entry, to be replenished
+    /// into the `ProvidedBufRing` by the caller. Empty for all other entries.
+    pub fn recv_forward_bids(&self, idx: u16) -> &[u16] {
+        let entry = &self.entries[idx as usize];
+        &entry.bids[..entry.bid_count as usize]
+    }
+
     /// Advance past `bytes_sent` bytes in the iovec array.
     /// Returns `Some(msghdr_ptr)` if there are remaining bytes to send (partial resubmit).
     /// Returns `None` if all data has been sent.
@@ -239,6 +295,7 @@ impl InFlightSendSlab {
         entry.guard_count = 0;
         entry.pool_slot = u16::MAX;
         entry.pool_slot_count = 0;
+        entry.bid_count = 0;
         entry.in_use = false;
         entry.awaiting_notifications = false;
         entry.pending_notifs = 0;

@@ -255,6 +255,40 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
 
+            // Retry recv-forward send resubmissions that failed (SQ was full).
+            if !self.driver.pending_recv_forward_retries.is_empty() {
+                let retries: Vec<_> = self.driver.pending_recv_forward_retries.drain(..).collect();
+                for (conn_index, generation, slab_idx, retries) in retries {
+                    if !self.driver.send_slab.in_use(slab_idx) {
+                        continue; // slab released meanwhile
+                    }
+                    if retries >= 2
+                        || self.driver.connections.get(conn_index).is_none()
+                        || self.driver.connections.generation(conn_index) != generation
+                    {
+                        // Give up / connection reused — replenish bids and unwind.
+                        self.release_recv_forward(slab_idx);
+                        self.driver.submit_next_queued(conn_index);
+                        self.driver.note_send_finalized(conn_index);
+                        continue;
+                    }
+                    let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+                    if self
+                        .driver
+                        .ring
+                        .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
+                        .is_err()
+                    {
+                        self.driver.pending_recv_forward_retries.push((
+                            conn_index,
+                            generation,
+                            slab_idx,
+                            retries + 1,
+                        ));
+                    }
+                }
+            }
+
             // Retry any copy send resubmissions that failed (SQ was full).
             if !self.driver.pending_copy_retries.is_empty() {
                 let retries: Vec<_> = self.driver.pending_copy_retries.drain(..).collect();
@@ -654,6 +688,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendPollOut => self.handle_send_pollout(ud, result),
             OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
             OpTag::SendMsgCoalescedPollOut => self.handle_send_msg_coalesced_pollout(ud, result),
+            OpTag::SendRecvBufsCoalesced => self.handle_send_recv_bufs_coalesced(ud, result),
+            OpTag::SendRecvBufsCoalescedPollOut => {
+                self.handle_send_recv_bufs_coalesced_pollout(ud, result)
+            }
             #[cfg(feature = "timestamps")]
             OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
@@ -795,6 +833,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
             }
+        } else if self.driver.recv_forward[conn_index as usize] {
+            // Zero-copy recv-forward path: hold the provided buffer in-place
+            // (bid NOT replenished) for scatter-gather forwarding via
+            // `forward_held`. No accumulator copy. Backpressure is natural —
+            // unreplenished bids deplete the ring (ENOBUFS) until a forward
+            // completes. The hold is drained on close (see close_connection).
+            self.driver.recv_hold[conn_index as usize].push_back(crate::backend::PendingRecvBuf {
+                bid,
+                len: bytes_received,
+                ptr: buf_ptr,
+            });
+            self.executor.wake_recv(conn_index);
         } else {
             // Plaintext path: route through recv sink if active, else zero-copy/accumulator.
             if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
@@ -1430,6 +1480,129 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let generation = self.driver.connections.generation(conn_index);
             self.driver
                 .pending_coalesced_retries
+                .push((conn_index, generation, slab_idx, 0));
+        }
+    }
+
+    /// Replenish the held provided-buffer bids backing a recv-forward entry and
+    /// release the slab slot. The bids become available in the `ProvidedBufRing`
+    /// again (resuming recv if it was ENOBUFS-stalled).
+    fn release_recv_forward(&mut self, slab_idx: u16) {
+        let mut bids = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
+        let mut n = 0;
+        for &b in self.driver.send_slab.recv_forward_bids(slab_idx) {
+            bids[n] = b;
+            n += 1;
+        }
+        for &b in &bids[..n] {
+            self.driver.pending_replenish.push(b);
+        }
+        self.driver.send_slab.release(slab_idx);
+    }
+
+    /// Handle completion of a zero-copy recv-forward `sendmsg`
+    /// (OpTag::SendRecvBufsCoalesced). Mirrors `handle_send_msg_coalesced` but
+    /// the backing is held provided buffers whose bids are replenished (not pool
+    /// slots released) on completion. Partial sends advance the iovec array via
+    /// `try_advance`; the bids stay held (memory valid) until full completion.
+    fn handle_send_recv_bufs_coalesced(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let slab_idx = ud.payload() as u16;
+
+        if !self.driver.send_slab.in_use(slab_idx) {
+            return;
+        }
+
+        if result > 0 {
+            // Partial send: advance the iovec array and resubmit the remainder.
+            // Bids are NOT replenished yet — the provided-buffer memory must stay
+            // valid for the resubmitted iovecs.
+            if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
+                if self
+                    .driver
+                    .ring
+                    .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
+                    .is_err()
+                {
+                    let generation = self.driver.connections.generation(conn_index);
+                    self.driver
+                        .pending_recv_forward_retries
+                        .push((conn_index, generation, slab_idx, 0));
+                }
+                return;
+            }
+            // Fully sent.
+            let total = self.driver.send_slab.total_len(slab_idx);
+            metrics::BYTES.add(metrics::bytes::SENT, total as u64);
+            self.release_recv_forward(slab_idx);
+            self.driver.submit_next_queued(conn_index);
+            self.driver.note_send_finalized(conn_index);
+            self.executor.wake_send(conn_index, Ok(total));
+            return;
+        }
+
+        // EAGAIN/EWOULDBLOCK: wait for POLLOUT, keep the slab entry (and the held
+        // buffers) alive, then resubmit the same sendmsg.
+        let errno = -result;
+        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            if self
+                .driver
+                .ring
+                .submit_send_recv_bufs_coalesced_pollout(conn_index, slab_idx)
+                .is_err()
+            {
+                let generation = self.driver.connections.generation(conn_index);
+                self.driver
+                    .pending_recv_forward_retries
+                    .push((conn_index, generation, slab_idx, 0));
+            }
+            metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
+            return;
+        }
+
+        // Real error — replenish bids, release, and unwind the connection.
+        self.release_recv_forward(slab_idx);
+        self.driver.submit_next_queued(conn_index);
+        self.driver.note_send_finalized(conn_index);
+        let io_result = if result == 0 {
+            Ok(0u32)
+        } else {
+            Err(io::Error::from_raw_os_error(-result))
+        };
+        self.executor.wake_send(conn_index, io_result);
+    }
+
+    /// Handle a POLLOUT CQE armed after a recv-forward send returned `-EAGAIN`.
+    /// Resubmits the same sendmsg (held buffers still intact in the slab entry).
+    fn handle_send_recv_bufs_coalesced_pollout(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let slab_idx = ud.payload() as u16;
+
+        if !self.driver.send_slab.in_use(slab_idx)
+            || self.driver.connections.get(conn_index).is_none()
+        {
+            return;
+        }
+
+        if result < 0 {
+            self.release_recv_forward(slab_idx);
+            self.driver.submit_next_queued(conn_index);
+            self.driver.note_send_finalized(conn_index);
+            self.executor
+                .wake_send(conn_index, Err(io::Error::from_raw_os_error(-result)));
+            return;
+        }
+
+        let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+        if self
+            .driver
+            .ring
+            .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
+            .is_err()
+        {
+            let generation = self.driver.connections.generation(conn_index);
+            self.driver
+                .pending_recv_forward_retries
                 .push((conn_index, generation, slab_idx, 0));
         }
     }

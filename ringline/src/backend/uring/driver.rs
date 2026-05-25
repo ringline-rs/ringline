@@ -129,6 +129,15 @@ pub(crate) struct Driver {
     /// Set when `forward_recv_buf` initiates a send; used by `handle_send_recv_buf`
     /// to compute the correct offset on partial sends (since buf_size != data_len).
     pub(crate) send_recv_buf_original_lens: Vec<u32>,
+    /// Per-connection multi-buffer zero-copy recv hold. When `recv_forward` is
+    /// set for a connection, incoming provided buffers are pushed here (bids NOT
+    /// replenished) instead of copied into the accumulator, then forwarded back
+    /// in one coalesced `sendmsg` via `forward_held`. Backpressure is natural:
+    /// unreplenished bids deplete the provided-buffer ring (ENOBUFS) until a
+    /// forward completes and replenishes them.
+    pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
+    /// Per-connection opt-in flag for the zero-copy recv-forward path.
+    pub(crate) recv_forward: Vec<bool>,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
@@ -214,6 +223,9 @@ pub(crate) struct Driver {
     /// Drained each tick — used when resubmitting a coalesced `sendmsg` (partial
     /// remainder or POLLOUT rearm) found the SQ full.
     pub(crate) pending_coalesced_retries: Vec<(u32, u32, u16, u8)>,
+    /// Pending recv-forward send resubmissions that failed (SQ full):
+    /// (conn_index, generation, slab_idx, retries). Drained each tick.
+    pub(crate) pending_recv_forward_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
     /// Per-worker UDP socket state.
@@ -381,6 +393,10 @@ impl Driver {
             pending_replenish: Vec::with_capacity(config.recv_buffer.ring_size as usize),
             pending_recv_bufs: vec![None; config.max_connections as usize],
             send_recv_buf_original_lens: vec![0; config.max_connections as usize],
+            recv_hold: (0..config.max_connections)
+                .map(|_| std::collections::VecDeque::new())
+                .collect(),
+            recv_forward: vec![false; config.max_connections as usize],
             accept_rx,
             eventfd,
             eventfd_buf: [0u8; 8],
@@ -425,6 +441,7 @@ impl Driver {
             pending_copy_retries: Vec::new(),
             pending_send_pollout_retries: Vec::new(),
             pending_coalesced_retries: Vec::new(),
+            pending_recv_forward_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             udp_sockets,
             nvme_devices: config
@@ -548,6 +565,16 @@ impl Driver {
             conn.recv_mode = RecvMode::Closed;
         } else {
             return;
+        }
+        // Replenish any held (not-yet-forwarded) zero-copy recv buffers so their
+        // bids aren't leaked, and clear the opt-in flag for slot reuse. An
+        // in-flight forward's bids live in its slab entry (already drained from
+        // recv_hold) and are replenished by its own completion handler.
+        if self.recv_forward[conn_index as usize] {
+            for pending in self.recv_hold[conn_index as usize].drain(..) {
+                self.pending_replenish.push(pending.bid);
+            }
+            self.recv_forward[conn_index as usize] = false;
         }
         // Cancel any active chain — per-SQE resources released as CQEs arrive.
         self.chain_table.cancel(conn_index);

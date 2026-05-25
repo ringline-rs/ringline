@@ -74,6 +74,33 @@ impl AsyncEventHandler for BurstSender {
     }
 }
 
+// ── Zero-copy recv-forward echo handler ────────────────────────────
+
+/// Echo via the multi-buffer zero-copy recv-forward path: held provided recv
+/// buffers are scatter-gathered back in one `sendmsg`, no accumulator copy.
+struct RecvForwardEcho;
+
+impl AsyncEventHandler for RecvForwardEcho {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.enable_recv_forward();
+            loop {
+                conn.recv_ready().await;
+                let n = match conn.forward_held() {
+                    Ok(f) => f.await.unwrap_or(0),
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        RecvForwardEcho
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn test_config() -> Config {
@@ -169,6 +196,61 @@ fn coalesced_sends_preserve_order() {
             );
         }
     }
+
+    drop(stream);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn recv_forward_echo_preserves_order_across_buffers() {
+    // Drive the zero-copy recv-forward path with many distinct messages, each
+    // larger than one provided recv buffer (so a message spans buffers and
+    // multiple buffers are held), and verify the echo is byte-for-byte in order.
+    let mut config = test_config();
+    config.recv_buffer.buffer_size = 4096; // each 16 KiB msg spans ~4 buffers
+    config.recv_buffer.ring_size = 256;
+    config.sq_entries = 256;
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<RecvForwardEcho>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    const N: usize = 20;
+    const MSG: usize = 16384;
+    let mut payload = Vec::with_capacity(N * MSG);
+    for i in 0..N {
+        payload.extend(std::iter::repeat_n((i % 251) as u8, MSG));
+    }
+    stream.write_all(&payload).unwrap();
+    stream.flush().unwrap();
+
+    let total = N * MSG;
+    let mut buf = vec![0u8; total];
+    let mut read = 0;
+    while read < total {
+        match stream.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+    assert_eq!(read, total, "received {read} of {total} bytes");
+    assert!(
+        buf == payload,
+        "echoed bytes differ (reordering or corruption)"
+    );
 
     drop(stream);
     shutdown.shutdown();
