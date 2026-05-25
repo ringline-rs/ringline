@@ -1,20 +1,25 @@
 //! Standalone echo client for distributed benchmarking.
 //!
 //! Drives load against a server, measures latency and throughput,
-//! and outputs JSON results to stdout.
+//! and outputs JSON results to stdout. The `--runtime` flag selects the
+//! load-generator runtime (ringline or tokio), mirroring `bench-server`.
 //!
 //! Usage:
-//!   bench-client --addr 10.0.1.5:7878 --clients 100 --msg-size 64 --duration 10
-//!   bench-client --addr 10.0.1.5:7878 --clients 1000 --msg-size 4096 --duration 30 --warmup 5
+//!   bench-client --runtime tokio    --addr 10.0.1.5:7878 --clients 100  --msg-size 64   --duration 10
+//!   bench-client --runtime ringline --addr 10.0.1.5:7878 --clients 1000 --msg-size 4096 --duration 30 --warmup 5
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Parser;
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+
+use ringline_bench::client::{OpenLoop, run_bench};
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Runtime {
+    Ringline,
+    Tokio,
+}
 
 #[derive(Parser)]
 #[command(
@@ -22,6 +27,10 @@ use tokio::net::TcpStream;
     about = "Echo client for distributed benchmarking"
 )]
 struct Args {
+    /// Load-generator runtime
+    #[arg(long)]
+    runtime: Runtime,
+
     /// Server address
     #[arg(long)]
     addr: String,
@@ -42,14 +51,34 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     warmup: u64,
 
-    /// Number of tokio worker threads for load generation
-    #[arg(long, default_value_t = 4)]
+    /// Number of load-generation worker threads (applies to both runtimes;
+    /// connections are distributed across them)
+    #[arg(long, default_value_t = 8)]
     threads: usize,
+
+    /// Open-loop mode: offer requests at a fixed rate instead of one in-flight
+    /// per connection (closed loop). Requires --rate.
+    #[arg(long)]
+    open: bool,
+
+    /// Aggregate offered requests/sec (open-loop only), split across connections.
+    #[arg(long, default_value_t = 0)]
+    rate: u64,
+
+    /// Max outstanding requests per connection in open-loop mode. When reached
+    /// the sender stalls and falls behind schedule (coordinated-omission-free).
+    /// Kept modest so the per-connection send queue (each entry holds a
+    /// send-copy-pool slot) can't exhaust the pool under overload.
+    #[arg(long, default_value_t = 64)]
+    max_inflight: usize,
 }
 
 #[derive(Serialize)]
 struct ClientReport {
     addr: String,
+    runtime: String,
+    mode: String,
+    offered_rate: u64,
     clients: usize,
     msg_size: usize,
     duration_secs: u64,
@@ -64,167 +93,72 @@ struct ClientReport {
     sample_count: u64,
 }
 
-struct LatencyHistogram {
-    samples: Vec<u64>,
-}
-
-impl LatencyHistogram {
-    fn new() -> Self {
-        LatencyHistogram {
-            samples: Vec::with_capacity(1_000_000),
-        }
-    }
-
-    fn record(&mut self, ns: u64) {
-        self.samples.push(ns);
-    }
-
-    fn samples(&self) -> &[u64] {
-        &self.samples
-    }
-}
-
-async fn run_client(
-    addr: String,
-    msg_size: usize,
-    stop: Arc<AtomicBool>,
-    ops_counter: Arc<AtomicU64>,
-) -> LatencyHistogram {
-    let msg = vec![0xABu8; msg_size];
-    let mut recv_buf = vec![0u8; msg_size];
-    let mut histogram = LatencyHistogram::new();
-
-    let mut stream = match TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("  client connect failed: {e}");
-            return histogram;
-        }
-    };
-    stream.set_nodelay(true).ok();
-
-    let mut local_ops: u64 = 0;
-
-    while !stop.load(Ordering::Relaxed) {
-        let t0 = Instant::now();
-
-        if stream.write_all(&msg).await.is_err() {
-            break;
-        }
-
-        let mut total_read = 0;
-        while total_read < msg_size {
-            match stream.read(&mut recv_buf[total_read..]).await {
-                Ok(0) => return histogram,
-                Ok(n) => total_read += n,
-                Err(_) => return histogram,
-            }
-        }
-
-        let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        histogram.record(elapsed_ns);
-
-        local_ops += 1;
-        if local_ops & 0xFF == 0 {
-            ops_counter.fetch_add(256, Ordering::Relaxed);
-        }
-    }
-
-    ops_counter.fetch_add(local_ops & 0xFF, Ordering::Relaxed);
-    histogram
-}
-
-fn percentile(sorted: &[u64], p: f64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = ((sorted.len() as f64) * p / 100.0) as usize;
-    sorted[idx.min(sorted.len() - 1)]
-}
-
 fn main() {
     let args = Args::parse();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let ops = Arc::new(AtomicU64::new(0));
+    let runtime_name = match args.runtime {
+        Runtime::Ringline => "ringline",
+        Runtime::Tokio => "tokio",
+    };
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.threads)
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime");
+    if args.open && args.rate == 0 {
+        eprintln!("error: --open requires --rate > 0");
+        std::process::exit(2);
+    }
+    let open = if args.open {
+        Some(OpenLoop {
+            rate: args.rate,
+            max_inflight: args.max_inflight,
+        })
+    } else {
+        None
+    };
+    let mode = if args.open { "open" } else { "closed" };
 
     eprintln!(
-        "bench-client: {} clients, {}B messages, {}s warmup + {}s test -> {}",
-        args.clients, args.msg_size, args.warmup, args.duration, args.addr,
+        "bench-client: {} runtime, {} mode{}, {} clients, {}B messages, {}s warmup + {}s test -> {}",
+        runtime_name,
+        mode,
+        if args.open {
+            format!(" @ {} rps", args.rate)
+        } else {
+            String::new()
+        },
+        args.clients,
+        args.msg_size,
+        args.warmup,
+        args.duration,
+        args.addr,
     );
 
-    // Wait for server to be reachable.
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(&args.addr).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    // Spawn client tasks.
-    let mut task_handles = Vec::with_capacity(args.clients);
-    for _ in 0..args.clients {
-        let addr = args.addr.clone();
-        let stop = stop.clone();
-        let ops = ops.clone();
-        let msg_size = args.msg_size;
-        task_handles.push(rt.spawn(run_client(addr, msg_size, stop, ops)));
-    }
-
-    // Warmup.
-    eprintln!("bench-client: warming up for {}s", args.warmup);
-    std::thread::sleep(Duration::from_secs(args.warmup));
-    ops.store(0, Ordering::Relaxed);
-
-    // Measurement.
-    eprintln!("bench-client: measuring for {}s", args.duration);
-    let start = Instant::now();
-    std::thread::sleep(Duration::from_secs(args.duration));
-    let elapsed = start.elapsed();
-    stop.store(true, Ordering::Relaxed);
-
-    // Collect — give tasks a grace period, then abort stragglers stuck in I/O.
-    let mut all_samples: Vec<u64> = Vec::new();
-    rt.block_on(async {
-        for handle in task_handles {
-            match tokio::time::timeout(Duration::from_secs(2), handle).await {
-                Ok(Ok(histogram)) => all_samples.extend_from_slice(histogram.samples()),
-                Ok(Err(_join_err)) => {}
-                Err(_timeout) => {
-                    // Task stuck in I/O after stop was signaled — samples already
-                    // recorded up to the last completed op, just move on.
-                }
-            }
-        }
-    });
-
-    rt.shutdown_timeout(Duration::from_secs(1));
-
-    all_samples.sort_unstable();
-
-    let total_ops = ops.load(Ordering::Relaxed);
-    let ops_per_sec = total_ops as f64 / elapsed.as_secs_f64();
+    let result = run_bench(
+        &args.addr,
+        args.clients,
+        args.msg_size,
+        Duration::from_secs(args.warmup),
+        Duration::from_secs(args.duration),
+        args.runtime == Runtime::Ringline,
+        args.threads,
+        open,
+    );
 
     let report = ClientReport {
         addr: args.addr,
+        runtime: runtime_name.to_string(),
+        mode: mode.to_string(),
+        offered_rate: args.rate,
         clients: args.clients,
         msg_size: args.msg_size,
         duration_secs: args.duration,
-        ops_per_sec,
-        total_ops,
-        p50_ns: percentile(&all_samples, 50.0),
-        p90_ns: percentile(&all_samples, 90.0),
-        p99_ns: percentile(&all_samples, 99.0),
-        p999_ns: percentile(&all_samples, 99.9),
-        p9999_ns: percentile(&all_samples, 99.99),
-        max_ns: all_samples.last().copied().unwrap_or(0),
-        sample_count: all_samples.len() as u64,
+        ops_per_sec: result.ops_per_sec,
+        total_ops: result.total_ops,
+        p50_ns: result.latency.p50_ns,
+        p90_ns: result.latency.p90_ns,
+        p99_ns: result.latency.p99_ns,
+        p999_ns: result.latency.p999_ns,
+        p9999_ns: result.latency.p9999_ns,
+        max_ns: result.latency.max_ns,
+        sample_count: result.latency.count,
     };
 
     // JSON to stdout for machine consumption.

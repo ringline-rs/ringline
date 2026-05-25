@@ -220,6 +220,41 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
 
+            // Retry coalesced send resubmissions that failed (SQ was full).
+            if !self.driver.pending_coalesced_retries.is_empty() {
+                let retries: Vec<_> = self.driver.pending_coalesced_retries.drain(..).collect();
+                for (conn_index, generation, slab_idx, retries) in retries {
+                    if !self.driver.send_slab.in_use(slab_idx) {
+                        continue; // slab released meanwhile
+                    }
+                    if retries >= 2
+                        || self.driver.connections.get(conn_index).is_none()
+                        || self.driver.connections.generation(conn_index) != generation
+                    {
+                        // Give up / connection reused — release and unwind this
+                        // connection's send state so it isn't left stuck.
+                        self.release_coalesced(slab_idx);
+                        self.driver.drain_conn_send_queue(conn_index);
+                        self.driver.note_send_finalized(conn_index);
+                        continue;
+                    }
+                    let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+                    if self
+                        .driver
+                        .ring
+                        .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
+                        .is_err()
+                    {
+                        self.driver.pending_coalesced_retries.push((
+                            conn_index,
+                            generation,
+                            slab_idx,
+                            retries + 1,
+                        ));
+                    }
+                }
+            }
+
             // Retry any copy send resubmissions that failed (SQ was full).
             if !self.driver.pending_copy_retries.is_empty() {
                 let retries: Vec<_> = self.driver.pending_copy_retries.drain(..).collect();
@@ -617,6 +652,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
             OpTag::SendRecvBuf => self.handle_send_recv_buf(ud, result),
             OpTag::SendPollOut => self.handle_send_pollout(ud, result),
+            OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
+            OpTag::SendMsgCoalescedPollOut => self.handle_send_msg_coalesced_pollout(ud, result),
             #[cfg(feature = "timestamps")]
             OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
@@ -1276,6 +1313,124 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver
                 .pending_copy_retries
                 .push((conn_index, generation, pool_slot, 0));
+        }
+    }
+
+    /// Release the backing pool slots of a coalesced send, then the slab entry.
+    fn release_coalesced(&mut self, slab_idx: u16) {
+        let mut slots = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
+        let mut n = 0;
+        for &s in self.driver.send_slab.coalesced_pool_slots(slab_idx) {
+            slots[n] = s;
+            n += 1;
+        }
+        for &s in &slots[..n] {
+            self.driver.send_copy_pool.release(s);
+        }
+        self.driver.send_slab.release(slab_idx);
+    }
+
+    /// Handle completion of a coalesced plaintext `sendmsg` (OpTag::SendMsgCoalesced).
+    /// Mirrors `handle_send` but the backing is a slab entry holding several
+    /// pool slots; partial sends advance the iovec array via `try_advance`.
+    fn handle_send_msg_coalesced(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let slab_idx = ud.payload() as u16;
+
+        // Guard against a stale CQE for an already-released slab entry.
+        if !self.driver.send_slab.in_use(slab_idx) {
+            return;
+        }
+
+        if result > 0 {
+            // Partial send: advance the iovec array and resubmit the remainder.
+            if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
+                if self
+                    .driver
+                    .ring
+                    .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
+                    .is_err()
+                {
+                    let generation = self.driver.connections.generation(conn_index);
+                    self.driver
+                        .pending_coalesced_retries
+                        .push((conn_index, generation, slab_idx, 0));
+                }
+                return;
+            }
+            // Fully sent.
+            let total = self.driver.send_slab.total_len(slab_idx);
+            metrics::BYTES.add(metrics::bytes::SENT, total as u64);
+            self.release_coalesced(slab_idx);
+            self.driver.submit_next_queued(conn_index);
+            self.driver.note_send_finalized(conn_index);
+            self.executor.wake_send(conn_index, Ok(total));
+            return;
+        }
+
+        // EAGAIN/EWOULDBLOCK: socket buffer full — wait for POLLOUT, keep the
+        // slab entry (and its data) alive, then resubmit the same sendmsg.
+        let errno = -result;
+        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            if self
+                .driver
+                .ring
+                .submit_send_msg_coalesced_pollout(conn_index, slab_idx)
+                .is_err()
+            {
+                let generation = self.driver.connections.generation(conn_index);
+                self.driver
+                    .pending_coalesced_retries
+                    .push((conn_index, generation, slab_idx, 0));
+            }
+            metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
+            return;
+        }
+
+        // Real error — release everything and drain the connection's queue.
+        self.release_coalesced(slab_idx);
+        self.driver.drain_conn_send_queue(conn_index);
+        self.driver.note_send_finalized(conn_index);
+        let io_result = if result == 0 {
+            Ok(0u32)
+        } else {
+            Err(io::Error::from_raw_os_error(-result))
+        };
+        self.executor.wake_send(conn_index, io_result);
+    }
+
+    /// Handle a POLLOUT CQE armed after a coalesced send returned `-EAGAIN`.
+    /// Resubmits the same sendmsg (data still intact in the slab entry).
+    fn handle_send_msg_coalesced_pollout(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let slab_idx = ud.payload() as u16;
+
+        if !self.driver.send_slab.in_use(slab_idx)
+            || self.driver.connections.get(conn_index).is_none()
+        {
+            return;
+        }
+
+        if result < 0 {
+            self.release_coalesced(slab_idx);
+            self.driver.drain_conn_send_queue(conn_index);
+            self.driver.note_send_finalized(conn_index);
+            self.executor
+                .wake_send(conn_index, Err(io::Error::from_raw_os_error(-result)));
+            return;
+        }
+
+        let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+        if self
+            .driver
+            .ring
+            .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
+            .is_err()
+        {
+            let generation = self.driver.connections.generation(conn_index);
+            self.driver
+                .pending_coalesced_retries
+                .push((conn_index, generation, slab_idx, 0));
         }
     }
 

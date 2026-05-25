@@ -1,6 +1,6 @@
 use crate::guard::GuardBox;
 
-pub const MAX_IOVECS: usize = 8;
+pub const MAX_IOVECS: usize = 32;
 pub const MAX_GUARDS: usize = 4;
 
 /// Slab for in-flight scatter-gather sends with zero-copy guards.
@@ -21,6 +21,11 @@ struct InFlightSendEntry {
     msghdr: libc::msghdr,
     /// SendCopyPool slot index. u16::MAX means no pool slot.
     pool_slot: u16,
+    /// Additional SendCopyPool slots backing a coalesced (non-ZC) send — one per
+    /// gathered message. Released together on the operation CQE. Empty for the
+    /// ZC-guard path (which uses `pool_slot` + `guards`).
+    pool_slots: [u16; MAX_IOVECS],
+    pool_slot_count: u8,
     guards: [Option<GuardBox>; MAX_GUARDS],
     guard_count: u8,
     conn_index: u32,
@@ -44,6 +49,8 @@ impl InFlightSendSlab {
                 iov_start: 0,
                 msghdr: unsafe { std::mem::zeroed() },
                 pool_slot: u16::MAX,
+                pool_slots: [u16::MAX; MAX_IOVECS],
+                pool_slot_count: 0,
                 guards: [None, None, None, None],
                 guard_count: 0,
                 conn_index: 0,
@@ -83,6 +90,7 @@ impl InFlightSendSlab {
         entry.iov_count = iovecs_slice.len() as u8;
         entry.iov_start = 0;
         entry.pool_slot = pool_slot;
+        entry.pool_slot_count = 0;
         entry.guards = guards;
         entry.guard_count = guard_count;
         entry.conn_index = conn_index;
@@ -97,6 +105,53 @@ impl InFlightSendSlab {
         entry.msghdr.msg_iovlen = entry.iov_count as _;
 
         Some((idx, &entry.msghdr as *const libc::msghdr))
+    }
+
+    /// Allocate a slot for a coalesced (non-ZC) send: one `sendmsg` whose iovecs
+    /// point into `pool_slots` (one per gathered message). No guards, no ZC
+    /// notifications — the pool slots are released together on the operation CQE.
+    /// `iovecs_slice` and `pool_slots` must be the same length and <= MAX_IOVECS.
+    pub fn allocate_coalesced(
+        &mut self,
+        conn_index: u32,
+        iovecs_slice: &[libc::iovec],
+        pool_slots: &[u16],
+        total_len: u32,
+    ) -> Option<(u16, *const libc::msghdr)> {
+        debug_assert!(iovecs_slice.len() <= MAX_IOVECS);
+        debug_assert_eq!(iovecs_slice.len(), pool_slots.len());
+        let idx = self.free_list.pop()?;
+        let entry = &mut self.entries[idx as usize];
+
+        for (i, iov) in iovecs_slice.iter().enumerate() {
+            entry.iovecs[i] = *iov;
+        }
+        entry.iov_count = iovecs_slice.len() as u8;
+        entry.iov_start = 0;
+        entry.pool_slot = u16::MAX;
+        for (i, &slot) in pool_slots.iter().enumerate() {
+            entry.pool_slots[i] = slot;
+        }
+        entry.pool_slot_count = pool_slots.len() as u8;
+        entry.guard_count = 0;
+        entry.conn_index = conn_index;
+        entry.total_len = total_len;
+        entry.pending_notifs = 0;
+        entry.awaiting_notifications = false;
+        entry.in_use = true;
+
+        entry.msghdr = unsafe { std::mem::zeroed() };
+        entry.msghdr.msg_iov = entry.iovecs.as_mut_ptr();
+        entry.msghdr.msg_iovlen = entry.iov_count as _;
+
+        Some((idx, &entry.msghdr as *const libc::msghdr))
+    }
+
+    /// The coalesced (non-ZC) pool slots backing this entry, to be released into
+    /// the `SendCopyPool` by the caller. Empty for ZC entries.
+    pub fn coalesced_pool_slots(&self, idx: u16) -> &[u16] {
+        let entry = &self.entries[idx as usize];
+        &entry.pool_slots[..entry.pool_slot_count as usize]
     }
 
     /// Advance past `bytes_sent` bytes in the iovec array.
@@ -183,6 +238,7 @@ impl InFlightSendSlab {
         }
         entry.guard_count = 0;
         entry.pool_slot = u16::MAX;
+        entry.pool_slot_count = 0;
         entry.in_use = false;
         entry.awaiting_notifications = false;
         entry.pending_notifs = 0;

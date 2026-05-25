@@ -210,6 +210,10 @@ pub(crate) struct Driver {
     /// Only used when `submit_send_pollout` itself failed (SQ full at
     /// the time the EAGAIN CQE arrived).
     pub(crate) pending_send_pollout_retries: Vec<(u32, u32, u16, u8)>,
+    /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
+    /// Drained each tick — used when resubmitting a coalesced `sendmsg` (partial
+    /// remainder or POLLOUT rearm) found the SQ full.
+    pub(crate) pending_coalesced_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
     /// Per-worker UDP socket state.
@@ -420,6 +424,7 @@ impl Driver {
             pending_zc_retries: Vec::new(),
             pending_copy_retries: Vec::new(),
             pending_send_pollout_retries: Vec::new(),
+            pending_coalesced_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             udp_sockets,
             nvme_devices: config
@@ -671,7 +676,88 @@ impl Driver {
     /// Returns true if a send was submitted, false if the queue was empty
     /// (in which case in_flight is set to false).
     pub(crate) fn submit_next_queued(&mut self, conn_index: u32) -> bool {
-        let state = &mut self.send_queues[conn_index as usize];
+        use crate::buffer::send_slab::MAX_IOVECS;
+
+        let ci = conn_index as usize;
+
+        // Coalesce a run of consecutive plaintext copy sends (pool_slot set, no
+        // ZC slab) at the front of the queue into a single `sendmsg`, so more
+        // than one queued message is pipelined per CQE round-trip. Order is
+        // preserved (one SQE; iovec order = FIFO queue order). ZC-guard sends
+        // and recv-buffer forwards are not coalescable and fall through to the
+        // single-submit path below.
+        let coalescable =
+            |b: &crate::handler::BuiltSend| b.pool_slot != u16::MAX && b.slab_idx == u16::MAX;
+        let n = {
+            let q = &self.send_queues[ci].queue;
+            let mut n = 0;
+            while n < MAX_IOVECS {
+                match q.get(n) {
+                    Some(b) if coalescable(b) => n += 1,
+                    _ => break,
+                }
+            }
+            n
+        };
+        if n >= 2 {
+            let mut pool_slots = [u16::MAX; MAX_IOVECS];
+            {
+                let q = &self.send_queues[ci].queue;
+                for (i, slot) in pool_slots.iter_mut().enumerate().take(n) {
+                    *slot = q[i].pool_slot;
+                }
+            }
+            let mut iovecs = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; MAX_IOVECS];
+            let mut total: u32 = 0;
+            for i in 0..n {
+                let (ptr, len) = self.send_copy_pool.current_ptr_remaining(pool_slots[i]);
+                iovecs[i] = libc::iovec {
+                    iov_base: ptr as *mut libc::c_void,
+                    iov_len: len as usize,
+                };
+                total += len;
+            }
+            // Only commit to coalescing if the slab has room; otherwise fall
+            // through to single-submit (nothing popped yet).
+            if let Some((slab_idx, msg_ptr)) =
+                self.send_slab
+                    .allocate_coalesced(conn_index, &iovecs[..n], &pool_slots[..n], total)
+            {
+                for _ in 0..n {
+                    self.send_queues[ci].queue.pop_front();
+                }
+                match self
+                    .ring
+                    .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
+                {
+                    Ok(()) => return true,
+                    Err(_) => {
+                        // SQ full — release the coalesced slab entry + its pool
+                        // slots, drain the rest of the queue, clear in_flight.
+                        for &s in &pool_slots[..n] {
+                            self.send_copy_pool.release(s);
+                        }
+                        self.send_slab.release(slab_idx);
+                        let state = &mut self.send_queues[ci];
+                        Self::release_queued_sends(
+                            &mut state.queue,
+                            &mut self.send_slab,
+                            &mut self.send_copy_pool,
+                        );
+                        state.in_flight = false;
+                        state.shutdown_pending = false;
+                        self.try_finalize_close(conn_index);
+                        return false;
+                    }
+                }
+            }
+            // slab full → fall through to single-submit
+        }
+
+        let state = &mut self.send_queues[ci];
         match state.queue.pop_front() {
             Some(built) => {
                 let pool_slot = built.pool_slot;
