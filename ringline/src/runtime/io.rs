@@ -930,6 +930,165 @@ impl ConnCtx {
         })
     }
 
+    /// Enable the zero-copy recv-forward path for this connection.
+    ///
+    /// Once enabled, incoming provided recv buffers are *held in place* (not
+    /// copied into the accumulator) and can be echoed back zero-copy via
+    /// [`forward_held`](Self::forward_held), which gathers all held buffers into
+    /// one scatter-gather `sendmsg`. Intended for byte-pipe workloads (echo,
+    /// proxy) where the handler does not parse the stream. While enabled,
+    /// [`with_data`](Self::with_data) / [`with_bytes`](Self::with_bytes) will not
+    /// observe data (it never reaches the accumulator).
+    ///
+    /// Backpressure is automatic: held buffer ids are not returned to the
+    /// provided-buffer ring until their forward completes, so a slow peer
+    /// naturally throttles recv (`ENOBUFS`) rather than growing memory.
+    #[cfg(has_io_uring)]
+    pub fn enable_recv_forward(&self) {
+        with_state(|driver, _| {
+            driver.recv_forward[self.conn_index as usize] = true;
+        });
+    }
+
+    /// Forward all currently-held recv buffers back to the peer in one zero-copy
+    /// scatter-gather `sendmsg` (up to `MAX_IOVECS` buffers), returning a
+    /// [`SendFuture`] that resolves with the bytes sent. Requires
+    /// [`enable_recv_forward`](Self::enable_recv_forward).
+    ///
+    /// Gate calls on [`recv_ready`](Self::recv_ready), which becomes ready when
+    /// the hold is non-empty (or the connection closed). When the hold is empty
+    /// (e.g. the connection closed), the returned future resolves to `0`.
+    ///
+    /// One forward is in flight per connection at a time (await the returned
+    /// future before calling again); buffers received during the send accumulate
+    /// in the hold and are picked up by the next call.
+    #[cfg(has_io_uring)]
+    pub fn forward_held(&self) -> io::Result<SendFuture> {
+        with_state(|driver, executor| {
+            let conn_index = self.conn_index;
+            if driver.connections.generation(conn_index) != self.generation {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "stale connection",
+                ));
+            }
+
+            let n = driver.recv_hold[conn_index as usize]
+                .len()
+                .min(crate::buffer::send_slab::MAX_IOVECS);
+
+            // Nothing held (connection closed or spurious wake) — resolve to 0.
+            if n == 0 {
+                executor.io_results[conn_index as usize] = Some(IoResult::Send(Ok(0)));
+                executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                executor.send_waiters[conn_index as usize] = true;
+                return Ok(SendFuture {
+                    conn_index,
+                    generation: self.generation,
+                });
+            }
+
+            // Gather iovecs over the held provided-buffer memory (PendingRecvBuf
+            // is Copy, so each index read releases the recv_hold borrow).
+            let mut iovecs = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; crate::buffer::send_slab::MAX_IOVECS];
+            let mut bids = [0u16; crate::buffer::send_slab::MAX_IOVECS];
+            let mut total: u32 = 0;
+            for i in 0..n {
+                let p = driver.recv_hold[conn_index as usize][i];
+                iovecs[i] = libc::iovec {
+                    iov_base: p.ptr as *mut libc::c_void,
+                    iov_len: p.len as usize,
+                };
+                bids[i] = p.bid;
+                total += p.len;
+            }
+
+            let (slab_idx, msg_ptr) = driver
+                .send_slab
+                .allocate_recv_forward(conn_index, &iovecs[..n], &bids[..n], total)
+                .ok_or_else(|| io::Error::other("send slab exhausted"))?;
+
+            match driver
+                .ring
+                .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
+            {
+                Ok(()) => {
+                    // Buffers are now owned by the slab entry (bids replenished on
+                    // completion) — remove them from the hold.
+                    for _ in 0..n {
+                        driver.recv_hold[conn_index as usize].pop_front();
+                    }
+                    driver.send_queues[conn_index as usize].in_flight = true;
+                    executor.owner_task[conn_index as usize] =
+                        Some(CURRENT_TASK_ID.with(|c| c.get()));
+                    executor.send_waiters[conn_index as usize] = true;
+                    Ok(SendFuture {
+                        conn_index,
+                        generation: self.generation,
+                    })
+                }
+                Err(e) => {
+                    // Submission failed — release the slab entry; buffers stay in
+                    // the hold (bids un-replenished, still valid) for a later retry.
+                    driver.send_slab.release(slab_idx);
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// Enable the recv-forward path for this connection.
+    ///
+    /// mio fallback: no-op. There is no provided-buffer ring to hold, so recv
+    /// data flows through the accumulator as usual and
+    /// [`forward_held`](Self::forward_held) drains + copy-sends it (no
+    /// zero-copy). Keeps the API portable across backends.
+    #[cfg(not(has_io_uring))]
+    pub fn enable_recv_forward(&self) {}
+
+    /// Forward currently-buffered recv data back to the peer.
+    ///
+    /// mio fallback: drains the accumulator and copy-sends it, returning a
+    /// [`SendFuture`] that resolves with the bytes sent (`0` when empty). Gate
+    /// calls on [`recv_ready`](Self::recv_ready) as on the io_uring backend.
+    #[cfg(not(has_io_uring))]
+    pub fn forward_held(&self) -> io::Result<SendFuture> {
+        with_state(|driver, executor| {
+            let conn_index = self.conn_index;
+            if driver.connections.generation(conn_index) != self.generation {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "stale connection",
+                ));
+            }
+            // Copy out the accumulated bytes (releases the accumulator borrow so
+            // we can take a DriverCtx), then consume them once the send is queued.
+            let data = driver.accumulators.data(conn_index).to_vec();
+            if data.is_empty() {
+                executor.io_results[conn_index as usize] = Some(IoResult::Send(Ok(0)));
+                executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                executor.send_waiters[conn_index as usize] = true;
+                return Ok(SendFuture {
+                    conn_index,
+                    generation: self.generation,
+                });
+            }
+            let mut ctx = driver.make_ctx();
+            ctx.send(self.token(), &data)?;
+            driver.accumulators.consume(conn_index, data.len());
+            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.send_waiters[conn_index as usize] = true;
+            driver.send_completions[conn_index as usize].push_back(data.len() as u32);
+            Ok(SendFuture {
+                conn_index,
+                generation: self.generation,
+            })
+        })
+    }
+
     /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
     ///
     /// This mirrors `DriverCtx::send_parts()` — use `.copy(data)` for copied parts
@@ -1749,6 +1908,12 @@ impl Future for RecvReadyFuture {
 
             // Check accumulator.
             if !driver.accumulators.data(self.conn_index).is_empty() {
+                return Poll::Ready(());
+            }
+
+            // Check the zero-copy recv-forward hold.
+            #[cfg(has_io_uring)]
+            if !driver.recv_hold[self.conn_index as usize].is_empty() {
                 return Poll::Ready(());
             }
 

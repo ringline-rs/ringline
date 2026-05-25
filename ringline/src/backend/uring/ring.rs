@@ -247,6 +247,46 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a zero-copy recv-forward send: one plain (non-ZC) `sendmsg` whose
+    /// iovecs point directly into held provided recv buffers. The slab index is
+    /// in the payload; the slab entry holds the bids to replenish on completion.
+    pub fn submit_send_recv_bufs_coalesced(
+        &mut self,
+        conn_index: u32,
+        msg: *const libc::msghdr,
+        slab_idx: u16,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, slab_idx as u32);
+        let entry = opcode::SendMsg::new(Fixed(conn_index), msg)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Arm a POLLOUT poll after a recv-forward send returned `-EAGAIN`; the slab
+    /// index is carried in the payload so the handler can resubmit the sendmsg.
+    pub fn submit_send_recv_bufs_coalesced_pollout(
+        &mut self,
+        conn_index: u32,
+        slab_idx: u16,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(
+            OpTag::SendRecvBufsCoalescedPollOut,
+            conn_index,
+            slab_idx as u32,
+        );
+        let entry = opcode::PollAdd::new(Fixed(conn_index), libc::POLLOUT as u32)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit a TLS-internal send (handshake, alert). Uses OpTag::TlsSend
     /// so the CQE handler releases the pool slot without calling on_send_complete.
     pub fn submit_tls_send(

@@ -35,6 +35,12 @@ struct Args {
     /// Message size hint for buffer tuning (bytes)
     #[arg(long, default_value_t = 4096)]
     msg_size: usize,
+
+    /// (ringline only) Echo via the multi-buffer zero-copy recv-forward path
+    /// (`enable_recv_forward` + `forward_held`): held provided recv buffers are
+    /// scatter-gathered into one `sendmsg` with no accumulator copy.
+    #[arg(long, default_value_t = false)]
+    recv_forward: bool,
 }
 
 fn main() {
@@ -59,17 +65,18 @@ fn main() {
     );
 
     match args.runtime {
-        Runtime::Ringline => run_ringline(args.addr, workers, args.msg_size),
+        Runtime::Ringline => run_ringline(args.addr, workers, args.msg_size, args.recv_forward),
         Runtime::Tokio => run_tokio(args.addr, workers),
     }
 }
 
 #[allow(clippy::manual_async_fn)]
-fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize) {
+fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward: bool) {
     use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
 
+    // forward_recv_buf path (default): zero-copy when the message fits one
+    // provided recv buffer, else falls back to a copy send.
     struct EchoHandler;
-
     impl AsyncEventHandler for EchoHandler {
         fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
             async move {
@@ -94,6 +101,30 @@ fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize) {
         }
     }
 
+    // Multi-buffer zero-copy recv-forward path: hold provided recv buffers and
+    // scatter-gather them back in one sendmsg — no accumulator copy at all.
+    struct RecvForwardEchoHandler;
+    impl AsyncEventHandler for RecvForwardEchoHandler {
+        fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
+            async move {
+                conn.enable_recv_forward();
+                loop {
+                    conn.recv_ready().await;
+                    let n = match conn.forward_held() {
+                        Ok(f) => f.await.unwrap_or(0),
+                        Err(_) => break,
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            RecvForwardEchoHandler
+        }
+    }
+
     let mut config = Config::default();
     config.worker.threads = workers;
     config.worker.pin_to_core = true;
@@ -104,12 +135,15 @@ fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize) {
     config.send_copy_count = 512;
     config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
 
-    let (_shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr)
-        .launch::<EchoHandler>()
-        .expect("failed to launch ringline server");
+    let builder = RinglineBuilder::new(config).bind(addr);
+    let (_shutdown, handles) = if recv_forward {
+        builder.launch::<RecvForwardEchoHandler>()
+    } else {
+        builder.launch::<EchoHandler>()
+    }
+    .expect("failed to launch ringline server");
 
-    eprintln!("bench-server: ready");
+    eprintln!("bench-server: ready (recv_forward={recv_forward})");
 
     for h in handles {
         h.join().ok();
