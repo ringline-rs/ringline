@@ -1,0 +1,193 @@
+name = "ringline-tcp client-diag {server_runtime}s {clients}conn"
+
+# Focused diagnostic run: captures [ringline diag] stderr output from the
+# ringline client's event-loop counters added in commit 9d09f7e.
+#
+# Key metrics printed at shutdown by each worker thread:
+#   [ringline diag] iters=N dead=D (P%) cqes_1st_avg=X cqes_2nd_avg=Y
+#                   tasks_1st_avg=A tasks_fp_avg=B
+#
+# dead% measures whether flush()'s single-syscall enter(GETEVENTS, min=0)
+# successfully eliminates "dead" event-loop iterations (those that wake
+# only to process send CQEs without polling any user tasks).
+#
+# Compare dead% against ringline server vs tokio server to isolate the
+# mechanism behind the persistent ~20% client throughput deficit.
+
+[params]
+ringline_repo    = "https://github.com/brayniac/ringline"
+ringline_version = "main"
+port             = "7878"
+server_workers   = "8"
+client_threads   = "8"
+warmup_duration  = "3"
+test_duration    = "10"
+inter_run_sleep  = "5"
+
+[matrix]
+server_runtime = ["ringline", "tokio"]
+clients        = ["10", "50"]
+
+# ── Server job (z1.n.small) ────────────────────────────────────────────────
+
+[[jobs]]
+name = "server"
+tags = ["z1.n.small"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline
+    git fetch --all
+    git checkout {ringline_version}
+    git reset --hard origin/{ringline_version}
+else
+    git clone {ringline_repo} /tmp/ringline
+    cd /tmp/ringline
+    git checkout {ringline_version}
+fi
+cd /tmp/ringline
+cargo build --release --bin bench-server
+sudo cp target/release/bench-server /usr/local/bin/bench-server
+echo "bench-server build OK: $(bench-server --help 2>&1 | head -1)"
+"""
+
+[[jobs.steps]]
+name = "tune-system"
+type = "shell"
+command = """
+sudo sysctl -w net.core.somaxconn=65535
+sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo fuser -k {port}/tcp 2>/dev/null || true
+sleep 1
+echo "System tuning complete"
+"""
+
+[[jobs.steps]]
+name = "start-server"
+type = "shell"
+background = true
+command = """
+ulimit -n 500000
+exec bench-server \
+    --runtime {server_runtime} \
+    --addr 0.0.0.0:{port} \
+    --workers {server_workers}
+"""
+
+[[jobs.steps]]
+name = "wait-for-server"
+type = "shell"
+command = """
+for i in $(seq 1 30); do
+    nc -z localhost {port} 2>/dev/null && echo "Server ready on port {port}" && exit 0
+    echo "Waiting for server... ($i/30)"
+    sleep 1
+done
+echo "ERROR: bench-server failed to start on port {port}"
+exit 1
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"
+
+[[jobs.steps]]
+name = "server-stats"
+type = "shell"
+command = """
+echo "=== TCP socket stats ==="
+ss -s
+"""
+
+# ── Client job (z2.n.small) ────────────────────────────────────────────────
+
+[[jobs]]
+name = "client"
+tags = ["z2.n.small"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline
+    git fetch --all
+    git checkout {ringline_version}
+    git reset --hard origin/{ringline_version}
+else
+    git clone {ringline_repo} /tmp/ringline
+    cd /tmp/ringline
+    git checkout {ringline_version}
+fi
+cd /tmp/ringline
+cargo build --release --bin bench-client
+sudo cp target/release/bench-client /usr/local/bin/bench-client
+echo "bench-client build OK: $(bench-client --help 2>&1 | head -1)"
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+
+[[jobs.steps]]
+name = "verify-connectivity"
+type = "shell"
+command = """
+echo "SERVER_ADDR=$SERVER_ADDR"
+for i in $(seq 1 30); do
+    nc -z "$SERVER_ADDR" {port} 2>/dev/null && echo "Server reachable at $SERVER_ADDR:{port}" && exit 0
+    echo "Waiting for server to be reachable... ($i/30)"
+    sleep 1
+done
+echo "ERROR: Failed to connect to server at $SERVER_ADDR:{port}"
+exit 1
+"""
+
+[[jobs.steps]]
+name = "run-ringline-client"
+type = "shell"
+command = """
+ulimit -n 500000
+# Redirect stderr to capture [ringline diag] output from worker threads.
+bench-client \
+    --runtime ringline \
+    --addr "$SERVER_ADDR:{port}" \
+    --clients {clients} \
+    --msg-size 64 \
+    --warmup {warmup_duration} \
+    --duration {test_duration} \
+    --threads {client_threads} \
+    > results-ringline.json \
+    2> diag-ringline.txt
+echo "=== bench results ==="
+cat results-ringline.json
+echo "=== event-loop diagnostics (per worker) ==="
+cat diag-ringline.txt
+"""
+
+[[jobs.steps]]
+name = "upload-ringline-results"
+type = "upload_artifact"
+path = "results-ringline.json"
+
+[[jobs.steps]]
+name = "upload-ringline-diag"
+type = "upload_artifact"
+path = "diag-ringline.txt"
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"
