@@ -226,7 +226,7 @@ mod ringline_client {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use ringline::{
@@ -242,10 +242,10 @@ mod ringline_client {
         pub msg_size: usize,
         /// Total client connections (used to split the aggregate open-loop rate).
         pub num_clients: usize,
-        /// Total connections still to be opened. Each worker's `on_start`
-        /// drains this counter, so connections are distributed across workers
-        /// and the total is exactly the requested client count.
-        pub remaining: Arc<AtomicUsize>,
+        /// Number of ringline worker threads. Used by each worker's `on_start`
+        /// to compute its round-robin slice of connections:
+        ///   worker_id, worker_id + num_workers, worker_id + 2*num_workers, ...
+        pub num_workers: usize,
         pub stop: Arc<AtomicBool>,
         /// Set true once warmup ends; open-loop latency/ops are only recorded
         /// while this is true.
@@ -258,6 +258,9 @@ mod ringline_client {
 
     struct ClientHandler {
         state: Arc<ClientState>,
+        /// Index of the worker thread owning this handler.
+        /// Used to compute this worker's slice of connections in `on_start`.
+        worker_id: usize,
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -268,46 +271,49 @@ mod ringline_client {
 
         fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
             let state = self.state.clone();
+            let worker_id = self.worker_id;
             Some(Box::pin(async move {
-                // Claim connection slots from the shared counter until drained.
-                loop {
-                    let prev = state.remaining.load(Ordering::Relaxed);
-                    if prev == 0 {
-                        break;
-                    }
-                    if state
-                        .remaining
-                        .compare_exchange_weak(prev, prev - 1, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        let s = state.clone();
-                        match s.open {
-                            Some(ol) => {
-                                spawn(async move {
-                                    run_ringline_open_client(s, ol).await;
-                                })
-                                .ok();
-                            }
-                            None => {
-                                spawn(async move {
-                                    run_ringline_client(s).await;
-                                })
-                                .ok();
-                            }
+                // Round-robin assignment: this worker owns connection indices
+                //   worker_id, worker_id+num_workers, worker_id+2*num_workers, ...
+                //
+                // Previously this used a shared AtomicUsize drain loop with no
+                // awaits, which meant the first worker to call on_start() claimed
+                // every connection before any other worker started — all N
+                // connections ended up on one thread.  The round-robin approach
+                // gives each worker its pre-determined slice without any shared
+                // mutable state or contention.
+                let num_workers = state.num_workers;
+                let num_clients = state.num_clients;
+                let mut i = worker_id;
+                while i < num_clients {
+                    let s = state.clone();
+                    match s.open {
+                        Some(ol) => {
+                            spawn(async move {
+                                run_ringline_open_client(s, ol).await;
+                            })
+                            .ok();
+                        }
+                        None => {
+                            spawn(async move {
+                                run_ringline_client(s).await;
+                            })
+                            .ok();
                         }
                     }
+                    i += num_workers;
                 }
             }))
         }
 
-        fn create_for_worker(_worker_id: usize) -> Self {
+        fn create_for_worker(worker_id: usize) -> Self {
             let state = GLOBAL_STATE
                 .lock()
                 .unwrap()
                 .as_ref()
                 .expect("client state not set")
                 .clone();
-            ClientHandler { state }
+            ClientHandler { state, worker_id }
         }
     }
 
@@ -707,9 +713,7 @@ fn run_bench_ringline(
         target: addr.parse().expect("invalid addr for ringline client"),
         msg_size,
         num_clients,
-        // Total connections to open, distributed across workers (each worker's
-        // on_start drains this counter, so the total is exact).
-        remaining: Arc::new(std::sync::atomic::AtomicUsize::new(num_clients)),
+        num_workers: workers.max(1),
         stop: stop.clone(),
         measure: measure.clone(),
         ops: ops.clone(),
