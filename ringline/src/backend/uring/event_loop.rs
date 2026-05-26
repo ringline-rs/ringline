@@ -425,31 +425,29 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Poll all ready tasks.
             self.poll_ready_tasks();
 
-            // Flush any SQEs enqueued by poll_ready_tasks (e.g., echo sends)
-            // immediately without waiting for the next submit_and_wait. This
-            // avoids a full event-loop iteration of latency between a task
-            // waking and its SQE reaching the kernel. DEFER_TASKRUN also
-            // means flush() triggers delivery of any newly-posted recv CQEs
-            // accumulated since the last submit_and_wait.
+            // Flush any SQEs enqueued by poll_ready_tasks (e.g., client sends).
+            // flush() does two things:
+            //   1. submit() — delivers the SQEs to the kernel.
+            //   2. enter(GETEVENTS, min=0) — triggers DEFER_TASKRUN task_work
+            //      so deferred CQEs (send completions, recv arrivals) are
+            //      posted to the CQ ring *before* flush() returns.
+            // This means the drain_completions() below sees those CQEs
+            // inline, eliminating the "dead" submit_and_wait(1) iteration
+            // that would otherwise burn a full event-loop cycle just to
+            // process send CQEs that wake no tasks (no send waiter for
+            // send_nowait callers).
             let _ = self.driver.ring.flush();
 
-            // Non-blocking drain: catch CQEs (primarily send completions)
-            // that DEFER_TASKRUN posted during the flush() syscall above.
-            // Without this drain, the next submit_and_wait(1) would return
-            // immediately just to handle those "dead" send CQEs — burning
-            // a full event-loop iteration before we can block waiting for
-            // the meaningful recv CQE.  For send_nowait callers there is no
-            // send waiter, so wake_send is a no-op and the only work is
-            // freeing the send-copy-pool slot.  Draining it here collapses
-            // the two-iteration pattern (send-CQE dead iter + recv-CQE live
-            // iter) down to one live iter per round-trip.
+            // Non-blocking drain: consume the CQEs (primarily send completions)
+            // that flush()'s GETEVENTS step posted to the CQ ring.
+            // For send_nowait the pool slot is freed here; wake_send is a
+            // no-op (no waiter).  Draining inline collapses the two-iteration
+            // pattern (dead send-CQE iter + live recv-CQE iter) down to one.
             self.drain_completions();
 
-            // If any recv CQEs also arrived during flush() (e.g., a burst
-            // of responses came in while we were running tasks), drain_completions
-            // will have pushed their tasks directly onto ready_queue.  Run
-            // them now so their sends reach the SQ before we block on
-            // submit_and_wait.
+            // If the drain woke any tasks (recv CQEs that arrived while we
+            // were running tasks and were flushed by the GETEVENTS enter),
+            // run them now so their sends land in the SQ before we block.
             if !self.executor.ready_queue.is_empty() {
                 self.poll_ready_tasks();
                 let _ = self.driver.ring.flush();

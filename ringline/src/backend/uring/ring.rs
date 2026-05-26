@@ -554,8 +554,32 @@ impl Ring {
     }
 
     /// Submit pending SQEs without waiting. Used for mid-iteration flush.
+    ///
+    /// After submitting the SQEs this method issues a second `io_uring_enter`
+    /// with `IORING_ENTER_GETEVENTS` and `min_complete=0`.  With
+    /// `IORING_SETUP_DEFER_TASKRUN` the kernel only runs task_work (and posts
+    /// deferred CQEs to the completion ring) when `IORING_ENTER_GETEVENTS` is
+    /// set.  A plain `submit()` call does NOT set that flag, so send-completion
+    /// CQEs for the SQEs we just submitted sit in kernel-internal task_work
+    /// until the next `submit_and_wait(1)`, causing a "dead" event-loop
+    /// iteration that wakes up only to process those CQEs.
+    ///
+    /// By issuing a non-blocking `enter(GETEVENTS, min=0)` right after submit
+    /// we flush task_work inline — the send CQEs land in the CQ ring before
+    /// `flush()` returns, so the `drain_completions()` call that follows in
+    /// the event loop can consume them immediately.
     pub fn flush(&self) -> io::Result<()> {
+        // Step 1: submit pending SQEs (no GETEVENTS; pure submit path).
         self.ring.submit()?;
+        // Step 2: trigger DEFER_TASKRUN task_work delivery.
+        // IORING_ENTER_GETEVENTS = 1, min_complete = 0 → flush task_work but
+        // do NOT block waiting for any specific number of completions.
+        // Safety: `arg = None` is always valid for plain GETEVENTS enter.
+        unsafe {
+            self.ring
+                .submitter()
+                .enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None)?;
+        }
         Ok(())
     }
 
