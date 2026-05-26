@@ -920,8 +920,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .is_some_and(|c| c.direct_echo);
 
             if is_direct_echo {
-                // Encode bid + len into the payload the same way forward_recv_buf does.
-                let payload = (bid as u32) | (bytes_received << 16);
+                // Payload carries only the bid; remaining is in send_recv_buf_remaining.
+                let payload = bid as u32;
                 let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
                 let entry = io_uring::opcode::Send::new(
                     io_uring::types::Fixed(conn_index),
@@ -937,6 +937,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     total_len: bytes_received,
                 };
                 self.driver.send_recv_buf_original_lens[conn_index as usize] = bytes_received;
+                self.driver.send_recv_buf_remaining[conn_index as usize] = bytes_received;
                 if self.driver.submit_or_queue_send(conn_index, built).is_err() {
                     // SQ full — replenish and give up on this echo.
                     self.driver.pending_replenish.push(bid);
@@ -1715,8 +1716,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn handle_send_recv_buf(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
         let payload = ud.payload();
-        let bid = (payload & 0xFFFF) as u16;
-        let remaining_before = payload >> 16;
+        // Payload carries only the bid. The remaining byte count is in the driver
+        // field (send_recv_buf_remaining) so that buffer sizes > u16::MAX work.
+        let bid = payload as u16;
+        let remaining_before = self.driver.send_recv_buf_remaining[conn_index as usize];
 
         if result > 0 {
             let bytes_sent = result as u32;
@@ -1724,11 +1727,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if bytes_sent < remaining_before {
                 // Partial send — resubmit the remainder.
                 let new_remaining = remaining_before - bytes_sent;
+                self.driver.send_recv_buf_remaining[conn_index as usize] = new_remaining;
                 let (buf_ptr, _buf_size) = self.driver.provided_bufs.get_buffer(bid);
                 let original_len = self.driver.send_recv_buf_original_lens[conn_index as usize];
                 let offset = original_len - new_remaining;
                 let new_ptr = unsafe { buf_ptr.add(offset as usize) };
-                let new_payload = (bid as u32) | ((new_remaining) << 16);
+                let new_payload = bid as u32;
                 let new_ud = UserData::encode(
                     crate::completion::OpTag::SendRecvBuf,
                     conn_index,
@@ -4448,7 +4452,8 @@ mod tests {
         let bid: u16 = 3;
         let data_len: u32 = 100;
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // Full send: all 100 bytes sent.
@@ -4480,7 +4485,8 @@ mod tests {
         let bid: u16 = 5;
         let data_len: u32 = 200;
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // Simulate ECONNRESET.
@@ -4524,7 +4530,8 @@ mod tests {
 
         // Set up original length tracking (mirrors forward_recv_buf).
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // Partial send: only 60 of 100 bytes sent.
@@ -4536,16 +4543,14 @@ mod tests {
             "buffer replenished prematurely on partial send"
         );
 
-        // The retry SQE should have been pushed to the ring. We can verify by
-        // checking the ring's pending SQEs. Since we can't directly inspect SQEs,
-        // we verify the fix indirectly: the resubmitted SQE's pointer should be
-        // buf_ptr + 60 (not buf_ptr + buf_size - 40 which was the bug).
-        //
-        // Drain the retry by injecting the completion for the resubmitted send.
-        // The new payload should encode remaining=40.
-        let new_remaining: u32 = 40;
-        let new_payload = (bid as u32) | (new_remaining << 16);
-        let new_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, new_payload);
+        // The retry SQE should have been pushed to the ring. The handler updated
+        // send_recv_buf_remaining to 40; the retry CQE just needs bid in the payload.
+        assert_eq!(
+            el.driver.send_recv_buf_remaining[conn_index as usize],
+            40,
+            "remaining not updated after partial send"
+        );
+        let new_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
 
         // Complete the retry — all 40 remaining bytes sent.
         el.test_dispatch_cqe(new_ud.raw(), 40, 0);
@@ -4574,24 +4579,23 @@ mod tests {
         }
 
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // First partial: 30 of 100 bytes sent. Remaining = 70. Offset should be 30.
         el.test_dispatch_cqe(ud.raw(), 30, 0);
         assert!(!el.driver.pending_replenish.contains(&bid));
+        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 70);
 
         // Second partial: 20 of 70 bytes sent. Remaining = 50. Offset should be 50.
-        let remaining_70 = 70u32;
-        let payload2 = (bid as u32) | (remaining_70 << 16);
-        let ud2 = UserData::encode(OpTag::SendRecvBuf, conn_index, payload2);
+        let ud2 = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
         el.test_dispatch_cqe(ud2.raw(), 20, 0);
         assert!(!el.driver.pending_replenish.contains(&bid));
+        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 50);
 
         // Final: 50 of 50 bytes sent. Should complete.
-        let remaining_50 = 50u32;
-        let payload3 = (bid as u32) | (remaining_50 << 16);
-        let ud3 = UserData::encode(OpTag::SendRecvBuf, conn_index, payload3);
+        let ud3 = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
         el.test_dispatch_cqe(ud3.raw(), 50, 0);
         assert!(
             el.driver.pending_replenish.contains(&bid),
@@ -4618,7 +4622,8 @@ mod tests {
         // With buf_size=4096 and data_len=50, the wrong offset points way past the data.
 
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // Partial send: 25 of 50 bytes.
@@ -4633,8 +4638,8 @@ mod tests {
         //
         // The real verification is that the resubmitted send completes successfully.
         // Simulate that by completing the retry.
-        let retry_payload = (bid as u32) | (25u32 << 16);
-        let retry_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, retry_payload);
+        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 25);
+        let retry_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
         el.test_dispatch_cqe(retry_ud.raw(), 25, 0);
 
         assert!(
@@ -4656,7 +4661,8 @@ mod tests {
         let bid: u16 = 7;
         let data_len: u32 = 50;
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // Result == 0 (zero-length send).

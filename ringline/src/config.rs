@@ -282,15 +282,9 @@ impl Config {
                 "recv_buffer.ring_size must be a power of two".into(),
             ));
         }
-        // Load-bearing upper bound: the `SendRecvBuf` user_data encoding in
-        // `runtime/io.rs` packs `pending.len` (== buffer fill) into the high
-        // 16 bits of the 32-bit payload. Lifting this past `u16::MAX` would
-        // silently truncate the encoded length on release builds.
-        const MAX_RECV_BUFFER_SIZE: u32 = u16::MAX as u32;
-        if self.recv_buffer.buffer_size == 0 || self.recv_buffer.buffer_size > MAX_RECV_BUFFER_SIZE
-        {
+        if self.recv_buffer.buffer_size == 0 {
             return Err(crate::error::Error::RingSetup(
-                "recv_buffer.buffer_size must be > 0 and <= 65535".into(),
+                "recv_buffer.buffer_size must be > 0".into(),
             ));
         }
         if self.max_connections == 0 || self.max_connections >= (1 << 24) {
@@ -767,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_buffer_size_max_accepted() {
+    fn validate_buffer_size_accepted_65535() {
         assert!(
             config_with(|c| c.recv_buffer.buffer_size = 65535)
                 .validate()
@@ -776,23 +770,23 @@ mod tests {
     }
 
     #[test]
-    fn validate_buffer_size_overflow_rejected() {
-        let err = config_with(|c| c.recv_buffer.buffer_size = 65536)
-            .validate()
-            .unwrap_err();
-        let msg = format!("{err}");
+    fn validate_buffer_size_accepted_65536() {
+        // 65536 is the first value that previously caused a crash; it must now be
+        // accepted (the remaining-bytes counter is stored in the driver, not in the
+        // 16-bit CQE payload).
         assert!(
-            msg.contains("buffer_size"),
-            "error should mention buffer_size: {msg}"
+            config_with(|c| c.recv_buffer.buffer_size = 65536)
+                .validate()
+                .is_ok()
         );
     }
 
     #[test]
-    fn validate_buffer_size_large_rejected() {
+    fn validate_buffer_size_accepted_large() {
         assert!(
             config_with(|c| c.recv_buffer.buffer_size = 131072)
                 .validate()
-                .is_err()
+                .is_ok()
         );
     }
 

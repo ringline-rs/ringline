@@ -873,23 +873,14 @@ impl ConnCtx {
                     if data_ptr == pending_ptr && data.len() == pending.len as usize {
                         // Submit send SQE from the recv buffer. The bid is replenished
                         // on send completion via handle_send_recv_buf.
-                        // Payload: bid in low 16 bits, remaining_len in high 16 bits.
-                        //
-                        // The encoding is tied to the config validation cap
-                        // `recv_buffer.buffer_size <= 65535` in `config.rs`;
-                        // if that cap is ever raised this must be widened too.
-                        // Guard at runtime in release builds — silent
-                        // truncation here causes wrong-length completions.
-                        assert!(
-                            pending.len <= 0xFFFF,
-                            "forward_recv_buf: data length {} exceeds 16-bit payload capacity \
-                             — `Config::recv_buffer::buffer_size` cap diverged from the \
-                             `SendRecvBuf` user_data encoding",
-                            pending.len,
-                        );
-                        let payload = (pending.bid as u32) | ((pending.len) << 16);
-                        // Store original data length for correct offset on partial sends.
+                        // Payload: bid only (low 16 bits). The remaining byte count is
+                        // tracked in driver.send_recv_buf_remaining[conn_index] so that
+                        // buffer sizes > u16::MAX (e.g. 65536 B) are supported without
+                        // truncation in the CQE user_data payload.
+                        let payload = pending.bid as u32;
+                        // Store original and remaining lengths for partial-send tracking.
                         driver.send_recv_buf_original_lens[conn_index as usize] = pending.len;
+                        driver.send_recv_buf_remaining[conn_index as usize] = pending.len;
                         let user_data = crate::completion::UserData::encode(
                             crate::completion::OpTag::SendRecvBuf,
                             conn_index,
