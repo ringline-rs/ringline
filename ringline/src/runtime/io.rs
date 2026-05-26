@@ -2098,8 +2098,7 @@ impl Future for DirectEchoFuture {
 
             // Park until close — handle_recv_multi calls wake_recv when
             // result == 0 (EOF) or on error, which will wake this future.
-            executor.owner_task[self.conn_index as usize] =
-                Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })

@@ -112,6 +112,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
         }
 
+        // ── Diagnostic counters (printed to stderr at shutdown) ────────────────
+        // These measure the event-loop iteration mix to help diagnose client
+        // throughput deficits.  All counters are u64 locals — zero overhead
+        // in release builds when the eprintln! at shutdown is compiled away.
+        let mut diag_iters: u64 = 0;
+        let mut diag_dead_iters: u64 = 0; // iters where no tasks were polled in first poll_ready_tasks
+        let mut diag_cqes_1st: u64 = 0; // CQEs from first drain_completions (after submit_and_wait)
+        let mut diag_cqes_2nd: u64 = 0; // CQEs from second drain_completions (after flush)
+        let mut diag_tasks_1st: u64 = 0; // tasks polled in first poll_ready_tasks
+        let mut diag_tasks_fp: u64 = 0; // tasks polled in fast-path poll_ready_tasks
+
         loop {
             // Retry eventfd re-arm if a previous attempt failed (SQ was full).
             if !self.driver.eventfd_armed && !self.driver.shutdown_flag.load(Ordering::Relaxed) {
@@ -138,9 +149,25 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.ring.submit_and_wait(1)?;
 
             self.drain_completions();
+            diag_cqes_1st += self.driver.cqe_batch.len() as u64;
 
             // Check for shutdown after processing completions.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
+                // Print per-worker diagnostics before exiting.
+                let dead_pct = if diag_iters > 0 {
+                    100.0 * diag_dead_iters as f64 / diag_iters as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[ringline diag] iters={diag_iters} dead={diag_dead_iters} ({dead_pct:.1}%) \
+                     cqes_1st_avg={:.2} cqes_2nd_avg={:.2} \
+                     tasks_1st_avg={:.2} tasks_fp_avg={:.2}",
+                    diag_cqes_1st as f64 / diag_iters.max(1) as f64,
+                    diag_cqes_2nd as f64 / diag_iters.max(1) as f64,
+                    diag_tasks_1st as f64 / diag_iters.max(1) as f64,
+                    diag_tasks_fp as f64 / diag_iters.max(1) as f64,
+                );
                 self.driver.run_shutdown();
                 return Ok(());
             }
@@ -414,6 +441,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
 
             self.driver.tick_count += 1;
+            diag_iters += 1;
 
             // Check close_notify deadlines — force-close connections where
             // close_notify was sent but the close CQE never arrived.
@@ -423,7 +451,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.collect_wakeups();
 
             // Poll all ready tasks.
+            let tasks_before = self.executor.ready_queue.len();
             self.poll_ready_tasks();
+            diag_tasks_1st += tasks_before as u64;
+            if tasks_before == 0 {
+                diag_dead_iters += 1;
+            }
 
             // Flush any SQEs enqueued by poll_ready_tasks (e.g., client sends).
             // flush() does two things:
@@ -444,11 +477,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // no-op (no waiter).  Draining inline collapses the two-iteration
             // pattern (dead send-CQE iter + live recv-CQE iter) down to one.
             self.drain_completions();
+            diag_cqes_2nd += self.driver.cqe_batch.len() as u64;
 
             // If the drain woke any tasks (recv CQEs that arrived while we
             // were running tasks and were flushed by the GETEVENTS enter),
             // run them now so their sends land in the SQ before we block.
             if !self.executor.ready_queue.is_empty() {
+                diag_tasks_fp += self.executor.ready_queue.len() as u64;
                 self.poll_ready_tasks();
                 let _ = self.driver.ring.flush();
             }
