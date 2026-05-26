@@ -68,6 +68,12 @@ pub struct ConnectionState {
     /// Set when a `RecvMsgMulti` completion delivers a `SCM_TIMESTAMPING` cmsg.
     #[cfg(feature = "timestamps")]
     pub recv_timestamp_ns: u64,
+    /// When true, `handle_recv_multi` echoes received data directly from the CQE
+    /// handler instead of waking the connection's task. This eliminates the
+    /// task-wakeup overhead (collect_wakeups → poll_ready_tasks) on the hot echo
+    /// path, reducing per-message latency from ~2 event-loop iterations to ~1.
+    #[cfg(has_io_uring)]
+    pub direct_echo: bool,
 }
 
 impl Default for ConnectionState {
@@ -88,6 +94,8 @@ impl ConnectionState {
             connect_timeout_armed: false,
             #[cfg(feature = "timestamps")]
             recv_timestamp_ns: 0,
+            #[cfg(has_io_uring)]
+            direct_echo: false,
         }
     }
 
@@ -114,6 +122,10 @@ impl ConnectionState {
         #[cfg(feature = "timestamps")]
         {
             self.recv_timestamp_ns = 0;
+        }
+        #[cfg(has_io_uring)]
+        {
+            self.direct_echo = false;
         }
         self.generation = self.generation.wrapping_add(1);
     }

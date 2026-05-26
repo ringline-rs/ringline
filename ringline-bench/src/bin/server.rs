@@ -72,14 +72,25 @@ fn main() {
 
 #[allow(clippy::manual_async_fn)]
 fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward: bool) {
-    use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+    use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
+    // ParseResult is only needed in the non-io_uring fallback path.
+    #[cfg(not(has_io_uring))]
+    use ringline::ParseResult;
 
-    // forward_recv_buf path (default): zero-copy when the message fits one
-    // provided recv buffer, else falls back to a copy send.
+    // Direct-echo path (default): no task wakeup per message — echo SQEs are
+    // submitted directly from handle_recv_multi, bypassing collect_wakeups and
+    // poll_ready_tasks entirely. Falls back to the forward_recv_buf loop on the
+    // mio backend (macOS / non-io_uring builds).
     struct EchoHandler;
     impl AsyncEventHandler for EchoHandler {
         fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
             async move {
+                #[cfg(has_io_uring)]
+                {
+                    conn.run_direct_echo().await;
+                    return;
+                }
+                #[cfg(not(has_io_uring))]
                 loop {
                     let n = conn
                         .with_data(|data| {

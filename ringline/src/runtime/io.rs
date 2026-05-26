@@ -930,6 +930,28 @@ impl ConnCtx {
         })
     }
 
+    /// Run a direct-echo event loop for this connection (io_uring only).
+    ///
+    /// Instead of the standard task-driven approach where each recv CQE wakes
+    /// the owning task, which then calls `with_data` → `forward_recv_buf`, this
+    /// mode sets a flag on the connection that tells `handle_recv_multi` to
+    /// submit the echo SQE directly from the CQE handler — bypassing the
+    /// `collect_wakeups` → `poll_ready_tasks` roundtrip entirely.
+    ///
+    /// The returned future parks until the connection is closed, then resolves.
+    /// Any data buffered before the flag was set is drained on the first poll.
+    ///
+    /// On the mio backend this degrades gracefully to the normal `with_data` /
+    /// `forward_recv_buf` loop.
+    #[cfg(has_io_uring)]
+    pub fn run_direct_echo(&self) -> DirectEchoFuture {
+        DirectEchoFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            armed: false,
+        }
+    }
+
     /// Enable the zero-copy recv-forward path for this connection.
     ///
     /// Once enabled, incoming provided recv buffers are *held in place* (not
@@ -1994,6 +2016,113 @@ impl Drop for SendFuture {
         }
         let executor = unsafe { &mut *state.executor.as_mut() };
         executor.send_waiters[self.conn_index as usize] = false;
+    }
+}
+
+// ── DirectEchoFuture ─────────────────────────────────────────────────
+
+/// Future that drives a connection in direct-echo mode (io_uring only).
+///
+/// On first poll it sets `ConnectionState::direct_echo = true` so that all
+/// subsequent recv CQEs are echoed directly from `handle_recv_multi` without
+/// waking this task — eliminating the `collect_wakeups` → `poll_ready_tasks`
+/// roundtrip on the hot path. Any data buffered before the flag was set is
+/// drained on the first poll. The future parks until the connection is closed.
+///
+/// Created by [`ConnCtx::run_direct_echo`].
+#[cfg(has_io_uring)]
+pub struct DirectEchoFuture {
+    conn_index: u32,
+    generation: u32,
+    armed: bool,
+}
+
+#[cfg(has_io_uring)]
+impl Future for DirectEchoFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        with_state(|driver, executor| {
+            // Generation check: the slot was reused while we were parked.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return Poll::Ready(());
+            }
+
+            if !self.armed {
+                // Arm direct-echo mode on the connection.
+                if let Some(cs) = driver.connections.get_mut(self.conn_index) {
+                    cs.direct_echo = true;
+                }
+                self.armed = true;
+
+                // Drain any buffer that arrived before the flag was set.
+                // After this, all new bufs are echoed directly by handle_recv_multi.
+                if let Some(pending) = driver.pending_recv_bufs[self.conn_index as usize].take() {
+                    assert!(
+                        pending.len <= 0xFFFF,
+                        "DirectEchoFuture: data length {} exceeds 16-bit payload capacity",
+                        pending.len,
+                    );
+                    let payload = (pending.bid as u32) | (pending.len << 16);
+                    let ud = UserData::encode(OpTag::SendRecvBuf, self.conn_index, payload);
+                    let entry = io_uring::opcode::Send::new(
+                        io_uring::types::Fixed(self.conn_index),
+                        pending.ptr,
+                        pending.len,
+                    )
+                    .build()
+                    .user_data(ud.raw());
+                    let built = crate::handler::BuiltSend {
+                        entry,
+                        pool_slot: u16::MAX,
+                        slab_idx: u16::MAX,
+                        total_len: pending.len,
+                    };
+                    driver.send_recv_buf_original_lens[self.conn_index as usize] = pending.len;
+                    if driver.submit_or_queue_send(self.conn_index, built).is_err() {
+                        driver.pending_replenish.push(pending.bid);
+                    }
+                }
+            }
+
+            // Check if the connection is already closed.
+            let is_closed = driver
+                .connections
+                .get(self.conn_index)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+
+            if is_closed {
+                return Poll::Ready(());
+            }
+
+            // Park until close — handle_recv_multi calls wake_recv when
+            // result == 0 (EOF) or on error, which will wake this future.
+            executor.owner_task[self.conn_index as usize] =
+                Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[self.conn_index as usize] = true;
+            Poll::Pending
+        })
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Drop for DirectEchoFuture {
+    fn drop(&mut self) {
+        let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
+        if opt_non_null.is_none() {
+            return;
+        }
+        let mut non_null = opt_non_null.unwrap();
+        let state = unsafe { non_null.as_mut() };
+        let driver = unsafe { &mut *state.driver.as_mut() };
+        // Verify the slot still belongs to this connection before clearing
+        // its waiter — a close/reuse cycle gives the slot a new generation.
+        if driver.connections.generation(self.conn_index) != self.generation {
+            return;
+        }
+        let executor = unsafe { &mut *state.executor.as_mut() };
+        executor.recv_waiters[self.conn_index as usize] = false;
     }
 }
 

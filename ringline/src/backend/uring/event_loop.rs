@@ -425,6 +425,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Poll all ready tasks.
             self.poll_ready_tasks();
 
+            // Flush any SQEs enqueued by poll_ready_tasks (e.g., echo sends)
+            // immediately without waiting for the next submit_and_wait. This
+            // avoids a full event-loop iteration of latency between a task
+            // waking and its SQE reaching the kernel. DEFER_TASKRUN also
+            // means flush() triggers delivery of any newly-posted recv CQEs
+            // accumulated since the last submit_and_wait.
+            let _ = self.driver.ring.flush();
+
             // on_tick callback (synchronous). Set the executor's
             // driver_state thread-local so user code that calls
             // `ringline::spawn()` / wakers / `with_state` works from
@@ -846,72 +854,110 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             });
             self.executor.wake_recv(conn_index);
         } else {
-            // Plaintext path: route through recv sink if active, else zero-copy/accumulator.
-            if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
-                self.driver.pending_replenish.push(bid);
-                let remaining_cap = sink.cap - sink.pos;
-                let to_sink = data.len().min(remaining_cap);
-                if to_sink > 0 {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data.as_ptr(),
-                            sink.ptr.add(sink.pos),
-                            to_sink,
-                        );
-                    }
-                    sink.pos += to_sink;
-                }
-                // Overflow (trailing CRLF, next commands) goes to accumulator.
-                if to_sink < data.len()
-                    && !self
-                        .driver
-                        .accumulators
-                        .append(conn_index, &data[to_sink..])
-                {
-                    self.executor.wake_recv(conn_index);
-                    self.driver.close_connection(conn_index);
-                    return;
-                }
-            } else {
-                // Zero-copy fast path: if no pending buffer AND accumulator is
-                // empty, hold the kernel buffer in-place instead of copying.
-                let acc_empty = self.driver.accumulators.data(conn_index).is_empty();
-                let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
+            // Direct echo fast path: submit the echo SQE directly from the CQE
+            // handler, bypassing task wakeup entirely. This eliminates the
+            // collect_wakeups → poll_ready_tasks roundtrip (~1 full event-loop
+            // iteration of latency) on the hot single-connection echo path.
+            let is_direct_echo = self
+                .driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.direct_echo);
 
-                if acc_empty && slot.is_none() {
-                    *slot = Some(crate::backend::PendingRecvBuf {
-                        bid,
-                        len: bytes_received,
-                        ptr: buf_ptr,
-                    });
-                } else {
-                    // Flush any existing pending buffer to accumulator first.
-                    let mut accumulator_overflowed = false;
-                    if let Some(pending) = slot.take() {
-                        let pending_data = unsafe {
-                            std::slice::from_raw_parts(pending.ptr, pending.len as usize)
-                        };
-                        if !self.driver.accumulators.append(conn_index, pending_data) {
-                            accumulator_overflowed = true;
-                        }
-                        self.driver.pending_replenish.push(pending.bid);
-                    }
-                    if !accumulator_overflowed && !self.driver.accumulators.append(conn_index, data)
-                    {
-                        accumulator_overflowed = true;
-                    }
+            if is_direct_echo {
+                // Encode bid + len into the payload the same way forward_recv_buf does.
+                let payload = (bid as u32) | (bytes_received << 16);
+                let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
+                let entry = io_uring::opcode::Send::new(
+                    io_uring::types::Fixed(conn_index),
+                    buf_ptr,
+                    bytes_received,
+                )
+                .build()
+                .user_data(ud.raw());
+                let built = crate::handler::BuiltSend {
+                    entry,
+                    pool_slot: u16::MAX,
+                    slab_idx: u16::MAX,
+                    total_len: bytes_received,
+                };
+                self.driver.send_recv_buf_original_lens[conn_index as usize] = bytes_received;
+                if self.driver.submit_or_queue_send(conn_index, built).is_err() {
+                    // SQ full — replenish and give up on this echo.
                     self.driver.pending_replenish.push(bid);
-                    if accumulator_overflowed {
-                        // Handler kept returning NeedMore while the peer
-                        // streamed past `recv_accumulator_max`. Close the
-                        // connection rather than OOM the worker.
+                }
+                // Do NOT call wake_recv here. DirectEchoFuture only needs to
+                // be woken on connection close (handled by the result <= 0 path
+                // above), not on every incoming buffer.
+            } else {
+                // Plaintext path: route through recv sink if active, else zero-copy/accumulator.
+                if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
+                    self.driver.pending_replenish.push(bid);
+                    let remaining_cap = sink.cap - sink.pos;
+                    let to_sink = data.len().min(remaining_cap);
+                    if to_sink > 0 {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                data.as_ptr(),
+                                sink.ptr.add(sink.pos),
+                                to_sink,
+                            );
+                        }
+                        sink.pos += to_sink;
+                    }
+                    // Overflow (trailing CRLF, next commands) goes to accumulator.
+                    if to_sink < data.len()
+                        && !self
+                            .driver
+                            .accumulators
+                            .append(conn_index, &data[to_sink..])
+                    {
                         self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
                         return;
                     }
+                } else {
+                    // Zero-copy fast path: if no pending buffer AND accumulator is
+                    // empty, hold the kernel buffer in-place instead of copying.
+                    let acc_empty = self.driver.accumulators.data(conn_index).is_empty();
+                    let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
+
+                    if acc_empty && slot.is_none() {
+                        *slot = Some(crate::backend::PendingRecvBuf {
+                            bid,
+                            len: bytes_received,
+                            ptr: buf_ptr,
+                        });
+                    } else {
+                        // Flush any existing pending buffer to accumulator first.
+                        let mut accumulator_overflowed = false;
+                        if let Some(pending) = slot.take() {
+                            let pending_data = unsafe {
+                                std::slice::from_raw_parts(pending.ptr, pending.len as usize)
+                            };
+                            if !self.driver.accumulators.append(conn_index, pending_data) {
+                                accumulator_overflowed = true;
+                            }
+                            self.driver.pending_replenish.push(pending.bid);
+                        }
+                        if !accumulator_overflowed
+                            && !self.driver.accumulators.append(conn_index, data)
+                        {
+                            accumulator_overflowed = true;
+                        }
+                        self.driver.pending_replenish.push(bid);
+                        if accumulator_overflowed {
+                            // Handler kept returning NeedMore while the peer
+                            // streamed past `recv_accumulator_max`. Close the
+                            // connection rather than OOM the worker.
+                            self.executor.wake_recv(conn_index);
+                            self.driver.close_connection(conn_index);
+                            return;
+                        }
+                    }
                 }
+                self.executor.wake_recv(conn_index);
             }
-            self.executor.wake_recv(conn_index);
         }
 
         if !has_more
