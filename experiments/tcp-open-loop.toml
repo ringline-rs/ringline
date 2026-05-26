@@ -171,10 +171,10 @@ cat results.json
 """
 
 [[jobs.steps]]
-type = "barrier"
-name = "benchmark-complete"
-
-[[jobs.steps]]
 name = "upload-results"
 type = "upload_artifact"
 path = "results.json"
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"
