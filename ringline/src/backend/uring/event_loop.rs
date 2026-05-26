@@ -433,6 +433,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // accumulated since the last submit_and_wait.
             let _ = self.driver.ring.flush();
 
+            // Non-blocking drain: catch CQEs (primarily send completions)
+            // that DEFER_TASKRUN posted during the flush() syscall above.
+            // Without this drain, the next submit_and_wait(1) would return
+            // immediately just to handle those "dead" send CQEs — burning
+            // a full event-loop iteration before we can block waiting for
+            // the meaningful recv CQE.  For send_nowait callers there is no
+            // send waiter, so wake_send is a no-op and the only work is
+            // freeing the send-copy-pool slot.  Draining it here collapses
+            // the two-iteration pattern (send-CQE dead iter + recv-CQE live
+            // iter) down to one live iter per round-trip.
+            self.drain_completions();
+
+            // If any recv CQEs also arrived during flush() (e.g., a burst
+            // of responses came in while we were running tasks), drain_completions
+            // will have pushed their tasks directly onto ready_queue.  Run
+            // them now so their sends reach the SQ before we block on
+            // submit_and_wait.
+            if !self.executor.ready_queue.is_empty() {
+                self.poll_ready_tasks();
+                let _ = self.driver.ring.flush();
+            }
+
             // on_tick callback (synchronous). Set the executor's
             // driver_state thread-local so user code that calls
             // `ringline::spawn()` / wakers / `with_state` works from
