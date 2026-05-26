@@ -569,16 +569,27 @@ impl Ring {
     /// `flush()` returns, so the `drain_completions()` call that follows in
     /// the event loop can consume them immediately.
     pub fn flush(&self) -> io::Result<()> {
-        // Step 1: submit pending SQEs (no GETEVENTS; pure submit path).
-        self.ring.submit()?;
-        // Step 2: trigger DEFER_TASKRUN task_work delivery.
-        // IORING_ENTER_GETEVENTS = 1, min_complete = 0 → flush task_work but
-        // do NOT block waiting for any specific number of completions.
-        // Safety: `arg = None` is always valid for plain GETEVENTS enter.
+        // Combine submit + DEFER_TASKRUN flush into a single kernel entry.
+        //
+        // The old two-call path was:
+        //   submit()                           → enter(sq_len, 0, 0=no-GETEVENTS, None)
+        //   enter::<()>(0, 0, GETEVENTS, None) → enter(0,      0, GETEVENTS,       None)
+        //
+        // Merged into one:
+        //   enter(sq_len, 0, GETEVENTS, None)
+        //
+        // This submits any pending SQEs AND triggers DEFER_TASKRUN task_work
+        // delivery in a single syscall, saving one round-trip to the kernel
+        // per flush() invocation (≈ once or twice per event-loop iteration).
+        //
+        // Safety: `submission_shared()` gives a shared view of the SQ head/tail
+        // atomics.  We only read `.len()` (sq_tail − sq_head) and never push
+        // new entries here, so there is no aliasing or mutation hazard.
+        let n = unsafe { self.ring.submission_shared().len() } as u32;
         unsafe {
             self.ring
                 .submitter()
-                .enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None)?;
+                .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)?;
         }
         Ok(())
     }

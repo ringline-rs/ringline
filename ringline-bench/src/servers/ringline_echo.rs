@@ -59,11 +59,11 @@ impl RinglineServer {
         let mut config = Config::default();
         config.worker.threads = workers;
         config.worker.pin_to_core = false;
-        config.sq_entries = 256;
-        config.recv_buffer.ring_size = 256;
+        config.sq_entries = 4096;
+        config.recv_buffer.ring_size = 4096;
         config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
         config.max_connections = 4096;
-        config.send_copy_count = 512;
+        config.send_copy_count = 4096;
         config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
 
         let (shutdown, handles) = RinglineBuilder::new(config)
