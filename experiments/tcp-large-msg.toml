@@ -19,11 +19,11 @@ server_runtime = ["ringline", "tokio"]
 clients        = ["50"]
 msg_size       = ["4096", "16384", "32768", "65536"]
 
-# ── Server job (z1.n.small) ────────────────────────────────────────────────
+# ── Server job (z2.n.small) ────────────────────────────────────────────────
 
 [[jobs]]
 name = "server"
-tags = ["z1.n.small"]
+tags = ["z2.n.small"]
 
 [[jobs.steps]]
 name = "build"
