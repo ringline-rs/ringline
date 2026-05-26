@@ -31,7 +31,7 @@ if [ -d /tmp/ringline ]; then
     cd /tmp/ringline
     git fetch --all
     git checkout {ringline_version}
-    git pull --ff-only 2>/dev/null || true
+    git reset --hard origin/{ringline_version}
 else
     git clone {ringline_repo} /tmp/ringline
     cd /tmp/ringline
@@ -115,7 +115,7 @@ if [ -d /tmp/ringline ]; then
     cd /tmp/ringline
     git fetch --all
     git checkout {ringline_version}
-    git pull --ff-only 2>/dev/null || true
+    git reset --hard origin/{ringline_version}
 else
     git clone {ringline_repo} /tmp/ringline
     cd /tmp/ringline
@@ -135,6 +135,9 @@ name = "server-ready"
 name = "verify-connectivity"
 type = "shell"
 command = """
+# $SERVER_ADDR is injected by systemslab as the data-plane IP of the server job.
+# This step verifies the bench port is reachable on the data-plane NIC before
+# starting the benchmark. If this fails, check systemslab host networking config.
 echo "SERVER_ADDR=$SERVER_ADDR"
 for i in $(seq 1 30); do
     nc -z "$SERVER_ADDR" {port} 2>/dev/null && echo "Server reachable at $SERVER_ADDR:{port}" && exit 0
