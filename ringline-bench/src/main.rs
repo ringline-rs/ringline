@@ -78,6 +78,7 @@ fn run_server_bench(
         ringline_client,
         workers,
         None, // in-process matrix is closed-loop
+        1,    // conn_chunk_size: round-robin for in-process matrix
     );
 
     eprintln!(

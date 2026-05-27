@@ -82,6 +82,17 @@ pub struct Config {
     /// close the incoming fd if every worker is full) rather than
     /// accumulating fds without backpressure. Default: 1024.
     pub accept_queue_capacity: usize,
+    /// Number of connections assigned to each worker before moving to the
+    /// next one. `1` (the default) gives classic round-robin. Higher values
+    /// pack connections onto fewer workers at low connection counts, keeping
+    /// each active worker's CQE density high enough for io_uring batching to
+    /// pay off. Has no effect once total connections exceed
+    /// `conn_chunk_size * num_workers` — at that point every worker is
+    /// active and each gets the same number of connections as round-robin.
+    ///
+    /// Rule of thumb: set to the minimum connections-per-worker at which
+    /// your workload sees good batching (typically 16–64). Default: 1.
+    pub conn_chunk_size: usize,
     /// Number of copy-send pool slots. Each in-flight `send()` or copy part of a
     /// `send_parts()` call holds one slot until the kernel completes the send.
     /// Size this to cover your peak in-flight send count — exhaustion returns an
@@ -244,6 +255,7 @@ impl Default for Config {
             recv_accumulator_capacity: 4096,
             recv_accumulator_max: usize::MAX,
             accept_queue_capacity: 1024,
+            conn_chunk_size: 1,
             send_copy_count: 1024,
             send_copy_slot_size: 16384,
             send_slab_slots: 512,

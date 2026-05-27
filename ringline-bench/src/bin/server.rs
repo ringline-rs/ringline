@@ -145,6 +145,7 @@ fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward:
     config.max_connections = 16384;
     config.send_copy_count = 512;
     config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
+    config.conn_chunk_size = 32;
 
     let builder = RinglineBuilder::new(config).bind(addr);
     let (_shutdown, handles) = if recv_forward {

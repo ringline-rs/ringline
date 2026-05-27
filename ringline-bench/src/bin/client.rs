@@ -140,6 +140,7 @@ fn main() {
         args.runtime == Runtime::Ringline,
         args.threads,
         open,
+        32, // conn_chunk_size: pack 32 connections per worker before spreading
     );
 
     let report = ClientReport {

@@ -243,9 +243,11 @@ mod ringline_client {
         /// Total client connections (used to split the aggregate open-loop rate).
         pub num_clients: usize,
         /// Number of ringline worker threads. Used by each worker's `on_start`
-        /// to compute its round-robin slice of connections:
-        ///   worker_id, worker_id + num_workers, worker_id + 2*num_workers, ...
+        /// to compute its chunk-based slice of connections.
         pub num_workers: usize,
+        /// Connections assigned to each worker before moving to the next.
+        /// Mirrors `Config::conn_chunk_size` on the server side.
+        pub conn_chunk_size: usize,
         pub stop: Arc<AtomicBool>,
         /// Set true once warmup ends; open-loop latency/ops are only recorded
         /// while this is true.
@@ -273,35 +275,42 @@ mod ringline_client {
             let state = self.state.clone();
             let worker_id = self.worker_id;
             Some(Box::pin(async move {
-                // Round-robin assignment: this worker owns connection indices
-                //   worker_id, worker_id+num_workers, worker_id+2*num_workers, ...
+                // Chunk-based assignment: this worker owns connections in slices
+                // of `conn_chunk_size` starting at `worker_id * chunk_size`,
+                // then wrapping every `num_workers * chunk_size` indices.
                 //
-                // Previously this used a shared AtomicUsize drain loop with no
-                // awaits, which meant the first worker to call on_start() claimed
-                // every connection before any other worker started — all N
-                // connections ended up on one thread.  The round-robin approach
-                // gives each worker its pre-determined slice without any shared
-                // mutable state or contention.
+                // With chunk_size=1 this is identical to the previous round-robin
+                // (worker_id, worker_id+N, worker_id+2N, ...). With chunk_size=32
+                // and 8 workers: worker 0 owns 0–31, worker 1 owns 32–63, etc.,
+                // keeping each active worker's connection density high enough for
+                // io_uring CQE batching to pay off at low total connection counts.
                 let num_workers = state.num_workers;
                 let num_clients = state.num_clients;
-                let mut i = worker_id;
-                while i < num_clients {
-                    let s = state.clone();
-                    match s.open {
-                        Some(ol) => {
-                            spawn(async move {
-                                run_ringline_open_client(s, ol).await;
-                            })
-                            .ok();
+                let chunk = state.conn_chunk_size.max(1);
+                let mut chunk_start = worker_id * chunk;
+                while chunk_start < num_clients {
+                    for k in 0..chunk {
+                        let idx = chunk_start + k;
+                        if idx >= num_clients {
+                            break;
                         }
-                        None => {
-                            spawn(async move {
-                                run_ringline_client(s).await;
-                            })
-                            .ok();
+                        let s = state.clone();
+                        match s.open {
+                            Some(ol) => {
+                                spawn(async move {
+                                    run_ringline_open_client(s, ol).await;
+                                })
+                                .ok();
+                            }
+                            None => {
+                                spawn(async move {
+                                    run_ringline_client(s).await;
+                                })
+                                .ok();
+                            }
                         }
                     }
-                    i += num_workers;
+                    chunk_start += num_workers * chunk;
                 }
             }))
         }
@@ -562,7 +571,8 @@ fn wait_for_server(addr: &str) {
 /// Run a benchmark against a server already listening on `addr`.
 ///
 /// `open` selects open-loop (rate-controlled) mode; `None` is the closed-loop
-/// request/response loop.
+/// request/response loop. `conn_chunk_size` controls how many connections are
+/// assigned to each ringline worker before moving to the next (1 = round-robin).
 #[allow(clippy::too_many_arguments)]
 pub fn run_bench(
     addr: &str,
@@ -573,6 +583,7 @@ pub fn run_bench(
     ringline_client: bool,
     workers: usize,
     open: Option<OpenLoop>,
+    conn_chunk_size: usize,
 ) -> BenchResult {
     let stop = Arc::new(AtomicBool::new(false));
     let ops = Arc::new(AtomicU64::new(0));
@@ -590,6 +601,7 @@ pub fn run_bench(
             ops,
             workers,
             open,
+            conn_chunk_size,
         )
     } else {
         run_bench_tokio(
@@ -705,6 +717,7 @@ fn run_bench_ringline(
     ops: Arc<AtomicU64>,
     workers: usize,
     open: Option<OpenLoop>,
+    conn_chunk_size: usize,
 ) -> BenchResult {
     let histograms = Arc::new(Mutex::new(Vec::new()));
     let measure = Arc::new(AtomicBool::new(false));
@@ -714,6 +727,7 @@ fn run_bench_ringline(
         msg_size,
         num_clients,
         num_workers: workers.max(1),
+        conn_chunk_size,
         stop: stop.clone(),
         measure: measure.clone(),
         ops: ops.clone(),

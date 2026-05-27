@@ -643,6 +643,7 @@ impl RinglineBuilder {
                 },
                 #[cfg(feature = "timestamps")]
                 timestamps: self.config.timestamps,
+                conn_chunk_size: self.config.conn_chunk_size,
             };
 
             let acceptor_closed = closed.clone();
