@@ -41,6 +41,12 @@ struct Args {
     /// scatter-gathered into one `sendmsg` with no accumulator copy.
     #[arg(long, default_value_t = false)]
     recv_forward: bool,
+
+    /// (ringline only) Connections assigned to each worker before moving to the next.
+    /// 1 = classic round-robin. Higher values pack connections onto fewer workers
+    /// at low connection counts, keeping per-worker CQE density high for batching.
+    #[arg(long, default_value_t = 1)]
+    conn_chunk_size: usize,
 }
 
 fn main() {
@@ -65,13 +71,13 @@ fn main() {
     );
 
     match args.runtime {
-        Runtime::Ringline => run_ringline(args.addr, workers, args.msg_size, args.recv_forward),
+        Runtime::Ringline => run_ringline(args.addr, workers, args.msg_size, args.recv_forward, args.conn_chunk_size),
         Runtime::Tokio => run_tokio(args.addr, workers, args.msg_size),
     }
 }
 
 #[allow(clippy::manual_async_fn)]
-fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward: bool) {
+fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward: bool, conn_chunk_size: usize) {
     use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
     // ParseResult is only needed in the non-io_uring fallback path.
     #[cfg(not(has_io_uring))]
@@ -145,7 +151,7 @@ fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward:
     config.max_connections = 16384;
     config.send_copy_count = 512;
     config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
-    config.conn_chunk_size = 32;
+    config.conn_chunk_size = conn_chunk_size;
 
     let builder = RinglineBuilder::new(config).bind(addr);
     let (_shutdown, handles) = if recv_forward {

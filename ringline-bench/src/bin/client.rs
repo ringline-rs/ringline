@@ -71,6 +71,14 @@ struct Args {
     /// send-copy-pool slot) can't exhaust the pool under overload.
     #[arg(long, default_value_t = 64)]
     max_inflight: usize,
+
+    /// Connections assigned to each ringline worker before moving to the next.
+    /// 1 = classic round-robin. Higher values pack connections onto fewer workers
+    /// at low connection counts, keeping per-worker CQE density high enough for
+    /// io_uring batching to pay off. Has no effect once connections exceed
+    /// chunk_size * threads. (ringline client only)
+    #[arg(long, default_value_t = 1)]
+    conn_chunk_size: usize,
 }
 
 #[derive(Serialize)]
@@ -140,7 +148,7 @@ fn main() {
         args.runtime == Runtime::Ringline,
         args.threads,
         open,
-        32, // conn_chunk_size: pack 32 connections per worker before spreading
+        args.conn_chunk_size,
     );
 
     let report = ClientReport {
