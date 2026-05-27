@@ -66,7 +66,7 @@ fn main() {
 
     match args.runtime {
         Runtime::Ringline => run_ringline(args.addr, workers, args.msg_size, args.recv_forward),
-        Runtime::Tokio => run_tokio(args.addr, workers),
+        Runtime::Tokio => run_tokio(args.addr, workers, args.msg_size),
     }
 }
 
@@ -161,7 +161,7 @@ fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward:
     }
 }
 
-fn run_tokio(addr: SocketAddr, workers: usize) {
+fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
@@ -177,15 +177,23 @@ fn run_tokio(addr: SocketAddr, workers: usize) {
         eprintln!("bench-server: ready");
 
         loop {
-            let (stream, _) = match listener.accept().await {
+            let (mut stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(_) => continue,
             };
             stream.set_nodelay(true).ok();
 
             tokio::spawn(async move {
-                let (mut rd, mut wr) = stream.into_split();
-                tokio::io::copy(&mut rd, &mut wr).await.ok();
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; msg_size];
+                loop {
+                    if stream.read_exact(&mut buf).await.is_err() {
+                        break;
+                    }
+                    if stream.write_all(&buf).await.is_err() {
+                        break;
+                    }
+                }
             });
         }
     });
