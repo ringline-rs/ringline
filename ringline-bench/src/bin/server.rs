@@ -53,9 +53,7 @@ fn main() {
     let args = Args::parse();
 
     let workers = if args.workers == 0 {
-        std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
+        ringline::physical_core_count()
     } else {
         args.workers
     };

@@ -525,7 +525,7 @@ impl RinglineBuilder {
             + 'static,
     {
         let num_threads = if self.config.worker.threads == 0 {
-            num_cpus()
+            crate::topology::physical_core_count()
         } else {
             self.config.worker.threads
         };
@@ -981,10 +981,4 @@ fn create_unix_listener(path: &Path, backlog: i32) -> Result<RawFd, crate::error
     }
 
     Ok(fd)
-}
-
-/// Get the number of available CPU cores.
-fn num_cpus() -> usize {
-    let ret = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if ret < 1 { 1 } else { ret as usize }
 }

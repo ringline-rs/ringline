@@ -101,9 +101,7 @@ fn main() {
     }
 
     let workers = if args.workers == 0 {
-        std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
+        ringline_bench::physical_core_count()
     } else {
         args.workers
     };

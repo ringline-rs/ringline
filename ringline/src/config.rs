@@ -428,7 +428,18 @@ impl Default for RecvBufferConfig {
 /// Configuration for the thread-per-core worker model.
 #[derive(Clone)]
 pub struct WorkerConfig {
-    /// Number of worker threads. 0 = number of CPUs.
+    /// Number of worker threads.
+    ///
+    /// `0` (the default) auto-detects and uses the number of **physical CPU
+    /// cores** — not logical CPUs. On SMT/hyperthreaded hardware this is half
+    /// the value returned by `nproc` or `available_parallelism()`. Ringline's
+    /// io_uring event loops are CPU-bound; two hyperthreads on the same
+    /// physical core share execution units and caches, so spawning one worker
+    /// per logical CPU induces contention without additional throughput.
+    ///
+    /// Set explicitly to override (e.g. `threads = 1` for a single-threaded
+    /// server, or a larger value when you have many connections and the
+    /// per-worker CPU budget is low).
     pub threads: usize,
     /// Whether to pin each worker to a CPU core.
     pub pin_to_core: bool,
