@@ -123,7 +123,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let mut diag_tasks_1st: u64 = 0; // tasks polled in first poll_ready_tasks
         let mut diag_tasks_fp: u64 = 0; // tasks polled in fast-path poll_ready_tasks
 
+        // ── Latency stall counters ─────────────────────────────────────────────
+        // "wait"  = time blocked inside submit_and_wait (kernel side).
+        // "work"  = rest of the iteration (drain, tasks, flush, on_tick).
+        // Buckets count iterations where that phase exceeded the threshold.
+        // max values record the single worst observation.
+        let mut diag_wait_ge_1ms: u64 = 0;
+        let mut diag_wait_ge_5ms: u64 = 0;
+        let mut diag_wait_ge_10ms: u64 = 0;
+        let mut diag_wait_ns_max: u64 = 0;
+        let mut diag_work_ge_1ms: u64 = 0;
+        let mut diag_work_ge_5ms: u64 = 0;
+        let mut diag_work_ge_10ms: u64 = 0;
+        let mut diag_work_ns_max: u64 = 0;
+
         loop {
+            let iter_start = std::time::Instant::now();
+
             // Retry eventfd re-arm if a previous attempt failed (SQ was full).
             if !self.driver.eventfd_armed && !self.driver.shutdown_flag.load(Ordering::Relaxed) {
                 self.driver.eventfd_armed = self
@@ -146,7 +162,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.tick_timeout_armed = true;
             }
 
+            let wait_start = std::time::Instant::now();
             self.driver.ring.submit_and_wait(1)?;
+            let wait_ns = wait_start.elapsed().as_nanos() as u64;
+            if wait_ns >= 1_000_000 { diag_wait_ge_1ms += 1; }
+            if wait_ns >= 5_000_000 { diag_wait_ge_5ms += 1; }
+            if wait_ns >= 10_000_000 { diag_wait_ge_10ms += 1; }
+            if wait_ns > diag_wait_ns_max { diag_wait_ns_max = wait_ns; }
 
             self.drain_completions();
             diag_cqes_1st += self.driver.cqe_batch.len() as u64;
@@ -167,6 +189,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     diag_cqes_2nd as f64 / diag_iters.max(1) as f64,
                     diag_tasks_1st as f64 / diag_iters.max(1) as f64,
                     diag_tasks_fp as f64 / diag_iters.max(1) as f64,
+                );
+                eprintln!(
+                    "[ringline stall] \
+                     wait_ge_1ms={diag_wait_ge_1ms} wait_ge_5ms={diag_wait_ge_5ms} \
+                     wait_ge_10ms={diag_wait_ge_10ms} wait_max={:.1}ms | \
+                     work_ge_1ms={diag_work_ge_1ms} work_ge_5ms={diag_work_ge_5ms} \
+                     work_ge_10ms={diag_work_ge_10ms} work_max={:.1}ms",
+                    diag_wait_ns_max as f64 / 1_000_000.0,
+                    diag_work_ns_max as f64 / 1_000_000.0,
                 );
                 self.driver.run_shutdown();
                 return Ok(());
@@ -441,7 +472,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
 
             self.driver.tick_count += 1;
-            diag_iters += 1;
 
             // Check close_notify deadlines — force-close connections where
             // close_notify was sent but the close CQE never arrived.
@@ -508,6 +538,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 handler.on_tick(&mut ctx);
             }
             clear_driver_state();
+
+            // Record work-phase (everything except the blocking wait) duration.
+            let work_ns = iter_start.elapsed().as_nanos() as u64 - wait_ns;
+            if work_ns >= 1_000_000 { diag_work_ge_1ms += 1; }
+            if work_ns >= 5_000_000 { diag_work_ge_5ms += 1; }
+            if work_ns >= 10_000_000 { diag_work_ge_10ms += 1; }
+            if work_ns > diag_work_ns_max { diag_work_ns_max = work_ns; }
+
+            diag_iters += 1;
         }
     }
 
