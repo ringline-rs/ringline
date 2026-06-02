@@ -167,7 +167,11 @@ async fn run_tokio_open_client(
     let mut sent: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         let elapsed = start.elapsed().as_secs_f64();
-        let due = (elapsed / interval) as u64;
+        // +1 so the first request is due immediately at T=0 (sent=0 → target=start),
+        // matching the ringline client which also fires the first request at T=0.
+        // Without this, due=0 at T=0 so the first send is delayed one full interval,
+        // inflating all latency measurements by exactly 1/per_conn_rate seconds.
+        let due = (elapsed / interval) as u64 + 1;
         let inflight = sent.saturating_sub(received.load(Ordering::Relaxed));
         let room = max_inflight.saturating_sub(inflight as usize) as u64;
         let want = due
