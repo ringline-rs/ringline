@@ -150,16 +150,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
 
             // Arm a tick timeout before blocking.
+            // Only mark as armed if the SQE was actually submitted — if the SQ
+            // is full the submission silently fails, and leaving armed=false
+            // ensures we retry on the next iteration rather than calling
+            // submit_and_wait without any timeout in the ring.
             if !self.driver.tick_timeout_armed
                 && let Some(ref ts) = self.driver.tick_timeout_ts
             {
                 let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
-                // Best effort: submit_and_wait will unblock on any CQE regardless.
-                let _ = self
+                if self
                     .driver
                     .ring
-                    .submit_tick_timeout(ts as *const _, ud.raw());
-                self.driver.tick_timeout_armed = true;
+                    .submit_tick_timeout(ts as *const _, ud.raw())
+                    .is_ok()
+                {
+                    self.driver.tick_timeout_armed = true;
+                }
             }
 
             let wait_start = std::time::Instant::now();
