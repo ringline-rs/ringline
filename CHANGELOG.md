@@ -7,14 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed
+### Breaking
 
 - Worker thread count now defaults to **physical core count** (read from sysfs
   topology on Linux) rather than logical CPU count. On hyperthreaded systems
   this halves the default worker count, eliminating HT contention and
-  significantly improving per-core throughput. The old behaviour can be restored
-  with `Config::workers(n)`. `ringline::physical_core_count()` is exported as a
-  public helper. (#202)
+  significantly improving per-core throughput. Deployments that relied on the
+  logical-CPU default should set `Config::workers(n)` explicitly to restore the
+  previous count. `ringline::physical_core_count()` is exported as a public
+  helper for callers that want to replicate the new default. (#202)
 
 ### Fixed
 
