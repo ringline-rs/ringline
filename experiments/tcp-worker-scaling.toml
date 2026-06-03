@@ -1,0 +1,231 @@
+name = "ringline-tcp worker-scaling {server_workers}w {clients}conn {msg_size}B"
+
+# Worker-scaling + CPU-efficiency sweep for the distributed TCP echo bench.
+#
+# Holds the workload fixed (ringline server + ringline client) and sweeps the
+# server worker-thread count 1 → 2 → 4 → 8 on a 4-physical-core z1.n.small.
+# Captures both ends of the efficiency story:
+#   - throughput scaling: ops/s as workers grow (1/2/4 scale, 8 oversubscribes)
+#   - CPU efficiency: a background /proc/<pid>/stat sampler on the server VM
+#     records utime+stime across the run so ops/s-per-server-core can be derived
+#     (warmup trimmed in post-processing).
+#
+# Both jobs run on z1.n.small to match the documented distributed rig. The
+# server process is core-pinned (bench-server sets pin_to_core = true), so all
+# worker threads accrue under the single bench-server pid the sampler reads.
+#
+# Matrix: 4 worker counts × 2 conn counts × 2 msg sizes = 16 variants.
+
+[params]
+ringline_repo    = "https://github.com/brayniac/ringline"
+ringline_version = "main"
+port             = "7878"
+client_threads   = "4"
+warmup_duration  = "10"
+test_duration    = "30"
+
+[matrix]
+server_workers = ["1", "2", "4", "8"]
+clients        = ["64", "512"]
+msg_size       = ["256", "4096"]
+
+# ── Server job (z1.n.small) ────────────────────────────────────────────────
+
+[[jobs]]
+name = "server"
+tags = ["z1.n.small"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline
+    git fetch --all
+    git checkout {ringline_version}
+    git reset --hard origin/{ringline_version}
+else
+    git clone {ringline_repo} /tmp/ringline
+    cd /tmp/ringline
+    git checkout {ringline_version}
+fi
+cd /tmp/ringline
+cargo build --release --bin bench-server
+sudo cp target/release/bench-server /usr/local/bin/bench-server
+echo "bench-server build OK: $(bench-server --help 2>&1 | head -1)"
+"""
+
+[[jobs.steps]]
+name = "tune-system"
+type = "shell"
+command = """
+sudo sysctl -w net.core.somaxconn=65535
+sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo fuser -k {port}/tcp 2>/dev/null || true
+sleep 1
+echo "System tuning complete"
+"""
+
+[[jobs.steps]]
+name = "start-server"
+type = "shell"
+background = true
+command = """
+ulimit -n 500000
+exec bench-server \
+    --runtime ringline \
+    --addr 0.0.0.0:{port} \
+    --workers {server_workers} \
+    --msg-size {msg_size}
+"""
+
+[[jobs.steps]]
+name = "wait-for-server"
+type = "shell"
+command = """
+for i in $(seq 1 30); do
+    nc -z localhost {port} 2>/dev/null && echo "Server ready on port {port}" && exit 0
+    echo "Waiting for server... ($i/30)"
+    sleep 1
+done
+echo "ERROR: bench-server failed to start on port {port}"
+exit 1
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+
+# Background CPU sampler: read server-process utime+stime (clock ticks) once a
+# second for the whole warmup+test window. Post-processing drops the warmup
+# samples and divides the steady-window CPU delta by the window length to get
+# server cores-busy, then ops/s ÷ cores-busy for ops/s-per-core.
+[[jobs.steps]]
+name = "cpu-sampler"
+type = "shell"
+background = true
+command = """
+PID=$(pgrep -x bench-server | head -1)
+CLK=$(getconf CLK_TCK)
+echo "kind epoch_ms clk_tck utime stime" > cpu-samples.log
+echo "start $(date +%s%3N) $CLK 0 0" >> cpu-samples.log
+for i in $(seq 1 $(( {warmup_duration} + {test_duration} + 5 ))); do
+    read -r _ _ _ _ _ _ _ _ _ _ _ _ _ U S _ < /proc/$PID/stat 2>/dev/null || break
+    echo "tick $(date +%s%3N) $CLK $U $S" >> cpu-samples.log
+    sleep 1
+done
+echo "cpu sampler done"
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"
+
+# Let the background sampler finish its final ticks before uploading.
+[[jobs.steps]]
+name = "drain-sampler"
+type = "shell"
+command = "sleep 8; echo '=== cpu-samples.log ==='; cat cpu-samples.log"
+
+[[jobs.steps]]
+name = "upload-cpu-samples"
+type = "upload_artifact"
+path = "cpu-samples.log"
+
+[[jobs.steps]]
+name = "server-stats"
+type = "shell"
+command = """
+echo "=== TCP socket stats ==="
+ss -s
+echo "=== Established connections ==="
+ss -tn state established | head -20
+"""
+
+# ── Client job (z1.n.small) ────────────────────────────────────────────────
+
+[[jobs]]
+name = "client"
+tags = ["z1.n.small"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline
+    git fetch --all
+    git checkout {ringline_version}
+    git reset --hard origin/{ringline_version}
+else
+    git clone {ringline_repo} /tmp/ringline
+    cd /tmp/ringline
+    git checkout {ringline_version}
+fi
+cd /tmp/ringline
+cargo build --release --bin bench-client
+sudo cp target/release/bench-client /usr/local/bin/bench-client
+echo "bench-client build OK: $(bench-client --help 2>&1 | head -1)"
+"""
+
+[[jobs.steps]]
+name = "tune-system"
+type = "shell"
+command = """
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+sudo sysctl -w net.ipv4.tcp_fin_timeout=15
+sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+echo "Client system tuning complete"
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+
+[[jobs.steps]]
+name = "verify-connectivity"
+type = "shell"
+command = """
+echo "SERVER_ADDR=$SERVER_ADDR"
+for i in $(seq 1 30); do
+    nc -z "$SERVER_ADDR" {port} 2>/dev/null && echo "Server reachable at $SERVER_ADDR:{port}" && exit 0
+    echo "Waiting for server to be reachable... ($i/30)"
+    sleep 1
+done
+echo "ERROR: Failed to connect to server at $SERVER_ADDR:{port}"
+exit 1
+"""
+
+[[jobs.steps]]
+name = "run-benchmark"
+type = "shell"
+command = """
+ulimit -n 500000
+bench-client \
+    --runtime ringline \
+    --addr "$SERVER_ADDR:{port}" \
+    --clients {clients} \
+    --msg-size {msg_size} \
+    --warmup {warmup_duration} \
+    --duration {test_duration} \
+    --threads {client_threads} \
+    > results.json
+cat results.json
+"""
+
+[[jobs.steps]]
+name = "upload-results"
+type = "upload_artifact"
+path = "results.json"
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"
