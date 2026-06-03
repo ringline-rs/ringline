@@ -69,13 +69,25 @@ fn main() {
     );
 
     match args.runtime {
-        Runtime::Ringline => run_ringline(args.addr, workers, args.msg_size, args.recv_forward, args.conn_chunk_size),
+        Runtime::Ringline => run_ringline(
+            args.addr,
+            workers,
+            args.msg_size,
+            args.recv_forward,
+            args.conn_chunk_size,
+        ),
         Runtime::Tokio => run_tokio(args.addr, workers, args.msg_size),
     }
 }
 
 #[allow(clippy::manual_async_fn)]
-fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward: bool, conn_chunk_size: usize) {
+fn run_ringline(
+    addr: SocketAddr,
+    workers: usize,
+    msg_size: usize,
+    recv_forward: bool,
+    conn_chunk_size: usize,
+) {
     use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
     // ParseResult is only needed in the non-io_uring fallback path.
     #[cfg(not(has_io_uring))]

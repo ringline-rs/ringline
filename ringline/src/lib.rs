@@ -154,9 +154,9 @@ pub(crate) mod region_registry;
 pub(crate) mod resolver;
 pub(crate) mod runtime;
 pub(crate) mod spawner;
-pub mod topology;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod tls;
+pub mod topology;
 pub(crate) mod wakeup;
 pub(crate) mod worker;
 
