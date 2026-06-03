@@ -86,6 +86,71 @@ per-connection overhead dominates, and at 128–512 connections where per-worker
 CQE density is highest. The 65536 B column is bandwidth-limited — the choice
 of server runtime stops mattering.
 
+### Worker scaling & CPU efficiency
+
+The tables above hold the ringline server at its 4-worker default. This section
+sweeps the server's worker count (`--workers 1/2/4/8`) on the same 4-physical-core
+`z1.n.small`, holding the workload fixed (ringline server + ringline client,
+closed-loop). It answers two questions raw ops/s can't: **how does throughput
+scale with cores**, and **how efficiently is each core spent** (ops/s per
+server-core-second).
+
+CPU is measured on the server VM only — the server runs alone on its host, so its
+`/proc/<pid>/stat` `utime+stime` over the steady test window (warmup excluded) is a
+clean per-process figure. `cores busy` is server CPU-seconds ÷ wall-seconds; `ops/s
+per core` is throughput ÷ `cores busy`. Each worker is pinned to a core. Rerun
+with `experiments/tcp-worker-scaling.toml`.
+
+**256 B, 512 connections** — the high-density small-message cell:
+
+| workers | ops/s | scaling | p50 | p99 | cores busy | ops/s per core |
+|--------:|------:|--------:|----:|----:|-----------:|---------------:|
+| 1 | 37,871 | 1.00× | 7.45 ms | 264 ms | 0.98 | 38,500 |
+| 2 | 106,778 | 2.82× | 4.95 ms | 8.04 ms | 1.93 | 55,300 |
+| 4 | **227,176** | **6.00×** | 2.17 ms | 4.74 ms | 3.35 | **67,900** |
+| 8 | 241,127 | 6.37× | 2.01 ms | 4.61 ms | 4.73 | 51,000 |
+
+**4096 B, 512 connections** — medium message, same connection density:
+
+| workers | ops/s | scaling | p50 | p99 | cores busy | ops/s per core |
+|--------:|------:|--------:|----:|----:|-----------:|---------------:|
+| 1 | 31,030 | 1.00× | 9.17 ms | 105 ms | 0.88 | 35,100 |
+| 2 | 66,568 | 2.15× | 7.72 ms | 13.6 ms | 1.57 | 42,300 |
+| 4 | **104,009** | **3.35×** | 4.64 ms | 10.5 ms | 2.23 | **46,600** |
+| 8 | 100,268 | 3.23× | 4.77 ms | 12.2 ms | 3.49 | 28,700 |
+
+Throughput at lower connection density (64 connections; CPU not isolated here
+because the server is far from saturated):
+
+| msg | 1w | 2w | 4w | 8w |
+|----:|---:|---:|---:|---:|
+| 256 B  | 37,367 | 83,421 | 136,102 | 137,446 |
+| 4096 B | 28,271 | 54,297 | 78,703  | 78,465  |
+
+**What the numbers say:**
+
+- **Near-linear to the physical core count, then flat.** Throughput rises steeply
+  through 4 workers (the box has 4 physical cores) and barely moves — or regresses
+  — at 8. The 8th-worker "gain" is hyperthread siblings contending for the same
+  physical execution units; at 4096 B 8 workers is actually *slower* than 4.
+- **Density makes scaling super-linear.** At 256 B / 512 conn, 4 workers deliver
+  **6.0×** a single worker — more than the 4× a pure compute model predicts. The
+  reason is the same mechanism the throughput tables credit: a single worker driving
+  512 connections spends a large fraction of its core on per-connection bookkeeping
+  and thin CQE batches, while 4 workers each handle ~128 connections at much higher
+  per-poll CQE density. The per-core efficiency column shows it directly —
+  **38,500 → 67,900 ops/s per core** from 1→4 workers. At 64 connections (16
+  conn/worker at 4 workers) there isn't enough density to fill the pipeline, so
+  scaling caps near 3.6×.
+- **Efficiency peaks at the physical core count.** ops/s per core climbs 1→4
+  workers, then collapses past 4 (51,000 at 8w for 256 B; 28,700 at 8w for 4096 B)
+  as hyperthread oversubscription burns cores for no throughput. For this workload
+  the physical-core-count default is also the efficiency sweet spot.
+- **Workers crush tail latency.** A single worker fronting 512 connections head-of-
+  lines badly — p99 of 264 ms (256 B) / 105 ms (4096 B). Adding workers spreads the
+  connections and drops p99 by ~50× (to 4.6 ms / 12 ms at 4–8 workers). Worker count
+  is a tail-latency lever, not just a throughput one.
+
 ### Open-loop latency vs. offered rate (256 B)
 
 Latency measured from scheduled send time; points where actual throughput
@@ -642,7 +707,7 @@ Before this fix, every event-loop iteration ran a TLS-only `check_close_notify_d
 
 ## Caveats
 
-- **Single ringline worker.** Numbers are for `worker.threads = 1`. Multi-worker scaling is not exercised here.
+- **Single ringline worker.** These single-machine numbers are for `worker.threads = 1`. Multi-worker scaling is exercised separately in the distributed section's *Worker scaling & CPU efficiency*.
 - **Localhost only.** All servers and clients run on the same box. Real network latency would shift the relative shapes.
 - **TCP/UDP "ringline → ringline" actually uses a tokio server today.** `protocols/tcp.rs` and `protocols/udp.rs` both call into a tokio-based echo server for both columns; see the `// Use tokio server for now — ringline server requires TLS setup` comment in `tcp.rs`. So the "vs tokio" rows really compare the **client** side; both have the same server CPU cost included. A native ringline echo server would likely widen ringline's lead on those rows.
 - **Bench's ringline client at 32 KiB is the bottleneck for the −10 %..−30 % rows.** It uses `with_data` with a single buffered echo per round trip, and at 32 KiB the recv-buffer churn dominates. Improving that path is its own piece of work and unrelated to runtime perf.
