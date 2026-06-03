@@ -112,7 +112,34 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
         }
 
+        // ── Diagnostic counters (printed to stderr at shutdown) ────────────────
+        // These measure the event-loop iteration mix to help diagnose client
+        // throughput deficits.  All counters are u64 locals — zero overhead
+        // in release builds when the eprintln! at shutdown is compiled away.
+        let mut diag_iters: u64 = 0;
+        let mut diag_dead_iters: u64 = 0; // iters where no tasks were polled in first poll_ready_tasks
+        let mut diag_cqes_1st: u64 = 0; // CQEs from first drain_completions (after submit_and_wait)
+        let mut diag_cqes_2nd: u64 = 0; // CQEs from second drain_completions (after flush)
+        let mut diag_tasks_1st: u64 = 0; // tasks polled in first poll_ready_tasks
+        let mut diag_tasks_fp: u64 = 0; // tasks polled in fast-path poll_ready_tasks
+
+        // ── Latency stall counters ─────────────────────────────────────────────
+        // "wait"  = time blocked inside submit_and_wait (kernel side).
+        // "work"  = rest of the iteration (drain, tasks, flush, on_tick).
+        // Buckets count iterations where that phase exceeded the threshold.
+        // max values record the single worst observation.
+        let mut diag_wait_ge_1ms: u64 = 0;
+        let mut diag_wait_ge_5ms: u64 = 0;
+        let mut diag_wait_ge_10ms: u64 = 0;
+        let mut diag_wait_ns_max: u64 = 0;
+        let mut diag_work_ge_1ms: u64 = 0;
+        let mut diag_work_ge_5ms: u64 = 0;
+        let mut diag_work_ge_10ms: u64 = 0;
+        let mut diag_work_ns_max: u64 = 0;
+
         loop {
+            let iter_start = std::time::Instant::now();
+
             // Retry eventfd re-arm if a previous attempt failed (SQ was full).
             if !self.driver.eventfd_armed && !self.driver.shutdown_flag.load(Ordering::Relaxed) {
                 self.driver.eventfd_armed = self
@@ -123,24 +150,69 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
 
             // Arm a tick timeout before blocking.
+            // Only mark as armed if the SQE was actually submitted — if the SQ
+            // is full the submission silently fails, and leaving armed=false
+            // ensures we retry on the next iteration rather than calling
+            // submit_and_wait without any timeout in the ring.
             if !self.driver.tick_timeout_armed
                 && let Some(ref ts) = self.driver.tick_timeout_ts
             {
                 let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
-                // Best effort: submit_and_wait will unblock on any CQE regardless.
-                let _ = self
+                if self
                     .driver
                     .ring
-                    .submit_tick_timeout(ts as *const _, ud.raw());
-                self.driver.tick_timeout_armed = true;
+                    .submit_tick_timeout(ts as *const _, ud.raw())
+                    .is_ok()
+                {
+                    self.driver.tick_timeout_armed = true;
+                }
             }
 
+            let wait_start = std::time::Instant::now();
             self.driver.ring.submit_and_wait(1)?;
+            let wait_ns = wait_start.elapsed().as_nanos() as u64;
+            if wait_ns >= 1_000_000 {
+                diag_wait_ge_1ms += 1;
+            }
+            if wait_ns >= 5_000_000 {
+                diag_wait_ge_5ms += 1;
+            }
+            if wait_ns >= 10_000_000 {
+                diag_wait_ge_10ms += 1;
+            }
+            if wait_ns > diag_wait_ns_max {
+                diag_wait_ns_max = wait_ns;
+            }
 
             self.drain_completions();
+            diag_cqes_1st += self.driver.cqe_batch.len() as u64;
 
             // Check for shutdown after processing completions.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
+                // Print per-worker diagnostics before exiting.
+                let dead_pct = if diag_iters > 0 {
+                    100.0 * diag_dead_iters as f64 / diag_iters as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[ringline diag] iters={diag_iters} dead={diag_dead_iters} ({dead_pct:.1}%) \
+                     cqes_1st_avg={:.2} cqes_2nd_avg={:.2} \
+                     tasks_1st_avg={:.2} tasks_fp_avg={:.2}",
+                    diag_cqes_1st as f64 / diag_iters.max(1) as f64,
+                    diag_cqes_2nd as f64 / diag_iters.max(1) as f64,
+                    diag_tasks_1st as f64 / diag_iters.max(1) as f64,
+                    diag_tasks_fp as f64 / diag_iters.max(1) as f64,
+                );
+                eprintln!(
+                    "[ringline stall] \
+                     wait_ge_1ms={diag_wait_ge_1ms} wait_ge_5ms={diag_wait_ge_5ms} \
+                     wait_ge_10ms={diag_wait_ge_10ms} wait_max={:.1}ms | \
+                     work_ge_1ms={diag_work_ge_1ms} work_ge_5ms={diag_work_ge_5ms} \
+                     work_ge_10ms={diag_work_ge_10ms} work_max={:.1}ms",
+                    diag_wait_ns_max as f64 / 1_000_000.0,
+                    diag_work_ns_max as f64 / 1_000_000.0,
+                );
                 self.driver.run_shutdown();
                 return Ok(());
             }
@@ -423,7 +495,42 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.collect_wakeups();
 
             // Poll all ready tasks.
+            let tasks_before = self.executor.ready_queue.len();
             self.poll_ready_tasks();
+            diag_tasks_1st += tasks_before as u64;
+            if tasks_before == 0 {
+                diag_dead_iters += 1;
+            }
+
+            // Flush any SQEs enqueued by poll_ready_tasks (e.g., client sends).
+            // flush() does two things:
+            //   1. submit() — delivers the SQEs to the kernel.
+            //   2. enter(GETEVENTS, min=0) — triggers DEFER_TASKRUN task_work
+            //      so deferred CQEs (send completions, recv arrivals) are
+            //      posted to the CQ ring *before* flush() returns.
+            // This means the drain_completions() below sees those CQEs
+            // inline, eliminating the "dead" submit_and_wait(1) iteration
+            // that would otherwise burn a full event-loop cycle just to
+            // process send CQEs that wake no tasks (no send waiter for
+            // send_nowait callers).
+            let _ = self.driver.ring.flush();
+
+            // Non-blocking drain: consume the CQEs (primarily send completions)
+            // that flush()'s GETEVENTS step posted to the CQ ring.
+            // For send_nowait the pool slot is freed here; wake_send is a
+            // no-op (no waiter).  Draining inline collapses the two-iteration
+            // pattern (dead send-CQE iter + live recv-CQE iter) down to one.
+            self.drain_completions();
+            diag_cqes_2nd += self.driver.cqe_batch.len() as u64;
+
+            // If the drain woke any tasks (recv CQEs that arrived while we
+            // were running tasks and were flushed by the GETEVENTS enter),
+            // run them now so their sends land in the SQ before we block.
+            if !self.executor.ready_queue.is_empty() {
+                diag_tasks_fp += self.executor.ready_queue.len() as u64;
+                self.poll_ready_tasks();
+                let _ = self.driver.ring.flush();
+            }
 
             // on_tick callback (synchronous). Set the executor's
             // driver_state thread-local so user code that calls
@@ -445,6 +552,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 handler.on_tick(&mut ctx);
             }
             clear_driver_state();
+
+            // Record work-phase (everything except the blocking wait) duration.
+            let work_ns = iter_start.elapsed().as_nanos() as u64 - wait_ns;
+            if work_ns >= 1_000_000 {
+                diag_work_ge_1ms += 1;
+            }
+            if work_ns >= 5_000_000 {
+                diag_work_ge_5ms += 1;
+            }
+            if work_ns >= 10_000_000 {
+                diag_work_ge_10ms += 1;
+            }
+            if work_ns > diag_work_ns_max {
+                diag_work_ns_max = work_ns;
+            }
+
+            diag_iters += 1;
         }
     }
 
@@ -846,72 +970,111 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             });
             self.executor.wake_recv(conn_index);
         } else {
-            // Plaintext path: route through recv sink if active, else zero-copy/accumulator.
-            if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
-                self.driver.pending_replenish.push(bid);
-                let remaining_cap = sink.cap - sink.pos;
-                let to_sink = data.len().min(remaining_cap);
-                if to_sink > 0 {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data.as_ptr(),
-                            sink.ptr.add(sink.pos),
-                            to_sink,
-                        );
-                    }
-                    sink.pos += to_sink;
-                }
-                // Overflow (trailing CRLF, next commands) goes to accumulator.
-                if to_sink < data.len()
-                    && !self
-                        .driver
-                        .accumulators
-                        .append(conn_index, &data[to_sink..])
-                {
-                    self.executor.wake_recv(conn_index);
-                    self.driver.close_connection(conn_index);
-                    return;
-                }
-            } else {
-                // Zero-copy fast path: if no pending buffer AND accumulator is
-                // empty, hold the kernel buffer in-place instead of copying.
-                let acc_empty = self.driver.accumulators.data(conn_index).is_empty();
-                let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
+            // Direct echo fast path: submit the echo SQE directly from the CQE
+            // handler, bypassing task wakeup entirely. This eliminates the
+            // collect_wakeups → poll_ready_tasks roundtrip (~1 full event-loop
+            // iteration of latency) on the hot single-connection echo path.
+            let is_direct_echo = self
+                .driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.direct_echo);
 
-                if acc_empty && slot.is_none() {
-                    *slot = Some(crate::backend::PendingRecvBuf {
-                        bid,
-                        len: bytes_received,
-                        ptr: buf_ptr,
-                    });
-                } else {
-                    // Flush any existing pending buffer to accumulator first.
-                    let mut accumulator_overflowed = false;
-                    if let Some(pending) = slot.take() {
-                        let pending_data = unsafe {
-                            std::slice::from_raw_parts(pending.ptr, pending.len as usize)
-                        };
-                        if !self.driver.accumulators.append(conn_index, pending_data) {
-                            accumulator_overflowed = true;
-                        }
-                        self.driver.pending_replenish.push(pending.bid);
-                    }
-                    if !accumulator_overflowed && !self.driver.accumulators.append(conn_index, data)
-                    {
-                        accumulator_overflowed = true;
-                    }
+            if is_direct_echo {
+                // Payload carries only the bid; remaining is in send_recv_buf_remaining.
+                let payload = bid as u32;
+                let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
+                let entry = io_uring::opcode::Send::new(
+                    io_uring::types::Fixed(conn_index),
+                    buf_ptr,
+                    bytes_received,
+                )
+                .build()
+                .user_data(ud.raw());
+                let built = crate::handler::BuiltSend {
+                    entry,
+                    pool_slot: u16::MAX,
+                    slab_idx: u16::MAX,
+                    total_len: bytes_received,
+                };
+                self.driver.send_recv_buf_original_lens[conn_index as usize] = bytes_received;
+                self.driver.send_recv_buf_remaining[conn_index as usize] = bytes_received;
+                if self.driver.submit_or_queue_send(conn_index, built).is_err() {
+                    // SQ full — replenish and give up on this echo.
                     self.driver.pending_replenish.push(bid);
-                    if accumulator_overflowed {
-                        // Handler kept returning NeedMore while the peer
-                        // streamed past `recv_accumulator_max`. Close the
-                        // connection rather than OOM the worker.
+                }
+                // Do NOT call wake_recv here. DirectEchoFuture only needs to
+                // be woken on connection close (handled by the result <= 0 path
+                // above), not on every incoming buffer.
+            } else {
+                // Plaintext path: route through recv sink if active, else zero-copy/accumulator.
+                if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
+                    self.driver.pending_replenish.push(bid);
+                    let remaining_cap = sink.cap - sink.pos;
+                    let to_sink = data.len().min(remaining_cap);
+                    if to_sink > 0 {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                data.as_ptr(),
+                                sink.ptr.add(sink.pos),
+                                to_sink,
+                            );
+                        }
+                        sink.pos += to_sink;
+                    }
+                    // Overflow (trailing CRLF, next commands) goes to accumulator.
+                    if to_sink < data.len()
+                        && !self
+                            .driver
+                            .accumulators
+                            .append(conn_index, &data[to_sink..])
+                    {
                         self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
                         return;
                     }
+                } else {
+                    // Zero-copy fast path: if no pending buffer AND accumulator is
+                    // empty, hold the kernel buffer in-place instead of copying.
+                    let acc_empty = self.driver.accumulators.data(conn_index).is_empty();
+                    let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
+
+                    if acc_empty && slot.is_none() {
+                        *slot = Some(crate::backend::PendingRecvBuf {
+                            bid,
+                            len: bytes_received,
+                            ptr: buf_ptr,
+                        });
+                    } else {
+                        // Flush any existing pending buffer to accumulator first.
+                        let mut accumulator_overflowed = false;
+                        if let Some(pending) = slot.take() {
+                            let pending_data = unsafe {
+                                std::slice::from_raw_parts(pending.ptr, pending.len as usize)
+                            };
+                            if !self.driver.accumulators.append(conn_index, pending_data) {
+                                accumulator_overflowed = true;
+                            }
+                            self.driver.pending_replenish.push(pending.bid);
+                        }
+                        if !accumulator_overflowed
+                            && !self.driver.accumulators.append(conn_index, data)
+                        {
+                            accumulator_overflowed = true;
+                        }
+                        self.driver.pending_replenish.push(bid);
+                        if accumulator_overflowed {
+                            // Handler kept returning NeedMore while the peer
+                            // streamed past `recv_accumulator_max`. Close the
+                            // connection rather than OOM the worker.
+                            self.executor.wake_recv(conn_index);
+                            self.driver.close_connection(conn_index);
+                            return;
+                        }
+                    }
                 }
+                self.executor.wake_recv(conn_index);
             }
-            self.executor.wake_recv(conn_index);
         }
 
         if !has_more
@@ -1614,8 +1777,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn handle_send_recv_buf(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
         let payload = ud.payload();
-        let bid = (payload & 0xFFFF) as u16;
-        let remaining_before = payload >> 16;
+        // Payload carries only the bid. The remaining byte count is in the driver
+        // field (send_recv_buf_remaining) so that buffer sizes > u16::MAX work.
+        let bid = payload as u16;
+        let remaining_before = self.driver.send_recv_buf_remaining[conn_index as usize];
 
         if result > 0 {
             let bytes_sent = result as u32;
@@ -1623,11 +1788,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if bytes_sent < remaining_before {
                 // Partial send — resubmit the remainder.
                 let new_remaining = remaining_before - bytes_sent;
+                self.driver.send_recv_buf_remaining[conn_index as usize] = new_remaining;
                 let (buf_ptr, _buf_size) = self.driver.provided_bufs.get_buffer(bid);
                 let original_len = self.driver.send_recv_buf_original_lens[conn_index as usize];
                 let offset = original_len - new_remaining;
                 let new_ptr = unsafe { buf_ptr.add(offset as usize) };
-                let new_payload = (bid as u32) | ((new_remaining) << 16);
+                let new_payload = bid as u32;
                 let new_ud = UserData::encode(
                     crate::completion::OpTag::SendRecvBuf,
                     conn_index,
@@ -4347,7 +4513,8 @@ mod tests {
         let bid: u16 = 3;
         let data_len: u32 = 100;
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // Full send: all 100 bytes sent.
@@ -4379,7 +4546,8 @@ mod tests {
         let bid: u16 = 5;
         let data_len: u32 = 200;
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // Simulate ECONNRESET.
@@ -4423,7 +4591,8 @@ mod tests {
 
         // Set up original length tracking (mirrors forward_recv_buf).
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // Partial send: only 60 of 100 bytes sent.
@@ -4435,16 +4604,13 @@ mod tests {
             "buffer replenished prematurely on partial send"
         );
 
-        // The retry SQE should have been pushed to the ring. We can verify by
-        // checking the ring's pending SQEs. Since we can't directly inspect SQEs,
-        // we verify the fix indirectly: the resubmitted SQE's pointer should be
-        // buf_ptr + 60 (not buf_ptr + buf_size - 40 which was the bug).
-        //
-        // Drain the retry by injecting the completion for the resubmitted send.
-        // The new payload should encode remaining=40.
-        let new_remaining: u32 = 40;
-        let new_payload = (bid as u32) | (new_remaining << 16);
-        let new_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, new_payload);
+        // The retry SQE should have been pushed to the ring. The handler updated
+        // send_recv_buf_remaining to 40; the retry CQE just needs bid in the payload.
+        assert_eq!(
+            el.driver.send_recv_buf_remaining[conn_index as usize], 40,
+            "remaining not updated after partial send"
+        );
+        let new_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
 
         // Complete the retry — all 40 remaining bytes sent.
         el.test_dispatch_cqe(new_ud.raw(), 40, 0);
@@ -4473,24 +4639,23 @@ mod tests {
         }
 
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // First partial: 30 of 100 bytes sent. Remaining = 70. Offset should be 30.
         el.test_dispatch_cqe(ud.raw(), 30, 0);
         assert!(!el.driver.pending_replenish.contains(&bid));
+        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 70);
 
         // Second partial: 20 of 70 bytes sent. Remaining = 50. Offset should be 50.
-        let remaining_70 = 70u32;
-        let payload2 = (bid as u32) | (remaining_70 << 16);
-        let ud2 = UserData::encode(OpTag::SendRecvBuf, conn_index, payload2);
+        let ud2 = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
         el.test_dispatch_cqe(ud2.raw(), 20, 0);
         assert!(!el.driver.pending_replenish.contains(&bid));
+        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 50);
 
         // Final: 50 of 50 bytes sent. Should complete.
-        let remaining_50 = 50u32;
-        let payload3 = (bid as u32) | (remaining_50 << 16);
-        let ud3 = UserData::encode(OpTag::SendRecvBuf, conn_index, payload3);
+        let ud3 = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
         el.test_dispatch_cqe(ud3.raw(), 50, 0);
         assert!(
             el.driver.pending_replenish.contains(&bid),
@@ -4517,7 +4682,8 @@ mod tests {
         // With buf_size=4096 and data_len=50, the wrong offset points way past the data.
 
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // Partial send: 25 of 50 bytes.
@@ -4532,8 +4698,8 @@ mod tests {
         //
         // The real verification is that the resubmitted send completes successfully.
         // Simulate that by completing the retry.
-        let retry_payload = (bid as u32) | (25u32 << 16);
-        let retry_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, retry_payload);
+        assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 25);
+        let retry_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
         el.test_dispatch_cqe(retry_ud.raw(), 25, 0);
 
         assert!(
@@ -4555,7 +4721,8 @@ mod tests {
         let bid: u16 = 7;
         let data_len: u32 = 50;
         el.driver.send_recv_buf_original_lens[conn_index as usize] = data_len;
-        let payload = (bid as u32) | (data_len << 16);
+        el.driver.send_recv_buf_remaining[conn_index as usize] = data_len;
+        let payload = bid as u32;
         let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, payload);
 
         // Result == 0 (zero-length send).

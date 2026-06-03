@@ -148,9 +148,15 @@ cargo run --example echo_tls_server
 
 ## Benchmarks
 
-See [BENCHMARKS.md](BENCHMARKS.md) for the current TCP / UDP / Redis
-numbers (ringline vs tokio on a single ringline worker), how to
-reproduce them, and a history of perf-relevant changes.
+See [BENCHMARKS.md](BENCHMARKS.md) for benchmark results including:
+
+- **Distributed TCP server comparison** — ringline server vs tokio server
+  across 8–2048 connections and 256 B–64 KiB messages, measured from a
+  separate client VM over 10 GbE. Closed-loop throughput and open-loop
+  latency-vs-offered-rate curves.
+- **TCP / UDP / Redis / Memcache / HTTP / QUIC client benchmarks** —
+  ringline client vs tokio client against the same server, with
+  per-change history.
 
 ## License
 

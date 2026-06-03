@@ -82,6 +82,17 @@ pub struct Config {
     /// close the incoming fd if every worker is full) rather than
     /// accumulating fds without backpressure. Default: 1024.
     pub accept_queue_capacity: usize,
+    /// Number of connections assigned to each worker before moving to the
+    /// next one. `1` (the default) gives classic round-robin. Higher values
+    /// pack connections onto fewer workers at low connection counts, keeping
+    /// each active worker's CQE density high enough for io_uring batching to
+    /// pay off. Has no effect once total connections exceed
+    /// `conn_chunk_size * num_workers` — at that point every worker is
+    /// active and each gets the same number of connections as round-robin.
+    ///
+    /// Rule of thumb: set to the minimum connections-per-worker at which
+    /// your workload sees good batching (typically 16–64). Default: 1.
+    pub conn_chunk_size: usize,
     /// Number of copy-send pool slots. Each in-flight `send()` or copy part of a
     /// `send_parts()` call holds one slot until the kernel completes the send.
     /// Size this to cover your peak in-flight send count — exhaustion returns an
@@ -244,6 +255,7 @@ impl Default for Config {
             recv_accumulator_capacity: 4096,
             recv_accumulator_max: usize::MAX,
             accept_queue_capacity: 1024,
+            conn_chunk_size: 1,
             send_copy_count: 1024,
             send_copy_slot_size: 16384,
             send_slab_slots: 512,
@@ -282,15 +294,9 @@ impl Config {
                 "recv_buffer.ring_size must be a power of two".into(),
             ));
         }
-        // Load-bearing upper bound: the `SendRecvBuf` user_data encoding in
-        // `runtime/io.rs` packs `pending.len` (== buffer fill) into the high
-        // 16 bits of the 32-bit payload. Lifting this past `u16::MAX` would
-        // silently truncate the encoded length on release builds.
-        const MAX_RECV_BUFFER_SIZE: u32 = u16::MAX as u32;
-        if self.recv_buffer.buffer_size == 0 || self.recv_buffer.buffer_size > MAX_RECV_BUFFER_SIZE
-        {
+        if self.recv_buffer.buffer_size == 0 {
             return Err(crate::error::Error::RingSetup(
-                "recv_buffer.buffer_size must be > 0 and <= 65535".into(),
+                "recv_buffer.buffer_size must be > 0".into(),
             ));
         }
         if self.max_connections == 0 || self.max_connections >= (1 << 24) {
@@ -422,7 +428,18 @@ impl Default for RecvBufferConfig {
 /// Configuration for the thread-per-core worker model.
 #[derive(Clone)]
 pub struct WorkerConfig {
-    /// Number of worker threads. 0 = number of CPUs.
+    /// Number of worker threads.
+    ///
+    /// `0` (the default) auto-detects and uses the number of **physical CPU
+    /// cores** — not logical CPUs. On SMT/hyperthreaded hardware this is half
+    /// the value returned by `nproc` or `available_parallelism()`. Ringline's
+    /// io_uring event loops are CPU-bound; two hyperthreads on the same
+    /// physical core share execution units and caches, so spawning one worker
+    /// per logical CPU induces contention without additional throughput.
+    ///
+    /// Set explicitly to override (e.g. `threads = 1` for a single-threaded
+    /// server, or a larger value when you have many connections and the
+    /// per-worker CPU budget is low).
     pub threads: usize,
     /// Whether to pin each worker to a CPU core.
     pub pin_to_core: bool,
@@ -767,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_buffer_size_max_accepted() {
+    fn validate_buffer_size_accepted_65535() {
         assert!(
             config_with(|c| c.recv_buffer.buffer_size = 65535)
                 .validate()
@@ -776,23 +793,23 @@ mod tests {
     }
 
     #[test]
-    fn validate_buffer_size_overflow_rejected() {
-        let err = config_with(|c| c.recv_buffer.buffer_size = 65536)
-            .validate()
-            .unwrap_err();
-        let msg = format!("{err}");
+    fn validate_buffer_size_accepted_65536() {
+        // 65536 is the first value that previously caused a crash; it must now be
+        // accepted (the remaining-bytes counter is stored in the driver, not in the
+        // 16-bit CQE payload).
         assert!(
-            msg.contains("buffer_size"),
-            "error should mention buffer_size: {msg}"
+            config_with(|c| c.recv_buffer.buffer_size = 65536)
+                .validate()
+                .is_ok()
         );
     }
 
     #[test]
-    fn validate_buffer_size_large_rejected() {
+    fn validate_buffer_size_accepted_large() {
         assert!(
             config_with(|c| c.recv_buffer.buffer_size = 131072)
                 .validate()
-                .is_err()
+                .is_ok()
         );
     }
 

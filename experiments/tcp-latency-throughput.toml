@@ -1,0 +1,233 @@
+name = "ringline-tcp-latency {server_runtime}s {clients}conn {msg_size}B @{offered_rate}rps"
+
+# Characterize the throughput-latency curve for ringline vs tokio servers.
+#
+# Both clients (ringline and tokio) probe each server at every combination of
+# connection count and offered rate. This decouples two axes:
+#
+#   1. Load axis (offered_rate): what does latency look like at X% of saturation?
+#   2. Connection axis (clients): does server-side connection overhead add latency
+#      at the same offered rate when you have 64 vs 512 vs 4096 connections?
+#
+# The connection pool is large enough that it never becomes the concurrency
+# bottleneck: at 4096 connections × 40K rps each connection fires at ~10 ops/s,
+# so max-inflight=64 is never reached. Open-loop is genuine.
+#
+# Analysis: discard points where actual_ops_per_sec < 0.95 × offered_rate —
+# that indicates saturation (open-loop collapsed to closed-loop). Keep the rest
+# and plot p50/p99 vs offered_rate for each server × client × conn × msg_size.
+#
+# Matrix: 2 server × 3 conn × 2 msg × 8 rates = 96 variants
+# Each variant runs two client types sequentially: ~4 hours total.
+
+[params]
+ringline_repo    = "https://github.com/brayniac/ringline"
+ringline_version = "main"
+port             = "7878"
+warmup_duration  = "10"
+test_duration    = "60"
+inter_run_sleep  = "20"
+
+[matrix]
+server_runtime = ["ringline", "tokio"]
+clients        = ["64", "512", "4096"]
+msg_size       = ["256", "4096"]
+offered_rate   = ["1000", "5000", "10000", "15000", "20000", "25000", "30000", "40000"]
+
+# ── Server job (z1.n.small) ────────────────────────────────────────────────
+
+[[jobs]]
+name = "server"
+tags = ["z1.n.small"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline
+    git fetch --all
+    git checkout {ringline_version}
+    git reset --hard origin/{ringline_version}
+else
+    git clone {ringline_repo} /tmp/ringline
+    cd /tmp/ringline
+    git checkout {ringline_version}
+fi
+cd /tmp/ringline
+cargo build --release --bin bench-server
+sudo cp target/release/bench-server /usr/local/bin/bench-server
+echo "bench-server build OK"
+"""
+
+[[jobs.steps]]
+name = "tune-system"
+type = "shell"
+command = """
+sudo sysctl -w net.core.somaxconn=65535
+sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+sudo sysctl -w net.ipv4.tcp_fin_timeout=15
+sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+sudo fuser -k {port}/tcp 2>/dev/null || true
+sleep 1
+echo "System tuning complete"
+"""
+
+[[jobs.steps]]
+name = "start-server"
+type = "shell"
+background = true
+command = """
+ulimit -n 500000
+exec bench-server \
+    --runtime {server_runtime} \
+    --addr 0.0.0.0:{port} \
+    --msg-size {msg_size}
+"""
+
+[[jobs.steps]]
+name = "wait-for-server"
+type = "shell"
+command = """
+for i in $(seq 1 30); do
+    nc -z localhost {port} 2>/dev/null && echo "Server ready on port {port}" && exit 0
+    echo "Waiting for server... ($i/30)"
+    sleep 1
+done
+echo "ERROR: bench-server failed to start"
+exit 1
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"
+
+[[jobs.steps]]
+name = "server-stats"
+type = "shell"
+command = """
+echo "=== TCP socket stats ==="
+ss -s
+echo "=== Established connection count ==="
+ss -tn state established | wc -l
+"""
+
+# ── Client job (z1.n.small) ────────────────────────────────────────────────
+
+[[jobs]]
+name = "client"
+tags = ["z1.n.small"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline
+    git fetch --all
+    git checkout {ringline_version}
+    git reset --hard origin/{ringline_version}
+else
+    git clone {ringline_repo} /tmp/ringline
+    cd /tmp/ringline
+    git checkout {ringline_version}
+fi
+cd /tmp/ringline
+cargo build --release --bin bench-client
+sudo cp target/release/bench-client /usr/local/bin/bench-client
+echo "bench-client build OK"
+"""
+
+[[jobs.steps]]
+name = "tune-system"
+type = "shell"
+command = """
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+sudo sysctl -w net.ipv4.tcp_fin_timeout=15
+sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+echo "Client system tuning complete"
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+
+[[jobs.steps]]
+name = "verify-connectivity"
+type = "shell"
+command = """
+for i in $(seq 1 30); do
+    nc -z "$SERVER_ADDR" {port} 2>/dev/null && echo "Server reachable at $SERVER_ADDR:{port}" && exit 0
+    sleep 1
+done
+echo "ERROR: Failed to connect to $SERVER_ADDR:{port}"
+exit 1
+"""
+
+[[jobs.steps]]
+name = "run-ringline-client"
+type = "shell"
+command = """
+ulimit -n 500000
+bench-client \
+    --runtime ringline \
+    --addr "$SERVER_ADDR:{port}" \
+    --clients {clients} \
+    --msg-size {msg_size} \
+    --open \
+    --rate {offered_rate} \
+    --warmup {warmup_duration} \
+    --duration {test_duration} \
+    > results-ringline.json
+cat results-ringline.json
+"""
+
+[[jobs.steps]]
+name = "inter-run-cooldown"
+type = "shell"
+command = "sleep {inter_run_sleep}"
+
+[[jobs.steps]]
+name = "run-tokio-client"
+type = "shell"
+command = """
+ulimit -n 500000
+bench-client \
+    --runtime tokio \
+    --addr "$SERVER_ADDR:{port}" \
+    --clients {clients} \
+    --msg-size {msg_size} \
+    --open \
+    --rate {offered_rate} \
+    --warmup {warmup_duration} \
+    --duration {test_duration} \
+    > results-tokio.json
+cat results-tokio.json
+"""
+
+[[jobs.steps]]
+name = "upload-ringline-results"
+type = "upload_artifact"
+path = "results-ringline.json"
+
+[[jobs.steps]]
+name = "upload-tokio-results"
+type = "upload_artifact"
+path = "results-tokio.json"
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"

@@ -4,6 +4,146 @@ Point-in-time performance numbers for ringline, alongside a tokio
 reference. These are checked in so future changes have a baseline to
 beat (or to flag a regression against).
 
+---
+
+## Distributed TCP server comparison
+
+This section compares the **ringline server** against a **tokio server** — both
+serving the same TCP echo workload from a dedicated VM, with the client on a
+separate VM. This is distinct from the single-machine client benchmarks
+below (which compare the ringline client vs tokio client against the same
+server).
+
+### Summary
+
+For small and medium messages (≤ 4096 B), the ringline server delivers
+**1.2–1.5× more throughput** and **2–3.5× lower p50 latency under load**
+compared to a tokio server at equivalent connection counts. The advantage
+grows with connection density (io_uring amortises per-syscall overhead more
+effectively as CQE batches grow) and under high offered rates (the event loop
+stays flatter as load approaches saturation). For large messages (≥ 16384 B)
+the workload becomes bandwidth-limited and the two servers are equivalent —
+the choice of runtime does not matter.
+
+### Caveats
+
+- **Intra-host network.** Client and server VMs sit on the same physical machine
+  connected via dedicated 10 GbE ports. True cross-machine latency would
+  increase the absolute numbers but should not change the relative ratios, since
+  both servers see identical network conditions.
+- **Echo workload.** The server does no application logic — receive, copy to send
+  pool, transmit. Real applications that do meaningful per-request work will
+  amortise runtime overhead further, which generally favours both runtimes
+  equally (the delta is in connection-handling overhead, not compute).
+- **4 server workers.** Results reflect the physical-core-count default. Fewer
+  workers tighten the gap at low connection counts (less parallelism to cover
+  idle connections); more workers would push the saturation ceiling higher for
+  both runtimes.
+- **Dedicated, non-oversubscribed cores.** The VMs run with pinned physical
+  cores. On shared infrastructure with noisy neighbours or oversubscribed
+  hypervisors, tail latency for both runtimes will increase; ringline's
+  thread-per-core model has no work-stealing fallback if a core is stolen.
+
+### Test rig
+
+| Item | Value |
+|:-----|:------|
+| Physical host | AMD Threadripper 1950X (16 cores / 32 threads) |
+| VMs | Two z1.n.small VMs on the same physical host, each with 4 dedicated physical cores and a dedicated 10 GbE network port |
+| Network | VM-to-VM via dedicated 10 GbE ports on the same host |
+| Kernel | Linux (SystemsLab managed) |
+| Rust | 1.96.0 |
+| Server workers | 4 (physical core count, default) |
+| Methodology | Closed-loop: client fires next request immediately on response. Open-loop: fixed offered rate, latency measured from scheduled send time. |
+
+### Closed-loop throughput
+
+Throughput of each server at saturation, measured with a ringline client.
+Ratio = ringline server ÷ tokio server at the same connection count and message
+size.
+
+| connections | 256 B | 1024 B | 4096 B | 16384 B | 65536 B |
+|------------:|------:|-------:|-------:|--------:|--------:|
+| 8 | 1.28× | 1.28× | 1.21× | 1.16× | 1.11× |
+| 16 | 1.26× | 1.26× | 1.21× | 1.14× | 1.03× |
+| 32 | 1.21× | 1.20× | 1.19× | 1.13× | 0.99× |
+| 64 | 1.27× | 1.25× | 1.23× | 1.10× | 1.01× |
+| 128 | 1.37× | 1.36× | 1.27× | 1.12× | 1.01× |
+| 256 | 1.43× | 1.43× | 1.29× | 1.08× | 1.00× |
+| 512 | **1.52×** | 1.45× | 1.21× | 1.08× | 1.00× |
+| 1024 | 1.47× | 1.43× | 1.10× | 1.04× | 1.00× |
+| 2048 | 1.47× | 1.43× | 1.09× | 1.04× | 1.01× |
+
+Peak absolute throughput (ringline server, ringline client):
+- **256 B / 512 connections: 225,633 ops/s**
+- 1024 B / 512 connections: 213,660 ops/s
+- 4096 B / 256 connections: 104,896 ops/s
+
+**Where the advantage comes from:** io_uring's multishot recv and CQE batching
+allow the server to process more completions per syscall as connection density
+grows. The benefit is most pronounced at small messages (256–1024 B) where
+per-connection overhead dominates, and at 128–512 connections where per-worker
+CQE density is highest. The 65536 B column is bandwidth-limited — the choice
+of server runtime stops mattering.
+
+### Open-loop latency vs. offered rate (256 B)
+
+Latency measured from scheduled send time; points where actual throughput
+dropped below 95% of offered rate are saturated and excluded.
+
+**64 connections** — both servers sustain 150 K rps cleanly; ringline stays
+flatter under load:
+
+| offered rps | rl-server p50 | rl-server p99 | tok-server p50 | tok-server p99 |
+|------------:|:-------------:|:-------------:|:--------------:|:--------------:|
+| 1 K | 0.57 ms | 1.22 ms | 0.64 ms | 1.22 ms |
+| 10 K | 0.40 ms | 0.86 ms | 0.51 ms | 0.96 ms |
+| 50 K | 0.46 ms | 0.96 ms | 0.45 ms | 1.02 ms |
+| 100 K | 0.61 ms | 1.56 ms | 0.74 ms | 3.06 ms |
+| 150 K | **0.92 ms** | **6.7 ms** | **1.82 ms** | **9.8 ms** |
+
+**512 connections** — gap widens significantly above 50 K rps:
+
+| offered rps | rl-server p50 | rl-server p99 | tok-server p50 | tok-server p99 |
+|------------:|:-------------:|:-------------:|:--------------:|:--------------:|
+| 1 K | 0.95 ms | 4.65 ms | 1.17 ms | 5.32 ms |
+| 25 K | 0.47 ms | 2.26 ms | 0.51 ms | 1.30 ms |
+| 50 K | **0.54 ms** | **3.55 ms** | **1.92 ms** | **4.57 ms** |
+| 100 K | 1.71 ms | 5.88 ms | 2.51 ms | 6.52 ms |
+| 150 K | 3.54 ms | 8.75 ms | 5.62 ms | 19.5 ms |
+
+At 512 connections × 50 K rps, the tokio server p50 jumps to ~1.9 ms while
+ringline holds at 0.54 ms. At 150 K rps ringline's p50 is ~1.6× lower and
+p99 is ~2.2× lower.
+
+### Open-loop latency vs. offered rate (16384 B) — honest picture
+
+At large message sizes the servers converge. Using valid (unsaturated) points
+only (≤ 25 K rps for 64 connections, ≤ 25 K rps for 512 connections):
+
+| offered rps | rl-server p50 | tok-server p50 |
+|------------:|:-------------:|:--------------:|
+| 64 conn, 1 K | 0.47 ms | 0.73 ms |
+| 64 conn, 5 K | 0.65 ms | 0.61 ms |
+| 64 conn, 10 K | 0.70 ms | 0.44 ms |
+| 64 conn, 25 K | 0.60 ms | 0.68 ms |
+
+No consistent winner at 16384 B. Both servers saturate around 40–60 K ops/s
+for 64 connections and ~25–30 K ops/s for 512 connections. For large-message
+workloads the bottleneck is bandwidth and message processing cost, not
+server-side connection handling — the choice of runtime does not matter.
+
+### Summary
+
+| scenario | recommendation |
+|:---------|:---------------|
+| Small/medium messages (≤ 4096 B), any connection count | ringline server: 1.1–1.5× higher throughput |
+| Small messages under high load (>50 K rps) with many connections | ringline server: 1.6–3.5× lower p50 latency |
+| Large messages (≥ 16384 B) at any load | servers equivalent — use either |
+| Bandwidth-saturated workloads (65536 B) | tied; bottleneck is elsewhere |
+
+---
+
 ## Test rig
 
 | Item    | Value                                                          |

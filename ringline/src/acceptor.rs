@@ -18,6 +18,9 @@ pub struct AcceptorConfig {
     pub shutdown_flag: Arc<AtomicBool>,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub tcp_nodelay: bool,
+    /// Connections to assign to each worker before moving to the next.
+    /// 1 = round-robin. See [`Config::conn_chunk_size`].
+    pub conn_chunk_size: usize,
     /// Whether to set SO_TIMESTAMPING on accepted connections.
     #[cfg(feature = "timestamps")]
     pub timestamps: bool,
@@ -33,7 +36,8 @@ pub fn run_acceptor(config: AcceptorConfig) {
         return;
     }
 
-    let mut next_worker = 0usize;
+    let chunk_size = config.conn_chunk_size.max(1);
+    let mut conn_count = 0usize; // successfully dispatched connections
     let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut alive = vec![true; num_workers];
     let mut alive_count = num_workers;
@@ -100,16 +104,16 @@ pub fn run_acceptor(config: AcceptorConfig) {
         let peer_addr = sockaddr_to_socket_addr(&addr_storage)
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
 
-        // Round-robin pick a live worker. Try up to num_workers times.
-        // `try_send` lets us distinguish a full queue (skip to next worker)
-        // from a disconnected channel (mark dead). Closing the fd when all
-        // workers are full or dead lets the kernel deliver a clean
-        // connection-refused to the peer instead of growing an unbounded
-        // backlog inside the channel.
+        // Pick a target worker based on chunk assignment, then fall back to
+        // adjacent workers if that worker's channel is full or it has exited.
+        // `try_send` lets us distinguish a full queue (skip) from a
+        // disconnected channel (mark dead). Closing the fd when all workers
+        // are full or dead lets the kernel deliver a clean connection-refused
+        // to the peer instead of growing an unbounded backlog in the channel.
+        let primary = (conn_count / chunk_size) % num_workers;
         let mut sent = false;
-        for _ in 0..num_workers {
-            let worker_idx = next_worker % num_workers;
-            next_worker = next_worker.wrapping_add(1);
+        for i in 0..num_workers {
+            let worker_idx = (primary + i) % num_workers;
 
             if !alive[worker_idx] {
                 continue;
@@ -118,6 +122,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
             match config.worker_channels[worker_idx].try_send((fd, peer_addr)) {
                 Ok(()) => {
                     config.worker_wake_handles[worker_idx].wake();
+                    conn_count = conn_count.wrapping_add(1);
                     sent = true;
                     break;
                 }

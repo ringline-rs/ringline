@@ -78,6 +78,7 @@ fn run_server_bench(
         ringline_client,
         workers,
         None, // in-process matrix is closed-loop
+        1,    // conn_chunk_size: round-robin for in-process matrix
     );
 
     eprintln!(
@@ -100,9 +101,7 @@ fn main() {
     }
 
     let workers = if args.workers == 0 {
-        std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
+        ringline_bench::physical_core_count()
     } else {
         args.workers
     };

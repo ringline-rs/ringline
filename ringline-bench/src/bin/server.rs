@@ -41,15 +41,19 @@ struct Args {
     /// scatter-gathered into one `sendmsg` with no accumulator copy.
     #[arg(long, default_value_t = false)]
     recv_forward: bool,
+
+    /// (ringline only) Connections assigned to each worker before moving to the next.
+    /// 1 = classic round-robin. Higher values pack connections onto fewer workers
+    /// at low connection counts, keeping per-worker CQE density high for batching.
+    #[arg(long, default_value_t = 1)]
+    conn_chunk_size: usize,
 }
 
 fn main() {
     let args = Args::parse();
 
     let workers = if args.workers == 0 {
-        std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
+        ringline::physical_core_count()
     } else {
         args.workers
     };
@@ -65,21 +69,44 @@ fn main() {
     );
 
     match args.runtime {
-        Runtime::Ringline => run_ringline(args.addr, workers, args.msg_size, args.recv_forward),
-        Runtime::Tokio => run_tokio(args.addr, workers),
+        Runtime::Ringline => run_ringline(
+            args.addr,
+            workers,
+            args.msg_size,
+            args.recv_forward,
+            args.conn_chunk_size,
+        ),
+        Runtime::Tokio => run_tokio(args.addr, workers, args.msg_size),
     }
 }
 
 #[allow(clippy::manual_async_fn)]
-fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward: bool) {
-    use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+fn run_ringline(
+    addr: SocketAddr,
+    workers: usize,
+    msg_size: usize,
+    recv_forward: bool,
+    conn_chunk_size: usize,
+) {
+    use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
+    // ParseResult is only needed in the non-io_uring fallback path.
+    #[cfg(not(has_io_uring))]
+    use ringline::ParseResult;
 
-    // forward_recv_buf path (default): zero-copy when the message fits one
-    // provided recv buffer, else falls back to a copy send.
+    // Direct-echo path (default): no task wakeup per message — echo SQEs are
+    // submitted directly from handle_recv_multi, bypassing collect_wakeups and
+    // poll_ready_tasks entirely. Falls back to the forward_recv_buf loop on the
+    // mio backend (macOS / non-io_uring builds).
     struct EchoHandler;
     impl AsyncEventHandler for EchoHandler {
         fn on_accept(&self, conn: ConnCtx) -> impl std::future::Future<Output = ()> + 'static {
             async move {
+                #[cfg(has_io_uring)]
+                {
+                    conn.run_direct_echo().await;
+                    return;
+                }
+                #[cfg(not(has_io_uring))]
                 loop {
                     let n = conn
                         .with_data(|data| {
@@ -134,6 +161,7 @@ fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward:
     config.max_connections = 16384;
     config.send_copy_count = 512;
     config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
+    config.conn_chunk_size = conn_chunk_size;
 
     let builder = RinglineBuilder::new(config).bind(addr);
     let (_shutdown, handles) = if recv_forward {
@@ -150,7 +178,7 @@ fn run_ringline(addr: SocketAddr, workers: usize, msg_size: usize, recv_forward:
     }
 }
 
-fn run_tokio(addr: SocketAddr, workers: usize) {
+fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
@@ -166,15 +194,23 @@ fn run_tokio(addr: SocketAddr, workers: usize) {
         eprintln!("bench-server: ready");
 
         loop {
-            let (stream, _) = match listener.accept().await {
+            let (mut stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(_) => continue,
             };
             stream.set_nodelay(true).ok();
 
             tokio::spawn(async move {
-                let (mut rd, mut wr) = stream.into_split();
-                tokio::io::copy(&mut rd, &mut wr).await.ok();
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; msg_size];
+                loop {
+                    if stream.read_exact(&mut buf).await.is_err() {
+                        break;
+                    }
+                    if stream.write_all(&buf).await.is_err() {
+                        break;
+                    }
+                }
             });
         }
     });

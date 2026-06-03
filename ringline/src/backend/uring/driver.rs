@@ -129,6 +129,11 @@ pub(crate) struct Driver {
     /// Set when `forward_recv_buf` initiates a send; used by `handle_send_recv_buf`
     /// to compute the correct offset on partial sends (since buf_size != data_len).
     pub(crate) send_recv_buf_original_lens: Vec<u32>,
+    /// Per-connection remaining bytes for in-flight SendRecvBuf operations.
+    /// Tracks how many bytes still need to be sent (decremented on each partial send).
+    /// Stored here rather than in the CQE payload so that buffer sizes > u16::MAX are
+    /// supported (the old encoding packed remaining into the high 16 bits of the payload).
+    pub(crate) send_recv_buf_remaining: Vec<u32>,
     /// Per-connection multi-buffer zero-copy recv hold. When `recv_forward` is
     /// set for a connection, incoming provided buffers are pushed here (bids NOT
     /// replenished) instead of copied into the accumulator, then forwarded back
@@ -393,6 +398,7 @@ impl Driver {
             pending_replenish: Vec::with_capacity(config.recv_buffer.ring_size as usize),
             pending_recv_bufs: vec![None; config.max_connections as usize],
             send_recv_buf_original_lens: vec![0; config.max_connections as usize],
+            send_recv_buf_remaining: vec![0; config.max_connections as usize],
             recv_hold: (0..config.max_connections)
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),

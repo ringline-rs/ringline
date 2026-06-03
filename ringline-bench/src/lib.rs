@@ -3,5 +3,8 @@
 
 pub mod client;
 pub mod output;
+
+/// Re-export from ringline for use in bench binaries.
+pub use ringline::physical_core_count;
 pub mod servers;
 pub mod stats;

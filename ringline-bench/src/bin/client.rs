@@ -52,8 +52,8 @@ struct Args {
     warmup: u64,
 
     /// Number of load-generation worker threads (applies to both runtimes;
-    /// connections are distributed across them)
-    #[arg(long, default_value_t = 8)]
+    /// connections are distributed across them). 0 = physical core count.
+    #[arg(long, default_value_t = 0)]
     threads: usize,
 
     /// Open-loop mode: offer requests at a fixed rate instead of one in-flight
@@ -71,6 +71,14 @@ struct Args {
     /// send-copy-pool slot) can't exhaust the pool under overload.
     #[arg(long, default_value_t = 64)]
     max_inflight: usize,
+
+    /// Connections assigned to each ringline worker before moving to the next.
+    /// 1 = classic round-robin. Higher values pack connections onto fewer workers
+    /// at low connection counts, keeping per-worker CQE density high enough for
+    /// io_uring batching to pay off. Has no effect once connections exceed
+    /// chunk_size * threads. (ringline client only)
+    #[arg(long, default_value_t = 1)]
+    conn_chunk_size: usize,
 }
 
 #[derive(Serialize)]
@@ -95,6 +103,12 @@ struct ClientReport {
 
 fn main() {
     let args = Args::parse();
+
+    let threads = if args.threads == 0 {
+        ringline::physical_core_count()
+    } else {
+        args.threads
+    };
 
     let runtime_name = match args.runtime {
         Runtime::Ringline => "ringline",
@@ -138,8 +152,9 @@ fn main() {
         Duration::from_secs(args.warmup),
         Duration::from_secs(args.duration),
         args.runtime == Runtime::Ringline,
-        args.threads,
+        threads,
         open,
+        args.conn_chunk_size,
     );
 
     let report = ClientReport {

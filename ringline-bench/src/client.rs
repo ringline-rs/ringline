@@ -167,7 +167,11 @@ async fn run_tokio_open_client(
     let mut sent: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         let elapsed = start.elapsed().as_secs_f64();
-        let due = (elapsed / interval) as u64;
+        // +1 so the first request is due immediately at T=0 (sent=0 → target=start),
+        // matching the ringline client which also fires the first request at T=0.
+        // Without this, due=0 at T=0 so the first send is delayed one full interval,
+        // inflating all latency measurements by exactly 1/per_conn_rate seconds.
+        let due = (elapsed / interval) as u64 + 1;
         let inflight = sent.saturating_sub(received.load(Ordering::Relaxed));
         let room = max_inflight.saturating_sub(inflight as usize) as u64;
         let want = due
@@ -226,7 +230,7 @@ mod ringline_client {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use ringline::{
@@ -242,10 +246,12 @@ mod ringline_client {
         pub msg_size: usize,
         /// Total client connections (used to split the aggregate open-loop rate).
         pub num_clients: usize,
-        /// Total connections still to be opened. Each worker's `on_start`
-        /// drains this counter, so connections are distributed across workers
-        /// and the total is exactly the requested client count.
-        pub remaining: Arc<AtomicUsize>,
+        /// Number of ringline worker threads. Used by each worker's `on_start`
+        /// to compute its chunk-based slice of connections.
+        pub num_workers: usize,
+        /// Connections assigned to each worker before moving to the next.
+        /// Mirrors `Config::conn_chunk_size` on the server side.
+        pub conn_chunk_size: usize,
         pub stop: Arc<AtomicBool>,
         /// Set true once warmup ends; open-loop latency/ops are only recorded
         /// while this is true.
@@ -258,6 +264,9 @@ mod ringline_client {
 
     struct ClientHandler {
         state: Arc<ClientState>,
+        /// Index of the worker thread owning this handler.
+        /// Used to compute this worker's slice of connections in `on_start`.
+        worker_id: usize,
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -268,18 +277,27 @@ mod ringline_client {
 
         fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
             let state = self.state.clone();
+            let worker_id = self.worker_id;
             Some(Box::pin(async move {
-                // Claim connection slots from the shared counter until drained.
-                loop {
-                    let prev = state.remaining.load(Ordering::Relaxed);
-                    if prev == 0 {
-                        break;
-                    }
-                    if state
-                        .remaining
-                        .compare_exchange_weak(prev, prev - 1, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
+                // Chunk-based assignment: this worker owns connections in slices
+                // of `conn_chunk_size` starting at `worker_id * chunk_size`,
+                // then wrapping every `num_workers * chunk_size` indices.
+                //
+                // With chunk_size=1 this is identical to the previous round-robin
+                // (worker_id, worker_id+N, worker_id+2N, ...). With chunk_size=32
+                // and 8 workers: worker 0 owns 0–31, worker 1 owns 32–63, etc.,
+                // keeping each active worker's connection density high enough for
+                // io_uring CQE batching to pay off at low total connection counts.
+                let num_workers = state.num_workers;
+                let num_clients = state.num_clients;
+                let chunk = state.conn_chunk_size.max(1);
+                let mut chunk_start = worker_id * chunk;
+                while chunk_start < num_clients {
+                    for k in 0..chunk {
+                        let idx = chunk_start + k;
+                        if idx >= num_clients {
+                            break;
+                        }
                         let s = state.clone();
                         match s.open {
                             Some(ol) => {
@@ -296,18 +314,19 @@ mod ringline_client {
                             }
                         }
                     }
+                    chunk_start += num_workers * chunk;
                 }
             }))
         }
 
-        fn create_for_worker(_worker_id: usize) -> Self {
+        fn create_for_worker(worker_id: usize) -> Self {
             let state = GLOBAL_STATE
                 .lock()
                 .unwrap()
                 .as_ref()
                 .expect("client state not set")
                 .clone();
-            ClientHandler { state }
+            ClientHandler { state, worker_id }
         }
     }
 
@@ -556,7 +575,8 @@ fn wait_for_server(addr: &str) {
 /// Run a benchmark against a server already listening on `addr`.
 ///
 /// `open` selects open-loop (rate-controlled) mode; `None` is the closed-loop
-/// request/response loop.
+/// request/response loop. `conn_chunk_size` controls how many connections are
+/// assigned to each ringline worker before moving to the next (1 = round-robin).
 #[allow(clippy::too_many_arguments)]
 pub fn run_bench(
     addr: &str,
@@ -567,6 +587,7 @@ pub fn run_bench(
     ringline_client: bool,
     workers: usize,
     open: Option<OpenLoop>,
+    conn_chunk_size: usize,
 ) -> BenchResult {
     let stop = Arc::new(AtomicBool::new(false));
     let ops = Arc::new(AtomicU64::new(0));
@@ -584,6 +605,7 @@ pub fn run_bench(
             ops,
             workers,
             open,
+            conn_chunk_size,
         )
     } else {
         run_bench_tokio(
@@ -699,6 +721,7 @@ fn run_bench_ringline(
     ops: Arc<AtomicU64>,
     workers: usize,
     open: Option<OpenLoop>,
+    conn_chunk_size: usize,
 ) -> BenchResult {
     let histograms = Arc::new(Mutex::new(Vec::new()));
     let measure = Arc::new(AtomicBool::new(false));
@@ -707,9 +730,8 @@ fn run_bench_ringline(
         target: addr.parse().expect("invalid addr for ringline client"),
         msg_size,
         num_clients,
-        // Total connections to open, distributed across workers (each worker's
-        // on_start drains this counter, so the total is exact).
-        remaining: Arc::new(std::sync::atomic::AtomicUsize::new(num_clients)),
+        num_workers: workers.max(1),
+        conn_chunk_size,
         stop: stop.clone(),
         measure: measure.clone(),
         ops: ops.clone(),

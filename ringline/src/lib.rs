@@ -156,6 +156,7 @@ pub(crate) mod runtime;
 pub(crate) mod spawner;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod tls;
+pub mod topology;
 pub(crate) mod wakeup;
 pub(crate) mod worker;
 
@@ -197,6 +198,10 @@ pub mod error;
 pub mod guard;
 pub mod handler;
 pub mod signal;
+
+/// Number of physical CPU cores — the right default for worker thread count.
+/// See [`topology::physical_core_count`] for details.
+pub use topology::physical_core_count;
 
 // ── Re-exports: Handler types ─────────────────────────────────────────
 

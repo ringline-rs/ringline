@@ -554,8 +554,43 @@ impl Ring {
     }
 
     /// Submit pending SQEs without waiting. Used for mid-iteration flush.
+    ///
+    /// After submitting the SQEs this method issues a second `io_uring_enter`
+    /// with `IORING_ENTER_GETEVENTS` and `min_complete=0`.  With
+    /// `IORING_SETUP_DEFER_TASKRUN` the kernel only runs task_work (and posts
+    /// deferred CQEs to the completion ring) when `IORING_ENTER_GETEVENTS` is
+    /// set.  A plain `submit()` call does NOT set that flag, so send-completion
+    /// CQEs for the SQEs we just submitted sit in kernel-internal task_work
+    /// until the next `submit_and_wait(1)`, causing a "dead" event-loop
+    /// iteration that wakes up only to process those CQEs.
+    ///
+    /// By issuing a non-blocking `enter(GETEVENTS, min=0)` right after submit
+    /// we flush task_work inline — the send CQEs land in the CQ ring before
+    /// `flush()` returns, so the `drain_completions()` call that follows in
+    /// the event loop can consume them immediately.
     pub fn flush(&self) -> io::Result<()> {
-        self.ring.submit()?;
+        // Combine submit + DEFER_TASKRUN flush into a single kernel entry.
+        //
+        // The old two-call path was:
+        //   submit()                           → enter(sq_len, 0, 0=no-GETEVENTS, None)
+        //   enter::<()>(0, 0, GETEVENTS, None) → enter(0,      0, GETEVENTS,       None)
+        //
+        // Merged into one:
+        //   enter(sq_len, 0, GETEVENTS, None)
+        //
+        // This submits any pending SQEs AND triggers DEFER_TASKRUN task_work
+        // delivery in a single syscall, saving one round-trip to the kernel
+        // per flush() invocation (≈ once or twice per event-loop iteration).
+        //
+        // Safety: `submission_shared()` gives a shared view of the SQ head/tail
+        // atomics.  We only read `.len()` (sq_tail − sq_head) and never push
+        // new entries here, so there is no aliasing or mutation hazard.
+        let n = unsafe { self.ring.submission_shared().len() } as u32;
+        unsafe {
+            self.ring
+                .submitter()
+                .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)?;
+        }
         Ok(())
     }
 
