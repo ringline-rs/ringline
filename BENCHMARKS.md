@@ -18,9 +18,9 @@ server).
 
 | Item | Value |
 |:-----|:------|
-| Server host | z1.n.small — AMD Threadripper 1950X, 4 physical cores exposed |
-| Client host | z1.n.small (separate machine, same network) |
-| Network | data-plane LAN, sub-ms RTT |
+| Physical host | AMD Threadripper 1950X (16 cores / 32 threads) |
+| VMs | Two z1.n.small VMs on the same physical host, each with 4 dedicated physical cores and a dedicated 10 GbE network port |
+| Network | VM-to-VM via dedicated 10 GbE ports on the same host |
 | Kernel | Linux (SystemsLab managed) |
 | Rust | 1.96.0 |
 | Server workers | 4 (physical core count, default) |
