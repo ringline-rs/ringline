@@ -171,10 +171,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let wait_start = std::time::Instant::now();
             self.driver.ring.submit_and_wait(1)?;
             let wait_ns = wait_start.elapsed().as_nanos() as u64;
-            if wait_ns >= 1_000_000 { diag_wait_ge_1ms += 1; }
-            if wait_ns >= 5_000_000 { diag_wait_ge_5ms += 1; }
-            if wait_ns >= 10_000_000 { diag_wait_ge_10ms += 1; }
-            if wait_ns > diag_wait_ns_max { diag_wait_ns_max = wait_ns; }
+            if wait_ns >= 1_000_000 {
+                diag_wait_ge_1ms += 1;
+            }
+            if wait_ns >= 5_000_000 {
+                diag_wait_ge_5ms += 1;
+            }
+            if wait_ns >= 10_000_000 {
+                diag_wait_ge_10ms += 1;
+            }
+            if wait_ns > diag_wait_ns_max {
+                diag_wait_ns_max = wait_ns;
+            }
 
             self.drain_completions();
             diag_cqes_1st += self.driver.cqe_batch.len() as u64;
@@ -547,10 +555,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // Record work-phase (everything except the blocking wait) duration.
             let work_ns = iter_start.elapsed().as_nanos() as u64 - wait_ns;
-            if work_ns >= 1_000_000 { diag_work_ge_1ms += 1; }
-            if work_ns >= 5_000_000 { diag_work_ge_5ms += 1; }
-            if work_ns >= 10_000_000 { diag_work_ge_10ms += 1; }
-            if work_ns > diag_work_ns_max { diag_work_ns_max = work_ns; }
+            if work_ns >= 1_000_000 {
+                diag_work_ge_1ms += 1;
+            }
+            if work_ns >= 5_000_000 {
+                diag_work_ge_5ms += 1;
+            }
+            if work_ns >= 10_000_000 {
+                diag_work_ge_10ms += 1;
+            }
+            if work_ns > diag_work_ns_max {
+                diag_work_ns_max = work_ns;
+            }
 
             diag_iters += 1;
         }
@@ -4591,8 +4607,7 @@ mod tests {
         // The retry SQE should have been pushed to the ring. The handler updated
         // send_recv_buf_remaining to 40; the retry CQE just needs bid in the payload.
         assert_eq!(
-            el.driver.send_recv_buf_remaining[conn_index as usize],
-            40,
+            el.driver.send_recv_buf_remaining[conn_index as usize], 40,
             "remaining not updated after partial send"
         );
         let new_ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);

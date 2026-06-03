@@ -42,13 +42,10 @@ fn linux_physical_cores() -> Option<usize> {
     use std::collections::HashSet;
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut cpu = 0usize;
-    loop {
-        let pkg = match std::fs::read_to_string(format!(
-            "/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"
-        )) {
-            Ok(s) => s.trim().to_owned(),
-            Err(_) => break,
-        };
+    while let Ok(pkg_raw) = std::fs::read_to_string(format!(
+        "/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"
+    )) {
+        let pkg = pkg_raw.trim().to_owned();
         let core = match std::fs::read_to_string(format!(
             "/sys/devices/system/cpu/cpu{cpu}/topology/core_id"
         )) {
@@ -58,7 +55,11 @@ fn linux_physical_cores() -> Option<usize> {
         seen.insert((pkg, core));
         cpu += 1;
     }
-    if seen.is_empty() { None } else { Some(seen.len()) }
+    if seen.is_empty() {
+        None
+    } else {
+        Some(seen.len())
+    }
 }
 
 #[cfg(test)]
