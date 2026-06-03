@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Worker thread count now defaults to **physical core count** (read from sysfs
+  topology on Linux) rather than logical CPU count. On hyperthreaded systems
+  this halves the default worker count, eliminating HT contention and
+  significantly improving per-core throughput. The old behaviour can be restored
+  with `Config::workers(n)`. `ringline::physical_core_count()` is exported as a
+  public helper. (#202)
+
+### Fixed
+
+- `tick_timeout_armed` is now only set to `true` when `submit_tick_timeout`
+  actually succeeds. Previously the flag was set unconditionally, so a full
+  submission queue at arm time would silently leave the event loop without a
+  periodic wakeup timer until the next real CQE arrived.
+
+### Added
+
+- Event-loop diagnostics now emit a `[ringline stall]` line at shutdown alongside
+  the existing `[ringline diag]` line. It reports per-worker counts and worst-case
+  durations for both the kernel-wait phase (`submit_and_wait`) and the userspace
+  work phase (drain, task polling, `on_tick`), split into ≥1 ms / ≥5 ms / ≥10 ms
+  buckets. Useful for diagnosing tail latency from OS scheduler preemption or SQ
+  contention.
+
 ## [0.1.2] - 2026-04-26
 
 ### Added
