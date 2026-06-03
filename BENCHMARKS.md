@@ -9,10 +9,40 @@ beat (or to flag a regression against).
 ## Distributed TCP server comparison
 
 This section compares the **ringline server** against a **tokio server** — both
-serving the same TCP echo workload from a dedicated host, with the client on a
-separate machine. This is distinct from the single-machine client benchmarks
+serving the same TCP echo workload from a dedicated VM, with the client on a
+separate VM. This is distinct from the single-machine client benchmarks
 below (which compare the ringline client vs tokio client against the same
 server).
+
+### Summary
+
+For small and medium messages (≤ 4096 B), the ringline server delivers
+**1.2–1.5× more throughput** and **2–3.5× lower p50 latency under load**
+compared to a tokio server at equivalent connection counts. The advantage
+grows with connection density (io_uring amortises per-syscall overhead more
+effectively as CQE batches grow) and under high offered rates (the event loop
+stays flatter as load approaches saturation). For large messages (≥ 16384 B)
+the workload becomes bandwidth-limited and the two servers are equivalent —
+the choice of runtime does not matter.
+
+### Caveats
+
+- **Intra-host network.** Client and server VMs sit on the same physical machine
+  connected via dedicated 10 GbE ports. True cross-machine latency would
+  increase the absolute numbers but should not change the relative ratios, since
+  both servers see identical network conditions.
+- **Echo workload.** The server does no application logic — receive, copy to send
+  pool, transmit. Real applications that do meaningful per-request work will
+  amortise runtime overhead further, which generally favours both runtimes
+  equally (the delta is in connection-handling overhead, not compute).
+- **4 server workers.** Results reflect the physical-core-count default. Fewer
+  workers tighten the gap at low connection counts (less parallelism to cover
+  idle connections); more workers would push the saturation ceiling higher for
+  both runtimes.
+- **Dedicated, non-oversubscribed cores.** The VMs run with pinned physical
+  cores. On shared infrastructure with noisy neighbours or oversubscribed
+  hypervisors, tail latency for both runtimes will increase; ringline's
+  thread-per-core model has no work-stealing fallback if a core is stolen.
 
 ### Test rig
 
