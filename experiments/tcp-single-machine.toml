@@ -1,0 +1,74 @@
+name = "ringline-benchmarks single-machine tcp (real ringline server)"
+
+# Regenerates the single-machine "TCP echo" table in BENCHMARKS.md after the
+# server fix: `ringline-benchmarks`' TCP `start_ringline_server` is now a native
+# RinglineBuilder echo server (forward_recv_buf), not a tokio io::copy. Runs the
+# full client×server combo matrix on one z1.n.small so the `ringline → ringline`
+# column is a real full ringline stack vs the `tokio → tokio` full tokio stack.
+#
+# Single host, single job. ~8 min after build.
+
+[params]
+ringline_repo    = "https://github.com/brayniac/ringline"
+ringline_version = "main"
+
+[[jobs]]
+name = "bench"
+tags = ["z1.n.small"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline
+    git fetch --all
+    git checkout {ringline_version}
+    git reset --hard origin/{ringline_version}
+else
+    git clone {ringline_repo} /tmp/ringline
+    cd /tmp/ringline
+    git checkout {ringline_version}
+fi
+cd /tmp/ringline
+cargo build --release -p ringline-benchmarks
+echo "build OK"
+"""
+
+[[jobs.steps]]
+name = "tune-system"
+type = "shell"
+command = """
+sudo sysctl -w net.core.somaxconn=65535 || true
+sudo sysctl -w net.core.rmem_max=134217728 || true
+sudo sysctl -w net.core.wmem_max=134217728 || true
+echo "tuning done"
+"""
+
+[[jobs.steps]]
+name = "run-tcp"
+type = "shell"
+command = """
+source "$HOME/.cargo/env"
+cd /tmp/ringline
+ulimit -n 500000
+./target/release/ringline-benchmarks \
+    --only tcp \
+    --clients 1,10,50,200 \
+    --sizes 64,512,4096,32768 \
+    --json tcp.json 2>&1 | tee tcp-run.log
+echo "=== tcp.json ==="
+cat tcp.json
+"""
+
+[[jobs.steps]]
+name = "upload-json"
+type = "upload_artifact"
+path = "/tmp/ringline/tcp.json"
+
+[[jobs.steps]]
+name = "upload-log"
+type = "upload_artifact"
+path = "/tmp/ringline/tcp-run.log"
