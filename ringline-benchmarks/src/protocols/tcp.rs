@@ -104,61 +104,80 @@ fn start_tokio_server(
 
     Ok((
         addr,
-        BenchmarkServer {
+        BenchmarkServer::Tokio {
             shutdown: Some(shutdown_tx),
             thread: Some(rt),
         },
     ))
 }
 
+/// Native ringline TCP echo server. Echoes via `forward_recv_buf` — the
+/// provided recv buffer is handed straight back to a send without an
+/// accumulator copy. This is the same echo path the standalone `bench-server`
+/// runs (its `#[cfg(has_io_uring)]` direct-echo branch is never enabled in a
+/// downstream crate, since that cfg is set only inside the `ringline` crate's
+/// own build, so both reduce to this loop).
+struct RinglineEchoHandler;
+
+impl ringline::AsyncEventHandler for RinglineEchoHandler {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(
+        &self,
+        conn: ringline::ConnCtx,
+    ) -> impl std::future::Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let n = conn
+                    .with_data(|data| {
+                        if conn.forward_recv_buf(data).is_err() {
+                            return ringline::ParseResult::NeedMore;
+                        }
+                        ringline::ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        RinglineEchoHandler
+    }
+}
+
 fn start_ringline_server(
     port_manager: &PortManager,
     _workers: usize,
-    _msg_size: usize,
+    msg_size: usize,
 ) -> Result<(SocketAddr, BenchmarkServer), String> {
     let addr = port_manager.next_addr();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    // Use tokio server for now — ringline server requires TLS setup
-    let rt = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build tokio runtime");
+    // Single worker to match the single-machine methodology (1 ringline worker
+    // vs 1 tokio current_thread). Mirrors the standalone bench-server config.
+    let mut config = ringline::Config::default();
+    config.worker.threads = 1;
+    config.worker.pin_to_core = false;
+    config.sq_entries = 256;
+    config.recv_buffer.ring_size = 256;
+    config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
+    config.max_connections = 16384;
+    config.send_copy_count = 512;
+    config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
 
-        rt.block_on(async move {
-            let socket = tokio::net::TcpSocket::new_v4().expect("failed to create socket");
-            socket.set_reuseaddr(true).expect("failed to set reuseaddr");
-            socket.bind(addr).expect("failed to bind");
-            let listener = socket.listen(1024).expect("failed to listen");
-
-            tokio::pin!(shutdown_rx);
-            loop {
-                tokio::select! {
-                    _ = &mut shutdown_rx => break,
-                    result = listener.accept() => {
-                        let (stream, _) = match result {
-                            Ok(conn) => conn,
-                            Err(_) => continue,
-                        };
-                        stream.set_nodelay(true).ok();
-                        tokio::spawn(async move {
-                            let (mut rd, mut wr) = stream.into_split();
-                            tokio::io::copy(&mut rd, &mut wr).await.ok();
-                        });
-                    }
-                }
-            }
-        });
-    });
+    let (shutdown, handles) = ringline::RinglineBuilder::new(config)
+        .bind(addr)
+        .launch::<RinglineEchoHandler>()
+        .map_err(|e| format!("ringline TCP server launch failed: {e}"))?;
 
     std::thread::sleep(Duration::from_millis(100));
 
     Ok((
         addr,
-        BenchmarkServer {
-            shutdown: Some(shutdown_tx),
-            thread: Some(rt),
+        BenchmarkServer::Ringline {
+            shutdown: Some(shutdown),
+            handles,
         },
     ))
 }
@@ -481,16 +500,40 @@ fn wait_for_server(addr: &str) {
     }
 }
 
-pub struct BenchmarkServer {
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+pub enum BenchmarkServer {
+    Tokio {
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    },
+    Ringline {
+        shutdown: Option<ringline::ShutdownHandle>,
+        handles: Vec<std::thread::JoinHandle<Result<(), ringline::error::Error>>>,
+    },
 }
 
 impl BenchmarkServer {
-    fn stop(mut self) {
-        drop(self.shutdown.take());
-        if let Some(h) = self.thread {
-            h.join().ok();
+    fn stop(self) {
+        match self {
+            BenchmarkServer::Tokio {
+                mut shutdown,
+                mut thread,
+            } => {
+                drop(shutdown.take());
+                if let Some(h) = thread.take() {
+                    h.join().ok();
+                }
+            }
+            BenchmarkServer::Ringline {
+                mut shutdown,
+                handles,
+            } => {
+                if let Some(s) = shutdown.take() {
+                    s.shutdown();
+                }
+                for h in handles {
+                    h.join().ok();
+                }
+            }
         }
     }
 }
