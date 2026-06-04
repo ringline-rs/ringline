@@ -1,0 +1,70 @@
+name = "ringline-benchmarks single-machine full sweep (per-protocol isolation)"
+
+# Regenerates every single-machine table in BENCHMARKS.md on one z1.n.small.
+# Each protocol runs as its own ringline-benchmarks process so no single
+# process accumulates hundreds of server binds (which intermittently produced
+# dead 0-ops cells). Relies on the PortManager bindability probe for the rest.
+#
+# Single host, single job. ~40 min after build. Per-protocol JSON artifacts +
+# a jq summary (transport clients size client_rt->server_rt ops p50ns p99ns).
+
+[params]
+ringline_repo    = "https://github.com/brayniac/ringline"
+ringline_version = "main"
+
+[[jobs]]
+name = "bench"
+tags = ["z1.n.small"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+cd /tmp/ringline 2>/dev/null && git fetch --all && git checkout {ringline_version} && git reset --hard origin/{ringline_version} || (git clone {ringline_repo} /tmp/ringline && cd /tmp/ringline && git checkout {ringline_version})
+cd /tmp/ringline
+cargo build --release -p ringline-benchmarks
+which jq || sudo apt-get install -y jq || true
+echo "build OK"
+"""
+
+[[jobs.steps]]
+name = "tune-system"
+type = "shell"
+command = """
+sudo sysctl -w net.core.somaxconn=65535 || true
+sudo sysctl -w net.core.rmem_max=134217728 || true
+sudo sysctl -w net.core.wmem_max=134217728 || true
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1 || true
+sudo sysctl -w net.ipv4.tcp_fin_timeout=10 || true
+echo "tuning done"
+"""
+
+[[jobs.steps]]
+name = "run-isolated"
+type = "shell"
+command = """
+source "$HOME/.cargo/env"
+cd /tmp/ringline
+ulimit -n 500000
+for proto in tcp udp quic http1 http2 http3 redis memcache; do
+  echo ">>> running $proto"
+  ./target/release/ringline-benchmarks --only $proto --clients 1,10,50,200 --sizes 64,512,4096,32768 --json ${proto}.json > ${proto}-run.log 2>&1
+  echo "<<< done $proto (exit $?)"
+done
+echo "=== SUMMARY (transport clients size client_rt->server_rt ops p50ns p99ns) ==="
+for proto in tcp udp quic http1 http2 http3 redis memcache; do
+  [ -f ${proto}.json ] && jq -r '.configs[] | (.ringline_ringline // .tokio_tokio // .ringline_tokio // .tokio_ringline) as $r | [.transport, .clients, .msg_size, (.client_runtime+"->"+.server_runtime), ($r.ops_per_sec|floor), $r.latency.p50_ns, $r.latency.p99_ns] | @tsv' ${proto}.json
+done
+"""
+
+[[jobs.steps]]
+name = "upload-summary"
+type = "shell"
+command = "cd /tmp/ringline && tar czf single-machine-json.tgz *.json && echo packed"
+
+[[jobs.steps]]
+name = "upload-artifacts"
+type = "upload_artifact"
+path = "/tmp/ringline/single-machine-json.tgz"
