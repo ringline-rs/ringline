@@ -247,28 +247,45 @@ Per-iter "ops/s" is total completed operations across all clients ÷ measured wa
 
 ## TCP echo
 
-`ringline → ringline` column is the ringline client + ringline-runtime server. `tokio → tokio` is the tokio current\_thread baseline.
+`ringline → ringline` is the **full ringline stack** — ringline client + a native
+ringline `RinglineBuilder` echo server (`forward_recv_buf`). `tokio → tokio` is the
+**full tokio stack** — tokio client + tokio current\_thread server. So this is a
+runtime-vs-runtime comparison of both ends, not just the client.
+
+> **Re-run note.** These numbers were regenerated on a `z1.n.small` (4 physical /
+> 8 logical cores) after fixing the server (the `ringline → ringline` server used
+> to be a tokio echo — see history below), so absolute values differ from the
+> Threadripper 3970X figures the *other* single-machine tables still use; the
+> ringline-vs-tokio ratios are the comparison that carries across rigs. UDP /
+> redis / memcache / HTTP below are pending a re-run on this rig.
 
 | Clients × Size | ringline → ringline | tokio → tokio | ringline vs tokio | p50 (ringline) | p99 (ringline) |
 |:---|---:|---:|---:|---:|---:|
-| 1c × 64 B   |  43 k |  37 k | **+17 %** | 23 µs |  37 µs |
-| 1c × 512 B  |  40 k |  36 k | +10 % | 23 µs |  38 µs |
-| 1c × 4 KiB  |  37 k |  32 k | +18 % | 26 µs |  46 µs |
-| 1c × 32 KiB |  17 k |  21 k | −17 % | 53 µs | 158 µs |
-| 10c × 64 B  | 200 k | 179 k | +12 % | 49 µs |  67 µs |
-| 10c × 512 B | 197 k | 177 k | +12 % | 50 µs |  68 µs |
-| 10c × 4 KiB | 166 k | 140 k | +19 % | 61 µs |  99 µs |
-| 10c × 32 KiB |  35 k |  37 k | −4 % | 281 µs | 336 µs |
-| 50c × 64 B  | 202 k | 180 k | +13 % | 246 µs | 321 µs |
-| 50c × 512 B | 200 k | 179 k | +12 % | 248 µs | 310 µs |
-| 50c × 4 KiB | 159 k | 140 k | +13 % | 278 µs | 566 µs |
-| 50c × 32 KiB|  36 k |  36 k | ±0 % | 1.40 ms | 1.87 ms |
-| 200c × 64 B | 205 k | 184 k | +11 % | 990 µs | 1.20 ms |
-| 200c × 512 B | 205 k | 178 k | +15 % | 1.00 ms | 1.23 ms |
-| 200c × 4 KiB | 154 k | 142 k | +8 % | 1.17 ms | 2.47 ms |
-| 200c × 32 KiB|  31 k |  34 k | −10 % | 6.22 ms | 9.70 ms |
+| 1c × 64 B   |  12.0 k |  9.3 k | **+29 %** | 81 µs | 118 µs |
+| 1c × 512 B  |  12.1 k |  9.0 k | +34 % | 82 µs | 121 µs |
+| 1c × 4 KiB  |  11.6 k |  8.9 k | +30 % | 84 µs | 129 µs |
+| 1c × 32 KiB |  10.2 k |  8.6 k | +19 % | 95 µs | 145 µs |
+| 10c × 64 B  | 119 k |  88 k | +35 % | 84 µs | 152 µs |
+| 10c × 512 B | 115 k |  83 k | +39 % | 87 µs | 161 µs |
+| 10c × 4 KiB |  99 k |  77 k | +28 % | 99 µs | 187 µs |
+| 10c × 32 KiB |  53 k |  20 k | **+163 %** | 194 µs | 323 µs |
+| 50c × 64 B  | 123 k |  86 k | +44 % | 349 µs | 709 µs |
+| 50c × 512 B | 128 k |  88 k | +45 % | 331 µs | 669 µs |
+| 50c × 4 KiB | 108 k |  79 k | +37 % | 398 µs | 826 µs |
+| 50c × 32 KiB|  46 k |  20 k | **+127 %** | 902 µs | 1.91 ms |
+| 200c × 64 B | 135 k |  88 k | **+54 %** | 1.36 ms | 2.95 ms |
+| 200c × 512 B | 130 k |  88 k | +47 % | 1.41 ms | 3.08 ms |
+| 200c × 4 KiB | 102 k |  82 k | +25 % | 1.77 ms | 3.90 ms |
+| 200c × 32 KiB|  36 k |  26 k | +35 % | 5.09 ms | 9.75 ms |
 
-ringline leads tokio across most of the matrix; the 32 KiB cells where it trails are explained in *Caveats*.
+With a real ringline server on both ends, **ringline leads tokio across the entire
+matrix**, including the 32 KiB cells. The previous version of this table showed
+ringline *trailing* by 4–17 % at 32 KiB — that was an artifact of pointing the
+ringline client at a **tokio** server (the `ringline → ringline` server was
+silently a tokio echo); the large-message gap was the tokio server's per-stream
+`io::copy`, not ringline. The full-stack gap is widest at small messages under
+concurrency (io_uring batching) and at 32 KiB / moderate concurrency, where the
+tokio echo server collapses to ~20 k ops/s while ringline holds 46–53 k.
 
 ## UDP echo
 
@@ -709,8 +726,7 @@ Before this fix, every event-loop iteration ran a TLS-only `check_close_notify_d
 
 - **Single ringline worker.** These single-machine numbers are for `worker.threads = 1`. Multi-worker scaling is exercised separately in the distributed section's *Worker scaling & CPU efficiency*.
 - **Localhost only.** All servers and clients run on the same box. Real network latency would shift the relative shapes.
-- **TCP/UDP "ringline → ringline" actually uses a tokio server today.** `protocols/tcp.rs` and `protocols/udp.rs` both call into a tokio-based echo server for both columns; see the `// Use tokio server for now — ringline server requires TLS setup` comment in `tcp.rs`. So the "vs tokio" rows really compare the **client** side; both have the same server CPU cost included. A native ringline echo server would likely widen ringline's lead on those rows.
-- **Bench's ringline client at 32 KiB is the bottleneck for the −10 %..−30 % rows.** It uses `with_data` with a single buffered echo per round trip, and at 32 KiB the recv-buffer churn dominates. Improving that path is its own piece of work and unrelated to runtime perf.
+- **TCP/UDP "ringline → ringline" is a native ringline server on both ends.** Historically the single-machine TCP `start_ringline_server` was a tokio echo (a stale `// ringline server requires TLS setup` shortcut), so that table's `ringline → ringline` column was really ringline-client → *tokio*-server — a client-only comparison. That is fixed: TCP now launches a real `RinglineBuilder` echo server (`forward_recv_buf`), and the single-machine UDP server was already native ringline. The TCP table was regenerated against the real server; UDP and the protocol-client tables below are pending a re-run on the same rig.
 - **Redis bench server is synthetic.** It does not implement a real Redis storage layer; the response size is fixed by `msg_size`. The numbers are an upper bound on what the wire+parser combo can do, not what a real Redis backend would deliver.
 - **`ringline-momento` and gRPC bench stubs are still TODO.** `cargo run -p ringline-benchmarks --only momento,grpc` currently returns `0 ops/s` for those — they're not measured here.
 - **Numbers reflect what's available to a single user-space process.** Under load from other tenants, especially on cloud VMs, ranks can flip.
