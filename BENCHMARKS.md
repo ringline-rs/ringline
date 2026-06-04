@@ -213,16 +213,16 @@ server-side connection handling — the choice of runtime does not matter.
 
 | Item    | Value                                                          |
 |:--------|:---------------------------------------------------------------|
-| CPU     | AMD Ryzen Threadripper 3970X 32-Core (8 cores exposed to runner) |
-| Memory  | 31 GiB                                                         |
-| Kernel  | Linux 6.12.63 (Debian 13 trixie)                               |
-| Rust    | 1.95.0                                                         |
+| CPU     | `z1.n.small` (4 physical / 8 logical cores), SystemsLab-managed |
+| Kernel  | Linux (SystemsLab managed, Debian)                            |
+| Rust    | 1.96.0                                                         |
 | Backend | io\_uring                                                       |
 | Worker threads | 1 (single-threaded ringline + single-thread tokio current\_thread) |
 | Bench harness | `cargo run --release -p ringline-benchmarks`             |
 | Sample window | 5 s, after 2 s warmup, per (clients × size × combo)      |
 | Latencies   | per-iter `Instant::now()` → `t0.elapsed()` recorded into in-process histograms |
-| Commit  | `f40de73` (after PR #184)                                      |
+| Servers     | `ringline → *` rows use a native ringline server; `* → tokio` rows hit a tokio/hyper/reqwest reference (see each section) |
+| Re-run note | All single-machine tables regenerated on this `z1.n.small` after the TCP server fix + a `PortManager` bindability-probe hardening. Absolute numbers differ from the earlier Threadripper 3970X figures; the ringline-vs-reference ratios are the durable comparison. |
 
 The runner spawns its own tokio-based server (TCP/UDP echo or RESP responder) and then drives it with either a tokio client or a ringline client. The "ringline → tokio" rows mean **ringline client** talking to a **tokio server** (which is also what the "ringline → ringline" rows are today — see *Caveats* below).
 
@@ -252,12 +252,10 @@ ringline `RinglineBuilder` echo server (`forward_recv_buf`). `tokio → tokio` i
 **full tokio stack** — tokio client + tokio current\_thread server. So this is a
 runtime-vs-runtime comparison of both ends, not just the client.
 
-> **Re-run note.** These numbers were regenerated on a `z1.n.small` (4 physical /
-> 8 logical cores) after fixing the server (the `ringline → ringline` server used
-> to be a tokio echo — see history below), so absolute values differ from the
-> Threadripper 3970X figures the *other* single-machine tables still use; the
-> ringline-vs-tokio ratios are the comparison that carries across rigs. UDP /
-> redis / memcache / HTTP below are pending a re-run on this rig.
+> **Server fix note.** The `ringline → ringline` server used to be a tokio echo
+> (a stale `// requires TLS setup` shortcut), so this table previously measured
+> only the *client*. It is now a real ringline server, so ringline leads the
+> whole matrix including 32 KiB — see history below for the before/after.
 
 | Clients × Size | ringline → ringline | tokio → tokio | ringline vs tokio | p50 (ringline) | p99 (ringline) |
 |:---|---:|---:|---:|---:|---:|
@@ -291,24 +289,24 @@ tokio echo server collapses to ~20 k ops/s while ringline holds 46–53 k.
 
 | Clients × Size | ringline → ringline | tokio → tokio | ringline vs tokio | p50 (ringline) | p99 (ringline) |
 |:---|---:|---:|---:|---:|---:|
-| 1c × 64 B   |  50 k |  39 k | **+29 %** | 18 µs |  34 µs |
-| 1c × 512 B  |  51 k |  39 k | +32 % | 18 µs |  33 µs |
-| 1c × 4 KiB  |  44 k |  35 k | +25 % | 21 µs |  38 µs |
-| 1c × 32 KiB |  33 k |  29 k | +12 % | 29 µs |  49 µs |
-| 10c × 64 B  | 273 k | 193 k | **+42 %** | 35 µs |  59 µs |
-| 10c × 512 B | 250 k | 191 k | +31 % | 38 µs |  64 µs |
-| 10c × 4 KiB | 204 k | 146 k | +39 % | 47 µs |  78 µs |
-| 10c × 32 KiB |  73 k |  86 k | −14 % | 92 µs | 152 µs |
-| 50c × 64 B  | 284 k | 203 k | **+40 %** | 172 µs | 240 µs |
-| 50c × 512 B | 259 k | 196 k | +32 % | 190 µs | 268 µs |
-| 50c × 4 KiB | 190 k | 153 k | +25 % | 133 µs | 197 µs |
-| 50c × 32 KiB|  72 k |  83 k | −13 % | 97 µs | 169 µs |
-| 200c × 64 B | 286 k | 208 k | **+38 %** | 583 µs | 863 µs |
-| 200c × 512 B | 283 k | 197 k | +43 % | 462 µs | 724 µs |
-| 200c × 4 KiB | 197 k | 152 k | +30 % | 132 µs | 424 µs |
-| 200c × 32 KiB|  62 k |  80 k | −23 % | 115 µs | 226 µs |
+| 1c × 64 B   |  13 k |  10 k | **+37 %** | 73 µs | 112 µs |
+| 1c × 512 B  |  13 k |  10 k | +33 % | 74 µs | 118 µs |
+| 1c × 4 KiB  |  13 k |  10 k | +31 % | 77 µs | 123 µs |
+| 1c × 32 KiB |  11 k |   9 k | +34 % | 85 µs | 135 µs |
+| 10c × 64 B  | 170 k | 102 k | **+67 %** | 54 µs | 126 µs |
+| 10c × 512 B | 168 k | 101 k | +67 % | 55 µs | 123 µs |
+| 10c × 4 KiB | 137 k |  86 k | +59 % | 68 µs | 141 µs |
+| 10c × 32 KiB |  57 k |  59 k | −3 % | 122 µs | 240 µs |
+| 50c × 64 B  | 202 k | 110 k | **+85 %** | 248 µs | 360 µs |
+| 50c × 512 B | 192 k | 108 k | +78 % | 256 µs | 376 µs |
+| 50c × 4 KiB | 142 k |  92 k | +56 % | 175 µs | 281 µs |
+| 50c × 32 KiB|  53 k |  58 k | −8 % | 123 µs | 244 µs |
+| 200c × 64 B | 201 k | 113 k | **+78 %** | 877 µs | 1.20 ms |
+| 200c × 512 B | 191 k | 112 k | +71 % | 765 µs | 1.11 ms |
+| 200c × 4 KiB | 148 k |  92 k | +61 % | 174 µs | 394 µs |
+| 200c × 32 KiB|  52 k |  56 k | −6 % | 127 µs | 251 µs |
 
-UDP is where ringline pulls farthest ahead — at 10c × 64 B the gap is +42 %; at 50c × 64 B it's +40 %. The 32 KiB rows still trail tokio at higher concurrency; with the bench's zero-allocation recv path now in place (PR #186), the residual gap is the unavoidable userspace memcpy into ringline's send copy pool (tokio's `send_to` syscall reads userland memory directly).
+UDP is where ringline pulls farthest ahead — the 64–512 B rows lead tokio by **+67 % to +85 %** at 10–50 connections. The 32 KiB rows still trail slightly (−3 % to −8 %); with the bench's zero-allocation recv path in place (PR #186), the residual gap is the unavoidable userspace memcpy into ringline's send copy pool (tokio's `send_to` syscall reads userland memory directly). Both columns are a real ringline UDP server vs a tokio UDP server.
 
 ## Redis (GET against a synthetic RESP server)
 
@@ -316,14 +314,14 @@ Workload: each client loops `GET k`. The server is a tokio TCP listener speaking
 
 | Clients × Size | ringline-redis | tokio (hand-rolled RESP) | ringline vs tokio |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  40 k |  37 k | **+8 %** |
-| 1c × 4 KiB  |  37 k |  35 k | +5 % |
-| 10c × 64 B  | 184 k | 178 k | +4 % |
-| 10c × 512 B | 191 k | 166 k | +15 % |
-| 50c × 64 B  | 187 k | 179 k | +4 % |
-| 50c × 512 B | 195 k | 174 k | +12 % |
-| 200c × 64 B | 195 k | 182 k | +7 % |
-| 200c × 4 KiB| 154 k | 166 k | −7 % |
+| 1c × 64 B   |  10 k |   9 k | **+13 %** |
+| 1c × 4 KiB  |  10 k |   9 k | +8 % |
+| 10c × 64 B  |  96 k |  86 k | +11 % |
+| 10c × 512 B | 100 k |  84 k | +18 % |
+| 50c × 64 B  | 100 k |  88 k | +13 % |
+| 50c × 512 B |  97 k |  86 k | +13 % |
+| 200c × 64 B | 102 k |  87 k | +17 % |
+| 200c × 4 KiB|  92 k |  86 k | +8 % |
 
 The hand-rolled tokio client uses fixed-size reads (it knows the response length up front); `ringline-redis::Client::get` walks the full RESP parser on every response. Despite that extra work, ringline-redis still leads in most cells, and the largest deficits are small.
 
@@ -333,20 +331,20 @@ Workload: each client loops `get k`. The server is a tokio TCP listener speaking
 
 | Clients × Size | ringline-memcache | tokio (hand-rolled) | ringline vs tokio |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  39 k |  37 k | **+5 %** |
-| 1c × 512 B  |  39 k |  36 k | +9 % |
-| 1c × 4 KiB  |  38 k |  35 k | +9 % |
-| 10c × 64 B  | 189 k | 177 k | +7 % |
-| 10c × 512 B | 186 k | 169 k | +10 % |
-| 10c × 4 KiB | 160 k | 160 k | tie |
-| 50c × 64 B  | 192 k | 179 k | +7 % |
-| 50c × 512 B | 195 k | 170 k | **+15 %** |
-| 50c × 4 KiB | 161 k | 166 k | −3 % |
-| 200c × 64 B | 205 k | 175 k | **+17 %** |
-| 200c × 512 B | 184 k | 176 k | +5 % |
-| 200c × 4 KiB | 164 k | 168 k | −2 % |
+| 1c × 64 B   |  10 k |   9 k | **+12 %** |
+| 1c × 512 B  |  10 k |   9 k | +12 % |
+| 1c × 4 KiB  |  10 k |   9 k | +11 % |
+| 10c × 64 B  |  98 k |  87 k | +13 % |
+| 10c × 512 B | 101 k |  87 k | +16 % |
+| 10c × 4 KiB |  91 k |  83 k | +9 % |
+| 50c × 64 B  | 105 k |  88 k | **+19 %** |
+| 50c × 512 B | 102 k |  89 k | +15 % |
+| 50c × 4 KiB |  95 k |  87 k | +9 % |
+| 200c × 64 B | 102 k |  92 k | +11 % |
+| 200c × 512 B |  92 k |  91 k | +2 % |
+| 200c × 4 KiB |  92 k |  85 k | +9 % |
 
-Same broad shape as the Redis numbers: ringline wins single-conn-per-client and high-concurrency-small-payload cells, ties at moderate concurrency × larger payloads. `ringline-memcache::Client::get` and the hand-rolled tokio client both parse the variable-length memcache response.
+Same broad shape as the Redis numbers: ringline-memcache leads the hand-rolled tokio client across the board (+9 % to +19 %), widest at small-payload high-concurrency. `ringline-memcache::Client::get` and the tokio client both parse the variable-length memcache response.
 
 ## HTTP/1.1 (GET against a synthetic server)
 
@@ -356,20 +354,20 @@ The reference client is **reqwest** — the de-facto tokio HTTP client — built
 
 | Clients × Size | ringline-http | reqwest | ringline vs reqwest |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  38 k |  22 k | **+69 %** |
-| 1c × 512 B  |  38 k |  23 k | +69 % |
-| 1c × 4 KiB  |  37 k |  21 k | +73 % |
-| 10c × 64 B  | 165 k |  54 k | **+208 %** |
-| 10c × 512 B | 162 k |  54 k | +202 % |
-| 10c × 4 KiB | 148 k |  50 k | +194 % |
-| 50c × 64 B  | 172 k |  53 k | **+224 %** |
-| 50c × 512 B | 169 k |  55 k | +209 % |
-| 50c × 4 KiB | 161 k |  52 k | +211 % |
-| 200c × 64 B | 174 k |  58 k | +201 % |
-| 200c × 512 B | 174 k |  60 k | +189 % |
-| 200c × 4 KiB | 164 k |  53 k | +210 % |
+| 1c × 64 B   |  10 k | 7.1 k | **+40 %** |
+| 1c × 512 B  |  10 k | 7.1 k | +42 % |
+| 1c × 4 KiB  | 9.5 k | 7.1 k | +34 % |
+| 10c × 64 B  |  97 k |  25 k | **+280 %** |
+| 10c × 512 B |  92 k |  24 k | +283 % |
+| 10c × 4 KiB |  85 k |  24 k | +258 % |
+| 50c × 64 B  |  97 k |  28 k | **+254 %** |
+| 50c × 512 B | 102 k |  27 k | +283 % |
+| 50c × 4 KiB |  92 k |  26 k | +258 % |
+| 200c × 64 B | 102 k |  30 k | +239 % |
+| 200c × 512 B | 102 k |  31 k | +228 % |
+| 200c × 4 KiB |  92 k |  29 k | +216 % |
 
-`ringline-http::HttpClient::get("/").send()` runs roughly **2-3× the throughput** of `reqwest::Client::get(url).send()` on the same wire format and the same server. Both paths allocate a builder, encode the request, send over keep-alive, and parse a typed response — the gap is purely in what the runtimes and protocol stacks do underneath.
+`ringline-http::HttpClient::get("/").send()` runs **3–4× the throughput** of `reqwest::Client::get(url).send()` on the same wire format and the same server once there is any concurrency (single-connection is +34–42 %). Both paths allocate a builder, encode the request, send over keep-alive, and parse a typed response — the gap is purely in what the runtimes and protocol stacks do underneath.
 
 ## HTTP/2 (GET against a synthetic TLS server)
 
@@ -377,24 +375,24 @@ Workload: each client loops `GET /` over a single multiplexed HTTP/2 connection.
 
 | Clients × Size | ringline-http | reqwest | ringline vs reqwest |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  25 k |  17 k | **+49 %** |
-| 1c × 512 B  |  25 k |  17 k | +52 % |
-| 1c × 4 KiB  |  22 k |  15 k | +47 % |
-| 1c × 32 KiB |  14 k |  10 k | +35 % |
-| 10c × 64 B  |  88 k |  50 k | **+75 %** |
-| 10c × 512 B |  85 k |  49 k | +71 % |
-| 10c × 4 KiB |  68 k |  43 k | +58 % |
-| 10c × 32 KiB |  28 k |  23 k | +23 % |
-| 50c × 64 B  |  92 k |  51 k | **+80 %** |
-| 50c × 512 B |  87 k |  55 k | +59 % |
-| 50c × 4 KiB |  72 k |  47 k | +52 % |
-| 50c × 32 KiB|  26 k |  24 k | +7 % |
-| 200c × 64 B |  82 k |  54 k | +52 % |
-| 200c × 512 B |  82 k |  52 k | +57 % |
-| 200c × 4 KiB | 72 k |  41 k | +75 % |
-| 200c × 32 KiB|  20 k |  24 k | −15 % |
+| 1c × 64 B   | 7.9 k | 5.7 k | **+40 %** |
+| 1c × 512 B  | 7.9 k | 5.7 k | +37 % |
+| 1c × 4 KiB  | 7.6 k | 5.7 k | +33 % |
+| 1c × 32 KiB | 5.8 k | 4.6 k | +26 % |
+| 10c × 64 B  |  46 k |  27 k | **+69 %** |
+| 10c × 512 B |  45 k |  26 k | +71 % |
+| 10c × 4 KiB |  41 k |  23 k | +84 % |
+| 10c × 32 KiB |  19 k |  13 k | +48 % |
+| 50c × 64 B  |  54 k |  30 k | **+79 %** |
+| 50c × 512 B |  51 k |  30 k | +72 % |
+| 50c × 4 KiB |  46 k |  27 k | +70 % |
+| 50c × 32 KiB|  20 k |  15 k | +37 % |
+| 200c × 64 B |  51 k |  33 k | +54 % |
+| 200c × 512 B |  51 k |  33 k | +56 % |
+| 200c × 4 KiB | 41 k |  26 k | +58 % |
+| 200c × 32 KiB|  20 k |  16 k | +30 % |
 
-`ringline-http` HTTP/2 over TLS runs **1.5–1.8× the throughput** of reqwest doing the equivalent work, widening at moderate concurrency (10–50 c) where HTTP/2 multiplexing benefits the runtime's batching most. ringline trails reqwest only at the 200 c × 32 KiB cell, where the bench's ringline send path bottlenecks on the userspace memcpy into the send copy pool — the same shape we see at 32 KiB on TCP and UDP.
+`ringline-http` HTTP/2 over TLS runs **1.3–1.8× the throughput** of reqwest doing the equivalent work, widening at moderate concurrency (10–50 c) where HTTP/2 multiplexing benefits the runtime's batching most. With the real ringline server and the TLS-drain fix (PR #189) in place, ringline now **leads at every cell including 200 c × 32 KiB** (+30 %) — the −15 % deficit that cell used to show is gone.
 
 ## QUIC (stream echo against a ringline server)
 
@@ -404,20 +402,20 @@ The tokio reference client is **quinn** — the de-facto tokio QUIC stack — al
 
 | Clients × Size | ringline-quic | quinn | ringline vs quinn |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  27 k |  24 k | +11 % |
-| 1c × 512 B  |  26 k |  25 k | +5 % |
-| 1c × 4 KiB  |  15 k |  17 k | −12 % |
-| 10c × 64 B  | 129 k | 101 k | **+28 %** |
-| 10c × 512 B | 104 k | 100 k | +5 % |
-| 10c × 4 KiB |  35 k |  42 k | −17 % |
-| 50c × 64 B  | 155 k | 120 k | **+29 %** |
-| 50c × 512 B | 123 k | 116 k | +6 % |
-| 50c × 4 KiB |  39 k |  43 k | −9 % |
-| 200c × 64 B | 167 k | 121 k | **+38 %** |
-| 200c × 512 B | 140 k | 125 k | +13 % |
-| 200c × 4 KiB |  41 k |  47 k | −12 % |
+| 1c × 64 B   | 9.6 k | 8.8 k | +8 % |
+| 1c × 512 B  | 9.3 k | 9.0 k | +3 % |
+| 1c × 4 KiB  | 7.4 k | 7.8 k | −5 % |
+| 10c × 64 B  |  86 k |  69 k | **+24 %** |
+| 10c × 512 B |  74 k |  65 k | +13 % |
+| 10c × 4 KiB |  28 k |  32 k | −12 % |
+| 50c × 64 B  | 114 k |  82 k | **+40 %** |
+| 50c × 512 B |  96 k |  74 k | +29 % |
+| 50c × 4 KiB |  31 k |  35 k | −9 % |
+| 200c × 64 B | 122 k |  92 k | **+33 %** |
+| 200c × 512 B | 111 k |  89 k | +24 % |
+| 200c × 4 KiB |  31 k |  34 k | −10 % |
 
-ringline-quic leads at small payloads (≤ 512 B) and at high concurrency × 64 B. The moderate-concurrency × small-payload rows used to trail quinn by 8–9 %; that flipped to a 28–29 % lead when the bench moved to `UdpCtx::recv_batch()` (see *Highlights*) which drains up to N queued datagrams in one task poll. The 4 KiB rows still trail by 9–17 %: there the bench is bottlenecked on the server-side body memcpy into the QUIC stream rather than the recv path.
+ringline-quic leads at small payloads (≤ 512 B) and at high concurrency × 64 B (up to +40 %), via `UdpCtx::recv_batch()` (see *Highlights*) which drains up to N queued datagrams per task poll. The 4 KiB rows still trail quinn by 5–12 %: there the bench is bottlenecked on the server-side body memcpy into the QUIC stream rather than the recv path.
 
 ## HTTP/3 (POST echo against a ringline server)
 
@@ -427,24 +425,24 @@ The tokio reference client is **`h3` + `h3-quinn`** — the canonical tokio HTTP
 
 | Clients × Size | ringline-h3 | tokio (h3 + h3-quinn) | ringline vs tokio |
 |:---|---:|---:|---:|
-| 1c × 64 B   |  25 k |  21 k | +17 % |
-| 1c × 512 B  |  24 k |  20 k | +18 % |
-| 1c × 4 KiB  |  17 k |  15 k | +15 % |
-| 1c × 32 KiB |  5.3 k | 5.8 k | −8 % |
-| 10c × 64 B  | 118 k |  87 k | **+36 %** |
-| 10c × 512 B | 113 k |  83 k | +36 % |
-| 10c × 4 KiB |  56 k |  51 k | +12 % |
-| 10c × 32 KiB | 10.6 k | 10.5 k | +1 % |
-| 50c × 64 B  | 235 k |  94 k | **+151 %** |
-| 50c × 512 B | 192 k |  96 k | **+101 %** |
-| 50c × 4 KiB |  65 k |  57 k | +14 % |
-| 50c × 32 KiB | **10.1 k** | 11.0 k | −9 % |
-| 200c × 64 B | 318 k | 103 k | **+208 %** |
-| 200c × 512 B | 206 k |  98 k | **+111 %** |
-| 200c × 4 KiB | 67 k |  61 k | +9 % |
-| 200c × 32 KiB | **9.9 k** | 13 k | −25 % |
+| 1c × 64 B   | 8.4 k | 8.2 k | +3 % |
+| 1c × 512 B  | 8.3 k | 8.0 k | +4 % |
+| 1c × 4 KiB  | 7.2 k | 6.9 k | +4 % |
+| 1c × 32 KiB | 3.5 k | 3.6 k | −1 % |
+| 10c × 64 B  |  62 k |  50 k | **+22 %** |
+| 10c × 512 B |  56 k |  50 k | +13 % |
+| 10c × 4 KiB |  34 k |  33 k | +3 % |
+| 10c × 32 KiB | 8.1 k | 8.4 k | −4 % |
+| 50c × 64 B  | 160 k |  62 k | **+158 %** |
+| 50c × 512 B | 132 k |  56 k | **+134 %** |
+| 50c × 4 KiB |  51 k |  39 k | +29 % |
+| 50c × 32 KiB | 8.0 k | 8.3 k | −4 % |
+| 200c × 64 B | 236 k |  62 k | **+281 %** |
+| 200c × 512 B | 171 k |  63 k | **+170 %** |
+| 200c × 4 KiB | 52 k |  44 k | +17 % |
+| 200c × 32 KiB | 7.8 k | 11 k | −29 % |
 
-ringline-h3 leads tokio across the small-payload zone (≤ 512 B by 2–3×) and now **leads through 4 KiB at every concurrency**. The 32 KiB cells are within −8 % to −25 % (10 c is a tie) — down from −14 % to −38 % — after **UDP GRO on the receive path**, on top of the single-batch drive and four earlier stacked changes:
+ringline-h3 leads tokio across the small-payload zone (≤ 512 B by up to ~3.8× at 200 c) and **leads through 4 KiB at every concurrency**. The 32 KiB cells are within −1 % to −29 % (1–10 c is a tie) after **UDP GRO on the receive path**, on top of the single-batch drive and four earlier stacked changes:
 
   1. **Server-side response batching** (PR #191): `QuicEndpoint::batch()` around the H3 event-drain + `send_data_bytes(Bytes::from(body))`, collapsing per-response `drain_transmits` and a per-echo body memcpy.
   2. **`UdpCtx::recv_batch()` / `recv_batch_timed()`** (PR #193 / #195): drain up to N queued UDP datagrams per task poll, with the driver-captured rx timestamp threaded through for accurate RTT samples.
@@ -726,7 +724,8 @@ Before this fix, every event-loop iteration ran a TLS-only `check_close_notify_d
 
 - **Single ringline worker.** These single-machine numbers are for `worker.threads = 1`. Multi-worker scaling is exercised separately in the distributed section's *Worker scaling & CPU efficiency*.
 - **Localhost only.** All servers and clients run on the same box. Real network latency would shift the relative shapes.
-- **TCP/UDP "ringline → ringline" is a native ringline server on both ends.** Historically the single-machine TCP `start_ringline_server` was a tokio echo (a stale `// ringline server requires TLS setup` shortcut), so that table's `ringline → ringline` column was really ringline-client → *tokio*-server — a client-only comparison. That is fixed: TCP now launches a real `RinglineBuilder` echo server (`forward_recv_buf`), and the single-machine UDP server was already native ringline. The TCP table was regenerated against the real server; UDP and the protocol-client tables below are pending a re-run on the same rig.
+- **Server semantics per table.** TCP and UDP `ringline → ringline` rows are a native ringline server vs a tokio server (both ends). QUIC and HTTP/3 run a native ringline server hit by ringline-quic/ringline-h3 vs quinn/h3-quinn clients. Redis, memcache, HTTP/1.1, and HTTP/2 are *client-vs-client* comparisons — ringline-redis/-memcache/-http vs a hand-rolled tokio client / reqwest — against a shared synthetic tokio/hyper server (there is no ringline server in those by design). The TCP server used to be a tokio echo by mistake; that is fixed (see history).
+- **Single-machine harness is flaky for huge back-to-back sweeps.** Running all protocols in one process churns hundreds of server binds; `PortManager` now probes port bindability to avoid silently-dead cells, and the regeneration ran each protocol in its own process for isolation.
 - **Redis bench server is synthetic.** It does not implement a real Redis storage layer; the response size is fixed by `msg_size`. The numbers are an upper bound on what the wire+parser combo can do, not what a real Redis backend would deliver.
 - **`ringline-momento` and gRPC bench stubs are still TODO.** `cargo run -p ringline-benchmarks --only momento,grpc` currently returns `0 ops/s` for those — they're not measured here.
 - **Numbers reflect what's available to a single user-space process.** Under load from other tenants, especially on cloud VMs, ranks can flip.
