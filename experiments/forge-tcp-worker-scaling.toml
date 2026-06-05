@@ -1,0 +1,253 @@
+# Forge port of the TCP echo worker-scaling + CPU-efficiency sweep.
+#
+# Runs on EC2 Graviton4 (c8g) via forge one-shot instances, in a cluster
+# placement group, so each run is a genuine two-machine, switched-network
+# measurement. Graviton has no SMT (1 thread/core), so c8g.4xlarge = 16 real
+# physical cores and the worker sweep 1/2/4/8/16 maps to actual cores with no
+# hyperthread confound — the thing the 4-core z*.n.small rig could not give us.
+#
+#   server: c8g.4xlarge  (16 physical cores — unit under test)
+#   client: c8g.8xlarge  (32 cores — sized so it never bottlenecks the server)
+#
+# Matrix: 5 workers x 2 conn x 2 size = 20 variants, 5 fixed runs each = 100 runs.
+# Build is per-run (one-shot instances); ~6 min of the ~10 min/run is cargo.
+# CPU efficiency: background /proc/<pid>/stat sampler on the server, warmup
+# trimmed in post-processing (same method/parser as the SystemsLab run).
+
+# forge appends -SERVER_WORKERS=..-CLIENTS=..-MSG_SIZE=.. per variant, so a
+# static prefix is enough (the name field is not {var}-interpolated).
+name = "ringline-tcp-ws"
+
+# Fixed 5x replication (min == max disables the adaptive early-stop).
+[replication.adaptive]
+min_runs = 5
+max_runs = 5
+confidence_level = 0.95
+relative_ci_threshold = 0.05
+
+[params]
+RINGLINE_REPO    = "https://github.com/brayniac/ringline"
+RINGLINE_VERSION = "main"
+PORT             = "7878"
+CLIENT_THREADS   = "16"
+WARMUP_DURATION  = "10"
+TEST_DURATION    = "30"
+
+[matrix]
+SERVER_WORKERS = ["1", "2", "4", "8", "16"]
+CLIENTS        = ["64", "512"]
+MSG_SIZE       = ["256", "4096"]
+
+# ── Server job: ringline bench-server on c8g.4xlarge (16 physical cores) ──────
+
+[[jobs]]
+name = "server"
+alias = "SERVER"
+port = 7878
+tags = ["c8g-4xlarge"]
+instance_type = "c8g.4xlarge"
+ami_id = "ami-00f9bd78b9eb2c2d0"
+spot_preference = "auto"
+
+[[jobs.steps]]
+type = "shell"
+command = """
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+# Fresh Ubuntu instances run cloud-init + unattended-upgrades on boot, which
+# hold the dpkg/apt lock. Racing apt-get against them fails fast with exit 1
+# (and -qq hides the error). Wait for cloud-init and the lock before apt.
+sudo cloud-init status --wait 2>/dev/null || true
+for i in $(seq 1 100); do
+    sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 || break
+    echo "apt/dpkg lock held, waiting ($i)..."
+    sleep 3
+done
+sudo apt-get update
+sudo apt-get install -y git build-essential pkg-config libssl-dev cmake clang libclang-dev perl netcat-openbsd
+if ! command -v cargo >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+fi
+. "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline && git fetch --all && git checkout ${RINGLINE_VERSION} && git reset --hard origin/${RINGLINE_VERSION}
+else
+    git clone ${RINGLINE_REPO} /tmp/ringline && cd /tmp/ringline && git checkout ${RINGLINE_VERSION}
+fi
+cd /tmp/ringline
+cargo build --release --bin bench-server
+sudo install -m 755 target/release/bench-server /usr/local/bin/bench-server
+echo "bench-server build OK"
+"""
+
+[[jobs.steps]]
+type = "shell"
+command = """
+sudo sysctl -w net.core.somaxconn=65535
+sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo fuser -k ${PORT}/tcp 2>/dev/null || true
+sleep 1
+echo "System tuning complete"
+"""
+
+[[jobs.steps]]
+type = "shell"
+background = true
+command = """
+ulimit -n 500000
+exec bench-server \
+    --runtime ringline \
+    --addr 0.0.0.0:${PORT} \
+    --workers ${SERVER_WORKERS} \
+    --msg-size ${MSG_SIZE}
+"""
+
+[[jobs.steps]]
+type = "shell"
+command = """
+for i in $(seq 1 30); do
+    nc -z localhost ${PORT} 2>/dev/null && echo "Server ready on port ${PORT}" && exit 0
+    echo "Waiting for server... ($i/30)"
+    sleep 1
+done
+echo "ERROR: bench-server failed to start on port ${PORT}"
+exit 1
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+
+# Background CPU sampler: server-process utime+stime once a second across the
+# whole warmup+test window. Post-processing drops the warmup samples.
+[[jobs.steps]]
+type = "shell"
+background = true
+command = """
+PID=$(pgrep -x bench-server | head -1)
+CLK=$(getconf CLK_TCK)
+echo "kind epoch_ms clk_tck utime stime" > cpu-samples.log
+echo "start $(date +%s%3N) $CLK 0 0" >> cpu-samples.log
+for i in $(seq 1 $(( ${WARMUP_DURATION} + ${TEST_DURATION} + 5 ))); do
+    read -r _ _ _ _ _ _ _ _ _ _ _ _ _ U S _ < /proc/$PID/stat 2>/dev/null || break
+    echo "tick $(date +%s%3N) $CLK $U $S" >> cpu-samples.log
+    sleep 1
+done
+echo "cpu sampler done"
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"
+
+[[jobs.steps]]
+type = "shell"
+command = "sleep 8; echo '=== cpu-samples.log ==='; cat cpu-samples.log"
+
+[[jobs.steps]]
+type = "upload_artifact"
+name = "cpu-samples.log"
+path = "cpu-samples.log"
+tags = ["cpu"]
+
+[[jobs.steps]]
+type = "shell"
+command = """
+echo "=== TCP socket stats ==="
+ss -s
+echo "=== retransmit / drop counters ==="
+nstat -az 2>/dev/null | grep -iE 'retrans|drop|rcvbuferr|listendrop' || true
+"""
+
+# ── Client job: ringline bench-client on c8g.8xlarge (32 cores) ───────────────
+
+[[jobs]]
+name = "client"
+tags = ["c8g-8xlarge"]
+instance_type = "c8g.8xlarge"
+ami_id = "ami-00f9bd78b9eb2c2d0"
+spot_preference = "auto"
+
+[[jobs.steps]]
+type = "shell"
+command = """
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+sudo cloud-init status --wait 2>/dev/null || true
+for i in $(seq 1 100); do
+    sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 || break
+    echo "apt/dpkg lock held, waiting ($i)..."
+    sleep 3
+done
+sudo apt-get update
+sudo apt-get install -y git build-essential pkg-config libssl-dev cmake clang libclang-dev perl netcat-openbsd
+if ! command -v cargo >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+fi
+. "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline && git fetch --all && git checkout ${RINGLINE_VERSION} && git reset --hard origin/${RINGLINE_VERSION}
+else
+    git clone ${RINGLINE_REPO} /tmp/ringline && cd /tmp/ringline && git checkout ${RINGLINE_VERSION}
+fi
+cd /tmp/ringline
+cargo build --release --bin bench-client
+sudo install -m 755 target/release/bench-client /usr/local/bin/bench-client
+echo "bench-client build OK"
+"""
+
+[[jobs.steps]]
+type = "shell"
+command = """
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+sudo sysctl -w net.ipv4.tcp_fin_timeout=15
+sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+echo "Client system tuning complete"
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+
+[[jobs.steps]]
+type = "shell"
+command = """
+echo "SERVER_ADDR=$SERVER_ADDR"
+for i in $(seq 1 30); do
+    nc -z "${SERVER_ADDR%:*}" "${SERVER_ADDR##*:}" 2>/dev/null && echo "Server reachable at $SERVER_ADDR" && exit 0
+    echo "Waiting for server to be reachable... ($i/30)"
+    sleep 1
+done
+echo "ERROR: Failed to connect to server at $SERVER_ADDR"
+exit 1
+"""
+
+[[jobs.steps]]
+type = "shell"
+command = """
+ulimit -n 500000
+bench-client \
+    --runtime ringline \
+    --addr "$SERVER_ADDR" \
+    --clients ${CLIENTS} \
+    --msg-size ${MSG_SIZE} \
+    --warmup ${WARMUP_DURATION} \
+    --duration ${TEST_DURATION} \
+    --threads ${CLIENT_THREADS} \
+    > results.json
+cat results.json
+"""
+
+[[jobs.steps]]
+type = "upload_artifact"
+name = "results.json"
+path = "results.json"
+tags = ["results"]
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"
