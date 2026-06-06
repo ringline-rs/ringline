@@ -84,6 +84,8 @@ async fn run_tokio_open_client(
     measure: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     ops_counter: Arc<AtomicU64>,
+    svc_out: Arc<Mutex<Vec<Vec<u64>>>>,
+    lag_out: Arc<Mutex<Vec<Vec<u64>>>>,
 ) -> LatencyHistogram {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -99,7 +101,11 @@ async fn run_tokio_open_client(
     let (mut rd, mut wr) = stream.into_split();
 
     let interval = 1.0 / per_conn_rate; // seconds between sends on this connection
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Instant>();
+    // Each in-flight request carries (scheduled time, actual send time) so the
+    // reader can decompose the response time into offer-lag (send − scheduled,
+    // the coordinated-omission/back-pressure component) and service time
+    // (recv − actual send, the true wire+server latency).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Instant, Instant)>();
     let received = Arc::new(AtomicU64::new(0));
 
     // Reader task: drains responses, matches each to its scheduled send time
@@ -111,6 +117,8 @@ async fn run_tokio_open_client(
         let stop = stop.clone();
         tokio::spawn(async move {
             let mut histogram = LatencyHistogram::new();
+            let mut svc_local: Vec<u64> = Vec::new();
+            let mut lag_local: Vec<u64> = Vec::new();
             let mut buf = vec![0u8; msg_size];
             let mut local_ops: u64 = 0;
             loop {
@@ -136,19 +144,27 @@ async fn run_tokio_open_client(
                         }
                     } => { break; }
                 }
-                let sched = match rx.recv().await {
+                let (sched, sent_at) = match rx.recv().await {
                     Some(s) => s,
                     None => break,
                 };
                 received.fetch_add(1, Ordering::Relaxed);
                 if measure.load(Ordering::Relaxed) {
-                    histogram.record(sched.elapsed().as_nanos() as u64);
+                    let now = Instant::now();
+                    // CO-corrected response time (recv − scheduled).
+                    histogram.record(now.saturating_duration_since(sched).as_nanos() as u64);
+                    // True service time (recv − actual send).
+                    svc_local.push(now.saturating_duration_since(sent_at).as_nanos() as u64);
+                    // Offer lag (actual send − scheduled): the CO/back-pressure part.
+                    lag_local.push(sent_at.saturating_duration_since(sched).as_nanos() as u64);
                     local_ops += 1;
                     if local_ops & 0xFF == 0 {
                         ops_counter.fetch_add(256, Ordering::Relaxed);
                     }
                 }
             }
+            svc_out.lock().unwrap().push(svc_local);
+            lag_out.lock().unwrap().push(lag_local);
             histogram
         })
     };
@@ -204,10 +220,14 @@ async fn run_tokio_open_client(
             stop.store(true, Ordering::Relaxed);
             break;
         }
+        // Timestamp the actual completion of the write — shared by the whole
+        // batch. This is the "send" point for service-time accounting; the gap
+        // from each request's scheduled time is its offer lag.
+        let sent_at = Instant::now();
         let mut failed = false;
         for k in 0..want as u64 {
             let sched = start + Duration::from_secs_f64(interval * (sent + k) as f64);
-            if tx.send(sched).is_err() {
+            if tx.send((sched, sent_at)).is_err() {
                 stop.store(true, Ordering::Relaxed);
                 failed = true;
                 break;
@@ -260,6 +280,13 @@ mod ringline_client {
         pub histograms: Arc<Mutex<Vec<Vec<u64>>>>,
         /// `Some` => open-loop (rate-controlled); `None` => closed-loop.
         pub open: Option<OpenLoop>,
+        /// Open-loop decomposition (per-connection sample vecs, ns). `svc` =
+        /// service time (recv - actual send_nowait); `lag` = offer lag
+        /// (actual send - scheduled), the coordinated-omission/back-pressure
+        /// component. Empty for closed-loop. The existing `histograms` keeps the
+        /// CO-corrected response time (recv - scheduled).
+        pub svc: Arc<Mutex<Vec<Vec<u64>>>>,
+        pub lag: Arc<Mutex<Vec<Vec<u64>>>>,
     }
 
     struct ClientHandler {
@@ -432,8 +459,10 @@ mod ringline_client {
         const SEND_BURST: usize = 256;
         let start = Instant::now();
         let mut sent: u64 = 0;
-        let mut fifo: VecDeque<Instant> = VecDeque::new();
+        let mut fifo: VecDeque<(Instant, Instant)> = VecDeque::new();
         let mut samples: Vec<u64> = Vec::with_capacity(1_000_000);
+        let mut svc: Vec<u64> = Vec::with_capacity(1_000_000);
+        let mut lag: Vec<u64> = Vec::with_capacity(1_000_000);
         let mut local_ops: u64 = 0;
         // Bytes received toward the next not-yet-complete response, carried
         // across recv wakes (responses are a fixed msg_size byte stream).
@@ -461,7 +490,7 @@ mod ringline_client {
                     pool_full = true;
                     break; // send pool full; drain responses first
                 }
-                fifo.push_back(target);
+                fifo.push_back((target, Instant::now()));
                 sent += 1;
                 burst += 1;
             }
@@ -505,10 +534,13 @@ mod ringline_client {
             partial -= completed * msg_size;
             let measuring = state.measure.load(Ordering::Relaxed);
             for _ in 0..completed {
-                if let Some(sched) = fifo.pop_front()
+                if let Some((sched, sent_at)) = fifo.pop_front()
                     && measuring
                 {
-                    samples.push(sched.elapsed().as_nanos() as u64);
+                    let now = Instant::now();
+                    samples.push(now.saturating_duration_since(sched).as_nanos() as u64);
+                    svc.push(now.saturating_duration_since(sent_at).as_nanos() as u64);
+                    lag.push(sent_at.saturating_duration_since(sched).as_nanos() as u64);
                     local_ops += 1;
                     if local_ops & 0xFF == 0 {
                         state.ops.fetch_add(256, Ordering::Relaxed);
@@ -518,6 +550,8 @@ mod ringline_client {
         }
         state.ops.fetch_add(local_ops & 0xFF, Ordering::Relaxed);
         state.histograms.lock().unwrap().push(samples);
+        state.svc.lock().unwrap().push(svc);
+        state.lag.lock().unwrap().push(lag);
     }
 
     pub struct RinglineClientRuntime {
@@ -643,6 +677,10 @@ fn run_bench_tokio(
     let measure = Arc::new(AtomicBool::new(false));
     let per_conn_rate = open.map(|o| o.rate as f64 / num_clients.max(1) as f64);
 
+    // Open-loop decomposition accumulators (per-connection ns sample vecs).
+    let svc = Arc::new(Mutex::new(Vec::new()));
+    let lag = Arc::new(Mutex::new(Vec::new()));
+
     let mut task_handles = Vec::with_capacity(num_clients);
     for _ in 0..num_clients {
         let addr = addr.to_string();
@@ -659,6 +697,8 @@ fn run_bench_tokio(
                 measure,
                 stop,
                 ops,
+                svc.clone(),
+                lag.clone(),
             )));
         } else {
             task_handles.push(client_rt.spawn(run_tokio_client(addr, msg_size, stop, ops)));
@@ -693,6 +733,11 @@ fn run_bench_tokio(
 
     client_rt.shutdown_timeout(Duration::from_secs(1));
 
+    if open.is_some() {
+        summarize_decomp("service recv-send", &svc.lock().unwrap());
+        summarize_decomp("offer_lag send-sched", &lag.lock().unwrap());
+    }
+
     // For open-loop, achieved throughput = measured responses; derive it from
     // the sample count so it stays consistent with the latency histogram.
     let total_ops = if open.is_some() {
@@ -710,6 +755,26 @@ fn run_bench_tokio(
     }
 }
 
+/// Print a percentile summary (µs) of flattened per-connection ns samples to
+/// stderr — used for the open-loop service-time / offer-lag decomposition.
+fn summarize_decomp(label: &str, per_conn: &[Vec<u64>]) {
+    let mut all: Vec<u64> = per_conn.iter().flatten().copied().collect();
+    if all.is_empty() {
+        return;
+    }
+    all.sort_unstable();
+    let n = all.len();
+    let q = |num: usize, den: usize| all[(n * num / den).min(n - 1)] / 1000;
+    eprintln!(
+        "[openloop-decomp] {label}: n={n} p50={}us p90={}us p99={}us p999={}us max={}us",
+        q(50, 100),
+        q(90, 100),
+        q(99, 100),
+        q(999, 1000),
+        all[n - 1] / 1000,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_bench_ringline(
     addr: &str,
@@ -724,6 +789,8 @@ fn run_bench_ringline(
     conn_chunk_size: usize,
 ) -> BenchResult {
     let histograms = Arc::new(Mutex::new(Vec::new()));
+    let svc = Arc::new(Mutex::new(Vec::new()));
+    let lag = Arc::new(Mutex::new(Vec::new()));
     let measure = Arc::new(AtomicBool::new(false));
 
     let state = Arc::new(ringline_client::ClientState {
@@ -737,6 +804,8 @@ fn run_bench_ringline(
         ops: ops.clone(),
         histograms: histograms.clone(),
         open,
+        svc: svc.clone(),
+        lag: lag.clone(),
     });
 
     let client_rt = match ringline_client::RinglineClientRuntime::start(state, workers.max(1)) {
@@ -768,11 +837,22 @@ fn run_bench_ringline(
     client_rt.stop();
 
     let mut merged = LatencyHistogram::new();
-    let collected = histograms.lock().unwrap();
-    for samples in collected.iter() {
-        for &sample in samples {
-            merged.record(sample);
+    {
+        let collected = histograms.lock().unwrap();
+        for samples in collected.iter() {
+            for &sample in samples {
+                merged.record(sample);
+            }
         }
+    }
+
+    // Open-loop decomposition: corrected response time (above) = service time
+    // (recv-actual_send) + offer lag (actual_send-scheduled). offer_lag ~ 0 ==
+    // clean open-loop; growing offer_lag == back-pressure/coordinated-omission
+    // contamination (past capacity).
+    if open.is_some() {
+        summarize_decomp("service recv-send", &svc.lock().unwrap());
+        summarize_decomp("offer_lag send-sched", &lag.lock().unwrap());
     }
 
     // For open-loop, achieved throughput = measured responses; derive it from

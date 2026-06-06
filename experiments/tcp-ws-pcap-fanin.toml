@@ -1,0 +1,194 @@
+name = "tcp-pcap-fanin {runtime} {clients}c"
+
+# Localizes the fan-in service-latency finding to the SERVER event loop.
+# Server-side tcpdump on the VF, open-loop 50k rps (sub-saturation), at 32c and
+# 512c, ringline vs tokio server. Offline we compute per-connection
+# recv->send hold (request-arrival -> response-departure) from the server's own
+# wire timestamps — no cross-host clock sync needed.
+#
+# Prediction (if the fan-in latency is in the ringline server loop): ringline's
+# on-wire recv->send hold rises from 32c to 512c, while tokio's stays flat. If
+# instead the hold is flat for both, the conn-scaling latency seen client-side
+# is NOT the server loop (would point at client/net), and we look elsewhere.
+
+[params]
+ringline_repo    = "https://github.com/brayniac/ringline"
+ringline_version = "perf/bench-tick-flag"
+port             = "7878"
+client_threads   = "8"
+client_runtime   = "ringline"
+offered_rate     = "50000"
+max_inflight     = "256"
+warmup_duration  = "5"
+test_duration    = "25"
+server_workers   = "4"
+msg_size         = "256"
+
+[matrix]
+runtime = ["ringline", "tokio"]
+clients = ["32", "512"]
+
+# ── Server ───────────────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "server"
+tags = ["z1.n.medium"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+export DEBIAN_FRONTEND=noninteractive
+for i in $(seq 1 30); do sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; echo "apt lock held ($i)"; sleep 2; done
+sudo apt-get update || true
+sudo apt-get install -y git build-essential pkg-config libssl-dev cmake clang libclang-dev perl tcpdump
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline && git fetch --all && git checkout {ringline_version} && git reset --hard origin/{ringline_version}
+else
+    git clone {ringline_repo} /tmp/ringline && cd /tmp/ringline && git checkout {ringline_version}
+fi
+cd /tmp/ringline
+cargo build --release --bin bench-server
+sudo cp target/release/bench-server /usr/local/bin/bench-server
+echo "bench-server build OK ($(git rev-parse --short HEAD))"
+"""
+
+[[jobs.steps]]
+name = "tune-system"
+type = "shell"
+command = """
+sudo sysctl -w net.core.somaxconn=65535
+sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo fuser -k {port}/tcp 2>/dev/null || true
+sleep 1
+echo "tuned"
+"""
+
+[[jobs.steps]]
+name = "start-server"
+type = "shell"
+background = true
+command = """
+ulimit -n 500000
+exec bench-server --runtime {runtime} --addr 0.0.0.0:{port} --workers {server_workers} --msg-size {msg_size}
+"""
+
+[[jobs.steps]]
+name = "wait-for-server"
+type = "shell"
+command = """
+for i in $(seq 1 30); do
+    nc -z localhost {port} 2>/dev/null && echo "ready" && exit 0
+    sleep 1
+done
+echo "ERROR: server did not start"; exit 1
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+
+# Capture a bounded window of payload packets mid-steady-state (after warmup).
+# -tt = unix timestamps; both directions; only data packets (non-zero payload).
+[[jobs.steps]]
+name = "capture"
+type = "shell"
+command = """
+IFACE=$(ip -o -4 addr show | awk '$4 ~ /^10\\.0\\./{print $2; exit}')
+echo "capturing on $IFACE"
+sleep 12
+sudo timeout 4 tcpdump -tt -nn -S -i "$IFACE" -c 200000 \
+  "tcp port {port} and ((ip[2:2] - ((ip[0]&0xf)<<2) - ((tcp[12]&0xf0)>>2)) != 0)" \
+  > /tmp/srv-cap.txt 2>/dev/null || true
+echo "captured $(wc -l < /tmp/srv-cap.txt) payload packets on $IFACE"
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"
+
+[[jobs.steps]]
+name = "graceful-stop"
+type = "shell"
+command = "sudo pkill -TERM -x bench-server 2>/dev/null || true; sleep 4; echo stopped"
+
+[[jobs.steps]]
+name = "upload-pcap"
+type = "upload_artifact"
+path = "/tmp/srv-cap.txt"
+
+# ── Client ───────────────────────────────────────────────────────────────────
+
+[[jobs]]
+name = "client"
+tags = ["z2.n.medium"]
+
+[[jobs.steps]]
+name = "build"
+type = "shell"
+command = """
+export DEBIAN_FRONTEND=noninteractive
+for i in $(seq 1 30); do sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; echo "apt lock held ($i)"; sleep 2; done
+sudo apt-get update || true
+sudo apt-get install -y git build-essential pkg-config libssl-dev cmake clang libclang-dev perl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+if [ -d /tmp/ringline ]; then
+    cd /tmp/ringline && git fetch --all && git checkout {ringline_version} && git reset --hard origin/{ringline_version}
+else
+    git clone {ringline_repo} /tmp/ringline && cd /tmp/ringline && git checkout {ringline_version}
+fi
+cd /tmp/ringline
+cargo build --release --bin bench-client
+sudo cp target/release/bench-client /usr/local/bin/bench-client
+echo "bench-client build OK"
+"""
+
+[[jobs.steps]]
+name = "tune-system"
+type = "shell"
+command = """
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+echo "tuned"
+"""
+
+[[jobs.steps]]
+type = "barrier"
+name = "server-ready"
+
+[[jobs.steps]]
+name = "verify-connectivity"
+type = "shell"
+command = """
+for i in $(seq 1 30); do
+    nc -z "$SERVER_ADDR" {port} 2>/dev/null && echo "reachable" && exit 0
+    sleep 1
+done
+echo "ERROR: cannot reach $SERVER_ADDR:{port}"; exit 1
+"""
+
+[[jobs.steps]]
+name = "run-benchmark"
+type = "shell"
+command = """
+ulimit -n 500000
+bench-client --runtime {client_runtime} --addr "$SERVER_ADDR:{port}" --clients {clients} --msg-size {msg_size} --warmup {warmup_duration} --duration {test_duration} --threads {client_threads} --open --rate {offered_rate} --max-inflight {max_inflight} > results.json 2> decomp.txt
+echo "=== results.json ==="; cat results.json
+echo "=== decomp (stderr) ==="; grep openloop-decomp decomp.txt || cat decomp.txt
+"""
+
+[[jobs.steps]]
+name = "upload-decomp"
+type = "upload_artifact"
+path = "decomp.txt"
+
+[[jobs.steps]]
+type = "barrier"
+name = "benchmark-complete"
