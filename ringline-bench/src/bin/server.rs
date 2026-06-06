@@ -47,10 +47,77 @@ struct Args {
     /// at low connection counts, keeping per-worker CQE density high for batching.
     #[arg(long, default_value_t = 1)]
     conn_chunk_size: usize,
+
+    /// Restrict the whole process to these logical CPUs, e.g. `0-7,16-23` or
+    /// `12,13,14,15` (the "taskset the task" model). When set, the process
+    /// affinity mask is applied before launch and ringline's per-worker core
+    /// pinning is disabled (so it doesn't pin to cores outside the mask).
+    /// Pass `--workers N` to match the number of physical cores in the list.
+    #[arg(long)]
+    cpu_list: Option<String>,
+}
+
+/// Parse a cpu-list spec (`0-7,16-23` / `12,13,14,15`) into logical CPU ids.
+fn parse_cpu_list(spec: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            let lo: usize = lo.trim().parse().expect("invalid cpu-list range start");
+            let hi: usize = hi.trim().parse().expect("invalid cpu-list range end");
+            cpus.extend(lo..=hi);
+        } else {
+            cpus.push(part.parse().expect("invalid cpu-list entry"));
+        }
+    }
+    cpus
+}
+
+/// Pin the current process to `cpus` via `sched_setaffinity` (taskset-equivalent,
+/// in-process). Worker threads spawned afterwards inherit this mask.
+#[cfg(target_os = "linux")]
+fn apply_cpu_affinity(cpus: &[usize]) {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        for &c in cpus {
+            libc::CPU_SET(c, &mut set);
+        }
+        let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if ret != 0 {
+            panic!(
+                "sched_setaffinity({cpus:?}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Process CPU affinity is not supported on this platform (no-op).
+#[cfg(not(target_os = "linux"))]
+fn apply_cpu_affinity(_cpus: &[usize]) {
+    eprintln!("bench-server: --cpu-list ignored (CPU affinity unsupported on this platform)");
 }
 
 fn main() {
     let args = Args::parse();
+
+    // Apply process CPU affinity before launch so worker threads inherit it.
+    // Disables ringline's own per-worker pinning (see run_ringline) to avoid
+    // pinning workers to cores outside the requested mask.
+    let pin_to_core = match &args.cpu_list {
+        Some(spec) => {
+            let cpus = parse_cpu_list(spec);
+            assert!(!cpus.is_empty(), "--cpu-list parsed to an empty set");
+            apply_cpu_affinity(&cpus);
+            eprintln!("bench-server: pinned process to CPUs {cpus:?}");
+            false
+        }
+        None => true,
+    };
 
     let workers = if args.workers == 0 {
         ringline::physical_core_count()
@@ -75,6 +142,7 @@ fn main() {
             args.msg_size,
             args.recv_forward,
             args.conn_chunk_size,
+            pin_to_core,
         ),
         Runtime::Tokio => run_tokio(args.addr, workers, args.msg_size),
     }
@@ -87,6 +155,7 @@ fn run_ringline(
     msg_size: usize,
     recv_forward: bool,
     conn_chunk_size: usize,
+    pin_to_core: bool,
 ) {
     use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
     // ParseResult is only needed in the non-io_uring fallback path.
@@ -154,7 +223,9 @@ fn run_ringline(
 
     let mut config = Config::default();
     config.worker.threads = workers;
-    config.worker.pin_to_core = true;
+    // When --cpu-list set a process affinity mask, leave the OS to schedule
+    // workers within it; otherwise pin each worker to its own core (0..N).
+    config.worker.pin_to_core = pin_to_core;
     config.sq_entries = 256;
     config.recv_buffer.ring_size = 256;
     config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
