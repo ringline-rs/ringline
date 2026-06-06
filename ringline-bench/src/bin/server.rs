@@ -164,7 +164,7 @@ fn run_ringline(
     config.conn_chunk_size = conn_chunk_size;
 
     let builder = RinglineBuilder::new(config).bind(addr);
-    let (_shutdown, handles) = if recv_forward {
+    let (shutdown, handles) = if recv_forward {
         builder.launch::<RecvForwardEchoHandler>()
     } else {
         builder.launch::<EchoHandler>()
@@ -172,6 +172,12 @@ fn run_ringline(
     .expect("failed to launch ringline server");
 
     eprintln!("bench-server: ready (recv_forward={recv_forward})");
+
+    // Block until SIGINT/SIGTERM, then trigger graceful shutdown so each
+    // worker's event loop runs its shutdown path — including the
+    // `[ringline diag]`/`[ringline stall]` counter dump. (A SIGKILL at
+    // teardown skips that, hiding the server-side loop diagnostics.)
+    shutdown.wait_on_signal();
 
     for h in handles {
         h.join().ok();
