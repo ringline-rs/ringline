@@ -150,7 +150,7 @@ ss -tn state established | head -20
 
 [[jobs]]
 name = "client"
-tags = ["z1.n.small"]
+tags = ["z2.n.small"]
 
 [[jobs.steps]]
 name = "build"
