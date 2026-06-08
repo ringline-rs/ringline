@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-08
+
 ### Breaking
 
 - Worker thread count now defaults to **physical core count** (read from sysfs
