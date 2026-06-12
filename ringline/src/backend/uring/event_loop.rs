@@ -112,6 +112,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
         }
 
+        // Wall-clock stall instrumentation costs ~4 clock reads per iteration,
+        // so it is opt-in: set RINGLINE_LOOP_DIAG=1 to record wait/work stall
+        // buckets (reported in the `[ringline stall]` line at shutdown). The
+        // cheap iteration-mix counters below are always on.
+        let loop_diag = std::env::var_os("RINGLINE_LOOP_DIAG").is_some();
+
         // ── Diagnostic counters (printed to stderr at shutdown) ────────────────
         // These measure the event-loop iteration mix to help diagnose client
         // throughput deficits.  All counters are u64 locals — zero overhead
@@ -138,7 +144,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let mut diag_work_ns_max: u64 = 0;
 
         loop {
-            let iter_start = std::time::Instant::now();
+            // Only read the clock when stall instrumentation is enabled.
+            let iter_start = if loop_diag {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             // Retry eventfd re-arm if a previous attempt failed (SQ was full).
             if !self.driver.eventfd_armed && !self.driver.shutdown_flag.load(Ordering::Relaxed) {
@@ -168,20 +179,29 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
 
-            let wait_start = std::time::Instant::now();
+            // The blocking wait itself is always performed; only the timing
+            // around it is gated on `loop_diag`.
+            let wait_start = if loop_diag {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             self.driver.ring.submit_and_wait(1)?;
-            let wait_ns = wait_start.elapsed().as_nanos() as u64;
-            if wait_ns >= 1_000_000 {
-                diag_wait_ge_1ms += 1;
-            }
-            if wait_ns >= 5_000_000 {
-                diag_wait_ge_5ms += 1;
-            }
-            if wait_ns >= 10_000_000 {
-                diag_wait_ge_10ms += 1;
-            }
-            if wait_ns > diag_wait_ns_max {
-                diag_wait_ns_max = wait_ns;
+            let mut wait_ns: u64 = 0;
+            if let Some(start) = wait_start {
+                wait_ns = start.elapsed().as_nanos() as u64;
+                if wait_ns >= 1_000_000 {
+                    diag_wait_ge_1ms += 1;
+                }
+                if wait_ns >= 5_000_000 {
+                    diag_wait_ge_5ms += 1;
+                }
+                if wait_ns >= 10_000_000 {
+                    diag_wait_ge_10ms += 1;
+                }
+                if wait_ns > diag_wait_ns_max {
+                    diag_wait_ns_max = wait_ns;
+                }
             }
 
             self.drain_completions();
@@ -204,15 +224,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     diag_tasks_1st as f64 / diag_iters.max(1) as f64,
                     diag_tasks_fp as f64 / diag_iters.max(1) as f64,
                 );
-                eprintln!(
-                    "[ringline stall] \
-                     wait_ge_1ms={diag_wait_ge_1ms} wait_ge_5ms={diag_wait_ge_5ms} \
-                     wait_ge_10ms={diag_wait_ge_10ms} wait_max={:.1}ms | \
-                     work_ge_1ms={diag_work_ge_1ms} work_ge_5ms={diag_work_ge_5ms} \
-                     work_ge_10ms={diag_work_ge_10ms} work_max={:.1}ms",
-                    diag_wait_ns_max as f64 / 1_000_000.0,
-                    diag_work_ns_max as f64 / 1_000_000.0,
-                );
+                if loop_diag {
+                    eprintln!(
+                        "[ringline stall] \
+                         wait_ge_1ms={diag_wait_ge_1ms} wait_ge_5ms={diag_wait_ge_5ms} \
+                         wait_ge_10ms={diag_wait_ge_10ms} wait_max={:.1}ms | \
+                         work_ge_1ms={diag_work_ge_1ms} work_ge_5ms={diag_work_ge_5ms} \
+                         work_ge_10ms={diag_work_ge_10ms} work_max={:.1}ms",
+                        diag_wait_ns_max as f64 / 1_000_000.0,
+                        diag_work_ns_max as f64 / 1_000_000.0,
+                    );
+                }
                 self.driver.run_shutdown();
                 return Ok(());
             }
@@ -554,18 +576,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             clear_driver_state();
 
             // Record work-phase (everything except the blocking wait) duration.
-            let work_ns = iter_start.elapsed().as_nanos() as u64 - wait_ns;
-            if work_ns >= 1_000_000 {
-                diag_work_ge_1ms += 1;
-            }
-            if work_ns >= 5_000_000 {
-                diag_work_ge_5ms += 1;
-            }
-            if work_ns >= 10_000_000 {
-                diag_work_ge_10ms += 1;
-            }
-            if work_ns > diag_work_ns_max {
-                diag_work_ns_max = work_ns;
+            if let Some(start) = iter_start {
+                // wait_ns was filled by the wait_start guard above — iter_start
+                // and wait_start are Some iff loop_diag, so it is never stale
+                // here. saturating_sub guards the (monotonic-clock-impossible)
+                // elapsed < wait_ns edge so a skew can't produce a huge bucket.
+                let work_ns = (start.elapsed().as_nanos() as u64).saturating_sub(wait_ns);
+                if work_ns >= 1_000_000 {
+                    diag_work_ge_1ms += 1;
+                }
+                if work_ns >= 5_000_000 {
+                    diag_work_ge_5ms += 1;
+                }
+                if work_ns >= 10_000_000 {
+                    diag_work_ge_10ms += 1;
+                }
+                if work_ns > diag_work_ns_max {
+                    diag_work_ns_max = work_ns;
+                }
             }
 
             diag_iters += 1;
