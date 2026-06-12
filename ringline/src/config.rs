@@ -101,6 +101,18 @@ pub struct Config {
     /// Size of each copy-send pool slot in bytes. A single `send()` or the
     /// combined copy parts of one `send_parts()` call must fit in one slot.
     pub send_copy_slot_size: u32,
+    /// Minimum total send size (bytes) for the zero-copy guard send path.
+    ///
+    /// Guard sends (`send_parts()` with `.guard()` parts) whose total length is
+    /// **less than** this threshold are gathered into a `SendCopyPool` slot and
+    /// submitted as a plain copy `Send` instead of `SendMsgZc`. For small sends
+    /// the ZC bookkeeping (in-flight slab entry plus a second completion for the
+    /// kernel's ZC notification) costs more than the memcpy it avoids.
+    ///
+    /// `0` disables the fallback (guard sends always use zero-copy).
+    /// Sends at or above the threshold, or that don't fit a send pool slot,
+    /// use the zero-copy path as before. Default: `4096`.
+    pub send_zc_threshold: u32,
     /// Number of InFlightSendSlab slots for in-flight scatter-gather sends
     /// (i.e., `send_parts()` calls that include at least one guard).
     /// Each slot is held until all ZC notifications arrive.
@@ -258,6 +270,7 @@ impl Default for Config {
             conn_chunk_size: 1,
             send_copy_count: 1024,
             send_copy_slot_size: 16384,
+            send_zc_threshold: 4096,
             send_slab_slots: 512,
             flush_interval_us: 100,
             tick_timeout_us: 1000,
@@ -571,6 +584,12 @@ impl ConfigBuilder {
     pub fn send_pool(mut self, count: u16, slot_size: u32) -> Self {
         self.config.send_copy_count = count;
         self.config.send_copy_slot_size = slot_size;
+        self
+    }
+
+    /// Set the zero-copy guard send threshold in bytes (0 = always zero-copy).
+    pub fn send_zc_threshold(mut self, bytes: u32) -> Self {
+        self.config.send_zc_threshold = bytes;
         self
     }
 
@@ -911,5 +930,19 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn send_zc_threshold_default() {
+        assert_eq!(Config::default().send_zc_threshold, 4096);
+    }
+
+    #[test]
+    fn send_zc_threshold_builder_zero() {
+        let cfg = ConfigBuilder::default()
+            .send_zc_threshold(0)
+            .build()
+            .expect("zero send_zc_threshold should be valid");
+        assert_eq!(cfg.send_zc_threshold, 0);
     }
 }
