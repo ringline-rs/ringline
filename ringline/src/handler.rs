@@ -116,6 +116,8 @@ pub struct DriverCtx<'a> {
     pub(crate) connect_addrs: &'a mut Vec<libc::sockaddr_storage>,
     /// Whether to set TCP_NODELAY on outbound connections.
     pub(crate) tcp_nodelay: bool,
+    /// Guard sends below this total length fall back to copy (0 = always ZC).
+    pub(crate) send_zc_threshold: u32,
     /// Whether SO_TIMESTAMPING is enabled.
     #[cfg(feature = "timestamps")]
     pub(crate) timestamps: bool,
