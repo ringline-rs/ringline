@@ -186,6 +186,8 @@ pub(crate) struct Driver {
     pub(crate) region_rx: crate::region_registry::RegionControlRx,
     /// Whether to set TCP_NODELAY on connections.
     pub(crate) tcp_nodelay: bool,
+    /// Guard sends below this total length fall back to copy (0 = always ZC).
+    pub(crate) send_zc_threshold: u32,
     /// Whether SO_TIMESTAMPING is enabled for connections.
     #[cfg(feature = "timestamps")]
     pub(crate) timestamps: bool,
@@ -416,6 +418,7 @@ impl Driver {
             connect_timespecs,
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),
             tcp_nodelay: config.tcp_nodelay,
+            send_zc_threshold: config.send_zc_threshold,
             #[cfg(feature = "timestamps")]
             timestamps: config.timestamps,
             #[cfg(feature = "timestamps")]
@@ -540,6 +543,7 @@ impl Driver {
             shutdown_requested: &mut self.shutdown_local,
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
+            send_zc_threshold: self.send_zc_threshold,
             #[cfg(feature = "timestamps")]
             timestamps: self.timestamps,
             #[cfg(feature = "timestamps")]

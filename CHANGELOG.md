@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `Config::send_zc_threshold` (and `ConfigBuilder::send_zc_threshold`) — guard
+  sends with total length below this threshold (default 4096 bytes, `0` =
+  always zero-copy) are gathered into the send copy pool and submitted as a
+  plain `Send` instead of `SendMsgZc`.
+
+### Changed
+
+- Small guard sends no longer pay zero-copy bookkeeping (in-flight slab entry
+  plus a ZC notification CQE per send). For small values the memcpy is cheaper
+  than the two-completion lifecycle, removing a small-value `SET` throughput
+  plateau observed in benchmarks. Sends at or above the threshold, sends that
+  don't fit a send pool slot, and TLS sends are unchanged.
+
 ## [0.2.0] - 2026-06-08
 
 ### Breaking
