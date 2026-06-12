@@ -2698,6 +2698,16 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             return self.submit_copy_only();
         }
 
+        // Small guard sends: ZC bookkeeping (slab entry + notification CQE) costs
+        // more than a memcpy below the threshold. Gather everything — guard memory
+        // included — into one pool slot and submit a plain Send. Guards drop
+        // immediately (data is copied out before return). Falls through to the ZC
+        // path when the pool is exhausted or the gather doesn't fit a slot.
+        let threshold = self.ctx.send_zc_threshold;
+        if threshold > 0 && self.total_len < threshold && self.submit_small_gather()? {
+            return Ok(());
+        }
+
         // With guards: build iovecs mixing copy pool subranges and guard pointers.
         self.submit_with_guards()
     }
@@ -2920,6 +2930,70 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     fn submit_copy_only(mut self) -> io::Result<()> {
         let built = self.build_copy_only()?;
         self.ctx.submit_or_queue(self.conn.index, built)
+    }
+
+    /// Small-send fallback: gather all parts (copy + guard memory, in part order)
+    /// into one pool slot and submit as a plain `Send`. Guard memory is copied,
+    /// so the guards are dropped on return instead of being held in the slab.
+    ///
+    /// Returns `Ok(false)` without consuming anything when the pool has no free
+    /// slot or the gather exceeds the slot size — the caller falls through to
+    /// the zero-copy path.
+    #[allow(clippy::needless_range_loop)]
+    fn submit_small_gather(&mut self) -> io::Result<bool> {
+        // Build the gather list in part order, mixing copy slices and guard memory.
+        let mut slices: [(*const u8, usize); MAX_IOVECS] = [(std::ptr::null(), 0); MAX_IOVECS];
+        let mut n = 0usize;
+        for i in 0..self.part_count as usize {
+            match self.parts[i] {
+                PartSlot::Copy { slice_idx } => {
+                    slices[n] = self.copy_slices[slice_idx as usize];
+                    n += 1;
+                }
+                PartSlot::Guard { guard_idx } => {
+                    let g = self.guards[guard_idx as usize]
+                        .as_ref()
+                        .expect("guard slot must be Some in submit_small_gather");
+                    let (ptr, len) = g.as_ptr_len();
+                    slices[n] = (ptr, len as usize);
+                    n += 1;
+                }
+                PartSlot::Empty => {}
+            }
+        }
+
+        // SAFETY: every (ptr, len) in `slices[..n]` is live — copy slices borrow
+        // caller data that outlives the builder, guard memory is owned by
+        // `self.guards` until this method returns.
+        // `self.total_len` equals the sum of all gathered part lengths, so the
+        // slot's `remaining` accounting matches the bytes actually copied in.
+        let Some((slot, ptr, len)) = (unsafe {
+            self.ctx
+                .send_copy_pool
+                .copy_in_gather(&slices[..n], self.total_len as usize)
+        }) else {
+            // Pool exhausted or gather exceeds slot size: keep guards, use ZC path.
+            return Ok(false);
+        };
+
+        let user_data = crate::completion::UserData::encode(
+            crate::completion::OpTag::Send,
+            self.conn.index,
+            slot as u32,
+        );
+        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
+            .build()
+            .user_data(user_data.raw());
+
+        let built = BuiltSend {
+            entry,
+            pool_slot: slot,
+            slab_idx: u16::MAX,
+            total_len: self.total_len,
+        };
+        // Data is in the pool slot now — guards can die with `self` after return.
+        self.ctx.submit_or_queue(self.conn.index, built)?;
+        Ok(true)
     }
 
     /// Mixed copy+guard path: submit or queue.
