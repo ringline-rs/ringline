@@ -138,6 +138,11 @@ use ringline::{ConnCtx, GuardBox, ParseResult, SendGuard};
 /// Callback type invoked after each command completes.
 type ResultCallback = Box<dyn Fn(&CommandResult)>;
 
+/// Maximum guards per scatter-gather send (matches ringline core limit).
+const MAX_FLUSH_GUARDS: usize = 4;
+/// Maximum iovecs per scatter-gather send (matches ringline core limit).
+const MAX_FLUSH_IOVECS: usize = 8;
+
 // -- Error -------------------------------------------------------------------
 
 /// Errors returned by the ringline Memcache client.
@@ -396,6 +401,7 @@ pub enum CompletedOp {
 pub struct ClientBuilder {
     conn: ConnCtx,
     on_result: Option<ResultCallback>,
+    max_batch_size: usize,
     max_in_flight: usize,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
@@ -408,6 +414,7 @@ impl ClientBuilder {
         Self {
             conn,
             on_result: None,
+            max_batch_size: 1,
             max_in_flight: usize::MAX,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
@@ -438,6 +445,20 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the maximum number of `fire_*` commands to coalesce into a single
+    /// send. Default is 1 (each `fire_*` sends immediately, matching
+    /// pre-coalescing behavior). Set higher for pipelined workloads to batch
+    /// multiple commands into fewer TCP segments.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is 0.
+    pub fn max_batch_size(mut self, n: usize) -> Self {
+        assert!(n > 0, "max_batch_size must be >= 1");
+        self.max_batch_size = n;
+        self
+    }
+
     /// Enable built-in histogram tracking (requires `metrics` feature).
     #[cfg(feature = "metrics")]
     pub fn with_metrics(mut self) -> Self {
@@ -452,7 +473,12 @@ impl ClientBuilder {
             on_result: self.on_result,
             pending: VecDeque::with_capacity(16),
             last_rx_bytes: Cell::new(0),
+            write_buf: Vec::new(),
+            write_guards: Vec::new(),
+            flushed_count: 0,
+            max_batch_size: self.max_batch_size,
             max_in_flight: self.max_in_flight,
+            buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
@@ -478,9 +504,24 @@ pub struct Client {
     on_result: Option<ResultCallback>,
     pending: VecDeque<PendingOp>,
     last_rx_bytes: Cell<u32>,
+    /// Write buffer for coalescing `fire_*` commands. Contains all copy data
+    /// (command framing, prefixes, suffixes, non-guard values). Guard values
+    /// are stored separately in `write_guards` with byte offsets into this buffer.
+    write_buf: Vec<u8>,
+    /// Zero-copy guards pending flush. Each entry is `(offset, guard)` where
+    /// `offset` is the byte position in `write_buf` where the guard value
+    /// should be inserted in the byte stream.
+    write_guards: Vec<(usize, GuardBox)>,
+    /// Number of pending ops whose send_ts has been finalized (at flush time).
+    flushed_count: usize,
+    /// Maximum `fire_*` commands to coalesce before flushing. 1 = send each
+    /// command immediately (default, matching pre-coalescing behavior).
+    max_batch_size: usize,
     /// Cap on `pending.len()`; `fire_*` returns `Error::TooManyInFlight`
     /// past it. `usize::MAX` (default) disables.
     max_in_flight: usize,
+    /// Number of ops buffered in `write_buf` that have not yet been flushed.
+    buffered_ops: usize,
     /// Reusable scratch buffer for encoding requests. Cleared before each
     /// use; keeps its capacity across requests so steady-state encoding is
     /// allocation-free.
@@ -501,7 +542,12 @@ impl Client {
             on_result: None,
             pending: VecDeque::new(),
             last_rx_bytes: Cell::new(0),
+            write_buf: Vec::new(),
+            write_guards: Vec::new(),
+            flushed_count: 0,
+            max_batch_size: 1,
             max_in_flight: usize::MAX,
+            buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
@@ -613,6 +659,22 @@ impl Client {
         }
     }
 
+    /// `timing_start()` for `fire_*` call sites, evaluated *after* the op
+    /// has been buffered/sent. When this op is buffered behind another op
+    /// (`buffered_ops > 1`), `flush()` will unconditionally re-stamp
+    /// `send_ts`/`start` for every op in the batch, so the fire-time clock
+    /// read would be discarded — skip it. `buffered_ops` is monotonic
+    /// between flushes, so if it is > 1 now, the rewriting branch in
+    /// `flush()` (`buffered_ops > 1`) is guaranteed to run for this op.
+    #[inline]
+    fn timing_start_buffered(&self) -> (u64, Option<Instant>) {
+        if self.buffered_ops > 1 {
+            (0, None)
+        } else {
+            self.timing_start()
+        }
+    }
+
     #[cfg(feature = "timestamps")]
     #[inline]
     fn compute_ttfb(&self, send_ts: u64) -> Option<u64> {
@@ -636,26 +698,125 @@ impl Client {
         self.pending.len()
     }
 
-    /// Returns `Err(TooManyInFlight)` if the pending queue has hit
-    /// `max_in_flight`. Called at the start of every `fire_*` to enforce
-    /// the cap and bail before doing any encode / send work.
-    #[inline]
-    fn check_in_flight(&self) -> Result<(), Error> {
+    /// Flush before appending the next op if adding it would exceed
+    /// guard/iovec limits for scatter-gather sends. Also enforces the
+    /// `max_in_flight` cap so adversarial / stalled callers can't grow
+    /// the pending queue without bound.
+    fn pre_flush_if_needed(&mut self, has_guard: bool) -> Result<(), Error> {
         if self.pending.len() >= self.max_in_flight {
-            Err(Error::TooManyInFlight)
-        } else {
-            Ok(())
+            return Err(Error::TooManyInFlight);
         }
+        if self.buffered_ops == 0 {
+            return Ok(());
+        }
+        let next_guards = self.write_guards.len() + usize::from(has_guard);
+        let next_parts = 2 * next_guards + 1;
+        if next_guards > MAX_FLUSH_GUARDS || next_parts > MAX_FLUSH_IOVECS {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Flush after appending an op if we have reached `max_batch_size`.
+    fn post_flush_if_needed(&mut self) -> Result<(), Error> {
+        if self.buffered_ops >= self.max_batch_size {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Flush buffered `fire_*` commands as a single send.
+    ///
+    /// Called automatically by [`recv()`](Self::recv). Call explicitly if you
+    /// need commands to hit the wire before reading responses (e.g., when
+    /// interleaving fire/recv across multiple clients).
+    pub fn flush(&mut self) -> Result<(), Error> {
+        if self.write_buf.is_empty() && self.write_guards.is_empty() {
+            self.buffered_ops = 0;
+            return Ok(());
+        }
+
+        // Send the batch. If the send itself errors (peer RST, kernel
+        // ENOBUFS, etc.), discard the bytes-in-progress and the pending
+        // ops we'd push_back'd for them. Otherwise the next `flush()` would
+        // re-send the same buffer, and `recv()` would pop a `PendingOp` for
+        // a request that was never on the wire and then hang forever
+        // awaiting a response that will never come.
+        let send_outcome: Result<(), Error> = if self.write_guards.is_empty() {
+            self.conn
+                .send_nowait(&self.write_buf)
+                .map(|_| ())
+                .map_err(Error::from)
+        } else {
+            use ringline::SendPart;
+            let mut parts: Vec<SendPart<'_>> = Vec::with_capacity(2 * MAX_FLUSH_GUARDS + 1);
+            let mut pos = 0;
+            for (offset, guard) in self.write_guards.drain(..) {
+                if offset > pos {
+                    parts.push(SendPart::Copy(&self.write_buf[pos..offset]));
+                }
+                parts.push(SendPart::Guard(guard));
+                pos = offset;
+            }
+            if pos < self.write_buf.len() {
+                parts.push(SendPart::Copy(&self.write_buf[pos..]));
+            }
+            self.conn
+                .send_parts()
+                .submit_batch(parts)
+                .map(|_| ())
+                .map_err(Error::from)
+        };
+
+        if let Err(e) = send_outcome {
+            // Discard everything that was buffered for this flush. The
+            // pending ops that haven't been finalised yet (i.e., those
+            // beyond `flushed_count`) correspond to commands that were
+            // pushed onto `pending` but never reached the wire — drop
+            // them so `recv()` doesn't try to read responses for them.
+            self.write_buf.clear();
+            self.write_guards.clear();
+            self.buffered_ops = 0;
+            self.pending.truncate(self.flushed_count);
+            return Err(e);
+        }
+
+        // Only rewrite send timestamps when batching multiple ops —
+        // for a single buffered op the timestamp captured at fire time
+        // is already accurate.
+        if self.buffered_ops > 1 {
+            let (send_ts, start) = self.timing_start();
+            for pending in self.pending.iter_mut().skip(self.flushed_count) {
+                pending.send_ts = send_ts;
+                pending.start = start;
+            }
+        }
+        self.flushed_count = self.pending.len();
+
+        self.write_buf.clear();
+        self.write_guards.clear();
+        self.buffered_ops = 0;
+
+        Ok(())
     }
 
     /// Fire a GET request without waiting for the response.
     pub fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
-        self.check_in_flight()?;
-        self.encode_buf.clear();
-        encode_request_into(&McRequest::get(key), &mut self.encode_buf)?;
-        let tx_bytes = self.encode_buf.len() as u32;
-        self.conn.send_nowait(&self.encode_buf)?;
-        let (send_ts, start) = self.timing_start();
+        self.pre_flush_if_needed(false)?;
+        let tx_bytes;
+        if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
+            // Direct send — skip write_buf round-trip.
+            self.encode_buf.clear();
+            encode_request_into(&McRequest::get(key), &mut self.encode_buf)?;
+            tx_bytes = self.encode_buf.len() as u32;
+            self.conn.send_nowait(&self.encode_buf)?;
+        } else {
+            let before = self.write_buf.len();
+            encode_request_into(&McRequest::get(key), &mut self.write_buf)?;
+            tx_bytes = (self.write_buf.len() - before) as u32;
+            self.buffered_ops += 1;
+        }
+        let (send_ts, start) = self.timing_start_buffered();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Get,
             send_ts,
@@ -663,6 +824,7 @@ impl Client {
             user_data,
             tx_bytes,
         });
+        self.post_flush_if_needed()?;
         Ok(())
     }
 
@@ -675,20 +837,27 @@ impl Client {
         exptime: u32,
         user_data: u64,
     ) -> Result<(), Error> {
-        self.check_in_flight()?;
-        self.encode_buf.clear();
-        encode_request_into(
-            &McRequest::Set {
-                key,
-                value,
-                flags,
-                exptime,
-            },
-            &mut self.encode_buf,
-        )?;
-        let tx_bytes = self.encode_buf.len() as u32;
-        self.conn.send_nowait(&self.encode_buf)?;
-        let (send_ts, start) = self.timing_start();
+        self.pre_flush_if_needed(false)?;
+        let req = McRequest::Set {
+            key,
+            value,
+            flags,
+            exptime,
+        };
+        let tx_bytes;
+        if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
+            // Direct send — skip write_buf round-trip.
+            self.encode_buf.clear();
+            encode_request_into(&req, &mut self.encode_buf)?;
+            tx_bytes = self.encode_buf.len() as u32;
+            self.conn.send_nowait(&self.encode_buf)?;
+        } else {
+            let before = self.write_buf.len();
+            encode_request_into(&req, &mut self.write_buf)?;
+            tx_bytes = (self.write_buf.len() - before) as u32;
+            self.buffered_ops += 1;
+        }
+        let (send_ts, start) = self.timing_start_buffered();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
             send_ts,
@@ -696,10 +865,14 @@ impl Client {
             user_data,
             tx_bytes,
         });
+        self.post_flush_if_needed()?;
         Ok(())
     }
 
     /// Fire a SET request with zero-copy value via SendGuard.
+    ///
+    /// The guard value is kept alive and sent zero-copy at flush time via
+    /// scatter-gather I/O. The command prefix/suffix are buffered as copy data.
     pub fn fire_set_with_guard<G: SendGuard>(
         &mut self,
         key: &[u8],
@@ -708,25 +881,18 @@ impl Client {
         exptime: u32,
         user_data: u64,
     ) -> Result<(), Error> {
-        self.check_in_flight()?;
+        self.pre_flush_if_needed(true)?;
         let (_, value_len) = guard.as_ptr_len();
-        self.encode_buf.clear();
-        append_set_guard_prefix(
-            &mut self.encode_buf,
-            key,
-            value_len as usize,
-            flags,
-            exptime,
-        )?;
-        let tx_bytes = (self.encode_buf.len() + value_len as usize + 2) as u32;
-        let prefix: &[u8] = &self.encode_buf;
-        self.conn.send_parts().build(move |b| {
-            b.copy(prefix)
-                .guard(GuardBox::new(guard))
-                .copy(b"\r\n")
-                .submit()
-        })?;
-        let (send_ts, start) = self.timing_start();
+        // Append prefix, record guard insertion point, append suffix —
+        // directly into write_buf, no intermediate allocation.
+        let before = self.write_buf.len();
+        append_set_guard_prefix(&mut self.write_buf, key, value_len as usize, flags, exptime)?;
+        self.write_guards
+            .push((self.write_buf.len(), GuardBox::new(guard)));
+        self.write_buf.extend_from_slice(b"\r\n");
+        let tx_bytes = (self.write_buf.len() - before + value_len as usize) as u32;
+        self.buffered_ops += 1;
+        let (send_ts, start) = self.timing_start_buffered();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
             send_ts,
@@ -734,17 +900,27 @@ impl Client {
             user_data,
             tx_bytes,
         });
+        self.post_flush_if_needed()?;
         Ok(())
     }
 
     /// Fire a DELETE request without waiting for the response.
     pub fn fire_delete(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
-        self.check_in_flight()?;
-        self.encode_buf.clear();
-        encode_request_into(&McRequest::delete(key), &mut self.encode_buf)?;
-        let tx_bytes = self.encode_buf.len() as u32;
-        self.conn.send_nowait(&self.encode_buf)?;
-        let (send_ts, start) = self.timing_start();
+        self.pre_flush_if_needed(false)?;
+        let tx_bytes;
+        if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
+            // Direct send — skip write_buf round-trip.
+            self.encode_buf.clear();
+            encode_request_into(&McRequest::delete(key), &mut self.encode_buf)?;
+            tx_bytes = self.encode_buf.len() as u32;
+            self.conn.send_nowait(&self.encode_buf)?;
+        } else {
+            let before = self.write_buf.len();
+            encode_request_into(&McRequest::delete(key), &mut self.write_buf)?;
+            tx_bytes = (self.write_buf.len() - before) as u32;
+            self.buffered_ops += 1;
+        }
+        let (send_ts, start) = self.timing_start_buffered();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Delete,
             send_ts,
@@ -752,6 +928,7 @@ impl Client {
             user_data,
             tx_bytes,
         });
+        self.post_flush_if_needed()?;
         Ok(())
     }
 
@@ -759,7 +936,11 @@ impl Client {
     ///
     /// Returns `Err(Error::NoPending)` if there are no in-flight requests.
     pub async fn recv(&mut self) -> Result<CompletedOp, Error> {
+        // Flush any buffered fire_* commands before reading.
+        self.flush()?;
+
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
+        self.flushed_count = self.flushed_count.saturating_sub(1);
 
         // Capture pre-read recv timestamp for TTFB before blocking on data.
         let ttfb_ns = self.compute_ttfb(pending.send_ts);
@@ -769,8 +950,11 @@ impl Client {
             Err(e) => {
                 // Connection is broken — clear remaining pending ops so
                 // subsequent recv() calls return NoPending instead of
-                // reading stale/misaligned responses.
+                // reading stale/misaligned responses. Reset `flushed_count`
+                // too — otherwise a stale count > 0 makes the next batched
+                // `flush()` skip the send_ts rewrite for newly-buffered ops.
                 self.pending.clear();
+                self.flushed_count = 0;
                 return Err(e);
             }
         };
@@ -1559,6 +1743,123 @@ mod encode_tests {
         assert_eq!(buf, b"EXISTING");
         assert!(append_set_guard_prefix(&mut buf, &long_key, 16, 0, 0).is_err());
         assert_eq!(buf, b"EXISTING");
+    }
+
+    // ── Coalescing byte-exactness ───────────────────────────────────────
+    //
+    // The write-coalescing layer (`max_batch_size > 1`) builds a single
+    // `write_buf` by appending each `fire_*` command's encoding back-to-back,
+    // then issues one send. The on-wire bytes for a coalesced batch must
+    // therefore equal the exact concatenation of the N individual command
+    // encodings. These tests pin that invariant without a live connection by
+    // exercising the same `encode_request_into` append path `fire_*` uses.
+
+    #[test]
+    fn coalesced_buf_equals_concatenation_of_individual_encodings() {
+        // Build the batch the way the coalescing path does: append each
+        // command into one shared buffer.
+        let mut coalesced = Vec::new();
+        encode_request_into(&McRequest::get(b"key1"), &mut coalesced).unwrap();
+        encode_request_into(
+            &McRequest::Set {
+                key: b"key2",
+                value: b"val",
+                flags: 0,
+                exptime: 0,
+            },
+            &mut coalesced,
+        )
+        .unwrap();
+        encode_request_into(&McRequest::delete(b"key3"), &mut coalesced).unwrap();
+
+        // Build the reference: concatenate three independently-encoded
+        // commands.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&encode_request(&McRequest::get(b"key1")).unwrap());
+        expected.extend_from_slice(
+            &encode_request(&McRequest::Set {
+                key: b"key2",
+                value: b"val",
+                flags: 0,
+                exptime: 0,
+            })
+            .unwrap(),
+        );
+        expected.extend_from_slice(&encode_request(&McRequest::delete(b"key3")).unwrap());
+
+        assert_eq!(coalesced, expected);
+        // And the literal on-wire bytes, to catch framing regressions.
+        assert_eq!(
+            coalesced,
+            &b"get key1\r\nset key2 0 0 3\r\nval\r\ndelete key3\r\n"[..]
+        );
+    }
+
+    #[test]
+    fn coalesced_guard_set_byte_layout() {
+        // Mirror the `fire_set_with_guard` buffer assembly: prefix into
+        // write_buf, guard insertion point recorded, then "\r\n" suffix.
+        // The flush scatter-gather then emits: prefix || value || "\r\n".
+        let mut write_buf = Vec::new();
+        let value: &[u8] = b"hello";
+        append_set_guard_prefix(&mut write_buf, KEY, value.len(), 42, 7200).unwrap();
+        let guard_offset = write_buf.len();
+        write_buf.extend_from_slice(b"\r\n");
+
+        // Reconstruct the on-wire stream the flush path produces:
+        // Copy(write_buf[..guard_offset]) Guard(value) Copy(write_buf[guard_offset..]).
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&write_buf[..guard_offset]);
+        wire.extend_from_slice(value);
+        wire.extend_from_slice(&write_buf[guard_offset..]);
+
+        assert_eq!(
+            wire,
+            &b"set user:123456789 42 7200 5\r\nhello\r\n"[..],
+            "coalesced guard SET must match a standard SET on the wire"
+        );
+
+        // tx_bytes accounting: write_buf bytes + value bytes (guard is not
+        // in write_buf). `fire_set_with_guard` computes
+        // (write_buf.len() - before + value_len).
+        assert_eq!(write_buf.len() + value.len(), wire.len());
+    }
+
+    #[test]
+    fn two_coalesced_guard_sets_interleave_correctly() {
+        // Two guard SETs in one batch must produce
+        // prefix1 value1 "\r\n" prefix2 value2 "\r\n" on the wire — this
+        // pins the drain/interleave loop in `flush()`.
+        let v1: &[u8] = b"aa";
+        let v2: &[u8] = b"bbbb";
+
+        let mut write_buf = Vec::new();
+        let mut guards: Vec<usize> = Vec::new();
+
+        append_set_guard_prefix(&mut write_buf, b"k1", v1.len(), 0, 0).unwrap();
+        guards.push(write_buf.len());
+        write_buf.extend_from_slice(b"\r\n");
+
+        append_set_guard_prefix(&mut write_buf, b"k2", v2.len(), 0, 0).unwrap();
+        guards.push(write_buf.len());
+        write_buf.extend_from_slice(b"\r\n");
+
+        // Replay the flush interleave loop.
+        let values = [v1, v2];
+        let mut wire = Vec::new();
+        let mut pos = 0;
+        for (i, &offset) in guards.iter().enumerate() {
+            if offset > pos {
+                wire.extend_from_slice(&write_buf[pos..offset]);
+            }
+            wire.extend_from_slice(values[i]);
+            pos = offset;
+        }
+        if pos < write_buf.len() {
+            wire.extend_from_slice(&write_buf[pos..]);
+        }
+
+        assert_eq!(wire, &b"set k1 0 0 2\r\naa\r\nset k2 0 0 4\r\nbbbb\r\n"[..]);
     }
 }
 
