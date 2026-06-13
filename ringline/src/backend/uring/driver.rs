@@ -159,9 +159,8 @@ pub(crate) struct Driver {
     /// Pre-allocated timespec storage for connect timeouts.
     pub(crate) connect_timespecs: Vec<io_uring::types::Timespec>,
     /// Pre-allocated batch buffer for draining CQEs.
-    /// Tuple: (user_data, result, flags, big_cqe). The big_cqe field
-    /// contains the extra 16 bytes from Entry32 CQEs (used by NVMe passthrough).
-    pub(crate) cqe_batch: Vec<(u64, i32, u32, [u64; 2])>,
+    /// Tuple: (user_data, result, flags).
+    pub(crate) cqe_batch: Vec<(u64, i32, u32)>,
     /// Per-worker channel for DNS resolve responses from the resolver pool.
     pub(crate) resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
     /// Per-worker sender for resolve responses (cloned into each request).
@@ -235,6 +234,15 @@ pub(crate) struct Driver {
     pub(crate) pending_recv_forward_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
+    /// Scratch buffers swapped with the corresponding `pending_*_retries`
+    /// queue at drain time so the per-tick drain reuses a single allocation
+    /// across ticks (the primary queue is left empty for in-iteration
+    /// re-enqueues; `drain(..)` on the scratch keeps its capacity).
+    pub(crate) zc_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) copy_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) send_pollout_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) coalesced_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) recv_forward_retry_scratch: Vec<(u32, u32, u16, u8)>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
     /// NVMe device tracking table. `None` when NVMe is not configured.
@@ -452,6 +460,11 @@ impl Driver {
             pending_coalesced_retries: Vec::new(),
             pending_recv_forward_retries: Vec::new(),
             pending_close_retries: Vec::new(),
+            zc_retry_scratch: Vec::new(),
+            copy_retry_scratch: Vec::new(),
+            send_pollout_retry_scratch: Vec::new(),
+            coalesced_retry_scratch: Vec::new(),
+            recv_forward_retry_scratch: Vec::new(),
             udp_sockets,
             nvme_devices: config
                 .nvme
@@ -1282,17 +1295,13 @@ impl Driver {
             {
                 let cq = self.ring.ring.completion();
                 for cqe in cq {
-                    self.cqe_batch.push((
-                        cqe.user_data(),
-                        cqe.result(),
-                        cqe.flags(),
-                        *cqe.big_cqe(),
-                    ));
+                    self.cqe_batch
+                        .push((cqe.user_data(), cqe.result(), cqe.flags()));
                 }
             }
 
             for i in 0..self.cqe_batch.len() {
-                let (user_data_raw, result, flags, _big_cqe) = self.cqe_batch[i];
+                let (user_data_raw, result, flags) = self.cqe_batch[i];
                 let ud = UserData(user_data_raw);
                 let tag = match ud.tag() {
                     Some(t) => t,
