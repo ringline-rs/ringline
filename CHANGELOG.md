@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-13
+
+Coordinated release of the 2026-06 performance audit:
+**ringline 0.2.1**, **ringline-redis 0.4.0**, **ringline-memcache 0.4.0**.
+
 ### Removed
 
 - The `ringline-momento` client crate has been removed.
