@@ -251,6 +251,33 @@ pub enum TlsRecvResult {
     Closed,
 }
 
+/// Drain all currently-decrypted plaintext from a TLS connection directly into
+/// the connection's recv accumulator, with no intermediate scratch buffer.
+///
+/// rustls's `Reader` implements `BufRead`: `fill_buf()` exposes the decrypted
+/// plaintext in rustls's own buffer, and `consume()` advances past what we copied.
+/// This is one copy (rustls buffer -> accumulator) vs. the previous two
+/// (rustls -> scratch -> accumulator).
+fn drain_tls_plaintext(
+    tls_conn: &mut TlsConn,
+    accumulators: &mut AccumulatorTable,
+    conn_index: u32,
+) {
+    use std::io::BufRead;
+    let mut reader = tls_conn.conn.reader();
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok([]) => break,
+            Ok(b) => b,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        };
+        let n = chunk.len();
+        accumulators.append(conn_index, chunk);
+        reader.consume(n);
+    }
+}
+
 /// Feed received ciphertext into the TLS connection, decrypt plaintext into
 /// the accumulator, and flush any TLS output (handshake responses, alerts).
 #[cfg(has_io_uring)]
@@ -259,7 +286,6 @@ pub fn feed_tls_recv(
     accumulators: &mut AccumulatorTable,
     ring: &mut Ring,
     send_copy_pool: &mut SendCopyPool,
-    scratch: &mut Vec<u8>,
     conn_index: u32,
     ciphertext: &[u8],
 ) -> TlsRecvResult {
@@ -311,17 +337,7 @@ pub fn feed_tls_recv(
         // Drain plaintext after each call so rustls's internal
         // buffer has room for the next `read_tls`.
         if state.plaintext_bytes_to_read() > 0 {
-            let mut reader = tls_conn.conn.reader();
-            loop {
-                match reader.read(scratch.as_mut_slice()) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        accumulators.append(conn_index, &scratch[..n]);
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
-            }
+            drain_tls_plaintext(tls_conn, accumulators, conn_index);
         }
     }
 
@@ -347,17 +363,7 @@ pub fn feed_tls_recv(
     // tick produced (e.g. from a record whose ciphertext was
     // entirely buffered earlier in the loop).
     if state.plaintext_bytes_to_read() > 0 {
-        let mut reader = tls_conn.conn.reader();
-        loop {
-            match reader.read(scratch.as_mut_slice()) {
-                Ok(0) => break,
-                Ok(n) => {
-                    accumulators.append(conn_index, &scratch[..n]);
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
+        drain_tls_plaintext(tls_conn, accumulators, conn_index);
     }
 
     // Flush any TLS output (handshake messages, alerts, etc.).
@@ -551,7 +557,6 @@ pub fn feed_tls_recv_mio(
     tls_table: &mut TlsTable,
     accumulators: &mut AccumulatorTable,
     stream: &mut mio::net::TcpStream,
-    scratch: &mut Vec<u8>,
     conn_index: u32,
     ciphertext: &[u8],
 ) -> TlsRecvResult {
@@ -595,17 +600,7 @@ pub fn feed_tls_recv_mio(
 
         // Read decrypted plaintext into accumulator.
         if state.plaintext_bytes_to_read() > 0 {
-            let mut reader = tls_conn.conn.reader();
-            loop {
-                match reader.read(scratch.as_mut_slice()) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        accumulators.append(conn_index, &scratch[..n]);
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
-            }
+            drain_tls_plaintext(tls_conn, accumulators, conn_index);
         }
 
         // Flush any TLS output (handshake messages, alerts, etc.).

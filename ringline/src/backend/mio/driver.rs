@@ -60,8 +60,6 @@ pub(crate) struct Driver {
     pub(crate) writable: Vec<bool>,
     /// Per-connection connect timeout deadline (None if no timeout or not connecting).
     pub(crate) connect_deadlines: Vec<Option<std::time::Instant>>,
-    /// Scratch buffer for TLS plaintext decryption (one per worker thread).
-    pub(crate) tls_scratch: Vec<u8>,
     /// Raw fd of the wake pipe read end — registered with mio as WAKE_TOKEN.
     pub(crate) wake_pipe_fd: RawFd,
     /// Whether to set TCP_NODELAY on accepted connections.
@@ -203,7 +201,6 @@ impl Driver {
             pending_sends: (0..max_conn).map(|_| VecDeque::new()).collect(),
             writable: vec![false; max_conn],
             connect_deadlines: vec![None; max_conn],
-            tls_scratch: vec![0u8; 16384],
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),

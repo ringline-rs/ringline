@@ -483,7 +483,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     tls_table,
                     &mut self.driver.accumulators,
                     &mut stream,
-                    &mut self.driver.tls_scratch,
                     conn_index,
                     &recv_buf[..n],
                 );

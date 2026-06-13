@@ -153,7 +153,6 @@ pub(crate) struct Driver {
     pub(crate) shutdown_flag: Arc<AtomicBool>,
     pub(crate) shutdown_local: bool,
     pub(crate) tls_table: Option<crate::tls::TlsTable>,
-    pub(crate) tls_scratch: Vec<u8>,
     /// Pre-allocated sockaddr storage for outbound connect SQEs.
     pub(crate) connect_addrs: Vec<libc::sockaddr_storage>,
     /// Pre-allocated timespec storage for connect timeouts.
@@ -361,7 +360,6 @@ impl Driver {
                 None
             }
         };
-        let tls_scratch = vec![0u8; 16384];
 
         let mut connect_addrs = Vec::with_capacity(config.max_connections as usize);
         connect_addrs.resize(config.max_connections as usize, unsafe {
@@ -421,7 +419,6 @@ impl Driver {
             shutdown_flag,
             shutdown_local: false,
             tls_table,
-            tls_scratch,
             connect_addrs,
             connect_timespecs,
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),

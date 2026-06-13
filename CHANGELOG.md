@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- TLS recv decrypts directly from rustls into the connection accumulator via
+  `BufRead::fill_buf`/`consume`, removing the per-worker 16 KiB scratch buffer and
+  one copy of every received plaintext byte (was rustls -> scratch -> accumulator,
+  now rustls -> accumulator).
 - redis/memcache clients gained `ClientBuilder::zc_threshold` (default 4096): `fire_set_with_guard`
   values below the threshold are copied into the coalescing send buffer so they batch like plain
   SETs instead of taking the scatter-gather guard path (which flushed every few ops), recovering
