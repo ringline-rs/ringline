@@ -586,6 +586,13 @@ impl Ring {
         // atomics.  We only read `.len()` (sq_tail − sq_head) and never push
         // new entries here, so there is no aliasing or mutation hazard.
         let n = unsafe { self.ring.submission_shared().len() } as u32;
+        if n == 0 {
+            // Nothing to submit. Pending DEFER_TASKRUN task_work and CQEs are
+            // reaped by the next submit_and_wait(1) (always a GETEVENTS enter),
+            // so skipping the syscall here only defers completion reaping by at
+            // most one loop iteration — no correctness impact.
+            return Ok(());
+        }
         unsafe {
             self.ring
                 .submitter()

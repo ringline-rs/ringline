@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The io_uring event loop skips the `io_uring_enter` syscall in `flush()` when no
+  SQEs are queued; deferred task_work and completions are reaped by the next
+  `submit_and_wait`, removing a redundant syscall on iterations that produce no sends.
 - The mio-backend TLS send path encrypts directly into the owned send buffer
   instead of encrypting into shared scratch and cloning, removing one ciphertext
   copy per TLS send.
