@@ -826,19 +826,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             let cq = self.driver.ring.ring.completion();
             for cqe in cq {
-                self.driver.cqe_batch.push((
-                    cqe.user_data(),
-                    cqe.result(),
-                    cqe.flags(),
-                    *cqe.big_cqe(),
-                ));
+                self.driver
+                    .cqe_batch
+                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
         }
 
         if let Some(interval) = self.driver.flush_interval {
             let mut last_flush = Instant::now();
             for i in 0..self.driver.cqe_batch.len() {
-                let (user_data_raw, result, flags, _big_cqe) = self.driver.cqe_batch[i];
+                let (user_data_raw, result, flags) = self.driver.cqe_batch[i];
                 self.dispatch_cqe(user_data_raw, result, flags);
                 // Check the clock every 16 CQEs to amortise Instant::now() cost.
                 if (i & 0xF) == 0xF {
@@ -852,7 +849,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         } else {
             for i in 0..self.driver.cqe_batch.len() {
-                let (user_data_raw, result, flags, _big_cqe) = self.driver.cqe_batch[i];
+                let (user_data_raw, result, flags) = self.driver.cqe_batch[i];
                 self.dispatch_cqe(user_data_raw, result, flags);
             }
         }

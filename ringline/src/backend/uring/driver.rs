@@ -159,9 +159,8 @@ pub(crate) struct Driver {
     /// Pre-allocated timespec storage for connect timeouts.
     pub(crate) connect_timespecs: Vec<io_uring::types::Timespec>,
     /// Pre-allocated batch buffer for draining CQEs.
-    /// Tuple: (user_data, result, flags, big_cqe). The big_cqe field
-    /// contains the extra 16 bytes from Entry32 CQEs (used by NVMe passthrough).
-    pub(crate) cqe_batch: Vec<(u64, i32, u32, [u64; 2])>,
+    /// Tuple: (user_data, result, flags).
+    pub(crate) cqe_batch: Vec<(u64, i32, u32)>,
     /// Per-worker channel for DNS resolve responses from the resolver pool.
     pub(crate) resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
     /// Per-worker sender for resolve responses (cloned into each request).
@@ -1282,17 +1281,13 @@ impl Driver {
             {
                 let cq = self.ring.ring.completion();
                 for cqe in cq {
-                    self.cqe_batch.push((
-                        cqe.user_data(),
-                        cqe.result(),
-                        cqe.flags(),
-                        *cqe.big_cqe(),
-                    ));
+                    self.cqe_batch
+                        .push((cqe.user_data(), cqe.result(), cqe.flags()));
                 }
             }
 
             for i in 0..self.cqe_batch.len() {
-                let (user_data_raw, result, flags, _big_cqe) = self.cqe_batch[i];
+                let (user_data_raw, result, flags) = self.cqe_batch[i];
                 let ud = UserData(user_data_raw);
                 let tag = match ud.tag() {
                     Some(t) => t,
