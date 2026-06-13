@@ -1809,11 +1809,27 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
         with_state(|driver, executor| {
-            // See `WithDataFuture::poll` for the rationale.
-            if driver.connections.generation(self.conn_index) != self.generation {
+            // Single connection-table lookup: extract generation + closed
+            // state together so the rest of poll needs no further accesses.
+            // `get()` returns None when the slot is inactive (connection
+            // already released), which we treat the same as a stale token.
+            let (conn_generation, is_closed) = match driver.connections.get(self.conn_index) {
+                None => {
+                    // Slot is inactive — definitely stale.
+                    self.f.take();
+                    return Poll::Ready(0);
+                }
+                Some(conn) => (
+                    conn.generation,
+                    matches!(conn.recv_mode, crate::connection::RecvMode::Closed),
+                ),
+            };
+            if conn_generation != self.generation {
+                // Slot was recycled for a different connection.
                 self.f.take();
                 return Poll::Ready(0);
             }
+
             // Flush any pending zero-copy recv buffer to accumulator so
             // take_frozen() will include it (io_uring only).
             #[cfg(has_io_uring)]
@@ -1826,12 +1842,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 
             let data = driver.accumulators.data(self.conn_index);
             if data.is_empty() {
-                // Check if the connection has been closed — return 0 (EOF).
-                let is_closed = driver
-                    .connections
-                    .get(self.conn_index)
-                    .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
-                    .unwrap_or(true);
+                // No data yet — check closed state from the lookup above.
                 if is_closed {
                     let f = self.f.as_mut().expect("WithBytesFuture polled after Ready");
                     let result = f(Bytes::new());
@@ -1848,11 +1859,12 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
                 return Poll::Pending;
             }
 
-            // Detach accumulator as frozen Bytes (O(1)).
+            // Detach accumulator as frozen Bytes (O(1), tail capacity retained).
             let frozen = driver.accumulators.take_frozen(self.conn_index);
             let len = frozen.len();
 
             let f = self.f.as_mut().expect("WithBytesFuture polled after Ready");
+            // clone is an O(1) Bytes refcount bump; the original `frozen` is retained for the prepend calls below.
             let result = f(frozen.clone());
 
             match result {
@@ -1870,14 +1882,9 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
             }
 
             // NeedMore or Consumed(0) on non-empty data: incomplete parse.
-            // Put everything back.
+            // Put everything back and use closed state from the lookup above.
             driver.accumulators.prepend(self.conn_index, &frozen[..]);
 
-            let is_closed = driver
-                .connections
-                .get(self.conn_index)
-                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
-                .unwrap_or(true);
             if is_closed {
                 self.f.take();
                 return Poll::Ready(0);
