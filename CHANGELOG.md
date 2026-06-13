@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   so the prepended remainder reuses the allocation's tail capacity instead of
   allocating a fresh buffer. `WithBytesFuture` also drops two redundant
   connection-table lookups per poll.
+- `CancellationToken` futures register as a waiter once instead of rescanning
+  the waiter list on every poll (O(1) vs O(n)).
+- The executor de-duplicates ready-queue entries per poll batch, avoiding
+  redundant task-poll passes when many completions target the same connection
+  in one drain.
 
 ## [0.2.0] - 2026-06-08
 

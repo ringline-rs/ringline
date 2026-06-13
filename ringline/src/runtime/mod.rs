@@ -396,6 +396,18 @@ pub(crate) struct Executor {
     pub(crate) pending_blocking: HashMap<u64, (u32, Option<Box<dyn std::any::Any + Send>>)>,
     /// Monotonic counter for blocking request IDs.
     pub(crate) next_blocking_id: u64,
+    /// Per-batch dedup bitset for connection-task ready-queue entries.
+    ///
+    /// Indexed by `conn_index`. Set to `true` when that id is first seen in
+    /// `poll_ready_tasks`; cleared only for the entries touched, never
+    /// globally. Sized to `max_connections` at construction — zero per-call
+    /// allocation.
+    pub(crate) poll_dedup_conn: Vec<bool>,
+    /// Per-batch dedup bitset for standalone-task ready-queue entries.
+    ///
+    /// Indexed by `task_idx & !STANDALONE_BIT`. Same lifecycle as
+    /// `poll_dedup_conn`. Sized to `standalone_task_capacity`.
+    pub(crate) poll_dedup_standalone: Vec<bool>,
 }
 
 impl Executor {
@@ -449,6 +461,8 @@ impl Executor {
             next_pidfd_seq: 0,
             pending_blocking: HashMap::new(),
             next_blocking_id: 0,
+            poll_dedup_conn: vec![false; cap],
+            poll_dedup_standalone: vec![false; standalone_capacity as usize],
         }
     }
 

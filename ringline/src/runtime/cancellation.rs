@@ -86,6 +86,7 @@ impl CancellationToken {
     pub fn cancelled(&self) -> CancelledFuture {
         CancelledFuture {
             state: Rc::clone(&self.state),
+            registered: false,
         }
     }
 
@@ -152,19 +153,28 @@ fn cancel_state(state: &Rc<RefCell<State>>) {
 /// Resolves when the associated token is cancelled.
 pub struct CancelledFuture {
     state: Rc<RefCell<State>>,
+    /// True once this future has registered its task_id as a waiter.
+    /// Avoids the O(n) `Vec::contains` scan on every re-poll of the same
+    /// future: we only push once, and after that skip the registration check.
+    registered: bool,
 }
 
 impl Future for CancelledFuture {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        let mut s = self.state.borrow_mut();
-        if s.cancelled {
-            return Poll::Ready(());
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        // Check cancellation first.
+        {
+            let s = self.state.borrow();
+            if s.cancelled {
+                return Poll::Ready(());
+            }
         }
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        if !s.waiters.contains(&task_id) {
-            s.waiters.push(task_id);
+        // Register as waiter exactly once.
+        if !self.registered {
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            self.state.borrow_mut().waiters.push(task_id);
+            self.registered = true;
         }
         Poll::Pending
     }
@@ -243,5 +253,78 @@ mod tests {
     fn default_is_new() {
         let token = CancellationToken::default();
         assert!(!token.is_cancelled());
+    }
+
+    /// Polling a CancelledFuture N times before cancel must add the waiter
+    /// exactly once (no O(n) vec growth per poll).
+    #[test]
+    fn repeated_polls_do_not_grow_waiters() {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        // Minimal no-op waker for driving polls outside the executor.
+        unsafe fn noop_clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &NOOP_VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &NOOP_VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+
+        let token = CancellationToken::new();
+        let mut fut = std::pin::pin!(token.cancelled());
+
+        // Poll many times — should stay Pending, waiters vec stays length 1.
+        for _ in 0..10 {
+            assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+            assert_eq!(
+                token.state.borrow().waiters.len(),
+                1,
+                "waiters vec must not grow on repeated polls"
+            );
+        }
+
+        // After cancel the future must resolve.
+        token.cancel();
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(())));
+    }
+
+    /// Multiple futures awaiting the same token must all be woken.
+    #[test]
+    fn multiple_futures_all_registered() {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        unsafe fn noop_clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &NOOP_VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &NOOP_VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+
+        let token = CancellationToken::new();
+
+        // Three separate futures for three separate clones of the same token.
+        let t1 = token.clone();
+        let t2 = token.clone();
+        let t3 = token.clone();
+        let mut f1 = std::pin::pin!(t1.cancelled());
+        let mut f2 = std::pin::pin!(t2.cancelled());
+        let mut f3 = std::pin::pin!(t3.cancelled());
+
+        // Poll each future once to register them.
+        assert!(matches!(f1.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(f2.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(f3.as_mut().poll(&mut cx), Poll::Pending));
+
+        // All three task IDs must be in the waiters list (3 entries).
+        assert_eq!(token.state.borrow().waiters.len(), 3);
+
+        // Cancel — wakers drain the list (cancel_state takes the vec).
+        token.cancel();
+
+        // Each future should now be Ready.
+        assert!(matches!(f1.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert!(matches!(f2.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert!(matches!(f3.as_mut().poll(&mut cx), Poll::Ready(())));
     }
 }
