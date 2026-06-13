@@ -239,13 +239,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return Ok(());
             }
 
-            // Batch replenish recv buffers.
-            if !self.driver.pending_replenish.is_empty() {
-                self.driver
-                    .provided_bufs
-                    .replenish_batch(&self.driver.pending_replenish);
-                self.driver.pending_replenish.clear();
-            }
+            // Recv buffer replenish for TCP now happens eagerly at the end of
+            // `drain_completions` (same iteration the buffers were consumed).
+            // UDP replenish stays here — it is conditional on the UDP buffer
+            // ring being configured and is off the burst hot path.
             if !self.driver.udp_pending_replenish.is_empty()
                 && let Some(ref mut udp_bufs) = self.driver.udp_provided_bufs
             {
@@ -882,6 +879,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let (user_data_raw, result, flags) = self.driver.cqe_batch[i];
                 self.dispatch_cqe(user_data_raw, result, flags);
             }
+        }
+
+        // Eagerly return consumed recv buffers to the kernel ring in the same
+        // iteration they were consumed, keeping the ring fuller under burst.
+        // Safe because every bid pushed to `pending_replenish` had its contents
+        // copied out (into the accumulator / recv sink / TLS state) before being
+        // pushed — the dispatch loop above has fully completed, so no handler
+        // still references these buffers. Zero-copy held buffers are tracked in
+        // `pending_recv_bufs` / `recv_hold` slots and are never in this queue.
+        if !self.driver.pending_replenish.is_empty() {
+            self.driver
+                .provided_bufs
+                .replenish_batch(&self.driver.pending_replenish);
+            self.driver.pending_replenish.clear();
         }
     }
 

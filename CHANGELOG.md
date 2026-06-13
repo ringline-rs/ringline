@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection-table lookups per poll.
 - `CancellationToken` futures register as a waiter once instead of rescanning
   the waiter list on every poll (O(1) vs O(n)).
+- io_uring event-loop memory traffic reductions on the hot path: the CQE drain
+  batch no longer carries the unused 16-byte `big_cqe` extended payload per CQE;
+  the six per-tick send-retry drains reuse a swap-buffer instead of heap-
+  allocating a fresh `Vec` whenever retries are pending (SQ-full backpressure);
+  and consumed provided recv buffers are now replenished to the kernel ring at
+  the end of `drain_completions` (same iteration they were consumed) instead of
+  at the top of the next tick, keeping the buffer ring fuller under burst.
 - The executor de-duplicates ready-queue entries per poll batch, avoiding
   redundant task-poll passes when many completions target the same connection
   in one drain.
