@@ -3,7 +3,6 @@ pub mod http1;
 pub mod http2;
 pub mod http3;
 pub mod memcache;
-pub mod momento;
 pub mod quic;
 pub mod redis;
 pub mod tcp;

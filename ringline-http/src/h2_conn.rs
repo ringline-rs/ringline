@@ -1,7 +1,7 @@
 //! Async HTTP/2 connection wrapping `H2Connection` with a pump loop.
 //!
-//! Follows the momento pattern: fire requests synchronously, then pump the
-//! connection (recv bytes → feed H2 → dispatch events → flush sends) until
+//! Uses a fire/recv pipelining pattern: fire requests synchronously, then pump
+//! the connection (recv bytes → feed H2 → dispatch events → flush sends) until
 //! a stream completes.
 
 use std::collections::{HashMap, VecDeque};

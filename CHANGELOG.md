@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+
+- The `ringline-momento` client crate has been removed.
+
 ### Added
 
 - `Config::send_zc_threshold` (and `ConfigBuilder::send_zc_threshold`) — guard

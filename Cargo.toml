@@ -8,7 +8,6 @@ members = [
     "ringline-h3",
     "ringline-h2",
     "ringline-ping",
-    "ringline-momento",
     "ringline-grpc",
     "ringline-http",
     "ringline-bench",
@@ -30,7 +29,6 @@ ringline-h2 = { path = "ringline-h2" }
 ringline-h3 = { path = "ringline-h3" }
 ringline-redis = { path = "ringline-redis" }
 ringline-memcache = { path = "ringline-memcache" }
-ringline-momento = { path = "ringline-momento" }
 ringline-grpc = { path = "ringline-grpc" }
 ringline-ping = { path = "ringline-ping" }
 resp-proto = "0.0.1"
