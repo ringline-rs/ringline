@@ -1430,6 +1430,50 @@ fn now_realtime_ns() -> u64 {
 }
 
 #[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    // 14-byte key with digits — exercises digit/key-byte adjacency and
+    // multi-digit integer fields (itoa boundary cases).
+    const KEY: &[u8] = b"user:123456789";
+
+    #[test]
+    fn golden_encode_request_get() {
+        let encoded = encode_request(&McRequest::get(KEY)).unwrap();
+        assert_eq!(encoded, b"get user:123456789\r\n");
+    }
+
+    #[test]
+    fn golden_encode_request_delete() {
+        let encoded = encode_request(&McRequest::delete(KEY)).unwrap();
+        assert_eq!(encoded, b"delete user:123456789\r\n");
+    }
+
+    #[test]
+    fn golden_encode_request_set() {
+        let encoded = encode_set(KEY, b"hello world value", 42, 7200).unwrap();
+        assert_eq!(
+            encoded,
+            &b"set user:123456789 42 7200 17\r\nhello world value\r\n"[..]
+        );
+    }
+
+    #[test]
+    fn golden_encode_request_set_zero_fields() {
+        let encoded = encode_set(KEY, b"v", 0, 0).unwrap();
+        assert_eq!(encoded, &b"set user:123456789 0 0 1\r\nv\r\n"[..]);
+    }
+
+    #[test]
+    fn golden_set_guard_prefix() {
+        // Non-trivial flags / exptime / value_len so every integer field
+        // is pinned byte-exactly.
+        let prefix = encode_set_guard_prefix(KEY, 1024, 42, 7200).unwrap();
+        assert_eq!(prefix, &b"set user:123456789 42 7200 1024\r\n"[..]);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
