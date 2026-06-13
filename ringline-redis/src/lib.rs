@@ -2522,6 +2522,65 @@ mod encode_tests {
                *3\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n"[..]
         );
     }
+
+    // Key constants shared by the tx_bytes tests below.
+    const VALUE: &[u8] = b"hello";
+    const VALUE_LEN: usize = VALUE.len(); // 5
+    const TTL: u64 = 7200;
+
+    /// Pin the tx_bytes arithmetic for the non-EX guard SET path.
+    ///
+    /// The guard split is: `prefix || [value bytes supplied by caller] || "\r\n"`.
+    /// So the full on-wire byte count is `prefix.len() + value_len + 2`.
+    #[test]
+    fn tx_bytes_guard_set_no_ex() {
+        // Full wire bytes for SET key value (no EX), constructed explicitly.
+        let full_wire: &[u8] = b"*3\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$5\r\nhello\r\n";
+
+        let mut prefix = Vec::new();
+        append_set_guard_prefix(&mut prefix, KEY, VALUE_LEN);
+
+        // The caller sends: prefix || value_bytes || "\r\n".
+        // So full wire length == prefix.len() + value_len + 2.
+        assert_eq!(
+            prefix.len() + VALUE_LEN + 2,
+            full_wire.len(),
+            "prefix.len()={} + value_len={} + 2 should equal full wire len={}",
+            prefix.len(),
+            VALUE_LEN,
+            full_wire.len(),
+        );
+    }
+
+    /// Pin the tx_bytes arithmetic for the EX guard SET path.
+    ///
+    /// The guard split is: `prefix || [value bytes supplied by caller] || suffix`.
+    /// The suffix *starts* with "\r\n" (terminating the value bulk string),
+    /// so the full on-wire byte count is `prefix.len() + value_len + suffix.len()`.
+    #[test]
+    fn tx_bytes_guard_set_ex() {
+        // Full wire bytes for SET key value EX ttl, constructed explicitly.
+        let full_wire: &[u8] =
+            b"*5\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$5\r\nhello\r\n$2\r\nEX\r\n$4\r\n7200\r\n";
+
+        let mut prefix = Vec::new();
+        append_set_guard_prefix_ex(&mut prefix, KEY, VALUE_LEN);
+        let mut suffix = Vec::new();
+        append_set_guard_suffix_ex(&mut suffix, TTL);
+
+        // The suffix starts with "\r\n" which closes the value bulk string —
+        // no separate "\r\n" is needed between value and suffix.
+        // So full wire length == prefix.len() + value_len + suffix.len().
+        assert_eq!(
+            prefix.len() + VALUE_LEN + suffix.len(),
+            full_wire.len(),
+            "prefix.len()={} + value_len={} + suffix.len()={} should equal full wire len={}",
+            prefix.len(),
+            VALUE_LEN,
+            suffix.len(),
+            full_wire.len(),
+        );
+    }
 }
 
 #[cfg(test)]
