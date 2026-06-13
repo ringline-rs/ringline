@@ -9,7 +9,7 @@
 //!
 //! `H2AsyncConn` wraps an `H2Connection` (sans-IO) with a pump loop that
 //! continuously transfers bytes between `ConnCtx` and the H2 state machine.
-//! This follows the same pattern as `ringline-momento`: fire requests
+//! This uses a fire/recv pipelining pattern: fire requests
 //! synchronously, then pump until responses arrive.
 //!
 //! `H1Conn` provides simple HTTP/1.1 request-response over a `ConnCtx`,

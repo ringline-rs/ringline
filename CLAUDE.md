@@ -37,7 +37,6 @@ This is a Cargo workspace. The core runtime is in `ringline/`; protocol client c
 - **ringline-redis** — RESP protocol client wrapping `ConnCtx`
 - **ringline-memcache** — Memcache protocol client wrapping `ConnCtx`
 - **ringline-ping** — Simple PING/PONG client
-- **ringline-momento** — Multiplexed Momento cache client (protobuf over TLS)
 - **ringline-h2** — Sans-IO HTTP/2 client framing (HPACK, streams)
 - **ringline-h3** — HTTP/3 framing on top of `ringline-quic` (QPACK, control streams)
 - **ringline-quic** — QUIC layer wrapping `quinn-proto` sans-IO state machine
@@ -156,15 +155,6 @@ The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parse
 
 **Summary**: Recv is fully zero-copy (refcounted slices), matching redis. Send always copies the command envelope (key names, memcache framing) into the pool. For large values, `set_with_guard()` avoids copying the value itself.
 
-#### ringline-momento
-
-| Path | Copies | Mechanism |
-|------|--------|-----------|
-| **Recv (values)** | **0** | Uses `with_bytes()` + `CacheResponse::decode_bytes()`. Values are `Bytes::slice()` into the accumulator — no allocation, O(1) refcount. |
-| **Send (requests)** | **1** | Single-pass `encode_into()` writes all protobuf nesting levels directly into one reusable buffer. Then `send_nowait()` copies into pool. |
-
-**Summary**: Recv is fully zero-copy (refcounted slices), matching redis/memcache. Send uses single-pass encoding into a reusable buffer — 1 copy into the send pool. Note: all Momento connections use TLS, which adds encryption copies on the send path regardless (`SendGuard` cannot help since TLS must read plaintext and write ciphertext).
-
 #### ringline-ping
 
 | Path | Copies | Mechanism |
@@ -186,7 +176,7 @@ The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parse
 
 ## Fire/Recv Pipelining API
 
-The protocol client crates (`ringline-redis`, `ringline-memcache`, `ringline-momento`) support a fire/recv pattern for pipelined request-response without blocking on each individual response. This enables higher throughput by overlapping network round trips.
+The protocol client crates (`ringline-redis`, `ringline-memcache`) support a fire/recv pattern for pipelined request-response without blocking on each individual response. This enables higher throughput by overlapping network round trips.
 
 ### Pattern
 
@@ -211,8 +201,6 @@ Each client has a `VecDeque<PendingOp>` that tracks in-flight requests. `fire_*(
 **ringline-redis**: `fire_get`, `fire_set`, `fire_set_with_guard`, `fire_set_ex`, `fire_set_ex_with_guard`, `fire_del`, `recv() -> CompletedOp`
 
 **ringline-memcache**: `fire_get`, `fire_set`, `fire_set_with_guard`, `fire_delete`, `recv() -> CompletedOp`
-
-**ringline-momento**: `fire_get`, `fire_set`, `fire_delete`, `recv() -> CompletedOp`
 
 ### Design Notes
 

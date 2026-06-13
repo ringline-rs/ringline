@@ -1,7 +1,7 @@
 //! Connection pool for HTTP clients.
 //!
 //! Fixed-size pool with round-robin dispatch and lazy reconnection.
-//! Follows the `ringline-momento/src/pool.rs` pattern.
+//! Connection pool with multiplexed in-flight request tracking.
 
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};

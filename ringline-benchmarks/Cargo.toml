@@ -23,7 +23,6 @@ ringline-h2 = { workspace = true }
 ringline-h3 = { workspace = true }
 ringline-redis = { workspace = true }
 ringline-memcache = { workspace = true }
-ringline-momento = { workspace = true }
 ringline-grpc = { workspace = true }
 ringline-ping = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
