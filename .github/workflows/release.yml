@@ -134,7 +134,6 @@ jobs:
           publish_if_needed ringline-quic
           publish_if_needed ringline-redis
           publish_if_needed ringline-memcache
-          publish_if_needed ringline-momento
           publish_if_needed ringline-ping
 
           # Tier 2: crates that depend on other workspace crates
