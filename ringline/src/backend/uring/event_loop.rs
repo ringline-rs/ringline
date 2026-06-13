@@ -673,14 +673,53 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let driver = unsafe { &mut *driver };
         let executor = unsafe { &mut *executor };
 
+        // Per-batch dedup: collapse duplicate ready-queue entries that were
+        // present at the START of this poll_ready_tasks call. N CQEs for the
+        // same connection landing in one drain_completions batch push N copies
+        // of the same id; without dedup, the second through Nth entries each
+        // build a waker, set CURRENT_TASK_ID, and call take_ready → None —
+        // pure overhead.
+        //
+        // Safety argument for lost-wakeup freedom:
+        //
+        // Dedup applies ONLY to entries at indices < initial_len (captured
+        // before the loop). Entries appended to ready_queue *during* this call
+        // (via wake_task() called from within a polled future, which pushes
+        // directly to executor.ready_queue) have i >= initial_len and bypass
+        // the dedup check entirely — they are processed unconditionally.
+        //
+        // This boundary is essential: without it, a future that parks itself
+        // and then is immediately re-woken by another task in the same batch
+        // (e.g. A wakes B, B's continuation wakes A) would be suppressed by
+        // the dedup bit set for A's first occurrence, causing a lost wakeup.
+        // With the boundary, only the initial-batch duplicates (from the drain)
+        // are collapsed; in-flight wakeups from the futures themselves are
+        // always honored.
+        //
+        // STANDALONE_BIT separates the two dedup arrays so a standalone task
+        // and a connection task with the same low-bit index are never confused.
+        // Arrays are pre-allocated in Executor (zero per-call heap allocation).
+        // Bits are reset by scanning only the initial-batch slice.
+
+        let initial_len = executor.ready_queue.len();
+
         let mut i = 0;
         while i < executor.ready_queue.len() {
             let raw_id = executor.ready_queue[i];
+            let in_initial_batch = i < initial_len;
             i += 1;
 
             if raw_id & STANDALONE_BIT != 0 {
                 // Standalone task.
-                let task_idx = raw_id & !STANDALONE_BIT;
+                let task_idx = (raw_id & !STANDALONE_BIT) as usize;
+                if in_initial_batch && task_idx < executor.poll_dedup_standalone.len() {
+                    if executor.poll_dedup_standalone[task_idx] {
+                        // Duplicate in initial batch — skip.
+                        continue;
+                    }
+                    executor.poll_dedup_standalone[task_idx] = true;
+                }
+                let task_idx = task_idx as u32;
                 if let Some(mut fut) = executor.standalone_slab.take_ready(task_idx) {
                     let waker = standalone_waker(task_idx);
                     let mut cx = Context::from_waker(&waker);
@@ -711,7 +750,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             } else {
                 // Connection task.
-                let conn_index = raw_id;
+                let conn_index = raw_id as usize;
+                if in_initial_batch && conn_index < executor.poll_dedup_conn.len() {
+                    if executor.poll_dedup_conn[conn_index] {
+                        // Duplicate in initial batch — skip.
+                        continue;
+                    }
+                    executor.poll_dedup_conn[conn_index] = true;
+                }
+                let conn_index = conn_index as u32;
                 if let Some(mut fut) = executor.task_slab.take_ready(conn_index) {
                     let waker = conn_waker(conn_index);
                     let mut cx = Context::from_waker(&waker);
@@ -741,6 +788,25 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             );
                         }
                     }
+                }
+            }
+        }
+
+        // Reset dedup bits for the initial-batch entries only (those are the
+        // only ones whose bits could have been set). Zero extra allocation —
+        // we index into the ready_queue we already hold.
+        let reset_end = initial_len.min(executor.ready_queue.len());
+        for idx in 0..reset_end {
+            let raw_id = executor.ready_queue[idx];
+            if raw_id & STANDALONE_BIT != 0 {
+                let task_idx = (raw_id & !STANDALONE_BIT) as usize;
+                if task_idx < executor.poll_dedup_standalone.len() {
+                    executor.poll_dedup_standalone[task_idx] = false;
+                }
+            } else {
+                let conn_index = raw_id as usize;
+                if conn_index < executor.poll_dedup_conn.len() {
+                    executor.poll_dedup_conn[conn_index] = false;
                 }
             }
         }

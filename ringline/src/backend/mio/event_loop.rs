@@ -908,14 +908,29 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let driver = unsafe { &mut *driver };
         let executor = unsafe { &mut *executor };
 
+        // Per-batch dedup: same strategy as the io_uring backend.
+        // See that backend's poll_ready_tasks for the full safety argument,
+        // including the initial_len boundary that prevents lost wakeups when
+        // a future wakes itself during the current poll pass.
+
+        let initial_len = executor.ready_queue.len();
+
         let mut i = 0;
         while i < executor.ready_queue.len() {
             let raw_id = executor.ready_queue[i];
+            let in_initial_batch = i < initial_len;
             i += 1;
 
             if raw_id & STANDALONE_BIT != 0 {
                 // Standalone task.
-                let task_idx = raw_id & !STANDALONE_BIT;
+                let task_idx = (raw_id & !STANDALONE_BIT) as usize;
+                if in_initial_batch && task_idx < executor.poll_dedup_standalone.len() {
+                    if executor.poll_dedup_standalone[task_idx] {
+                        continue;
+                    }
+                    executor.poll_dedup_standalone[task_idx] = true;
+                }
+                let task_idx = task_idx as u32;
                 if let Some(mut fut) = executor.standalone_slab.take_ready(task_idx) {
                     let waker = standalone_waker(task_idx);
                     let mut cx = Context::from_waker(&waker);
@@ -940,7 +955,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             } else {
                 // Connection task.
-                let conn_index = raw_id;
+                let conn_index = raw_id as usize;
+                if in_initial_batch && conn_index < executor.poll_dedup_conn.len() {
+                    if executor.poll_dedup_conn[conn_index] {
+                        continue;
+                    }
+                    executor.poll_dedup_conn[conn_index] = true;
+                }
+                let conn_index = conn_index as u32;
                 if let Some(mut fut) = executor.task_slab.take_ready(conn_index) {
                     let waker = conn_waker(conn_index);
                     let mut cx = Context::from_waker(&waker);
@@ -967,6 +989,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             );
                         }
                     }
+                }
+            }
+        }
+
+        // Reset dedup bits for the initial-batch entries only.
+        let reset_end = initial_len.min(executor.ready_queue.len());
+        for idx in 0..reset_end {
+            let raw_id = executor.ready_queue[idx];
+            if raw_id & STANDALONE_BIT != 0 {
+                let task_idx = (raw_id & !STANDALONE_BIT) as usize;
+                if task_idx < executor.poll_dedup_standalone.len() {
+                    executor.poll_dedup_standalone[task_idx] = false;
+                }
+            } else {
+                let conn_index = raw_id as usize;
+                if conn_index < executor.poll_dedup_conn.len() {
+                    executor.poll_dedup_conn[conn_index] = false;
                 }
             }
         }
