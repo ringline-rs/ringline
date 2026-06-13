@@ -71,6 +71,12 @@ impl RecvAccumulator {
     pub fn reset(&mut self) {
         self.buf.clear();
     }
+
+    /// Return the current backing-buffer capacity. Test-only.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
 }
 
 use bytes::Buf;
@@ -123,13 +129,38 @@ impl AccumulatorTable {
         self.accumulators[index as usize].reset();
     }
 
+    /// Return the current backing-buffer capacity for the accumulator at
+    /// the given index. Test-only.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self, index: u32) -> usize {
+        self.accumulators[index as usize].capacity()
+    }
+
     /// Detach the accumulator's buffer as a frozen `Bytes` (O(1)).
     ///
-    /// The accumulator is left empty. Use `prepend()` to put back
-    /// any unconsumed remainder after zero-copy parsing.
+    /// The accumulator is left empty but retains the tail capacity of the
+    /// same allocation via `split_to`. Any subsequent `prepend()` of an
+    /// unconsumed remainder (the hot pipelined-parse path) reuses that
+    /// capacity instead of heap-allocating a fresh `BytesMut`.
+    ///
+    /// Note: when the returned `Bytes` (or sub-slices the parser keeps, as in
+    /// `with_bytes`) outlive the next `append()`, the shared allocation cannot
+    /// reclaim its front, so the tail capacity shrinks across cycles and a
+    /// later `append()` may still reallocate. The win is the avoided per-parse
+    /// remainder allocation, not elimination of all reallocation.
     pub fn take_frozen(&mut self, index: u32) -> Bytes {
         let acc = &mut self.accumulators[index as usize];
-        std::mem::replace(&mut acc.buf, BytesMut::new()).freeze()
+        let len = acc.buf.len();
+        // Fast path: empty accumulator — `split_to(0)` would unnecessarily
+        // upgrade `BytesMut` to shared mode, blocking later front-reclaim.
+        if len == 0 {
+            return Bytes::new();
+        }
+        // `split_to(len)` hands back the filled front as `other` and leaves
+        // `acc.buf` empty but still owning the tail capacity of the same
+        // allocation — O(1), no copy. The `freeze()` on the front is also
+        // O(1). Both operations are non-allocating.
+        acc.buf.split_to(len).freeze()
     }
 
     /// Put unconsumed data back into the accumulator.
@@ -141,13 +172,24 @@ impl AccumulatorTable {
             return;
         }
         let acc = &mut self.accumulators[index as usize];
-        // The accumulator should be empty after take_frozen(), but if new
-        // data arrived (impossible in single-threaded poll), handle it.
+        // Within the single-threaded per-worker event loop, `prepend` is
+        // always called immediately after `take_frozen` (within the same
+        // `poll`). No other task can append to this accumulator between
+        // `take_frozen` and `prepend`, so the buffer must be empty here.
+        debug_assert!(
+            acc.buf.is_empty(),
+            "prepend: accumulator unexpectedly non-empty (single-threaded invariant violated); \
+             len={}",
+            acc.buf.len()
+        );
         if acc.buf.is_empty() {
+            // Fast path (invariant): buffer is empty, tail capacity is
+            // retained from `take_frozen`'s `split_to` — no allocation.
             acc.buf.extend_from_slice(data);
         } else {
-            // Rare path: new data already present. Prepend by building a
-            // new buffer with remainder first.
+            // Slow path: new data already present (cannot happen in the
+            // single-threaded runtime). Prepend by building a new buffer
+            // with remainder first.
             let mut new_buf = BytesMut::with_capacity(data.len() + acc.buf.len());
             new_buf.extend_from_slice(data);
             new_buf.extend_from_slice(&acc.buf);
@@ -229,6 +271,53 @@ mod tests {
         // Put back the unconsumed remainder.
         table.prepend(0, &frozen[11..]);
         assert_eq!(table.data(0), b"$3\r\nbar\r\n");
+    }
+
+    /// After `take_frozen` + `prepend(remainder)`, the accumulator must NOT
+    /// have allocated a new backing buffer — the tail capacity from the
+    /// split must still be in place (`capacity() > 0` immediately after
+    /// `take_frozen`, and the `prepend` does not reallocate).
+    #[test]
+    fn take_frozen_preserves_tail_capacity() {
+        let mut table = AccumulatorTable::new(1, 256);
+        // Fill with data that will have a remainder after the first parse.
+        assert!(table.append(0, b"$5\r\nhello\r\n$3\r\nbar\r\n"));
+
+        let frozen = table.take_frozen(0);
+        // Capacity must be non-zero — the tail allocation is retained.
+        assert!(
+            table.capacity(0) > 0,
+            "take_frozen must retain tail capacity, got 0"
+        );
+
+        // Prepend the unconsumed remainder — must not reallocate.
+        let cap_after_take = table.capacity(0);
+        let remainder = &frozen[11..];
+        table.prepend(0, remainder);
+        assert_eq!(
+            table.capacity(0),
+            cap_after_take,
+            "prepend(remainder) must reuse the retained capacity, not reallocate"
+        );
+        assert_eq!(table.data(0), b"$3\r\nbar\r\n");
+
+        // Multiple cycles must each preserve capacity (no per-cycle realloc).
+        for _ in 0..3 {
+            assert!(table.append(0, b" extra"));
+            let f = table.take_frozen(0);
+            assert!(
+                table.capacity(0) > 0,
+                "cycle: take_frozen must retain capacity"
+            );
+            let cap_before = table.capacity(0);
+            table.prepend(0, &f[..3]);
+            assert_eq!(
+                table.capacity(0),
+                cap_before,
+                "cycle: prepend must reuse retained capacity"
+            );
+            drop(f);
+        }
     }
 
     #[test]

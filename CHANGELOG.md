@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   per-iteration `Instant::now()`/`elapsed()` reads it required are skipped by
   default, removing ~4 clock reads per event-loop iteration on the hot path.
   The `[ringline diag]` iteration-mix counters remain always-on.
+- `with_bytes` zero-copy parsing avoids a per-parse heap allocation when
+  stashing the unconsumed remainder: `take_frozen()` detaches via `split_to`,
+  so the prepended remainder reuses the allocation's tail capacity instead of
+  allocating a fresh buffer. `WithBytesFuture` also drops two redundant
+  connection-table lookups per poll.
 
 ## [0.2.0] - 2026-06-08
 
