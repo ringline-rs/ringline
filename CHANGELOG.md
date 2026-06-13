@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   than the two-completion lifecycle, removing a small-value `SET` throughput
   plateau observed in benchmarks. Sends at or above the threshold, sends that
   don't fit a send pool slot, and TLS sends are unchanged.
+- Event-loop wall-clock stall instrumentation (the `[ringline stall]` shutdown
+  report) is now opt-in via the `RINGLINE_LOOP_DIAG` environment variable. The
+  per-iteration `Instant::now()`/`elapsed()` reads it required are skipped by
+  default, removing ~4 clock reads per event-loop iteration on the hot path.
+  The `[ringline diag]` iteration-mix counters remain always-on.
 
 ## [0.2.0] - 2026-06-08
 
