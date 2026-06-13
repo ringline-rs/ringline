@@ -719,6 +719,21 @@ impl ConnCtx {
         }
     }
 
+    /// Construct a `ConnCtx` with arbitrary index/generation for use in
+    /// downstream-crate unit tests that exercise buffering / encoding logic
+    /// without a live io_uring driver.
+    ///
+    /// The returned handle does **not** refer to any real connection. Any I/O
+    /// method (`with_data`, `send`, `flush`, …) will index into a driver table
+    /// that has no slot for it and is therefore undefined to call. It is only
+    /// safe to use in tests that touch in-memory client state (write buffers,
+    /// pending queues, encoders) and never reach the wire.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn for_test(conn_index: u32, generation: u32) -> Self {
+        ConnCtx::new(conn_index, generation)
+    }
+
     /// Returns the connection slot index. Useful for indexing into per-connection arrays.
     pub fn index(&self) -> usize {
         self.conn_index as usize

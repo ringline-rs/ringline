@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+ringline = { workspace = true, features = ["testing"] }
 
 [[bench]]
 name = "resp_bench"

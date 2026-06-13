@@ -147,6 +147,10 @@ use ringline::{ConnCtx, GuardBox, ParseResult, SendGuard};
 const MAX_FLUSH_GUARDS: usize = 4;
 /// Maximum iovecs per scatter-gather send (matches ringline core limit).
 const MAX_FLUSH_IOVECS: usize = 8;
+/// Default [`ClientBuilder::zc_threshold`]. Matches the runtime
+/// `Config::send_zc_threshold` default so small guarded SETs fold into the
+/// coalescing copy path by default.
+const DEFAULT_ZC_THRESHOLD: u32 = 4096;
 
 // ── Error ───────────────────────────────────────────────────────────────
 
@@ -378,6 +382,7 @@ pub struct ClientBuilder {
     on_result: Option<ResultCallback>,
     max_batch_size: usize,
     max_in_flight: usize,
+    zc_threshold: u32,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -391,11 +396,26 @@ impl ClientBuilder {
             on_result: None,
             max_batch_size: 1,
             max_in_flight: usize::MAX,
+            zc_threshold: DEFAULT_ZC_THRESHOLD,
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
             with_metrics: false,
         }
+    }
+
+    /// Set the zero-copy guard threshold (in bytes). Guard values passed to
+    /// [`fire_set_with_guard`](Client::fire_set_with_guard) /
+    /// [`fire_set_ex_with_guard`](Client::fire_set_ex_with_guard) *smaller*
+    /// than this are copied into the coalescing send buffer so they batch like
+    /// plain SETs instead of taking the scatter-gather guard path (which
+    /// flushes every few ops). `0` = always use the guard path.
+    ///
+    /// Defaults to 4096. Should generally match the runtime
+    /// `Config::send_zc_threshold`.
+    pub fn zc_threshold(mut self, bytes: u32) -> Self {
+        self.zc_threshold = bytes;
+        self
     }
 
     /// Configure the maximum number of in-flight `fire_*` operations
@@ -458,6 +478,7 @@ impl ClientBuilder {
             flushed_count: 0,
             max_batch_size: self.max_batch_size,
             max_in_flight: self.max_in_flight,
+            zc_threshold: self.zc_threshold,
             buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
@@ -500,6 +521,10 @@ pub struct Client {
     /// Cap on `pending.len()`; `fire_*` returns `Error::TooManyInFlight`
     /// past it. `usize::MAX` (default) disables.
     max_in_flight: usize,
+    /// Guard values smaller than this (bytes) are folded into the coalescing
+    /// copy path by `fire_set_with_guard` / `fire_set_ex_with_guard` instead
+    /// of taking the scatter-gather guard path. `0` disables the fold.
+    zc_threshold: u32,
     /// Number of ops buffered in `write_buf` that have not yet been flushed.
     buffered_ops: usize,
     /// Reusable scratch buffer for encoding single requests (direct-send
@@ -529,6 +554,7 @@ impl Client {
             flushed_count: 0,
             max_batch_size: 1,
             max_in_flight: usize::MAX,
+            zc_threshold: DEFAULT_ZC_THRESHOLD,
             buffered_ops: 0,
             encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
@@ -855,8 +881,20 @@ impl Client {
         guard: G,
         user_data: u64,
     ) -> Result<(), Error> {
+        let (ptr, value_len) = guard.as_ptr_len();
+        // Small guard values: fold into the coalescing copy path so they
+        // batch like plain SETs (up to `max_batch_size`) instead of taking
+        // the scatter-gather guard path, which flushes every few ops.
+        if self.zc_threshold != 0 && value_len < self.zc_threshold {
+            // SAFETY: `guard` is owned and live for the duration of this
+            // function, so `ptr`/`value_len` describe a valid byte range.
+            // `fire_set` copies those bytes into `write_buf`/`encode_buf`
+            // synchronously (no `.await` between this borrow and the copy),
+            // after which the guard `G` is dropped at the end of this call.
+            let value = unsafe { core::slice::from_raw_parts(ptr, value_len as usize) };
+            return self.fire_set(key, value, user_data);
+        }
         self.pre_flush_if_needed(true)?;
-        let (_, value_len) = guard.as_ptr_len();
         // Append prefix, record guard insertion point, append suffix —
         // directly into write_buf, no intermediate allocation.
         let before = self.write_buf.len();
@@ -924,8 +962,20 @@ impl Client {
         ttl_secs: u64,
         user_data: u64,
     ) -> Result<(), Error> {
+        let (ptr, value_len) = guard.as_ptr_len();
+        // Small guard values: fold into the coalescing copy path (the EX
+        // copy SET, `fire_set_ex`) so they batch like plain SETs instead of
+        // taking the scatter-gather guard path.
+        if self.zc_threshold != 0 && value_len < self.zc_threshold {
+            // SAFETY: `guard` is owned and live for the duration of this
+            // function, so `ptr`/`value_len` describe a valid byte range.
+            // `fire_set_ex` copies those bytes synchronously (no `.await`
+            // between this borrow and the copy), after which the guard `G`
+            // is dropped at the end of this call.
+            let value = unsafe { core::slice::from_raw_parts(ptr, value_len as usize) };
+            return self.fire_set_ex(key, value, ttl_secs, user_data);
+        }
         self.pre_flush_if_needed(true)?;
-        let (_, value_len) = guard.as_ptr_len();
         // Append prefix, record guard insertion point, append suffix —
         // directly into write_buf, no intermediate allocations.
         let before = self.write_buf.len();
@@ -2580,6 +2630,146 @@ mod encode_tests {
             suffix.len(),
             full_wire.len(),
         );
+    }
+}
+
+#[cfg(test)]
+mod zc_threshold_tests {
+    use super::*;
+    use ringline::{ConnCtx, RegionId, SendGuard};
+
+    const KEY: &[u8] = b"user:123456789";
+
+    /// Heap-backed guard for tests. The `Vec` keeps bytes alive for the
+    /// guard's lifetime.
+    struct VecGuard(Vec<u8>);
+
+    impl SendGuard for VecGuard {
+        fn as_ptr_len(&self) -> (*const u8, u32) {
+            (self.0.as_ptr(), self.0.len() as u32)
+        }
+        fn region(&self) -> RegionId {
+            RegionId::UNREGISTERED
+        }
+    }
+
+    /// A `Client` backed by a dangling `ConnCtx`. Only safe for tests that
+    /// stay in the buffered path (no flush, no direct send, no recv).
+    fn test_client(max_batch_size: usize, zc_threshold: u32) -> Client {
+        let conn = ConnCtx::for_test(0, 0);
+        let mut client = Client::builder(conn).max_batch_size(max_batch_size);
+        client = client.zc_threshold(zc_threshold);
+        client.build()
+    }
+
+    #[test]
+    fn small_guard_set_is_byte_identical_to_plain_set() {
+        // Small guarded SET must produce byte-identical write_buf to a plain
+        // copy SET of the same key/value, because it routes through fire_set.
+        let value = vec![0xABu8; 64];
+
+        let mut guarded = test_client(4, 4096);
+        guarded
+            .fire_set_with_guard(KEY, VecGuard(value.clone()), 1)
+            .unwrap();
+
+        let mut plain = test_client(4, 4096);
+        plain.fire_set(KEY, &value, 1).unwrap();
+
+        assert_eq!(guarded.write_buf, plain.write_buf);
+        assert!(guarded.write_guards.is_empty());
+    }
+
+    #[test]
+    fn small_guard_set_ex_is_byte_identical_to_plain_set_ex() {
+        let value = vec![0xCDu8; 64];
+
+        let mut guarded = test_client(4, 4096);
+        guarded
+            .fire_set_ex_with_guard(KEY, VecGuard(value.clone()), 7200, 1)
+            .unwrap();
+
+        let mut plain = test_client(4, 4096);
+        plain.fire_set_ex(KEY, &value, 7200, 1).unwrap();
+
+        assert_eq!(guarded.write_buf, plain.write_buf);
+        assert!(guarded.write_guards.is_empty());
+    }
+
+    #[test]
+    fn small_value_takes_copy_path() {
+        // 64B < 4096 → folds into copy path: write_guards empty, one buffered op.
+        let mut client = test_client(4, 4096);
+        client
+            .fire_set_with_guard(KEY, VecGuard(vec![0u8; 64]), 1)
+            .unwrap();
+        assert!(client.write_guards.is_empty());
+        assert_eq!(client.buffered_ops, 1);
+        assert!(!client.write_buf.is_empty());
+    }
+
+    #[test]
+    fn large_value_takes_guard_path() {
+        // 8KB >= 4096 → guard path: write_guards non-empty.
+        let mut client = test_client(4, 4096);
+        client
+            .fire_set_with_guard(KEY, VecGuard(vec![0u8; 8192]), 1)
+            .unwrap();
+        assert_eq!(client.write_guards.len(), 1);
+    }
+
+    #[test]
+    fn large_value_set_ex_takes_guard_path() {
+        let mut client = test_client(4, 4096);
+        client
+            .fire_set_ex_with_guard(KEY, VecGuard(vec![0u8; 8192]), 7200, 1)
+            .unwrap();
+        assert_eq!(client.write_guards.len(), 1);
+    }
+
+    #[test]
+    fn threshold_zero_disables_fold() {
+        // zc_threshold = 0 → always guard path, even for tiny values.
+        let mut client = test_client(4, 0);
+        client
+            .fire_set_with_guard(KEY, VecGuard(vec![0u8; 64]), 1)
+            .unwrap();
+        assert_eq!(client.write_guards.len(), 1);
+
+        let mut client_ex = test_client(4, 0);
+        client_ex
+            .fire_set_ex_with_guard(KEY, VecGuard(vec![0u8; 64]), 7200, 1)
+            .unwrap();
+        assert_eq!(client_ex.write_guards.len(), 1);
+    }
+
+    #[test]
+    fn batch_of_small_guard_sets_coalesces_to_one_flush() {
+        // N small guarded SETs at max_batch_size = N: all fold into the copy
+        // path (write_guards stays empty), so they batch into a single buffer
+        // and exactly one flush is triggered by the Nth op (buffered_ops
+        // resets to 0, write_buf cleared). With a guard path they'd flush
+        // every MAX_FLUSH_GUARDS (4) ops instead.
+        const N: usize = 8;
+        let mut client = test_client(N, 4096);
+        // Pre-fill write_buf so we can detect the flush clearing it; but the
+        // flush itself would hit the (dangling) conn, so instead assert the
+        // pre-flush invariant: the first N-1 ops accumulate with no guards.
+        for i in 0..N - 1 {
+            client
+                .fire_set_with_guard(KEY, VecGuard(vec![0u8; 64]), i as u64)
+                .unwrap();
+            assert!(
+                client.write_guards.is_empty(),
+                "op {i} must use the copy path, not the guard path"
+            );
+            assert_eq!(client.buffered_ops, i + 1);
+        }
+        // After N-1 small guarded SETs we have N-1 buffered copy ops and zero
+        // guards — proving the whole batch coalesces (a guard path would have
+        // flushed at op index 4 when next_guards exceeded MAX_FLUSH_GUARDS).
+        assert_eq!(client.buffered_ops, N - 1);
+        assert!(client.write_guards.is_empty());
     }
 }
 

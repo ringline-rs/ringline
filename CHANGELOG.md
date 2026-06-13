@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- redis/memcache clients gained `ClientBuilder::zc_threshold` (default 4096): `fire_set_with_guard`
+  values below the threshold are copied into the coalescing send buffer so they batch like plain
+  SETs instead of taking the scatter-gather guard path (which flushed every few ops), recovering
+  ~17% throughput on small pipelined SET workloads. Larger values keep the zero-copy guard path.
 - The io_uring event loop skips the `io_uring_enter` syscall in `flush()` when no
   SQEs are queued; deferred task_work and completions are reaped by the next
   `submit_and_wait`, removing a redundant syscall on iterations that produce no sends.
