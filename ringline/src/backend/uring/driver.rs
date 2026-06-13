@@ -234,6 +234,15 @@ pub(crate) struct Driver {
     pub(crate) pending_recv_forward_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
+    /// Scratch buffers swapped with the corresponding `pending_*_retries`
+    /// queue at drain time so the per-tick drain reuses a single allocation
+    /// across ticks (the primary queue is left empty for in-iteration
+    /// re-enqueues; `drain(..)` on the scratch keeps its capacity).
+    pub(crate) zc_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) copy_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) send_pollout_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) coalesced_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) recv_forward_retry_scratch: Vec<(u32, u32, u16, u8)>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
     /// NVMe device tracking table. `None` when NVMe is not configured.
@@ -451,6 +460,11 @@ impl Driver {
             pending_coalesced_retries: Vec::new(),
             pending_recv_forward_retries: Vec::new(),
             pending_close_retries: Vec::new(),
+            zc_retry_scratch: Vec::new(),
+            copy_retry_scratch: Vec::new(),
+            send_pollout_retry_scratch: Vec::new(),
+            coalesced_retry_scratch: Vec::new(),
+            recv_forward_retry_scratch: Vec::new(),
             udp_sockets,
             nvme_devices: config
                 .nvme

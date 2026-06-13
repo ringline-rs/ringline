@@ -262,8 +262,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Retry any ZC send resubmissions that failed on the previous tick
             // (SQ was full). The SQ has been flushed by submit_and_wait above.
             if !self.driver.pending_zc_retries.is_empty() {
-                let retries: Vec<_> = self.driver.pending_zc_retries.drain(..).collect();
-                for (conn_index, generation, slab_idx, retries) in retries {
+                std::mem::swap(
+                    &mut self.driver.pending_zc_retries,
+                    &mut self.driver.zc_retry_scratch,
+                );
+                for idx in 0..self.driver.zc_retry_scratch.len() {
+                    let (conn_index, generation, slab_idx, retries) =
+                        self.driver.zc_retry_scratch[idx];
                     if retries >= 2 {
                         // Max retries exceeded — release and drop.
                         if self.driver.send_slab.in_use(slab_idx) {
@@ -312,12 +317,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         ));
                     }
                 }
+                self.driver.zc_retry_scratch.clear();
             }
 
             // Retry coalesced send resubmissions that failed (SQ was full).
             if !self.driver.pending_coalesced_retries.is_empty() {
-                let retries: Vec<_> = self.driver.pending_coalesced_retries.drain(..).collect();
-                for (conn_index, generation, slab_idx, retries) in retries {
+                std::mem::swap(
+                    &mut self.driver.pending_coalesced_retries,
+                    &mut self.driver.coalesced_retry_scratch,
+                );
+                for idx in 0..self.driver.coalesced_retry_scratch.len() {
+                    let (conn_index, generation, slab_idx, retries) =
+                        self.driver.coalesced_retry_scratch[idx];
                     if !self.driver.send_slab.in_use(slab_idx) {
                         continue; // slab released meanwhile
                     }
@@ -347,12 +358,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         ));
                     }
                 }
+                self.driver.coalesced_retry_scratch.clear();
             }
 
             // Retry recv-forward send resubmissions that failed (SQ was full).
             if !self.driver.pending_recv_forward_retries.is_empty() {
-                let retries: Vec<_> = self.driver.pending_recv_forward_retries.drain(..).collect();
-                for (conn_index, generation, slab_idx, retries) in retries {
+                std::mem::swap(
+                    &mut self.driver.pending_recv_forward_retries,
+                    &mut self.driver.recv_forward_retry_scratch,
+                );
+                for idx in 0..self.driver.recv_forward_retry_scratch.len() {
+                    let (conn_index, generation, slab_idx, retries) =
+                        self.driver.recv_forward_retry_scratch[idx];
                     if !self.driver.send_slab.in_use(slab_idx) {
                         continue; // slab released meanwhile
                     }
@@ -381,12 +398,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         ));
                     }
                 }
+                self.driver.recv_forward_retry_scratch.clear();
             }
 
             // Retry any copy send resubmissions that failed (SQ was full).
             if !self.driver.pending_copy_retries.is_empty() {
-                let retries: Vec<_> = self.driver.pending_copy_retries.drain(..).collect();
-                for (conn_index, generation, pool_slot, retries) in retries {
+                std::mem::swap(
+                    &mut self.driver.pending_copy_retries,
+                    &mut self.driver.copy_retry_scratch,
+                );
+                for idx in 0..self.driver.copy_retry_scratch.len() {
+                    let (conn_index, generation, pool_slot, retries) =
+                        self.driver.copy_retry_scratch[idx];
                     if retries >= 2 {
                         // Max retries exceeded — release and drop.
                         if self.driver.send_copy_pool.in_use(pool_slot) {
@@ -432,6 +455,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         ));
                     }
                 }
+                self.driver.copy_retry_scratch.clear();
             }
 
             // Retry any close submissions that failed (SQ was full).
@@ -462,9 +486,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // (the SQ was full when we received the EAGAIN CQE).
             // Max 3 retries with backoff: only re-queue every 2 ticks.
             if !self.driver.pending_send_pollout_retries.is_empty() {
-                let retries: Vec<_> = self.driver.pending_send_pollout_retries.drain(..).collect();
+                std::mem::swap(
+                    &mut self.driver.pending_send_pollout_retries,
+                    &mut self.driver.send_pollout_retry_scratch,
+                );
                 let tick_mod = self.driver.tick_count % 2;
-                for (conn_index, generation, pool_slot, retry) in retries {
+                for idx in 0..self.driver.send_pollout_retry_scratch.len() {
+                    let (conn_index, generation, pool_slot, retry) =
+                        self.driver.send_pollout_retry_scratch[idx];
                     if retry >= 3 {
                         // Max retries exceeded — release pool + drain queue + close.
                         if self.driver.send_copy_pool.in_use(pool_slot) {
@@ -505,6 +534,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         ));
                     }
                 }
+                self.driver.send_pollout_retry_scratch.clear();
             }
 
             self.driver.tick_count += 1;
