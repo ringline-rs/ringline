@@ -115,7 +115,7 @@
 //! | Path | Copies | Mechanism |
 //! |------|--------|-----------|
 //! | **Recv (values)** | **0** | `with_bytes()` + `ResponseBytes::parse()`. Keys and values are `Bytes::slice()` references into the accumulator — zero allocation, O(1) refcount. |
-//! | **Send (commands)** | 1 | `encode_request()` serializes into `Vec<u8>`, then `conn.send()` copies into the send pool. |
+//! | **Send (commands)** | 1 | Requests are encoded into a reusable per-client buffer (no per-request allocation), then `conn.send()` copies into the send pool. |
 //! | **Send (SET value, guard)** | 0 (value) | [`Client::set_with_guard`]: prefix+suffix copied to pool, value stays in-place via `SendGuard`. |
 //!
 //! TLS connections add encryption copies on the send path regardless of
@@ -453,6 +453,7 @@ impl ClientBuilder {
             pending: VecDeque::with_capacity(16),
             last_rx_bytes: Cell::new(0),
             max_in_flight: self.max_in_flight,
+            encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: self.use_kernel_ts,
             #[cfg(feature = "metrics")]
@@ -480,6 +481,10 @@ pub struct Client {
     /// Cap on `pending.len()`; `fire_*` returns `Error::TooManyInFlight`
     /// past it. `usize::MAX` (default) disables.
     max_in_flight: usize,
+    /// Reusable scratch buffer for encoding requests. Cleared before each
+    /// use; keeps its capacity across requests so steady-state encoding is
+    /// allocation-free.
+    encode_buf: Vec<u8>,
     #[cfg(feature = "timestamps")]
     use_kernel_ts: bool,
     #[cfg(feature = "metrics")]
@@ -497,6 +502,7 @@ impl Client {
             pending: VecDeque::new(),
             last_rx_bytes: Cell::new(0),
             max_in_flight: usize::MAX,
+            encode_buf: Vec::new(),
             #[cfg(feature = "timestamps")]
             use_kernel_ts: false,
             #[cfg(feature = "metrics")]
@@ -645,9 +651,10 @@ impl Client {
     /// Fire a GET request without waiting for the response.
     pub fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         self.check_in_flight()?;
-        let encoded = encode_request(&McRequest::get(key))?;
-        let tx_bytes = encoded.len() as u32;
-        self.conn.send_nowait(&encoded)?;
+        self.encode_buf.clear();
+        encode_request_into(&McRequest::get(key), &mut self.encode_buf)?;
+        let tx_bytes = self.encode_buf.len() as u32;
+        self.conn.send_nowait(&self.encode_buf)?;
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Get,
@@ -669,9 +676,18 @@ impl Client {
         user_data: u64,
     ) -> Result<(), Error> {
         self.check_in_flight()?;
-        let encoded = encode_set(key, value, flags, exptime)?;
-        let tx_bytes = encoded.len() as u32;
-        self.conn.send_nowait(&encoded)?;
+        self.encode_buf.clear();
+        encode_request_into(
+            &McRequest::Set {
+                key,
+                value,
+                flags,
+                exptime,
+            },
+            &mut self.encode_buf,
+        )?;
+        let tx_bytes = self.encode_buf.len() as u32;
+        self.conn.send_nowait(&self.encode_buf)?;
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Set,
@@ -694,10 +710,18 @@ impl Client {
     ) -> Result<(), Error> {
         self.check_in_flight()?;
         let (_, value_len) = guard.as_ptr_len();
-        let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime)?;
-        let tx_bytes = (prefix.len() + value_len as usize + 2) as u32;
+        self.encode_buf.clear();
+        append_set_guard_prefix(
+            &mut self.encode_buf,
+            key,
+            value_len as usize,
+            flags,
+            exptime,
+        )?;
+        let tx_bytes = (self.encode_buf.len() + value_len as usize + 2) as u32;
+        let prefix: &[u8] = &self.encode_buf;
         self.conn.send_parts().build(move |b| {
-            b.copy(&prefix)
+            b.copy(prefix)
                 .guard(GuardBox::new(guard))
                 .copy(b"\r\n")
                 .submit()
@@ -716,9 +740,10 @@ impl Client {
     /// Fire a DELETE request without waiting for the response.
     pub fn fire_delete(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         self.check_in_flight()?;
-        let encoded = encode_request(&McRequest::delete(key))?;
-        let tx_bytes = encoded.len() as u32;
-        self.conn.send_nowait(&encoded)?;
+        self.encode_buf.clear();
+        encode_request_into(&McRequest::delete(key), &mut self.encode_buf)?;
+        let tx_bytes = self.encode_buf.len() as u32;
+        self.conn.send_nowait(&self.encode_buf)?;
         let (send_ts, start) = self.timing_start();
         self.pending.push_back(PendingOp {
             kind: PendingOpKind::Delete,
@@ -906,10 +931,11 @@ impl Client {
     /// Get the value of a key. Returns `None` on cache miss.
     pub async fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Value>, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&McRequest::get(key))?;
+        self.encode_buf.clear();
+        encode_request_into(&McRequest::get(key), &mut self.encode_buf)?;
 
         if !self.is_instrumented() {
-            let response = self.execute(&encoded).await?;
+            let response = self.execute(&self.encode_buf).await?;
             return match response {
                 McResponseBytes::Values(mut values) => {
                     if values.is_empty() {
@@ -926,10 +952,10 @@ impl Client {
             };
         }
 
-        let tx_bytes = encoded.len() as u32;
+        let tx_bytes = self.encode_buf.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let response = self.execute(&encoded).await;
+        let response = self.execute(&self.encode_buf).await;
         let latency_ns = self.finish_timing(send_ts, start);
         let rx_bytes = self.last_rx_bytes.get();
 
@@ -1006,20 +1032,29 @@ impl Client {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_set(key, value, flags, exptime)?;
+        self.encode_buf.clear();
+        encode_request_into(
+            &McRequest::Set {
+                key,
+                value,
+                flags,
+                exptime,
+            },
+            &mut self.encode_buf,
+        )?;
 
         if !self.is_instrumented() {
-            let response = self.execute(&encoded).await?;
+            let response = self.execute(&self.encode_buf).await?;
             return match response {
                 McResponseBytes::Stored => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
             };
         }
 
-        let tx_bytes = encoded.len() as u32;
+        let tx_bytes = self.encode_buf.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let response = self.execute(&encoded).await;
+        let response = self.execute(&self.encode_buf).await;
         let latency_ns = self.finish_timing(send_ts, start);
         let rx_bytes = self.last_rx_bytes.get();
 
@@ -1167,10 +1202,11 @@ impl Client {
     /// Delete a key. Returns `true` if deleted, `false` if not found.
     pub async fn delete(&mut self, key: impl AsRef<[u8]>) -> Result<bool, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&McRequest::delete(key))?;
+        self.encode_buf.clear();
+        encode_request_into(&McRequest::delete(key), &mut self.encode_buf)?;
 
         if !self.is_instrumented() {
-            let response = self.execute(&encoded).await?;
+            let response = self.execute(&self.encode_buf).await?;
             return match response {
                 McResponseBytes::Deleted => Ok(true),
                 McResponseBytes::NotFound => Ok(false),
@@ -1178,10 +1214,10 @@ impl Client {
             };
         }
 
-        let tx_bytes = encoded.len() as u32;
+        let tx_bytes = self.encode_buf.len() as u32;
         let send_ts = self.send_timestamp();
         let start = Instant::now();
-        let response = self.execute(&encoded).await;
+        let response = self.execute(&self.encode_buf).await;
         let latency_ns = self.finish_timing(send_ts, start);
         let rx_bytes = self.last_rx_bytes.get();
 
@@ -1236,10 +1272,18 @@ impl Client {
     ) -> Result<(), Error> {
         if !self.is_instrumented() {
             let (_, value_len) = guard.as_ptr_len();
-            let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime)?;
+            self.encode_buf.clear();
+            append_set_guard_prefix(
+                &mut self.encode_buf,
+                key,
+                value_len as usize,
+                flags,
+                exptime,
+            )?;
 
+            let prefix: &[u8] = &self.encode_buf;
             self.conn.send_parts().build(move |b| {
-                b.copy(&prefix)
+                b.copy(prefix)
                     .guard(GuardBox::new(guard))
                     .copy(b"\r\n")
                     .submit()
@@ -1254,14 +1298,22 @@ impl Client {
         }
 
         let (_, value_len) = guard.as_ptr_len();
-        let prefix = encode_set_guard_prefix(key, value_len as usize, flags, exptime)?;
-        let tx_bytes = (prefix.len() + value_len as usize + 2) as u32;
+        self.encode_buf.clear();
+        append_set_guard_prefix(
+            &mut self.encode_buf,
+            key,
+            value_len as usize,
+            flags,
+            exptime,
+        )?;
+        let tx_bytes = (self.encode_buf.len() + value_len as usize + 2) as u32;
 
         let send_ts = self.send_timestamp();
         let start = Instant::now();
 
+        let prefix: &[u8] = &self.encode_buf;
         self.conn.send_parts().build(move |b| {
-            b.copy(&prefix)
+            b.copy(prefix)
                 .guard(GuardBox::new(guard))
                 .copy(b"\r\n")
                 .submit()
@@ -1296,28 +1348,34 @@ impl Client {
 
 // -- Zero-copy SET encoding helpers ------------------------------------------
 
-/// Encode memcache text SET prefix for guard-based sends.
-///
-/// Returns: `set {key} {flags} {exptime} {valuelen}\r\n`
+/// Append the memcache text SET prefix for guard-based sends to `buf`:
+/// `set {key} {flags} {exptime} {valuelen}\r\n`.
 /// The caller must append value bytes (via guard) + `\r\n` suffix.
 ///
 /// Validates `key` (≤ [`MAX_KEY_LEN`]) and `value_len` (≤ [`MAX_VALUE_LEN`]);
 /// returns the corresponding `Error` variant if either bound is exceeded so
-/// that no bytes hit the wire for a request the server will reject.
-fn encode_set_guard_prefix(
+/// that no bytes hit the wire for a request the server will reject. On error
+/// nothing is appended to `buf`.
+fn append_set_guard_prefix(
+    buf: &mut Vec<u8>,
     key: &[u8],
     value_len: usize,
     flags: u32,
     exptime: u32,
-) -> Result<Vec<u8>, Error> {
-    use std::io::Write;
+) -> Result<(), Error> {
     validate_key(key)?;
     validate_value_len(value_len)?;
-    let mut buf = Vec::with_capacity(32 + key.len());
+    let mut itoa_buf = itoa::Buffer::new();
     buf.extend_from_slice(b"set ");
     buf.extend_from_slice(key);
-    write!(buf, " {} {} {}\r\n", flags, exptime, value_len).unwrap();
-    Ok(buf)
+    buf.push(b' ');
+    buf.extend_from_slice(itoa_buf.format(flags).as_bytes());
+    buf.push(b' ');
+    buf.extend_from_slice(itoa_buf.format(exptime).as_bytes());
+    buf.push(b' ');
+    buf.extend_from_slice(itoa_buf.format(value_len).as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    Ok(())
 }
 
 // -- Encoding helpers --------------------------------------------------------
@@ -1348,9 +1406,10 @@ fn validate_request(req: &McRequest<'_>) -> Result<(), Error> {
     }
 }
 
-/// Encode a `McRequest` into a `Vec<u8>`, rejecting oversized keys/values
-/// up-front (see [`validate_request`]).
-pub(crate) fn encode_request(req: &McRequest<'_>) -> Result<Vec<u8>, Error> {
+/// Append the encoding of a `McRequest` to `buf`, rejecting oversized
+/// keys/values up-front (see [`validate_request`]). No allocation once
+/// `buf` has sufficient capacity. On error nothing is appended to `buf`.
+pub(crate) fn encode_request_into(req: &McRequest<'_>, buf: &mut Vec<u8>) -> Result<(), Error> {
     validate_request(req)?;
     let size = match req {
         McRequest::Get { key } => 6 + key.len(),
@@ -1368,9 +1427,19 @@ pub(crate) fn encode_request(req: &McRequest<'_>) -> Result<Vec<u8>, Error> {
         McRequest::Version => 9,
         McRequest::Quit => 6,
     };
-    let mut buf = vec![0u8; size];
-    let len = req.encode(&mut buf);
-    buf.truncate(len);
+    let start = buf.len();
+    buf.resize(start + size, 0);
+    let len = req.encode(&mut buf[start..]);
+    buf.truncate(start + len);
+    Ok(())
+}
+
+/// Encode a `McRequest` into a freshly allocated `Vec<u8>`, rejecting
+/// oversized keys/values up-front (see [`validate_request`]). Hot paths in
+/// [`Client`] use [`encode_request_into`] with a reusable buffer instead.
+pub(crate) fn encode_request(req: &McRequest<'_>) -> Result<Vec<u8>, Error> {
+    let mut buf = Vec::new();
+    encode_request_into(req, &mut buf)?;
     Ok(buf)
 }
 
@@ -1468,8 +1537,28 @@ mod encode_tests {
     fn golden_set_guard_prefix() {
         // Non-trivial flags / exptime / value_len so every integer field
         // is pinned byte-exactly.
-        let prefix = encode_set_guard_prefix(KEY, 1024, 42, 7200).unwrap();
+        let mut prefix = Vec::new();
+        append_set_guard_prefix(&mut prefix, KEY, 1024, 42, 7200).unwrap();
         assert_eq!(prefix, &b"set user:123456789 42 7200 1024\r\n"[..]);
+    }
+
+    #[test]
+    fn encode_into_appends_without_clobbering() {
+        // The `_into` helper must append, never clear — clearing is the
+        // caller's responsibility.
+        let mut buf = b"EXISTING".to_vec();
+        encode_request_into(&McRequest::get(KEY), &mut buf).unwrap();
+        assert_eq!(buf, &b"EXISTINGget user:123456789\r\n"[..]);
+    }
+
+    #[test]
+    fn encode_into_error_leaves_buf_untouched() {
+        let mut buf = b"EXISTING".to_vec();
+        let long_key = vec![b'k'; MAX_KEY_LEN + 1];
+        assert!(encode_request_into(&McRequest::get(&long_key), &mut buf).is_err());
+        assert_eq!(buf, b"EXISTING");
+        assert!(append_set_guard_prefix(&mut buf, &long_key, 16, 0, 0).is_err());
+        assert_eq!(buf, b"EXISTING");
     }
 }
 
@@ -1531,21 +1620,21 @@ mod tests {
     }
 
     #[test]
-    fn encode_set_guard_prefix_rejects_long_key() {
+    fn set_guard_prefix_rejects_long_key() {
         let key = vec![b'k'; MAX_KEY_LEN + 1];
-        let r = encode_set_guard_prefix(&key, 16, 0, 0);
+        let r = append_set_guard_prefix(&mut Vec::new(), &key, 16, 0, 0);
         assert!(matches!(r, Err(Error::KeyTooLong)));
     }
 
     #[test]
-    fn encode_set_guard_prefix_rejects_long_value_len() {
-        let r = encode_set_guard_prefix(b"k", MAX_VALUE_LEN + 1, 0, 0);
+    fn set_guard_prefix_rejects_long_value_len() {
+        let r = append_set_guard_prefix(&mut Vec::new(), b"k", MAX_VALUE_LEN + 1, 0, 0);
         assert!(matches!(r, Err(Error::ValueTooLong)));
     }
 
     #[test]
-    fn encode_set_guard_prefix_accepts_max_value_len() {
-        let r = encode_set_guard_prefix(b"k", MAX_VALUE_LEN, 0, 0);
+    fn set_guard_prefix_accepts_max_value_len() {
+        let r = append_set_guard_prefix(&mut Vec::new(), b"k", MAX_VALUE_LEN, 0, 0);
         assert!(r.is_ok());
     }
 
