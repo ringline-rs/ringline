@@ -71,6 +71,12 @@ impl RecvAccumulator {
     pub fn reset(&mut self) {
         self.buf.clear();
     }
+
+    /// Return the current backing-buffer capacity. Test-only.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
 }
 
 use bytes::Buf;
@@ -121,6 +127,13 @@ impl AccumulatorTable {
     /// Reset the accumulator at the given index.
     pub fn reset(&mut self, index: u32) {
         self.accumulators[index as usize].reset();
+    }
+
+    /// Return the current backing-buffer capacity for the accumulator at
+    /// the given index. Test-only.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self, index: u32) -> usize {
+        self.accumulators[index as usize].capacity()
     }
 
     /// Detach the accumulator's buffer as a frozen `Bytes` (O(1)).
@@ -229,6 +242,50 @@ mod tests {
         // Put back the unconsumed remainder.
         table.prepend(0, &frozen[11..]);
         assert_eq!(table.data(0), b"$3\r\nbar\r\n");
+    }
+
+    /// After `take_frozen` + `prepend(remainder)`, the accumulator must NOT
+    /// have allocated a new backing buffer — the tail capacity from the
+    /// split must still be in place (`capacity() > 0` immediately after
+    /// `take_frozen`, and the `prepend` does not reallocate).
+    #[test]
+    fn take_frozen_preserves_tail_capacity() {
+        let mut table = AccumulatorTable::new(1, 256);
+        // Fill with data that will have a remainder after the first parse.
+        assert!(table.append(0, b"$5\r\nhello\r\n$3\r\nbar\r\n"));
+
+        let frozen = table.take_frozen(0);
+        // Capacity must be non-zero — the tail allocation is retained.
+        assert!(
+            table.capacity(0) > 0,
+            "take_frozen must retain tail capacity, got 0"
+        );
+
+        // Prepend the unconsumed remainder — must not reallocate.
+        let cap_after_take = table.capacity(0);
+        let remainder = &frozen[11..];
+        table.prepend(0, remainder);
+        assert_eq!(
+            table.capacity(0),
+            cap_after_take,
+            "prepend(remainder) must reuse the retained capacity, not reallocate"
+        );
+        assert_eq!(table.data(0), b"$3\r\nbar\r\n");
+
+        // Multiple cycles must each preserve capacity (no per-cycle realloc).
+        for _ in 0..3 {
+            assert!(table.append(0, b" extra"));
+            let f = table.take_frozen(0);
+            assert!(table.capacity(0) > 0, "cycle: take_frozen must retain capacity");
+            let cap_before = table.capacity(0);
+            table.prepend(0, &f[..3]);
+            assert_eq!(
+                table.capacity(0),
+                cap_before,
+                "cycle: prepend must reuse retained capacity"
+            );
+            drop(f);
+        }
     }
 
     #[test]
