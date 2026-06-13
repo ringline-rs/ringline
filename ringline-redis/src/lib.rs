@@ -2379,6 +2379,64 @@ pub(crate) fn parse_bytes_array(value: Value) -> Result<Vec<Bytes>, Error> {
 }
 
 #[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    // 14-byte key with digits — exercises two-digit bulk-string length
+    // headers and digit/key-byte adjacency (itoa boundary cases).
+    const KEY: &[u8] = b"user:123456789";
+
+    #[test]
+    fn golden_encode_request_get() {
+        let encoded = Client::encode_request(&Request::get(KEY));
+        assert_eq!(encoded, b"*2\r\n$3\r\nGET\r\n$14\r\nuser:123456789\r\n");
+    }
+
+    #[test]
+    fn golden_encode_request_del() {
+        let encoded = Client::encode_request(&Request::del(KEY));
+        assert_eq!(encoded, b"*2\r\n$3\r\nDEL\r\n$14\r\nuser:123456789\r\n");
+    }
+
+    #[test]
+    fn golden_encode_set_request() {
+        let encoded = Client::encode_set_request(&Request::set(KEY, b"hello world value"));
+        assert_eq!(
+            encoded,
+            &b"*3\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$17\r\nhello world value\r\n"[..]
+        );
+    }
+
+    #[test]
+    fn golden_encode_set_request_ex() {
+        let encoded = Client::encode_set_request(&Request::set(KEY, b"v").ex(7200));
+        assert_eq!(
+            encoded,
+            &b"*5\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n$2\r\nEX\r\n$4\r\n7200\r\n"[..]
+        );
+    }
+
+    #[test]
+    fn golden_set_guard_prefix() {
+        let prefix = encode_set_guard_prefix(KEY, 1024, None);
+        assert_eq!(
+            prefix,
+            &b"*3\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$1024\r\n"[..]
+        );
+    }
+
+    #[test]
+    fn golden_set_guard_prefix_ex() {
+        let (prefix, suffix) = encode_set_guard_prefix_ex(KEY, 1024, 7200);
+        assert_eq!(
+            prefix,
+            &b"*5\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$1024\r\n"[..]
+        );
+        assert_eq!(suffix, &b"\r\n$2\r\nEX\r\n$4\r\n7200\r\n"[..]);
+    }
+}
+
+#[cfg(test)]
 mod audit_tests {
     use super::*;
 
