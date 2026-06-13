@@ -686,7 +686,7 @@ pub fn encrypt_for_send_mio(
     conn_index: u32,
     plaintext: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let (conn_slot, write_buf) = borrow_conn_and_buf(tls_table, conn_index);
+    let (conn_slot, _write_buf) = borrow_conn_and_buf(tls_table, conn_index);
     let tls_conn = conn_slot.as_mut().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotConnected, "no TLS state for connection")
     })?;
@@ -698,14 +698,17 @@ pub fn encrypt_for_send_mio(
         .write_all(plaintext)
         .map_err(io::Error::other)?;
 
-    // Extract ciphertext into shared scratch buffer.
-    write_buf.clear();
+    // Encrypt directly into an owned buffer the caller takes ownership of.
+    // (The shared `write_buf` is the io_uring flush path's scratch; the mio
+    // send queue needs a distinct owned Vec per pending send anyway, so
+    // encrypting straight into it avoids a redundant clone of the ciphertext.)
+    let mut ciphertext = Vec::with_capacity(plaintext.len() + 128);
     tls_conn
         .conn
-        .write_tls(write_buf)
+        .write_tls(&mut ciphertext)
         .map_err(io::Error::other)?;
 
-    Ok(write_buf.clone())
+    Ok(ciphertext)
 }
 
 /// Borrow a connection slot and the shared write_buf from a TlsTable simultaneously.

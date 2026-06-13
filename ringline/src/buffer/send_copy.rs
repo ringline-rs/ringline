@@ -36,7 +36,13 @@ impl SendCopyPool {
         if data.len() > self.slot_size as usize {
             return None;
         }
-        let idx = self.free_list.pop()?;
+        let idx = match self.free_list.pop() {
+            Some(i) => i,
+            None => {
+                crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
+                return None;
+            }
+        };
         let offset = idx as usize * self.slot_size as usize;
         self.backing[offset..offset + data.len()].copy_from_slice(data);
         let ptr = self.backing.as_ptr().wrapping_add(offset);
@@ -59,7 +65,13 @@ impl SendCopyPool {
         if total_len > self.slot_size as usize {
             return None;
         }
-        let idx = self.free_list.pop()?;
+        let idx = match self.free_list.pop() {
+            Some(i) => i,
+            None => {
+                crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
+                return None;
+            }
+        };
         let base = idx as usize * self.slot_size as usize;
         let mut dest_offset = 0;
         for &(ptr, len) in parts {
@@ -170,6 +182,29 @@ mod tests {
         let _ = pool.copy_in(b"a").unwrap();
         let _ = pool.copy_in(b"b").unwrap();
         assert!(pool.copy_in(b"c").is_none());
+    }
+
+    #[test]
+    fn exhausted_pool_returns_none_copy_in() {
+        // A 1-slot pool: first alloc succeeds, second returns None (SEND_EXHAUSTED
+        // metric is incremented inside; we assert the observable None behavior).
+        let mut pool = SendCopyPool::new(1, 64);
+        let _ = pool.copy_in(b"first").unwrap();
+        assert_eq!(pool.free_count(), 0);
+        assert!(pool.copy_in(b"second").is_none());
+    }
+
+    #[test]
+    fn exhausted_pool_returns_none_copy_in_gather() {
+        // Same as above but exercising the gather variant.
+        let mut pool = SendCopyPool::new(1, 64);
+        let data = b"first";
+        let parts: &[(*const u8, usize)] = &[(data.as_ptr(), data.len())];
+        let _ = unsafe { pool.copy_in_gather(parts, data.len()) }.unwrap();
+        assert_eq!(pool.free_count(), 0);
+        let data2 = b"second";
+        let parts2: &[(*const u8, usize)] = &[(data2.as_ptr(), data2.len())];
+        assert!(unsafe { pool.copy_in_gather(parts2, data2.len()) }.is_none());
     }
 
     #[test]

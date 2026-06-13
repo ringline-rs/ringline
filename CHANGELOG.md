@@ -18,8 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   always zero-copy) are gathered into the send copy pool and submitted as a
   plain `Send` instead of `SendMsgZc`.
 
+### Added
+
+- The send copy pool now increments the `send_exhausted` pool metric when it has
+  no free slot, giving visibility into send-side backpressure (previously the
+  pool returned empty silently).
+
 ### Changed
 
+- The mio-backend TLS send path encrypts directly into the owned send buffer
+  instead of encrypting into shared scratch and cloning, removing one ciphertext
+  copy per TLS send.
 - ringline-redis and ringline-memcache encode paths no longer heap-allocate per
   request: commands encode into a reusable per-client buffer (or directly into
   the coalescing write buffer), guard-SET prefixes append in place, and integer
