@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- ringline-redis and ringline-memcache encode paths no longer heap-allocate per
+  request: commands encode into a reusable per-client buffer (or directly into
+  the coalescing write buffer), guard-SET prefixes append in place, and integer
+  formatting uses `itoa`. Wire format is byte-identical (golden-tested).
 - Small guard sends no longer pay zero-copy bookkeeping (in-flight slab entry
   plus a ZC notification CQE per send). For small values the memcpy is cheaper
   than the two-completion lifecycle, removing a small-value `SET` throughput
