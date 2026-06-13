@@ -1032,7 +1032,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     &mut self.driver.accumulators,
                     &mut self.driver.ring,
                     &mut self.driver.send_copy_pool,
-                    &mut self.driver.tls_scratch,
                     conn_index,
                     data,
                 );

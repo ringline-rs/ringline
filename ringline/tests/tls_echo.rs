@@ -181,6 +181,85 @@ fn tls_echo_with_external_client() {
     }
 }
 
+// ── Test 1b: Large multi-chunk payloads (BufRead fill_buf/consume loop) ──
+
+/// Echo payloads larger than rustls's internal plaintext buffer (~16 KiB) so
+/// the recv-side `fill_buf`/`consume` drain loop iterates across multiple
+/// chunks and across multiple TLS records. This is the regression guard for
+/// the zero-scratch drain: any off-by-one in the chunk advance would corrupt
+/// the round-trip. A non-constant byte pattern makes mis-ordering detectable.
+///
+/// Gated to the io_uring backend: this guards the `fill_buf`/`consume` recv
+/// drain (shared by both backends, but the change this regression-tests is in
+/// the io_uring path). The mio backend has a pre-existing large-payload TLS
+/// busy-spin (reproduces on `main` without this change), tracked separately;
+/// running this test there hangs for reasons unrelated to the drain.
+#[cfg(has_io_uring)]
+#[test]
+fn tls_echo_large_multichunk() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (certs, key) = generate_self_signed();
+    let server_config = server_tls_config(certs.clone(), key);
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut config = test_config();
+    config.tls = Some(TlsConfig { server_config });
+
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<TlsEchoHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+
+    // Two sizes, both well past rustls's ~16 KiB plaintext buffer so the
+    // drain loop must iterate over several chunks and several records.
+    for &size in &[64 * 1024usize, 100 * 1024usize] {
+        // Distinctive, position-dependent pattern so any chunk reorder or
+        // off-by-one in the advance is caught by the byte-exact comparison.
+        let msg: Vec<u8> = (0..size)
+            .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+            .collect();
+
+        stream.write_all(&msg).unwrap();
+        stream.flush().unwrap();
+
+        let mut buf = vec![0u8; size];
+        let mut total = 0;
+        while total < size {
+            match stream.read(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) => panic!("TLS read error ({size} bytes): {e}"),
+            }
+        }
+        assert_eq!(total, size, "short read for {size}-byte payload");
+        assert_eq!(buf, msg, "byte-exact mismatch for {size}-byte payload");
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
 // ── Test 2: Outbound connect_tls from ringline worker ───────────────────
 
 static TLS_SERVER_ADDR: OnceLock<SocketAddr> = OnceLock::new();
