@@ -13,13 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The memcache client gained an opt-in write-coalescing layer (`ClientBuilder::max_batch_size`):
+  multiple `fire_*` commands batch into a single send, matching the redis client. Defaults to 1
+  (no coalescing) so existing behavior is unchanged.
 - `Config::send_zc_threshold` (and `ConfigBuilder::send_zc_threshold`) — guard
   sends with total length below this threshold (default 4096 bytes, `0` =
   always zero-copy) are gathered into the send copy pool and submitted as a
   plain `Send` instead of `SendMsgZc`.
-
-### Added
-
 - The send copy pool now increments the `send_exhausted` pool metric when it has
   no free slot, giving visibility into send-side backpressure (previously the
   pool returned empty silently).
