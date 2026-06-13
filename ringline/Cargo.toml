@@ -16,6 +16,7 @@ check-cfg = ["cfg(has_io_uring)"]
 
 [features]
 force-mio = []
+testing = []
 timestamps = []
 
 [dependencies]

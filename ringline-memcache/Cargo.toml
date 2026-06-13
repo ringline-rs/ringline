@@ -21,3 +21,6 @@ libc = { workspace = true, optional = true }
 ringline = { workspace = true }
 memcache-proto = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+ringline = { workspace = true, features = ["testing"] }
