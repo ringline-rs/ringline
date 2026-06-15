@@ -19,7 +19,7 @@ pub struct AcceptorConfig {
     /// Whether to set TCP_NODELAY on accepted connections.
     pub tcp_nodelay: bool,
     /// Connections to assign to each worker before moving to the next.
-    /// 1 = round-robin. See [`Config::conn_chunk_size`].
+    /// 1 = round-robin. See [`ConfigBuilder::conn_chunk_size`](crate::ConfigBuilder::conn_chunk_size).
     pub conn_chunk_size: usize,
     /// Whether to set SO_TIMESTAMPING on accepted connections.
     #[cfg(feature = "timestamps")]

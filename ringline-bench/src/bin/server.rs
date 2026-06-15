@@ -4,6 +4,7 @@
 //!   bench-server --runtime ringline --addr 0.0.0.0:7878 --workers 4 --msg-size 64
 //!   bench-server --runtime tokio --addr 0.0.0.0:7878 --workers 4
 
+use ringline::ConfigBuilder;
 use std::net::SocketAddr;
 
 use clap::Parser;
@@ -157,7 +158,7 @@ fn run_ringline(
     conn_chunk_size: usize,
     pin_to_core: bool,
 ) {
-    use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
+    use ringline::{AsyncEventHandler, ConnCtx, RinglineBuilder};
     // ParseResult is only needed in the non-io_uring fallback path.
     #[cfg(not(has_io_uring))]
     use ringline::ParseResult;
@@ -221,18 +222,18 @@ fn run_ringline(
         }
     }
 
-    let mut config = Config::default();
-    config.worker.threads = workers;
-    // When --cpu-list set a process affinity mask, leave the OS to schedule
-    // workers within it; otherwise pin each worker to its own core (0..N).
-    config.worker.pin_to_core = pin_to_core;
-    config.sq_entries = 256;
-    config.recv_buffer.ring_size = 256;
-    config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
-    config.max_connections = 16384;
-    config.send_copy_count = 512;
-    config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
-    config.conn_chunk_size = conn_chunk_size;
+    let config = ConfigBuilder::new()
+        .workers(workers)
+        // When --cpu-list set a process affinity mask, leave the OS to schedule
+        // workers within it; otherwise pin each worker to its own core (0..N).
+        .pin_to_core(pin_to_core)
+        .sq_entries(256)
+        .recv_buffer(256, msg_size.next_power_of_two().max(4096) as u32)
+        .max_connections(16384)
+        .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
+        .conn_chunk_size(conn_chunk_size)
+        .build()
+        .expect("valid config");
 
     let builder = RinglineBuilder::new(config).bind(addr);
     let (shutdown, handles) = if recv_forward {

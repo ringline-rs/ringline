@@ -1,3 +1,4 @@
+use ringline::ConfigBuilder;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -277,27 +278,27 @@ fn make_ringline_client_config(
     _msg_size: usize,
     cert: &CertificateDer<'static>,
 ) -> ringline::Config {
-    let mut config = ringline::Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = (num_clients * 8).next_power_of_two().max(512) as u32;
-    config.recv_buffer.ring_size = (num_clients * 4).next_power_of_two().max(256) as u16;
-    // HTTP/2 default `max_frame_size` is 16 KiB and TLS records can
-    // be up to 16 KiB on top of that, so the recv buffer must be
-    // comfortably larger than the body to keep one full HTTP/2 DATA
-    // frame inside a single provided buffer. ringline caps
-    // `recv_buffer.buffer_size` at 65535 (the user_data encoding
-    // reserves 16 bits for the remaining-len field), so use that
-    // ceiling — comfortably above the bench's worst case.
-    config.recv_buffer.buffer_size = 65535;
-    // Default send_copy_slot_size is 16384; keep it. ringline-http
-    // can flush a request's HEADERS + DATA + WINDOW_UPDATE into one
-    // send_nowait call, so the slot must accommodate the worst-case
-    // batch size we expect to send in a single iteration.
-    config.send_copy_slot_size = 16384;
-    config.standalone_task_capacity = (num_clients + 1).next_power_of_two().max(64) as u32;
-    config.tls_client = Some(make_ringline_client_tls(cert));
-    config
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries((num_clients * 8).next_power_of_two().max(512) as u32)
+        .recv_buffer((num_clients * 4).next_power_of_two().max(256) as u16, 65535)
+        // HTTP/2 default `max_frame_size` is 16 KiB and TLS records can
+        // be up to 16 KiB on top of that, so the recv buffer must be
+        // comfortably larger than the body to keep one full HTTP/2 DATA
+        // frame inside a single provided buffer. ringline caps
+        // `recv_buffer.buffer_size` at 65535 (the user_data encoding
+        // reserves 16 bits for the remaining-len field), so use that
+        // ceiling — comfortably above the bench's worst case.
+        // Default send_copy_slot_size is 16384; keep it. ringline-http
+        // can flush a request's HEADERS + DATA + WINDOW_UPDATE into one
+        // send_nowait call, so the slot must accommodate the worst-case
+        // batch size we expect to send in a single iteration.
+        .send_pool(1024, 16384)
+        .standalone_task_capacity((num_clients + 1).next_power_of_two().max(64) as u32)
+        .tls_client(make_ringline_client_tls(cert))
+        .build()
+        .expect("valid config")
 }
 
 fn run_bench_ringline(

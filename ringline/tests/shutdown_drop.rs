@@ -13,7 +13,7 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, RinglineBuilder};
 
 struct NoopHandler;
 
@@ -27,17 +27,19 @@ impl AsyncEventHandler for NoopHandler {
     }
 }
 
+fn test_config_builder() -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(16, 1024)
+        .max_connections(16)
+        .send_pool(16, 16384)
+        .max_registered_regions(4)
+}
+
 fn test_config() -> Config {
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 16;
-    config.recv_buffer.buffer_size = 1024;
-    config.max_connections = 16;
-    config.send_copy_count = 16;
-    config.max_registered_regions = 4;
-    config
+    test_config_builder().build().expect("valid config")
 }
 
 #[test]

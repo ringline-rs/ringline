@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder, TlsConfig};
+use ringline::{
+    AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig,
+};
 
 struct TlsEcho {
     worker_id: usize,
@@ -75,14 +77,15 @@ fn main() {
 
     let server_config = load_tls_config();
 
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 128;
-    config.recv_buffer.ring_size = 128;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 1024;
-    config.tls = Some(TlsConfig { server_config });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(128)
+        .recv_buffer(128, 4096)
+        .max_connections(1024)
+        .tls(TlsConfig { server_config })
+        .build()
+        .expect("valid config");
 
     eprintln!("starting TLS echo server on {bind_addr}");
     eprintln!("test with: openssl s_client -connect {bind_addr}");

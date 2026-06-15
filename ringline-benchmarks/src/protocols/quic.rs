@@ -1,3 +1,4 @@
+use ringline::ConfigBuilder;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -218,17 +219,17 @@ fn start_quic_server(
         *guard = Some(quic_config);
     }
 
-    let mut config = ringline::Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 1024;
-    config.udp_recv_buffer.ring_size = 512;
-    config.udp_recv_buffer.buffer_size = 4096;
-    config.udp_send_slots = 256;
-    config.udp_recv_queue_capacity = 4096;
-    config.send_copy_count = 1024;
-    config.send_copy_slot_size = 65536;
-    config.standalone_task_capacity = 64;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(1024)
+        .udp_recv_buffer(512, 4096)
+        .udp_send_slots(256)
+        .udp_recv_queue_capacity(4096)
+        .send_pool(1024, 65536)
+        .standalone_task_capacity(64)
+        .build()
+        .expect("valid config");
 
     let (shutdown, handles) = ringline::RinglineBuilder::new(config)
         .bind_udp(addr)
@@ -484,17 +485,17 @@ fn run_bench_ringline(
 
     let client_bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-    let mut config = ringline::Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 1024;
-    config.udp_recv_buffer.ring_size = 512;
-    config.udp_recv_buffer.buffer_size = 4096;
-    config.udp_send_slots = 256;
-    config.udp_recv_queue_capacity = 4096;
-    config.send_copy_count = 1024;
-    config.send_copy_slot_size = 65536;
-    config.standalone_task_capacity = 64;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(1024)
+        .udp_recv_buffer(512, 4096)
+        .udp_send_slots(256)
+        .udp_recv_queue_capacity(4096)
+        .send_pool(1024, 65536)
+        .standalone_task_capacity(64)
+        .build()
+        .expect("valid config");
 
     let (shutdown, handles) = match ringline::RinglineBuilder::new(config)
         .bind_udp(client_bind)

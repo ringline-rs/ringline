@@ -1,3 +1,4 @@
+use ringline::ConfigBuilder;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -156,15 +157,15 @@ fn start_ringline_server(
 
     // Single worker to match the single-machine methodology (1 ringline worker
     // vs 1 tokio current_thread). Mirrors the standalone bench-server config.
-    let mut config = ringline::Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 256;
-    config.recv_buffer.ring_size = 256;
-    config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
-    config.max_connections = 16384;
-    config.send_copy_count = 512;
-    config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(256)
+        .recv_buffer(256, msg_size.next_power_of_two().max(4096) as u32)
+        .max_connections(16384)
+        .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
+        .build()
+        .expect("valid config");
 
     let (shutdown, handles) = ringline::RinglineBuilder::new(config)
         .bind(addr)
@@ -396,19 +397,26 @@ impl ringline::AsyncEventHandler for RinglineTcpBench {
     }
 }
 
+fn make_ringline_client_config_builder(num_clients: usize, msg_size: usize) -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        // Each connection needs a send SQE + a recv SQE; add headroom.
+        .sq_entries((num_clients * 4).next_power_of_two().max(256) as u32)
+        // One provided recv buffer in flight per connection.
+        .recv_buffer(
+            (num_clients * 2).next_power_of_two().max(64) as u16,
+            msg_size.next_power_of_two().max(4096) as u32,
+        )
+        .send_pool(1024, msg_size.next_power_of_two().max(4096) as u32)
+        // One standalone task per connection, plus the on_start task.
+        .standalone_task_capacity((num_clients + 1).next_power_of_two().max(64) as u32)
+}
+
 fn make_ringline_client_config(num_clients: usize, msg_size: usize) -> ringline::Config {
-    let mut config = ringline::Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    // Each connection needs a send SQE + a recv SQE; add headroom.
-    config.sq_entries = (num_clients * 4).next_power_of_two().max(256) as u32;
-    // One provided recv buffer in flight per connection.
-    config.recv_buffer.ring_size = (num_clients * 2).next_power_of_two().max(64) as u16;
-    config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
-    config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
-    // One standalone task per connection, plus the on_start task.
-    config.standalone_task_capacity = (num_clients + 1).next_power_of_two().max(64) as u32;
-    config
+    make_ringline_client_config_builder(num_clients, msg_size)
+        .build()
+        .expect("valid config")
 }
 
 fn run_bench_ringline(

@@ -70,7 +70,7 @@ impl ShutdownHandle {
     ///
     /// - `io::ErrorKind::Other` "registered-region table is full" if the
     ///   table has no free slots (size set by
-    ///   [`Config::max_registered_regions`](crate::Config::max_registered_regions)).
+    ///   [`ConfigBuilder::max_registered_regions`](crate::ConfigBuilder::max_registered_regions)).
     /// - The first kernel error reported by any worker if the underlying
     ///   `register_buffers_update` call fails.
     /// - On the mio backend (no io_uring): always returns

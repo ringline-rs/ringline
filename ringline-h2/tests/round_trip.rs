@@ -8,7 +8,9 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder, TlsConfig};
+use ringline::{
+    AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig,
+};
 use ringline_h2::hpack::{Decoder, Encoder};
 use ringline_h2::{Frame, H2Connection, H2Event, HeaderField, Settings};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -49,16 +51,14 @@ fn client_tls_config(certs: &[CertificateDer<'static>]) -> Arc<rustls::ClientCon
 
 // -- Helpers --
 
-fn test_config() -> Config {
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 64;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 64;
-    config.send_copy_count = 64;
-    config
+fn test_config_builder() -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .send_pool(64, 16384)
 }
 
 fn free_port() -> u16 {
@@ -466,10 +466,12 @@ fn h2_request_response() {
     let port = free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let mut config = test_config();
-    config.tls = Some(TlsConfig {
-        server_config: server_tls,
-    });
+    let config = test_config_builder()
+        .tls(TlsConfig {
+            server_config: server_tls,
+        })
+        .build()
+        .expect("valid config");
 
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr)
@@ -517,10 +519,12 @@ fn h2_request_with_body() {
     let port = free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let mut config = test_config();
-    config.tls = Some(TlsConfig {
-        server_config: server_tls,
-    });
+    let config = test_config_builder()
+        .tls(TlsConfig {
+            server_config: server_tls,
+        })
+        .build()
+        .expect("valid config");
 
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr)

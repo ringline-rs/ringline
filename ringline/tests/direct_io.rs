@@ -14,25 +14,31 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, DirectIoConfig, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, ConnCtx, DirectIoConfig, RinglineBuilder,
+};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+fn direct_io_test_config_builder() -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(8)
+        .send_pool(8, 16384)
+        .tick_timeout_us(1000)
+        .direct_io(DirectIoConfig {
+            max_files: 4,
+            max_commands_in_flight: 32,
+        })
+}
+
 fn direct_io_test_config() -> Config {
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 64;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 8;
-    config.send_copy_count = 8;
-    config.tick_timeout_us = 1000; // 1ms tick for responsive tests
-    config.direct_io = Some(DirectIoConfig {
-        max_files: 4,
-        max_commands_in_flight: 32,
-    });
-    config
+    direct_io_test_config_builder()
+        .build()
+        .expect("valid config")
 }
 
 /// Generate a temp file path in the current working directory.

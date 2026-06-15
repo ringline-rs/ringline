@@ -10,7 +10,7 @@ use std::net::TcpStream;
 use std::pin::Pin;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ── Async echo handler ─────────────────────────────────────────────
@@ -103,16 +103,18 @@ impl AsyncEventHandler for RecvForwardEcho {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+fn test_config_builder() -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .send_pool(64, 16384)
+}
+
 fn test_config() -> Config {
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 64;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 64;
-    config.send_copy_count = 64;
-    config
+    test_config_builder().build().expect("valid config")
 }
 
 /// Find an available port by binding to :0.
@@ -160,8 +162,10 @@ fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
 fn coalesced_sends_preserve_order() {
     // Many small sends queued on one connection drain through the coalesced
     // sendmsg path; verify they arrive in order, byte-for-byte, none dropped.
-    let mut config = test_config();
-    config.send_copy_count = 512;
+    let config = test_config_builder()
+        .send_pool(512, 16384)
+        .build()
+        .expect("valid config");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -209,10 +213,11 @@ fn recv_forward_echo_preserves_order_across_buffers() {
     // Drive the zero-copy recv-forward path with many distinct messages, each
     // larger than one provided recv buffer (so a message spans buffers and
     // multiple buffers are held), and verify the echo is byte-for-byte in order.
-    let mut config = test_config();
-    config.recv_buffer.buffer_size = 4096; // each 16 KiB msg spans ~4 buffers
-    config.recv_buffer.ring_size = 256;
-    config.sq_entries = 256;
+    let config = test_config_builder()
+        .recv_buffer(256, 4096)
+        .sq_entries(256)
+        .build()
+        .expect("valid config");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -1675,9 +1680,10 @@ fn async_select_with_sleep() {
     let addr = format!("127.0.0.1:{port}");
 
     // Use a config with limited timer slots to make leaks detectable.
-    let mut config = test_config();
-    config.timer_slots = 16;
-
+    let config = test_config_builder()
+        .timer_slots(16)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr.parse().unwrap())
         .launch::<SelectSleepHandler>()
@@ -1906,9 +1912,10 @@ fn async_spawn_exhaustion() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    let mut config = test_config();
-    config.standalone_task_capacity = 1;
-
+    let config = test_config_builder()
+        .standalone_task_capacity(1)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr.parse().unwrap())
         .launch::<TrySpawnHandler>()
@@ -1999,9 +2006,10 @@ fn async_cancel_running_task() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    let mut config = test_config();
-    config.standalone_task_capacity = 1;
-
+    let config = test_config_builder()
+        .standalone_task_capacity(1)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr.parse().unwrap())
         .launch::<CancelTaskHandler>()
@@ -2129,9 +2137,10 @@ fn async_cancel_completed_task() {
 // ── Multi-worker tests ──────────────────────────────────────────────
 
 fn multi_worker_config(threads: usize) -> Config {
-    let mut config = test_config();
-    config.worker.threads = threads;
-    config
+    test_config_builder()
+        .workers(threads)
+        .build()
+        .expect("valid config")
 }
 
 #[test]
@@ -2452,9 +2461,10 @@ fn async_try_sleep_exhaustion() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    let mut config = test_config();
-    config.timer_slots = 2;
-
+    let config = test_config_builder()
+        .timer_slots(2)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr.parse().unwrap())
         .launch::<TrySleepHandler>()
@@ -2544,9 +2554,10 @@ fn async_try_timeout_exhaustion() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    let mut config = test_config();
-    config.timer_slots = 2;
-
+    let config = test_config_builder()
+        .timer_slots(2)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr.parse().unwrap())
         .launch::<TryTimeoutHandler>()
@@ -3491,10 +3502,11 @@ fn async_send_pool_exhaustion() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    let mut config = test_config();
-    // Very small send pool to trigger exhaustion quickly.
-    config.send_copy_count = 4;
-
+    let config = test_config_builder()
+        // Very small send pool to trigger exhaustion quickly.
+        .send_pool(4, 16384)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr.parse().unwrap())
         .launch::<PoolExhaustionHandler>()
@@ -3741,9 +3753,10 @@ fn buffer_ring_exhaustion_recovers() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    let mut config = test_config();
-    config.recv_buffer.ring_size = 4; // Very small — triggers ENOBUFS easily.
-
+    let config = test_config_builder()
+        .recv_buffer(4, 4096)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr.parse().unwrap())
         .launch::<AsyncEcho>()
@@ -4586,9 +4599,10 @@ fn resolve_disabled_returns_error() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    let mut config = test_config();
-    config.resolver_threads = 0;
-
+    let config = test_config_builder()
+        .resolver_threads(0)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr.parse().unwrap())
         .launch::<ResolveDisabledHandler>()
@@ -4886,10 +4900,11 @@ fn forward_echo_large_message() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    let mut config = test_config();
-    config.recv_buffer.buffer_size = 32768;
-    config.send_copy_slot_size = 32768;
-
+    let config = test_config_builder()
+        .recv_buffer(64, 32768)
+        .send_pool(64, 32768)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind(addr.parse().unwrap())
         .launch::<ForwardEcho>()

@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder, connect};
+use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, connect};
 
 /// Demonstrates outbound `connect()`. On start, connects to a remote
 /// echo server, sends "Hello from ringline!\n", prints the echoed response,
@@ -77,13 +77,14 @@ fn main() {
     // Then run:         cargo run --example connect_echo
     // Or specify:       TARGET=10.0.0.1:8080 cargo run --example connect_echo
 
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 64;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 64;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .build()
+        .expect("valid config");
 
     eprintln!("starting connect_echo example (client-only mode)");
 

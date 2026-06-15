@@ -11,7 +11,7 @@ use thiserror::Error;
 /// | `Io` | System call failure | Check `io::ErrorKind`; transient network errors may be retryable |
 /// | `RingSetup` | Unsupported kernel feature | Upgrade kernel or use mio backend (`--no-default-features`) |
 /// | `BufferRegistration` | `mmap()` or io_uring registration failed | Check system memory limits (`ulimit -v`) |
-/// | `ConnectionLimitReached` | All connection slots in use | Increase `config.worker.max_connections` or close idle connections |
+/// | `ConnectionLimitReached` | All connection slots in use | Increase via `ConfigBuilder::max_connections(...)` or close idle connections |
 /// | `InvalidConnection` | Stale token, connection closed | Re-establish connection; do not reuse the `ConnCtx` |
 /// | `SendPoolExhausted` | All send buffer slots in use | Await pending sends to complete before sending more |
 /// | `InvalidRegion` | Region ID not registered | Check `MemoryRegion` registration; ensure region outlives usage |
@@ -48,7 +48,7 @@ pub enum Error {
     /// Connection limit reached.
     ///
     /// The worker has no free slots for new connections. Either:
-    /// - Increase `config.worker.max_connections` (default: 65536)
+    /// - Increase via `ConfigBuilder::max_connections(...)` (default: 16000)
     /// - Close idle connections to free slots
     /// - Add more worker threads to distribute load
     #[error("connection limit reached")]
@@ -70,7 +70,7 @@ pub enum Error {
     /// All send buffer slots are in flight. This is a backpressure signal:
     /// - Await pending `send()` futures before sending more
     /// - Use `send_nowait()` for fire-and-forget with explicit error handling
-    /// - Increase `config.worker.send_pool_size` (default: 8192)
+    /// - Increase via `ConfigBuilder::send_pool(count, slot_size)` (default count: 1024)
     #[error("send pool exhausted")]
     SendPoolExhausted,
 

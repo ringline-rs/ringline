@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- **Breaking:** `Config` fields are now private; construct and configure it via
+  `ConfigBuilder` (e.g. `ConfigBuilder::new().workers(8).tcp_nodelay(true).build()?`).
+  Direct struct construction / field mutation and `ConfigBuilder::config_mut()` are
+  removed. This ensures `Config::validate()` always runs. `Config::default()` is unchanged.
+
 ## [0.2.1] - 2026-06-13
 
 Coordinated release of the 2026-06 performance audit:

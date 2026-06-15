@@ -1,3 +1,4 @@
+use ringline::ConfigBuilder;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -206,18 +207,19 @@ fn start_ringline_server(
 ) -> Result<(SocketAddr, UdpServerHandle), String> {
     let addr = port_manager.next_addr();
 
-    let mut config = ringline::Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 1024;
-    config.udp_recv_buffer.ring_size = 256;
-    // Each buffer holds the recvmsg header (~160 bytes) plus the payload.
-    config.udp_recv_buffer.buffer_size = (msg_size + 4096).min(65535) as u32;
-    config.udp_send_slots = 256;
-    config.udp_recv_queue_capacity = 4096;
-    // Send copy pool slot must fit the largest datagram the server echoes.
-    config.send_copy_slot_size = msg_size.next_power_of_two().max(16384) as u32;
-    config.standalone_task_capacity = 64;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(1024)
+        // Each buffer holds the recvmsg header (~160 bytes) plus the payload.
+        .udp_recv_buffer(256, (msg_size + 4096).min(65535) as u32)
+        .udp_send_slots(256)
+        .udp_recv_queue_capacity(4096)
+        // Send copy pool slot must fit the largest datagram the server echoes.
+        .send_pool(1024, msg_size.next_power_of_two().max(16384) as u32)
+        .standalone_task_capacity(64)
+        .build()
+        .expect("valid config");
 
     let (shutdown, handles) = ringline::RinglineBuilder::new(config)
         .bind_udp(addr)
@@ -453,18 +455,22 @@ fn run_bench_ringline(
         }));
     }
 
-    let mut config = ringline::Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = (num_clients * 4).next_power_of_two().max(256) as u32;
-    config.udp_recv_buffer.ring_size = (num_clients * 2).next_power_of_two().max(64) as u16;
-    // Each buffer holds the recvmsg header (~160 bytes) plus the payload.
-    config.udp_recv_buffer.buffer_size = (msg_size + 4096).min(65535) as u32;
-    config.udp_send_slots = (num_clients * 2).next_power_of_two().max(64) as u16;
-    config.udp_recv_queue_capacity = 4096;
-    // Send copy pool slot must fit the largest datagram a client transmits.
-    config.send_copy_slot_size = msg_size.next_power_of_two().max(16384) as u32;
-    config.standalone_task_capacity = (num_clients + 4).next_power_of_two().max(64) as u32;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries((num_clients * 4).next_power_of_two().max(256) as u32)
+        // Each buffer holds the recvmsg header (~160 bytes) plus the payload.
+        .udp_recv_buffer(
+            (num_clients * 2).next_power_of_two().max(64) as u16,
+            (msg_size + 4096).min(65535) as u32,
+        )
+        .udp_send_slots((num_clients * 2).next_power_of_two().max(64) as u16)
+        .udp_recv_queue_capacity(4096)
+        // Send copy pool slot must fit the largest datagram a client transmits.
+        .send_pool(1024, msg_size.next_power_of_two().max(16384) as u32)
+        .standalone_task_capacity((num_clients + 4).next_power_of_two().max(64) as u32)
+        .build()
+        .expect("valid config");
 
     let server_addr: SocketAddr = addr.parse().expect("invalid server addr");
     let mut builder = ringline::RinglineBuilder::new(config);
