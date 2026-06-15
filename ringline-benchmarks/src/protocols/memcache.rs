@@ -1,3 +1,4 @@
+use ringline::ConfigBuilder;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -307,18 +308,25 @@ impl ringline::AsyncEventHandler for RinglineMemcacheBench {
     }
 }
 
+fn make_ringline_client_config_builder(num_clients: usize, msg_size: usize) -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries((num_clients * 4).next_power_of_two().max(256) as u32)
+        .recv_buffer(
+            (num_clients * 2).next_power_of_two().max(64) as u16,
+            (msg_size + 64).next_power_of_two().max(4096) as u32,
+        )
+        // Response includes value bytes + ~32 B of framing overhead
+        // (`VALUE k 0 <bytes>\r\n` + `\r\nEND\r\n`).
+        .send_pool(1024, 512)
+        .standalone_task_capacity((num_clients + 1).next_power_of_two().max(64) as u32)
+}
+
 fn make_ringline_client_config(num_clients: usize, msg_size: usize) -> ringline::Config {
-    let mut config = ringline::Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = (num_clients * 4).next_power_of_two().max(256) as u32;
-    config.recv_buffer.ring_size = (num_clients * 2).next_power_of_two().max(64) as u16;
-    // Response includes value bytes + ~32 B of framing overhead
-    // (`VALUE k 0 <bytes>\r\n` + `\r\nEND\r\n`).
-    config.recv_buffer.buffer_size = (msg_size + 64).next_power_of_two().max(4096) as u32;
-    config.send_copy_slot_size = 512;
-    config.standalone_task_capacity = (num_clients + 1).next_power_of_two().max(64) as u32;
-    config
+    make_ringline_client_config_builder(num_clients, msg_size)
+        .build()
+        .expect("valid config")
 }
 
 fn run_bench_ringline(

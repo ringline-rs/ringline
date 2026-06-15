@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, MemoryRegion, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, MemoryRegion, RinglineBuilder};
 
 struct Idle;
 
@@ -20,17 +20,19 @@ impl AsyncEventHandler for Idle {
     }
 }
 
+fn small_config_builder() -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(2)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(16, 1024)
+        .max_connections(16)
+        .send_pool(16, 16384)
+        .max_registered_regions(4)
+}
+
 fn small_config() -> Config {
-    let mut config = Config::default();
-    config.worker.threads = 2;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 16;
-    config.recv_buffer.buffer_size = 1024;
-    config.max_connections = 16;
-    config.send_copy_count = 16;
-    config.max_registered_regions = 4;
-    config
+    small_config_builder().build().expect("valid config")
 }
 
 /// Register and unregister a region; subsequent register must reuse the slot.
@@ -60,8 +62,10 @@ fn register_unregister_roundtrip() {
 /// Register up to `max_registered_regions`; the next register must error.
 #[test]
 fn table_full_returns_error() {
-    let mut config = small_config();
-    config.max_registered_regions = 2;
+    let config = small_config_builder()
+        .max_registered_regions(2)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config).launch::<Idle>().unwrap();
 
     let mut buf1 = vec![0u8; 1024];
@@ -96,8 +100,10 @@ fn initial_regions_reserve_low_slots() {
     let mut backing_initial = vec![0u8; 1024];
     let initial = unsafe { MemoryRegion::new(backing_initial.as_mut_ptr(), 1024) };
 
-    let mut config = small_config();
-    config.registered_regions = vec![initial];
+    let config = small_config_builder()
+        .registered_regions(vec![initial])
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config).launch::<Idle>().unwrap();
 
     let mut backing = vec![0u8; 1024];

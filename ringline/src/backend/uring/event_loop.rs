@@ -3028,6 +3028,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConfigBuilder;
     use crate::completion::{OpTag, UserData};
     use crate::config::Config;
     use crate::runtime::io::ConnCtx;
@@ -3048,21 +3049,23 @@ mod tests {
         }
     }
 
+    fn test_config_builder() -> ConfigBuilder {
+        ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .sq_entries(32)
+            .recv_buffer(16, 4096)
+            .max_connections(16)
+            .send_pool(16, 16384)
+            .send_slab_slots(8)
+            .fs(crate::fs::FsConfig {
+                max_files: 2,
+                max_commands_in_flight: 4,
+            })
+    }
+
     fn test_config() -> Config {
-        let mut config = Config::default();
-        config.worker.threads = 1;
-        config.worker.pin_to_core = false;
-        config.sq_entries = 32;
-        config.recv_buffer.ring_size = 16;
-        config.recv_buffer.buffer_size = 4096;
-        config.max_connections = 16;
-        config.send_copy_count = 16;
-        config.send_slab_slots = 8;
-        config.fs = Some(crate::fs::FsConfig {
-            max_files: 2,
-            max_commands_in_flight: 4,
-        });
-        config
+        test_config_builder().build().expect("valid config")
     }
 
     /// Create a test event loop. Requires Linux with io_uring support.

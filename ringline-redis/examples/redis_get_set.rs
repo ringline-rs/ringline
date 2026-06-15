@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, RinglineBuilder};
 
 static REDIS_ADDR: OnceLock<std::net::SocketAddr> = OnceLock::new();
 
@@ -80,9 +80,11 @@ fn main() {
         .expect("invalid REDIS_ADDR");
     REDIS_ADDR.set(addr).unwrap();
 
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .build()
+        .expect("valid config");
 
     let (_shutdown, handles) = RinglineBuilder::new(config)
         .launch::<RedisHandler>()

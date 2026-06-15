@@ -14,6 +14,7 @@
 //! are also printed via `eprintln!` so a human reading test output can
 //! spot drift.
 
+use ringline::ConfigBuilder;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -29,21 +30,23 @@ use ringline::{
 
 // ── Shared test config ────────────────────────────────────────────────
 
+fn test_config_builder() -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        // Sized so an 8 MiB sustained echo fits without stalling on
+        // resource limits — the slot count covers the worst-case in-flight
+        // pipeline given default 16 KiB slots, the SQ holds enough entries
+        // to keep io_uring busy, and the recv buffer ring matches.
+        .sq_entries(2048)
+        .recv_buffer(512, 16 * 1024)
+        .max_connections(64)
+        .send_pool(2048, 16384)
+        .standalone_task_capacity(32)
+}
+
 fn test_config() -> Config {
-    let mut cfg = Config::default();
-    cfg.worker.threads = 1;
-    cfg.worker.pin_to_core = false;
-    // Sized so an 8 MiB sustained echo fits without stalling on
-    // resource limits — the slot count covers the worst-case in-flight
-    // pipeline given default 16 KiB slots, the SQ holds enough entries
-    // to keep io_uring busy, and the recv buffer ring matches.
-    cfg.sq_entries = 2048;
-    cfg.recv_buffer.ring_size = 512;
-    cfg.recv_buffer.buffer_size = 16 * 1024;
-    cfg.max_connections = 64;
-    cfg.send_copy_count = 2048;
-    cfg.standalone_task_capacity = 32;
-    cfg
+    test_config_builder().build().expect("valid config")
 }
 
 fn free_port() -> u16 {
@@ -328,9 +331,11 @@ fn udp_request_reply_ringline(count: usize, payload_size: usize) -> Duration {
     UDP_HANDLER_STARTED.store(0, Ordering::SeqCst);
     let port = free_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let mut cfg = test_config();
-    cfg.udp_send_slots = 64;
-    cfg.udp_recv_queue_capacity = 4096;
+    let cfg = test_config_builder()
+        .udp_send_slots(64)
+        .udp_recv_queue_capacity(4096)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<AsyncUdpEcho>()

@@ -10,23 +10,25 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
 use ringline_ping::{Pool, PoolConfig};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn test_config_builder() -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .send_pool(64, 16384)
+}
+
 fn test_config() -> Config {
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 64;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 64;
-    config.send_copy_count = 64;
-    config
+    test_config_builder().build().expect("valid config")
 }
 
 fn free_port() -> u16 {

@@ -20,15 +20,15 @@ pub struct TlsClientConfig {
 #[derive(Clone)]
 pub struct Config {
     /// Number of SQ entries. CQ will be 4x this.
-    pub sq_entries: u32,
+    pub(crate) sq_entries: u32,
     /// Enable SQPOLL mode (kernel-side submission polling).
-    pub sqpoll: bool,
+    pub(crate) sqpoll: bool,
     /// SQPOLL idle timeout in milliseconds.
-    pub sqpoll_idle_ms: u32,
+    pub(crate) sqpoll_idle_ms: u32,
     /// Pin SQPOLL kernel thread to this CPU core. Only meaningful when sqpoll=true.
-    pub sqpoll_cpu: Option<u32>,
+    pub(crate) sqpoll_cpu: Option<u32>,
     /// Recv buffer configuration (provided buffer ring) for TCP multishot recv.
-    pub recv_buffer: RecvBufferConfig,
+    pub(crate) recv_buffer: RecvBufferConfig,
     /// Recv buffer configuration for UDP multishot recvmsg.
     ///
     /// UDP uses a separate provided buffer ring from TCP so the two can be
@@ -39,14 +39,14 @@ pub struct Config {
     /// expect jumbo datagrams.
     ///
     /// `bgid` must differ from `recv_buffer.bgid` when UDP is in use.
-    pub udp_recv_buffer: RecvBufferConfig,
+    pub(crate) udp_recv_buffer: RecvBufferConfig,
     /// User-registered memory regions (e.g., mmap'd storage arenas).
     ///
     /// Regions listed here occupy slots `0..registered_regions.len()` at
-    /// startup. The remaining slots up to [`Config::max_registered_regions`] are
+    /// startup. The remaining slots up to [`ConfigBuilder::max_registered_regions`] are
     /// available for dynamic registration via
     /// [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region).
-    pub registered_regions: Vec<MemoryRegion>,
+    pub(crate) registered_regions: Vec<MemoryRegion>,
     /// Maximum number of fixed-buffer slots to reserve in the io_uring
     /// registered-buffer table. Must be `>= registered_regions.len()`.
     ///
@@ -56,15 +56,15 @@ pub struct Config {
     /// fixed-size; expand by re-launching with a larger value.
     ///
     /// Default: 64.
-    pub max_registered_regions: u16,
+    pub(crate) max_registered_regions: u16,
     /// Worker/thread configuration.
-    pub worker: WorkerConfig,
+    pub(crate) worker: WorkerConfig,
     /// TCP listen backlog.
-    pub backlog: i32,
+    pub(crate) backlog: i32,
     /// Maximum number of direct file descriptors (connections).
-    pub max_connections: u32,
+    pub(crate) max_connections: u32,
     /// Initial capacity for per-connection recv accumulators.
-    pub recv_accumulator_capacity: usize,
+    pub(crate) recv_accumulator_capacity: usize,
     /// Upper bound on a single per-connection recv accumulator. If the
     /// application's parser keeps returning `NeedMore` while the peer
     /// streams data, the accumulator grows indefinitely; setting this
@@ -76,12 +76,12 @@ pub struct Config {
     /// values are 4–16× the typical request size; setting it too low
     /// will close legitimate slow-consumer workloads (where kernel recv
     /// CQEs batch faster than the handler runs).
-    pub recv_accumulator_max: usize,
+    pub(crate) recv_accumulator_max: usize,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly
     /// close the incoming fd if every worker is full) rather than
     /// accumulating fds without backpressure. Default: 1024.
-    pub accept_queue_capacity: usize,
+    pub(crate) accept_queue_capacity: usize,
     /// Number of connections assigned to each worker before moving to the
     /// next one. `1` (the default) gives classic round-robin. Higher values
     /// pack connections onto fewer workers at low connection counts, keeping
@@ -92,15 +92,15 @@ pub struct Config {
     ///
     /// Rule of thumb: set to the minimum connections-per-worker at which
     /// your workload sees good batching (typically 16–64). Default: 1.
-    pub conn_chunk_size: usize,
+    pub(crate) conn_chunk_size: usize,
     /// Number of copy-send pool slots. Each in-flight `send()` or copy part of a
     /// `send_parts()` call holds one slot until the kernel completes the send.
     /// Size this to cover your peak in-flight send count — exhaustion returns an
     /// error to the handler. Memory cost: `send_copy_count * send_copy_slot_size`.
-    pub send_copy_count: u16,
+    pub(crate) send_copy_count: u16,
     /// Size of each copy-send pool slot in bytes. A single `send()` or the
     /// combined copy parts of one `send_parts()` call must fit in one slot.
-    pub send_copy_slot_size: u32,
+    pub(crate) send_copy_slot_size: u32,
     /// Minimum total send size (bytes) for the zero-copy guard send path.
     ///
     /// Guard sends (`send_parts()` with `.guard()` parts) whose total length is
@@ -112,49 +112,49 @@ pub struct Config {
     /// `0` disables the fallback (guard sends always use zero-copy).
     /// Sends at or above the threshold, or that don't fit a send pool slot,
     /// use the zero-copy path as before. Default: `4096`.
-    pub send_zc_threshold: u32,
+    pub(crate) send_zc_threshold: u32,
     /// Number of InFlightSendSlab slots for in-flight scatter-gather sends
     /// (i.e., `send_parts()` calls that include at least one guard).
     /// Each slot is held until all ZC notifications arrive.
-    pub send_slab_slots: u16,
+    pub(crate) send_slab_slots: u16,
     /// Deadline-based flush interval in microseconds during CQE processing.
     /// When non-SQPOLL, if this many microseconds elapse since the last submit
     /// while processing a CQE batch, pending SQEs are flushed mid-iteration.
     /// 0 = disabled. Ignored when SQPOLL is active (kernel handles it).
-    pub flush_interval_us: u64,
+    pub(crate) flush_interval_us: u64,
     /// Maximum time in microseconds that `submit_and_wait` will block before
     /// returning to call `on_tick`. Prevents the event loop from stalling when
     /// there are no pending completions (e.g., client-only mode between phases).
     /// 0 = no timeout (block indefinitely until a CQE arrives).
     /// Default: 1000 (1ms).
-    pub tick_timeout_us: u64,
+    pub(crate) tick_timeout_us: u64,
     /// Optional TLS configuration. When set, all accepted connections use TLS.
-    pub tls: Option<TlsConfig>,
+    pub(crate) tls: Option<TlsConfig>,
     /// Optional TLS client configuration for outbound `connect_tls()` calls.
-    pub tls_client: Option<TlsClientConfig>,
+    pub(crate) tls_client: Option<TlsClientConfig>,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
-    pub tcp_nodelay: bool,
+    pub(crate) tcp_nodelay: bool,
     /// Enable SO_TIMESTAMPING for kernel-level receive timestamps.
     /// When enabled, connections use `RecvMsgMulti` instead of `RecvMulti`
     /// to receive ancillary data containing kernel RX timestamps.
     #[cfg(feature = "timestamps")]
-    pub timestamps: bool,
+    pub(crate) timestamps: bool,
     /// Maximum number of SQEs per IOSQE_IO_LINK chain. 0 disables chaining.
     /// When disabled, sends exceeding MAX_IOVECS fall back to sequential
     /// round-trips (one SQE at a time via on_send_complete).
     /// Default: 16.
-    pub max_chain_length: u16,
+    pub(crate) max_chain_length: u16,
     /// Maximum number of standalone async tasks (not bound to connections)
     /// per worker. Used with [`spawn()`](crate::spawn).
     /// Default: 256.
-    pub standalone_task_capacity: u32,
+    pub(crate) standalone_task_capacity: u32,
     /// Maximum number of concurrent timer slots per worker.
     /// Used by [`sleep()`](crate::sleep) and [`timeout()`](crate::timeout).
     /// Default: 256.
-    pub timer_slots: u32,
+    pub(crate) timer_slots: u32,
     /// UDP bind addresses. Each worker creates its own socket with SO_REUSEPORT.
     /// Empty = no UDP sockets.
-    pub udp_bind: Vec<SocketAddr>,
+    pub(crate) udp_bind: Vec<SocketAddr>,
     /// Optional peer to `connect(2)` each UDP socket to, parallel to
     /// `udp_bind`. `None` leaves the socket unconnected (the usual UDP
     /// server case); `Some(peer)` calls `connect()` so the kernel filters
@@ -162,13 +162,13 @@ pub struct Config {
     /// `RecvUdp`/`SendUdp` opcodes instead of `RecvMsgUdp`/`SendMsgUdp`.
     /// Saves ~4 microseconds per round trip on single-shot client workloads.
     /// Must have the same length as `udp_bind` (enforced at validation).
-    pub udp_connect_peers: Vec<Option<SocketAddr>>,
+    pub(crate) udp_connect_peers: Vec<Option<SocketAddr>>,
     /// Number of concurrent in-flight UDP sends per socket. Each slot owns a
     /// pre-allocated `sockaddr_storage` + `iovec` + `msghdr` triple used to
     /// submit a `sendmsg` SQE; the slot is returned to the freelist on CQE.
     /// Exhaustion returns [`crate::error::UdpSendError::PoolExhausted`].
     /// Default: 64.
-    pub udp_send_slots: u16,
+    pub(crate) udp_send_slots: u16,
     /// Maximum number of datagrams buffered per UDP socket awaiting a
     /// consumer. The runtime fills this queue from `recvmsg` completions;
     /// the application's `on_udp_bind` future drains it via
@@ -179,7 +179,7 @@ pub struct Config {
     /// or returns early.
     ///
     /// Default: 1024.
-    pub udp_recv_queue_capacity: usize,
+    pub(crate) udp_recv_queue_capacity: usize,
     /// Enable UDP Generic Receive Offload (GRO) on bound UDP sockets.
     ///
     /// When set, the runtime calls `setsockopt(SOL_UDP, UDP_GRO)` so the
@@ -199,37 +199,37 @@ pub struct Config {
     /// effect on `connect(2)`-ed UDP sockets (they use the lighter `recv`
     /// path, which carries no control message). Linux-only — a no-op on
     /// other platforms. Default: false.
-    pub udp_gro: bool,
+    pub(crate) udp_gro: bool,
     /// Optional NVMe passthrough configuration. When set, enables NVMe device
     /// management and `IORING_OP_URING_CMD` submission for direct NVMe I/O.
-    pub nvme: Option<crate::nvme::NvmeConfig>,
+    pub(crate) nvme: Option<crate::nvme::NvmeConfig>,
     /// Optional direct I/O configuration. When set, enables `O_DIRECT` file I/O
     /// via io_uring `IORING_OP_READ` / `IORING_OP_WRITE`, bypassing the page cache.
-    pub direct_io: Option<crate::direct_io::DirectIoConfig>,
+    pub(crate) direct_io: Option<crate::direct_io::DirectIoConfig>,
     /// Optional buffered filesystem I/O configuration. When set, enables async
     /// file open/read/write/stat/rename/unlink/mkdir via io_uring.
-    pub fs: Option<crate::fs::FsConfig>,
+    pub(crate) fs: Option<crate::fs::FsConfig>,
     /// Number of dedicated DNS resolver threads. The resolver pool runs
     /// `getaddrinfo` on background threads, keeping blocking DNS isolated
     /// from the io_uring event loop.
     ///
     /// 0 = disabled (no resolver pool; [`resolve()`](crate::resolve) will
     /// return an error). Default: 2.
-    pub resolver_threads: usize,
+    pub(crate) resolver_threads: usize,
     /// Number of dedicated process spawner threads. The spawner pool runs
     /// `posix_spawnp` + `pidfd_open` on background threads, keeping blocking
     /// process creation isolated from the io_uring event loop.
     ///
     /// 0 = disabled (no spawner pool; [`Command::spawn()`](crate::process::Command::spawn)
     /// will return an error). Default: 1.
-    pub spawner_threads: usize,
+    pub(crate) spawner_threads: usize,
     /// Number of dedicated blocking threads. The blocking pool runs
     /// user-provided closures on low-priority (`SCHED_IDLE`) background threads,
     /// keeping CPU-bound or blocking work isolated from the io_uring event loop.
     ///
     /// 0 = disabled (no blocking pool; [`spawn_blocking()`](crate::spawn_blocking)
     /// will return an error). Default: 4.
-    pub blocking_threads: usize,
+    pub(crate) blocking_threads: usize,
     /// Number of dedicated disk I/O threads (mio backend only). The disk I/O
     /// pool executes blocking filesystem syscalls (pread, pwrite, fsync, stat,
     /// rename, unlink, mkdir) on background threads, enabling async file I/O
@@ -237,13 +237,13 @@ pub struct Config {
     ///
     /// 0 = disabled (filesystem/direct I/O operations return `Unsupported`).
     /// Default: 2.
-    pub disk_io_threads: usize,
+    pub(crate) disk_io_threads: usize,
     /// Maximum time in milliseconds to wait for a TLS close_notify send to
     /// complete before force-closing the connection. When a TLS connection
     /// sends close_notify but the send never completes (e.g., due to pool
     /// exhaustion), this prevents the connection from hanging indefinitely.
     /// Default: 5000.
-    pub close_notify_timeout_ms: u64,
+    pub(crate) close_notify_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -300,6 +300,12 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The zero-copy guard send threshold in bytes. See
+    /// [`ConfigBuilder::send_zc_threshold`].
+    pub fn send_zc_threshold(&self) -> u32 {
+        self.send_zc_threshold
+    }
+
     /// Validate configuration values. Returns an error if any value is out of range.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
         if !self.recv_buffer.ring_size.is_power_of_two() {
@@ -533,6 +539,19 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the number of connections assigned to each worker before moving to
+    /// the next one. `1` (the default) gives classic round-robin.
+    pub fn conn_chunk_size(mut self, n: usize) -> Self {
+        self.config.conn_chunk_size = n;
+        self
+    }
+
+    /// Set the bound on the per-worker accept channel. Default: 1024.
+    pub fn accept_queue_capacity(mut self, n: usize) -> Self {
+        self.config.accept_queue_capacity = n;
+        self
+    }
+
     /// Enable or disable TCP_NODELAY on all connections.
     pub fn tcp_nodelay(mut self, enable: bool) -> Self {
         self.config.tcp_nodelay = enable;
@@ -574,9 +593,22 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the recv buffer group ID (bgid) for the TCP provided buffer ring.
+    pub fn recv_buffer_bgid(mut self, bgid: u16) -> Self {
+        self.config.recv_buffer.bgid = bgid;
+        self
+    }
+
     /// Set the initial capacity for per-connection recv accumulators.
     pub fn recv_accumulator_capacity(mut self, n: usize) -> Self {
         self.config.recv_accumulator_capacity = n;
+        self
+    }
+
+    /// Set the upper bound on a single per-connection recv accumulator.
+    /// `usize::MAX` (the default) disables the cap.
+    pub fn recv_accumulator_max(mut self, n: usize) -> Self {
+        self.config.recv_accumulator_max = n;
         self
     }
 
@@ -671,11 +703,18 @@ impl ConfigBuilder {
     }
 
     /// Set the UDP recv buffer configuration (ring_size, buffer_size).
-    /// The `bgid` is left at its default; change it via `config_mut()` if
-    /// you need to override.
+    /// The `bgid` is left at its default; override it with
+    /// [`udp_recv_buffer_bgid`](Self::udp_recv_buffer_bgid).
     pub fn udp_recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
         self.config.udp_recv_buffer.ring_size = ring_size;
         self.config.udp_recv_buffer.buffer_size = buffer_size;
+        self
+    }
+
+    /// Set the UDP recv buffer group ID (bgid). Must differ from the TCP
+    /// `recv_buffer` bgid when UDP is in use.
+    pub fn udp_recv_buffer_bgid(mut self, bgid: u16) -> Self {
+        self.config.udp_recv_buffer.bgid = bgid;
         self
     }
 
@@ -688,7 +727,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Enable UDP GRO on bound UDP sockets. See [`Config::udp_gro`]. Remember
+    /// Enable UDP GRO on bound UDP sockets. Remember
     /// to size `udp_recv_buffer` to hold a full coalesced datagram (~64 KiB).
     pub fn udp_gro(mut self, enabled: bool) -> Self {
         self.config.udp_gro = enabled;
@@ -757,12 +796,20 @@ impl ConfigBuilder {
         self
     }
 
-    // ── Escape hatch ─────────────────────────────────────────────────
+    // ── Memory regions ───────────────────────────────────────────────
 
-    /// Get mutable access to the underlying config for fields not covered
-    /// by builder methods.
-    pub fn config_mut(&mut self) -> &mut Config {
-        &mut self.config
+    /// Set the user-registered memory regions occupying the initial
+    /// registered-buffer slots.
+    pub fn registered_regions(mut self, regions: Vec<MemoryRegion>) -> Self {
+        self.config.registered_regions = regions;
+        self
+    }
+
+    /// Set the maximum number of fixed-buffer slots to reserve. Must be
+    /// `>= registered_regions.len()`. Default: 64.
+    pub fn max_registered_regions(mut self, n: u16) -> Self {
+        self.config.max_registered_regions = n;
+        self
     }
 
     // ── Terminal ─────────────────────────────────────────────────────

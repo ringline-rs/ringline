@@ -15,6 +15,7 @@
 //! tests still pass there (and pin the same wire format), but only exercise
 //! the small-gather/ZC branch selection on Linux with io_uring.
 
+use ringline::ConfigBuilder;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -104,16 +105,18 @@ impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
 
 // ── Harness ─────────────────────────────────────────────────────────
 
+fn test_config_builder() -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .send_pool(64, 16384)
+}
+
 fn test_config() -> Config {
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 64;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 64;
-    config.send_copy_count = 64;
-    config
+    test_config_builder().build().expect("valid config")
 }
 
 fn wait_for_server(addr: &str) {
@@ -192,7 +195,11 @@ const LARGE_VALUE: usize = 16384;
 #[test]
 fn guard_send_below_threshold_small_gather() {
     let config = test_config();
-    assert_eq!(config.send_zc_threshold, 4096, "default threshold changed");
+    assert_eq!(
+        config.send_zc_threshold(),
+        4096,
+        "default threshold changed"
+    );
     run_case::<SMALL_VALUE>(config);
 }
 
@@ -201,8 +208,10 @@ fn guard_send_below_threshold_small_gather() {
 /// identical payload and assertions.
 #[test]
 fn guard_send_above_threshold_zc() {
-    let mut config = test_config();
-    config.send_zc_threshold = 1;
+    let config = test_config_builder()
+        .send_zc_threshold(1)
+        .build()
+        .expect("valid config");
     run_case::<SMALL_VALUE>(config);
 }
 
@@ -210,8 +219,10 @@ fn guard_send_above_threshold_zc() {
 /// payload and assertions.
 #[test]
 fn guard_send_threshold_disabled_zc() {
-    let mut config = test_config();
-    config.send_zc_threshold = 0;
+    let config = test_config_builder()
+        .send_zc_threshold(0)
+        .build()
+        .expect("valid config");
     run_case::<SMALL_VALUE>(config);
 }
 

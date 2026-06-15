@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, TlsClientConfig};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, TlsClientConfig};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -27,18 +27,18 @@ fn test_config(alpn: &[&[u8]]) -> Config {
         tls.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     }
 
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 64;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 64;
-    config.send_copy_count = 64;
-    config.tls_client = Some(TlsClientConfig {
-        client_config: Arc::new(tls),
-    });
-    config
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .send_pool(64, 16384)
+        .tls_client(TlsClientConfig {
+            client_config: Arc::new(tls),
+        })
+        .build()
+        .expect("valid config")
 }
 
 fn resolve(host: &str, port: u16) -> std::net::SocketAddr {

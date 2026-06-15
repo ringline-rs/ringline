@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
-use ringline::{AsyncEventHandler, Config, ConnCtx, ConnStream, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ConnStream, RinglineBuilder};
 
 // ── Stream-based echo handler ────────────────────────────────────────
 
@@ -123,16 +123,18 @@ impl AsyncEventHandler for TinyReadEcho {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+fn test_config_builder() -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .send_pool(64, 16384)
+}
+
 fn test_config() -> Config {
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 64;
-    config.recv_buffer.ring_size = 64;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 64;
-    config.send_copy_count = 64;
-    config
+    test_config_builder().build().expect("valid config")
 }
 
 fn free_port() -> u16 {

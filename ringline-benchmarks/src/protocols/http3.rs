@@ -1,3 +1,4 @@
+use ringline::ConfigBuilder;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -239,10 +240,14 @@ fn echo_responses(
 /// already far ahead. A real QUIC app would make the same per-workload
 /// choice; the bench mirrors it by `msg_size`. When enabled, recv buffers
 /// are grown to hold a full ~64 KiB coalesced datagram.
-fn apply_gro_config(config: &mut ringline::Config, msg_size: usize) {
+/// Apply GRO-related recv buffer sizing to the builder. `ring_size` is the
+/// UDP recv ring size already chosen by the caller (preserved here); when GRO
+/// is enabled the buffer must hold a full ~64 KiB coalesced datagram.
+fn apply_gro_config(builder: ConfigBuilder, ring_size: u16, msg_size: usize) -> ConfigBuilder {
     if msg_size >= 4096 {
-        config.udp_gro = true;
-        config.udp_recv_buffer.buffer_size = 68 * 1024;
+        builder.udp_gro(true).udp_recv_buffer(ring_size, 68 * 1024)
+    } else {
+        builder
     }
 }
 
@@ -447,21 +452,22 @@ fn start_h3_server(
         *guard = Some(quic_config);
     }
 
-    let mut config = ringline::Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 1024;
-    config.udp_recv_buffer.ring_size = 512;
-    config.udp_recv_buffer.buffer_size = 4096;
-    config.udp_send_slots = 256;
-    config.udp_recv_queue_capacity = 4096;
-    config.send_copy_count = 1024;
-    config.send_copy_slot_size = 65536;
-    config.standalone_task_capacity = 64;
-    apply_gro_config(
-        &mut config,
+    let builder = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(1024)
+        .udp_recv_buffer(512, 4096)
+        .udp_send_slots(256)
+        .udp_recv_queue_capacity(4096)
+        .send_pool(1024, 65536)
+        .standalone_task_capacity(64);
+    let config = apply_gro_config(
+        builder,
+        512,
         SERVER_MSG_SIZE.load(Ordering::Relaxed).max(1) as usize,
-    );
+    )
+    .build()
+    .expect("valid config");
 
     let (shutdown, handles) = ringline::RinglineBuilder::new(config)
         .bind_udp(addr)
@@ -635,18 +641,18 @@ fn run_bench_ringline(
 
     let client_bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-    let mut config = ringline::Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 1024;
-    config.udp_recv_buffer.ring_size = 512;
-    config.udp_recv_buffer.buffer_size = 4096;
-    config.udp_send_slots = 256;
-    config.udp_recv_queue_capacity = 4096;
-    config.send_copy_count = 1024;
-    config.send_copy_slot_size = 65536;
-    config.standalone_task_capacity = 64;
-    apply_gro_config(&mut config, msg_size);
+    let builder = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(1024)
+        .udp_recv_buffer(512, 4096)
+        .udp_send_slots(256)
+        .udp_recv_queue_capacity(4096)
+        .send_pool(1024, 65536)
+        .standalone_task_capacity(64);
+    let config = apply_gro_config(builder, 512, msg_size)
+        .build()
+        .expect("valid config");
 
     let (shutdown, handles) = match ringline::RinglineBuilder::new(config)
         .bind_udp(client_bind)

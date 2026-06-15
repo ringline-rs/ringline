@@ -13,7 +13,7 @@ use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder, TlsClientConfig};
+use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, RinglineBuilder, TlsClientConfig};
 
 #[derive(Debug)]
 struct Target {
@@ -105,12 +105,14 @@ fn main() {
         .with_no_client_auth();
     tls.alpn_protocols = vec![b"h2".to_vec()];
 
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.tls_client = Some(TlsClientConfig {
-        client_config: Arc::new(tls),
-    });
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .tls_client(TlsClientConfig {
+            client_config: Arc::new(tls),
+        })
+        .build()
+        .expect("valid config");
 
     let (_shutdown, handles) = RinglineBuilder::new(config)
         .launch::<HttpHandler>()

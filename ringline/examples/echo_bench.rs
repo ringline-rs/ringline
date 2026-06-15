@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
 
 // ── Async echo handler ──────────────────────────────────────────────
 
@@ -204,17 +204,20 @@ struct BenchResult {
     cpu_ns: u64,
 }
 
+fn make_config_builder(workers: usize, msg_size: usize) -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(workers)
+        .pin_to_core(false)
+        .sq_entries(256)
+        .recv_buffer(256, msg_size.next_power_of_two().max(4096) as u32)
+        .max_connections(4096)
+        .send_pool(512, msg_size.next_power_of_two().max(4096) as u32)
+}
+
 fn make_config(workers: usize, msg_size: usize) -> Config {
-    let mut config = Config::default();
-    config.worker.threads = workers;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 256;
-    config.recv_buffer.ring_size = 256;
-    config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
-    config.max_connections = 4096;
-    config.send_copy_count = 512;
-    config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
-    config
+    make_config_builder(workers, msg_size)
+        .build()
+        .expect("valid config")
 }
 
 fn wait_for_server(addr: &str) {

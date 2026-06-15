@@ -254,8 +254,8 @@ mod ringline_client {
     use std::time::{Duration, Instant};
 
     use ringline::{
-        AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder, ShutdownHandle, connect,
-        sleep, spawn,
+        AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, ShutdownHandle,
+        connect, sleep, spawn,
     };
 
     use super::OpenLoop;
@@ -565,19 +565,19 @@ mod ringline_client {
 
             *GLOBAL_STATE.lock().unwrap() = Some(state);
 
-            let mut config = Config::default();
-            config.worker.threads = workers;
-            config.worker.pin_to_core = false;
-            config.sq_entries = 4096;
-            config.recv_buffer.ring_size = 4096;
-            config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
-            config.max_connections = 4096;
-            // The send-copy pool is the open-loop in-flight ceiling: it must
-            // comfortably exceed max_inflight * (conns per worker), or sends fail
-            // below capacity. Keep a generous slot count; don't reserve 4 KiB per
-            // slot for tiny messages.
-            config.send_copy_count = 32768;
-            config.send_copy_slot_size = msg_size.next_power_of_two().max(256) as u32;
+            let config = ConfigBuilder::new()
+                .workers(workers)
+                .pin_to_core(false)
+                .sq_entries(4096)
+                .recv_buffer(4096, msg_size.next_power_of_two().max(4096) as u32)
+                .max_connections(4096)
+                // The send-copy pool is the open-loop in-flight ceiling: it must
+                // comfortably exceed max_inflight * (conns per worker), or sends fail
+                // below capacity. Keep a generous slot count; don't reserve 4 KiB per
+                // slot for tiny messages.
+                .send_pool(32768, msg_size.next_power_of_two().max(256) as u32)
+                .build()
+                .expect("valid config");
 
             // Client-only mode: no bind address.
             let (shutdown, handles) = RinglineBuilder::new(config).launch::<ClientHandler>()?;

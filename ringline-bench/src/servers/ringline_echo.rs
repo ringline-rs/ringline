@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::thread::JoinHandle;
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, RinglineBuilder, ShutdownHandle};
+use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, RinglineBuilder, ShutdownHandle};
 // ParseResult is only needed in the non-io_uring fallback path.
 #[cfg(not(has_io_uring))]
 use ringline::ParseResult;
@@ -56,15 +56,15 @@ impl RinglineServer {
         workers: usize,
         msg_size: usize,
     ) -> Result<Self, ringline::Error> {
-        let mut config = Config::default();
-        config.worker.threads = workers;
-        config.worker.pin_to_core = false;
-        config.sq_entries = 4096;
-        config.recv_buffer.ring_size = 4096;
-        config.recv_buffer.buffer_size = msg_size.next_power_of_two().max(4096) as u32;
-        config.max_connections = 4096;
-        config.send_copy_count = 4096;
-        config.send_copy_slot_size = msg_size.next_power_of_two().max(4096) as u32;
+        let config = ConfigBuilder::new()
+            .workers(workers)
+            .pin_to_core(false)
+            .sq_entries(4096)
+            .recv_buffer(4096, msg_size.next_power_of_two().max(4096) as u32)
+            .max_connections(4096)
+            .send_pool(4096, msg_size.next_power_of_two().max(4096) as u32)
+            .build()
+            .expect("valid config");
 
         let (shutdown, handles) = RinglineBuilder::new(config)
             .bind(addr)

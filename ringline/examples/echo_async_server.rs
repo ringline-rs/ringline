@@ -4,7 +4,7 @@
 //!   cargo run --example echo_async_server [BIND_ADDR]
 //!   # default: 127.0.0.1:7878
 
-use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
 
 struct AsyncEcho {
     worker_id: usize,
@@ -43,13 +43,14 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:7878".to_string());
 
-    let mut config = Config::default();
-    config.worker.threads = 1;
-    config.worker.pin_to_core = false;
-    config.sq_entries = 128;
-    config.recv_buffer.ring_size = 128;
-    config.recv_buffer.buffer_size = 4096;
-    config.max_connections = 1024;
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(128)
+        .recv_buffer(128, 4096)
+        .max_connections(1024)
+        .build()
+        .expect("valid config");
 
     eprintln!("starting async echo server on {bind_addr}");
 

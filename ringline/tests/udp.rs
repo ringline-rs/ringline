@@ -7,6 +7,7 @@
 //! paths funnel through the same `UdpCtx` API so the tests are
 //! backend-agnostic except where noted.
 
+use ringline::ConfigBuilder;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
@@ -21,18 +22,20 @@ use ringline::{
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+fn base_config_builder() -> ConfigBuilder {
+    ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .recv_buffer(64, 4096)
+        .max_connections(64)
+        .send_pool(64, 16384)
+        .standalone_task_capacity(64)
+        .tick_timeout_us(5_000)
+}
+
 fn base_config() -> Config {
-    let mut cfg = Config::default();
-    cfg.worker.threads = 1;
-    cfg.worker.pin_to_core = false;
-    cfg.sq_entries = 64;
-    cfg.recv_buffer.ring_size = 64;
-    cfg.recv_buffer.buffer_size = 4096;
-    cfg.max_connections = 64;
-    cfg.send_copy_count = 64;
-    cfg.standalone_task_capacity = 64;
-    cfg.tick_timeout_us = 5_000;
-    cfg
+    base_config_builder().build().expect("valid config")
 }
 
 fn free_udp_port() -> u16 {
@@ -234,10 +237,12 @@ fn udp_echo_burst_unique_payloads() {
     let port = free_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let mut cfg = base_config();
-    // Make sure send slot ring is comfortably larger than the burst so the
-    // server doesn't have to wait on send_ready for the common case.
-    cfg.udp_send_slots = 64;
+    let cfg = base_config_builder()
+        // Make sure send slot ring is comfortably larger than the burst so the
+        // server doesn't have to wait on send_ready for the common case.
+        .udp_send_slots(64)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<UdpEcho>()
@@ -300,8 +305,10 @@ fn udp_large_datagram_within_mtu() {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     // Bump the recv buffer to comfortably cover ~1400 bytes + header.
-    let mut cfg = base_config();
-    cfg.udp_recv_buffer.buffer_size = 4096;
+    let cfg = base_config_builder()
+        .udp_recv_buffer(128, 4096)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<UdpEcho>()
@@ -520,9 +527,10 @@ fn udp_send_ready_unblocks_after_exhaustion() {
     let port = free_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let mut cfg = base_config();
-    cfg.udp_send_slots = 4; // tiny ring → forces exhaustion
-
+    let cfg = base_config_builder()
+        .udp_send_slots(4)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<SendStress>()
@@ -662,9 +670,11 @@ fn udp_oversized_send_does_not_corrupt_state() {
     let port = free_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let mut cfg = base_config();
-    cfg.send_copy_slot_size = 4096; // smaller than the big payload
-    cfg.udp_recv_buffer.buffer_size = 4096;
+    let cfg = base_config_builder()
+        .send_pool(64, 4096)
+        .udp_recv_buffer(128, 4096)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<OversizedSend>()
@@ -757,9 +767,10 @@ fn udp_truncated_datagram_recoverable() {
 
     // Tight recv buffer: 256 bytes total → ~70 bytes for payload after the
     // io_uring header + sockaddr.
-    let mut cfg = base_config();
-    cfg.udp_recv_buffer.buffer_size = 256;
-    cfg.udp_recv_buffer.ring_size = 16;
+    let cfg = base_config_builder()
+        .udp_recv_buffer(16, 256)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<CountingEcho>()
@@ -865,10 +876,11 @@ fn udp_reuseport_balances_across_workers() {
     let port = free_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let mut cfg = base_config();
-    cfg.worker.threads = 4;
-    let workers = cfg.worker.threads;
-
+    let workers = 4;
+    let cfg = base_config_builder()
+        .workers(workers)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<ReuseportEcho>()
@@ -1147,8 +1159,10 @@ fn udp_recv_queue_capacity_drops_excess_datagrams() {
     let port = free_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let mut cfg = base_config();
-    cfg.udp_recv_queue_capacity = 8;
+    let cfg = base_config_builder()
+        .udp_recv_queue_capacity(8)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<ExitingUdpHandler>()
@@ -1434,8 +1448,10 @@ fn udp_concurrent_inflight_sends_recycle_slots() {
     let port = free_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let mut cfg = base_config();
-    cfg.udp_send_slots = 8;
+    let cfg = base_config_builder()
+        .udp_send_slots(8)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<ConcurrentSenders>()
@@ -1507,11 +1523,11 @@ fn udp_max_size_loopback_datagram() {
     // larger than any standard MTU so we exercise loopback's
     // happy-with-jumbo path.
     let payload_len = 65000;
-    let mut cfg = base_config();
-    cfg.send_copy_slot_size = 65535;
-    cfg.udp_recv_buffer.buffer_size = 65535;
-    cfg.udp_recv_buffer.ring_size = 16;
-
+    let cfg = base_config_builder()
+        .send_pool(64, 65535)
+        .udp_recv_buffer(16, 65535)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<UdpEcho>()
@@ -1605,10 +1621,10 @@ fn udp_recv_ring_exhaustion_under_burst() {
     let port = free_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let mut cfg = base_config();
-    cfg.udp_recv_buffer.ring_size = 4;
-    cfg.udp_recv_buffer.buffer_size = 256;
-
+    let cfg = base_config_builder()
+        .udp_recv_buffer(4, 256)
+        .build()
+        .expect("valid config");
     let buf_empty_before = ringline::metrics::POOL
         .value(ringline::metrics::pool::BUFFER_RING_EMPTY)
         .unwrap_or(0);
@@ -1934,8 +1950,10 @@ fn udp_gso_segments_one_send_into_many_datagrams() {
     let port = free_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let mut cfg = base_config();
-    cfg.send_copy_slot_size = 16384; // comfortably > 5 * 1000
+    let cfg = base_config_builder()
+        .send_pool(64, 16384)
+        .build()
+        .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
         .bind_udp(addr)
         .launch::<GsoSendHandler>()
