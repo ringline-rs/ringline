@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- **Breaking:** removed the unused `AsyncSendBuilder::build_await` and
+  `AsyncSendBuilder::submit_batch_await` methods (use `build` / `submit_batch`
+  with an awaited `SendFuture` if needed), and unexported the internal
+  `MAX_IOVECS` / `MAX_GUARDS` constants (they are no longer part of the public API).
 - **Breaking:** `Config` fields are now private; construct and configure it via
   `ConfigBuilder` (e.g. `ConfigBuilder::new().workers(8).tcp_nodelay(true).build()?`).
   Direct struct construction / field mutation and `ConfigBuilder::config_mut()` are
