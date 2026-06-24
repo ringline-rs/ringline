@@ -1,7 +1,7 @@
 use crate::guard::GuardBox;
 
-pub const MAX_IOVECS: usize = 32;
-pub const MAX_GUARDS: usize = 4;
+pub(crate) const MAX_IOVECS: usize = 32;
+pub(crate) const MAX_GUARDS: usize = 4;
 
 /// Slab for in-flight scatter-gather sends with zero-copy guards.
 ///
