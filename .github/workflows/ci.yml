@@ -35,7 +35,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   clippy-mio:
     name: Clippy (mio)
@@ -46,7 +46,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --features force-mio -- -D warnings
+      - run: cargo clippy --locked --all-targets --features force-mio -- -D warnings
 
   clippy-macos:
     name: Clippy (macOS)
@@ -57,7 +57,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   doc:
     name: Doc
@@ -66,7 +66,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 
   audit:
     name: Audit
@@ -88,7 +88,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all
+      - run: cargo test --locked --all
 
   test-release:
     name: Test (release)
@@ -97,7 +97,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all --release
+      - run: cargo test --locked --all --release
 
   test-mio:
     name: Test (mio)
@@ -106,7 +106,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all --features force-mio
+      - run: cargo test --locked --all --features force-mio
 
   test-macos:
     name: Test (macOS)
@@ -115,7 +115,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all
+      - run: cargo test --locked --all
 
   test-mio-release:
     name: Test (mio, release)
@@ -124,7 +124,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all --features force-mio --release
+      - run: cargo test --locked --all --features force-mio --release
 
   integration-clients:
     name: Integration (public servers)
@@ -133,9 +133,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p ringline-h2 --test public_servers -- --ignored --nocapture
-      - run: cargo test -p ringline-h3 --test public_servers -- --ignored --nocapture
-      - run: cargo test -p ringline-http --test public_servers -- --ignored --nocapture
+      - run: cargo test --locked -p ringline-h2 --test public_servers -- --ignored --nocapture
+      - run: cargo test --locked -p ringline-h3 --test public_servers -- --ignored --nocapture
+      - run: cargo test --locked -p ringline-http --test public_servers -- --ignored --nocapture
 
   integration-clients-mio:
     name: Integration (public servers, mio)
@@ -144,8 +144,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p ringline-h2 --test public_servers --features ringline/force-mio -- --ignored --nocapture
-      - run: cargo test -p ringline-http --test public_servers --features ringline/force-mio -- --ignored --nocapture
+      - run: cargo test --locked -p ringline-h2 --test public_servers --features ringline/force-mio -- --ignored --nocapture
+      - run: cargo test --locked -p ringline-http --test public_servers --features ringline/force-mio -- --ignored --nocapture
 
   integration-services:
     name: Integration (Redis + Memcache)
@@ -168,8 +168,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p ringline-redis --test integration -- --ignored --nocapture
-      - run: cargo test -p ringline-memcache --test integration -- --ignored --nocapture
+      - run: cargo test --locked -p ringline-redis --test integration -- --ignored --nocapture
+      - run: cargo test --locked -p ringline-memcache --test integration -- --ignored --nocapture
 
   integration-services-mio:
     name: Integration (Redis + Memcache, mio)
@@ -192,5 +192,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p ringline-redis --test integration --features ringline/force-mio -- --ignored --nocapture
-      - run: cargo test -p ringline-memcache --test integration --features ringline/force-mio -- --ignored --nocapture
+      - run: cargo test --locked -p ringline-redis --test integration --features ringline/force-mio -- --ignored --nocapture
+      - run: cargo test --locked -p ringline-memcache --test integration --features ringline/force-mio -- --ignored --nocapture
