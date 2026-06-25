@@ -108,9 +108,7 @@ fn main() {
     let config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
-        .tls_client(TlsClientConfig {
-            client_config: Arc::new(tls),
-        })
+        .tls_client(TlsClientConfig::new(Arc::new(tls)))
         .build()
         .expect("valid config");
 

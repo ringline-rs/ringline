@@ -449,9 +449,7 @@ fn grpc_unary_echo() {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     let config = test_config_builder()
-        .tls(TlsConfig {
-            server_config: server_tls,
-        })
+        .tls(TlsConfig::new(server_tls))
         .build()
         .expect("valid config");
 

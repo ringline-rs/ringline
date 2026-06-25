@@ -6,14 +6,28 @@ use crate::buffer::fixed::MemoryRegion;
 #[derive(Clone)]
 pub struct TlsConfig {
     /// Pre-built rustls ServerConfig. User loads certs/keys and configures ALPN etc.
-    pub server_config: std::sync::Arc<rustls::ServerConfig>,
+    pub(crate) server_config: std::sync::Arc<rustls::ServerConfig>,
+}
+
+impl TlsConfig {
+    /// Wrap a pre-built rustls `ServerConfig` (configure certs/ALPN/etc. on the rustls side).
+    pub fn new(server_config: std::sync::Arc<rustls::ServerConfig>) -> Self {
+        Self { server_config }
+    }
 }
 
 /// TLS client configuration for outbound connections.
 #[derive(Clone)]
 pub struct TlsClientConfig {
     /// Pre-built rustls ClientConfig. User configures root certs, ALPN, etc.
-    pub client_config: std::sync::Arc<rustls::ClientConfig>,
+    pub(crate) client_config: std::sync::Arc<rustls::ClientConfig>,
+}
+
+impl TlsClientConfig {
+    /// Wrap a pre-built rustls `ClientConfig`.
+    pub fn new(client_config: std::sync::Arc<rustls::ClientConfig>) -> Self {
+        Self { client_config }
+    }
 }
 
 /// Configuration for the io_uring driver.
@@ -425,7 +439,7 @@ impl Config {
 
 /// Configuration for the provided buffer ring (multishot recv).
 #[derive(Clone)]
-pub struct RecvBufferConfig {
+pub(crate) struct RecvBufferConfig {
     /// Number of buffers in the ring (must be power of 2).
     pub ring_size: u16,
     /// Size of each buffer in bytes.
@@ -446,7 +460,7 @@ impl Default for RecvBufferConfig {
 
 /// Configuration for the thread-per-core worker model.
 #[derive(Clone)]
-pub struct WorkerConfig {
+pub(crate) struct WorkerConfig {
     /// Number of worker threads.
     ///
     /// `0` (the default) auto-detects and uses the number of **physical CPU

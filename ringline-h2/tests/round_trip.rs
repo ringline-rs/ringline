@@ -467,9 +467,7 @@ fn h2_request_response() {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     let config = test_config_builder()
-        .tls(TlsConfig {
-            server_config: server_tls,
-        })
+        .tls(TlsConfig::new(server_tls))
         .build()
         .expect("valid config");
 
@@ -520,9 +518,7 @@ fn h2_request_with_body() {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     let config = test_config_builder()
-        .tls(TlsConfig {
-            server_config: server_tls,
-        })
+        .tls(TlsConfig::new(server_tls))
         .build()
         .expect("valid config");
 

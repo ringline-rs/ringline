@@ -376,10 +376,6 @@ pub use buffer::fixed::RegionId;
 pub use config::Config;
 /// Builder for [`Config`] with discoverable methods and `build()` validation.
 pub use config::ConfigBuilder;
-/// Recv buffer ring configuration.
-pub use config::RecvBufferConfig;
-/// Worker thread configuration.
-pub use config::WorkerConfig;
 /// Direct I/O completion result.
 pub use direct_io::DirectIoCompletion;
 /// Direct I/O configuration.

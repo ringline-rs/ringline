@@ -14,10 +14,32 @@ use crate::buffer::send_copy::SendCopyPool;
 
 /// Information about a negotiated TLS session.
 pub struct TlsInfo {
-    pub protocol_version: Option<rustls::ProtocolVersion>,
-    pub cipher_suite: Option<rustls::SupportedCipherSuite>,
-    pub alpn_protocol: Option<Vec<u8>>,
-    pub sni_hostname: Option<String>,
+    pub(crate) protocol_version: Option<rustls::ProtocolVersion>,
+    pub(crate) cipher_suite: Option<rustls::SupportedCipherSuite>,
+    pub(crate) alpn_protocol: Option<Vec<u8>>,
+    pub(crate) sni_hostname: Option<String>,
+}
+
+impl TlsInfo {
+    /// The negotiated TLS protocol version, if the handshake has completed.
+    pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
+        self.protocol_version
+    }
+
+    /// The negotiated cipher suite, if the handshake has completed.
+    pub fn cipher_suite(&self) -> Option<rustls::SupportedCipherSuite> {
+        self.cipher_suite
+    }
+
+    /// The ALPN protocol negotiated for this session, if any.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_protocol.as_deref()
+    }
+
+    /// The SNI hostname the peer requested, if any.
+    pub fn sni_hostname(&self) -> Option<&str> {
+        self.sni_hostname.as_deref()
+    }
 }
 
 /// TLS connection kind — server (inbound) or client (outbound).

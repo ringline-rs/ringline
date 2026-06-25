@@ -117,7 +117,7 @@ fn tls_echo_with_external_client() {
     let addr = format!("127.0.0.1:{port}");
 
     let config = test_config_builder()
-        .tls(TlsConfig { server_config })
+        .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -207,7 +207,7 @@ fn tls_echo_large_multichunk() {
     let addr = format!("127.0.0.1:{port}");
 
     let config = test_config_builder()
-        .tls(TlsConfig { server_config })
+        .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -340,7 +340,7 @@ fn tls_outbound_connect_and_echo() {
 
     // Start TLS server.
     let srv_config = test_config_builder()
-        .tls(TlsConfig { server_config })
+        .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
 
@@ -355,9 +355,7 @@ fn tls_outbound_connect_and_echo() {
     // Start client-only ringline with TLS client config.
     let client_tls = client_tls_config(&certs);
     let cli_config = test_config_builder()
-        .tls_client(ringline::TlsClientConfig {
-            client_config: client_tls,
-        })
+        .tls_client(ringline::TlsClientConfig::new(client_tls))
         .build()
         .expect("valid config");
 
