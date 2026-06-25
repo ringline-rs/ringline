@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-25
+
+Coordinated breaking release. Crate versions:
+**ringline 0.3.0**; **ringline-redis 0.5.0**, **ringline-memcache 0.5.0**;
+**ringline-ping / -http / -grpc / -quic / -h2 / -h3 0.4.0**.
+Headline: the public API surface is simplified and made opaque (see Breaking),
+on top of the 0.2.1 performance-audit work.
+
 ### Breaking
 
 - **Breaking:** removed the unused `AsyncSendBuilder::build_await` and

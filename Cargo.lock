@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-grpc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "rcgen",
@@ -1645,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-h2"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "rcgen",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-h3"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "quinn-proto",
@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-http"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "brotli",
  "bytes",
@@ -1686,7 +1686,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-memcache"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "histogram 0.11.5",
@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-ping"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "histogram 0.11.5",
  "libc",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-quic"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "quinn-proto",
@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-redis"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "criterion",
