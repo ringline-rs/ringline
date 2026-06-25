@@ -18,6 +18,7 @@ use thiserror::Error;
 /// | `PointerOutOfRegion` | SendGuard pointer outside registered region | Verify pointer arithmetic; region boundaries are strict |
 /// | `ResourceLimit` | `RLIMIT_NOFILE` too low | Increase with `ulimit -n` (recommended: 65536+) |
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// I/O error from a system call.
     ///
@@ -111,6 +112,7 @@ pub enum Error {
 /// connectionless. The ringline runtime maintains per-worker send pools
 /// to bound memory usage.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum UdpSendError {
     /// UDP send pool exhausted.
     ///

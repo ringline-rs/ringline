@@ -493,6 +493,9 @@ impl AsyncEventHandler for SendStress {
                         Err(UdpSendError::Io(_)) => {
                             return;
                         }
+                        Err(_) => {
+                            return;
+                        }
                     }
                 }
             }
@@ -637,6 +640,7 @@ impl AsyncEventHandler for OversizedSend {
                 Err(UdpSendError::Io(_)) => {
                     oversized_err.fetch_add(1, Ordering::SeqCst);
                 }
+                Err(_) => {}
             }
             // Now send a normal payload; this must succeed.
             if udp.send_to(peer, b"after-oversized").is_ok() {

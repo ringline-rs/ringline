@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ConfigBuilder` (e.g. `ConfigBuilder::new().workers(8).tcp_nodelay(true).build()?`).
   Direct struct construction / field mutation and `ConfigBuilder::config_mut()` are
   removed. This ensures `Config::validate()` always runs. `Config::default()` is unchanged.
+- **Breaking:** `Error` and `UdpSendError` are now `#[non_exhaustive]` (match arms must include `_`).
+- **Breaking:** `TlsInfo` fields are private; read them via accessor methods
+  (`protocol_version()`, `cipher_suite()`, `alpn_protocol()`, `sni_hostname()`).
+- **Breaking:** construct `TlsConfig` / `TlsClientConfig` via `::new(...)` instead of struct literals;
+  their fields are now private.
+- **Breaking:** `WorkerConfig` and `RecvBufferConfig` are no longer exported; configure workers and
+  recv buffers via the `ConfigBuilder` setters (`workers`, `pin_to_core`, `core_offset`, `recv_buffer`).
 
 ## [0.2.1] - 2026-06-13
 

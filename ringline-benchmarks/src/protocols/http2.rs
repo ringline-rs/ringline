@@ -268,9 +268,7 @@ fn make_ringline_client_tls(cert: &CertificateDer<'static>) -> ringline::TlsClie
         .with_root_certificates(roots)
         .with_no_client_auth();
     client_config.alpn_protocols = vec![b"h2".to_vec()];
-    ringline::TlsClientConfig {
-        client_config: Arc::new(client_config),
-    }
+    ringline::TlsClientConfig::new(Arc::new(client_config))
 }
 
 fn make_ringline_client_config(
