@@ -8,11 +8,11 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ringline::{
-    AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig,
+    AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig, TlsInfo,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 
@@ -376,4 +376,158 @@ fn tls_outbound_connect_and_echo() {
     for h in s_handles {
         h.join().unwrap().unwrap();
     }
+}
+
+// ── Test 3: TlsInfo accessors ────────────────────────────────────────────
+
+/// Snapshot of TlsInfo fields recorded by the handler on the first recv.
+struct TlsInfoSnapshot {
+    is_some: bool,
+    protocol_version_some: bool,
+    cipher_suite_some: bool,
+    alpn_protocol: Option<Vec<u8>>,
+    sni_hostname: Option<String>,
+}
+
+static TLS_INFO_SNAPSHOT: Mutex<Option<TlsInfoSnapshot>> = Mutex::new(None);
+
+struct TlsInfoHandler;
+
+impl AsyncEventHandler for TlsInfoHandler {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let mut recorded = false;
+            loop {
+                let n = conn
+                    .with_data(|data| {
+                        // Record TlsInfo on the first data arrival (handshake is
+                        // already complete — data is decrypted plaintext).
+                        if !recorded {
+                            recorded = true;
+                            let info: Option<TlsInfo> = conn.tls_info();
+                            let snapshot = TlsInfoSnapshot {
+                                is_some: info.is_some(),
+                                protocol_version_some: info
+                                    .as_ref()
+                                    .and_then(|i| i.protocol_version())
+                                    .is_some(),
+                                cipher_suite_some: info
+                                    .as_ref()
+                                    .and_then(|i| i.cipher_suite())
+                                    .is_some(),
+                                alpn_protocol: info
+                                    .as_ref()
+                                    .and_then(|i| i.alpn_protocol())
+                                    .map(|b| b.to_vec()),
+                                sni_hostname: info
+                                    .as_ref()
+                                    .and_then(|i| i.sni_hostname())
+                                    .map(|s| s.to_string()),
+                            };
+                            *TLS_INFO_SNAPSHOT.lock().unwrap() = Some(snapshot);
+                        }
+                        let _ = conn.send_nowait(data);
+                        ParseResult::Consumed(data.len())
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsInfoHandler
+    }
+}
+
+#[test]
+fn tls_info_accessors() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Reset shared state from any prior test run.
+    *TLS_INFO_SNAPSHOT.lock().unwrap() = None;
+
+    let (certs, key) = generate_self_signed();
+    let server_config = server_tls_config(certs.clone(), key);
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_config))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<TlsInfoHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    // Connect with a rustls client using SNI "localhost".
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+
+    // One round-trip to trigger on_accept and populate TLS_INFO_SNAPSHOT.
+    let msg = b"tls-info-probe";
+    stream.write_all(msg).unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = vec![0u8; msg.len()];
+    let mut total = 0;
+    while total < msg.len() {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("TLS read error: {e}"),
+        }
+    }
+    assert_eq!(&buf[..total], msg, "echoed data mismatch");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+
+    // Assert all four TlsInfo accessors.
+    let guard = TLS_INFO_SNAPSHOT.lock().unwrap();
+    let snap = guard
+        .as_ref()
+        .expect("TlsInfo was never recorded — handler did not run");
+
+    assert!(
+        snap.is_some,
+        "conn.tls_info() returned None after handshake"
+    );
+    assert!(
+        snap.protocol_version_some,
+        "protocol_version() was None after completed TLS handshake"
+    );
+    assert!(
+        snap.cipher_suite_some,
+        "cipher_suite() was None after completed TLS handshake"
+    );
+    // No ALPN protocols are configured in server_tls_config, so the handshake
+    // does not negotiate one.
+    assert_eq!(
+        snap.alpn_protocol, None,
+        "expected alpn_protocol() == None (no ALPN configured)"
+    );
+    // rustls ServerConnection::server_name() returns the SNI hostname from the
+    // client's ClientHello.  The client above used "localhost" as ServerName.
+    assert_eq!(
+        snap.sni_hostname.as_deref(),
+        Some("localhost"),
+        "sni_hostname() should reflect the client's SNI value"
+    );
 }
