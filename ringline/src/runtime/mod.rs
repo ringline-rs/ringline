@@ -337,6 +337,15 @@ pub(crate) struct Executor {
     pub(crate) timer_pool: TimerSlotPool,
     /// Connection indices (and standalone task indices with STANDALONE_BIT) ready to poll.
     pub(crate) ready_queue: VecDeque<u32>,
+    /// The task currently being polled (its future is checked out of the
+    /// slab, so its slot reads Empty). `wake_task` consults this to record
+    /// self-wakes instead of dropping them.
+    pub(crate) currently_polling: Option<u32>,
+    /// Set by `wake_task` when the currently-polling task wakes itself;
+    /// consumed by the poll loop to re-queue the task after parking.
+    pub(crate) woken_while_polling: bool,
+    /// Scratch for draining the thread-local waker queue.
+    waker_drain_scratch: VecDeque<u32>,
     /// Per-connection: task is awaiting recv data.
     pub(crate) recv_waiters: Vec<bool>,
     /// Per-connection: task is awaiting send completion.
@@ -434,6 +443,9 @@ impl Executor {
             standalone_slab: StandaloneTaskSlab::new(standalone_capacity),
             timer_pool: TimerSlotPool::new(timer_slots),
             ready_queue: VecDeque::with_capacity(64),
+            currently_polling: None,
+            woken_while_polling: false,
+            waker_drain_scratch: VecDeque::with_capacity(64),
             recv_waiters: vec![false; cap],
             send_waiters: vec![false; cap],
             connect_waiters: vec![false; cap],
@@ -474,10 +486,20 @@ impl Executor {
         }
     }
 
-    /// Drain the thread-local waker queue into our ready_queue,
-    /// then wake corresponding tasks in the slab.
+    /// Drain the thread-local waker queue, transitioning each woken task
+    /// Parked → Ready and queueing it for poll.
+    ///
+    /// The transition matters: a std `Waker` pushes only the raw id onto the
+    /// thread-local queue. Draining that id straight into `ready_queue`
+    /// (as this used to) left the slot Parked, so `take_ready()` returned
+    /// `None` and the wake was lost forever — stored wakers never worked
+    /// for parked tasks. Routing through `wake_task` performs the slab
+    /// transition and also handles wakes of the currently-polling task.
     pub(crate) fn collect_wakeups(&mut self) {
-        drain_ready_queue(&mut self.ready_queue);
+        drain_ready_queue(&mut self.waker_drain_scratch);
+        while let Some(id) = self.waker_drain_scratch.pop_front() {
+            let _ = self.wake_task(id);
+        }
     }
 
     /// Reset all per-connection state for a connection that was closed.
@@ -501,7 +523,7 @@ impl Executor {
                 self.recv_waiters[idx] || self.send_waiters[idx] || self.connect_waiters[idx];
             if any_waiter
                 && let Some(task_id) = self.owner_task[idx]
-                && task_id & waker::STANDALONE_BIT != 0
+                && (task_id & waker::STANDALONE_BIT != 0 || task_id != conn_index)
             {
                 // Push to the ready queue; the standalone task slab still
                 // holds the future, and the next poll will short-circuit on
@@ -522,6 +544,14 @@ impl Executor {
     /// (index | STANDALONE_BIT). Returns true if the task was parked and
     /// is now ready.
     pub(crate) fn wake_task(&mut self, task_id: u32) -> bool {
+        // A task waking itself from inside its own poll: the future is
+        // checked out of the slab (slot reads Empty), so slab.wake() would
+        // silently drop the wake and the task would park forever. Record it;
+        // the poll loop re-queues the task after parking it.
+        if self.currently_polling == Some(task_id) {
+            self.woken_while_polling = true;
+            return true;
+        }
         if task_id & waker::STANDALONE_BIT != 0 {
             let idx = task_id & !waker::STANDALONE_BIT;
             if self.standalone_slab.wake(idx) {
@@ -665,6 +695,66 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_wakeups_transitions_parked_to_ready() {
+        // A std Waker pushes only the raw id onto the thread-local queue.
+        // collect_wakeups must transition the slot Parked -> Ready or the
+        // wake is lost (take_ready returns None for Parked slots).
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.task_slab.spawn(3, Box::pin(async {}));
+        let fut = exec.task_slab.take_ready(3).unwrap();
+        exec.task_slab.park(3, fut);
+
+        waker::conn_waker(3).wake_by_ref();
+        exec.collect_wakeups();
+
+        assert_eq!(exec.ready_queue.len(), 1);
+        assert!(
+            exec.task_slab.take_ready(3).is_some(),
+            "waker-woken parked task must be Ready"
+        );
+    }
+
+    #[test]
+    fn wake_task_during_own_poll_is_recorded() {
+        // While a task is being polled its future is checked out (slot
+        // Empty); a self-wake must be recorded for post-park re-queue
+        // instead of being dropped.
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.task_slab.spawn(2, Box::pin(async {}));
+        let fut = exec.task_slab.take_ready(2).unwrap();
+
+        exec.currently_polling = Some(2);
+        assert!(exec.wake_task(2), "self-wake must be accepted");
+        assert!(exec.woken_while_polling);
+        exec.currently_polling = None;
+
+        // The poll loop parks and re-queues:
+        exec.task_slab.park(2, fut);
+        assert!(exec.wake_task(2));
+        assert!(exec.task_slab.take_ready(2).is_some());
+    }
+
+    #[test]
+    fn remove_connection_wakes_cross_index_connection_task_owner() {
+        // Proxy pattern: connection task 3 (inbound) awaits recv on
+        // upstream connection 5. Teardown of 5 must re-wake task 3 even
+        // though it is not a standalone task.
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.task_slab.spawn(3, Box::pin(async {}));
+        let fut = exec.task_slab.take_ready(3).unwrap();
+        exec.task_slab.park(3, fut);
+
+        exec.recv_waiters[5] = true;
+        exec.owner_task[5] = Some(3);
+        exec.remove_connection(5);
+
+        assert!(
+            exec.task_slab.take_ready(3).is_some(),
+            "cross-index owner task must be re-woken on teardown"
+        );
+    }
 
     #[cfg(not(has_io_uring))]
     #[test]

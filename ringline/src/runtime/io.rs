@@ -82,6 +82,32 @@ pub(crate) fn clear_driver_state() {
     CURRENT_DRIVER.with(|c| c.set(None));
 }
 
+/// RAII guard returned by [`set_driver_state_guarded`]. Clears the
+/// thread-local driver pointer on drop — including during panic unwind.
+/// Without this, a panic between set and clear leaves `CURRENT_DRIVER`
+/// pointing into a popped stack frame, and futures' `Drop` impls
+/// (`SendFuture`, `SleepFuture`, ...) dereference it while the executor's
+/// slabs unwind — a use-after-free.
+pub(crate) struct DriverStateGuard(());
+
+impl Drop for DriverStateGuard {
+    fn drop(&mut self) {
+        clear_driver_state();
+    }
+}
+
+/// Set the thread-local driver pointer, returning a guard that clears it
+/// when dropped (normally or during unwind).
+///
+/// # Safety
+///
+/// Same contract as [`set_driver_state`]: `state` must point to valid
+/// `DriverState` on the current thread's stack for the guard's lifetime.
+pub(crate) unsafe fn set_driver_state_guarded(state: &mut DriverState) -> DriverStateGuard {
+    unsafe { set_driver_state(state) };
+    DriverStateGuard(())
+}
+
 /// Access the thread-local driver state. Panics if called outside the executor.
 ///
 /// # Safety

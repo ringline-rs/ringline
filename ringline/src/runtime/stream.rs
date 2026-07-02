@@ -118,8 +118,17 @@ impl AsyncRead for ConnStream {
         }
 
         let conn_index = self.ctx.conn_index;
+        let generation = self.ctx.generation;
 
         with_state(|driver, executor| {
+            // Stale stream: the connection this stream was created for is
+            // gone and the slot may belong to a new connection. Reading the
+            // accumulator or registering waiters here would leak another
+            // connection's bytes and hijack its recv wakeups. Report EOF,
+            // mirroring WithDataFuture's generation check.
+            if driver.connections.generation(conn_index) != generation {
+                return Poll::Ready(Ok(0));
+            }
             // Flush zero-copy recv buffer to accumulator if present.
             Self::flush_pending_recv(driver, conn_index);
 
@@ -154,9 +163,14 @@ impl AsyncBufRead for ConnStream {
         // Empty or absent — fetch from accumulator.
         this.fill_buf = None;
         let conn_index = this.ctx.conn_index;
+        let generation = this.ctx.generation;
 
         // Try to detach the accumulator as a refcounted Bytes (O(1)).
         let frozen = with_state(|driver, executor| {
+            // Stale stream (slot reused) — report EOF; see poll_read.
+            if driver.connections.generation(conn_index) != generation {
+                return Ok(None);
+            }
             // Flush zero-copy recv buffer to accumulator if present.
             Self::flush_pending_recv(driver, conn_index);
 
