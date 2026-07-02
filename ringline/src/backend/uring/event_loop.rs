@@ -2297,6 +2297,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let conn_index = ud.conn_index();
         let pool_slot = ud.payload() as u16;
 
+        // Guard against stale CQE for an already-released pool slot, matching
+        // handle_send. Without this, try_advance on a released slot would
+        // wrap in release mode and resubmit a wild length.
+        if !self.driver.send_copy_pool.in_use(pool_slot) {
+            return;
+        }
+
         if result > 0
             && let Some((ptr, remaining)) = self
                 .driver
@@ -3624,6 +3631,33 @@ mod tests {
         assert!(
             conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
             "connection not closed after TLS send error"
+        );
+    }
+
+    #[test]
+    fn handle_tls_send_stale_slot_ignored() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Allocate and immediately release a slot, then deliver a stale
+        // TlsSend CQE for it (Close CQE processed earlier in the same batch).
+        let data = b"ciphertext";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        el.driver.send_copy_pool.release(slot);
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), -104, 0);
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before,
+            "stale CQE must not double-release the slot"
+        );
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_some() && !matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            "stale TlsSend CQE must not close the connection"
         );
     }
 

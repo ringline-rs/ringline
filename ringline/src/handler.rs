@@ -2618,7 +2618,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         if self.part_count as usize >= MAX_IOVECS {
             self.error = Some(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "too many send parts (max 8)",
+                "too many send parts (max 32)",
             ));
             return self;
         }
@@ -2641,7 +2641,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         if self.part_count as usize >= MAX_IOVECS {
             self.error = Some(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "too many send parts (max 8)",
+                "too many send parts (max 32)",
             ));
             return self;
         }
@@ -3167,15 +3167,17 @@ pub struct ChainPartsBuilder<'b, 'a> {
 
 #[cfg(has_io_uring)]
 impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
-    /// Add a copy part to this scatter-gather SQE.
-    pub fn copy(mut self, data: &[u8]) -> Self {
+    /// Add a copy part to this scatter-gather SQE. The data reference must
+    /// outlive the builder (guaranteed by the `'b` lifetime) — the bytes are
+    /// only read when `.add()` gathers them into the send pool.
+    pub fn copy(mut self, data: &'b [u8]) -> Self {
         if self.chain.error.is_some() {
             return self;
         }
         if self.part_count as usize >= MAX_IOVECS {
             self.chain.error = Some(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "too many send parts (max 8)",
+                "too many send parts (max 32)",
             ));
             return self;
         }
@@ -3197,7 +3199,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         if self.part_count as usize >= MAX_IOVECS {
             self.chain.error = Some(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "too many send parts (max 8)",
+                "too many send parts (max 32)",
             ));
             return self;
         }

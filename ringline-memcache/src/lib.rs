@@ -140,8 +140,11 @@ type ResultCallback = Box<dyn Fn(&CommandResult)>;
 
 /// Maximum guards per scatter-gather send (matches ringline core limit).
 const MAX_FLUSH_GUARDS: usize = 4;
-/// Maximum iovecs per scatter-gather send (matches ringline core limit).
-const MAX_FLUSH_IOVECS: usize = 8;
+/// Maximum iovecs a full guard batch needs: each guard contributes an iovec
+/// plus at most one copied-run iovec before it, plus one trailing copied run
+/// (2g+1 = 9). Well under the ringline core limit of 32. Was incorrectly 8,
+/// which made guard batches flush at 3 guards instead of MAX_FLUSH_GUARDS.
+const MAX_FLUSH_IOVECS: usize = 2 * MAX_FLUSH_GUARDS + 1;
 /// Default [`ClientBuilder::zc_threshold`]. Matches the runtime
 /// `Config::send_zc_threshold` default so small guarded SETs fold into the
 /// coalescing copy path by default.
@@ -2071,6 +2074,25 @@ mod zc_threshold_tests {
             .fire_set_with_guard(KEY, VecGuard(vec![0u8; 64]), 0, 0, 1)
             .unwrap();
         assert_eq!(client.write_guards.len(), 1);
+    }
+
+    #[test]
+    fn guard_batch_accumulates_max_flush_guards_before_flush() {
+        // zc_threshold = 0 forces the guard path. MAX_FLUSH_GUARDS (4) guards
+        // must accumulate without triggering a pre-flush: 4 guards need
+        // 2*4+1 = 9 iovecs, within MAX_FLUSH_IOVECS. A stale iovec cap of 8
+        // used to force a flush at the 4th guard (batching only 3).
+        let mut client = test_client(16, 0);
+        for i in 0..MAX_FLUSH_GUARDS {
+            client
+                .fire_set_with_guard(KEY, VecGuard(vec![0u8; 64]), 0, 0, i as u64)
+                .unwrap();
+        }
+        assert_eq!(
+            client.write_guards.len(),
+            MAX_FLUSH_GUARDS,
+            "a full guard batch must accumulate without a premature flush"
+        );
     }
 
     #[test]
