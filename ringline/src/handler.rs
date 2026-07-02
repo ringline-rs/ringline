@@ -1769,11 +1769,13 @@ pub struct DriverCtx<'a> {
     pub(crate) send_queues: &'a mut Vec<ConnSendState>,
     /// Per-connection pending send buffers (mio backend).
     /// DriverCtx::send() pushes data here; the event loop flushes on writable.
-    pub(crate) pending_sends: &'a mut Vec<std::collections::VecDeque<(Vec<u8>, usize)>>,
+    pub(crate) pending_sends:
+        &'a mut Vec<std::collections::VecDeque<crate::backend::mio::driver::PendingSend>>,
     /// Per-connection mio TcpStream storage (for connect / shutdown_write).
     pub(crate) tcp_streams: &'a mut Vec<Option<mio::net::TcpStream>>,
     /// Mio poll instance (for registering new connections).
     pub(crate) poll: &'a mut mio::Poll,
+    pub(crate) pending_closes: &'a mut Vec<u32>,
     /// Per-connection writable flag.
     pub(crate) writable: &'a mut Vec<bool>,
     /// Per-connection send completion queue (byte counts for awaitable sends).
@@ -1846,65 +1848,50 @@ impl<'a> DriverCtx<'a> {
                 let ciphertext = crate::tls::encrypt_for_send_mio(tls_table, conn.index, data)?;
                 if !ciphertext.is_empty() {
                     let idx = conn.index as usize;
-                    self.pending_sends[idx].push_back((ciphertext, 0));
+                    self.pending_sends[idx].push_back((ciphertext, 0, None));
                 }
                 return Ok(());
             }
         }
 
         let idx = conn.index as usize;
-        self.pending_sends[idx].push_back((data.to_vec(), 0));
+        self.pending_sends[idx].push_back((data.to_vec(), 0, None));
         Ok(())
     }
 
-    /// Close a connection.
+    /// Mark the most recently queued pending send as awaitable: its
+    /// completion (`wake_send(Ok(len))`) is delivered when the entry has
+    /// fully reached the socket, not at queue time.
+    pub(crate) fn mark_last_send_awaited(&mut self, conn_index: u32) {
+        let idx = conn_index as usize;
+        if let Some((data, offset, notify)) = self.pending_sends[idx].back_mut() {
+            *notify = Some((data.len() - *offset) as u32);
+        } else {
+            // The send was flushed... it can't have been (mio sends are
+            // queued, never written inline) — but if the queue is somehow
+            // empty, deliver a zero-byte completion so the future resolves.
+            self.send_completions[idx].push_back(0);
+        }
+    }
+
+    /// Close a connection. Marks it Closed and defers teardown (socket,
+    /// buffers, executor cleanup, slot release) to the event loop's
+    /// drain_pending_closes — releasing the slot here left the executor's
+    /// parked future, waiter flags, and recv sink alive into the slot's
+    /// next occupant.
     pub fn close(&mut self, conn: ConnToken) {
-        let idx = conn.index as usize;
         if let Some(cs) = self.connections.get_mut(conn.index) {
             if cs.generation != conn.generation {
+                return;
+            }
+            if matches!(cs.recv_mode, crate::connection::RecvMode::Closed) {
                 return;
             }
             cs.recv_mode = crate::connection::RecvMode::Closed;
         } else {
             return;
         }
-
-        // Flush any pending send data before closing.
-        if let Some(ref mut stream) = self.tcp_streams[idx] {
-            use std::io::Write;
-            for (data, offset) in self.pending_sends[idx].drain(..) {
-                let _ = stream.write_all(&data[offset..]);
-            }
-            let _ = stream.flush();
-
-            // Send TLS close_notify if this is a TLS connection.
-            if !self.tls_table.is_null() {
-                let tls_table = unsafe { &mut *self.tls_table };
-                if tls_table.has(conn.index) {
-                    if let Some(tls_conn) = tls_table.get_mut(conn.index) {
-                        tls_conn.conn.send_close_notify();
-                    }
-                    crate::tls::flush_tls_output_mio(tls_table, stream, conn.index);
-                    tls_table.remove(conn.index);
-                }
-            }
-        }
-
-        // Deregister from poll and drop the stream.
-        if let Some(mut stream) = self.tcp_streams[idx].take() {
-            let _ = self.poll.registry().deregister(&mut stream);
-        }
-
-        // Clear per-connection state.
-        self.pending_sends[idx].clear();
-        self.writable[idx] = false;
-        self.connect_deadlines[idx] = None;
-        self.send_completions[idx].clear();
-
-        // Release the connection slot.
-        if self.connections.get(conn.index).is_some() {
-            self.connections.release(conn.index);
-        }
+        self.pending_closes.push(conn.index);
     }
 
     /// Get TLS session info for a connection.
@@ -1933,7 +1920,7 @@ impl<'a> DriverCtx<'a> {
         // Flush any pending send data before shutting down.
         if let Some(ref mut stream) = self.tcp_streams[idx] {
             use std::io::Write;
-            for (data, offset) in self.pending_sends[idx].drain(..) {
+            for (data, offset, _notify) in self.pending_sends[idx].drain(..) {
                 let _ = stream.write_all(&data[offset..]);
             }
             let _ = stream.flush();
@@ -2029,10 +2016,21 @@ impl<'a> DriverCtx<'a> {
         // Perform the TCP connect first.
         let token = self.connect(addr)?;
 
-        // Create TLS client state (buffers ClientHello internally).
-        let sni = rustls::pki_types::ServerName::try_from(server_name.to_owned())
-            .map_err(|e| crate::error::Error::RingSetup(format!("invalid server name: {e}")))?;
+        // Create TLS client state (buffers ClientHello internally). On
+        // failure the already-established TCP connection must be torn down —
+        // returning early here used to leak the slot and the registered
+        // stream on every failed TLS connect attempt.
+        let sni = match rustls::pki_types::ServerName::try_from(server_name.to_owned()) {
+            Ok(sni) => sni,
+            Err(e) => {
+                self.close(token);
+                return Err(crate::error::Error::RingSetup(format!(
+                    "invalid server name: {e}"
+                )));
+            }
+        };
         if let Err(e) = tls_table.create_client(token.index, sni) {
+            self.close(token);
             return Err(crate::error::Error::RingSetup(format!(
                 "TLS client setup failed: {e}"
             )));

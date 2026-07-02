@@ -3190,6 +3190,120 @@ fn async_standalone_connect() {
     }
 }
 
+// ── Server-speaks-first greeting ─────────────────────────────────
+
+/// Server that sends a greeting immediately on accept (MySQL/SMTP style),
+/// before the client sends anything.
+struct GreetingServer;
+
+impl AsyncEventHandler for GreetingServer {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let _ = conn.send_nowait(b"WELCOME!");
+            // Keep the connection open until the peer disconnects.
+            loop {
+                let n = conn
+                    .with_data(|data| ParseResult::Consumed(data.len()))
+                    .await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        GreetingServer
+    }
+}
+
+static GREETING_ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
+static GREETING_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Client that connects and expects the server's greeting to arrive intact.
+/// Regression: on the mio backend, greeting bytes delivered in the same
+/// event batch as the connect-writable event were read into the accumulator
+/// and then destroyed by the connect-success accumulator reset — and
+/// edge-triggered mio never re-delivered them, so the client stalled.
+struct GreetingClientHandler;
+
+impl AsyncEventHandler for GreetingClientHandler {
+    fn on_accept(&self, _conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let addr = *GREETING_ADDR.get().expect("greeting addr not set");
+        Some(Box::pin(async move {
+            let conn = match ringline::connect(addr) {
+                Ok(fut) => match fut.await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        GREETING_RESULT.set(format!("CONNECT_ERR:{e}")).ok();
+                        ringline::request_shutdown().ok();
+                        return;
+                    }
+                },
+                Err(e) => {
+                    GREETING_RESULT.set(format!("SUBMIT_ERR:{e}")).ok();
+                    ringline::request_shutdown().ok();
+                    return;
+                }
+            };
+
+            let mut greeting = Vec::new();
+            while greeting.len() < 8 {
+                let remaining = 8 - greeting.len();
+                let got = conn
+                    .with_data(|data| {
+                        let take = data.len().min(remaining);
+                        greeting.extend_from_slice(&data[..take]);
+                        ParseResult::Consumed(take)
+                    })
+                    .await;
+                if got == 0 {
+                    break;
+                }
+            }
+            GREETING_RESULT
+                .set(String::from_utf8_lossy(&greeting).to_string())
+                .ok();
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        GreetingClientHandler
+    }
+}
+
+#[test]
+fn async_server_speaks_first_greeting() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<GreetingServer>()
+        .expect("server launch failed");
+    wait_for_server(&addr);
+
+    GREETING_ADDR.set(addr.parse().unwrap()).ok();
+
+    let (_c_shutdown, c_handles) = RinglineBuilder::new(test_config())
+        .launch::<GreetingClientHandler>()
+        .expect("client launch failed");
+    for h in c_handles {
+        h.join().unwrap().unwrap();
+    }
+
+    let result = GREETING_RESULT.get().expect("client did not set result");
+    assert_eq!(result, "WELCOME!", "greeting lost or corrupted: {result}");
+
+    s_shutdown.shutdown();
+    for h in s_handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
 // ── Client-only mode via on_start() ─────────────────────────────
 
 /// Handler that uses on_start() for client-only mode: connects to a

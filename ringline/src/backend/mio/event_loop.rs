@@ -36,6 +36,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         handler: A,
         accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
         eventfd: RawFd,
+        wake_fd: crate::wakeup::WakeFd,
         shutdown_flag: Arc<AtomicBool>,
         resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
         resolve_tx: Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
@@ -67,6 +68,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             config,
             accept_rx,
             eventfd,
+            wake_fd,
             shutdown_flag,
             resolve_rx,
             resolve_tx,
@@ -185,13 +187,27 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     tok => {
                         let conn_index = (tok.0 - 1) as u32;
-                        // On error events for connecting sockets, treat as writable
-                        // so handle_writable detects the connect failure via SO_ERROR.
-                        if is_err
-                            && let Some(cs) = self.driver.connections.get(conn_index)
-                            && matches!(cs.recv_mode, RecvMode::Connecting)
-                        {
-                            self.handle_writable(conn_index);
+                        let connecting = self
+                            .driver
+                            .connections
+                            .get(conn_index)
+                            .is_some_and(|cs| matches!(cs.recv_mode, RecvMode::Connecting));
+                        if connecting {
+                            // Writable (or error — handle_writable reads
+                            // SO_ERROR) resolves the connect FIRST. Handling
+                            // readable first let a server-speaks-first
+                            // greeting land in the accumulator only to race
+                            // connect bookkeeping, and a FIN in the same
+                            // batch marked the conn Closed so the Connecting
+                            // check failed and wake_connect never fired —
+                            // connect().await hung forever (edge-triggered
+                            // mio never re-delivers).
+                            if writable || is_err {
+                                self.handle_writable(conn_index);
+                            }
+                            if readable {
+                                self.handle_readable(conn_index, &mut recv_buf);
+                            }
                             continue;
                         }
                         if readable {
@@ -214,11 +230,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.collect_wakeups();
             self.poll_ready_tasks();
 
-            // 6a. Deliver buffered send completions and re-poll until drained.
+            // 6a. Flush pending sends queued during task polling, then
+            // deliver the completions that flushing produced (completions
+            // are recorded when bytes reach the socket, so flush must run
+            // first or every awaited send waits an extra iteration).
+            self.flush_all_pending_sends();
             self.drain_send_completions();
 
-            // 6b. Flush pending sends that were queued during task polling.
-            self.flush_all_pending_sends();
+            // 6b. Finish teardown of connections closed during this
+            // iteration: executor cleanup (parked futures, waiter flags,
+            // recv sinks) before the slot is released for reuse.
+            self.drain_pending_closes();
 
             // 7. on_tick callback (synchronous). Set the executor's
             // driver_state thread-local so user code that calls
@@ -246,9 +268,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 drop(guard);
             }
 
-            // 8. Deliver send completions and flush any sends queued by on_tick.
-            self.drain_send_completions();
+            // 8. Flush any sends queued by on_tick, deliver their
+            // completions, and finish any closes it triggered.
             self.flush_all_pending_sends();
+            self.drain_send_completions();
+            self.drain_pending_closes();
 
             // 9. Check shutdown.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
@@ -473,9 +497,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let n = match stream.read(recv_buf) {
                     Ok(0) => {
                         self.driver.tcp_streams[idx] = Some(stream);
-                        // EOF
+                        // EOF. A FIN without the peer's close_notify is a
+                        // truncation, not a clean TLS shutdown.
+                        let close_notify_seen = self
+                            .driver
+                            .tls_table
+                            .as_mut()
+                            .and_then(|t| t.get_mut(conn_index))
+                            .map(|tc| tc.peer_sent_close_notify)
+                            .unwrap_or(true);
                         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                             cs.recv_mode = RecvMode::Closed;
+                            if !close_notify_seen {
+                                cs.eof_truncated = true;
+                            }
                         }
                         self.executor.wake_recv(conn_index);
                         break;
@@ -499,7 +534,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let result = crate::tls::feed_tls_recv_mio(
                     tls_table,
                     &mut self.driver.accumulators,
-                    &mut stream,
+                    &mut self.driver.pending_sends[idx],
                     conn_index,
                     &recv_buf[..n],
                 );
@@ -655,17 +690,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let _ = stream.set_nodelay(true);
                 }
 
-                // Reset accumulator for the new connection.
-                self.driver.accumulators.reset(conn_index);
-
                 // TLS client path: flush ClientHello, don't wake connect waiter
                 // yet — wait for the TLS handshake to complete in handle_readable.
                 if let Some(ref mut tls_table) = self.driver.tls_table
                     && tls_table.has(conn_index)
                 {
-                    let mut stream = self.driver.tcp_streams[idx].take().unwrap();
-                    crate::tls::flush_tls_output_mio(tls_table, &mut stream, conn_index);
-                    self.driver.tcp_streams[idx] = Some(stream);
+                    crate::tls::flush_tls_output_mio_queued(
+                        tls_table,
+                        &mut self.driver.pending_sends[idx],
+                        conn_index,
+                    );
+                    self.driver.register_writable(conn_index);
+                    let _ = self.driver.flush_sends(conn_index);
                     return;
                 }
 
@@ -688,7 +724,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Normal writable — mark writable and flush sends.
         self.driver.writable[idx] = true;
-        self.driver.flush_sends(conn_index);
+        if let Err(e) = self.driver.flush_sends(conn_index) {
+            self.fail_connection_on_send_error(conn_index, e);
+        }
+    }
+
+    /// A hard write error (EPIPE/ECONNRESET/peer-closed) during a flush:
+    /// fail the awaiting sender, wake the recv side so the owning task
+    /// observes the close, and tear the connection down. Previously the
+    /// error was swallowed — the queue was retried every loop iteration
+    /// forever while send().await had already reported success.
+    fn fail_connection_on_send_error(&mut self, conn_index: u32, e: io::Error) {
+        self.driver.pending_sends[conn_index as usize].clear();
+        self.executor.wake_send(conn_index, Err(e));
+        self.executor.wake_recv(conn_index);
+        self.driver.close_connection(conn_index);
     }
 
     /// Handle a UDP socket becoming readable: drain datagrams into the
@@ -802,10 +852,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // Register writable interest so mio tells us when we can write.
                 self.driver.register_writable(idx as u32);
                 // If we already know the socket is writable, try flushing now.
-                if self.driver.writable[idx] {
-                    self.driver.flush_sends(idx as u32);
+                if self.driver.writable[idx]
+                    && let Err(e) = self.driver.flush_sends(idx as u32)
+                {
+                    self.fail_connection_on_send_error(idx as u32, e);
                 }
             }
+        }
+    }
+
+    /// Finish teardown for connections closed since the last drain.
+    /// Executor cleanup runs first — the slot must not be released (and
+    /// reusable) while a stale parked future, waiter flags, or a recv-sink
+    /// raw pointer still reference it.
+    fn drain_pending_closes(&mut self) {
+        while let Some(conn_index) = self.driver.pending_closes.pop() {
+            self.executor.remove_connection(conn_index);
+            self.driver.finish_close(conn_index);
         }
     }
 

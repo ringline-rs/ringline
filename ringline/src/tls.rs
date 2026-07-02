@@ -671,7 +671,7 @@ pub fn encrypt_to_sends(
 pub fn feed_tls_recv_mio(
     tls_table: &mut TlsTable,
     accumulators: &mut AccumulatorTable,
-    stream: &mut mio::net::TcpStream,
+    pending: &mut std::collections::VecDeque<crate::backend::mio::driver::PendingSend>,
     conn_index: u32,
     ciphertext: &[u8],
 ) -> TlsRecvResult {
@@ -707,7 +707,7 @@ pub fn feed_tls_recv_mio(
             Err(e) => {
                 // Try to flush alert before returning error.
                 if tls_conn.conn.wants_write() {
-                    flush_tls_output_mio_inner(tls_conn, &mut tls_table.write_buf, stream);
+                    flush_tls_output_mio_inner(tls_conn, &mut tls_table.write_buf, pending);
                 }
                 return TlsRecvResult::Error(e);
             }
@@ -722,9 +722,9 @@ pub fn feed_tls_recv_mio(
             ));
         }
 
-        // Flush any TLS output (handshake messages, alerts, etc.).
+        // Queue any TLS output (handshake messages, alerts, etc.).
         if tls_conn.conn.wants_write() {
-            flush_tls_output_mio_inner(tls_conn, &mut tls_table.write_buf, stream);
+            flush_tls_output_mio_inner(tls_conn, &mut tls_table.write_buf, pending);
         }
 
         if state.peer_has_closed() {
@@ -750,23 +750,28 @@ pub fn feed_tls_recv_mio(
 /// Flush pending TLS output to the network via direct stream write.
 /// Public entry point takes `&mut TlsTable`.
 #[cfg(not(has_io_uring))]
-pub fn flush_tls_output_mio(
+pub fn flush_tls_output_mio_queued(
     tls_table: &mut TlsTable,
-    stream: &mut mio::net::TcpStream,
+    pending: &mut std::collections::VecDeque<crate::backend::mio::driver::PendingSend>,
     conn_index: u32,
 ) {
     let (conn_slot, write_buf) = borrow_conn_and_buf(tls_table, conn_index);
     if let Some(tls_conn) = conn_slot {
-        flush_tls_output_mio_inner(tls_conn, write_buf, stream);
+        flush_tls_output_mio_inner(tls_conn, write_buf, pending);
     }
 }
 
-/// Inner flush for mio: writes ciphertext directly to the TcpStream.
+/// Inner flush for mio: queue ciphertext into the connection's pending-send
+/// FIFO instead of writing to the stream directly. Direct writes dropped
+/// the unwritten remainder on WouldBlock — losing handshake/alert bytes
+/// with no retry (a truncated TLS record stalls the peer's handshake) —
+/// and could reorder records around ciphertext already sitting in
+/// pending_sends.
 #[cfg(not(has_io_uring))]
 fn flush_tls_output_mio_inner(
     tls_conn: &mut TlsConn,
     write_buf: &mut Vec<u8>,
-    stream: &mut mio::net::TcpStream,
+    pending: &mut std::collections::VecDeque<crate::backend::mio::driver::PendingSend>,
 ) {
     write_buf.clear();
     if tls_conn.conn.write_tls(write_buf).is_err() {
@@ -777,9 +782,24 @@ fn flush_tls_output_mio_inner(
         return;
     }
 
-    // Write ciphertext to the stream. For non-blocking sockets we do our
-    // best effort — partial writes during handshake are unlikely because the
-    // messages are small, but we handle WouldBlock gracefully.
+    pending.push_back((std::mem::take(write_buf), 0, None));
+}
+
+/// Direct-write flush for close paths (close_notify): the connection is
+/// being torn down, so best-effort nonblocking writes are appropriate —
+/// there is no later flush opportunity.
+#[cfg(not(has_io_uring))]
+pub fn flush_tls_output_mio_direct(
+    tls_table: &mut TlsTable,
+    stream: &mut mio::net::TcpStream,
+    conn_index: u32,
+) {
+    let (conn_slot, write_buf) = borrow_conn_and_buf(tls_table, conn_index);
+    let Some(tls_conn) = conn_slot else { return };
+    write_buf.clear();
+    if tls_conn.conn.write_tls(write_buf).is_err() || write_buf.is_empty() {
+        return;
+    }
     let mut offset = 0;
     while offset < write_buf.len() {
         match stream.write(&write_buf[offset..]) {
@@ -806,22 +826,28 @@ pub fn encrypt_for_send_mio(
         io::Error::new(io::ErrorKind::NotConnected, "no TLS state for connection")
     })?;
 
-    // Write plaintext into rustls (encrypts in place).
-    tls_conn
-        .conn
-        .writer()
-        .write_all(plaintext)
-        .map_err(io::Error::other)?;
-
-    // Encrypt directly into an owned buffer the caller takes ownership of.
-    // (The shared `write_buf` is the io_uring flush path's scratch; the mio
-    // send queue needs a distinct owned Vec per pending send anyway, so
-    // encrypting straight into it avoids a redundant clone of the ciphertext.)
+    // Interleave writer().write with write_tls draining: rustls caps its
+    // ciphertext buffer at 64 KiB, so a single write_all of a larger
+    // plaintext fails with WriteZero after the first 64 KiB was already
+    // encrypted (same fix as the io_uring path's encrypt_to_sends).
     let mut ciphertext = Vec::with_capacity(plaintext.len() + 128);
-    tls_conn
-        .conn
-        .write_tls(&mut ciphertext)
-        .map_err(io::Error::other)?;
+    let mut offset = 0;
+    while offset < plaintext.len() {
+        let n = tls_conn
+            .conn
+            .writer()
+            .write(&plaintext[offset..])
+            .map_err(io::Error::other)?;
+        offset += n;
+        let before = ciphertext.len();
+        tls_conn
+            .conn
+            .write_tls(&mut ciphertext)
+            .map_err(io::Error::other)?;
+        if n == 0 && ciphertext.len() == before {
+            return Err(io::Error::other("TLS encryption made no progress"));
+        }
+    }
 
     Ok(ciphertext)
 }

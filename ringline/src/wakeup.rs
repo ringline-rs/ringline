@@ -22,7 +22,11 @@ pub(crate) struct WakeFd {
 }
 
 impl WakeFd {
-    /// Wrap a raw file descriptor as a non-owning fd carrier.
+    /// Wrap a raw file descriptor as a non-owning fd carrier. Only valid
+    /// for fds that accept writes (io_uring's eventfd is bidirectional; the
+    /// mio backend's pipe read end is NOT — its driver receives the write
+    /// end explicitly).
+    #[cfg(has_io_uring)]
     pub(crate) fn from_raw_fd(fd: RawFd) -> Self {
         WakeFd { fd }
     }
