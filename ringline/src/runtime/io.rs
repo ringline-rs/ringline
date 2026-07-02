@@ -1335,6 +1335,28 @@ impl ConnCtx {
         })
     }
 
+    /// Whether this TLS connection's EOF was a truncation: the peer's TCP
+    /// FIN arrived *without* a preceding close_notify alert. A truncated
+    /// stream may be missing data the peer (or an active attacker injecting
+    /// the FIN) cut off — length- or delimiter-framed protocols should treat
+    /// it as an error rather than a clean end-of-stream.
+    ///
+    /// Check this when a recv (`with_data`/`with_bytes`) reports EOF. The
+    /// flag is readable while the connection slot is still held (the wake
+    /// that delivered the EOF and this check run before the slot is
+    /// recycled); it returns `false` for plaintext connections, for clean
+    /// TLS shutdowns, and once the slot has been reused.
+    pub fn eof_truncated(&self) -> bool {
+        with_state(|driver, _| {
+            driver
+                .connections
+                .get(self.conn_index)
+                .filter(|c| c.generation == self.generation)
+                .map(|c| c.eof_truncated)
+                .unwrap_or(false)
+        })
+    }
+
     /// Initiate an outbound TLS connection and await the result.
     pub fn connect_tls(&self, addr: SocketAddr, server_name: &str) -> io::Result<ConnectFuture> {
         with_state(|driver, executor| {

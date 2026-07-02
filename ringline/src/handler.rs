@@ -160,6 +160,7 @@ pub struct DriverCtx<'a> {
     pub(crate) fs_fd_base: u32,
     /// Pending close retries from failed submit_close calls.
     pub(crate) pending_close_retries: &'a mut Vec<(u32, u8)>,
+    pub(crate) close_notify_timeout: std::time::Duration,
 }
 
 #[cfg(has_io_uring)]
@@ -216,13 +217,13 @@ impl<'a> DriverCtx<'a> {
         if !self.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.tls_table };
             if tls_table.get_mut(conn.index).is_some() {
-                return crate::tls::encrypt_and_send(
-                    tls_table,
-                    self.ring,
-                    self.send_copy_pool,
-                    conn.index,
-                    data,
-                );
+                let sends =
+                    crate::tls::encrypt_to_sends(tls_table, self.send_copy_pool, conn.index, data)?;
+                // Route every ciphertext chunk through the per-connection
+                // send queue: io_uring doesn't order independent SQEs, and
+                // a partial-send resubmit would interleave chunks on the
+                // wire (bad_record_mac at the peer).
+                return self.queue_built_sends(conn.index, sends);
             }
         }
 
@@ -256,6 +257,32 @@ impl<'a> DriverCtx<'a> {
             self.submit_or_queue(conn.index, built)?;
         }
 
+        Ok(())
+    }
+
+    /// Queue a batch of built sends in order; on a submit failure the
+    /// remaining entries' resources are released so nothing leaks.
+    pub(crate) fn queue_built_sends(
+        &mut self,
+        conn_index: u32,
+        sends: Vec<BuiltSend>,
+    ) -> io::Result<()> {
+        let mut it = sends.into_iter();
+        while let Some(built) = it.next() {
+            if let Err(e) = self.submit_or_queue(conn_index, built) {
+                for rest in it {
+                    if rest.slab_idx != u16::MAX {
+                        let pool_slot = self.send_slab.release(rest.slab_idx);
+                        if pool_slot != u16::MAX {
+                            self.send_copy_pool.release(pool_slot);
+                        }
+                    } else if rest.pool_slot != u16::MAX {
+                        self.send_copy_pool.release(rest.pool_slot);
+                    }
+                }
+                return Err(e);
+            }
+        }
         Ok(())
     }
 
@@ -365,7 +392,7 @@ impl<'a> DriverCtx<'a> {
                     // worker CPU at high request rates.
                     let state = &mut self.send_queues[conn.index as usize];
                     state.close_notify_deadline =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                        Some(std::time::Instant::now() + self.close_notify_timeout);
                     if !self.close_notify_armed.contains(&conn.index) {
                         self.close_notify_armed.push(conn.index);
                     }
@@ -2736,13 +2763,13 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         for g in self.guards.iter_mut() {
             *g = None;
         }
-        crate::tls::encrypt_and_send(
+        let sends = crate::tls::encrypt_to_sends(
             tls_table,
-            self.ctx.ring,
             self.ctx.send_copy_pool,
             self.conn.index,
             &plaintext,
-        )
+        )?;
+        self.ctx.queue_built_sends(self.conn.index, sends)
     }
 
     /// Copy-only path: gather all copy parts into one pool slot, return built SQE.

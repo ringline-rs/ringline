@@ -206,6 +206,10 @@ pub(crate) struct Driver {
     /// non-TLS workloads — without this, the per-iteration deadline
     /// scan dominates worker CPU at high request rates.
     pub(crate) close_notify_armed: Vec<u32>,
+    /// Configured close_notify drain deadline (Config::close_notify_timeout_ms).
+    pub(crate) close_notify_timeout: std::time::Duration,
+    /// Scratch for TLS output sends collected during CQE handling.
+    pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
     /// Tick timeout duration. When set, a timeout SQE ensures the event loop
     /// wakes periodically even when no I/O completions are pending.
     pub(crate) tick_timeout_ts: Option<io_uring::types::Timespec>,
@@ -223,7 +227,7 @@ pub(crate) struct Driver {
     /// path: (conn_index, generation, pool_slot, retries). Drained each tick.
     /// Only used when `submit_send_pollout` itself failed (SQ full at
     /// the time the EAGAIN CQE arrived).
-    pub(crate) pending_send_pollout_retries: Vec<(u32, u32, u16, u8)>,
+    pub(crate) pending_send_pollout_retries: Vec<(u32, u32, u16, u8, bool)>,
     /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
     /// Drained each tick — used when resubmitting a coalesced `sendmsg` (partial
     /// remainder or POLLOUT rearm) found the SQ full.
@@ -239,7 +243,7 @@ pub(crate) struct Driver {
     /// re-enqueues; `drain(..)` on the scratch keeps its capacity).
     pub(crate) zc_retry_scratch: Vec<(u32, u32, u16, u8)>,
     pub(crate) copy_retry_scratch: Vec<(u32, u32, u16, u8, OpTag)>,
-    pub(crate) send_pollout_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) send_pollout_retry_scratch: Vec<(u32, u32, u16, u8, bool)>,
     pub(crate) coalesced_retry_scratch: Vec<(u32, u32, u16, u8)>,
     pub(crate) recv_forward_retry_scratch: Vec<(u32, u32, u16, u8)>,
     /// Per-worker UDP socket state.
@@ -439,6 +443,8 @@ impl Driver {
             max_chain_length: config.max_chain_length,
             send_queues,
             close_notify_armed: Vec::new(),
+            close_notify_timeout: std::time::Duration::from_millis(config.close_notify_timeout_ms),
+            tls_out_scratch: Vec::new(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
                     io_uring::types::Timespec::new()
@@ -574,6 +580,7 @@ impl Driver {
             fs_cmd_slab: &mut self.fs_cmd_slab,
             fs_fd_base: self.fs_fd_base,
             pending_close_retries: &mut self.pending_close_retries,
+            close_notify_timeout: self.close_notify_timeout,
         }
     }
 
@@ -879,6 +886,35 @@ impl Driver {
                 }
             }
         }
+    }
+
+    /// Queue a batch of built sends in order through the per-connection
+    /// send queue. If one fails to submit (SQ full on the first while
+    /// nothing is in flight — submit_or_queue_send releases that entry's
+    /// own resources), the remaining entries' pool slots are released here
+    /// so nothing leaks, and the error is returned.
+    pub(crate) fn queue_built_sends(
+        &mut self,
+        conn_index: u32,
+        sends: &mut Vec<crate::handler::BuiltSend>,
+    ) -> io::Result<()> {
+        let mut it = sends.drain(..);
+        while let Some(built) = it.next() {
+            if let Err(e) = self.submit_or_queue_send(conn_index, built) {
+                for rest in it {
+                    if rest.slab_idx != u16::MAX {
+                        let pool_slot = self.send_slab.release(rest.slab_idx);
+                        if pool_slot != u16::MAX {
+                            self.send_copy_pool.release(pool_slot);
+                        }
+                    } else if rest.pool_slot != u16::MAX {
+                        self.send_copy_pool.release(rest.pool_slot);
+                    }
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// Drain and release all queued sends for a connection.

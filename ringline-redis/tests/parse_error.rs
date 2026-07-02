@@ -32,11 +32,18 @@ fn test_config() -> Config {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    // Unique within the test binary; see ringline/tests/echo.rs::free_port.
+    use std::sync::Mutex;
+    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
+    loop {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut guard = CLAIMED.lock().unwrap();
+        if guard.get_or_insert_with(Default::default).insert(port) {
+            return port;
+        }
+    }
 }
 
 fn wait_for_server(addr: &str) {

@@ -31,11 +31,22 @@ fn test_config_builder() -> ConfigBuilder {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    // Tests run on many threads; the naive bind(:0)-drop-rebind pattern
+    // races (the kernel can hand the same port to two tests before either
+    // rebinds), which shows up as AddrInUse launch failures or clients
+    // connecting to another test's server. A process-global claimed set
+    // makes each handed-out port unique within the test binary.
+    use std::sync::Mutex;
+    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
+    loop {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut guard = CLAIMED.lock().unwrap();
+        if guard.get_or_insert_with(Default::default).insert(port) {
+            return port;
+        }
+    }
 }
 
 fn wait_for_server(addr: &str) {
@@ -195,6 +206,105 @@ fn tls_echo_with_external_client() {
 /// the io_uring path). The mio backend has a pre-existing large-payload TLS
 /// busy-spin (reproduces on `main` without this change), tracked separately;
 /// running this test there hangs for reasons unrelated to the drain.
+/// A handler that responds to the first received byte with one large
+/// `send()` — larger than rustls's 64 KiB ciphertext buffer cap
+/// (`DEFAULT_BUFFER_LIMIT`). Exercises the interleaved encrypt/drain loop:
+/// a single oversized `writer().write_all()` used to fail with WriteZero
+/// after the first 64 KiB was already encrypted and queued.
+#[cfg(has_io_uring)]
+struct TlsBigSendHandler;
+
+#[cfg(has_io_uring)]
+const BIG_SEND_SIZE: usize = 150 * 1024;
+
+#[cfg(has_io_uring)]
+fn big_send_payload() -> Vec<u8> {
+    (0..BIG_SEND_SIZE)
+        .map(|i| (i as u32).wrapping_mul(2246822519) as u8)
+        .collect()
+}
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsBigSendHandler {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+            let payload = big_send_payload();
+            conn.send(&payload)
+                .expect("large TLS send submit failed")
+                .await
+                .expect("large TLS send failed");
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsBigSendHandler
+    }
+}
+
+#[cfg(has_io_uring)]
+#[test]
+fn tls_single_send_larger_than_rustls_buffer() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (certs, key) = generate_self_signed();
+    let server_config = server_tls_config(certs.clone(), key);
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_config))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<TlsBigSendHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+
+    stream.write_all(b"go").unwrap();
+    stream.flush().unwrap();
+
+    let expected = big_send_payload();
+    let mut buf = vec![0u8; BIG_SEND_SIZE];
+    let mut total = 0;
+    while total < BIG_SEND_SIZE {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(e) => panic!("TLS read error: {e}"),
+        }
+    }
+    assert_eq!(total, BIG_SEND_SIZE, "short read");
+    assert_eq!(buf, expected, "byte-exact mismatch — chunk reorder or loss");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
 #[cfg(has_io_uring)]
 #[test]
 fn tls_echo_large_multichunk() {
@@ -229,7 +339,7 @@ fn tls_echo_large_multichunk() {
 
     // Two sizes, both well past rustls's ~16 KiB plaintext buffer so the
     // drain loop must iterate over several chunks and several records.
-    for &size in &[64 * 1024usize, 100 * 1024usize] {
+    for &size in &[64 * 1024usize, 100 * 1024usize, 200 * 1024usize] {
         // Distinctive, position-dependent pattern so any chunk reorder or
         // off-by-one in the advance is caught by the byte-exact comparison.
         let msg: Vec<u8> = (0..size)
