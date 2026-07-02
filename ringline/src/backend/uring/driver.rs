@@ -218,7 +218,7 @@ pub(crate) struct Driver {
     /// Pending ZC send retries: (conn_index, generation, slab_idx, retries). Drained each tick.
     pub(crate) pending_zc_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending copy send retries: (conn_index, generation, pool_slot, retries). Drained each tick.
-    pub(crate) pending_copy_retries: Vec<(u32, u32, u16, u8)>,
+    pub(crate) pending_copy_retries: Vec<(u32, u32, u16, u8, OpTag)>,
     /// Pending PollAdd-on-POLLOUT retries from the EAGAIN backpressure
     /// path: (conn_index, generation, pool_slot, retries). Drained each tick.
     /// Only used when `submit_send_pollout` itself failed (SQ full at
@@ -238,7 +238,7 @@ pub(crate) struct Driver {
     /// across ticks (the primary queue is left empty for in-iteration
     /// re-enqueues; `drain(..)` on the scratch keeps its capacity).
     pub(crate) zc_retry_scratch: Vec<(u32, u32, u16, u8)>,
-    pub(crate) copy_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) copy_retry_scratch: Vec<(u32, u32, u16, u8, OpTag)>,
     pub(crate) send_pollout_retry_scratch: Vec<(u32, u32, u16, u8)>,
     pub(crate) coalesced_retry_scratch: Vec<(u32, u32, u16, u8)>,
     pub(crate) recv_forward_retry_scratch: Vec<(u32, u32, u16, u8)>,
@@ -665,17 +665,11 @@ impl Driver {
         }
         if self.ring.submit_close(conn_index).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
-            let retries = self
-                .pending_close_retries
-                .iter()
-                .map(|(idx, r)| (*idx, (*r + 1)))
-                .collect::<Vec<_>>();
-            self.pending_close_retries.clear();
-            for (idx, retry) in retries {
-                if retry < 5 {
-                    self.pending_close_retries.push((idx, retry));
-                }
-            }
+            // Queue this connection for retry on a later tick. (An earlier
+            // version rebuilt the whole retry vec here — aging every other
+            // entry toward discard and never enqueueing the connection whose
+            // close just failed, leaking its fd and slot permanently.)
+            self.pending_close_retries.push((conn_index, 0));
         }
     }
 
@@ -840,6 +834,11 @@ impl Driver {
                     state.shutdown_pending = false;
                     let _ = self.ring.submit_shutdown(conn_index);
                 }
+                // Fire a deferred close now that nothing is in flight and the
+                // queue is empty. The ZC and recv-forward completion paths
+                // reach here without a note_send_finalized call, so without
+                // this a close_pending connection would leak its fd and slot.
+                self.try_finalize_close(conn_index);
                 false
             }
         }
@@ -891,6 +890,9 @@ impl Driver {
             &mut self.send_copy_pool,
         );
         state.in_flight = false;
+        // The queue is now empty and nothing is in flight — fire a deferred
+        // close if one was pending so the connection can't leak.
+        self.try_finalize_close(conn_index);
     }
 
     /// Release all entries from a send queue.

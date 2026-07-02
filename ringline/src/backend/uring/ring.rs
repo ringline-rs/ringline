@@ -531,11 +531,22 @@ impl Ring {
     }
 
     /// Submit all pending SQEs and wait for at least `min_complete` CQEs.
+    ///
+    /// A bare `?` here would kill the worker thread (and every connection on
+    /// it) on the first transient `io_uring_enter` failure:
+    /// - `EINTR`: any signal delivered to the worker interrupts the wait
+    ///   regardless of `SA_RESTART` — restart it.
+    /// - `EBUSY`: the CQ is backed up (overflow list non-empty); return `Ok`
+    ///   so the caller drains completions, which frees CQ space.
     pub fn submit_and_wait(&self, min_complete: u32) -> io::Result<()> {
-        self.ring
-            .submitter()
-            .submit_and_wait(min_complete as usize)?;
-        Ok(())
+        loop {
+            match self.ring.submitter().submit_and_wait(min_complete as usize) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Submit a timeout SQE that fires after the given duration.
