@@ -143,11 +143,19 @@ impl ShutdownHandle {
     /// Also closes the listen fd to unblock the acceptor's `accept()`.
     pub fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
-        // Close listen_fd to unblock the acceptor thread's accept() call.
         if let (Some(fd), Some(closed)) = (self.listen_fd, &self.listen_fd_closed)
             && !closed.swap(true, Ordering::AcqRel)
         {
             unsafe {
+                // shutdown(SHUT_RD) first: on Linux this wakes a thread
+                // blocked in accept4 (with EINVAL) and releases the bound
+                // port immediately. close(2) alone does neither — the
+                // in-progress syscall holds a file reference, so the
+                // acceptor stayed parked and the socket stayed listening
+                // until one more peer connected (EADDRINUSE on prompt
+                // relaunch). The close below then runs after the acceptor
+                // can no longer loop into a reused fd number.
+                libc::shutdown(fd, libc::SHUT_RD);
                 libc::close(fd);
             }
         }
@@ -732,6 +740,13 @@ impl RinglineBuilder {
                         // the launching thread waits indefinitely for
                         // a startup signal that never arrives.
                         if let Err(e) = pin_to_core(core) {
+                            // A bare EINVAL here is opaque — name the knob.
+                            eprintln!(
+                                "ringline: failed to pin worker {worker_id} to logical CPU {core} \
+                                 (core_offset {} + worker id): {e} — check Config::core_offset \
+                                 against the machine's CPU count",
+                                config.worker.core_offset
+                            );
                             let _ = startup_tx.send(Err(()));
                             return Err(e);
                         }
@@ -850,13 +865,23 @@ fn ensure_nofile_limit(
         return Err(crate::error::Error::Io(io::Error::last_os_error()));
     }
 
-    // register_files_sparse(max_connections) needs RLIMIT_NOFILE >= max_connections.
-    // Add per-worker overhead (ring fd, eventfd, transient socket fds) and global
-    // overhead (listen socket, stdio, misc).
+    // io_uring: register_files_sparse(max_connections) needs RLIMIT_NOFILE
+    // >= max_connections (the kernel's check is per-ring; connections live
+    // in fixed-file tables, not real fds). Add per-worker overhead (ring
+    // fd, eventfd, transient socket fds) and global overhead (listen
+    // socket, stdio, misc).
+    //
+    // mio: every connection holds a REAL fd and each worker has its own
+    // max_connections-slot table, so the worst case scales with the worker
+    // count — the io_uring formula under-provisioned and configs passed
+    // the check only to fail with EMFILE under load.
     let per_worker_overhead: u64 = 8;
     let global_overhead: u64 = 64;
-    let required =
-        max_connections as u64 + per_worker_overhead * num_workers as u64 + global_overhead;
+    #[cfg(has_io_uring)]
+    let conn_fds = max_connections as u64;
+    #[cfg(not(has_io_uring))]
+    let conn_fds = max_connections as u64 * num_workers as u64;
+    let required = conn_fds + per_worker_overhead * num_workers as u64 + global_overhead;
 
     let soft = rlim.rlim_cur;
     let hard = rlim.rlim_max;

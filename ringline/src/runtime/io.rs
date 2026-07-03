@@ -1498,9 +1498,13 @@ impl AsyncSendBuilder {
     ///
     /// This avoids the lifetime constraints of the closure-based [`build()`](Self::build),
     /// allowing callers to mix copy and guard parts in a single SQE from borrowed data.
-    /// Parts are consumed in order up to `MAX_IOVECS` total or `MAX_GUARDS` guards.
     ///
-    /// Returns the number of parts consumed on success.
+    /// All parts go into a single SQE. If the batch exceeds the internal
+    /// iovec or guard limits, the entire batch is rejected with `Err`
+    /// (nothing is sent, guard parts are dropped) — the call never consumes
+    /// a prefix. On success, returns the number of parts submitted (always
+    /// `parts.len()`); callers wanting larger batches should split them
+    /// (the protocol clients cap at 4 guards / 9 iovecs per flush).
     pub fn submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<usize> {
         use crate::handler::SendPart;
         with_state(|driver, _| {

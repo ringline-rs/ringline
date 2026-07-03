@@ -164,10 +164,12 @@ pub fn run_acceptor(config: AcceptorConfig) {
 /// On Linux, uses `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)` for a single
 /// syscall. On other platforms, falls back to `accept()` + `fcntl()`.
 ///
-/// Because this blocks, the acceptor thread can only be unblocked at
-/// shutdown by closing the listen fd (the syscall then returns `EBADF`).
-/// On a quiet listener the thread will sit in `accept4` until a peer
-/// connects or the listen fd is closed.
+/// Because this blocks, the acceptor thread is unblocked at shutdown by
+/// `shutdown(fd, SHUT_RD)` on the listen socket, which makes a blocked
+/// (or subsequent) `accept4` fail with `EINVAL` on Linux. (Closing the fd
+/// alone does NOT wake a blocked accept — the in-progress syscall holds a
+/// file reference.) On non-Linux platforms the wake is best-effort; a
+/// quiet listener's acceptor thread may persist until a peer connects.
 fn accept_nonblock(
     listen_fd: libc::c_int,
     addr: &mut libc::sockaddr_storage,

@@ -79,7 +79,8 @@ pub enum Error {
     ///
     /// The `RegionId` passed to `SendGuard` does not correspond to a
     /// registered `MemoryRegion`. Ensure:
-    /// - The region was registered via `RinglineBuilder::register_region()`
+    /// - The region was registered via [`ConfigBuilder::registered_regions`](crate::ConfigBuilder::registered_regions)
+    ///   or [`ShutdownHandle::register_region`](crate::ShutdownHandle::register_region)
     /// - The region is still valid (not dropped)
     #[error("invalid memory region ID")]
     InvalidRegion,

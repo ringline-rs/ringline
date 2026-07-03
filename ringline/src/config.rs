@@ -781,6 +781,18 @@ impl ConfigBuilder {
         self
     }
 
+    /// Disable filesystem I/O support entirely.
+    ///
+    /// `fs` defaults to enabled (unlike `nvme`/`direct_io`), so its
+    /// per-worker file table and command slab are otherwise always
+    /// allocated. Workloads that never touch [`crate::fs`] can reclaim
+    /// that footprint; fs operations will then fail with "filesystem I/O
+    /// not configured".
+    pub fn no_fs(mut self) -> Self {
+        self.config.fs = None;
+        self
+    }
+
     /// Set the number of DNS resolver threads. 0 = disabled.
     pub fn resolver_threads(mut self, threads: usize) -> Self {
         self.config.resolver_threads = threads;

@@ -103,6 +103,17 @@ pub struct WaitFuture {
     pid: u32,
 }
 
+impl Drop for WaitFuture {
+    fn drop(&mut self) {
+        // Deregister so an abandoned wait (select/timeout loser) doesn't
+        // leave a stale waiter/result entry behind forever.
+        let _ = try_with_state(|_driver, executor| {
+            executor.pidfd_waiters.remove(&self.seq);
+            executor.pidfd_results.remove(&self.seq);
+        });
+    }
+}
+
 impl Future for WaitFuture {
     type Output = io::Result<ExitStatus>;
 
@@ -252,6 +263,25 @@ impl Command {
 /// Future returned by [`Command::spawn()`]. Resolves to a [`Child`].
 pub struct SpawnFuture {
     request_id: u64,
+}
+
+impl Drop for SpawnFuture {
+    fn drop(&mut self) {
+        // A SpawnFuture abandoned before completion (select/timeout loser)
+        // must not leak its map entry — and, worse, the spawner's response
+        // (containing an OPEN PIDFD) would be stored into the entry and
+        // never taken. Mark the entry as abandoned by removing it; the
+        // deliver path closes the pidfd when no entry is waiting.
+        let _ = try_with_state(|_driver, executor| {
+            // Response already arrived but was never consumed — close the
+            // pidfd so it doesn't leak.
+            if let Some((_, Some(Ok(r)))) = executor.pending_spawns.remove(&self.request_id) {
+                unsafe {
+                    libc::close(r.pidfd);
+                }
+            }
+        });
+    }
 }
 
 impl Future for SpawnFuture {
