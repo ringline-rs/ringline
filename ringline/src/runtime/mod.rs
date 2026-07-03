@@ -79,6 +79,10 @@ pub(crate) struct PendingUdpDatagram {
     /// this size (the last chunk may be shorter), invoking the recv callback
     /// once per chunk. Zero means a single, un-coalesced datagram.
     pub(crate) segment_size: u32,
+    /// Bytes already handed out by segment-wise consumers
+    /// (`recv_from`/`with_datagram` on a GRO-coalesced entry). Zero for
+    /// whole-entry consumers (`recv_batch`, non-GRO paths).
+    pub(crate) consumed: u32,
 }
 
 pub(crate) enum PendingUdpBuf {
@@ -129,6 +133,24 @@ impl PendingUdpDatagram {
                 f(chunk);
             }
         }
+    }
+
+    /// Byte range of the next un-consumed datagram: the whole payload for
+    /// an un-coalesced entry, one `segment_size` chunk for a GRO entry.
+    pub(crate) fn next_segment_range(&self) -> (usize, usize) {
+        let len = self.data().len();
+        if self.segment_size == 0 {
+            (0, len)
+        } else {
+            let start = (self.consumed as usize).min(len);
+            let end = (start + self.segment_size as usize).min(len);
+            (start, end)
+        }
+    }
+
+    /// Whether all contained datagrams have been handed out.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.segment_size == 0 || self.consumed as usize >= self.data().len()
     }
 
     /// If this entry holds a kernel-provided buffer, return the bid so the
@@ -245,6 +267,11 @@ impl TimerSlotPool {
         }
         self.fired[idx] = true;
         Some(self.waker_ids[idx])
+    }
+
+    /// Total number of slots in the pool.
+    pub(crate) fn capacity(&self) -> usize {
+        self.generations.len()
     }
 
     /// Check if a timer slot has fired.
@@ -772,12 +799,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn next_segment_range_walks_gro_entry() {
+        // 2.5 segments of 1000: ranges must advance one segment at a time.
+        let mut e = owned_datagram(vec![0u8; 2500], 1000);
+        assert_eq!(e.next_segment_range(), (0, 1000));
+        e.consumed = 1000;
+        assert!(!e.exhausted());
+        assert_eq!(e.next_segment_range(), (1000, 2000));
+        e.consumed = 2000;
+        assert_eq!(e.next_segment_range(), (2000, 2500));
+        e.consumed = 2500;
+        assert!(e.exhausted());
+    }
+
+    #[test]
+    fn next_segment_range_uncoalesced_is_whole_payload() {
+        let e = owned_datagram(vec![7u8; 1200], 0);
+        assert_eq!(e.next_segment_range(), (0, 1200));
+        assert!(e.exhausted());
+    }
+
     fn owned_datagram(payload: Vec<u8>, segment_size: u32) -> PendingUdpDatagram {
         PendingUdpDatagram {
             peer: "127.0.0.1:0".parse().unwrap(),
             buf: PendingUdpBuf::Owned(payload),
             recv_at: std::time::Instant::now(),
             segment_size,
+            consumed: 0,
         }
     }
 

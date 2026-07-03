@@ -345,9 +345,14 @@ impl Config {
                 "accept_queue_capacity must be > 0".into(),
             ));
         }
-        if self.timer_slots > 65535 {
+        if self.timer_slots == 0 || self.timer_slots > 65535 {
             return Err(crate::error::Error::RingSetup(
-                "timer_slots must be <= 65535".into(),
+                "timer_slots must be > 0 and <= 65535".into(),
+            ));
+        }
+        if self.send_slab_slots == 0 {
+            return Err(crate::error::Error::RingSetup(
+                "send_slab_slots must be > 0".into(),
             ));
         }
         if self.send_copy_slot_size == 0 {
@@ -860,6 +865,16 @@ mod tests {
         Config::default()
             .validate()
             .expect("default config should be valid");
+    }
+
+    #[test]
+    fn validate_timer_slots_zero_rejected() {
+        assert!(config_with(|c| c.timer_slots = 0).validate().is_err());
+    }
+
+    #[test]
+    fn validate_send_slab_slots_zero_rejected() {
+        assert!(config_with(|c| c.send_slab_slots = 0).validate().is_err());
     }
 
     #[test]

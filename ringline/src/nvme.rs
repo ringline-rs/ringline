@@ -332,7 +332,10 @@ pub struct NvmeCompletion {
 impl NvmeCompletion {
     /// Whether the command completed successfully.
     pub fn is_success(&self) -> bool {
-        self.result >= 0
+        // 0 is success. Positive values are the NVMe status word (SCT/SC,
+        // e.g. 0x281 media error) placed in cqe->res by the kernel's
+        // passthrough completion; negative values are transport errnos.
+        self.result == 0
     }
 }
 

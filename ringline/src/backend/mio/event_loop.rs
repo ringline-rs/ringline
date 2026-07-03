@@ -773,6 +773,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                                 buf: crate::runtime::PendingUdpBuf::Owned(data),
                                 recv_at: std::time::Instant::now(),
                                 segment_size: 0,
+                                consumed: 0,
                             },
                         );
                         self.executor.wake_udp_recv(udp_index);
@@ -839,6 +840,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 buf: crate::runtime::PendingUdpBuf::Owned(data),
                 recv_at: std::time::Instant::now(),
                 segment_size,
+                consumed: 0,
             });
             self.executor.wake_udp_recv(udp_index);
         }
