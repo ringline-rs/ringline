@@ -192,6 +192,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // queue is polled now instead of after the next CQE or tick
             // timeout (indefinitely, with tick_timeout_us = 0).
             self.executor.collect_wakeups();
+            // Commit buffer returns from the poll pass and revive
+            // ENOBUFS-parked receivers before we block.
+            self.flush_replenish_and_rearm();
             let min_complete = u32::from(self.executor.ready_queue.is_empty());
             self.driver.ring.submit_and_wait(min_complete)?;
             let mut wait_ns: u64 = 0;
@@ -609,6 +612,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     fn drain_completions(&mut self) {
+        // One arrival timestamp per batch for queued UDP datagrams (a vDSO
+        // clock call per packet showed up on the hot path).
+        if !self.driver.udp_sockets.is_empty() {
+            self.driver.udp_batch_recv_at = std::time::Instant::now();
+        }
         self.driver.cqe_batch.clear();
 
         {
@@ -644,16 +652,44 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Eagerly return consumed recv buffers to the kernel ring in the same
         // iteration they were consumed, keeping the ring fuller under burst.
-        // Safe because every bid pushed to `pending_replenish` had its contents
-        // copied out (into the accumulator / recv sink / TLS state) before being
-        // pushed — the dispatch loop above has fully completed, so no handler
-        // still references these buffers. Zero-copy held buffers are tracked in
-        // `pending_recv_bufs` / `recv_hold` slots and are never in this queue.
+        self.flush_replenish_and_rearm();
+    }
+
+    /// Commit pending provided-buffer returns to the kernel ring and re-arm
+    /// any connections whose multishot recv was parked on ENOBUFS.
+    ///
+    /// Safe because every bid pushed to `pending_replenish` had its contents
+    /// copied out (into the accumulator / recv sink / TLS state) before being
+    /// pushed — dispatch has fully completed, so no handler still references
+    /// these buffers. Zero-copy held buffers are tracked in
+    /// `pending_recv_bufs` / `recv_hold` slots and are never in this queue.
+    ///
+    /// Also called from the run loop right before the blocking wait: bids
+    /// released by tasks during the poll pass would otherwise sit uncommitted
+    /// (and starved connections parked) until the next unrelated CQE.
+    fn flush_replenish_and_rearm(&mut self) {
         if !self.driver.pending_replenish.is_empty() {
             self.driver
                 .provided_bufs
                 .replenish_batch(&self.driver.pending_replenish);
             self.driver.pending_replenish.clear();
+
+            // Buffers are available again — wake the parked receivers.
+            while let Some(conn_index) = self.driver.recv_starved.pop() {
+                let alive = self
+                    .driver
+                    .connections
+                    .get(conn_index)
+                    .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
+                if !alive {
+                    continue;
+                }
+                if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+                    metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+                    self.executor.wake_recv(conn_index);
+                    self.driver.close_connection(conn_index);
+                }
+            }
         }
     }
 
@@ -755,10 +791,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let errno = -result;
             if errno == libc::ENOBUFS {
                 metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
-                if !has_more && self.driver.ring.submit_multishot_recv(conn_index).is_err() {
-                    metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-                    self.executor.wake_recv(conn_index);
-                    self.driver.close_connection(conn_index);
+                // Park until buffers return to the provided ring (see
+                // flush_replenish_and_rearm). Re-arming immediately
+                // completed with ENOBUFS again while data was pending and
+                // the ring was empty — submit_and_wait(1) never blocked and
+                // the worker spun at 100% CPU until a task freed a bid.
+                if !has_more && !self.driver.recv_starved.contains(&conn_index) {
+                    self.driver.recv_starved.push(conn_index);
                 }
             } else if errno == libc::ECANCELED {
                 return;
@@ -2226,6 +2265,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     fn handle_recv_msg_udp(&mut self, ud: UserData, result: i32, flags: u32) {
+        let batch_recv_at = self.driver.udp_batch_recv_at;
         /// Parse the `name` region from a multishot `recvmsg` output into a
         /// `SocketAddr`. The region is a `sockaddr_in` or `sockaddr_in6`
         /// depending on `ss_family`; we copy it into an aligned
@@ -2354,7 +2394,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                                 ptr: payload_ptr,
                                 payload_len,
                             },
-                            recv_at: std::time::Instant::now(),
+                            recv_at: batch_recv_at,
                             segment_size,
                             consumed: 0,
                         },
@@ -2416,6 +2456,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// since we used `IORING_OP_RECV` rather than `RECVMSG`). The peer is
     /// known from `UdpSocketState::connected_peer`.
     fn handle_recv_udp(&mut self, ud: UserData, result: i32, flags: u32) {
+        let batch_recv_at = self.driver.udp_batch_recv_at;
         let udp_index = ud.conn_index();
         let idx = udp_index as usize;
         let has_more = cqueue::more(flags);
@@ -2486,7 +2527,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         ptr: buf_ptr,
                         payload_len,
                     },
-                    recv_at: std::time::Instant::now(),
+                    recv_at: batch_recv_at,
                     // Connected sockets use the plain `recv` path with no
                     // msghdr/control region, so GRO never applies here.
                     segment_size: 0,
