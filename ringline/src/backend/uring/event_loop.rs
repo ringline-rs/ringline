@@ -61,12 +61,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             blocking_pool,
             region_rx,
         )?;
+        // On io_uring the recv queue holds kernel ring buffer bids
+        // (`PendingUdpBuf::Kernel`), so each queued datagram pins one
+        // provided buffer until the task consumes it. Capacity beyond the
+        // ring size is physically unusable: the ring starves (ENOBUFS)
+        // before the queue ever fills, and the drop accounting never
+        // fires. Clamp so overflow is an observable drop instead of a
+        // silent stall. (The mio backend copies into owned buffers and
+        // keeps the full configured depth.)
+        let udp_queue_capacity = config
+            .udp_recv_queue_capacity
+            .min(config.udp_recv_buffer.ring_size as usize);
         let executor = Executor::new(
             config.max_connections,
             config.standalone_task_capacity,
             config.timer_slots,
             config.udp_bind.len() as u32,
-            config.udp_recv_queue_capacity,
+            udp_queue_capacity,
         );
         Ok(AsyncEventLoop {
             driver,

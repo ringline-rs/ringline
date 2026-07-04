@@ -690,6 +690,21 @@ impl RinglineBuilder {
         let has_acceptor = listen_fd.is_some();
         let (startup_tx, startup_rx) = crossbeam_channel::bounded::<Result<(), ()>>(num_threads);
 
+        // SMT-aware pinning: when the requested worker range fits within
+        // the machine's physical cores, treat `core_offset + worker_id`
+        // as a physical-core index and pin to that core's first SMT
+        // sibling. On machines that enumerate hyperthread siblings
+        // adjacently (cpu0/cpu1 = one core), raw logical ids would stack
+        // two workers on one core. Ranges that don't fit fall back to
+        // raw logical ids so deliberate hyperthread layouts remain
+        // expressible.
+        let physical_cpus: Option<Vec<usize>> = if self.config.worker.pin_to_core {
+            crate::topology::physical_core_first_cpus()
+                .filter(|cpus| self.config.worker.core_offset + num_threads <= cpus.len())
+        } else {
+            None
+        };
+
         for worker_id in 0..num_threads {
             let config = self.config.clone();
             let rx = worker_rxs.remove(0);
@@ -731,11 +746,16 @@ impl RinglineBuilder {
                 .take()
                 .expect("region rx already consumed");
 
+            let pin_cpu = {
+                let raw = self.config.worker.core_offset + worker_id;
+                physical_cpus.as_ref().map(|cpus| cpus[raw]).unwrap_or(raw)
+            };
+
             let handle = thread::Builder::new()
                 .name(format!("ringline-worker-{worker_id}"))
                 .spawn(move || {
                     if config.worker.pin_to_core {
-                        let core = config.worker.core_offset + worker_id;
+                        let core = pin_cpu;
                         // Report the failure before bailing — otherwise
                         // the launching thread waits indefinitely for
                         // a startup signal that never arrives.
