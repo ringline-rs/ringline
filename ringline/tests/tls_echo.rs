@@ -211,20 +211,16 @@ fn tls_echo_with_external_client() {
 /// (`DEFAULT_BUFFER_LIMIT`). Exercises the interleaved encrypt/drain loop:
 /// a single oversized `writer().write_all()` used to fail with WriteZero
 /// after the first 64 KiB was already encrypted and queued.
-#[cfg(has_io_uring)]
 struct TlsBigSendHandler;
 
-#[cfg(has_io_uring)]
 const BIG_SEND_SIZE: usize = 150 * 1024;
 
-#[cfg(has_io_uring)]
 fn big_send_payload() -> Vec<u8> {
     (0..BIG_SEND_SIZE)
         .map(|i| (i as u32).wrapping_mul(2246822519) as u8)
         .collect()
 }
 
-#[cfg(has_io_uring)]
 impl AsyncEventHandler for TlsBigSendHandler {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
@@ -248,7 +244,6 @@ impl AsyncEventHandler for TlsBigSendHandler {
     }
 }
 
-#[cfg(has_io_uring)]
 #[test]
 fn tls_single_send_larger_than_rustls_buffer() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
@@ -305,7 +300,6 @@ fn tls_single_send_larger_than_rustls_buffer() {
     }
 }
 
-#[cfg(has_io_uring)]
 #[test]
 fn tls_echo_large_multichunk() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());

@@ -1132,10 +1132,13 @@ impl ConnCtx {
             }
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), &data)?;
+            // Deliver the completion only when the bytes actually reach the
+            // socket — completing at queue time reported success for data
+            // that was never written and swallowed write errors.
+            ctx.mark_last_send_awaited(conn_index);
             driver.accumulators.consume(conn_index, data.len());
             executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.send_waiters[conn_index as usize] = true;
-            driver.send_completions[conn_index as usize].push_back(data.len() as u32);
             Ok(SendFuture {
                 conn_index,
                 generation: self.generation,
@@ -1171,15 +1174,14 @@ impl ConnCtx {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
             ctx.send(self.token(), data)?;
+            // On mio, the send is buffered — mark it awaitable so the event
+            // loop delivers wake_send when the bytes actually reach the
+            // socket (not at queue time, which reported success for data
+            // that was never written and swallowed write errors).
+            #[cfg(not(has_io_uring))]
+            ctx.mark_last_send_awaited(self.conn_index);
             executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.send_waiters[self.conn_index as usize] = true;
-            // On mio, the send is buffered synchronously — record a pending
-            // completion so the event loop can deliver wake_send for each
-            // individual awaitable send.
-            #[cfg(not(has_io_uring))]
-            {
-                driver.send_completions[self.conn_index as usize].push_back(data.len() as u32);
-            }
             Ok(SendFuture {
                 conn_index: self.conn_index,
                 generation: self.generation,
@@ -2945,6 +2947,8 @@ impl UdpCtx {
     pub fn send_ready(&self) -> UdpSendReadyFuture {
         UdpSendReadyFuture {
             udp_index: self.udp_index,
+            #[cfg(not(has_io_uring))]
+            yielded: false,
         }
     }
 
@@ -3293,6 +3297,9 @@ where
 
 /// Future returned by [`UdpCtx::send_ready()`].
 pub struct UdpSendReadyFuture {
+    /// Mio: whether this future has yielded once (cooperative backoff).
+    #[cfg(not(has_io_uring))]
+    yielded: bool,
     /// Never read on the mio backend — the future resolves immediately
     /// without looking at any per-socket state.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
@@ -3325,10 +3332,18 @@ impl Future for UdpSendReadyFuture {
         })
     }
 
-    /// Mio backend: sends are synchronous `send_to` calls that never queue,
-    /// so this future resolves immediately. Callers stay backend-agnostic.
+    /// Mio backend: sends are synchronous `send_to` calls that never queue.
+    /// Yield once before resolving: the documented retry pattern
+    /// (`PoolExhausted`/`WouldBlock` → `send_ready().await` → retry) would
+    /// otherwise be a hard busy-loop inside a single task poll,
+    /// monopolizing the worker until the kernel drains the socket buffer.
     #[cfg(not(has_io_uring))]
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if !self.yielded {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
         Poll::Ready(())
     }
 }

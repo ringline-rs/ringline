@@ -19,8 +19,12 @@ use mio::Interest;
 /// mio token 0 is reserved for the wake pipe.
 pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
 
-/// Per-connection pending send: `(data, offset)` for partial writes.
-pub(crate) type PendingSend = (Vec<u8>, usize);
+/// Per-connection pending send: `(data, offset, notify_len)` for partial
+/// writes. `notify_len` is `Some(len)` for awaitable sends: the completion
+/// (wake_send) is delivered only when the entry has fully reached the
+/// socket — completing at queue time reported success for bytes that were
+/// never written and swallowed write errors entirely.
+pub(crate) type PendingSend = (Vec<u8>, usize, Option<u32>);
 
 /// Per-worker mio driver state.
 pub(crate) struct Driver {
@@ -64,6 +68,14 @@ pub(crate) struct Driver {
     pub(crate) wake_pipe_fd: RawFd,
     /// Whether to set TCP_NODELAY on accepted connections.
     pub(crate) tcp_nodelay: bool,
+    /// Connections closed this iteration, awaiting executor cleanup and
+    /// slot release by the event loop's `drain_pending_closes`. Deferring
+    /// the release (a) lets `Executor::remove_connection` run (stale parked
+    /// futures, waiter flags, and recv sinks used to survive into the
+    /// slot's next occupant — a use-after-free via the recv-sink raw
+    /// pointer), and (b) closes the reuse window between a task closing a
+    /// connection and its own post-poll cleanup.
+    pub(crate) pending_closes: Vec<u32>,
     /// Per-connection queue of awaitable-send byte counts.
     /// `DriverCtx::send_await()` pushes len here; the event loop drains
     /// these and calls `Executor::wake_send()` for each.
@@ -114,6 +126,7 @@ impl Driver {
         config: &Config,
         accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
         eventfd: RawFd,
+        wake_fd: crate::wakeup::WakeFd,
         shutdown_flag: Arc<AtomicBool>,
         resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
         resolve_tx: Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
@@ -181,7 +194,12 @@ impl Driver {
             send_copy_pool: SendCopyPool::new(config.send_copy_count, config.send_copy_slot_size),
             send_queues: (0..max_conn).map(|_| ConnSendState::new()).collect(),
             accept_rx,
-            wake_handle: crate::wakeup::WakeFd::from_raw_fd(eventfd),
+            // The pipe's WRITE end: handed to worker-pool threads (disk I/O,
+            // resolver, spawner) so their completion wakes actually reach
+            // this worker. `eventfd` is the READ end (polled by the loop) —
+            // it used to be wrapped here, making every pool wake an EBADF
+            // no-op observed only at the poll timeout (~10 ms).
+            wake_handle: wake_fd,
             shutdown_flag,
             shutdown_local: false,
             tls_table,
@@ -198,6 +216,7 @@ impl Driver {
             blocking_tx,
             blocking_pool,
             tcp_streams: (0..max_conn).map(|_| None).collect(),
+            pending_closes: Vec::new(),
             pending_sends: (0..max_conn).map(|_| VecDeque::new()).collect(),
             writable: vec![false; max_conn],
             connect_deadlines: vec![None; max_conn],
@@ -254,6 +273,7 @@ impl Driver {
             recvmsg_msghdr: std::ptr::null(),
             send_queues: &mut self.send_queues,
             pending_sends: &mut self.pending_sends,
+            pending_closes: &mut self.pending_closes,
             tcp_streams: &mut self.tcp_streams,
             poll: &mut self.poll,
             writable: &mut self.writable,
@@ -284,32 +304,40 @@ impl Driver {
         } else {
             return;
         }
+        let _ = idx;
+        // Teardown (socket, buffers, executor state, slot release) happens
+        // in the event loop's drain_pending_closes, which has Executor
+        // access. Marking Closed above makes this idempotent.
+        self.pending_closes.push(conn_index);
+    }
 
-        // Flush any pending send data before closing. Temporarily switch to
-        // blocking mode so write_all doesn't fail with WouldBlock.
+    /// Tear down a closed connection's driver-side state: best-effort
+    /// nonblocking flush of pending sends, TLS close_notify, socket
+    /// deregistration, buffer cleanup, and slot release. Called by the
+    /// event loop after `Executor::remove_connection`.
+    ///
+    /// The flush is a single nonblocking attempt — the previous behavior
+    /// flipped the fd to blocking and `write_all`'d, which let one
+    /// zero-window peer stall the entire worker indefinitely.
+    pub(crate) fn finish_close(&mut self, conn_index: u32) {
+        let idx = conn_index as usize;
+
+        let _ = self.flush_sends(conn_index);
+
         if let Some(ref mut stream) = self.tcp_streams[idx] {
             use std::io::Write;
-            use std::os::fd::AsRawFd;
-            let fd = stream.as_raw_fd();
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-            }
-            for (data, offset) in self.pending_sends[idx].drain(..) {
-                let _ = stream.write_all(&data[offset..]);
-            }
-            let _ = stream.flush();
-
-            // Send TLS close_notify if this is a TLS connection.
+            // Send TLS close_notify if this is a TLS connection
+            // (best-effort, nonblocking).
             if let Some(ref mut tls_table) = self.tls_table
                 && tls_table.has(conn_index)
             {
                 if let Some(tls_conn) = tls_table.get_mut(conn_index) {
                     tls_conn.conn.send_close_notify();
                 }
-                crate::tls::flush_tls_output_mio(tls_table, stream, conn_index);
+                crate::tls::flush_tls_output_mio_direct(tls_table, stream, conn_index);
                 tls_table.remove(conn_index);
             }
+            let _ = stream.flush();
         }
 
         // Deregister from poll and drop the TcpStream.
@@ -318,39 +346,53 @@ impl Driver {
             // stream is dropped here, closing the fd
         }
 
-        // Clear pending sends (already drained above, but reset state).
+        let was_established = self
+            .connections
+            .get(conn_index)
+            .map(|c| c.established)
+            .unwrap_or(false);
+
         self.pending_sends[idx].clear();
         self.writable[idx] = false;
         self.connect_deadlines[idx] = None;
         self.send_completions[idx].clear();
+        self.accumulators.reset(conn_index);
 
-        // Clear send queue.
         self.send_queues[idx].queue.clear();
         self.send_queues[idx].in_flight = false;
 
-        // Release the connection slot.
         if self.connections.get(conn_index).is_some() {
             self.connections.release(conn_index);
         }
 
         crate::metrics::CONNECTIONS.increment(crate::metrics::conn::CLOSED);
-        crate::metrics::CONNECTIONS_ACTIVE.decrement();
+        // Only decrement the active gauge for connections that were counted
+        // into it — failed connects and TLS-handshake failures never
+        // incremented, so unconditional decrement underflowed the gauge.
+        if was_established {
+            crate::metrics::CONNECTIONS_ACTIVE.decrement();
+        }
     }
 
     /// Flush pending sends for a connection. Called by the event loop when
     /// the connection becomes writable.
     ///
-    /// Returns `(all_flushed, bytes_written)`: `all_flushed` is true if all
-    /// pending data was flushed (or there was nothing to flush), false if we
-    /// got WouldBlock mid-flush. `bytes_written` is the total bytes written
-    /// in this call.
-    pub(crate) fn flush_sends(&mut self, conn_index: u32) -> (bool, u32) {
+    /// Returns `Ok((all_flushed, bytes_written))`: `all_flushed` is true if
+    /// all pending data was flushed (or there was nothing to flush), false
+    /// if we got WouldBlock mid-flush. A hard write error is returned as
+    /// `Err` — the caller must fail the connection (the previous code
+    /// swallowed it, kept the queue, and retried the failing writev every
+    /// loop iteration forever while awaited sends reported success).
+    ///
+    /// Awaitable entries (`notify_len` set) push their completion when the
+    /// entry's last byte reaches the socket.
+    pub(crate) fn flush_sends(&mut self, conn_index: u32) -> io::Result<(bool, u32)> {
         use std::os::fd::AsRawFd;
 
         let idx = conn_index as usize;
         let stream = match self.tcp_streams[idx].as_mut() {
             Some(s) => s,
-            None => return (true, 0),
+            None => return Ok((true, 0)),
         };
 
         let mut total_written: u32 = 0;
@@ -360,7 +402,7 @@ impl Driver {
         while !self.pending_sends[idx].is_empty() {
             let mut iovecs: Vec<libc::iovec> =
                 Vec::with_capacity(self.pending_sends[idx].len().min(1024));
-            for (data, offset) in self.pending_sends[idx].iter() {
+            for (data, offset, _notify) in self.pending_sends[idx].iter() {
                 if iovecs.len() >= 1024 {
                     break;
                 }
@@ -385,24 +427,29 @@ impl Driver {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
                     self.writable[idx] = false;
-                    return (false, total_written);
+                    return Ok((false, total_written));
                 }
-                // Write error — connection will be closed.
-                return (true, total_written);
+                return Err(err);
             }
             if result == 0 {
                 // Connection closed by peer.
-                return (true, total_written);
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "peer closed during send flush",
+                ));
             }
 
             // Advance through the pending sends by the number of bytes written.
             let mut remaining = result as usize;
             total_written += result as u32;
             while remaining > 0 {
-                if let Some((data, offset)) = self.pending_sends[idx].front_mut() {
+                if let Some((data, offset, notify)) = self.pending_sends[idx].front_mut() {
                     let avail = data.len() - *offset;
                     if remaining >= avail {
                         remaining -= avail;
+                        if let Some(len) = notify.take() {
+                            self.send_completions[idx].push_back(len);
+                        }
                         self.pending_sends[idx].pop_front();
                     } else {
                         *offset += remaining;
@@ -422,7 +469,7 @@ impl Driver {
                 mio::Interest::READABLE,
             );
         }
-        (true, total_written)
+        Ok((true, total_written))
     }
 
     /// Register writable interest for a connection (because we have

@@ -436,7 +436,7 @@ impl RinglineBuilder {
                     &config,
                     handler,
                     accept_rx,
-                    eventfd,
+                    eventfd.0,
                     shutdown_flag,
                     resolve_rx,
                     resolve_tx,
@@ -456,7 +456,8 @@ impl RinglineBuilder {
                         &config,
                         handler,
                         accept_rx,
-                        eventfd,
+                        eventfd.0,
+                        eventfd.1,
                         shutdown_flag,
                         resolve_rx,
                         resolve_tx,
@@ -506,7 +507,7 @@ impl RinglineBuilder {
                 usize,
                 Config,
                 Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
-                RawFd,
+                (RawFd, crate::wakeup::WakeFd),
                 Arc<AtomicBool>,
                 Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
                 Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
@@ -677,7 +678,12 @@ impl RinglineBuilder {
         for worker_id in 0..num_threads {
             let config = self.config.clone();
             let rx = worker_rxs.remove(0);
-            let eventfd = worker_eventfds[worker_id];
+            // (read end for polling, write end for cross-thread wakes —
+            // on the mio backend these are the two ends of a pipe; the
+            // disk-I/O pool must write the WRITE end. It used to be handed
+            // the read end, so every fs completion wake was an EBADF no-op
+            // and completions were only noticed at the poll timeout.)
+            let eventfd = (worker_eventfds[worker_id], worker_wake_fds[worker_id]);
             let shutdown_flag = shutdown_flag.clone();
             let worker_fn = worker_fn.clone();
             let startup_tx = startup_tx.clone();
