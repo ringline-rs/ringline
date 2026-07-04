@@ -2053,6 +2053,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             None => return,
         };
 
+        // Generation check (payload carries it): a stale -ETIME arriving
+        // after close + slot reuse must not kill the new occupant's connect.
+        if conn.generation != ud.payload() || !conn.connect_timeout_armed {
+            return;
+        }
+
         if !matches!(conn.recv_mode, RecvMode::Connecting) {
             return;
         }
@@ -2350,6 +2356,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             },
                             recv_at: std::time::Instant::now(),
                             segment_size,
+                            consumed: 0,
                         },
                     );
                     handed_to_queue = true;
@@ -2428,6 +2435,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
 
         if result <= 0 {
+            // Defensive: a zero-length datagram (or an error CQE on some
+            // kernels) can still carry a selected buffer — failing to
+            // replenish its bid shrinks the UDP ring by one per occurrence
+            // until ENOBUFS (a remote peer sending empty datagrams could
+            // drain the ring entirely).
+            if let Some(bid) = cqueue::buffer_select(flags) {
+                self.driver.udp_pending_replenish.push(bid);
+            }
             let errno = -result;
             if !has_more && errno != libc::ECANCELED {
                 if errno == libc::ENOBUFS {
@@ -2475,6 +2490,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     // Connected sockets use the plain `recv` path with no
                     // msghdr/control region, so GRO never applies here.
                     segment_size: 0,
+                    consumed: 0,
                 });
                 handed_to_queue = true;
                 self.executor.wake_udp_recv(udp_index);
@@ -2511,8 +2527,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             dev.in_flight = dev.in_flight.saturating_sub(1);
         }
 
+        // NVMe passthrough puts the device-level status word (positive,
+        // e.g. 0x281 media error) in cqe->res on command failure; 0 is
+        // success and negative is a transport errno. Treating result >= 0
+        // as success returned Ok(status) for failed reads/writes — silent
+        // data corruption on device errors.
+        let result = if result > 0 { -libc::EIO } else { result };
+
         // Wake the async task waiting for this NVMe completion.
-        self.executor.wake_disk_io(slab_idx as u32, result);
+        self.executor.wake_disk_io(ud.payload(), result);
     }
 
     fn handle_direct_io(&mut self, ud: UserData, result: i32) {
@@ -2537,7 +2560,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Wake the async task waiting for this Direct I/O completion.
-        self.executor.wake_disk_io(slab_idx as u32, result);
+        self.executor.wake_disk_io(ud.payload(), result);
     }
 
     fn handle_fs(&mut self, ud: UserData, result: i32) {
@@ -2562,9 +2585,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && let Some(ref statx_buf) = entry.statx_buf
         {
             let metadata = crate::fs::Metadata::from_statx(statx_buf);
-            self.executor
-                .fs_stat_results
-                .insert(slab_idx as u32, metadata);
+            // Keyed by the full disk-I/O key (StatFuture holds the same),
+            // not the raw slab index.
+            self.executor.fs_stat_results.insert(ud.payload(), metadata);
         }
 
         // For Open ops, handle success/failure of the file slot.
@@ -2590,7 +2613,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Wake the async task waiting for this completion.
-        self.executor.wake_disk_io(slab_idx as u32, result);
+        self.executor.wake_disk_io(ud.payload(), result);
     }
 
     fn handle_pidfd_poll(&mut self, ud: UserData, result: i32) {
@@ -4516,6 +4539,50 @@ mod tests {
         // and pending_notifs is still 1 — will be released when the
         // notification CQE arrives).
         // The key assertion: no panic, no hang, retry was handled.
+    }
+
+    #[test]
+    fn disk_io_keys_are_unique_per_op() {
+        // fs/NVMe/direct-io share the executor's completion maps; the key
+        // must differ across ops even for the same slab index (three
+        // independent slabs all start their free lists at 0).
+        let mut el = make_test_loop();
+        let mut ctx = el.driver.make_ctx();
+        let k1 = ctx.disk_io_key(3);
+        let k2 = ctx.disk_io_key(3);
+        assert_ne!(k1, k2, "same slab index must map to distinct keys");
+        assert_eq!(k1 & 0xFFFF, 3, "low 16 bits must carry the slab index");
+        assert_eq!(k2 & 0xFFFF, 3);
+    }
+
+    #[test]
+    fn stale_connect_timeout_ignored_on_reused_slot() {
+        // A -ETIME deferred through CQ overflow can arrive after the slot
+        // was closed and reused for a NEW outbound connect. The generation
+        // in the payload must prevent it from killing the new connect.
+        let mut el = make_test_loop();
+        let conn_index = el.driver.connections.allocate_outbound().unwrap();
+        let old_generation = el.driver.connections.generation(conn_index);
+
+        // Close + reuse: new outbound connect in the same slot.
+        el.driver.close_connection(conn_index);
+        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.inject_and_dispatch(close_ud.raw(), 0);
+        let reused = el.driver.connections.allocate_outbound().unwrap();
+        assert_eq!(reused, conn_index);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.connect_timeout_armed = true;
+        }
+
+        // Stale -ETIME with the OLD generation: must be ignored.
+        let ud = UserData::encode(OpTag::Timeout, conn_index, old_generation);
+        el.inject_and_dispatch(ud.raw(), -62);
+
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_some() && matches!(conn.unwrap().recv_mode, RecvMode::Connecting),
+            "stale connect-timeout CQE must not kill the reused slot's connect"
+        );
     }
 
     #[test]

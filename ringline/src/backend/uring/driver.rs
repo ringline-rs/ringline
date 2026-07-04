@@ -210,6 +210,8 @@ pub(crate) struct Driver {
     pub(crate) close_notify_timeout: std::time::Duration,
     /// Scratch for TLS output sends collected during CQE handling.
     pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
+    /// Monotonic disk-I/O sequence (see DriverCtx::disk_io_key).
+    pub(crate) next_disk_io_seq: u16,
     /// Tick timeout duration. When set, a timeout SQE ensures the event loop
     /// wakes periodically even when no I/O completions are pending.
     pub(crate) tick_timeout_ts: Option<io_uring::types::Timespec>,
@@ -445,6 +447,7 @@ impl Driver {
             close_notify_armed: Vec::new(),
             close_notify_timeout: std::time::Duration::from_millis(config.close_notify_timeout_ms),
             tls_out_scratch: Vec::new(),
+            next_disk_io_seq: 0,
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
                     io_uring::types::Timespec::new()
@@ -581,6 +584,7 @@ impl Driver {
             fs_fd_base: self.fs_fd_base,
             pending_close_retries: &mut self.pending_close_retries,
             close_notify_timeout: self.close_notify_timeout,
+            next_disk_io_seq: &mut self.next_disk_io_seq,
         }
     }
 

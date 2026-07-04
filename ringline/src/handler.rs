@@ -161,6 +161,7 @@ pub struct DriverCtx<'a> {
     /// Pending close retries from failed submit_close calls.
     pub(crate) pending_close_retries: &'a mut Vec<(u32, u8)>,
     pub(crate) close_notify_timeout: std::time::Duration,
+    pub(crate) next_disk_io_seq: &'a mut u16,
 }
 
 #[cfg(has_io_uring)]
@@ -258,6 +259,21 @@ impl<'a> DriverCtx<'a> {
         }
 
         Ok(())
+    }
+
+    /// Allocate a unique 32-bit disk-I/O completion key: monotonic sequence
+    /// in the high 16 bits, slab index in the low 16. fs, NVMe, and
+    /// direct-io share the executor's completion/graveyard maps; a raw slab
+    /// index collided across their three independent slabs (results swapped
+    /// between subsystems, a dropped fs future's graveyard buffer freed by
+    /// an unrelated NVMe completion while the kernel was still writing to
+    /// it) and across LIFO reuse of one slab slot within a drain batch.
+    /// CQE handlers extract the slab index from the low 16 bits and wake
+    /// with the full key.
+    pub(crate) fn disk_io_key(&mut self, slab_idx: u16) -> u32 {
+        let seq = *self.next_disk_io_seq;
+        *self.next_disk_io_seq = seq.wrapping_add(1);
+        ((seq as u32) << 16) | slab_idx as u32
     }
 
     /// Queue a batch of built sends in order; on a submit failure the
@@ -909,7 +925,7 @@ impl<'a> DriverCtx<'a> {
     /// `buf_addr` must point to a valid, aligned buffer of at least `buf_len`
     /// bytes that remains valid and exclusively accessible until the
     /// corresponding CQE completes.
-    pub fn nvme_read(
+    pub unsafe fn nvme_read(
         &mut self,
         device: crate::nvme::NvmeDevice,
         lba: u64,
@@ -931,10 +947,11 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
 
         let cmd = crate::nvme::NvmeUringCmd::read(nsid, lba, num_blocks, buf_addr, buf_len);
+        let key = self.disk_io_key(slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::NvmeCmd,
             device.index as u32,
-            slab_idx as u32,
+            key,
         );
 
         match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
@@ -944,7 +961,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     dev.in_flight += 1;
                 }
-                Ok(slab_idx as u32)
+                Ok(key)
             }
             Err(e) => {
                 if let Some(slab) = self.nvme_cmd_slab.as_mut() {
@@ -967,7 +984,7 @@ impl<'a> DriverCtx<'a> {
     /// `buf_addr` must point to a valid, aligned buffer of at least `buf_len`
     /// bytes that remains valid and exclusively accessible until the
     /// corresponding CQE completes.
-    pub fn nvme_write(
+    pub unsafe fn nvme_write(
         &mut self,
         device: crate::nvme::NvmeDevice,
         lba: u64,
@@ -989,10 +1006,11 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
 
         let cmd = crate::nvme::NvmeUringCmd::write(nsid, lba, num_blocks, buf_addr, buf_len);
+        let key = self.disk_io_key(slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::NvmeCmd,
             device.index as u32,
-            slab_idx as u32,
+            key,
         );
 
         match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
@@ -1002,7 +1020,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     dev.in_flight += 1;
                 }
-                Ok(slab_idx as u32)
+                Ok(key)
             }
             Err(e) => {
                 if let Some(slab) = self.nvme_cmd_slab.as_mut() {
@@ -1028,10 +1046,11 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
 
         let cmd = crate::nvme::NvmeUringCmd::flush(nsid);
+        let key = self.disk_io_key(slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::NvmeCmd,
             device.index as u32,
-            slab_idx as u32,
+            key,
         );
 
         match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
@@ -1041,7 +1060,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     dev.in_flight += 1;
                 }
-                Ok(slab_idx as u32)
+                Ok(key)
             }
             Err(e) => {
                 if let Some(slab) = self.nvme_cmd_slab.as_mut() {
@@ -1162,10 +1181,11 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::direct_io::DirectIoOp::Read)
             .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
 
+        let key = self.disk_io_key(slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::DirectIo,
             file.index as u32,
-            slab_idx as u32,
+            key,
         );
 
         match unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) } {
@@ -1175,7 +1195,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     f.in_flight += 1;
                 }
-                Ok(slab_idx as u32)
+                Ok(key)
             }
             Err(e) => {
                 if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
@@ -1214,10 +1234,11 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::direct_io::DirectIoOp::Write)
             .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
 
+        let key = self.disk_io_key(slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::DirectIo,
             file.index as u32,
-            slab_idx as u32,
+            key,
         );
 
         match unsafe {
@@ -1230,7 +1251,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     f.in_flight += 1;
                 }
-                Ok(slab_idx as u32)
+                Ok(key)
             }
             Err(e) => {
                 if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
@@ -1255,10 +1276,11 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::direct_io::DirectIoOp::Fsync)
             .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
 
+        let key = self.disk_io_key(slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::DirectIo,
             file.index as u32,
-            slab_idx as u32,
+            key,
         );
 
         match self.ring.submit_direct_fsync(fd_index, ud) {
@@ -1268,7 +1290,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     f.in_flight += 1;
                 }
-                Ok(slab_idx as u32)
+                Ok(key)
             }
             Err(e) => {
                 if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
@@ -1371,17 +1393,18 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
+        let key = self.disk_io_key(slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file_index as u32,
-            slab_idx as u32,
+            key,
         );
 
         match unsafe {
             self.ring
                 .submit_openat(fd_index, path_ptr, flags.0, mode, ud.raw())
         } {
-            Ok(()) => Ok((file_index, generation, slab_idx as u32)),
+            Ok(()) => Ok((file_index, generation, key)),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
                     slab.release(slab_idx);
@@ -1416,10 +1439,11 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::fs::FsOp::Read)
             .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
 
+        let key = self.disk_io_key(slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file.index as u32,
-            slab_idx as u32,
+            key,
         );
 
         match unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) } {
@@ -1429,7 +1453,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     f.in_flight += 1;
                 }
-                Ok(slab_idx as u32)
+                Ok(key)
             }
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
@@ -1462,10 +1486,11 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::fs::FsOp::Write)
             .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
 
+        let key = self.disk_io_key(slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file.index as u32,
-            slab_idx as u32,
+            key,
         );
 
         match unsafe {
@@ -1478,7 +1503,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     f.in_flight += 1;
                 }
-                Ok(slab_idx as u32)
+                Ok(key)
             }
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
@@ -1501,10 +1526,11 @@ impl<'a> DriverCtx<'a> {
             .allocate(file.index, crate::fs::FsOp::Fsync)
             .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
 
+        let key = self.disk_io_key(slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file.index as u32,
-            slab_idx as u32,
+            key,
         );
 
         match self.ring.submit_direct_fsync(fd_index, ud) {
@@ -1514,7 +1540,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     f.in_flight += 1;
                 }
-                Ok(slab_idx as u32)
+                Ok(key)
             }
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
@@ -1575,11 +1601,11 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let ud =
-            crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, slab_idx as u32);
+        let key = self.disk_io_key(slab_idx);
+        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
 
         match unsafe { self.ring.submit_statx(path_ptr, statx_ptr, ud.raw()) } {
-            Ok(()) => Ok(slab_idx as u32),
+            Ok(()) => Ok(key),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
                     slab.release(slab_idx);
@@ -1619,11 +1645,11 @@ impl<'a> DriverCtx<'a> {
             )
         };
 
-        let ud =
-            crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, slab_idx as u32);
+        let key = self.disk_io_key(slab_idx);
+        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
 
         match unsafe { self.ring.submit_renameat(old_ptr, new_ptr, ud.raw()) } {
-            Ok(()) => Ok(slab_idx as u32),
+            Ok(()) => Ok(key),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
                     slab.release(slab_idx);
@@ -1660,11 +1686,11 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let ud =
-            crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, slab_idx as u32);
+        let key = self.disk_io_key(slab_idx);
+        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
 
         match unsafe { self.ring.submit_unlinkat(path_ptr, 0, ud.raw()) } {
-            Ok(()) => Ok(slab_idx as u32),
+            Ok(()) => Ok(key),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
                     slab.release(slab_idx);
@@ -1701,11 +1727,11 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let ud =
-            crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, slab_idx as u32);
+        let key = self.disk_io_key(slab_idx);
+        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
 
         match unsafe { self.ring.submit_mkdirat(path_ptr, mode, ud.raw()) } {
-            Ok(()) => Ok(slab_idx as u32),
+            Ok(()) => Ok(key),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
                     slab.release(slab_idx);
@@ -1738,8 +1764,20 @@ impl<'a> DriverCtx<'a> {
             .sec(timeout_ms / 1000)
             .nsec((timeout_ms % 1000) as u32 * 1_000_000);
 
-        let ud =
-            crate::completion::UserData::encode(crate::completion::OpTag::Timeout, conn_index, 0);
+        // Carry the connection generation in the payload: a stale -ETIME
+        // deferred through CQ overflow could otherwise land after this slot
+        // was closed and reused for a NEW outbound connect (again in
+        // Connecting state) and kill it with a spurious TimedOut.
+        let generation = self
+            .connections
+            .get(conn_index)
+            .map(|c| c.generation)
+            .unwrap_or(0);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::Timeout,
+            conn_index,
+            generation,
+        );
         if self.ring.submit_timeout(ts as *const _, ud).is_ok()
             && let Some(cs) = self.connections.get_mut(conn_index)
         {
@@ -2065,7 +2103,12 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// NVMe read (not supported on mio backend).
-    pub fn nvme_read(
+    ///
+    /// # Safety
+    ///
+    /// Mirrors the io_uring backend's contract (caller-supplied DMA address
+    /// must be valid and outlive the operation); this stub always errors.
+    pub unsafe fn nvme_read(
         &mut self,
         _device: crate::nvme::NvmeDevice,
         _lba: u64,
@@ -2080,7 +2123,11 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// NVMe write (not supported on mio backend).
-    pub fn nvme_write(
+    ///
+    /// # Safety
+    ///
+    /// Mirrors the io_uring backend's contract; this stub always errors.
+    pub unsafe fn nvme_write(
         &mut self,
         _device: crate::nvme::NvmeDevice,
         _lba: u64,

@@ -2213,9 +2213,17 @@ impl Future for SleepFuture {
             let (slot, generation) = match executor.timer_pool.allocate(waker_id) {
                 Some(pair) => pair,
                 None => {
-                    // Pool exhausted — complete immediately rather than panic.
-                    // Callers needing explicit error handling should use try_sleep().
-                    return Poll::Ready(());
+                    // Documented contract: the infallible variants panic on
+                    // pool exhaustion (try_sleep/try_timeout are the fallible
+                    // API). Completing immediately instead was far worse than
+                    // the panic: every timeout() fired a spurious
+                    // zero-duration Elapsed that cancelled healthy I/O, and a
+                    // sleep() loop became a busy-spin keeping the pool
+                    // exhausted.
+                    panic!(
+                        "timer slot pool exhausted ({} slots) — raise Config::timer_slots or use try_sleep()/try_timeout()",
+                        executor.timer_pool.capacity()
+                    );
                 }
             };
 
@@ -2235,10 +2243,14 @@ impl Future for SleepFuture {
                     driver.ring.submit_timeout(ts_ptr, ud)
                 };
 
-                if let Err(_e) = submit_result {
+                if let Err(e) = submit_result {
                     executor.timer_pool.release(slot);
-                    // On SQE submission failure, complete immediately rather than hang.
-                    return Poll::Ready(());
+                    // SQ full at timer-arm time. Completing immediately would
+                    // fire a spurious zero-duration timeout; panicking matches
+                    // the documented infallible contract.
+                    panic!(
+                        "timer SQE submission failed: {e} — use try_sleep()/try_timeout() for fallible arming"
+                    );
                 }
             }
 
@@ -2710,7 +2722,7 @@ pub unsafe fn direct_io_read(
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
-pub fn nvme_read(
+pub unsafe fn nvme_read(
     device: crate::nvme::NvmeDevice,
     lba: u64,
     num_blocks: u16,
@@ -2719,7 +2731,9 @@ pub fn nvme_read(
 ) -> io::Result<DiskIoFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        let seq = ctx.nvme_read(device, lba, num_blocks, buf_addr, buf_len)?;
+        // SAFETY: forwarded contract — the caller of the (unsafe) public
+        // wrapper guarantees buf_addr/buf_len validity and lifetime.
+        let seq = unsafe { ctx.nvme_read(device, lba, num_blocks, buf_addr, buf_len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
         Ok(DiskIoFuture { seq })
@@ -2790,7 +2804,7 @@ pub fn nvme_flush(device: crate::nvme::NvmeDevice) -> io::Result<DiskIoFuture> {
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
-pub fn nvme_write(
+pub unsafe fn nvme_write(
     device: crate::nvme::NvmeDevice,
     lba: u64,
     num_blocks: u16,
@@ -2799,7 +2813,8 @@ pub fn nvme_write(
 ) -> io::Result<DiskIoFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        let seq = ctx.nvme_write(device, lba, num_blocks, buf_addr, buf_len)?;
+        // SAFETY: forwarded contract — see nvme_read above.
+        let seq = unsafe { ctx.nvme_write(device, lba, num_blocks, buf_addr, buf_len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.disk_io_waiters.insert(seq, task_id);
         Ok(DiskIoFuture { seq })
@@ -3060,8 +3075,30 @@ impl Future for UdpRecvFuture {
         with_state(|driver, executor| {
             let idx = self.udp_index as usize;
             if idx < executor.udp_recv_queues.len()
-                && let Some(entry) = executor.udp_recv_queues[idx].pop_front()
+                && let Some(mut entry) = executor.udp_recv_queues[idx].pop_front()
             {
+                // GRO-coalesced entry: hand out ONE datagram per call (the
+                // docs promise "the next datagram"). Returning the whole
+                // coalesced blob concatenated N datagrams into one.
+                if entry.segment_size != 0 {
+                    let (start, end) = entry.next_segment_range();
+                    let peer = entry.peer;
+                    let seg = entry.data()[start..end].to_vec();
+                    entry.consumed = end as u32;
+                    if entry.exhausted() {
+                        let bid = entry.bid_to_release();
+                        #[cfg(has_io_uring)]
+                        if let Some(bid) = bid {
+                            driver.udp_pending_replenish.push(bid);
+                        }
+                        #[cfg(not(has_io_uring))]
+                        let _ = bid;
+                    } else {
+                        executor.udp_recv_queues[idx].push_front(entry);
+                    }
+                    let _ = &driver;
+                    return Poll::Ready((seg, peer));
+                }
                 let bid = entry.bid_to_release();
                 let owned = entry.into_owned();
                 #[cfg(has_io_uring)]
@@ -3118,22 +3155,30 @@ where
         with_state(|driver, executor| {
             let idx = this.udp_index as usize;
             if idx < executor.udp_recv_queues.len()
-                && let Some(entry) = executor.udp_recv_queues[idx].pop_front()
+                && let Some(mut entry) = executor.udp_recv_queues[idx].pop_front()
             {
-                let bid = entry.bid_to_release();
                 let f = this
                     .f
                     .as_mut()
                     .expect("UdpWithDatagramFuture polled after Ready");
-                let r = f(entry.data(), entry.peer);
+                // One datagram per call: for a GRO-coalesced entry, run the
+                // callback on the next segment and keep the remainder queued.
+                let (start, end) = entry.next_segment_range();
+                let r = f(&entry.data()[start..end], entry.peer);
                 this.f.take();
-                drop(entry);
-                #[cfg(has_io_uring)]
-                if let Some(bid) = bid {
-                    driver.udp_pending_replenish.push(bid);
+                entry.consumed = end as u32;
+                if entry.exhausted() {
+                    let bid = entry.bid_to_release();
+                    drop(entry);
+                    #[cfg(has_io_uring)]
+                    if let Some(bid) = bid {
+                        driver.udp_pending_replenish.push(bid);
+                    }
+                    #[cfg(not(has_io_uring))]
+                    let _ = (bid, driver);
+                } else {
+                    executor.udp_recv_queues[idx].push_front(entry);
                 }
-                #[cfg(not(has_io_uring))]
-                let _ = (bid, driver);
                 return Poll::Ready(r);
             }
             let task_id = CURRENT_TASK_ID.with(|c| c.get());

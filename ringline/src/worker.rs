@@ -525,6 +525,13 @@ impl RinglineBuilder {
             + Clone
             + 'static,
     {
+        // Re-validate: RinglineBuilder::bind_udp / bind_udp_connected mutate
+        // udp_bind AFTER ConfigBuilder::build() ran validate(), and every
+        // UDP check is gated on !udp_bind.is_empty() — so builder-bound UDP
+        // sockets used to skip validation entirely (e.g. GRO with a
+        // too-small buffer silently truncates datagrams).
+        self.config.validate()?;
+
         let num_threads = if self.config.worker.threads == 0 {
             crate::topology::physical_core_count()
         } else {
