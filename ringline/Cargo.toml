@@ -45,6 +45,11 @@ proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
 
 [[bench]]
+name = "accumulator"
+harness = false
+path = "benches/accumulator.rs"
+
+[[bench]]
 name = "buffer"
 harness = false
 path = "benches/buffer.rs"

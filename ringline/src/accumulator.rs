@@ -163,6 +163,14 @@ impl AccumulatorTable {
         acc.buf.split_to(len).freeze()
     }
 
+    /// Put back the unconsumed remainder of a `take_frozen()` view.
+    ///
+    /// Called from the `with_bytes` path when the parser didn't consume
+    /// everything (pipelined remainder or incomplete next message).
+    pub fn put_back(&mut self, index: u32, data: Bytes) {
+        self.prepend(index, &data);
+    }
+
     /// Put unconsumed data back into the accumulator.
     ///
     /// Called after `take_frozen()` when the parser didn't consume
