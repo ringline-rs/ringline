@@ -35,7 +35,8 @@ use memcache_proto::ResponseBytes as McResponseBytes;
 use ringline::ConnCtx;
 
 use crate::{
-    Client, Error, GetValue, Value, check_error_bytes, encode_add, encode_request, encode_set,
+    Client, Error, GetValue, Value, check_error_bytes, encode_add, encode_request,
+    encode_request_into,
 };
 use memcache_proto::Request as McRequest;
 
@@ -82,6 +83,7 @@ pub struct ShardedClient {
     ring: ketama::Ring,
     connect_timeout_ms: u64,
     tls_server_name: Option<String>,
+    encode_buf: Vec<u8>,
 }
 
 impl ShardedClient {
@@ -113,6 +115,7 @@ impl ShardedClient {
             ring,
             connect_timeout_ms: config.connect_timeout_ms,
             tls_server_name: config.tls_server_name,
+            encode_buf: Vec::new(),
         }
     }
 
@@ -247,8 +250,14 @@ impl ShardedClient {
     /// Get the value of a key. Returns `None` on cache miss.
     pub async fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Value>, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&memcache_proto::Request::get(key))?;
-        let response = self.route_command(key, &encoded).await?;
+        let mut buf = std::mem::take(&mut self.encode_buf);
+        buf.clear();
+        let response = match encode_request_into(&memcache_proto::Request::get(key), &mut buf) {
+            Ok(()) => self.route_command(key, &buf).await,
+            Err(e) => Err(e),
+        };
+        self.encode_buf = buf;
+        let response = response?;
         match response {
             McResponseBytes::Values(mut values) => {
                 if values.is_empty() {
@@ -307,8 +316,20 @@ impl ShardedClient {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = encode_set(key, value, flags, exptime)?;
-        let response = self.route_command(key, &encoded).await?;
+        let mut buf = std::mem::take(&mut self.encode_buf);
+        buf.clear();
+        let req = McRequest::Set {
+            key,
+            value,
+            flags,
+            exptime,
+        };
+        let response = match encode_request_into(&req, &mut buf) {
+            Ok(()) => self.route_command(key, &buf).await,
+            Err(e) => Err(e),
+        };
+        self.encode_buf = buf;
+        let response = response?;
         match response {
             McResponseBytes::Stored => Ok(()),
             _ => Err(Error::UnexpectedResponse),
@@ -442,8 +463,14 @@ impl ShardedClient {
     /// Delete a key. Returns `true` if deleted, `false` if not found.
     pub async fn delete(&mut self, key: impl AsRef<[u8]>) -> Result<bool, Error> {
         let key = key.as_ref();
-        let encoded = encode_request(&McRequest::delete(key))?;
-        let response = self.route_command(key, &encoded).await?;
+        let mut buf = std::mem::take(&mut self.encode_buf);
+        buf.clear();
+        let response = match encode_request_into(&McRequest::delete(key), &mut buf) {
+            Ok(()) => self.route_command(key, &buf).await,
+            Err(e) => Err(e),
+        };
+        self.encode_buf = buf;
+        let response = response?;
         match response {
             McResponseBytes::Deleted => Ok(true),
             McResponseBytes::NotFound => Ok(false),

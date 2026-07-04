@@ -89,6 +89,7 @@ pub struct ShardedClient {
     tls_server_name: Option<String>,
     password: Option<String>,
     username: Option<String>,
+    encode_buf: Vec<u8>,
 }
 
 impl ShardedClient {
@@ -122,6 +123,7 @@ impl ShardedClient {
             tls_server_name: config.tls_server_name,
             password: config.password,
             username: config.username,
+            encode_buf: Vec::new(),
         }
     }
 
@@ -267,8 +269,12 @@ impl ShardedClient {
     /// Get the value of a key.
     pub async fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
-        self.route_bulk(key, &Client::encode_request(&Request::get(key)))
-            .await
+        let mut buf = std::mem::take(&mut self.encode_buf);
+        buf.clear();
+        Client::encode_request_into(&Request::get(key), &mut buf);
+        let res = self.route_bulk(key, &buf).await;
+        self.encode_buf = buf;
+        res
     }
 
     /// Set a key-value pair.
@@ -279,8 +285,12 @@ impl ShardedClient {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = Client::encode_set_request(&Request::set(key, value));
-        let resp = self.route_command(key, &encoded).await?;
+        let mut buf = std::mem::take(&mut self.encode_buf);
+        buf.clear();
+        Client::encode_set_request_into(&Request::set(key, value), &mut buf);
+        let resp = self.route_command(key, &buf).await;
+        self.encode_buf = buf;
+        let resp = resp?;
         match resp {
             Value::SimpleString(_) | Value::Null => Ok(()),
             _ => Err(Error::UnexpectedResponse),
@@ -296,8 +306,12 @@ impl ShardedClient {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = Client::encode_set_request(&Request::set(key, value).ex(ttl_secs));
-        self.route_ok(key, &encoded).await
+        let mut buf = std::mem::take(&mut self.encode_buf);
+        buf.clear();
+        Client::encode_set_request_into(&Request::set(key, value).ex(ttl_secs), &mut buf);
+        let res = self.route_ok(key, &buf).await;
+        self.encode_buf = buf;
+        res
     }
 
     /// Set a key-value pair with TTL in milliseconds.
@@ -309,8 +323,12 @@ impl ShardedClient {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = Client::encode_set_request(&Request::set(key, value).px(ttl_ms));
-        self.route_ok(key, &encoded).await
+        let mut buf = std::mem::take(&mut self.encode_buf);
+        buf.clear();
+        Client::encode_set_request_into(&Request::set(key, value).px(ttl_ms), &mut buf);
+        let res = self.route_ok(key, &buf).await;
+        self.encode_buf = buf;
+        res
     }
 
     /// Set a key only if it does not already exist. Returns true if the key was set.
@@ -321,8 +339,12 @@ impl ShardedClient {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let encoded = Client::encode_set_request(&Request::set(key, value).nx());
-        let resp = self.route_command(key, &encoded).await?;
+        let mut buf = std::mem::take(&mut self.encode_buf);
+        buf.clear();
+        Client::encode_set_request_into(&Request::set(key, value).nx(), &mut buf);
+        let resp = self.route_command(key, &buf).await;
+        self.encode_buf = buf;
+        let resp = resp?;
         match resp {
             Value::SimpleString(_) => Ok(true),
             Value::Null => Ok(false),
@@ -333,9 +355,12 @@ impl ShardedClient {
     /// Delete a key. Returns the number of keys deleted.
     pub async fn del(&mut self, key: impl AsRef<[u8]>) -> Result<u64, Error> {
         let key = key.as_ref();
-        self.route_int(key, &Client::encode_request(&Request::del(key)))
-            .await
-            .map(|n| n as u64)
+        let mut buf = std::mem::take(&mut self.encode_buf);
+        buf.clear();
+        Client::encode_request_into(&Request::del(key), &mut buf);
+        let res = self.route_int(key, &buf).await;
+        self.encode_buf = buf;
+        res.map(|n| n as u64)
     }
 
     /// Get values for multiple keys. All keys must route to the same shard.
@@ -385,7 +410,8 @@ impl ShardedClient {
     /// Increment the integer value of a key by a given amount.
     pub async fn incrby(&mut self, key: impl AsRef<[u8]>, delta: i64) -> Result<i64, Error> {
         let key = key.as_ref();
-        let delta_str = delta.to_string();
+        let mut delta_itoa = itoa::Buffer::new();
+        let delta_str = delta_itoa.format(delta);
         self.route_int(
             key,
             &Client::encode_request(&Request::cmd(b"INCRBY").arg(key).arg(delta_str.as_bytes())),
@@ -396,7 +422,8 @@ impl ShardedClient {
     /// Decrement the integer value of a key by a given amount.
     pub async fn decrby(&mut self, key: impl AsRef<[u8]>, delta: i64) -> Result<i64, Error> {
         let key = key.as_ref();
-        let delta_str = delta.to_string();
+        let mut delta_itoa = itoa::Buffer::new();
+        let delta_str = delta_itoa.format(delta);
         self.route_int(
             key,
             &Client::encode_request(&Request::cmd(b"DECRBY").arg(key).arg(delta_str.as_bytes())),
@@ -435,7 +462,8 @@ impl ShardedClient {
     /// Set a timeout on a key in seconds.
     pub async fn expire(&mut self, key: impl AsRef<[u8]>, seconds: u64) -> Result<bool, Error> {
         let key = key.as_ref();
-        let secs_str = seconds.to_string();
+        let mut secs_itoa = itoa::Buffer::new();
+        let secs_str = secs_itoa.format(seconds);
         self.route_int(
             key,
             &Client::encode_request(&Request::cmd(b"EXPIRE").arg(key).arg(secs_str.as_bytes())),
@@ -676,7 +704,8 @@ impl ShardedClient {
     ) -> Result<i64, Error> {
         let key = key.as_ref();
         let field = field.as_ref();
-        let delta_str = delta.to_string();
+        let mut delta_itoa = itoa::Buffer::new();
+        let delta_str = delta_itoa.format(delta);
         self.route_int(
             key,
             &Client::encode_request(
@@ -766,7 +795,8 @@ impl ShardedClient {
         index: i64,
     ) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
-        let idx_str = index.to_string();
+        let mut idx_itoa = itoa::Buffer::new();
+        let idx_str = idx_itoa.format(index);
         self.route_bulk(
             key,
             &Client::encode_request(&Request::cmd(b"LINDEX").arg(key).arg(idx_str.as_bytes())),
@@ -782,8 +812,10 @@ impl ShardedClient {
         stop: i64,
     ) -> Result<Vec<Bytes>, Error> {
         let key = key.as_ref();
-        let start_str = start.to_string();
-        let stop_str = stop.to_string();
+        let mut start_itoa = itoa::Buffer::new();
+        let start_str = start_itoa.format(start);
+        let mut stop_itoa = itoa::Buffer::new();
+        let stop_str = stop_itoa.format(stop);
         let value = self
             .route_command(
                 key,
@@ -806,8 +838,10 @@ impl ShardedClient {
         stop: i64,
     ) -> Result<(), Error> {
         let key = key.as_ref();
-        let start_str = start.to_string();
-        let stop_str = stop.to_string();
+        let mut start_itoa = itoa::Buffer::new();
+        let start_str = start_itoa.format(start);
+        let mut stop_itoa = itoa::Buffer::new();
+        let stop_str = stop_itoa.format(stop);
         self.route_ok(
             key,
             &Client::encode_request(
@@ -829,7 +863,8 @@ impl ShardedClient {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let idx_str = index.to_string();
+        let mut idx_itoa = itoa::Buffer::new();
+        let idx_str = idx_itoa.format(index);
         self.route_ok(
             key,
             &Client::encode_request(
@@ -978,7 +1013,8 @@ impl ShardedClient {
         count: i64,
     ) -> Result<Vec<Bytes>, Error> {
         let key = key.as_ref();
-        let count_str = count.to_string();
+        let mut count_itoa = itoa::Buffer::new();
+        let count_str = count_itoa.format(count);
         let value = self
             .route_command(
                 key,
