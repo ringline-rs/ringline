@@ -379,7 +379,7 @@ impl<'a> DriverCtx<'a> {
             copy_slices: [(std::ptr::null(), 0); MAX_IOVECS],
             copy_count: 0,
             total_copy_len: 0,
-            guards: [None, None, None, None],
+            guards: [const { None }; crate::buffer::send_slab::MAX_GUARDS],
             guard_count: 0,
             total_len: 0,
             error: None,
@@ -2733,7 +2733,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         if self.guard_count as usize >= MAX_GUARDS {
             self.error = Some(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "too many guards (max 4)",
+                "too many guards (max 8)",
             ));
             return self;
         }
@@ -3158,7 +3158,7 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             copy_slices: [(std::ptr::null(), 0); MAX_IOVECS],
             copy_count: 0,
             total_copy_len: 0,
-            guards: [None, None, None, None],
+            guards: [const { None }; crate::buffer::send_slab::MAX_GUARDS],
             guard_count: 0,
             total_len: 0,
         }
@@ -3291,7 +3291,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         if self.guard_count as usize >= MAX_GUARDS {
             self.chain.error = Some(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "too many guards (max 4)",
+                "too many guards (max 8)",
             ));
             return self;
         }
@@ -3324,7 +3324,68 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         // Build the SQE using a temporary SendBuilder on the chain's context.
         let conn_index = self.chain.conn.index;
 
-        let built = if self.guard_count == 0 {
+        // Small guard sends: ZC bookkeeping (slab entry + notification CQE)
+        // costs more than a memcpy below the threshold. Same fold that
+        // `SendBuilder::submit` performs via `submit_small_gather`; without
+        // it, chained sub-threshold guard parts paid the ZC path
+        // unconditionally. Gather all parts — guard bytes included — into
+        // one pool slot and emit a plain Send; guards drop immediately
+        // (data is copied out before return). Falls through to the ZC path
+        // when the pool is exhausted or the gather doesn't fit a slot.
+        let threshold = self.chain.ctx.send_zc_threshold;
+        let folded: Option<BuiltSend> =
+            if self.guard_count > 0 && threshold > 0 && self.total_len < threshold {
+                let mut all_slices = [(std::ptr::null::<u8>(), 0usize); MAX_IOVECS];
+                let mut n = 0usize;
+                for i in 0..self.part_count as usize {
+                    match self.parts[i] {
+                        PartSlot::Copy { slice_idx } => {
+                            all_slices[n] = self.copy_slices[slice_idx as usize];
+                            n += 1;
+                        }
+                        PartSlot::Guard { guard_idx } => {
+                            let g = self.guards[guard_idx as usize].as_ref().unwrap();
+                            let (gptr, glen) = g.as_ptr_len();
+                            all_slices[n] = (gptr, glen as usize);
+                            n += 1;
+                        }
+                        PartSlot::Empty => {}
+                    }
+                }
+                let gathered = unsafe {
+                    self.chain
+                        .ctx
+                        .send_copy_pool
+                        .copy_in_gather(&all_slices[..n], self.total_len as usize)
+                };
+                gathered.map(|(slot, ptr, len)| {
+                    // Data is in the pool now — release the guards.
+                    for g in self.guards.iter_mut() {
+                        *g = None;
+                    }
+                    let user_data = crate::completion::UserData::encode(
+                        crate::completion::OpTag::Send,
+                        conn_index,
+                        slot as u32,
+                    );
+                    let entry =
+                        io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
+                            .build()
+                            .user_data(user_data.raw());
+                    BuiltSend {
+                        entry,
+                        pool_slot: slot,
+                        slab_idx: u16::MAX,
+                        total_len: self.total_len,
+                    }
+                })
+            } else {
+                None
+            };
+
+        let built = if let Some(built) = folded {
+            built
+        } else if self.guard_count == 0 {
             // Copy-only: gather into pool slot.
             let result = unsafe {
                 self.chain.ctx.send_copy_pool.copy_in_gather(

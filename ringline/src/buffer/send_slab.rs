@@ -1,7 +1,12 @@
 use crate::guard::GuardBox;
 
 pub(crate) const MAX_IOVECS: usize = 32;
-pub(crate) const MAX_GUARDS: usize = 4;
+/// Raised from 4 after rig measurement showed the guard-flush batching cap
+/// costing ~17% on guarded-SET pipelines vs the copy path (each flush pays a
+/// syscall + slab entry; deeper batches amortize it). 8 guards need 2*8+1 =
+/// 17 iovecs, still well under MAX_IOVECS; the per-entry cost is 4 more
+/// `Option<GuardBox>` slots (64 B).
+pub(crate) const MAX_GUARDS: usize = 8;
 
 /// Slab for in-flight scatter-gather sends with zero-copy guards.
 ///
@@ -59,7 +64,7 @@ impl InFlightSendSlab {
                 pool_slot_count: 0,
                 bids: [u16::MAX; MAX_IOVECS],
                 bid_count: 0,
-                guards: [None, None, None, None],
+                guards: [const { None }; MAX_GUARDS],
                 guard_count: 0,
                 conn_index: 0,
                 total_len: 0,
@@ -373,7 +378,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         let (idx, ptr) = slab
             .allocate(42, &iovecs, u16::MAX, guards, 0, 100)
             .unwrap();
@@ -410,7 +415,7 @@ mod tests {
             },
         ];
 
-        let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
 
         // Partial send: 50 bytes (entire first iovec)
@@ -435,7 +440,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
 
         slab.inc_pending_notifs(idx);
@@ -478,7 +483,9 @@ mod tests {
             drop_counter: counter.clone(),
         });
 
-        let guards: [Option<GuardBox>; MAX_GUARDS] = [Some(g1), Some(g2), None, None];
+        let mut guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
+        guards[0] = Some(g1);
+        guards[1] = Some(g2);
         let (idx, _) = slab.allocate(0, &iovecs, 5, guards, 2, 10).unwrap();
 
         assert_eq!(counter.load(Ordering::SeqCst), 0);
@@ -496,7 +503,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
 
         // Simulate result == 0: no inc_pending_notifs, just mark_awaiting.
@@ -522,7 +529,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
 
         // Simulate error result (result < 0): do NOT call inc_pending_notifs.
@@ -545,7 +552,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         let (idx, _) = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 100).unwrap();
 
         // Bug scenario: incorrectly calling inc_pending_notifs on error result.
@@ -572,10 +579,10 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 10,
         }];
-        let guards: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let guards: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         let _ = slab.allocate(0, &iovecs, u16::MAX, guards, 0, 10).unwrap();
 
-        let guards2: [Option<GuardBox>; MAX_GUARDS] = [None, None, None, None];
+        let guards2: [Option<GuardBox>; MAX_GUARDS] = [const { None }; MAX_GUARDS];
         assert!(
             slab.allocate(0, &iovecs, u16::MAX, guards2, 0, 10)
                 .is_none()

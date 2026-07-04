@@ -144,10 +144,10 @@ use resp_proto::{Request, Value};
 use ringline::{ConnCtx, GuardBox, ParseResult, SendGuard};
 
 /// Maximum guards per scatter-gather send (matches ringline core limit).
-const MAX_FLUSH_GUARDS: usize = 4;
+const MAX_FLUSH_GUARDS: usize = 8;
 /// Maximum iovecs a full guard batch needs: each guard contributes an iovec
 /// plus at most one copied-run iovec before it, plus one trailing copied run
-/// (2g+1 = 9). Well under the ringline core limit of 32. Was incorrectly 8,
+/// (2g+1 = 17). Well under the ringline core limit of 32. Was incorrectly 8,
 /// which made guard batches flush at 3 guards instead of MAX_FLUSH_GUARDS.
 const MAX_FLUSH_IOVECS: usize = 2 * MAX_FLUSH_GUARDS + 1;
 /// Default [`ClientBuilder::zc_threshold`]. Matches the runtime
@@ -2792,9 +2792,9 @@ mod zc_threshold_tests {
 
     #[test]
     fn guard_batch_accumulates_max_flush_guards_before_flush() {
-        // zc_threshold = 0 forces the guard path. MAX_FLUSH_GUARDS (4) guards
-        // must accumulate without triggering a pre-flush: 4 guards need
-        // 2*4+1 = 9 iovecs, within MAX_FLUSH_IOVECS. A stale iovec cap of 8
+        // zc_threshold = 0 forces the guard path. MAX_FLUSH_GUARDS guards
+        // must accumulate without triggering a pre-flush: g guards need
+        // 2g+1 iovecs, within MAX_FLUSH_IOVECS. A stale iovec cap of 8
         // used to force a flush at the 4th guard (batching only 3).
         let mut client = test_client(16, 0);
         for i in 0..MAX_FLUSH_GUARDS {
@@ -2815,7 +2815,7 @@ mod zc_threshold_tests {
         // path (write_guards stays empty), so they batch into a single buffer
         // and exactly one flush is triggered by the Nth op (buffered_ops
         // resets to 0, write_buf cleared). With a guard path they'd flush
-        // every MAX_FLUSH_GUARDS (4) ops instead.
+        // every MAX_FLUSH_GUARDS ops instead.
         const N: usize = 8;
         let mut client = test_client(N, 4096);
         // Pre-fill write_buf so we can detect the flush clearing it; but the

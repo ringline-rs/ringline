@@ -3324,7 +3324,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards = [None, None, None, None];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
@@ -3357,7 +3357,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards = [None, None, None, None];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
@@ -3384,7 +3384,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards = [None, None, None, None];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
@@ -3965,7 +3965,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards = [None, None, None, None];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
@@ -4103,7 +4103,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards = [None, None, None, None];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
@@ -4166,7 +4166,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards = [None, None, None, None];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
@@ -4197,7 +4197,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards = [None, None, None, None];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
@@ -4563,7 +4563,7 @@ mod tests {
             iov_base: std::ptr::null_mut(),
             iov_len: 100,
         }];
-        let guards = [None, None, None, None];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
         let (slab_idx, _ptr) = el
             .driver
             .send_slab
@@ -5471,7 +5471,7 @@ mod tests {
 
                 for action in &actions {
                     let iovecs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 100 }];
-                    let guards = [None, None, None, None];
+                    let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
                     let (slab_idx, _) = match el.driver.send_slab.allocate(conn_index, &iovecs, u16::MAX, guards, 0, 100) {
                         Some(s) => s,
                         None => break,
@@ -5591,7 +5591,7 @@ mod tests {
                                 iov_base: std::ptr::null_mut(),
                                 iov_len: 50,
                             }];
-                            let guards = [None, None, None, None];
+                            let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
                             if let Some((slab_idx, _)) = el.driver.send_slab.allocate(
                                 ci, &iovecs, u16::MAX, guards, 0, 50,
                             ) {
@@ -5612,7 +5612,7 @@ mod tests {
                                 iov_base: std::ptr::null_mut(),
                                 iov_len: 50,
                             }];
-                            let guards = [None, None, None, None];
+                            let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
                             if let Some((slab_idx, _)) = el.driver.send_slab.allocate(
                                 ci, &iovecs, u16::MAX, guards, 0, 50,
                             ) {
