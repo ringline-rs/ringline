@@ -255,285 +255,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // message is applied to this worker's ring + registry and then
             // acknowledged so the registrar can return to its caller.
             self.drain_region_control();
-
-            // Retry any ZC send resubmissions that failed on the previous tick
+            // Retry send/close submissions that failed on a previous tick
             // (SQ was full). The SQ has been flushed by submit_and_wait above.
-            if !self.driver.pending_zc_retries.is_empty() {
-                std::mem::swap(
-                    &mut self.driver.pending_zc_retries,
-                    &mut self.driver.zc_retry_scratch,
-                );
-                for idx in 0..self.driver.zc_retry_scratch.len() {
-                    let (conn_index, generation, slab_idx, retries) =
-                        self.driver.zc_retry_scratch[idx];
-                    if retries >= 2 {
-                        // Max retries exceeded — release and drop.
-                        if self.driver.send_slab.in_use(slab_idx) {
-                            self.driver.send_slab.mark_awaiting_notifications(slab_idx);
-                            if self.driver.send_slab.should_release(slab_idx) {
-                                let pool_slot = self.driver.send_slab.release(slab_idx);
-                                if pool_slot != u16::MAX {
-                                    self.driver.send_copy_pool.release(pool_slot);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    if !self.driver.send_slab.in_use(slab_idx) {
-                        continue; // slab was released in the meantime
-                    }
-                    // Verify the connection hasn't been reused (generation check).
-                    if self.driver.connections.get(conn_index).is_none()
-                        || self.driver.connections.generation(conn_index) != generation
-                    {
-                        // Connection closed or reused — release the slab.
-                        if self.driver.send_slab.in_use(slab_idx) {
-                            self.driver.send_slab.mark_awaiting_notifications(slab_idx);
-                            if self.driver.send_slab.should_release(slab_idx) {
-                                let pool_slot = self.driver.send_slab.release(slab_idx);
-                                if pool_slot != u16::MAX {
-                                    self.driver.send_copy_pool.release(pool_slot);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-                    if self
-                        .driver
-                        .ring
-                        .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
-                        .is_err()
-                    {
-                        // Still failing — re-queue with incremented count.
-                        self.driver.pending_zc_retries.push((
-                            conn_index,
-                            generation,
-                            slab_idx,
-                            retries + 1,
-                        ));
-                    }
-                }
-                self.driver.zc_retry_scratch.clear();
-            }
-
-            // Retry coalesced send resubmissions that failed (SQ was full).
-            if !self.driver.pending_coalesced_retries.is_empty() {
-                std::mem::swap(
-                    &mut self.driver.pending_coalesced_retries,
-                    &mut self.driver.coalesced_retry_scratch,
-                );
-                for idx in 0..self.driver.coalesced_retry_scratch.len() {
-                    let (conn_index, generation, slab_idx, retries) =
-                        self.driver.coalesced_retry_scratch[idx];
-                    if !self.driver.send_slab.in_use(slab_idx) {
-                        continue; // slab released meanwhile
-                    }
-                    if retries >= 2
-                        || self.driver.connections.get(conn_index).is_none()
-                        || self.driver.connections.generation(conn_index) != generation
-                    {
-                        // Give up / connection reused — release and unwind this
-                        // connection's send state so it isn't left stuck.
-                        self.release_coalesced(slab_idx);
-                        self.driver.drain_conn_send_queue(conn_index);
-                        self.driver.note_send_finalized(conn_index);
-                        continue;
-                    }
-                    let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-                    if self
-                        .driver
-                        .ring
-                        .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
-                        .is_err()
-                    {
-                        self.driver.pending_coalesced_retries.push((
-                            conn_index,
-                            generation,
-                            slab_idx,
-                            retries + 1,
-                        ));
-                    }
-                }
-                self.driver.coalesced_retry_scratch.clear();
-            }
-
-            // Retry recv-forward send resubmissions that failed (SQ was full).
-            if !self.driver.pending_recv_forward_retries.is_empty() {
-                std::mem::swap(
-                    &mut self.driver.pending_recv_forward_retries,
-                    &mut self.driver.recv_forward_retry_scratch,
-                );
-                for idx in 0..self.driver.recv_forward_retry_scratch.len() {
-                    let (conn_index, generation, slab_idx, retries) =
-                        self.driver.recv_forward_retry_scratch[idx];
-                    if !self.driver.send_slab.in_use(slab_idx) {
-                        continue; // slab released meanwhile
-                    }
-                    if retries >= 2
-                        || self.driver.connections.get(conn_index).is_none()
-                        || self.driver.connections.generation(conn_index) != generation
-                    {
-                        // Give up / connection reused — replenish bids and unwind.
-                        self.release_recv_forward(slab_idx);
-                        self.driver.submit_next_queued(conn_index);
-                        self.driver.note_send_finalized(conn_index);
-                        continue;
-                    }
-                    let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-                    if self
-                        .driver
-                        .ring
-                        .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
-                        .is_err()
-                    {
-                        self.driver.pending_recv_forward_retries.push((
-                            conn_index,
-                            generation,
-                            slab_idx,
-                            retries + 1,
-                        ));
-                    }
-                }
-                self.driver.recv_forward_retry_scratch.clear();
-            }
-
-            // Retry any copy send resubmissions that failed (SQ was full).
-            if !self.driver.pending_copy_retries.is_empty() {
-                std::mem::swap(
-                    &mut self.driver.pending_copy_retries,
-                    &mut self.driver.copy_retry_scratch,
-                );
-                for idx in 0..self.driver.copy_retry_scratch.len() {
-                    let (conn_index, generation, pool_slot, retries) =
-                        self.driver.copy_retry_scratch[idx];
-                    if retries >= 2 {
-                        // Max retries exceeded — release and drop.
-                        if self.driver.send_copy_pool.in_use(pool_slot) {
-                            self.driver.send_copy_pool.release(pool_slot);
-                        }
-                        continue;
-                    }
-                    if !self.driver.send_copy_pool.in_use(pool_slot) {
-                        continue;
-                    }
-                    // Verify the connection hasn't been reused (generation check).
-                    if self.driver.connections.get(conn_index).is_none()
-                        || self.driver.connections.generation(conn_index) != generation
-                    {
-                        if self.driver.send_copy_pool.in_use(pool_slot) {
-                            self.driver.send_copy_pool.release(pool_slot);
-                        }
-                        continue;
-                    }
-                    let (ptr, remaining) =
-                        self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
-                    // Determine opcode: TLS connections use TlsSend, others use Send.
-                    let is_tls = self
-                        .driver
-                        .tls_table
-                        .as_ref()
-                        .is_some_and(|t| t.has(conn_index));
-                    let result = if is_tls {
-                        self.driver
-                            .ring
-                            .submit_tls_send(conn_index, ptr, remaining, pool_slot)
-                    } else {
-                        self.driver
-                            .ring
-                            .submit_send_copied(conn_index, ptr, remaining, pool_slot)
-                    };
-                    if result.is_err() {
-                        self.driver.pending_copy_retries.push((
-                            conn_index,
-                            generation,
-                            pool_slot,
-                            retries + 1,
-                        ));
-                    }
-                }
-                self.driver.copy_retry_scratch.clear();
-            }
-
-            // Retry any close submissions that failed (SQ was full).
-            // Max 5 retries with backoff: only re-queue every 4 ticks.
-            if !self.driver.pending_close_retries.is_empty() {
-                let retries: Vec<_> = self.driver.pending_close_retries.drain(..).collect();
-                let tick_mod = self.driver.tick_count % 4;
-                for (conn_index, retry) in retries {
-                    if retry >= 5 {
-                        // Max retries exceeded — give up, finalize close.
-                        self.driver.try_finalize_close(conn_index);
-                        continue;
-                    }
-                    // Backoff: only re-queue every 4 ticks.
-                    if tick_mod != 0 {
-                        continue;
-                    }
-                    if self.driver.ring.submit_close(conn_index).is_err() {
-                        // Still failing — re-queue with incremented count.
-                        self.driver
-                            .pending_close_retries
-                            .push((conn_index, retry + 1));
-                    }
-                }
-            }
-
-            // Retry any POLLOUT arming that failed at EAGAIN time
-            // (the SQ was full when we received the EAGAIN CQE).
-            // Max 3 retries with backoff: only re-queue every 2 ticks.
-            if !self.driver.pending_send_pollout_retries.is_empty() {
-                std::mem::swap(
-                    &mut self.driver.pending_send_pollout_retries,
-                    &mut self.driver.send_pollout_retry_scratch,
-                );
-                let tick_mod = self.driver.tick_count % 2;
-                for idx in 0..self.driver.send_pollout_retry_scratch.len() {
-                    let (conn_index, generation, pool_slot, retry) =
-                        self.driver.send_pollout_retry_scratch[idx];
-                    if retry >= 3 {
-                        // Max retries exceeded — release pool + drain queue + close.
-                        if self.driver.send_copy_pool.in_use(pool_slot) {
-                            self.driver.send_copy_pool.release(pool_slot);
-                        }
-                        self.driver.drain_conn_send_queue(conn_index);
-                        let err = io::Error::other("max retries during send pollout retry");
-                        self.executor.wake_send(conn_index, Err(err));
-                        self.driver.close_connection(conn_index);
-                        continue;
-                    }
-                    // Backoff: only re-queue every 2 ticks.
-                    if tick_mod != 0 {
-                        continue;
-                    }
-                    if !self.driver.send_copy_pool.in_use(pool_slot) {
-                        continue;
-                    }
-                    if self.driver.connections.get(conn_index).is_none()
-                        || self.driver.connections.generation(conn_index) != generation
-                    {
-                        if self.driver.send_copy_pool.in_use(pool_slot) {
-                            self.driver.send_copy_pool.release(pool_slot);
-                        }
-                        continue;
-                    }
-                    if self
-                        .driver
-                        .ring
-                        .submit_send_pollout(conn_index, pool_slot)
-                        .is_err()
-                    {
-                        self.driver.pending_send_pollout_retries.push((
-                            conn_index,
-                            generation,
-                            pool_slot,
-                            retry + 1,
-                        ));
-                    }
-                }
-                self.driver.send_pollout_retry_scratch.clear();
-            }
-
+            self.drain_zc_retries();
+            self.drain_coalesced_retries();
+            self.drain_recv_forward_retries();
+            self.drain_copy_retries();
+            self.drain_close_retries();
+            self.drain_send_pollout_retries();
             self.driver.tick_count += 1;
 
             // Check close_notify deadlines — force-close connections where
@@ -1554,9 +1283,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 {
                     // SQ full — queue for retry on next tick.
                     let generation = self.driver.connections.generation(conn_index);
-                    self.driver
-                        .pending_copy_retries
-                        .push((conn_index, generation, pool_slot, 0));
+                    self.driver.pending_copy_retries.push((
+                        conn_index,
+                        generation,
+                        pool_slot,
+                        0,
+                        OpTag::Send,
+                    ));
                 }
                 return;
             }
@@ -1654,9 +1387,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             // SQ full — pick up on the next tick.
             let generation = self.driver.connections.generation(conn_index);
-            self.driver
-                .pending_copy_retries
-                .push((conn_index, generation, pool_slot, 0));
+            self.driver.pending_copy_retries.push((
+                conn_index,
+                generation,
+                pool_slot,
+                0,
+                OpTag::Send,
+            ));
         }
     }
 
@@ -2317,11 +2054,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .is_err()
             {
                 // SQ full — queue for retry on next tick. Use copy retry
-                // since TLS sends use SendCopyPool slots.
+                // since TLS sends use SendCopyPool slots; the stored OpTag
+                // keeps the resubmission on the TlsSend completion path.
                 let generation = self.driver.connections.generation(conn_index);
-                self.driver
-                    .pending_copy_retries
-                    .push((conn_index, generation, pool_slot, 0));
+                self.driver.pending_copy_retries.push((
+                    conn_index,
+                    generation,
+                    pool_slot,
+                    0,
+                    OpTag::TlsSend,
+                ));
             }
             return;
         }
@@ -2844,108 +2586,312 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.drain_completions();
     }
 
-    /// Test-only: directly drain pending retry queues (without running
-    /// the full event loop). This tests the retry mechanism in isolation.
-    #[cfg(test)]
-    pub(crate) fn drain_retries(&mut self) {
-        // Copy retry drain — mirrors the logic in run().
-        if !self.driver.pending_copy_retries.is_empty() {
-            let retries: Vec<_> = self.driver.pending_copy_retries.drain(..).collect();
-            for (conn_index, generation, pool_slot, retries) in retries {
-                if retries >= 2 {
-                    if self.driver.send_copy_pool.in_use(pool_slot) {
-                        self.driver.send_copy_pool.release(pool_slot);
-                    }
-                    continue;
-                }
-                if !self.driver.send_copy_pool.in_use(pool_slot) {
-                    continue;
-                }
-                if self.driver.connections.get(conn_index).is_none()
-                    || self.driver.connections.generation(conn_index) != generation
-                {
-                    if self.driver.send_copy_pool.in_use(pool_slot) {
-                        self.driver.send_copy_pool.release(pool_slot);
-                    }
-                    continue;
-                }
-                let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
-                let result = self
-                    .driver
-                    .ring
-                    .submit_send_copied(conn_index, ptr, remaining, pool_slot);
-                if result.is_err() {
-                    self.driver.pending_copy_retries.push((
-                        conn_index,
-                        generation,
-                        pool_slot,
-                        retries + 1,
-                    ));
-                }
+    /// Retry ZC send resubmissions that failed on a previous tick (SQ full).
+    fn drain_zc_retries(&mut self) {
+        if self.driver.pending_zc_retries.is_empty() {
+            return;
+        }
+        std::mem::swap(
+            &mut self.driver.pending_zc_retries,
+            &mut self.driver.zc_retry_scratch,
+        );
+        for idx in 0..self.driver.zc_retry_scratch.len() {
+            let (conn_index, generation, slab_idx, retries) = self.driver.zc_retry_scratch[idx];
+            if !self.driver.send_slab.in_use(slab_idx) {
+                continue; // slab was released in the meantime
+            }
+            // Connection closed or reused — release the slab and nothing
+            // else: the slot may already belong to a new connection.
+            if self.driver.connections.get(conn_index).is_none()
+                || self.driver.connections.generation(conn_index) != generation
+            {
+                self.release_zc_slab(slab_idx);
+                continue;
+            }
+            if retries >= 2 {
+                // Give up: bytes of this send are already missing from the
+                // stream, so fail the waiter and close rather than leaving
+                // in_flight stuck and the connection wedged open.
+                self.release_zc_slab(slab_idx);
+                self.driver.drain_conn_send_queue(conn_index);
+                let err = io::Error::other("max retries during zc send resubmit");
+                self.executor.wake_send(conn_index, Err(err));
+                self.driver.close_connection(conn_index);
+                continue;
+            }
+            let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+            if self
+                .driver
+                .ring
+                .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
+                .is_err()
+            {
+                self.driver.pending_zc_retries.push((
+                    conn_index,
+                    generation,
+                    slab_idx,
+                    retries + 1,
+                ));
             }
         }
+        self.driver.zc_retry_scratch.clear();
+    }
 
-        // ZC retry drain.
-        if !self.driver.pending_zc_retries.is_empty() {
-            let retries: Vec<_> = self.driver.pending_zc_retries.drain(..).collect();
-            for (conn_index, generation, slab_idx, retries) in retries {
-                if retries >= 2 {
-                    if self.driver.send_slab.in_use(slab_idx) {
-                        self.driver.send_slab.mark_awaiting_notifications(slab_idx);
-                        if self.driver.send_slab.should_release(slab_idx) {
-                            let pool_slot = self.driver.send_slab.release(slab_idx);
-                            if pool_slot != u16::MAX {
-                                self.driver.send_copy_pool.release(pool_slot);
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if !self.driver.send_slab.in_use(slab_idx) {
-                    continue;
-                }
-                if self.driver.connections.get(conn_index).is_none()
-                    || self.driver.connections.generation(conn_index) != generation
-                {
-                    if self.driver.send_slab.in_use(slab_idx) {
-                        self.driver.send_slab.mark_awaiting_notifications(slab_idx);
-                        if self.driver.send_slab.should_release(slab_idx) {
-                            let pool_slot = self.driver.send_slab.release(slab_idx);
-                            if pool_slot != u16::MAX {
-                                self.driver.send_copy_pool.release(pool_slot);
-                            }
-                        }
-                    }
-                    continue;
-                }
-                let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-                if self
-                    .driver
-                    .ring
-                    .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
-                    .is_err()
-                {
-                    self.driver.pending_zc_retries.push((
-                        conn_index,
-                        generation,
-                        slab_idx,
-                        retries + 1,
-                    ));
-                }
+    /// Release a ZC slab entry (and its paired pool slot) that will never
+    /// get a completion CQE because its resubmission was abandoned.
+    fn release_zc_slab(&mut self, slab_idx: u16) {
+        self.driver.send_slab.mark_awaiting_notifications(slab_idx);
+        if self.driver.send_slab.should_release(slab_idx) {
+            let pool_slot = self.driver.send_slab.release(slab_idx);
+            if pool_slot != u16::MAX {
+                self.driver.send_copy_pool.release(pool_slot);
             }
         }
+    }
 
-        // Close retry drain.
-        if !self.driver.pending_close_retries.is_empty() {
-            let retries: Vec<_> = self.driver.pending_close_retries.drain(..).collect();
-            for (conn_index, retry) in retries {
-                if self.driver.ring.submit_close(conn_index).is_err() && retry < 5 {
-                    self.driver
-                        .pending_close_retries
-                        .push((conn_index, retry + 1));
-                }
+    /// Retry coalesced send resubmissions that failed (SQ was full).
+    fn drain_coalesced_retries(&mut self) {
+        if self.driver.pending_coalesced_retries.is_empty() {
+            return;
+        }
+        std::mem::swap(
+            &mut self.driver.pending_coalesced_retries,
+            &mut self.driver.coalesced_retry_scratch,
+        );
+        for idx in 0..self.driver.coalesced_retry_scratch.len() {
+            let (conn_index, generation, slab_idx, retries) =
+                self.driver.coalesced_retry_scratch[idx];
+            if !self.driver.send_slab.in_use(slab_idx) {
+                continue; // slab released meanwhile
+            }
+            // Connection closed or reused — release the slab only. Touching
+            // the send queue here would drain a *new* connection's sends.
+            if self.driver.connections.get(conn_index).is_none()
+                || self.driver.connections.generation(conn_index) != generation
+            {
+                self.release_coalesced(slab_idx);
+                continue;
+            }
+            if retries >= 2 {
+                // Give up: fail the waiter and close so the connection isn't
+                // left open with a hole in its byte stream.
+                self.release_coalesced(slab_idx);
+                self.driver.drain_conn_send_queue(conn_index);
+                let err = io::Error::other("max retries during coalesced send resubmit");
+                self.executor.wake_send(conn_index, Err(err));
+                self.driver.close_connection(conn_index);
+                continue;
+            }
+            let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+            if self
+                .driver
+                .ring
+                .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
+                .is_err()
+            {
+                self.driver.pending_coalesced_retries.push((
+                    conn_index,
+                    generation,
+                    slab_idx,
+                    retries + 1,
+                ));
             }
         }
+        self.driver.coalesced_retry_scratch.clear();
+    }
+
+    /// Retry recv-forward send resubmissions that failed (SQ was full).
+    fn drain_recv_forward_retries(&mut self) {
+        if self.driver.pending_recv_forward_retries.is_empty() {
+            return;
+        }
+        std::mem::swap(
+            &mut self.driver.pending_recv_forward_retries,
+            &mut self.driver.recv_forward_retry_scratch,
+        );
+        for idx in 0..self.driver.recv_forward_retry_scratch.len() {
+            let (conn_index, generation, slab_idx, retries) =
+                self.driver.recv_forward_retry_scratch[idx];
+            if !self.driver.send_slab.in_use(slab_idx) {
+                continue; // slab released meanwhile
+            }
+            // Connection closed or reused — replenish bids and release only.
+            if self.driver.connections.get(conn_index).is_none()
+                || self.driver.connections.generation(conn_index) != generation
+            {
+                self.release_recv_forward(slab_idx);
+                continue;
+            }
+            if retries >= 2 {
+                // Give up: forwarded bytes were dropped mid-stream, so close
+                // instead of forwarding the rest of the queue after the gap.
+                self.release_recv_forward(slab_idx);
+                self.driver.drain_conn_send_queue(conn_index);
+                let err = io::Error::other("max retries during recv-forward resubmit");
+                self.executor.wake_send(conn_index, Err(err));
+                self.driver.close_connection(conn_index);
+                continue;
+            }
+            let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+            if self
+                .driver
+                .ring
+                .submit_send_recv_bufs_coalesced(conn_index, msg_ptr, slab_idx)
+                .is_err()
+            {
+                self.driver.pending_recv_forward_retries.push((
+                    conn_index,
+                    generation,
+                    slab_idx,
+                    retries + 1,
+                ));
+            }
+        }
+        self.driver.recv_forward_retry_scratch.clear();
+    }
+
+    /// Retry copy send resubmissions that failed (SQ was full).
+    fn drain_copy_retries(&mut self) {
+        if self.driver.pending_copy_retries.is_empty() {
+            return;
+        }
+        std::mem::swap(
+            &mut self.driver.pending_copy_retries,
+            &mut self.driver.copy_retry_scratch,
+        );
+        for idx in 0..self.driver.copy_retry_scratch.len() {
+            let (conn_index, generation, pool_slot, retries, op) =
+                self.driver.copy_retry_scratch[idx];
+            if !self.driver.send_copy_pool.in_use(pool_slot) {
+                continue;
+            }
+            // Connection closed or reused — release the slot only.
+            if self.driver.connections.get(conn_index).is_none()
+                || self.driver.connections.generation(conn_index) != generation
+            {
+                self.driver.send_copy_pool.release(pool_slot);
+                continue;
+            }
+            if retries >= 2 {
+                // Give up: fail the waiter and close so the connection isn't
+                // left open with a hole in its byte stream.
+                self.driver.send_copy_pool.release(pool_slot);
+                self.driver.drain_conn_send_queue(conn_index);
+                let err = io::Error::other("max retries during send resubmit");
+                self.executor.wake_send(conn_index, Err(err));
+                self.driver.close_connection(conn_index);
+                continue;
+            }
+            let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
+            // Resubmit with the entry's original OpTag. Choosing by
+            // tls_table membership here re-tagged the *final* chunk of a TLS
+            // send (deliberately OpTag::Send so its CQE wakes the waiter) as
+            // TlsSend, whose handler never wakes — a permanent send() hang.
+            let result = if matches!(op, OpTag::TlsSend) {
+                self.driver
+                    .ring
+                    .submit_tls_send(conn_index, ptr, remaining, pool_slot)
+            } else {
+                self.driver
+                    .ring
+                    .submit_send_copied(conn_index, ptr, remaining, pool_slot)
+            };
+            if result.is_err() {
+                self.driver.pending_copy_retries.push((
+                    conn_index,
+                    generation,
+                    pool_slot,
+                    retries + 1,
+                    op,
+                ));
+            }
+        }
+        self.driver.copy_retry_scratch.clear();
+    }
+
+    /// Retry Close submissions that failed (SQ was full). Entries are never
+    /// dropped: the connection slot cannot be reused until the Close CQE
+    /// runs handle_close, so giving up would leak the fd and the slot
+    /// permanently. Backoff: attempt only every 4th tick.
+    fn drain_close_retries(&mut self) {
+        if self.driver.pending_close_retries.is_empty() {
+            return;
+        }
+        let retries: Vec<_> = self.driver.pending_close_retries.drain(..).collect();
+        let tick_mod = self.driver.tick_count % 4;
+        for (conn_index, retry) in retries {
+            if tick_mod != 0 {
+                // Not this tick — keep the entry queued.
+                self.driver.pending_close_retries.push((conn_index, retry));
+                continue;
+            }
+            if self.driver.ring.submit_close(conn_index).is_err() {
+                self.driver
+                    .pending_close_retries
+                    .push((conn_index, retry.saturating_add(1)));
+            }
+        }
+    }
+
+    /// Retry POLLOUT arming that failed at EAGAIN time (SQ was full).
+    /// Max 3 attempts with backoff: attempt only every 2nd tick, keeping
+    /// entries queued in between.
+    fn drain_send_pollout_retries(&mut self) {
+        if self.driver.pending_send_pollout_retries.is_empty() {
+            return;
+        }
+        std::mem::swap(
+            &mut self.driver.pending_send_pollout_retries,
+            &mut self.driver.send_pollout_retry_scratch,
+        );
+        let tick_mod = self.driver.tick_count % 2;
+        for idx in 0..self.driver.send_pollout_retry_scratch.len() {
+            let (conn_index, generation, pool_slot, retry) =
+                self.driver.send_pollout_retry_scratch[idx];
+            if retry >= 3 {
+                // Max retries exceeded — release pool + drain queue + close.
+                if self.driver.send_copy_pool.in_use(pool_slot) {
+                    self.driver.send_copy_pool.release(pool_slot);
+                }
+                self.driver.drain_conn_send_queue(conn_index);
+                let err = io::Error::other("max retries during send pollout retry");
+                self.executor.wake_send(conn_index, Err(err));
+                self.driver.close_connection(conn_index);
+                continue;
+            }
+            if tick_mod != 0 {
+                // Not this tick — keep the entry queued.
+                self.driver
+                    .pending_send_pollout_retries
+                    .push((conn_index, generation, pool_slot, retry));
+                continue;
+            }
+            if !self.driver.send_copy_pool.in_use(pool_slot) {
+                continue;
+            }
+            if self.driver.connections.get(conn_index).is_none()
+                || self.driver.connections.generation(conn_index) != generation
+            {
+                if self.driver.send_copy_pool.in_use(pool_slot) {
+                    self.driver.send_copy_pool.release(pool_slot);
+                }
+                continue;
+            }
+            if self
+                .driver
+                .ring
+                .submit_send_pollout(conn_index, pool_slot)
+                .is_err()
+            {
+                self.driver.pending_send_pollout_retries.push((
+                    conn_index,
+                    generation,
+                    pool_slot,
+                    retry + 1,
+                ));
+            }
+        }
+        self.driver.send_pollout_retry_scratch.clear();
     }
 
     /// Test-only: inject multiple NOPs and dispatch them all in one batch.
@@ -4340,7 +4286,7 @@ mod tests {
         // Queue the retry.
         el.driver
             .pending_copy_retries
-            .push((conn_index, generation, slot, 0));
+            .push((conn_index, generation, slot, 0, OpTag::Send));
 
         // Close the connection before the retry fires.
         el.driver.close_connection(conn_index);
@@ -4349,7 +4295,7 @@ mod tests {
         el.inject_and_dispatch(close_ud.raw(), 0);
 
         // Now drain retries — the connection is gone.
-        el.drain_retries();
+        el.drain_copy_retries();
 
         // Retry queue should be empty.
         assert!(el.driver.pending_copy_retries.is_empty());
@@ -4374,7 +4320,7 @@ mod tests {
         // Queue the retry with the old generation.
         el.driver
             .pending_copy_retries
-            .push((conn_index, old_generation, slot, 0));
+            .push((conn_index, old_generation, slot, 0, OpTag::Send));
 
         // Close the connection.
         el.driver.close_connection(conn_index);
@@ -4391,7 +4337,7 @@ mod tests {
         assert_ne!(old_generation, new_generation);
 
         // Drain retries — should detect generation mismatch.
-        el.drain_retries();
+        el.drain_copy_retries();
 
         // Pool slot should be released (not resubmitted to new connection).
         assert!(
@@ -4433,13 +4379,124 @@ mod tests {
         el.inject_and_dispatch(close_ud.raw(), 0);
 
         // Drain retries — connection is gone.
-        el.drain_retries();
+        el.drain_zc_retries();
 
         assert!(el.driver.pending_zc_retries.is_empty());
         // Slab should be marked for release (awaiting_notifications set,
         // and pending_notifs is still 1 — will be released when the
         // notification CQE arrives).
         // The key assertion: no panic, no hang, retry was handled.
+    }
+
+    #[test]
+    fn close_retry_backoff_preserves_entry() {
+        // On a backoff tick (tick_count % 4 != 0) the entry must stay
+        // queued — it used to be silently dropped, leaking the fd + slot.
+        let mut el = make_test_loop();
+        el.driver.tick_count = 1;
+        el.driver.pending_close_retries.push((7, 2));
+
+        el.drain_close_retries();
+
+        assert_eq!(
+            el.driver.pending_close_retries,
+            vec![(7, 2)],
+            "backoff tick must preserve the close-retry entry unchanged"
+        );
+    }
+
+    #[test]
+    fn pollout_retry_backoff_preserves_entry() {
+        // Same as above for the POLLOUT retry queue (every 2nd tick).
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+
+        el.driver.tick_count = 1;
+        el.driver
+            .pending_send_pollout_retries
+            .push((conn_index, generation, slot, 1));
+
+        el.drain_send_pollout_retries();
+
+        assert_eq!(
+            el.driver.pending_send_pollout_retries,
+            vec![(conn_index, generation, slot, 1)],
+            "backoff tick must preserve the pollout-retry entry unchanged"
+        );
+    }
+
+    #[test]
+    fn copy_retry_giveup_fails_send_and_closes() {
+        // Exhausted retries must not leave the connection wedged open with
+        // in_flight stuck: release the slot, wake the waiter, close.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        el.executor.send_waiters[conn_index as usize] = true;
+
+        el.driver
+            .pending_copy_retries
+            .push((conn_index, generation, slot, 2, OpTag::Send));
+        el.drain_copy_retries();
+
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "give-up must release the pool slot"
+        );
+        assert!(
+            el.executor.io_results[conn_index as usize].is_some(),
+            "give-up must wake the send waiter with a result"
+        );
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            "give-up must close the connection"
+        );
+    }
+
+    #[test]
+    fn submit_next_queued_empty_finalizes_deferred_close() {
+        // A close deferred behind an in-flight ZC/recv-forward send must
+        // finalize when the queue empties, even though those completion
+        // paths never call note_send_finalized.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Simulate an in-flight send, then close: the Close SQE is deferred.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        el.driver.close_connection(conn_index);
+        assert!(
+            el.driver.send_queues[conn_index as usize].close_pending,
+            "close must defer while a send is in flight"
+        );
+
+        // The send's CQE path ends in submit_next_queued with an empty
+        // queue — this must fire the deferred close.
+        el.driver.submit_next_queued(conn_index);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_pending,
+            "deferred close must finalize once the queue drains"
+        );
+    }
+
+    #[test]
+    fn drain_conn_send_queue_finalizes_deferred_close() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        el.driver.close_connection(conn_index);
+        assert!(el.driver.send_queues[conn_index as usize].close_pending);
+
+        el.driver.drain_conn_send_queue(conn_index);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_pending,
+            "deferred close must finalize when the queue is force-drained"
+        );
     }
 
     // ── Linked SQE chain error propagation tests ───────────────────
