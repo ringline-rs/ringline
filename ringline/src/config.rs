@@ -337,6 +337,14 @@ impl Config {
                 "max_connections must be > 0 and < 2^24".into(),
             ));
         }
+        // A zero-capacity crossbeam channel is a rendezvous channel: try_send
+        // only succeeds while a receiver is blocked in recv(), and workers
+        // only ever try_recv — so every accept would fail.
+        if self.accept_queue_capacity == 0 {
+            return Err(crate::error::Error::RingSetup(
+                "accept_queue_capacity must be > 0".into(),
+            ));
+        }
         if self.timer_slots > 65535 {
             return Err(crate::error::Error::RingSetup(
                 "timer_slots must be <= 65535".into(),
@@ -852,6 +860,17 @@ mod tests {
         Config::default()
             .validate()
             .expect("default config should be valid");
+    }
+
+    #[test]
+    fn validate_accept_queue_capacity_zero_rejected() {
+        // bounded(0) is a rendezvous channel; workers only try_recv, so
+        // every accept would fail with the queue reported as full.
+        assert!(
+            config_with(|c| c.accept_queue_capacity = 0)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

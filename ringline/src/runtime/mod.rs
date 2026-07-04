@@ -225,6 +225,14 @@ impl TimerSlotPool {
         let idx = slot as usize;
         if idx < self.generations.len() {
             self.generations[idx] = self.generations[idx].wrapping_add(1);
+            // Clear the mio deadline: the expiry scan reads the slot's
+            // *current* generation, so a stale deadline on a free slot would
+            // pass fire()'s generation check, spuriously wake the old
+            // waker_id, and keep shortening the poll timeout until it passes.
+            #[cfg(not(has_io_uring))]
+            {
+                self.deadlines[idx] = None;
+            }
             self.free_list.push(slot);
         }
     }
@@ -657,6 +665,22 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(has_io_uring))]
+    #[test]
+    fn timer_release_clears_mio_deadline() {
+        // The mio expiry scan reads the slot's current generation, so a
+        // deadline left on a free slot would self-satisfy fire()'s check.
+        let mut pool = TimerSlotPool::new(4);
+        let (slot, _gen) = pool.allocate(42).unwrap();
+        pool.deadlines[slot as usize] =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        pool.release(slot);
+        assert!(
+            pool.deadlines[slot as usize].is_none(),
+            "released slot must not retain a deadline"
+        );
+    }
 
     fn owned_datagram(payload: Vec<u8>, segment_size: u32) -> PendingUdpDatagram {
         PendingUdpDatagram {

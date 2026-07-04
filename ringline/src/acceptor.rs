@@ -146,12 +146,13 @@ pub fn run_acceptor(config: AcceptorConfig) {
         }
 
         if !sent {
-            // Every live worker is either dead or backlogged. Drop the
-            // connection rather than block the acceptor.
+            // Every live worker is backlogged. Drop the connection rather
+            // than block the acceptor, and keep accepting — the backlog is
+            // transient. (The all-workers-dead case returns above.)
             unsafe {
                 libc::close(fd);
             }
-            return;
+            continue;
         }
     }
 }
