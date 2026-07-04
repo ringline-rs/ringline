@@ -519,8 +519,16 @@ impl Ring {
     /// the handler can resubmit the original send from where it
     /// stopped. (`current_ptr_remaining(pool_slot)` gives the right
     /// `(ptr, len)` to retry with.)
-    pub fn submit_send_pollout(&mut self, conn_index: u32, pool_slot: u16) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::SendPollOut, conn_index, pool_slot as u32);
+    pub fn submit_send_pollout(
+        &mut self,
+        conn_index: u32,
+        pool_slot: u16,
+        is_tls: bool,
+    ) -> io::Result<()> {
+        // Payload: pool_slot in the low 16 bits, is_tls flag in bit 16 so
+        // the POLLOUT handler resubmits on the right completion path.
+        let payload = pool_slot as u32 | (u32::from(is_tls) << 16);
+        let user_data = UserData::encode(OpTag::SendPollOut, conn_index, payload);
         let entry = opcode::PollAdd::new(Fixed(conn_index), libc::POLLOUT as u32)
             .build()
             .user_data(user_data.raw());

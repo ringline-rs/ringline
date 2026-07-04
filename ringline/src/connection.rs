@@ -64,6 +64,11 @@ pub struct ConnectionState {
     pub peer_addr: Option<PeerAddr>,
     /// Whether a connect timeout SQE is armed for this connection.
     pub connect_timeout_armed: bool,
+    /// TCP FIN arrived on a TLS connection before the peer's close_notify
+    /// alert. Distinguishes a truncation (possibly attacker-injected FIN)
+    /// from a clean TLS shutdown: recv futures surface `UnexpectedEof`
+    /// instead of a clean EOF.
+    pub eof_truncated: bool,
     /// Most recent kernel RX timestamp (nanoseconds since epoch, CLOCK_REALTIME).
     /// Set when a `RecvMsgMulti` completion delivers a `SCM_TIMESTAMPING` cmsg.
     #[cfg(feature = "timestamps")]
@@ -92,6 +97,7 @@ impl ConnectionState {
             established: false,
             peer_addr: None,
             connect_timeout_armed: false,
+            eof_truncated: false,
             #[cfg(feature = "timestamps")]
             recv_timestamp_ns: 0,
             #[cfg(has_io_uring)]
@@ -119,6 +125,7 @@ impl ConnectionState {
         self.established = false;
         self.peer_addr = None;
         self.connect_timeout_armed = false;
+        self.eof_truncated = false;
         #[cfg(feature = "timestamps")]
         {
             self.recv_timestamp_ns = 0;

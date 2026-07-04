@@ -72,11 +72,22 @@ fn test_config() -> Config {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    // Tests run on many threads; the naive bind(:0)-drop-rebind pattern
+    // races (the kernel can hand the same port to two tests before either
+    // rebinds), which shows up as AddrInUse launch failures or clients
+    // connecting to another test's server. A process-global claimed set
+    // makes each handed-out port unique within the test binary.
+    use std::sync::Mutex;
+    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
+    loop {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut guard = CLAIMED.lock().unwrap();
+        if guard.get_or_insert_with(Default::default).insert(port) {
+            return port;
+        }
+    }
 }
 
 fn wait_for_server(addr: SocketAddr) {

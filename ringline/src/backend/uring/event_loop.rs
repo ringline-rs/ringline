@@ -731,6 +731,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         if result <= 0 {
             if result == 0 {
+                // TCP FIN. For a TLS connection this is only a clean EOF if
+                // the peer's close_notify was processed first — otherwise
+                // it's a truncation (possibly an attacker-injected FIN) and
+                // recv futures must surface UnexpectedEof, not clean EOF.
+                let close_notify_seen = self
+                    .driver
+                    .tls_table
+                    .as_mut()
+                    .and_then(|t| t.get_mut(conn_index))
+                    .map(|tc| tc.peer_sent_close_notify);
+                if close_notify_seen == Some(false)
+                    && let Some(cs) = self.driver.connections.get_mut(conn_index)
+                {
+                    cs.eof_truncated = true;
+                }
                 // Wake recv waiter before closing so the owning task can
                 // detect EOF (with_data will see RecvMode::Closed and return 0).
                 self.executor.wake_recv(conn_index);
@@ -791,11 +806,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let result = crate::tls::feed_tls_recv(
                     tls_table,
                     &mut self.driver.accumulators,
-                    &mut self.driver.ring,
                     &mut self.driver.send_copy_pool,
                     conn_index,
                     data,
+                    &mut self.driver.tls_out_scratch,
                 );
+
+                // Route collected TLS output (handshake responses, alerts)
+                // through the per-connection send queue — including on the
+                // Error path, where an alert should still go out before the
+                // close below.
+                if !self.driver.tls_out_scratch.is_empty() {
+                    let mut sends = std::mem::take(&mut self.driver.tls_out_scratch);
+                    let _ = self.driver.queue_built_sends(conn_index, &mut sends);
+                    self.driver.tls_out_scratch = sends;
+                }
 
                 match result {
                     crate::tls::TlsRecvResult::HandshakeJustCompleted => {
@@ -1358,14 +1383,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if self
                 .driver
                 .ring
-                .submit_send_pollout(conn_index, pool_slot)
+                .submit_send_pollout(conn_index, pool_slot, false)
                 .is_err()
             {
                 // SQ full now — queue for retry on the next tick.
                 let generation = self.driver.connections.generation(conn_index);
                 self.driver
                     .pending_send_pollout_retries
-                    .push((conn_index, generation, pool_slot, 0));
+                    .push((conn_index, generation, pool_slot, 0, false));
             }
             metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
             return;
@@ -1392,7 +1417,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// tick picks it up.
     fn handle_send_pollout(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
+        // Payload: pool_slot in the low 16 bits, is_tls flag in bit 16 —
+        // the resubmit must keep a TLS chunk on the TlsSend completion path.
         let pool_slot = ud.payload() as u16;
+        let is_tls = ud.payload() & (1 << 16) != 0;
 
         // Connection may have been closed while we were waiting; in
         // that case the pool slot was released and the queue drained
@@ -1416,21 +1444,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
-        if self
-            .driver
-            .ring
-            .submit_send_copied(conn_index, ptr, remaining, pool_slot)
-            .is_err()
-        {
+        let resubmit = if is_tls {
+            self.driver
+                .ring
+                .submit_tls_send(conn_index, ptr, remaining, pool_slot)
+        } else {
+            self.driver
+                .ring
+                .submit_send_copied(conn_index, ptr, remaining, pool_slot)
+        };
+        if resubmit.is_err() {
             // SQ full — pick up on the next tick.
             let generation = self.driver.connections.generation(conn_index);
-            self.driver.pending_copy_retries.push((
-                conn_index,
-                generation,
-                pool_slot,
-                0,
-                OpTag::Send,
-            ));
+            let tag = if is_tls { OpTag::TlsSend } else { OpTag::Send };
+            self.driver
+                .pending_copy_retries
+                .push((conn_index, generation, pool_slot, 0, tag));
         }
     }
 
@@ -1978,12 +2007,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if let Some(ref mut tls_table) = self.driver.tls_table
             && tls_table.get_mut(conn_index).is_some()
         {
-            if !crate::tls::flush_tls_output(
+            let flushed = crate::tls::flush_tls_output(
                 tls_table,
-                &mut self.driver.ring,
                 &mut self.driver.send_copy_pool,
                 conn_index,
-            ) {
+                &mut self.driver.tls_out_scratch,
+            );
+            if !self.driver.tls_out_scratch.is_empty() {
+                let mut sends = std::mem::take(&mut self.driver.tls_out_scratch);
+                let _ = self.driver.queue_built_sends(conn_index, &mut sends);
+                self.driver.tls_out_scratch = sends;
+            }
+            if !flushed {
                 let err = std::io::Error::other("send pool exhausted during TLS flush");
                 self.executor.wake_connect(conn_index, Err(err));
                 self.driver.close_connection(conn_index);
@@ -2104,13 +2139,46 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             return;
         }
+        // Socket send buffer full: wait for POLLOUT and resubmit the same
+        // chunk. Tearing the connection down here (the old behavior) turned
+        // ordinary backpressure during a large TLS write into a broken
+        // connection. Keep the slot; is_tls=true keeps the resubmission on
+        // the TlsSend path.
+        if result < 0 {
+            let errno = -result;
+            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                if self
+                    .driver
+                    .ring
+                    .submit_send_pollout(conn_index, pool_slot, true)
+                    .is_err()
+                {
+                    let generation = self.driver.connections.generation(conn_index);
+                    self.driver
+                        .pending_send_pollout_retries
+                        .push((conn_index, generation, pool_slot, 0, true));
+                }
+                metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
+                return;
+            }
+        }
+
         self.driver.send_copy_pool.release(pool_slot);
 
-        // On error, close the connection so the owning task unblocks.
-        // The last ciphertext chunk uses OpTag::Send which wakes the send
-        // waiter, but if an intermediate chunk fails the connection is
-        // broken — close it so handle_close cleans up.
+        // Intermediate TLS chunks are serialized through the per-connection
+        // send queue, so a completion must pop the next queued send and let
+        // a deferred close finalize, exactly like handle_send.
+        if result >= 0 {
+            self.driver.submit_next_queued(conn_index);
+            self.driver.note_send_finalized(conn_index);
+            return;
+        }
+
+        // On error, fail the connection so the owning task unblocks: drain
+        // the queued sibling chunks (their slots are released by the drain)
+        // and close.
         if result < 0 {
+            self.driver.drain_conn_send_queue(conn_index);
             self.driver.close_connection(conn_index);
         }
     }
@@ -2883,7 +2951,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         );
         let tick_mod = self.driver.tick_count % 2;
         for idx in 0..self.driver.send_pollout_retry_scratch.len() {
-            let (conn_index, generation, pool_slot, retry) =
+            let (conn_index, generation, pool_slot, retry, is_tls) =
                 self.driver.send_pollout_retry_scratch[idx];
             if retry >= 3 {
                 // Max retries exceeded — release pool + drain queue + close.
@@ -2900,7 +2968,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // Not this tick — keep the entry queued.
                 self.driver
                     .pending_send_pollout_retries
-                    .push((conn_index, generation, pool_slot, retry));
+                    .push((conn_index, generation, pool_slot, retry, is_tls));
                 continue;
             }
             if !self.driver.send_copy_pool.in_use(pool_slot) {
@@ -2917,7 +2985,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if self
                 .driver
                 .ring
-                .submit_send_pollout(conn_index, pool_slot)
+                .submit_send_pollout(conn_index, pool_slot, is_tls)
                 .is_err()
             {
                 self.driver.pending_send_pollout_retries.push((
@@ -2925,6 +2993,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     generation,
                     pool_slot,
                     retry + 1,
+                    is_tls,
                 ));
             }
         }
@@ -3614,6 +3683,30 @@ mod tests {
         assert!(
             conn.is_none() || matches!(conn.unwrap().recv_mode, RecvMode::Closed),
             "connection not closed after TLS send error"
+        );
+    }
+
+    #[test]
+    fn handle_tls_send_eagain_arms_pollout() {
+        // EAGAIN is ordinary socket backpressure: keep the slot (the unsent
+        // ciphertext) and arm POLLOUT — do NOT tear the connection down.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        let data = b"ciphertext";
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+
+        let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), -(libc::EAGAIN), 0);
+
+        assert!(
+            el.driver.send_copy_pool.in_use(slot),
+            "slot must stay alive across EAGAIN (unsent bytes)"
+        );
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_some() && !matches!(conn.unwrap().recv_mode, RecvMode::Closed),
+            "EAGAIN must not close the connection"
         );
     }
 
@@ -4453,13 +4546,13 @@ mod tests {
         el.driver.tick_count = 1;
         el.driver
             .pending_send_pollout_retries
-            .push((conn_index, generation, slot, 1));
+            .push((conn_index, generation, slot, 1, false));
 
         el.drain_send_pollout_retries();
 
         assert_eq!(
             el.driver.pending_send_pollout_retries,
-            vec![(conn_index, generation, slot, 1)],
+            vec![(conn_index, generation, slot, 1, false)],
             "backoff tick must preserve the pollout-retry entry unchanged"
         );
     }
