@@ -315,7 +315,14 @@ impl<'a> DriverCtx<'a> {
             state.queue.push_back(built);
             Ok(())
         } else {
-            let entry = built.entry.clone();
+            // Destructure instead of cloning the 64-byte SQE: the fields are
+            // only needed on the error branch.
+            let BuiltSend {
+                entry,
+                pool_slot,
+                slab_idx,
+                total_len: _,
+            } = built;
             match unsafe { self.ring.push_sqe(entry) } {
                 Ok(()) => {
                     state.in_flight = true;
@@ -323,13 +330,13 @@ impl<'a> DriverCtx<'a> {
                 }
                 Err(e) => {
                     // Release resources that would otherwise leak.
-                    if built.slab_idx != u16::MAX {
-                        let pool_slot = self.send_slab.release(built.slab_idx);
+                    if slab_idx != u16::MAX {
+                        let pool_slot = self.send_slab.release(slab_idx);
                         if pool_slot != u16::MAX {
                             self.send_copy_pool.release(pool_slot);
                         }
-                    } else if built.pool_slot != u16::MAX {
-                        self.send_copy_pool.release(built.pool_slot);
+                    } else if pool_slot != u16::MAX {
+                        self.send_copy_pool.release(pool_slot);
                     }
                     Err(e)
                 }

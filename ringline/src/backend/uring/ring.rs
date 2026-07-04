@@ -26,6 +26,9 @@ pub struct Ring {
     pub(crate) ring: IoUring<squeue::Entry128, cqueue::Entry32>,
     /// Recv buffer group ID for multishot recv.
     bgid: u16,
+    /// Reusable Entry128 conversion scratch for chain pushes — avoids a
+    /// heap allocation per chained send.
+    chain_scratch: Vec<squeue::Entry128>,
 }
 
 impl Ring {
@@ -56,6 +59,7 @@ impl Ring {
         Ok(Ring {
             ring,
             bgid: config.recv_buffer.bgid,
+            chain_scratch: Vec::new(),
         })
     }
 
@@ -725,8 +729,11 @@ impl Ring {
             *entry = entry.clone().flags(io_uring::squeue::Flags::IO_LINK);
         }
 
-        // Convert to Entry128 for the Big SQ ring.
-        let entries128: Vec<squeue::Entry128> = entries.iter().map(|e| e.clone().into()).collect();
+        // Convert to Entry128 for the Big SQ ring, reusing the scratch to
+        // avoid a per-chain heap allocation.
+        let mut entries128 = std::mem::take(&mut self.chain_scratch);
+        entries128.clear();
+        entries128.extend(entries.iter().map(|e| e.clone().into()));
 
         // Ensure enough room in the SQ for the entire chain.
         {
@@ -736,18 +743,24 @@ impl Ring {
                 self.ring.submit()?;
                 let sq = self.ring.submission();
                 if sq.capacity() - sq.len() < entries128.len() {
+                    entries128.clear();
+                    self.chain_scratch = entries128;
                     return Err(io::Error::other("SQ too small for chain"));
                 }
             }
         }
 
         // Atomic push of the entire chain.
-        unsafe {
+        let pushed = unsafe {
             self.ring
                 .submission()
                 .push_multiple(&entries128)
-                .map_err(|_| io::Error::other("SQ full after flush for chain"))?;
-        }
+                .map_err(|_| io::Error::other("SQ full after flush for chain"))
+        };
+        // Return the scratch for reuse regardless of outcome.
+        entries128.clear();
+        self.chain_scratch = entries128;
+        pushed?;
         Ok(())
     }
 

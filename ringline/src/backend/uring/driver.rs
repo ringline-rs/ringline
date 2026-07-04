@@ -212,6 +212,16 @@ pub(crate) struct Driver {
     pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
     /// Monotonic disk-I/O sequence (see DriverCtx::disk_io_key).
     pub(crate) next_disk_io_seq: u16,
+    /// Connections whose multishot recv hit ENOBUFS and is parked until
+    /// provided-ring buffers return. Re-arming immediately (the old
+    /// behavior) completed instantly with ENOBUFS again while data was
+    /// pending and the ring was empty — a 100% CPU spin until some task
+    /// released a bid.
+    pub(crate) recv_starved: Vec<u32>,
+    /// Arrival timestamp shared by all UDP datagrams queued in one CQE
+    /// drain batch. One clock read per batch instead of one per datagram;
+    /// precision loss is bounded by the drain duration (microseconds).
+    pub(crate) udp_batch_recv_at: std::time::Instant,
     /// Tick timeout duration. When set, a timeout SQE ensures the event loop
     /// wakes periodically even when no I/O completions are pending.
     pub(crate) tick_timeout_ts: Option<io_uring::types::Timespec>,
@@ -448,6 +458,8 @@ impl Driver {
             close_notify_timeout: std::time::Duration::from_millis(config.close_notify_timeout_ms),
             tls_out_scratch: Vec::new(),
             next_disk_io_seq: 0,
+            recv_starved: Vec::new(),
+            udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
                     io_uring::types::Timespec::new()
@@ -869,7 +881,14 @@ impl Driver {
             state.queue.push_back(built);
             Ok(())
         } else {
-            let entry = built.entry.clone();
+            // Destructure instead of cloning the 64-byte SQE: the fields are
+            // only needed on the error branch.
+            let crate::handler::BuiltSend {
+                entry,
+                pool_slot,
+                slab_idx,
+                total_len: _,
+            } = built;
             match unsafe { self.ring.push_sqe(entry) } {
                 Ok(()) => {
                     state.in_flight = true;
@@ -878,13 +897,13 @@ impl Driver {
                 Err(e) => {
                     // For SendRecvBuf, pool_slot and slab_idx are u16::MAX (no resources).
                     // The caller is responsible for replenishing the recv buffer bid on error.
-                    if built.slab_idx != u16::MAX {
-                        let pool_slot = self.send_slab.release(built.slab_idx);
+                    if slab_idx != u16::MAX {
+                        let pool_slot = self.send_slab.release(slab_idx);
                         if pool_slot != u16::MAX {
                             self.send_copy_pool.release(pool_slot);
                         }
-                    } else if built.pool_slot != u16::MAX {
-                        self.send_copy_pool.release(built.pool_slot);
+                    } else if pool_slot != u16::MAX {
+                        self.send_copy_pool.release(pool_slot);
                     }
                     Err(e)
                 }
