@@ -203,6 +203,12 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Regular (copying) send — copies data into library-owned pool before SQE submission.
+    ///
+    /// Data larger than one send-pool slot is queued as multiple chunks. If
+    /// a chunk fails mid-loop (pool exhausted), the chunks queued before it
+    /// are already committed to the wire and `Err` is returned — retrying
+    /// the whole buffer would duplicate that prefix. Treat a mid-buffer
+    /// error as fatal for the connection (close it) rather than retrying.
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
         let conn_state = self
             .connections
@@ -3382,6 +3388,24 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                                 PartSlot::Guard { guard_idx } => {
                                     let g = self.guards[guard_idx as usize].as_ref().unwrap();
                                     let (gptr, glen) = g.as_ptr_len();
+                                    let region = g.region();
+                                    if region != crate::buffer::fixed::RegionId::UNREGISTERED
+                                        && let Err(e) = self
+                                            .chain
+                                            .ctx
+                                            .fixed_buffers
+                                            .validate_region_ptr(region, gptr, glen)
+                                    {
+                                        // Same check SendBuilder performs — an
+                                        // out-of-region pointer must not reach a
+                                        // kernel iovec.
+                                        self.chain.ctx.send_copy_pool.release(slot);
+                                        self.chain.error = Some(io::Error::new(
+                                            io::ErrorKind::InvalidInput,
+                                            e.to_string(),
+                                        ));
+                                        return self.chain;
+                                    }
                                     iovecs[i] = libc::iovec {
                                         iov_base: gptr as *mut _,
                                         iov_len: glen as usize,
@@ -3444,6 +3468,18 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                     if let PartSlot::Guard { guard_idx } = self.parts[i] {
                         let g = self.guards[guard_idx as usize].as_ref().unwrap();
                         let (gptr, glen) = g.as_ptr_len();
+                        let region = g.region();
+                        if region != crate::buffer::fixed::RegionId::UNREGISTERED
+                            && let Err(e) = self
+                                .chain
+                                .ctx
+                                .fixed_buffers
+                                .validate_region_ptr(region, gptr, glen)
+                        {
+                            self.chain.error =
+                                Some(io::Error::new(io::ErrorKind::InvalidInput, e.to_string()));
+                            return self.chain;
+                        }
                         iovecs[i] = libc::iovec {
                             iov_base: gptr as *mut _,
                             iov_len: glen as usize,
