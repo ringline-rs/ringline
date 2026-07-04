@@ -1853,11 +1853,12 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 
             match result {
                 ParseResult::Consumed(consumed) if consumed > 0 => {
-                    // Put back unconsumed remainder (if any).
+                    // Put back the unconsumed remainder (if any) as a
+                    // refcounted slice handoff.
                     if consumed < len {
                         driver
                             .accumulators
-                            .prepend(self.conn_index, &frozen[consumed..]);
+                            .put_back(self.conn_index, frozen.slice(consumed..));
                     }
                     self.f.take();
                     return Poll::Ready(consumed);
@@ -1867,7 +1868,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 
             // NeedMore or Consumed(0) on non-empty data: incomplete parse.
             // Put everything back and use closed state from the lookup above.
-            driver.accumulators.prepend(self.conn_index, &frozen[..]);
+            driver.accumulators.put_back(self.conn_index, frozen);
 
             if is_closed {
                 self.f.take();

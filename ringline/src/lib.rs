@@ -130,6 +130,14 @@
 // ── Internal modules ────────────────────────────────────────────────────
 pub(crate) mod acceptor;
 pub(crate) mod accumulator;
+
+/// Internal types re-exported for the crate's own criterion benches.
+/// Not public API — no stability guarantees.
+#[doc(hidden)]
+pub mod bench_internal {
+    pub use crate::accumulator::AccumulatorTable;
+}
+
 pub(crate) mod backend;
 pub(crate) mod blocking;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
