@@ -6,8 +6,19 @@ use bytes::{Bytes, BytesMut};
 
 pub struct RecvAccumulator {
     buf: BytesMut,
-    /// Upper bound on `buf.len()` after an `append`. `append` reports
-    /// overflow rather than growing past this.
+    /// Unconsumed remainder of a previously frozen (`take_frozen`) view,
+    /// held as a refcounted slice. Serving subsequent parses from this is
+    /// O(1); it is merged (one copy) into `buf` only when NEW data arrives
+    /// while a remainder is held. The old representation copied the whole
+    /// remainder back into `buf` on every put-back — O(B²) over a
+    /// pipelined batch of B responses and O(N·K) for an N-byte value
+    /// arriving in K chunks.
+    ///
+    /// Invariant: `frozen` is `None` or non-empty.
+    frozen: Option<Bytes>,
+    /// Upper bound on total buffered bytes (`frozen` remainder + `buf`)
+    /// after an `append`. `append` reports overflow rather than growing
+    /// past this.
     max_size: usize,
 }
 
@@ -27,6 +38,7 @@ impl RecvAccumulator {
     pub fn new_with_max(capacity: usize, max_size: usize) -> Self {
         RecvAccumulator {
             buf: BytesMut::with_capacity(capacity),
+            frozen: None,
             max_size,
         }
     }
@@ -41,21 +53,87 @@ impl RecvAccumulator {
     /// `WithDataFuture::poll`). The authoritative cap-enforcement sites are
     /// the kernel-recv handlers in `backend/uring/event_loop.rs`.
     pub fn append(&mut self, data: &[u8]) -> bool {
-        if self.buf.len().saturating_add(data.len()) > self.max_size {
+        if self.total_len().saturating_add(data.len()) > self.max_size {
             return false;
         }
         self.buf.extend_from_slice(data);
         true
     }
 
-    /// Get a reference to the accumulated data.
-    pub fn data(&self) -> &[u8] {
-        &self.buf[..]
+    /// Total buffered bytes: held frozen remainder + mutable tail.
+    fn total_len(&self) -> usize {
+        self.frozen.as_ref().map_or(0, |f| f.len()) + self.buf.len()
     }
 
-    /// Consume `n` bytes from the front — O(1) via `BytesMut::advance`.
+    /// Merge a held frozen remainder into `buf` so the contents are one
+    /// contiguous mutable region again. One copy of the remainder; only
+    /// needed when new data arrived while a remainder was held, or when a
+    /// borrowed-slice consumer needs a single `&[u8]` view.
+    fn unfreeze(&mut self) {
+        let Some(rem) = self.frozen.take() else {
+            return;
+        };
+        // If the parser kept no slices alive (streaming NeedMore cycles),
+        // the remainder is uniquely referenced and `try_into_mut` recovers
+        // the original allocation with the data already in place — the
+        // merge then costs only the newly appended bytes, not the whole
+        // remainder. With live parser slices (pipelined batches) this
+        // falls back to one full copy, which only happens when new data
+        // arrives mid-batch.
+        match rem.try_into_mut() {
+            Ok(mut recovered) => {
+                if !self.buf.is_empty() {
+                    recovered.extend_from_slice(&self.buf);
+                }
+                self.buf = recovered;
+            }
+            Err(rem) => {
+                if self.buf.is_empty() {
+                    self.buf.extend_from_slice(&rem);
+                } else {
+                    let mut merged = BytesMut::with_capacity(rem.len() + self.buf.len());
+                    merged.extend_from_slice(&rem);
+                    merged.extend_from_slice(&self.buf);
+                    self.buf = merged;
+                }
+            }
+        }
+    }
+
+    /// Get a reference to the accumulated data.
+    ///
+    /// Merges a held frozen remainder first so the view is contiguous —
+    /// borrowed-slice consumers (`with_data`, streams, TLS drains) pay the
+    /// merge only when they interleave with `with_bytes` on one connection.
+    pub fn data(&mut self) -> &[u8] {
+        if self.frozen.is_some() && !self.buf.is_empty() {
+            self.unfreeze();
+        }
+        if let Some(ref f) = self.frozen {
+            &f[..]
+        } else {
+            &self.buf[..]
+        }
+    }
+
+    /// Consume `n` bytes from the front — O(1).
     pub fn consume(&mut self, n: usize) {
         if n == 0 {
+            return;
+        }
+        // After a `data()` view, at most one of `frozen` / `buf` is
+        // non-empty (data() merges when both are).
+        if let Some(ref mut f) = self.frozen {
+            debug_assert!(
+                n <= f.len(),
+                "consume({n}) exceeds frozen remainder length {}",
+                f.len()
+            );
+            let n = n.min(f.len());
+            f.advance(n);
+            if f.is_empty() {
+                self.frozen = None;
+            }
             return;
         }
         debug_assert!(
@@ -69,6 +147,7 @@ impl RecvAccumulator {
 
     /// Reset the accumulator (discard all data).
     pub fn reset(&mut self) {
+        self.frozen = None;
         self.buf.clear();
     }
 
@@ -115,7 +194,10 @@ impl AccumulatorTable {
     }
 
     /// Get accumulated data at the given index.
-    pub fn data(&self, index: u32) -> &[u8] {
+    ///
+    /// `&mut` because a held frozen remainder may need a one-time merge to
+    /// present a contiguous view (see [`RecvAccumulator::data`]).
+    pub fn data(&mut self, index: u32) -> &[u8] {
         self.accumulators[index as usize].data()
     }
 
@@ -150,6 +232,19 @@ impl AccumulatorTable {
     /// remainder allocation, not elimination of all reallocation.
     pub fn take_frozen(&mut self, index: u32) -> Bytes {
         let acc = &mut self.accumulators[index as usize];
+        // Serving a held remainder with no new data is the pipelined hot
+        // path: a batch of B responses is frozen once and each recv()
+        // cycle takes/puts-back the same refcounted Bytes — O(1) per
+        // cycle, no copies (previously the remainder was memcpy'd back
+        // into the buffer every cycle: O(B²) over the batch).
+        if let Some(rem) = acc.frozen.take() {
+            if acc.buf.is_empty() {
+                return rem;
+            }
+            // New data arrived while a remainder was held — merge once.
+            acc.frozen = Some(rem);
+            acc.unfreeze();
+        }
         let len = acc.buf.len();
         // Fast path: empty accumulator — `split_to(0)` would unnecessarily
         // upgrade `BytesMut` to shared mode, blocking later front-reclaim.
@@ -163,12 +258,25 @@ impl AccumulatorTable {
         acc.buf.split_to(len).freeze()
     }
 
-    /// Put back the unconsumed remainder of a `take_frozen()` view.
+    /// Put back the unconsumed remainder of a `take_frozen()` view — O(1).
     ///
     /// Called from the `with_bytes` path when the parser didn't consume
-    /// everything (pipelined remainder or incomplete next message).
+    /// everything (pipelined remainder or incomplete next message). The
+    /// remainder is stored as a refcounted slice; it is copied at most once
+    /// more (by `unfreeze`) and only if new data arrives before the next
+    /// take.
     pub fn put_back(&mut self, index: u32, data: Bytes) {
-        self.prepend(index, &data);
+        if data.is_empty() {
+            return;
+        }
+        let acc = &mut self.accumulators[index as usize];
+        debug_assert!(
+            acc.frozen.is_none(),
+            "put_back: a frozen remainder is already held (take/put must alternate)"
+        );
+        // `put_back` follows `take_frozen` within one poll, so `buf` holds
+        // only data appended after the take (normally nothing).
+        acc.frozen = Some(data);
     }
 
     /// Put unconsumed data back into the accumulator.
@@ -180,16 +288,14 @@ impl AccumulatorTable {
             return;
         }
         let acc = &mut self.accumulators[index as usize];
-        // Within the single-threaded per-worker event loop, `prepend` is
-        // always called immediately after `take_frozen` (within the same
-        // `poll`). No other task can append to this accumulator between
-        // `take_frozen` and `prepend`, so the buffer must be empty here.
-        debug_assert!(
-            acc.buf.is_empty(),
-            "prepend: accumulator unexpectedly non-empty (single-threaded invariant violated); \
-             len={}",
-            acc.buf.len()
-        );
+        // A held frozen remainder belongs BEHIND the prepended data
+        // (prepend callers put back OLDER bytes). Merge it into `buf`
+        // first so the ordering below is correct.
+        acc.unfreeze();
+        // NOTE: `buf` may legitimately be non-empty here — either data
+        // appended after a `take_frozen`, or a frozen remainder merged by
+        // the `unfreeze()` above. The prepended bytes are the OLDEST, so
+        // they go in front either way.
         if acc.buf.is_empty() {
             // Fast path (invariant): buffer is empty, tail capacity is
             // retained from `take_frozen`'s `split_to` — no allocation.
@@ -326,6 +432,88 @@ mod tests {
             );
             drop(f);
         }
+    }
+
+    #[test]
+    fn put_back_then_take_is_same_bytes_no_copy() {
+        let mut table = AccumulatorTable::new(1, 64);
+        assert!(table.append(0, b"aaaabbbbcccc"));
+        let frozen = table.take_frozen(0);
+        // Consume one "response", put the rest back.
+        let rem = frozen.slice(4..);
+        let rem_ptr = rem.as_ptr();
+        table.put_back(0, rem);
+        // Re-take must hand back the same allocation (O(1), no copy).
+        let again = table.take_frozen(0);
+        assert_eq!(&again[..], b"bbbbcccc");
+        assert_eq!(again.as_ptr(), rem_ptr, "re-take must not copy");
+    }
+
+    #[test]
+    fn append_while_frozen_held_merges_in_order() {
+        let mut table = AccumulatorTable::new(1, 64);
+        assert!(table.append(0, b"old-"));
+        let frozen = table.take_frozen(0);
+        table.put_back(0, frozen);
+        // New data arrives while the remainder is held.
+        assert!(table.append(0, b"new"));
+        assert_eq!(table.data(0), b"old-new");
+        let merged = table.take_frozen(0);
+        assert_eq!(&merged[..], b"old-new");
+    }
+
+    #[test]
+    fn cap_accounts_for_frozen_remainder() {
+        let mut table = AccumulatorTable::new_with_max(1, 8, 8);
+        assert!(table.append(0, b"abcdef"));
+        let frozen = table.take_frozen(0);
+        table.put_back(0, frozen);
+        // 6 held + 3 new = 9 > 8: must be rejected.
+        assert!(!table.append(0, b"xyz"));
+        // 6 + 2 = 8: fits.
+        assert!(table.append(0, b"gh"));
+        assert_eq!(table.data(0), b"abcdefgh");
+    }
+
+    #[test]
+    fn consume_from_frozen_remainder() {
+        let mut table = AccumulatorTable::new(1, 64);
+        assert!(table.append(0, b"0123456789"));
+        let frozen = table.take_frozen(0);
+        table.put_back(0, frozen);
+        // Borrowed-slice consumer path (with_data) over a held remainder.
+        assert_eq!(table.data(0), b"0123456789");
+        table.consume(0, 4);
+        assert_eq!(table.data(0), b"456789");
+        table.consume(0, 6);
+        assert_eq!(table.data(0), b"");
+        // Accumulator is fully reusable afterwards.
+        assert!(table.append(0, b"next"));
+        assert_eq!(table.data(0), b"next");
+    }
+
+    #[test]
+    fn prepend_orders_ahead_of_frozen_remainder() {
+        let mut table = AccumulatorTable::new(1, 64);
+        assert!(table.append(0, b"MID"));
+        let frozen = table.take_frozen(0);
+        table.put_back(0, frozen);
+        assert!(table.append(0, b"TAIL"));
+        // Oldest bytes prepended in front of remainder + new data.
+        table.prepend(0, b"HEAD");
+        assert_eq!(table.data(0), b"HEADMIDTAIL");
+    }
+
+    #[test]
+    fn reset_clears_frozen_remainder() {
+        let mut table = AccumulatorTable::new(1, 64);
+        assert!(table.append(0, b"data"));
+        let frozen = table.take_frozen(0);
+        table.put_back(0, frozen);
+        table.reset(0);
+        assert_eq!(table.data(0), b"");
+        assert!(table.append(0, b"fresh"));
+        assert_eq!(table.data(0), b"fresh");
     }
 
     #[test]
