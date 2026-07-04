@@ -13,7 +13,7 @@ use crate::completion::{OpTag, UserData};
 use crate::connection::RecvMode;
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
-use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, clear_driver_state, set_driver_state};
+use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded};
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
 
@@ -186,7 +186,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             } else {
                 None
             };
-            self.driver.ring.submit_and_wait(1)?;
+            // Don't block while tasks are already runnable (self-wakes
+            // collected after the last poll pass, tasks woken from
+            // on_tick): submit SQEs but return immediately so the ready
+            // queue is polled now instead of after the next CQE or tick
+            // timeout (indefinitely, with tick_timeout_us = 0).
+            self.executor.collect_wakeups();
+            let min_complete = u32::from(self.executor.ready_queue.is_empty());
+            self.driver.ring.submit_and_wait(min_complete)?;
             let mut wait_ns: u64 = 0;
             if let Some(start) = wait_start {
                 wait_ns = start.elapsed().as_nanos() as u64;
@@ -322,14 +329,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 driver: unsafe { NonNull::new_unchecked(driver_ptr) },
                 executor: unsafe { NonNull::new_unchecked(executor_ptr) },
             };
-            unsafe { set_driver_state(&mut driver_state) };
+            let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
             // Safety: driver_ptr is the only live reference to self.driver
-            // until we clear the driver_state below.
+            // until the guard is dropped below. catch_unwind keeps a panic
+            // in user tick code from unwinding past the guard's scope with
+            // futures observing a dangling CURRENT_DRIVER, and from killing
+            // the worker.
             {
                 let mut ctx = unsafe { (*driver_ptr).make_ctx() };
-                handler.on_tick(&mut ctx);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler.on_tick(&mut ctx);
+                }));
+                if result.is_err() {
+                    eprintln!("ringline: handler on_tick panicked; continuing");
+                }
             }
-            clear_driver_state();
+            drop(guard);
 
             // Record work-phase (everything except the blocking wait) duration.
             if let Some(start) = iter_start {
@@ -422,10 +437,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             driver: unsafe { NonNull::new_unchecked(driver) },
             executor: unsafe { NonNull::new_unchecked(executor) },
         };
-        unsafe { set_driver_state(&mut driver_state) };
+        let driver_state_guard = unsafe { set_driver_state_guarded(&mut driver_state) };
 
         // Safety: we have exclusive access to driver/executor via self, and
-        // only access them through these raw pointers until clear_driver_state.
+        // only access them through these raw pointers until the guard drops.
         let driver = unsafe { &mut *driver };
         let executor = unsafe { &mut *executor };
 
@@ -481,15 +496,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(raw_id));
+                    executor.currently_polling = Some(raw_id);
+                    executor.woken_while_polling = false;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         fut.as_mut().poll(&mut cx)
                     }));
+                    executor.currently_polling = None;
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             executor.standalone_slab.remove(task_idx);
                         }
                         Ok(std::task::Poll::Pending) => {
                             executor.standalone_slab.park(task_idx, fut);
+                            // The task woke itself mid-poll (its slot read
+                            // Empty, so the wake couldn't transition it) —
+                            // re-queue now that it is parked.
+                            if executor.woken_while_polling {
+                                let _ = executor.wake_task(raw_id);
+                            }
                         }
                         Err(_panic) => {
                             // Drop the future and free the slot. We swallow
@@ -520,9 +544,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(conn_index));
+                    executor.currently_polling = Some(conn_index);
+                    executor.woken_while_polling = false;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         fut.as_mut().poll(&mut cx)
                     }));
+                    executor.currently_polling = None;
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             // Task completed — connection handler is done.
@@ -531,6 +558,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         }
                         Ok(std::task::Poll::Pending) => {
                             executor.task_slab.park(conn_index, fut);
+                            // Self-wake during poll (slot read Empty) —
+                            // re-queue now that the task is parked.
+                            if executor.woken_while_polling {
+                                let _ = executor.wake_task(conn_index);
+                            }
                         }
                         Err(_panic) => {
                             // A panicking connection handler tears down the
@@ -567,7 +599,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
-        clear_driver_state();
+        drop(driver_state_guard);
 
         // Clear processed entries.
         executor.ready_queue.clear();
@@ -1230,12 +1262,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 driver: unsafe { NonNull::new_unchecked(driver_ptr) },
                 executor: unsafe { NonNull::new_unchecked(executor_ptr) },
             };
-            unsafe { set_driver_state(&mut driver_state) };
+            let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
             {
                 let mut ctx = unsafe { (*driver_ptr).make_ctx() };
-                handler.on_notify(&mut ctx);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler.on_notify(&mut ctx);
+                }));
+                if result.is_err() {
+                    eprintln!("ringline: handler on_notify panicked; continuing");
+                }
             }
-            clear_driver_state();
+            drop(guard);
         }
 
         // Re-arm eventfd read. Track whether the re-arm succeeded so the
@@ -3804,14 +3841,14 @@ mod tests {
             driver: unsafe { NonNull::new_unchecked(driver_ptr) },
             executor: unsafe { NonNull::new_unchecked(executor_ptr) },
         };
-        unsafe { set_driver_state(&mut driver_state) };
+        let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
 
         // Create and immediately drop a DiskIoFuture.
         {
             let _fut = crate::runtime::io::DiskIoFuture { seq };
         }
 
-        clear_driver_state();
+        drop(guard);
 
         // Waiter should be cleaned up.
         assert!(
@@ -4496,6 +4533,155 @@ mod tests {
         assert!(
             !el.driver.send_queues[conn_index as usize].close_pending,
             "deferred close must finalize when the queue is force-drained"
+        );
+    }
+
+    // ── Executor wake-path regression tests ────────────────────────
+
+    #[test]
+    fn self_wake_via_channel_completes() {
+        // join(rx.recv(), try_send) inside ONE task: recv registers its
+        // waiter, try_send wakes it while the task is mid-poll (slot
+        // Empty). The wake used to be dropped -> permanent deadlock.
+        use crate::runtime::{channel::mpsc, join::join};
+        let mut el = make_test_loop();
+        let (tx, rx) = mpsc::channel::<u32>(4);
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        let done2 = done.clone();
+
+        let idx = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                let (v, _) = join(rx.recv(), async move {
+                    tx.try_send(7).unwrap();
+                })
+                .await;
+                assert_eq!(v, Some(7));
+                done2.set(true);
+            }))
+            .unwrap();
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+
+        for _ in 0..4 {
+            el.poll_ready_tasks();
+        }
+        assert!(
+            done.get(),
+            "self-wake during poll was lost — task deadlocked"
+        );
+    }
+
+    #[test]
+    fn stored_std_waker_wakes_parked_task() {
+        // A future that stashes cx.waker() and is woken later from outside
+        // its own poll. The drain path used to skip the Parked->Ready
+        // transition, so the wake was lost forever.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::task::{Poll, Waker};
+
+        struct StashWaker {
+            slot: Rc<RefCell<Option<Waker>>>,
+            polls: u32,
+        }
+        impl std::future::Future for StashWaker {
+            type Output = ();
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> Poll<()> {
+                self.polls += 1;
+                if self.polls == 1 {
+                    *self.slot.borrow_mut() = Some(cx.waker().clone());
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            }
+        }
+
+        let mut el = make_test_loop();
+        let slot = Rc::new(RefCell::new(None));
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (slot2, done2) = (slot.clone(), done.clone());
+
+        let idx = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                StashWaker {
+                    slot: slot2,
+                    polls: 0,
+                }
+                .await;
+                done2.set(true);
+            }))
+            .unwrap();
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+        el.poll_ready_tasks();
+        assert!(!done.get(), "future must park on first poll");
+
+        // Wake from "outside" (e.g. another task) via the stored waker.
+        slot.borrow().as_ref().unwrap().wake_by_ref();
+        el.executor.collect_wakeups();
+        el.poll_ready_tasks();
+
+        assert!(done.get(), "stored-waker wake of a parked task was lost");
+    }
+
+    #[test]
+    fn mpsc_two_blocked_senders_both_complete() {
+        // Two producers blocked on a capacity-1 channel: the single-slot
+        // send_waiter used to let the second registration overwrite the
+        // first, hanging it forever.
+        use crate::runtime::channel::mpsc;
+        let mut el = make_test_loop();
+        let (tx, rx) = mpsc::channel::<u32>(1);
+        tx.try_send(0).unwrap(); // fill the queue
+        let completed = std::rc::Rc::new(std::cell::Cell::new(0u32));
+
+        for _ in 0..2 {
+            let tx = tx.clone();
+            let completed = completed.clone();
+            let idx = el
+                .executor
+                .standalone_slab
+                .spawn(Box::pin(async move {
+                    tx.send(1).await.unwrap();
+                    completed.set(completed.get() + 1);
+                }))
+                .unwrap();
+            el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+        }
+        // Park both senders on the full queue.
+        el.poll_ready_tasks();
+        assert_eq!(completed.get(), 0);
+
+        // Drain three values (the prefill + both sends), interleaving polls
+        // so each freed slot wakes exactly one blocked sender.
+        let drainer_done = std::rc::Rc::new(std::cell::Cell::new(false));
+        let dd = drainer_done.clone();
+        let idx = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                for _ in 0..3 {
+                    assert!(rx.recv().await.is_some());
+                }
+                dd.set(true);
+            }))
+            .unwrap();
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+
+        for _ in 0..8 {
+            el.poll_ready_tasks();
+        }
+        assert!(drainer_done.get(), "drainer did not finish");
+        assert_eq!(
+            completed.get(),
+            2,
+            "a blocked sender's wake was lost (single-slot send_waiter)"
         );
     }
 

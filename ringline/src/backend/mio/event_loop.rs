@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::connection::RecvMode;
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
-use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, clear_driver_state, set_driver_state};
+use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded};
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor};
 
@@ -132,8 +132,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 1. Fire expired timers.
             self.fire_expired_timers();
 
-            // 2. Compute poll timeout from nearest timer deadline.
-            let timeout = self.compute_poll_timeout();
+            // 2. Compute poll timeout from nearest timer deadline. Don't
+            // block at all while tasks are already runnable (self-wakes
+            // collected after the last poll pass, tasks woken from on_tick).
+            self.executor.collect_wakeups();
+            let timeout = if self.executor.ready_queue.is_empty() {
+                self.compute_poll_timeout()
+            } else {
+                Duration::ZERO
+            };
 
             // 3. Poll for I/O events.
             match self
@@ -226,12 +233,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     driver: unsafe { NonNull::new_unchecked(driver_ptr) },
                     executor: unsafe { NonNull::new_unchecked(executor_ptr) },
                 };
-                unsafe { set_driver_state(&mut driver_state) };
+                let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
                 {
                     let mut ctx = unsafe { (*driver_ptr).make_ctx() };
-                    handler.on_tick(&mut ctx);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handler.on_tick(&mut ctx);
+                    }));
+                    if result.is_err() {
+                        eprintln!("ringline: handler on_tick panicked; continuing");
+                    }
                 }
-                clear_driver_state();
+                drop(guard);
             }
 
             // 8. Deliver send completions and flush any sends queued by on_tick.
@@ -417,12 +429,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 driver: unsafe { NonNull::new_unchecked(driver_ptr) },
                 executor: unsafe { NonNull::new_unchecked(executor_ptr) },
             };
-            unsafe { set_driver_state(&mut driver_state) };
+            let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
             {
                 let mut ctx = unsafe { (*driver_ptr).make_ctx() };
-                handler.on_notify(&mut ctx);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler.on_notify(&mut ctx);
+                }));
+                if result.is_err() {
+                    eprintln!("ringline: handler on_notify panicked; continuing");
+                }
             }
-            clear_driver_state();
+            drop(guard);
         }
     }
 
@@ -900,10 +917,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             driver: unsafe { NonNull::new_unchecked(driver) },
             executor: unsafe { NonNull::new_unchecked(executor) },
         };
-        unsafe { set_driver_state(&mut driver_state) };
+        let driver_state_guard = unsafe { set_driver_state_guarded(&mut driver_state) };
 
         // Safety: we have exclusive access to driver/executor via self, and
-        // only access them through these raw pointers until clear_driver_state.
+        // only access them through these raw pointers until the guard drops.
         let driver = unsafe { &mut *driver };
         let executor = unsafe { &mut *executor };
 
@@ -935,15 +952,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(raw_id));
+                    executor.currently_polling = Some(raw_id);
+                    executor.woken_while_polling = false;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         fut.as_mut().poll(&mut cx)
                     }));
+                    executor.currently_polling = None;
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             executor.standalone_slab.remove(task_idx);
                         }
                         Ok(std::task::Poll::Pending) => {
                             executor.standalone_slab.park(task_idx, fut);
+                            // Self-wake during poll (slot read Empty) —
+                            // re-queue now that the task is parked.
+                            if executor.woken_while_polling {
+                                let _ = executor.wake_task(raw_id);
+                            }
                         }
                         Err(_panic) => {
                             drop(fut);
@@ -967,9 +992,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(conn_index));
+                    executor.currently_polling = Some(conn_index);
+                    executor.woken_while_polling = false;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         fut.as_mut().poll(&mut cx)
                     }));
+                    executor.currently_polling = None;
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             // Task completed — connection handler is done.
@@ -978,6 +1006,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         }
                         Ok(std::task::Poll::Pending) => {
                             executor.task_slab.park(conn_index, fut);
+                            // Self-wake during poll (slot read Empty) —
+                            // re-queue now that the task is parked.
+                            if executor.woken_while_polling {
+                                let _ = executor.wake_task(conn_index);
+                            }
                         }
                         Err(_panic) => {
                             drop(fut);
@@ -1009,7 +1042,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
-        clear_driver_state();
+        drop(driver_state_guard);
 
         // Clear processed entries.
         executor.ready_queue.clear();

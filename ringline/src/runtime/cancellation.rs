@@ -26,7 +26,7 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::task::{Context, Poll};
 
 use super::CURRENT_TASK_ID;
@@ -39,8 +39,10 @@ struct State {
     /// (e.g. several tasks each calling `cancelled()` on clones of the
     /// same token).
     waiters: Vec<u32>,
-    /// Child tokens to cancel when this token is cancelled.
-    children: Vec<Rc<RefCell<State>>>,
+    /// Child tokens to cancel when this token is cancelled. Held weakly:
+    /// a per-request child token must not be kept alive (and accumulated)
+    /// by a process-lifetime parent after the request ends.
+    children: Vec<Weak<RefCell<State>>>,
 }
 
 /// A token for cooperative cancellation of async tasks.
@@ -86,7 +88,7 @@ impl CancellationToken {
     pub fn cancelled(&self) -> CancelledFuture {
         CancelledFuture {
             state: Rc::clone(&self.state),
-            registered: false,
+            registered: None,
         }
     }
 
@@ -102,7 +104,10 @@ impl CancellationToken {
             drop(s);
             child.cancel();
         } else {
-            s.children.push(Rc::clone(&child.state));
+            // Opportunistically prune children that have been dropped so a
+            // long-lived parent's list doesn't grow without bound.
+            s.children.retain(|c| c.strong_count() > 0);
+            s.children.push(Rc::downgrade(&child.state));
         }
         child
     }
@@ -142,9 +147,11 @@ fn cancel_state(state: &Rc<RefCell<State>>) {
         });
     }
 
-    // Recursively cancel children.
+    // Recursively cancel children that are still alive.
     for child in children {
-        cancel_state(&child);
+        if let Some(child) = child.upgrade() {
+            cancel_state(&child);
+        }
     }
 }
 
@@ -153,10 +160,10 @@ fn cancel_state(state: &Rc<RefCell<State>>) {
 /// Resolves when the associated token is cancelled.
 pub struct CancelledFuture {
     state: Rc<RefCell<State>>,
-    /// True once this future has registered its task_id as a waiter.
-    /// Avoids the O(n) `Vec::contains` scan on every re-poll of the same
-    /// future: we only push once, and after that skip the registration check.
-    registered: bool,
+    /// The task id this future registered as a waiter, if any. Pushed at
+    /// most once (avoids an O(n) `Vec::contains` scan on every re-poll)
+    /// and removed again on drop.
+    registered: Option<u32>,
 }
 
 impl Future for CancelledFuture {
@@ -171,12 +178,33 @@ impl Future for CancelledFuture {
             }
         }
         // Register as waiter exactly once.
-        if !self.registered {
+        if self.registered.is_none() {
             let task_id = CURRENT_TASK_ID.with(|c| c.get());
             self.state.borrow_mut().waiters.push(task_id);
-            self.registered = true;
+            self.registered = Some(task_id);
         }
         Poll::Pending
+    }
+}
+
+impl Drop for CancelledFuture {
+    fn drop(&mut self) {
+        // The canonical select!-loop pattern creates a fresh CancelledFuture
+        // per iteration. Deregister on drop so a long-lived token's waiter
+        // list doesn't grow by one stale task id per iteration (each of
+        // which would spuriously wake whatever task reuses that id when the
+        // token finally cancels).
+        let Some(task_id) = self.registered else {
+            return;
+        };
+        let mut s = self.state.borrow_mut();
+        if s.cancelled {
+            // cancel_state already took the waiter list.
+            return;
+        }
+        if let Some(pos) = s.waiters.iter().position(|&w| w == task_id) {
+            s.waiters.swap_remove(pos);
+        }
     }
 }
 
