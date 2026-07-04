@@ -681,7 +681,7 @@ impl Client {
     /// `flush()` (`buffered_ops > 1`) is guaranteed to run for this op.
     #[inline]
     fn timing_start_buffered(&self) -> (u64, Option<Instant>) {
-        if self.buffered_ops > 1 {
+        if self.buffered_ops >= 1 {
             (0, None)
         } else {
             self.timing_start()
@@ -800,7 +800,7 @@ impl Client {
         // Only rewrite send timestamps when batching multiple ops —
         // for a single buffered op the timestamp captured at fire time
         // is already accurate.
-        if self.buffered_ops > 1 {
+        if self.buffered_ops >= 1 {
             let (send_ts, start) = self.timing_start();
             for pending in self.pending.iter_mut().skip(self.flushed_count) {
                 pending.send_ts = send_ts;
@@ -841,6 +841,14 @@ impl Client {
             user_data,
             tx_bytes,
         });
+        // Direct sends are already on the wire: keep flushed_count in
+        // sync so a later flush() failure only truncates pending ops
+        // that were never sent. Without this, the error path dropped
+        // an op whose response WILL arrive — permanently misattributing
+        // every subsequent response.
+        if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
+            self.flushed_count += 1;
+        }
         self.post_flush_if_needed()?;
         Ok(())
     }
@@ -870,6 +878,14 @@ impl Client {
             user_data,
             tx_bytes,
         });
+        // Direct sends are already on the wire: keep flushed_count in
+        // sync so a later flush() failure only truncates pending ops
+        // that were never sent. Without this, the error path dropped
+        // an op whose response WILL arrive — permanently misattributing
+        // every subsequent response.
+        if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
+            self.flushed_count += 1;
+        }
         self.post_flush_if_needed()?;
         Ok(())
     }
@@ -950,6 +966,14 @@ impl Client {
             user_data,
             tx_bytes,
         });
+        // Direct sends are already on the wire: keep flushed_count in
+        // sync so a later flush() failure only truncates pending ops
+        // that were never sent. Without this, the error path dropped
+        // an op whose response WILL arrive — permanently misattributing
+        // every subsequent response.
+        if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
+            self.flushed_count += 1;
+        }
         self.post_flush_if_needed()?;
         Ok(())
     }
@@ -1025,6 +1049,14 @@ impl Client {
             user_data,
             tx_bytes,
         });
+        // Direct sends are already on the wire: keep flushed_count in
+        // sync so a later flush() failure only truncates pending ops
+        // that were never sent. Without this, the error path dropped
+        // an op whose response WILL arrive — permanently misattributing
+        // every subsequent response.
+        if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
+            self.flushed_count += 1;
+        }
         self.post_flush_if_needed()?;
         Ok(())
     }
@@ -1038,9 +1070,6 @@ impl Client {
 
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
         self.flushed_count = self.flushed_count.saturating_sub(1);
-
-        // Capture pre-read recv timestamp for TTFB before blocking on data.
-        let ttfb_ns = self.compute_ttfb(pending.send_ts);
 
         let resp = match self.read_value().await {
             Ok(v) => v,
@@ -1056,6 +1085,10 @@ impl Client {
                 return Err(e);
             }
         };
+        // TTFB from the kernel timestamp of the data that completed THIS
+        // read. Sampling before the read used the PREVIOUS response's
+        // arrival time for every op after the first in a pipelined batch.
+        let ttfb_ns = self.compute_ttfb(pending.send_ts);
         let latency_ns = match pending.start {
             Some(start) => self.finish_timing(pending.send_ts, start),
             None => 0,
@@ -1174,7 +1207,16 @@ impl Client {
         if n == 0 {
             return result.unwrap_or(Err(Error::ConnectionClosed));
         }
-        result.unwrap()
+        let value = result.unwrap();
+        // A protocol error means the RESP framing is irrecoverably
+        // misaligned (the failed parse consumed the whole accumulator,
+        // possibly swallowing the fronts of pipelined responses). Close the
+        // connection so it can't serve stale responses to later commands —
+        // matching the memcache and ping clients.
+        if matches!(value, Err(Error::Protocol(_))) {
+            self.conn.close();
+        }
+        value
     }
 
     /// Send a SET command via scatter-gather (prefix + value + suffix as

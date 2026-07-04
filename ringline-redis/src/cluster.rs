@@ -81,6 +81,16 @@ enum AskOutcome {
 /// Commands are routed to the correct primary node using the cluster
 /// slot map. MOVED and ASK redirects are handled transparently with
 /// automatic topology refresh.
+///
+/// # Retry semantics (at-least-once)
+///
+/// When a send succeeds but the connection dies before the response is
+/// read, the command is retried on another connection. The server may have
+/// executed the first attempt, so commands are **at-least-once**: harmless
+/// for idempotent operations (GET/SET/DEL), but non-idempotent commands
+/// (INCR/DECR/APPEND) can be applied twice under connection churn. Wrap
+/// such operations in application-level idempotency (unique keys,
+/// versioning) if double-execution matters.
 pub struct ClusterClient {
     /// Map from "host:port" → node state.
     nodes: HashMap<String, NodeState>,
@@ -148,7 +158,20 @@ impl ClusterClient {
 
         for addr in &connected_addrs {
             if let Some(NodeState::Connected(conn)) = self.nodes.get(addr) {
-                conn.send(&cluster_slots_cmd)?;
+                // A send failure on a stale connection is expected during
+                // the very outages that trigger a refresh — mark the node
+                // down and try the next one instead of failing the whole
+                // refresh (which also failed the caller's command even
+                // though healthy nodes could serve it).
+                if conn.send(&cluster_slots_cmd).is_err() {
+                    if let Some(state) = self.nodes.get_mut(addr) {
+                        if let NodeState::Connected(conn) = state {
+                            conn.close();
+                        }
+                        *state = NodeState::Disconnected;
+                    }
+                    continue;
+                }
                 match Client::new(*conn).read_value().await {
                     Ok(value) => {
                         slots_value = Some(value);
@@ -172,7 +195,10 @@ impl ClusterClient {
             for &seed_addr in &self.seeds {
                 match self.do_connect(seed_addr).await {
                     Ok(conn) => {
-                        conn.send(&cluster_slots_cmd)?;
+                        if conn.send(&cluster_slots_cmd).is_err() {
+                            conn.close();
+                            continue;
+                        }
                         match Client::new(conn).read_value().await {
                             Ok(value) => {
                                 let key = seed_addr.to_string();

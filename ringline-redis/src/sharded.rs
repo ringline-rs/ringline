@@ -72,6 +72,16 @@ struct Shard {
 /// Commands are routed to independent Redis instances using consistent
 /// hashing. Each server has a pool of connections with round-robin
 /// dispatch and lazy reconnection.
+///
+/// # Retry semantics (at-least-once)
+///
+/// When a send succeeds but the connection dies before the response is
+/// read, the command is retried on another connection. The server may have
+/// executed the first attempt, so commands are **at-least-once**: harmless
+/// for idempotent operations (GET/SET/DEL), but non-idempotent commands
+/// (INCR/DECR/APPEND) can be applied twice under connection churn. Wrap
+/// such operations in application-level idempotency (unique keys,
+/// versioning) if double-execution matters.
 pub struct ShardedClient {
     shards: Vec<Shard>,
     ring: ketama::Ring,
