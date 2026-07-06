@@ -1996,11 +1996,21 @@ fn udp_gso_segments_one_send_into_many_datagrams() {
         "kernel should have produced exactly the {segments} segments"
     );
 
-    // Confirm only one logical send was issued by the handler.
+    // Confirm only one logical send was issued by the handler. The mio
+    // fallback sends synchronously inside `send_to_gso`, so the client can
+    // observe all segments before the handler thread has run the counter
+    // increment that follows the call — wait for it instead of sampling.
+    let sent = GSO_SENT.get().unwrap();
+    for _ in 0..400 {
+        if sent.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(
-        GSO_SENT.get().unwrap().load(Ordering::SeqCst),
+        sent.load(Ordering::SeqCst),
         1,
-        "send_to_gso should issue a single sendmsg call"
+        "send_to_gso should issue a single logical send"
     );
 
     shutdown.shutdown();
