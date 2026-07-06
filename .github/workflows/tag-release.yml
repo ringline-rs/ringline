@@ -110,7 +110,11 @@ jobs:
           # range (e.g., "0.1") so it doesn't need updating for patch bumps.
           sed -i "0,/^version = \"${VERSION}\"/s//version = \"${NEXT_DEV}\"/" ringline/Cargo.toml
 
-          git add ringline/Cargo.toml
+          # CI runs --locked against the committed Cargo.lock; refresh the
+          # workspace members' own entries or the bump PR is born red.
+          cargo update --workspace
+
+          git add ringline/Cargo.toml Cargo.lock
           git commit -m "chore: bump to ${NEXT_DEV} for next development iteration"
           git push origin "$BRANCH"
 
@@ -136,7 +140,11 @@ jobs:
 
           sed -i "0,/^version = \"${VERSION}\"/s//version = \"${NEXT_PATCH}\"/" "${CRATE}/Cargo.toml"
 
-          git add "${CRATE}/Cargo.toml"
+          # CI runs --locked against the committed Cargo.lock; refresh the
+          # workspace members' own entries or the bump PR is born red.
+          cargo update --workspace
+
+          git add "${CRATE}/Cargo.toml" Cargo.lock
           git commit -m "chore: bump ${CRATE} to ${NEXT_PATCH} for next development iteration"
           git push origin "$BRANCH"
 
