@@ -86,6 +86,36 @@ impl SendCopyPool {
         Some((idx, out_ptr, total_len as u32))
     }
 
+    /// Allocate an empty slot for incremental filling (e.g. TLS ciphertext
+    /// written directly by `write_tls` via `PoolWriter`). Returns
+    /// `(slot, base_ptr, capacity)`. The caller fills bytes front-to-back
+    /// and must call [`set_filled`](Self::set_filled) with the final length
+    /// before the slot is used in an SQE (until then remaining == 0).
+    pub fn alloc_raw(&mut self) -> Option<(u16, *mut u8, u32)> {
+        let idx = match self.free_list.pop() {
+            Some(i) => i,
+            None => {
+                crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
+                return None;
+            }
+        };
+        let offset = idx as usize * self.slot_size as usize;
+        self.slot_offset[idx as usize] = 0;
+        self.slot_remaining[idx as usize] = 0;
+        self.in_use[idx as usize] = true;
+        let ptr = self.backing.as_mut_ptr().wrapping_add(offset);
+        Some((idx, ptr, self.slot_size))
+    }
+
+    /// Record how many bytes were filled into a slot from [`alloc_raw`](Self::alloc_raw).
+    pub fn set_filled(&mut self, slot: u16, len: u32) {
+        let i = slot as usize;
+        debug_assert!(self.in_use[i]);
+        debug_assert!(len <= self.slot_size);
+        self.slot_offset[i] = 0;
+        self.slot_remaining[i] = len;
+    }
+
     /// Release a slot back to the free list (called on Send CQE).
     pub fn release(&mut self, idx: u16) {
         debug_assert!((idx as usize) < self.count as usize);
