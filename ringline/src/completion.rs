@@ -1,3 +1,14 @@
+/// Msg flags for TCP stream sends (`Send`/`SendMsg`, not the UDP paths).
+///
+/// `MSG_WAITALL`: io_uring (kernel >= 5.19) retries a short stream send
+/// in-kernel until the full buffer is sent or an error occurs, collapsing
+/// the short-send CQE -> userspace resubmit -> CQE round trip into a single
+/// completion. On kernels that don't implement it for send, the socket
+/// layer ignores the flag (send(2) semantics) - a safe no-op. The userspace
+/// partial-send machinery stays in place as the fallback either way.
+#[cfg(has_io_uring)]
+pub(crate) const STREAM_SEND_FLAGS: i32 = libc::MSG_WAITALL;
+
 /// Operation tags encoded in the upper 8 bits of user_data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

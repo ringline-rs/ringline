@@ -189,6 +189,7 @@ impl Ring {
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::Send, conn_index, pool_slot as u32);
         let entry = opcode::Send::new(Fixed(conn_index), ptr, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
             .build()
             .user_data(user_data.raw());
         unsafe {
@@ -225,6 +226,7 @@ impl Ring {
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::SendMsgCoalesced, conn_index, slab_idx as u32);
         let entry = opcode::SendMsg::new(Fixed(conn_index), msg)
+            .flags(crate::completion::STREAM_SEND_FLAGS as u32)
             .build()
             .user_data(user_data.raw());
         unsafe {
@@ -262,6 +264,7 @@ impl Ring {
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::SendRecvBufsCoalesced, conn_index, slab_idx as u32);
         let entry = opcode::SendMsg::new(Fixed(conn_index), msg)
+            .flags(crate::completion::STREAM_SEND_FLAGS as u32)
             .build()
             .user_data(user_data.raw());
         unsafe {
@@ -302,6 +305,7 @@ impl Ring {
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::TlsSend, conn_index, pool_slot as u32);
         let entry = opcode::Send::new(Fixed(conn_index), ptr, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
             .build()
             .user_data(user_data.raw());
         unsafe {
@@ -321,6 +325,7 @@ impl Ring {
     ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::TlsSend, conn_index, pool_slot as u32);
         let entry = opcode::Send::new(Fixed(conn_index), ptr, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
             .build()
             .user_data(user_data.raw())
             .flags(io_uring::squeue::Flags::IO_LINK);

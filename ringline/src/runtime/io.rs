@@ -932,6 +932,7 @@ impl ConnCtx {
                             pending_ptr,
                             pending.len,
                         )
+                        .flags(crate::completion::STREAM_SEND_FLAGS)
                         .build()
                         .user_data(user_data.raw());
 
@@ -2053,6 +2054,7 @@ impl Future for DirectEchoFuture {
                         pending.ptr,
                         pending.len,
                     )
+                    .flags(crate::completion::STREAM_SEND_FLAGS)
                     .build()
                     .user_data(ud.raw());
                     let built = crate::handler::BuiltSend {
