@@ -547,6 +547,13 @@ impl ConfigBuilder {
     }
 
     /// Set the starting CPU core index for pinning.
+    ///
+    /// When `core_offset + worker_threads` fits within the machine's
+    /// physical core count, this indexes *physical* cores and each
+    /// worker is pinned to a distinct physical core's first SMT sibling
+    /// (so hyperthread-adjacent CPU enumerations don't stack two workers
+    /// on one core). Larger offsets are treated as raw logical CPU ids,
+    /// which keeps deliberate hyperthread layouts expressible.
     pub fn core_offset(mut self, offset: usize) -> Self {
         self.config.worker.core_offset = offset;
         self
@@ -749,6 +756,12 @@ impl ConfigBuilder {
     ///
     /// Datagrams that arrive while the queue is full are dropped and
     /// counted in `udp::DATAGRAMS_DROPPED`. Default: 1024.
+    ///
+    /// On the io_uring backend each queued datagram pins one provided
+    /// ring buffer until it is consumed, so the effective capacity is
+    /// clamped to `udp_recv_buffer` ring_size — raise both knobs
+    /// together for deeper queues. The mio backend copies datagrams into
+    /// owned buffers and honors the full configured depth.
     pub fn udp_recv_queue_capacity(mut self, capacity: usize) -> Self {
         self.config.udp_recv_queue_capacity = capacity;
         self

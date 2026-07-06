@@ -35,12 +35,33 @@ pub fn physical_core_count() -> usize {
     if ret < 1 { 1 } else { ret as usize }
 }
 
-/// Parse unique (physical_package_id, core_id) pairs from sysfs.
-/// Returns `None` if sysfs is unavailable or yields zero entries.
+/// Logical CPU ids of the first SMT sibling of each physical core, in
+/// ascending logical-CPU order.
+///
+/// Used for SMT-aware worker pinning: indexing this list by a physical
+/// core number yields a logical CPU on a distinct physical core
+/// regardless of how the machine enumerates hyperthread siblings
+/// (grouped `0..N` physical then `N..2N` siblings, or adjacent
+/// `0/1 = one core`). Returns `None` when sysfs topology is unavailable
+/// (non-Linux, or exotic sysfs layouts).
+pub(crate) fn physical_core_first_cpus() -> Option<Vec<usize>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_first_siblings()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Walk sysfs recording the first logical CPU seen for each unique
+/// (physical_package_id, core_id) pair.
 #[cfg(target_os = "linux")]
-fn linux_physical_cores() -> Option<usize> {
+fn linux_first_siblings() -> Option<Vec<usize>> {
     use std::collections::HashSet;
     let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut firsts: Vec<usize> = Vec::new();
     let mut cpu = 0usize;
     while let Ok(pkg_raw) = std::fs::read_to_string(format!(
         "/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"
@@ -52,14 +73,23 @@ fn linux_physical_cores() -> Option<usize> {
             Ok(s) => s.trim().to_owned(),
             Err(_) => break,
         };
-        seen.insert((pkg, core));
+        if seen.insert((pkg, core)) {
+            firsts.push(cpu);
+        }
         cpu += 1;
     }
-    if seen.is_empty() {
+    if firsts.is_empty() {
         None
     } else {
-        Some(seen.len())
+        Some(firsts)
     }
+}
+
+/// Parse unique (physical_package_id, core_id) pairs from sysfs.
+/// Returns `None` if sysfs is unavailable or yields zero entries.
+#[cfg(target_os = "linux")]
+fn linux_physical_cores() -> Option<usize> {
+    linux_first_siblings().map(|v| v.len())
 }
 
 #[cfg(test)]
@@ -75,5 +105,16 @@ mod tests {
     fn physical_core_count_does_not_exceed_logical() {
         let logical = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as usize;
         assert!(physical_core_count() <= logical);
+    }
+
+    #[test]
+    fn first_siblings_are_distinct_ascending_and_agree_with_count() {
+        if let Some(cpus) = physical_core_first_cpus() {
+            assert_eq!(cpus.len(), physical_core_count());
+            // Strictly ascending (walk order) implies all-distinct.
+            assert!(cpus.windows(2).all(|w| w[0] < w[1]));
+            let logical = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as usize;
+            assert!(cpus.iter().all(|&c| c < logical));
+        }
     }
 }
