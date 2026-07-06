@@ -956,6 +956,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     buf_ptr,
                     bytes_received,
                 )
+                .flags(crate::completion::STREAM_SEND_FLAGS)
                 .build()
                 .user_data(ud.raw());
                 let built = crate::handler::BuiltSend {
@@ -1788,6 +1789,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     new_ptr,
                     new_remaining,
                 )
+                .flags(crate::completion::STREAM_SEND_FLAGS)
                 .build()
                 .user_data(new_ud.raw());
 

@@ -480,6 +480,7 @@ fn build_pool_send(
 ) -> crate::handler::BuiltSend {
     let user_data = crate::completion::UserData::encode(tag, conn_index, pool_slot as u32);
     let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
+        .flags(crate::completion::STREAM_SEND_FLAGS)
         .build()
         .user_data(user_data.raw());
     crate::handler::BuiltSend {

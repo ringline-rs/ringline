@@ -251,6 +251,7 @@ impl<'a> DriverCtx<'a> {
                 slot as u32,
             );
             let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn.index), ptr, len)
+                .flags(crate::completion::STREAM_SEND_FLAGS)
                 .build()
                 .user_data(user_data.raw());
 
@@ -2874,6 +2875,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             slot as u32,
         );
         let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
             .build()
             .user_data(user_data.raw());
 
@@ -3095,6 +3097,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
             slot as u32,
         );
         let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
             .build()
             .user_data(user_data.raw());
 
@@ -3162,6 +3165,7 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             slot as u32,
         );
         let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(self.conn.index), ptr, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
             .build()
             .user_data(user_data.raw());
 
@@ -3398,6 +3402,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                     );
                     let entry =
                         io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
+                            .flags(crate::completion::STREAM_SEND_FLAGS)
                             .build()
                             .user_data(user_data.raw());
                     BuiltSend {
@@ -3430,6 +3435,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                     );
                     let entry =
                         io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
+                            .flags(crate::completion::STREAM_SEND_FLAGS)
                             .build()
                             .user_data(user_data.raw());
 
