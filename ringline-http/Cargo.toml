@@ -12,6 +12,9 @@ gzip = ["dep:flate2"]
 zstd = ["dep:zstd"]
 brotli = ["dep:brotli"]
 compression = ["gzip", "zstd", "brotli"]
+# Exposes doc(hidden) entry points into the crate-private HTTP/1.1 parsers
+# for the fuzz harness in ../fuzz. Never enable outside fuzzing.
+fuzzing = []
 
 [dependencies]
 bytes = { workspace = true }

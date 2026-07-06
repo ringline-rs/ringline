@@ -13,6 +13,9 @@ members = [
     "ringline-bench",
     "ringline-benchmarks",
 ]
+# The fuzz harness is its own workspace (nightly-only, own lockfile) so it
+# cannot perturb --locked CI for the main workspace.
+exclude = ["fuzz"]
 
 [workspace.package]
 authors = ["Brian Martin <brayniac@gmail.com>"]

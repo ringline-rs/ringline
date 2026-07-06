@@ -1,7 +1,7 @@
 # Fuzzing the wire-facing parsers
 
-- **Status:** open
-- **Span:** started 2026-07-06
+- **Status:** shipped
+- **Span:** 2026-07-06
 
 ## Goal
 
@@ -64,12 +64,48 @@ Deliberately out of scope, with reasons:
 
 ## Outcome
 
-_(open)_
+Eight cargo-fuzz targets in a root `fuzz/` workspace (excluded from the main
+workspace, own committed lockfile — root `Cargo.lock` untouched):
+
+- `h2_frame`, `h2_hpack`, `h2_connection` — the last opens a real request
+  stream and delivers input in fuzzer-chosen chunk sizes.
+- `h3_frame` (varint + frame decode incl. the zero-copy `decode_frame_in`),
+  `h3_qpack`.
+- `grpc_message` (direct decode + `MessageBuffer` reassembly with chunked
+  delivery), `grpc_connection` (full gRPC-over-h2 stack behind a real
+  `send_unary`).
+- `http1_response` — reaches the crate-private h1 parsers via two
+  `#[doc(hidden)]` wrappers behind a new off-by-default `fuzzing` feature in
+  ringline-http (`fuzz_parse_response_headers`, `fuzz_decode_chunk`); the
+  internal types stay private.
+
+GO criteria verified locally (nightly, libFuzzer/ASan): all targets build; a
+20 s/target burn-in produced **no findings**; coverage confirms real parsing
+depth (`h2_connection` cov 1422 edges, corpus 2 seeds → 657 entries in 8 s;
+`http1_response` cov 566; `grpc_connection` cov 736; `h3_frame` cov 233).
+Main-workspace gates unperturbed: `cargo metadata --locked` clean, clippy
+`-D warnings` on both backends and with `--features fuzzing`, ringline-http
+tests green.
+
+CI: `.github/workflows/fuzz.yml` — daily cron + `workflow_dispatch`, 8-target
+matrix, 300 s/target (dispatch-tunable), crash artifacts uploaded on failure.
+Seed corpora committed under `fuzz/corpus/<target>/`.
+
+The `H3Connection` state machine remains unfuzzed as scoped: its only byte
+ingress is `handle_quic_event(&mut QuicEndpoint, ...)`, which requires a live
+quinn-proto endpoint — no sans-IO seam exists.
 
 ## Lessons / open questions
 
+- The seam survey found the h1 parsers were the only in-scope code not
+  publicly reachable; the `fuzzing`-feature wrapper pattern (doc-hidden fns
+  that consume results internally, no type exposure) kept the API surface
+  policy intact and is the template for future private seams.
 - Open: structured fuzzing of `RecvAccumulator` (append/advance/take/put-back
   sequences) — needs a `pub` seam or an in-crate fuzz setup; revisit if the
   accumulator grows more state transitions.
 - Open: seed corpora from real traffic captures would raise coverage; start
   with hand-written minimal seeds.
+- Open: a periodic corpus-persistence scheme (cache or artifact round-trip in
+  CI) would let coverage accumulate across runs instead of restarting from
+  seeds daily.
