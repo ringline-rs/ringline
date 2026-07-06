@@ -202,6 +202,12 @@ pub(crate) struct TimerSlotPool {
     /// Deadline instants for the mio backend timer expiry.
     #[cfg(not(has_io_uring))]
     pub(crate) deadlines: Vec<Option<std::time::Instant>>,
+    /// Min-heap of (deadline, slot, generation) for O(log n) expiry checks
+    /// on the mio backend (replaces full-pool scans per loop iteration).
+    /// Entries are lazily invalidated: a popped/peeked entry only counts if
+    /// the slot's generation and exact deadline still match.
+    #[cfg(not(has_io_uring))]
+    expiry_heap: std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u32, u16)>>,
     /// Which task (with STANDALONE_BIT encoding) to wake when this timer fires.
     pub(crate) waker_ids: Vec<u32>,
     /// Whether the CQE/event has arrived for this timer.
@@ -225,6 +231,8 @@ impl TimerSlotPool {
             timespecs: vec![io_uring::types::Timespec::new(); cap],
             #[cfg(not(has_io_uring))]
             deadlines: vec![None; cap],
+            #[cfg(not(has_io_uring))]
+            expiry_heap: std::collections::BinaryHeap::new(),
             waker_ids: vec![0; cap],
             fired: vec![false; cap],
             generations: vec![0; cap],
@@ -326,7 +334,10 @@ impl TimerSlotPool {
     #[cfg(not(has_io_uring))]
     pub(crate) fn set_relative(&mut self, slot: u32, duration: std::time::Duration) {
         let idx = slot as usize;
-        self.deadlines[idx] = Some(std::time::Instant::now() + duration);
+        let deadline = std::time::Instant::now() + duration;
+        self.deadlines[idx] = Some(deadline);
+        self.expiry_heap
+            .push(std::cmp::Reverse((deadline, slot, self.generations[idx])));
     }
 
     /// Store an absolute deadline (mio backend).
@@ -351,6 +362,50 @@ impl TimerSlotPool {
             std::time::Instant::now()
         };
         self.deadlines[idx] = Some(deadline);
+        self.expiry_heap
+            .push(std::cmp::Reverse((deadline, slot, self.generations[idx])));
+    }
+
+    /// A heap entry is live iff the slot still holds this exact deadline in
+    /// the same generation and hasn't fired. Anything else is a stale entry
+    /// left behind by release/re-arm and is skipped (lazy deletion).
+    #[cfg(not(has_io_uring))]
+    fn heap_entry_live(&self, deadline: std::time::Instant, slot: u32, generation: u16) -> bool {
+        let idx = slot as usize;
+        idx < self.generations.len()
+            && self.generations[idx] == generation
+            && !self.fired[idx]
+            && self.deadlines[idx] == Some(deadline)
+    }
+
+    /// Earliest live deadline, discarding stale heap heads.
+    #[cfg(not(has_io_uring))]
+    pub(crate) fn next_deadline(&mut self) -> Option<std::time::Instant> {
+        while let Some(&std::cmp::Reverse((deadline, slot, generation))) = self.expiry_heap.peek() {
+            if self.heap_entry_live(deadline, slot, generation) {
+                return Some(deadline);
+            }
+            self.expiry_heap.pop();
+        }
+        None
+    }
+
+    /// Pop the next timer whose deadline is <= `now`. Returns
+    /// `(slot, generation)` ready to pass to [`fire`](Self::fire).
+    #[cfg(not(has_io_uring))]
+    pub(crate) fn pop_expired(&mut self, now: std::time::Instant) -> Option<(u32, u16)> {
+        while let Some(&std::cmp::Reverse((deadline, slot, generation))) = self.expiry_heap.peek() {
+            if !self.heap_entry_live(deadline, slot, generation) {
+                self.expiry_heap.pop();
+                continue;
+            }
+            if deadline > now {
+                return None;
+            }
+            self.expiry_heap.pop();
+            return Some((slot, generation));
+        }
+        None
     }
 }
 

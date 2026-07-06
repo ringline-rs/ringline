@@ -60,6 +60,18 @@ pub(crate) struct Driver {
     /// Per-connection pending send buffers: `VecDeque<(data, offset)>`.
     /// Populated by DriverCtx::send(), drained by the event loop on writable.
     pub(crate) pending_sends: Vec<VecDeque<PendingSend>>,
+    /// Connection indices with non-empty `pending_sends`, so the per-loop
+    /// flush pass touches only dirty connections instead of scanning all
+    /// slots. Invariant: `pending_sends[i]` non-empty ⇒ `sends_dirty_flag[i]`
+    /// set (and `i` present in `sends_dirty`).
+    pub(crate) sends_dirty: Vec<u32>,
+    pub(crate) sends_dirty_flag: Vec<bool>,
+    /// Same shape for `send_completions`.
+    pub(crate) completions_dirty: Vec<u32>,
+    pub(crate) completions_dirty_flag: Vec<bool>,
+    /// Number of connections with an armed connect deadline — lets the
+    /// per-loop timeout sweep skip the scan entirely in the common case.
+    pub(crate) connect_pending: u32,
     /// Per-connection writable flag (most recent readiness from mio).
     pub(crate) writable: Vec<bool>,
     /// Per-connection connect timeout deadline (None if no timeout or not connecting).
@@ -218,6 +230,11 @@ impl Driver {
             tcp_streams: (0..max_conn).map(|_| None).collect(),
             pending_closes: Vec::new(),
             pending_sends: (0..max_conn).map(|_| VecDeque::new()).collect(),
+            sends_dirty: Vec::new(),
+            sends_dirty_flag: vec![false; max_conn],
+            completions_dirty: Vec::new(),
+            completions_dirty_flag: vec![false; max_conn],
+            connect_pending: 0,
             writable: vec![false; max_conn],
             connect_deadlines: vec![None; max_conn],
             wake_pipe_fd: eventfd,
@@ -273,6 +290,11 @@ impl Driver {
             recvmsg_msghdr: std::ptr::null(),
             send_queues: &mut self.send_queues,
             pending_sends: &mut self.pending_sends,
+            sends_dirty: &mut self.sends_dirty,
+            sends_dirty_flag: &mut self.sends_dirty_flag,
+            completions_dirty: &mut self.completions_dirty,
+            completions_dirty_flag: &mut self.completions_dirty_flag,
+            connect_pending: &mut self.connect_pending,
             pending_closes: &mut self.pending_closes,
             tcp_streams: &mut self.tcp_streams,
             poll: &mut self.poll,
@@ -354,7 +376,9 @@ impl Driver {
 
         self.pending_sends[idx].clear();
         self.writable[idx] = false;
-        self.connect_deadlines[idx] = None;
+        if self.connect_deadlines[idx].take().is_some() {
+            self.connect_pending -= 1;
+        }
         self.send_completions[idx].clear();
         self.accumulators.reset(conn_index);
 
@@ -371,6 +395,18 @@ impl Driver {
         // incremented, so unconditional decrement underflowed the gauge.
         if was_established {
             crate::metrics::CONNECTIONS_ACTIVE.decrement();
+        }
+    }
+
+    /// Record `idx` in the dirty-sends list so the event loop's flush pass
+    /// visits it. Invariant: non-empty `pending_sends[idx]` ⇒ flag set.
+    /// Every push into `pending_sends` — including the TLS paths that push
+    /// from the event loop — and every partial flush must uphold this, or
+    /// the queue stalls until an unrelated writable event arrives.
+    pub(crate) fn mark_send_dirty(&mut self, idx: usize) {
+        if !self.sends_dirty_flag[idx] {
+            self.sends_dirty_flag[idx] = true;
+            self.sends_dirty.push(idx as u32);
         }
     }
 
@@ -427,6 +463,8 @@ impl Driver {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
                     self.writable[idx] = false;
+                    // Queue survives this flush — keep the dirty invariant.
+                    self.mark_send_dirty(idx);
                     return Ok((false, total_written));
                 }
                 return Err(err);
@@ -449,6 +487,10 @@ impl Driver {
                         remaining -= avail;
                         if let Some(len) = notify.take() {
                             self.send_completions[idx].push_back(len);
+                            if !self.completions_dirty_flag[idx] {
+                                self.completions_dirty_flag[idx] = true;
+                                self.completions_dirty.push(idx as u32);
+                            }
                         }
                         self.pending_sends[idx].pop_front();
                     } else {

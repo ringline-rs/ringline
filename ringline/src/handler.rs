@@ -1833,6 +1833,11 @@ pub struct DriverCtx<'a> {
     pub(crate) send_completions: &'a mut Vec<std::collections::VecDeque<u32>>,
     /// Per-connection connect timeout deadlines.
     pub(crate) connect_deadlines: &'a mut Vec<Option<std::time::Instant>>,
+    pub(crate) sends_dirty: &'a mut Vec<u32>,
+    pub(crate) sends_dirty_flag: &'a mut Vec<bool>,
+    pub(crate) completions_dirty: &'a mut Vec<u32>,
+    pub(crate) completions_dirty_flag: &'a mut Vec<bool>,
+    pub(crate) connect_pending: &'a mut u32,
     /// Shared disk I/O pool for filesystem operations.
     pub(crate) disk_io_pool: &'a Option<std::sync::Arc<crate::disk_io_pool::DiskIoPool>>,
     /// Per-worker disk I/O response send channel (included in each request).
@@ -1900,6 +1905,7 @@ impl<'a> DriverCtx<'a> {
                 if !ciphertext.is_empty() {
                     let idx = conn.index as usize;
                     self.pending_sends[idx].push_back((ciphertext, 0, None));
+                    self.mark_send_dirty(idx);
                 }
                 return Ok(());
             }
@@ -1907,7 +1913,17 @@ impl<'a> DriverCtx<'a> {
 
         let idx = conn.index as usize;
         self.pending_sends[idx].push_back((data.to_vec(), 0, None));
+        self.mark_send_dirty(idx);
         Ok(())
+    }
+
+    /// Record `idx` in the dirty-sends list so the event loop's flush pass
+    /// visits it. Invariant: non-empty `pending_sends[idx]` ⇒ flag set.
+    fn mark_send_dirty(&mut self, idx: usize) {
+        if !self.sends_dirty_flag[idx] {
+            self.sends_dirty_flag[idx] = true;
+            self.sends_dirty.push(idx as u32);
+        }
     }
 
     /// Mark the most recently queued pending send as awaitable: its
@@ -1922,6 +1938,10 @@ impl<'a> DriverCtx<'a> {
             // queued, never written inline) — but if the queue is somehow
             // empty, deliver a zero-byte completion so the future resolves.
             self.send_completions[idx].push_back(0);
+            if !self.completions_dirty_flag[idx] {
+                self.completions_dirty_flag[idx] = true;
+                self.completions_dirty.push(idx as u32);
+            }
         }
     }
 
@@ -2041,8 +2061,12 @@ impl<'a> DriverCtx<'a> {
         timeout_ms: u64,
     ) -> Result<ConnToken, crate::error::Error> {
         let token = self.connect(addr)?;
-        self.connect_deadlines[token.index as usize] =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+        if self.connect_deadlines[token.index as usize]
+            .replace(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms))
+            .is_none()
+        {
+            *self.connect_pending += 1;
+        }
         Ok(token)
     }
 
@@ -2098,8 +2122,12 @@ impl<'a> DriverCtx<'a> {
         timeout_ms: u64,
     ) -> Result<ConnToken, crate::error::Error> {
         let token = self.connect_tls(addr, server_name)?;
-        self.connect_deadlines[token.index as usize] =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+        if self.connect_deadlines[token.index as usize]
+            .replace(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms))
+            .is_none()
+        {
+            *self.connect_pending += 1;
+        }
         Ok(token)
     }
 

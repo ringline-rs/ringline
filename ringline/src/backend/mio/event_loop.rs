@@ -542,6 +542,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // Put the stream back.
                 self.driver.tcp_streams[idx] = Some(stream);
 
+                // feed_tls_recv_mio pushes handshake/ciphertext output into
+                // pending_sends directly (not via DriverCtx), so uphold the
+                // dirty invariant here or the flush pass never visits it.
+                if !self.driver.pending_sends[idx].is_empty() {
+                    self.driver.mark_send_dirty(idx);
+                }
+
                 match result {
                     crate::tls::TlsRecvResult::HandshakeJustCompleted => {
                         let is_outbound = self
@@ -668,7 +675,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             // Connect completed — check SO_ERROR for connect failure.
             // Clear any connect timeout.
-            self.driver.connect_deadlines[idx] = None;
+            if self.driver.connect_deadlines[idx].take().is_some() {
+                self.driver.connect_pending -= 1;
+            }
 
             let result = if let Some(ref stream) = self.driver.tcp_streams[idx] {
                 match stream.take_error() {
@@ -700,6 +709,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         &mut self.driver.pending_sends[idx],
                         conn_index,
                     );
+                    if !self.driver.pending_sends[idx].is_empty() {
+                        self.driver.mark_send_dirty(idx);
+                    }
                     self.driver.register_writable(conn_index);
                     let _ = self.driver.flush_sends(conn_index);
                     return;
@@ -846,19 +858,29 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Flush pending sends for all connections that have buffered data.
+    /// Flush pending sends for connections with buffered data. Visits only
+    /// the dirty list (marked on queue) instead of scanning every slot;
+    /// connections whose queue survives the flush attempt are re-marked.
     fn flush_all_pending_sends(&mut self) {
-        let max = self.driver.pending_sends.len();
-        for idx in 0..max {
-            if !self.driver.pending_sends[idx].is_empty() {
-                // Register writable interest so mio tells us when we can write.
-                self.driver.register_writable(idx as u32);
-                // If we already know the socket is writable, try flushing now.
-                if self.driver.writable[idx]
-                    && let Err(e) = self.driver.flush_sends(idx as u32)
-                {
-                    self.fail_connection_on_send_error(idx as u32, e);
-                }
+        let dirty = std::mem::take(&mut self.driver.sends_dirty);
+        for conn_index in dirty {
+            let idx = conn_index as usize;
+            self.driver.sends_dirty_flag[idx] = false;
+            if self.driver.pending_sends[idx].is_empty() {
+                continue;
+            }
+            // Register writable interest so mio tells us when we can write.
+            self.driver.register_writable(conn_index);
+            // If we already know the socket is writable, try flushing now.
+            if self.driver.writable[idx]
+                && let Err(e) = self.driver.flush_sends(conn_index)
+            {
+                self.fail_connection_on_send_error(conn_index, e);
+                continue;
+            }
+            if !self.driver.pending_sends[idx].is_empty() && !self.driver.sends_dirty_flag[idx] {
+                self.driver.sends_dirty_flag[idx] = true;
+                self.driver.sends_dirty.push(conn_index);
             }
         }
     }
@@ -875,17 +897,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Drain per-connection send completion queues, calling wake_send for
-    /// each and re-polling tasks so that each SendFuture resolves.
+    /// each and re-polling tasks so that each SendFuture resolves. Visits
+    /// only connections marked dirty at completion-push time; a connection
+    /// with results left over (single waiter slot, or no waiter yet) is
+    /// re-marked for the next pass.
     fn drain_send_completions(&mut self) {
         loop {
             let mut delivered = false;
-            let max = self.driver.send_completions.len();
-            for idx in 0..max {
+            let dirty = std::mem::take(&mut self.driver.completions_dirty);
+            for conn_index in dirty {
+                let idx = conn_index as usize;
+                self.driver.completions_dirty_flag[idx] = false;
                 if let Some(bytes) = self.driver.send_completions[idx].pop_front()
                     && self.executor.send_waiters[idx]
                 {
-                    self.executor.wake_send(idx as u32, Ok(bytes));
+                    self.executor.wake_send(conn_index, Ok(bytes));
                     delivered = true;
+                }
+                if !self.driver.send_completions[idx].is_empty()
+                    && !self.driver.completions_dirty_flag[idx]
+                {
+                    self.driver.completions_dirty_flag[idx] = true;
+                    self.driver.completions_dirty.push(conn_index);
                 }
             }
             if !delivered {
@@ -901,59 +934,46 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Fire all expired timers and push the associated tasks to the ready queue.
     fn fire_expired_timers(&mut self) {
         let now = Instant::now();
-        // Collect timer slots that should fire to avoid borrow conflict.
-        let mut to_fire: Vec<(u32, u16)> = Vec::new();
-        let pool = &self.executor.timer_pool;
-        for slot in 0..pool.deadlines.len() {
-            if let Some(deadline) = pool.deadlines[slot]
-                && now >= deadline
-                && !pool.fired[slot]
-            {
-                let generation = pool.generations[slot];
-                to_fire.push((slot as u32, generation));
-            }
-        }
-        for (slot, generation) in to_fire {
+        // Heap-driven expiry: O(log n) per fired timer instead of a full
+        // pool scan per loop iteration.
+        while let Some((slot, generation)) = self.executor.timer_pool.pop_expired(now) {
             if let Some(waker_id) = self.executor.timer_pool.fire(slot, generation) {
                 self.executor.wake_task(waker_id);
             }
         }
 
-        // Check for timed-out connect operations.
-        let mut timed_out: Vec<u32> = Vec::new();
-        for (idx, deadline) in self.driver.connect_deadlines.iter().enumerate() {
-            if let Some(dl) = deadline
-                && now >= *dl
-            {
-                timed_out.push(idx as u32);
+        // Check for timed-out connect operations. `connect_pending` counts
+        // armed deadlines so the common no-outbound-connects case skips the
+        // scan entirely.
+        if self.driver.connect_pending > 0 {
+            let mut timed_out: Vec<u32> = Vec::new();
+            for (idx, deadline) in self.driver.connect_deadlines.iter().enumerate() {
+                if let Some(dl) = deadline
+                    && now >= *dl
+                {
+                    timed_out.push(idx as u32);
+                }
             }
-        }
-        for conn_index in timed_out {
-            self.driver.connect_deadlines[conn_index as usize] = None;
-            let err = io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
-            self.executor.wake_connect(conn_index, Err(err));
-            self.driver.close_connection(conn_index);
+            for conn_index in timed_out {
+                self.driver.connect_deadlines[conn_index as usize] = None;
+                self.driver.connect_pending -= 1;
+                let err = io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
+                self.executor.wake_connect(conn_index, Err(err));
+                self.driver.close_connection(conn_index);
+            }
         }
     }
 
-    /// Compute the poll timeout from the nearest timer deadline.
-    fn compute_poll_timeout(&self) -> Duration {
-        let now = Instant::now();
-        let mut min_duration = Duration::from_millis(10); // default tick interval
-
-        let pool = &self.executor.timer_pool;
-        for slot in 0..pool.deadlines.len() {
-            if let Some(deadline) = pool.deadlines[slot]
-                && !pool.fired[slot]
-            {
-                let remaining = deadline.saturating_duration_since(now);
-                if remaining < min_duration {
-                    min_duration = remaining;
-                }
-            }
+    /// Compute the poll timeout from the nearest timer deadline (heap
+    /// peek — no pool scan).
+    fn compute_poll_timeout(&mut self) -> Duration {
+        let default = Duration::from_millis(10); // default tick interval
+        match self.executor.timer_pool.next_deadline() {
+            Some(deadline) => deadline
+                .saturating_duration_since(Instant::now())
+                .min(default),
+            None => default,
         }
-
-        min_duration
     }
 
     /// Spawn an async task for a newly accepted connection.
