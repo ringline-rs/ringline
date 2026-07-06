@@ -49,6 +49,6 @@ reconstructed from the commit history (2026-02-20 through v0.4.0).
 | [2026-04/05 — UDP, QUIC, and HTTP/3 datagram stack](2026-04-udp-quic-h3.md) | Apr–May 2026 · v0.1.1–v0.1.2 | GSO/GRO, multishot recvmsg, QUIC events, closing the H3 throughput gap |
 | [2026-05 — Protocol conformance & resource-bounds audit](2026-05-conformance-audit.md) | May 2026 · PRs #158–#180 | RFC conformance, resource bounds, and error-path consistency across every protocol crate |
 | [2026-05/06 — Benchmark infrastructure and the honest numbers](2026-05-benchmarks.md) | Apr–Jun 2026 · PRs #151–#209 · v0.2.0 | Bench suite, BENCHMARKS.md published → withdrawn → re-measured on two machines |
-| [2026-06 — Performance audit](2026-06-perf-audit.md) | Jun 2026 · PRs #212–#227 · v0.2.1 | zc-threshold, write coalescing, allocation elimination; ringline-momento retired |
+| [2026-06 — Performance audit](2026-06-perf-audit.md) | Jun 2026 · PRs #212–#227 · v0.2.1 | zc-threshold, write coalescing, allocation and syscall elimination |
 | [2026-06 — API simplification](2026-06-api-simplification.md) | Jun 2026 · PRs #228–#235 · v0.3.0 | Opaque Config/TLS types, non_exhaustive errors, locked CI |
 | [2026-07 — Correctness audit and v0.4.0](2026-07-correctness-audit.md) | Jul 2026 · PRs #236–#255 · v0.4.0 | ~35 audit fixes in stacked PRs, send-completion design doc, perf follow-ups |

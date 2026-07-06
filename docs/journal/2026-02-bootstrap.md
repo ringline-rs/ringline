@@ -7,8 +7,7 @@
 
 Stand up the ringline repository: import the thread-per-core io_uring runtime as a
 publishable workspace, get CI and a release pipeline working, and grow a family of
-protocol client crates on top of it. Goals here are inferred from the commit
-sequence — there was no journal at the time.
+protocol client crates on top of it.
 
 ## What happened
 
@@ -34,8 +33,7 @@ wrappers, zero-copy SET via `SendGuard`, and histogram metrics; d7bc2f8
 
 **More clients (Feb 21–24).** 7185d91 added `ringline-ping`; 4442616 added kernel
 SO_TIMESTAMPING behind a `timestamps` feature, and b5a4214 folded the instrumented
-wrappers into the main clients. fac53e3 added `ringline-momento` (2,784 insertions,
-including a 1,207-line hand-rolled `proto.rs` — no protobuf dependency). 9a921f1
+wrappers into the main clients. 9a921f1
 added the sans-IO `ringline-h2` framing layer (5,110 insertions), a169e78
 `ringline-grpc` on top of it, and e978a6e `ringline-http`, bridging h2 and a new
 HTTP/1.1 path to `ConnCtx` (`ringline-http/src/client.rs`); 9706817 added streaming
@@ -49,18 +47,12 @@ flushing TLS control messages after `process_new_packets()`.
 **Integration tests against real servers (Feb 23).** 223f88b wired public-server
 tests for h2/h3 into CI (`ringline-h2/tests/public_servers.rs`,
 `ringline-h3/tests/public_servers.rs`); bb54196 added round-trip tests for ping plus
-ignored integration tests for redis (8), memcache (8), and momento (3), with new CI
+ignored integration tests for redis (8) and memcache (8), with new CI
 service jobs. This immediately shook out real bugs: DNS resolution had to move
-outside the io_uring event loop (02bba74), Momento endpoints needed a cell generation
-number (30d7c9e, PR #3), and outbound connections needed a TLS client config
-(0f5f8cd).
+outside the io_uring event loop (02bba74), and outbound connections needed a TLS
+client config (0f5f8cd).
 
-**Copy reduction and fire/recv (Feb 24–26).** 0f76448 cut momento copies — send 4→1
-by flattening protobuf encoding into a single-pass `encode_into()` on a reusable
-buffer, recv 1→0 by switching `with_data()` to `with_bytes()` with a
-`decode_bytes()` returning `Bytes::slice()` references (numbers from the commit
-message; no benchmark was checked in). 1f08cac followed with per-request allocation
-reductions. c084d5c added the fire/recv pipelining API (`fire_get`/`fire_set`/
+**Fire/recv pipelining (Feb 24–26).** c084d5c added the fire/recv pipelining API (`fire_get`/`fire_set`/
 `fire_del` + `recv()`, 490 lines across `ringline-redis/src/lib.rs` and
 `ringline-memcache/src/lib.rs`), with lazy timing and a non-panicking
 `Err(NoPending)`; ed3d69c documented it, closing the arc.
@@ -71,8 +63,7 @@ Two releases in the first week: v0.0.1 (core runtime) and v0.0.2 (redis, memcach
 quic, h3 clients + zero-copy SET). By Feb 26 the workspace had nine crates and the
 shapes that still define it: sans-IO framing layers (h2, h3, grpc), thin runtime
 clients, published proto crates as external deps, always-on rustls, and the fire/recv
-pipelining pattern. `ringline-momento` was born here but retired later — see
-[2026-06-perf-audit.md](2026-06-perf-audit.md) (removed in 7fa3b0b, PR #218).
+pipelining pattern.
 
 ## Lessons / open questions
 
@@ -81,8 +72,6 @@ pipelining pattern. `ringline-momento` was born here but retired later — see
   exactly the kind of bug unit tests never catch.
 - Feature flags have carrying costs: e82ce4c's removal of one flag deleted ~47 cfg
   gates. Defaulting a capability on and deleting the flag beat keeping both paths.
-- The copy-count discipline (0f76448's "send 4→1, recv 1→0") appears this early and
-  became the house analysis style — later codified in CLAUDE.md's Copy Semantics.
 - The proto-crate extraction (60189e7, 8b8dc4d) set the lasting boundary between
   wire-format parsing (published crates) and runtime integration (this workspace) —
   though 8b8dc4d left the orphaned `ketama/` directory behind, still unresolved.

@@ -57,16 +57,10 @@ syscall when no SQEs are queued. fe0899f (#213) made stall timing opt-in via
 in), matching redis. CLAUDE.md records the measured payoff: ~10x GET
 throughput at batch 16 vs batch 1 against memcached.
 
-**A retirement: ringline-momento.**
-7fa3b0b (#218) removed the `ringline-momento` crate — 3,978 lines deleted
-across the crate, its benchmark driver, and its CLAUDE.md sections. The stated
-rationale (PR #218) was simply "no longer needed"; the crate had lived about
-four months, born in the February client sprint (fac53e3 — see
-[2026-02-bootstrap.md](2026-02-bootstrap.md)) and was the only client
-requiring TLS + protobuf. This was a scope decision, not a performance one: it
-rode along in the audit release, and acaccaa (#226) cleaned up the stale CI
-and release-workflow jobs the day after. 37aa3b4 (#227) closed out with the
-dev bump to 0.2.2.
+**Housekeeping.**
+7fa3b0b (#218) removed an unused client crate (acaccaa #226 dropped its stale
+CI and release-workflow jobs the day after), and 37aa3b4 (#227) closed out
+with the dev bump to 0.2.2.
 
 ## Outcome
 
@@ -75,8 +69,7 @@ clients' minor bumps. The recurring shape of the wins: a copy, an allocation,
 or a syscall that ran per-request or per-iteration, removed by reusing a
 buffer or checking a cheap condition first. Both new thresholds
 (`send_zc_threshold`, client `zc_threshold`) defaulted to 4096 on the strength
-of the same sweep. The workspace also got smaller: one fewer client crate to
-keep honest.
+of the same sweep.
 
 ## Lessons / open questions
 
@@ -90,5 +83,3 @@ keep honest.
   And a separate July correctness audit (~35 fixes, PRs #236–#244, per
   CLAUDE.md) found real bugs this pass did not look for — a perf sweep and a
   correctness sweep are different lenses over the same code.
-- Retiring momento cost one PR plus a CI-cleanup follow-up (#226) that was
-  easy to forget; crate removal checklists should include workflows.

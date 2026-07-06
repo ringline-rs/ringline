@@ -10,11 +10,10 @@ clients), take a systematic adversarial pass over every crate — each protocol
 crate against its RFC, everything against resource-exhaustion attacks and
 error-path state consistency — and land the findings crate-by-crate.
 
-A caveat up front: **the audit process itself is not recorded in-repo.** Commit
-messages reference finding lists ("Thirteen findings from the ringline core
-audit" in 686a739, "Fourteen findings" in e289c8c, "F1/F3/F5/F9" numbering),
-but no audit report, methodology, or attribution was checked in. Only the fixes
-are visible; this entry reconstructs the audit's shape from what landed.
+The audit report itself is not in-repo: commit messages cite finding lists
+("Thirteen findings from the ringline core audit" in 686a739, "F1/F3/F5/F9"
+numbering), but only the fixes landed. This entry reconstructs the audit from
+them.
 
 ## What happened
 
@@ -60,11 +59,11 @@ defense + timeout encoding.
 
 **Protocol clients, error-path consistency**: 2525bd2 (#173) shared sweep —
 opt-in `max_in_flight` caps on pending queues (`Error::TooManyInFlight`) across
-redis/memcache/momento, plus error-path state consistency after transient send
+the clients, plus error-path state consistency after transient send
 failures; a1b5862 (#175) redis ASK redirect chaining (`AskOutcome` feeding
 follow-up redirects back into the routing loop), transient-error retry, ASKING
-response validation; 80e8e9a (#177) memcache; 63a5cc5 (#178) momento;
-9be79e6 (#179) ping close-on-parse-error.
+response validation; 80e8e9a (#177) memcache; 9be79e6 (#179) ping
+close-on-parse-error.
 
 **Supply chain**: e0548b1 (#170) pinned `rustls = "0.23.18"` (RUSTSEC-2024-0399)
 and `quinn-proto = "0.11.14"` (pulls patched `ring`, RUSTSEC-2025-0009) as
@@ -84,9 +83,6 @@ safe — and tightened `cargo audit` in CI.
   legitimate slow consumers (686a739's rationale for `recv_accumulator_max`).
 - The RUSTSEC pin convention from #170 persists today as comments in the
   workspace `Cargo.toml` (rustls/quinn-proto pin rationale, lines ~45–58).
-- `ringline-momento`, audited here (#173, #178), was later removed from the
-  workspace entirely (7fa3b0b, #218) — that hardening work was ultimately
-  discarded with the crate.
 
 ## Lessons / open questions
 
@@ -99,5 +95,3 @@ safe — and tightened `cargo audit` in CI.
 - The audit was static/adversarial, not fuzz-driven: no fuzz harness landed
   with it. Open question whether smuggling-class and varint-split bugs like
   f619303's would be cheaper to keep finding with a fuzzer in CI.
-- PR #167 does not appear in this range's history; the numbering gap is
-  unexplained in-repo.

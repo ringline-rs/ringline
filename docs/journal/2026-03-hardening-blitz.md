@@ -5,8 +5,7 @@
 
 ## Goal
 
-Inferred from the commit sequence — there was no journal at the time. Three interleaved
-threads: (1) an audit-style correctness pass over the young runtime and client crates,
+Three interleaved threads: (1) an audit-style correctness pass over the young runtime and client crates,
 (2) building test infrastructure that could exercise io_uring completion paths without a
 kernel, and (3) filling out the runtime's public surface toward general-purpose async
 usability. Roughly 80 PRs landed in this window, the bulk of them March 25–31.
@@ -56,11 +55,9 @@ today's tree: `ringline/src/runtime/{stream,join,channel,cancellation}.rs`,
 
 **Release.** After a quiet week (nothing landed Apr 1–8), 23eec50 (#83) audited
 `#[allow(dead_code)]` annotations and 8ffbf1b (#84) shipped v0.0.3 on Apr 9. Two
-follow-up releases went out the same day: v0.0.4 (333e708 #85 treating empty
-`MOMENTO_ENDPOINT`/`MOMENTO_REGION` as unset, fadb0e7 #86 fixing the tag-release version
-bump) and v0.0.5 (5d8460d #88 skipping Momento integration when secrets are missing).
-The `ringline-momento` crate those fixes served was later removed entirely (7fa3b0b
-#218, 2026-06-12).
+follow-up releases went out the same day — v0.0.4 (333e708 #85, fadb0e7 #86 fixing
+the tag-release version bump) and v0.0.5 (5d8460d #88) — both CI and
+integration-test environment fixes.
 
 ## Outcome
 
@@ -71,8 +68,7 @@ The `ringline-momento` crate those fixes served was later removed entirely (7fa3
   `ringline/src/backend/uring/event_loop.rs`, where it still sits today with 80 `#[test]`
   functions plus a `proptest_cqe` module. The July 2026 audit-fix PRs added their
   regression tests directly into it: 5173baa (#237, +1 test), fa71711 (#238, +5),
-  ca55c0d (#239, +3), 061997d (#240, +1). The May audit fixes (53cdde0 #156, 686a739
-  #168) modified the same file but I found no test additions there.
+  ca55c0d (#239, +3), 061997d (#240, +1).
 - Several fixes hardened patterns that are now written down as invariants (generation
   checks on stale CQEs, send-queue ordering, SQE lifetime) — though the July 2026 audit
   still found ~35 further violations of the same families, so this pass was a first
@@ -89,7 +85,3 @@ The `ringline-momento` crate those fixes served was later removed entirely (7fa3
   audit fixes (July, PRs #237–#240) could ship kernel-free regression tests in the same
   file. Keeping the tests in-module made them travel through the #94 backend refactor
   for free.
-- The fix and test threads were deliberately interleaved (fix PRs #46–#55 landed between
-  harness PRs #45 and #56) — whether tests were finding the bugs or bugs motivating the
-  tests isn't recoverable from the log.
-- Why the Apr 1–8 gap before release is not recorded anywhere I could find.

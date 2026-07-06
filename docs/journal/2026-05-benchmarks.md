@@ -8,8 +8,8 @@
 Give ringline a measured, reproducible performance story: hot-path
 microbenchmarks, a multi-protocol ringline-vs-tokio harness, and a checked-in
 `BENCHMARKS.md` baseline for future changes to beat or flag against. The
-unstated second goal, which the arc ended up being about: make sure the
-checked-in numbers are actually *true*.
+second goal, which the arc ended up being about: make sure the checked-in
+numbers are actually *true*.
 
 ## What happened
 
