@@ -1692,7 +1692,9 @@ pub(crate) fn encode_request(req: &McRequest<'_>) -> Result<Vec<u8>, Error> {
     Ok(buf)
 }
 
-/// Encode a SET command into a `Vec<u8>`.
+/// Encode a SET command into a `Vec<u8>`. Test-only convenience; hot paths
+/// use [`encode_request_into`] with a reused buffer.
+#[cfg(test)]
 pub(crate) fn encode_set(
     key: &[u8],
     value: &[u8],

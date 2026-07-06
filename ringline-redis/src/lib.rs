@@ -1301,7 +1301,9 @@ impl Client {
         buf
     }
 
-    /// Encode a `SetRequest` into a `Vec<u8>`.
+    /// Encode a `SetRequest` into a `Vec<u8>`. Test-only convenience; hot
+    /// paths use [`Self::encode_set_request_into`] with a reused buffer.
+    #[cfg(test)]
     pub(crate) fn encode_set_request(req: &resp_proto::SetRequest<'_>) -> Vec<u8> {
         let mut buf = Vec::new();
         Self::encode_set_request_into(req, &mut buf);
