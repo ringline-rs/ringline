@@ -16,8 +16,13 @@ pub const NVME_CMD_FLUSH: u8 = 0x00;
 pub const NVME_CMD_WRITE: u8 = 0x01;
 pub const NVME_CMD_READ: u8 = 0x02;
 
-/// NVMe uring_cmd sub-opcodes passed as `cmd_op` to `IORING_OP_URING_CMD`.
-pub const NVME_URING_CMD_IO: u32 = 0;
+/// NVMe uring_cmd opcode passed as `cmd_op` to `IORING_OP_URING_CMD`.
+///
+/// This is the kernel's `NVME_URING_CMD_IO = _IOWR('N', 0x80, struct
+/// nvme_uring_cmd)` ioctl encoding: dir=RW (3) << 30 | size (72) << 16 |
+/// 'N' (0x4E) << 8 | nr (0x80). The NVMe driver dispatches `uring_cmd` on
+/// this value; anything else (e.g. a literal 0) returns `ENOTTY`.
+pub const NVME_URING_CMD_IO: u32 = 0xC048_4E80;
 
 /// NVMe command structure for io_uring passthrough.
 ///
