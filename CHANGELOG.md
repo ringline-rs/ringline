@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-06
+
+Coordinated breaking release carrying the 2026-07 full correctness audit
+(~35 fixes across 11 PRs), two performance phases, and a hardware-verified
+NVMe passthrough path. Crate versions: **ringline 0.4.0**;
+**ringline-redis / -memcache 0.6.0**;
+**ringline-ping / -http / -grpc / -quic / -h2 / -h3 0.5.0**.
+
+### Breaking
+
+- **Breaking:** `nvme_read` / `nvme_write` are now `unsafe fn` — the caller
+  must guarantee the buffer is valid, aligned, and outlives the returned
+  future. The previous safe signatures allowed safe code to hand the kernel
+  a dangling buffer.
+- **Breaking:** `sleep` / `timeout` now panic on timer-pool exhaustion, as
+  their documentation always stated; use `try_sleep` / `try_timeout` for
+  fallible acquisition.
+
+### Fixed
+
+- NVMe passthrough was entirely non-functional: `NVME_URING_CMD_IO` was `0`
+  instead of the kernel ioctl encoding (`0xC048_4E80`), so every command
+  returned `ENOTTY`. Now hardware-verified (byte-exact LBA reads vs the
+  block device) with a read-only smoke test in `examples/nvme_smoke.rs`.
+- Executor: waking a parked task via a cloned `std::task::Waker` was fully
+  broken (lost wakeups / self-wake deadlock); mpsc channel waiters are now
+  FIFO with `Receiver` drop cleanup; cancelled futures deregister their
+  waiters.
+- TLS (io_uring): ciphertext is serialized through the per-connection send
+  queue — concurrent sends could interleave TLS records on the wire
+  (`bad_record_mac` at the peer); >64 KiB sends encrypt interleaved with
+  draining instead of failing at rustls's buffer cap; `EAGAIN` arms POLLOUT
+  instead of dropping records.
+- TLS (mio): fixed the long-standing >16 KiB busy-spin; TLS output is
+  queued through pending sends with correct close-path flushing.
+- Connection lifecycle: deferred-close now finalizes ZC / recv-forward
+  sends (fd leaks), retry backoff re-pushes instead of wedging, accept4 is
+  woken at shutdown (prompt-relaunch `EADDRINUSE`), pidfd leaks on
+  `Spawn` / `WaitFuture` drop are fixed, and NOFILE sizing accounts for all
+  workers on mio.
+- Disk / NVMe completions: CQE keys are sequence-tagged (stale-slot
+  collisions), NVMe completions with positive status words are errors
+  instead of silent success, fs `stat` results are keyed consistently.
+- UDP: GRO-coalesced datagrams split correctly in `recv_from` /
+  `with_datagram`; recv-buffer bids replenish on error CQEs; connect
+  timeout CQEs check the connection generation.
+- Protocol clients: responses could be misattributed after a direct send
+  (`flushed_count`); cluster topology refresh continues past dead nodes;
+  TTFB is stamped after the read; redis closes the connection on protocol
+  errors.
+- io_uring submit: `EINTR` retries, `EBUSY` treated as backpressure.
+
+### Added
+
+- `ConnCtx::eof_truncated()` — distinguishes a peer FIN mid-message from a
+  clean close.
+- `ConfigBuilder::no_fs()` and `close_notify_timeout_ms`.
+- `examples/nvme_smoke.rs` — read-only NVMe passthrough hardware check.
+- `docs/send-completion-design.md` — why CQE-skip is unsound for pool-backed
+  sends, MSG_WAITALL rationale, and io_uring zero-copy-RX scoping.
+
+### Performance
+
+- Accumulator rewind: `with_bytes` put-back is O(1) via refcounted
+  remainders (pipelined parse microbenchmarks −43% to −92%); "0-copy recv"
+  now holds for pipelined parsing.
+- Guard batching: `MAX_GUARDS` 4→8 and chained sub-threshold guard sends
+  fold into copied sends — measured **−10% client CPU at NIC line rate** on
+  guarded 8 KiB SET pipelines.
+- TLS sends encrypt directly into send-pool slots (3 copies → 2).
+- `MSG_WAITALL` on stream sends: short sends retry in-kernel (5.19+)
+  instead of a CQE → resubmit → CQE round trip.
+- Event-driven `ENOBUFS` re-arm ends recv-starvation spinning; buffer
+  replenishment is flushed before blocking waits.
+- mio backend: per-iteration O(n) scans (pending sends, completions, both
+  timer scans) replaced with dirty-lists and a timer min-heap.
+- Sharded / cluster clients reuse encode buffers and use `itoa` on hot
+  paths.
+- SMT-aware worker pinning: one worker per physical core regardless of
+  sibling enumeration order.
+
+### Changed
+
+- On io_uring, `udp_recv_queue_capacity` is clamped to the recv ring size —
+  queued datagrams pin ring buffers, so the excess depth was unusable
+  (overload now surfaces as counted drops instead of a silent stall).
+- `core_offset` indexes physical cores when `core_offset + workers` fits
+  the machine's physical core count (raw logical ids otherwise).
+
 ## [0.3.0] - 2026-06-25
 
 Coordinated breaking release. Crate versions:
