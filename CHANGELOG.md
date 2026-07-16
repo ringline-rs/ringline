@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [ringline-memcache 0.6.1] - 2026-07-16
+
+### Fixed
+
+- Values larger than 1 MiB are no longer rejected client-side. The
+  `validate_value` / `validate_value_len` checks (and the
+  `MAX_VALUE_LEN` constant) were removed from the encode path —
+  memcached's `-I` item-size limit is a tunable server knob, so an
+  oversized value now goes on the wire and the server replies with a
+  clean `SERVER_ERROR object too large for cache` instead of the client
+  second-guessing it. The 250-byte `MAX_KEY_LEN` check is retained (an
+  oversized key corrupts the command frame).
+
+### Removed
+
+- `Error::ValueTooLong` variant and the `MAX_VALUE_LEN` constant.
+  Non-breaking: `Error` is `#[non_exhaustive]` and the constant is a
+  `pub const` downstream can redefine.
+
 ## [ringline-redis 0.6.1] - 2026-07-16
 
 ### Fixed
