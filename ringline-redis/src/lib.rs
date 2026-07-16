@@ -1181,16 +1181,25 @@ impl Client {
 
     /// Read and parse a single RESP value from the connection.
     ///
-    /// Uses zero-copy parsing via `with_bytes` + `Value::parse_bytes`:
+    /// Uses zero-copy parsing via `with_bytes` + `Value::parse_bytes_with_options`:
     /// bulk string values are `Bytes::slice()` references into the
     /// accumulator's buffer rather than freshly allocated `Vec<u8>`.
     pub(crate) async fn read_value(&self) -> Result<Value, Error> {
         let mut result: Option<Result<Value, Error>> = None;
+        // resp-proto's `parse_bytes` defaults to a 1 MiB bulk-string cap
+        // (`DEFAULT_MAX_BULK_STRING_LEN`), which is far below what a real
+        // Redis server can return (Redis 7's `proto-max-bulk-len` defaults to
+        // 512 MiB). Hit the wall and the parser consumes the whole
+        // accumulator, forcing a connection close for a value the server
+        // happily produced. Use `usize::MAX` — the `RecvAccumulator`'s own
+        // capacity is the genuine backstop — and let the server be the
+        // authority on what's too large.
+        let options = resp_proto::ParseOptions::new().max_bulk_string_len(usize::MAX);
         let n = self
             .conn
             .with_bytes(|bytes| {
                 let len = bytes.len();
-                match Value::parse_bytes(bytes) {
+                match Value::parse_bytes_with_options(bytes, &options) {
                     Ok((value, consumed)) => {
                         result = Some(Ok(value));
                         ParseResult::Consumed(consumed)
