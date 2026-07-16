@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-16
+
+### Security
+
+- Bumped `crossbeam-epoch` 0.9.18 → 0.9.20 in the committed lockfile for
+  RUSTSEC-2026-0204 (dev-dependency via criterion; does not affect
+  downstream consumers of the published crates).
+
 ## [0.4.0] - 2026-07-06
 
 Coordinated breaking release carrying the 2026-07 full correctness audit
