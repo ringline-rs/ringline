@@ -1,0 +1,73 @@
+[package]
+name = "ringline-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+ringline-h2 = { path = "../ringline-h2" }
+ringline-h3 = { path = "../ringline-h3" }
+ringline-grpc = { path = "../ringline-grpc" }
+ringline-http = { path = "../ringline-http", features = ["fuzzing"] }
+
+[[bin]]
+name = "h2_frame"
+path = "fuzz_targets/h2_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_hpack"
+path = "fuzz_targets/h2_hpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_connection"
+path = "fuzz_targets/h2_connection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_frame"
+path = "fuzz_targets/h3_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_qpack"
+path = "fuzz_targets/h3_qpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grpc_message"
+path = "fuzz_targets/grpc_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grpc_connection"
+path = "fuzz_targets/grpc_connection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_response"
+path = "fuzz_targets/http1_response.rs"
+test = false
+doc = false
+bench = false

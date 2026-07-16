@@ -999,6 +999,46 @@ fn find_crlf(data: &[u8]) -> Option<usize> {
     (0..data.len().saturating_sub(1)).find(|&i| data[i] == b'\r' && data[i + 1] == b'\n')
 }
 
+/// Fuzzing-only entry point for the crate-private response-header parser.
+/// The internal types stay private; results are consumed so the sanitizer
+/// sees every field. Never call outside the fuzz harness.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_response_headers(data: &[u8]) {
+    if let Ok(parsed) = parse_response_headers(data) {
+        std::hint::black_box((
+            parsed.status,
+            parsed.content_length,
+            parsed.chunked,
+            parsed.connection_close,
+            parsed.content_encoding.as_deref().map(str::len),
+        ));
+        for (name, value) in &parsed.headers {
+            std::hint::black_box(name.len() + value.len());
+        }
+    }
+}
+
+/// Fuzzing-only entry point for the crate-private chunked-transfer decoder.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_decode_chunk(data: &[u8], max_chunk_size: usize, max_trailer_section: usize) {
+    match decode_chunk(data, max_chunk_size, max_trailer_section) {
+        ChunkResult::Complete {
+            data: payload,
+            consumed,
+            is_last,
+        } => {
+            assert!(consumed <= data.len(), "decode_chunk consumed past input");
+            std::hint::black_box((payload.iter().fold(0u8, |a, &b| a ^ b), is_last));
+        }
+        ChunkResult::NeedMore => {}
+        ChunkResult::Invalid(reason) => {
+            std::hint::black_box(reason);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

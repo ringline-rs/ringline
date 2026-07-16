@@ -52,3 +52,4 @@ reconstructed from the commit history (2026-02-20 through v0.4.0).
 | [2026-06 — Performance audit](2026-06-perf-audit.md) | Jun 2026 · PRs #212–#227 · v0.2.1 | zc-threshold, write coalescing, allocation and syscall elimination |
 | [2026-06 — API simplification](2026-06-api-simplification.md) | Jun 2026 · PRs #228–#235 · v0.3.0 | Opaque Config/TLS types, non_exhaustive errors, locked CI |
 | [2026-07 — Correctness audit and v0.4.0](2026-07-correctness-audit.md) | Jul 2026 · PRs #236–#255 · v0.4.0 | ~35 audit fixes in stacked PRs, send-completion design doc, perf follow-ups |
+| [2026-07 — Fuzzing the wire-facing parsers](2026-07-fuzzing.md) | Jul 2026 | Eight cargo-fuzz targets for h2/h3/http1/grpc parsing + daily fuzz CI |

@@ -1,0 +1,9 @@
+target/
+artifacts/
+coverage/
+
+# Only the hand-written seed corpus is tracked (committed with `git add -f`).
+# libFuzzer writes coverage-generated inputs into these dirs at runtime;
+# keep them out of git.
+corpus/*/*
+!corpus/*/*.seed

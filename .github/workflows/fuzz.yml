@@ -1,0 +1,56 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Daily; catches regressions in the wire-facing parsers continuously.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds to run each target"
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - h2_frame
+          - h2_hpack
+          - h2_connection
+          - h3_frame
+          - h3_qpack
+          - grpc_message
+          - grpc_connection
+          - http1_response
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: taiki-e/install-action@cargo-fuzz
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Run fuzz target
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${{ github.event.inputs.max_total_time || 300 }} \
+            -rss_limit_mb=4096 \
+            -timeout=30
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
