@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [ringline-redis 0.6.1] - 2026-07-16
+
+### Fixed
+
+- Bulk-string responses larger than 1 MiB no longer fail. `read_value()`
+  switched from resp-proto's default `Value::parse_bytes` (which caps bulk
+  strings at `DEFAULT_MAX_BULK_STRING_LEN`, 1 MiB) to
+  `Value::parse_bytes_with_options` with `max_bulk_string_len: usize::MAX`.
+  Previously a larger value from a real Redis server (Redis 7's
+  `proto-max-bulk-len` defaults to 512 MiB) hit `BulkStringTooLong` →
+  `Error::Protocol` → a deliberate connection close. The runtime
+  `RecvAccumulator` capacity remains the genuine backstop.
+
 ## [0.4.1] - 2026-07-16
 
 ### Security
