@@ -200,42 +200,15 @@ pub enum Error {
     /// pending-queue capacity for a doomed command.
     #[error("key too long (max 250 bytes)")]
     KeyTooLong,
-
-    /// Value exceeds memcache's default `-I` 1 MiB cap ([`MAX_VALUE_LEN`]).
-    /// Same rationale as [`Error::KeyTooLong`].
-    #[error("value too long (max 1048576 bytes)")]
-    ValueTooLong,
 }
 
 /// Maximum key length per memcache text-protocol spec.
 pub const MAX_KEY_LEN: usize = 250;
 
-/// Maximum value length matching the parser cap in `memcache-proto`
-/// (`MAX_VALUE_DATA_LEN`) and memcached's default `-I` 1 MiB item size.
-pub const MAX_VALUE_LEN: usize = 1024 * 1024;
-
 #[inline]
 fn validate_key(key: &[u8]) -> Result<(), Error> {
     if key.len() > MAX_KEY_LEN {
         Err(Error::KeyTooLong)
-    } else {
-        Ok(())
-    }
-}
-
-#[inline]
-fn validate_value(value: &[u8]) -> Result<(), Error> {
-    if value.len() > MAX_VALUE_LEN {
-        Err(Error::ValueTooLong)
-    } else {
-        Ok(())
-    }
-}
-
-#[inline]
-fn validate_value_len(value_len: usize) -> Result<(), Error> {
-    if value_len > MAX_VALUE_LEN {
-        Err(Error::ValueTooLong)
     } else {
         Ok(())
     }
@@ -1601,10 +1574,10 @@ impl Client {
 /// `set {key} {flags} {exptime} {valuelen}\r\n`.
 /// The caller must append value bytes (via guard) + `\r\n` suffix.
 ///
-/// Validates `key` (≤ [`MAX_KEY_LEN`]) and `value_len` (≤ [`MAX_VALUE_LEN`]);
-/// returns the corresponding `Error` variant if either bound is exceeded so
-/// that no bytes hit the wire for a request the server will reject. On error
-/// nothing is appended to `buf`.
+/// Validates `key` (≤ [`MAX_KEY_LEN`]); returns [`Error::KeyTooLong`] if the
+/// bound is exceeded so that no bytes hit the wire for a request the server
+/// would misparse. Value length is not checked — see [`validate_request`].
+/// On error nothing is appended to `buf`.
 fn append_set_guard_prefix(
     buf: &mut Vec<u8>,
     key: &[u8],
@@ -1613,7 +1586,6 @@ fn append_set_guard_prefix(
     exptime: u32,
 ) -> Result<(), Error> {
     validate_key(key)?;
-    validate_value_len(value_len)?;
     let mut itoa_buf = itoa::Buffer::new();
     buf.extend_from_slice(b"set ");
     buf.extend_from_slice(key);
@@ -1629,7 +1601,10 @@ fn append_set_guard_prefix(
 
 // -- Encoding helpers --------------------------------------------------------
 
-/// Reject requests whose key or value exceeds the protocol-defined caps.
+/// Reject requests whose key exceeds the 250-byte protocol cap. Value
+/// length is not checked here — memcached's `-I` item-size limit is a
+/// server knob, so the client lets the server reject an oversized value
+/// with a normal `SERVER_ERROR` reply rather than second-guessing it.
 fn validate_request(req: &McRequest<'_>) -> Result<(), Error> {
     match req {
         McRequest::Get { key }
@@ -1642,22 +1617,19 @@ fn validate_request(req: &McRequest<'_>) -> Result<(), Error> {
             }
             Ok(())
         }
-        McRequest::Set { key, value, .. }
-        | McRequest::Add { key, value, .. }
-        | McRequest::Replace { key, value, .. }
-        | McRequest::Append { key, value }
-        | McRequest::Prepend { key, value }
-        | McRequest::Cas { key, value, .. } => {
-            validate_key(key)?;
-            validate_value(value)
-        }
+        McRequest::Set { key, .. }
+        | McRequest::Add { key, .. }
+        | McRequest::Replace { key, .. }
+        | McRequest::Append { key, .. }
+        | McRequest::Prepend { key, .. }
+        | McRequest::Cas { key, .. } => validate_key(key),
         McRequest::FlushAll | McRequest::Version | McRequest::Quit => Ok(()),
     }
 }
 
-/// Append the encoding of a `McRequest` to `buf`, rejecting oversized
-/// keys/values up-front (see [`validate_request`]). No allocation once
-/// `buf` has sufficient capacity. On error nothing is appended to `buf`.
+/// Append the encoding of a `McRequest` to `buf`, rejecting oversized keys
+/// up-front (see [`validate_request`]). No allocation once `buf` has
+/// sufficient capacity. On error nothing is appended to `buf`.
 pub(crate) fn encode_request_into(req: &McRequest<'_>, buf: &mut Vec<u8>) -> Result<(), Error> {
     validate_request(req)?;
     let size = match req {
@@ -1684,7 +1656,7 @@ pub(crate) fn encode_request_into(req: &McRequest<'_>, buf: &mut Vec<u8>) -> Res
 }
 
 /// Encode a `McRequest` into a freshly allocated `Vec<u8>`, rejecting
-/// oversized keys/values up-front (see [`validate_request`]). Hot paths in
+/// oversized keys up-front (see [`validate_request`]). Hot paths in
 /// [`Client`] use [`encode_request_into`] with a reusable buffer instead.
 pub(crate) fn encode_request(req: &McRequest<'_>) -> Result<Vec<u8>, Error> {
     let mut buf = Vec::new();
@@ -1947,18 +1919,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_value_accepts_max_len() {
-        let v = vec![0u8; MAX_VALUE_LEN];
-        assert!(validate_value(&v).is_ok());
-    }
-
-    #[test]
-    fn validate_value_rejects_oversized() {
-        let v = vec![0u8; MAX_VALUE_LEN + 1];
-        assert!(matches!(validate_value(&v), Err(Error::ValueTooLong)));
-    }
-
-    #[test]
     fn encode_request_get_rejects_long_key() {
         let key = vec![b'k'; MAX_KEY_LEN + 1];
         let r = encode_request(&McRequest::get(&key));
@@ -1966,16 +1926,20 @@ mod tests {
     }
 
     #[test]
-    fn encode_request_set_rejects_long_value() {
+    fn encode_request_set_passes_large_value() {
+        // Value length is not checked client-side — memcached's `-I` item-size
+        // limit is a server knob, so an oversized value is allowed onto the
+        // wire and the server rejects it.
         let key = b"k";
-        let value = vec![0u8; MAX_VALUE_LEN + 1];
+        let value = vec![0u8; 2 * 1024 * 1024];
         let r = encode_request(&McRequest::Set {
             key,
             value: &value,
             flags: 0,
             exptime: 0,
         });
-        assert!(matches!(r, Err(Error::ValueTooLong)));
+        assert!(r.is_ok());
+        assert!(r.unwrap().starts_with(b"set "));
     }
 
     #[test]
@@ -1995,21 +1959,16 @@ mod tests {
     }
 
     #[test]
-    fn set_guard_prefix_rejects_long_value_len() {
-        let r = append_set_guard_prefix(&mut Vec::new(), b"k", MAX_VALUE_LEN + 1, 0, 0);
-        assert!(matches!(r, Err(Error::ValueTooLong)));
-    }
-
-    #[test]
-    fn set_guard_prefix_accepts_max_value_len() {
-        let r = append_set_guard_prefix(&mut Vec::new(), b"k", MAX_VALUE_LEN, 0, 0);
+    fn set_guard_prefix_passes_large_value_len() {
+        // Value length is not checked client-side (see `validate_request`).
+        let r = append_set_guard_prefix(&mut Vec::new(), b"k", 2 * 1024 * 1024, 0, 0);
         assert!(r.is_ok());
     }
 
     #[test]
-    fn encode_request_passes_through_at_caps() {
+    fn encode_request_passes_through_at_key_cap() {
         let key = vec![b'k'; MAX_KEY_LEN];
-        let value = vec![0u8; MAX_VALUE_LEN];
+        let value = vec![0u8; 1024];
         let r = encode_request(&McRequest::Set {
             key: &key,
             value: &value,
