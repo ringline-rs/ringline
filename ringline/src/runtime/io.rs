@@ -1671,7 +1671,9 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
             // Only available on io_uring where kernel-provided buffers are used.
             #[cfg(has_io_uring)]
             if driver.pending_recv_bufs[self.conn_index as usize].is_some() {
-                let acc_empty = driver.accumulators.data(self.conn_index).is_empty();
+                // Non-merging emptiness check — `data()` would merge a held
+                // frozen remainder just to answer a boolean.
+                let acc_empty = driver.accumulators.is_empty(self.conn_index);
                 if acc_empty {
                     // Borrow the kernel buffer in-place — no copy.
                     let pending = driver.pending_recv_bufs[self.conn_index as usize].unwrap();
@@ -1933,7 +1935,7 @@ impl Future for RecvReadyFuture {
             }
 
             // Check accumulator.
-            if !driver.accumulators.data(self.conn_index).is_empty() {
+            if !driver.accumulators.is_empty(self.conn_index) {
                 return Poll::Ready(());
             }
 
