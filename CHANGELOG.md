@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed (BREAKING — next coordinated release)
+## [0.5.0] - 2026-07-17
+
+Coordinated release. Core `ringline` takes a breaking `ParseResult`
+change; all client crates are rebuilt against it and republished
+(`ringline-redis` 0.6.2, `ringline-memcache` 0.6.2, and
+`ringline-ping` / `-h2` / `-h3` / `-quic` / `-http` / `-grpc` 0.5.1).
+
+### Changed (BREAKING)
 
 - `ParseResult` gains a `NeedAtLeast(usize)` variant and is now
   `#[non_exhaustive]`. A length-prefixed parser that has seen its header
@@ -16,8 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   message arriving in chunks (~2× the payload in avoided memcpy). Only
   code that exhaustively matches `ParseResult` is affected — closures
   that construct it are untouched.
-- ringline-redis: incomplete bulk-string replies now return
-  `ParseResult::NeedAtLeast` computed from the RESP `$<len>\r\n` header.
 
 ### Added
 
@@ -35,11 +40,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sinks, zero-copy forward, and direct echo keep the park-until-
   replenish behavior). New metrics: `pool/recv_fallback` submissions
   and `bytes/fallback_received`; the shutdown `[ringline diag]` line
-  gains `fallbacks=`.
+  gains `fallbacks=`. Rig-validated (64KiB ring): 4MB GET 30→216 req/s,
+  16MB 1→22 req/s.
 - Starved connections holding an unconsumed zero-copy buffer
   (`pending_recv_bufs`) now have the hold flushed to the accumulator on
   the replenish pass, returning its bid to the ring instead of waiting
   for the task to consume it.
+- `pool/recv_parked` metric (+ `parks=` in the shutdown diag line) and a
+  fix for the `ringline/ring` counter group being undersized (the
+  `cqe_unknown_tag` slot never counted).
+
+### ringline-redis 0.6.2
+
+- Incomplete bulk-string replies return `ParseResult::NeedAtLeast`
+  computed from the RESP `$<len>\r\n` header, so multi-MB values reserve
+  their accumulator once instead of regrowing per chunk.
+
+### Other client crates
+
+- `ringline-memcache` 0.6.2, `ringline-ping` / `ringline-h2` /
+  `ringline-h3` / `ringline-quic` / `ringline-http` / `ringline-grpc`
+  0.5.1: rebuilt against core 0.5.0. No API changes.
 
 ## [ringline-memcache 0.6.1] - 2026-07-16
 
