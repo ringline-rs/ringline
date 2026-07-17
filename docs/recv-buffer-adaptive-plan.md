@@ -476,7 +476,7 @@ pub(crate) trait RecvBufferProvider {
 
 - [ ] **Step 1: Write failing config tests** — assert defaults enable adaptive mode; assert an explicit `recv_buffer(..)` override disables adaptation and pins geometry; assert invalid combinations are rejected on `build()` (mirror existing `config.rs` validation tests).
 - [ ] **Step 2:** `cargo test -p ringline config` → FAIL.
-- [ ] **Step 3:** Implement fields + validation + builder methods (opaque, `pub(crate)` fields per the API-design rule — no `pub` fields, no `Config` split).
+- [ ] **Step 3:** Implement fields + validation + builder methods (opaque, `pub(crate)` fields per the API-design rule — no `pub` fields, no `Config` split). **Must** reserve the size-class bgid range `[recv_buffer.bgid, recv_buffer.bgid + NUM_SIZE_CLASSES)` and reject a `udp_recv_buffer.bgid` (or any registered bgid) that falls inside it — Phase 3.1 exposed this as an active `EEXIST`-at-launch footgun (the default UDP bgid was bumped 1→3 as a stopgap; validation must make custom configs safe too).
 - [ ] **Step 4:** `cargo test -p ringline config` → PASS. Update committed `Cargo.lock` if deps changed (none expected). Commit — `git commit -am "feat(recv): config override/cap + opaque adaptive knobs"`
 
 ### Task 6.2: Copy-count invariant regression tests
