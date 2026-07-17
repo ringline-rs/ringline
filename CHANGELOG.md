@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-17
+
+Coordinated patch release. The fix is in core `ringline`; all client
+crates are rebuilt against it and republished (`ringline-redis` 0.6.3,
+`ringline-memcache` 0.6.3, and `ringline-ping` / `-h2` / `-h3` /
+`-quic` / `-http` / `-grpc` 0.5.2). No client-crate API changes.
+
 ### Fixed
 
 - `RecvAccumulator`: receiving a large response streamed across many recv
