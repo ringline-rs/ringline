@@ -3885,9 +3885,19 @@ mod tests {
         assert!(el.driver.accumulators.append(conn_index, b"part"));
         el.flush_replenish_and_rearm();
         assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
+        // Fallback submission takes the connection out of the park queue;
+        // its completion re-parks it.
+        assert!(!el.driver.recv_starved.contains(&conn_index));
 
-        // Buffers come back while the fallback is still in flight: the
-        // multishot must NOT be re-armed alongside it.
+        // A stale multishot ENOBUFS CQE re-parks the connection while the
+        // fallback is still in flight. When buffers come back, the
+        // replenish pass must NOT arm a multishot alongside the
+        // outstanding one-shot — the connection stays parked until the
+        // fallback CQE hands off.
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
+        assert!(el.driver.recv_starved.contains(&conn_index));
+
         el.driver.pending_replenish.push(0);
         el.flush_replenish_and_rearm();
 
@@ -3933,11 +3943,12 @@ mod tests {
         assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
 
         // Write payload into the pool slot the way the kernel would.
+        // (`alloc_raw` leaves `remaining` at 0 — only the base pointer is
+        // meaningful here, matching what the recv SQE was built from.)
         let pool = el.driver.fallback_recv_pool.as_mut().expect("pool built");
         let slot: u16 = 0;
         assert!(pool.in_use(slot));
-        let (ptr, cap) = pool.current_ptr_remaining(slot);
-        assert!(cap >= 5);
+        let (ptr, _) = pool.current_ptr_remaining(slot);
         unsafe { std::ptr::copy_nonoverlapping(b"chunk".as_ptr(), ptr as *mut u8, 5) };
 
         let ud = UserData::encode(OpTag::RecvFallback, conn_index, slot as u32);
