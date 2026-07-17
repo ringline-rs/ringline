@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `RecvAccumulator`: receiving a large response streamed across many recv
+  completions no longer re-copies the entire accumulated buffer on every
+  chunk (O(N·K) for an N-byte value in K chunks). Two causes: (1)
+  `put_back()` now drops the empty `buf`'s handle to the allocation it
+  shared with the frozen remainder (left behind by `take_frozen()`'s
+  `split_to`), so `unfreeze()`'s `try_into_mut()` can recover the
+  allocation and append only the new bytes instead of falling back to a
+  full-remainder copy; (2) hot-path emptiness checks (`dispatch_cqe`
+  zero-copy fast path, `WithDataFuture`, wait-readable) use a new
+  non-merging `AccumulatorTable::is_empty()` instead of
+  `data().is_empty()`, which forced a merge per recv CQE. Measured with
+  ringline-redis GETs of 64 MiB values (c8gn.16xlarge pair, io_uring):
+  69 GB memcpy'd to receive 4.8 GB, single-connection fetch 197 ms
+  (2.7 Gbps) → after the fix 0 full-remainder copies, 56 ms (9.5 Gbps,
+  the per-flow wire cap); 32 connections: 15.8 → 200 Gbps (NIC line
+  rate). 128 KiB pipelined workloads are unaffected (within noise).
+
 ## [ringline-memcache 0.6.1] - 2026-07-16
 
 ### Fixed
