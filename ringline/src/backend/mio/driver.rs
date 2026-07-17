@@ -129,6 +129,15 @@ pub(crate) struct Driver {
     /// result (fd) is stored in `fs_fds[file_index]`. On failure, the file
     /// slot is released.
     pub(crate) pending_fs_opens: std::collections::HashMap<u32, u16>,
+
+    /// Worker-level adaptive sizing policy for the shared recv scratch
+    /// buffer (see `event_loop::AsyncEventLoop::run`). Mio has no
+    /// per-connection size classes — the scratch buffer is shared across
+    /// every connection on the worker, so a single aggregate policy (fed
+    /// by every connection's parser `Consumed`/`NeedAtLeast` signals) picks
+    /// one target size for the whole worker. Bounds match the io_uring
+    /// class floor/ceiling (8 KiB / 256 KiB).
+    pub(crate) recv_policy: crate::recv::sizing::SizingPolicy,
 }
 
 impl Driver {
@@ -266,6 +275,16 @@ impl Driver {
                 .map(|fs| vec![None; fs.max_files as usize])
                 .unwrap_or_default(),
             pending_fs_opens: std::collections::HashMap::new(),
+            recv_policy: crate::recv::sizing::SizingPolicy::new(
+                crate::recv::sizing::SizingConfig {
+                    min: 8192,
+                    max: 262144,
+                    alpha_num: 1,
+                    alpha_den: 4,
+                    downshift_num: 1,
+                    downshift_den: 2,
+                },
+            ),
         })
     }
 
@@ -396,6 +415,25 @@ impl Driver {
         if was_established {
             crate::metrics::CONNECTIONS_ACTIVE.decrement();
         }
+    }
+
+    /// Record an observed consumed-message size for the worker-level recv
+    /// sizing policy (upshifts the shared scratch target toward sustained
+    /// demand). Mirrors the io_uring per-connection `recv_observe`, but
+    /// mio has one policy per worker rather than one per connection.
+    pub(crate) fn recv_observe(&mut self, size: usize) {
+        self.recv_policy.observe(size);
+    }
+
+    /// Feed a parser `NeedAtLeast` hint into the worker-level recv sizing
+    /// policy (proactively bumps the target without waiting for the EWMA).
+    pub(crate) fn recv_hint(&mut self, need: usize) {
+        self.recv_policy.hint(need);
+    }
+
+    /// Current target size (bytes) for the shared recv scratch buffer.
+    pub(crate) fn recv_size_target(&self) -> usize {
+        self.recv_policy.target()
     }
 
     /// Record `idx` in the dirty-sends list so the event loop's flush pass

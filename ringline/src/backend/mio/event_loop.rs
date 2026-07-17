@@ -127,12 +127,29 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.ready_queue.push_back(idx | STANDALONE_BIT);
         }
 
-        // Recv buffer for reading from sockets.
+        // Recv buffer for reading from sockets — a single worker-shared
+        // scratch, adaptively grown toward the observed message-size
+        // high-water mark (see `Driver::recv_policy`). Fed by the same
+        // parser Consumed/NeedAtLeast signals the io_uring backend uses to
+        // pick a size class (`runtime/io.rs`, `#[cfg(not(has_io_uring))]`
+        // arms). Never shrunk within a run: the buffer is a transient
+        // per-read scratch (data is copied out immediately), so holding it
+        // at its high-water size costs nothing but a few hundred KiB of
+        // resident memory, and re-growing on every downshift would just
+        // reallocate on the next burst.
         let mut recv_buf = vec![0u8; 8192];
 
         loop {
             // 1. Fire expired timers.
             self.fire_expired_timers();
+
+            // 1a. Grow the shared recv scratch toward the current policy
+            // target. Cheap when already large enough (single comparison).
+            let recv_target = self.driver.recv_size_target();
+            if recv_target > recv_buf.len() {
+                recv_buf.resize(recv_target, 0);
+                metrics::RECV_SCRATCH_BYTES.set(recv_buf.len() as i64);
+            }
 
             // 2. Compute poll timeout from nearest timer deadline. Don't
             // block at all while tasks are already runnable (self-wakes

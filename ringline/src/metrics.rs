@@ -34,6 +34,18 @@ pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(4);
 )]
 pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 
+/// Current size (bytes) of the mio backend's worker-shared recv scratch
+/// buffer. Grows toward the adaptive `SizingPolicy` target as observed
+/// message sizes warrant (see `backend::mio::event_loop`); unset (0) on
+/// the io_uring backend, which has no equivalent shared scratch. Exposed
+/// primarily for tests to observe the effect of adaptive sizing without
+/// reaching into backend-private state.
+#[metric(
+    name = "ringline/recv/scratch_bytes",
+    description = "Current size of the mio shared recv scratch buffer"
+)]
+pub static RECV_SCRATCH_BYTES: Gauge = Gauge::new();
+
 // ── Index constants ─────────────────────────────────────────────
 
 /// Counter slot indices for connection metrics.
