@@ -93,6 +93,15 @@ impl SizingPolicy {
     }
 }
 
+/// Index of the smallest class whose buffer size is >= `target`, clamped to the
+/// largest class. `classes` must be ascending and non-empty.
+pub(crate) fn class_index_for(classes: &[usize], target: usize) -> usize {
+    classes
+        .iter()
+        .position(|&c| c >= target)
+        .unwrap_or(classes.len() - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +167,15 @@ mod tests {
             p.observe(1024);
         }
         assert!(p.target() < 128 * 1024, "target was {}", p.target());
+    }
+
+    #[test]
+    fn class_for_picks_smallest_class_ge_target() {
+        // classes: 4K, 64K, 512K
+        let classes = [4 * 1024, 64 * 1024, 512 * 1024];
+        assert_eq!(class_index_for(&classes, 3 * 1024), 0);
+        assert_eq!(class_index_for(&classes, 4 * 1024), 0);
+        assert_eq!(class_index_for(&classes, 5 * 1024), 1);
+        assert_eq!(class_index_for(&classes, 600 * 1024), 2); // clamps to largest
     }
 }
