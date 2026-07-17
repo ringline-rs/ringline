@@ -15,13 +15,13 @@ use metriken::{Gauge, ShardedCounterGroup, metric};
 pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(2);
 
 #[metric(name = "ringline/bytes", description = "Byte transfer counters")]
-pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
+pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(3);
 
 #[metric(name = "ringline/ring", description = "Ring utilization counters")]
 pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(5);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
-pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(5);
+pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(6);
 
 #[metric(name = "ringline/udp", description = "UDP counters")]
 pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(4);
@@ -46,6 +46,10 @@ pub mod conn {
 pub mod bytes {
     pub const RECEIVED: usize = 0;
     pub const SENT: usize = 1;
+    /// Bytes received via fallback one-shot recvs (also counted in
+    /// `RECEIVED`); the fraction of traffic arriving through the
+    /// degraded path when the provided ring is smaller than a response.
+    pub const FALLBACK_RECEIVED: usize = 2;
 }
 
 /// Counter slot indices for ring utilization metrics.
@@ -80,6 +84,11 @@ pub mod pool {
     /// (`ConfigBuilder::recv_buffer`) and throughput is gated on buffer
     /// recycling rather than on the wire.
     pub const RECV_PARKED: usize = 4;
+    /// A fallback one-shot recv was submitted for a connection parked on
+    /// ENOBUFS with a partial message accumulated — the graceful-
+    /// degradation path that keeps draining the socket when a single
+    /// response exceeds the provided ring.
+    pub const RECV_FALLBACK: usize = 5;
 }
 
 /// Counter slot indices for UDP metrics.
@@ -103,6 +112,11 @@ pub fn init_metadata() {
 
     BYTES.insert_metadata(bytes::RECEIVED, "op".into(), "received".into());
     BYTES.insert_metadata(bytes::SENT, "op".into(), "sent".into());
+    BYTES.insert_metadata(
+        bytes::FALLBACK_RECEIVED,
+        "op".into(),
+        "fallback_received".into(),
+    );
 
     RING.insert_metadata(ring::CQE_PROCESSED, "op".into(), "cqe_processed".into());
     RING.insert_metadata(
@@ -131,6 +145,7 @@ pub fn init_metadata() {
     );
     POOL.insert_metadata(pool::SEND_EAGAIN, "op".into(), "send_eagain".into());
     POOL.insert_metadata(pool::RECV_PARKED, "op".into(), "recv_parked".into());
+    POOL.insert_metadata(pool::RECV_FALLBACK, "op".into(), "recv_fallback".into());
 
     UDP.insert_metadata(
         udp::DATAGRAMS_RECEIVED,
@@ -162,7 +177,7 @@ mod tests {
                 "CONNECTIONS[{idx}] out of bounds"
             );
         }
-        for idx in [bytes::RECEIVED, bytes::SENT] {
+        for idx in [bytes::RECEIVED, bytes::SENT, bytes::FALLBACK_RECEIVED] {
             assert!(BYTES.increment(idx), "BYTES[{idx}] out of bounds");
         }
         for idx in [
@@ -180,6 +195,7 @@ mod tests {
             pool::BUFFER_RING_EMPTY,
             pool::SEND_EAGAIN,
             pool::RECV_PARKED,
+            pool::RECV_FALLBACK,
         ] {
             assert!(POOL.increment(idx), "POOL[{idx}] out of bounds");
         }

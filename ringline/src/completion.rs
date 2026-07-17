@@ -73,6 +73,11 @@ pub enum OpTag {
     /// PollAdd for POLLOUT after a recv-forward send returned `-EAGAIN`.
     /// Payload = InFlightSendSlab index to resubmit when writable.
     SendRecvBufsCoalescedPollOut = 27,
+    /// One-shot fallback recv into a fallback-pool slot, submitted when a
+    /// connection parked on ENOBUFS holds a partial message in its
+    /// accumulator (the provided ring is smaller than one response).
+    /// Payload = fallback pool slot to release on completion.
+    RecvFallback = 28,
 }
 
 impl OpTag {
@@ -106,6 +111,7 @@ impl OpTag {
             25 => Some(OpTag::SendMsgCoalescedPollOut),
             26 => Some(OpTag::SendRecvBufsCoalesced),
             27 => Some(OpTag::SendRecvBufsCoalescedPollOut),
+            28 => Some(OpTag::RecvFallback),
             _ => None,
         }
     }

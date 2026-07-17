@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Graceful degradation for responses larger than the provided recv ring
+  (io_uring backend). A connection whose multishot recv parks on
+  `ENOBUFS` with a partial message already accumulated now degrades to
+  one-shot fallback recvs into pool-owned memory instead of stalling
+  until buffers recycle — a parked receiver stops draining the socket,
+  so the TCP window closes and the sender stalls for the park's
+  duration. Plaintext accumulator-path connections only (TLS, recv
+  sinks, zero-copy forward, and direct echo keep the park-until-
+  replenish behavior). New metrics: `pool/recv_fallback` submissions
+  and `bytes/fallback_received`; the shutdown `[ringline diag]` line
+  gains `fallbacks=`.
+- Starved connections holding an unconsumed zero-copy buffer
+  (`pending_recv_bufs`) now have the hold flushed to the accumulator on
+  the replenish pass, returning its bid to the ring instead of waiting
+  for the task to consume it.
+
 ## [ringline-memcache 0.6.1] - 2026-07-16
 
 ### Fixed

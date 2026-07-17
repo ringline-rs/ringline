@@ -166,6 +166,28 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a one-shot fallback recv into fallback-pool memory for a
+    /// connection whose multishot recv is parked on ENOBUFS. The pool slot
+    /// is carried in the payload and released by `handle_recv_fallback`;
+    /// the pool owns `ptr` until that CQE arrives (SQE memory outlives the
+    /// operation even across close/slot-reuse).
+    pub fn submit_recv_fallback(
+        &mut self,
+        conn_index: u32,
+        ptr: *mut u8,
+        len: u32,
+        pool_slot: u16,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::RecvFallback, conn_index, pool_slot as u32);
+        let entry = opcode::Recv::new(Fixed(conn_index), ptr, len)
+            .build()
+            .user_data(user_data.raw());
+        unsafe {
+            self.push_sqe(entry)?;
+        }
+        Ok(())
+    }
+
     /// Submit a multishot recv with provided buffer ring for a connection.
     pub fn submit_multishot_recv(&mut self, conn_index: u32) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvMulti, conn_index, 0);
