@@ -58,3 +58,4 @@ Open efforts:
 | Entry | Started | Theme |
 |---|---|---|
 | [2026-07 — Fuzzing the wire-facing parsers](2026-07-fuzzing.md) | 2026-07-06 | cargo-fuzz targets for h2/h3/http1/grpc parsing + scheduled CI |
+| [2026-07 — ENOBUFS graceful degradation: fallback one-shot recv](2026-07-enobufs-fallback-recv.md) | 2026-07-16 | Park counter + fallback recv into accumulator memory for responses larger than the provided ring |
