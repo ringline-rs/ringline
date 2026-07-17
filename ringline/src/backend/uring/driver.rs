@@ -503,9 +503,18 @@ impl Driver {
             recv_fallback_inflight: vec![false; config.max_connections as usize],
             fallback_recv_pool: None,
             fallback_slot_owner: Vec::new(),
-            // A few provided-ring buffers per chunk: one event-loop pass
-            // moves one chunk per starved connection.
-            fallback_chunk: config.recv_buffer.buffer_size.saturating_mul(4),
+            // One event-loop pass moves at most one chunk per starved
+            // connection, so the chunk — not the provided ring — is the
+            // per-pass byte ceiling while degraded. It must be LARGER than
+            // the ring's capacity to beat the park/re-arm churn cycle it
+            // replaces (which moves one ring's worth per pass); a small
+            // chunk would be slower than the pathology. Floor of 1 MiB,
+            // scaled up for jumbo provided buffers.
+            fallback_chunk: config
+                .recv_buffer
+                .buffer_size
+                .saturating_mul(4)
+                .max(1 << 20),
             recv_fallback_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {

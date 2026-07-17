@@ -702,81 +702,80 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
-        if !self.driver.pending_replenish.is_empty() {
+        // Commit returned bids up front so re-armed multishots find them.
+        let replenished = if !self.driver.pending_replenish.is_empty() {
             self.driver
                 .provided_bufs
                 .replenish_batch(&self.driver.pending_replenish);
             self.driver.pending_replenish.clear();
+            true
+        } else {
+            false
+        };
 
-            // Buffers are available again — wake the parked receivers.
-            // Connections with a fallback recv in flight stay parked: a
-            // multishot armed alongside the outstanding one-shot could
-            // append out of order (io_uring does not order independent
-            // SQEs). The fallback's completion re-parks them and a later
-            // flush re-arms the multishot.
-            let mut still_parked = Vec::new();
-            while let Some(conn_index) = self.driver.recv_starved.pop() {
-                if self.driver.recv_fallback_inflight[conn_index as usize] {
-                    still_parked.push(conn_index);
-                    continue;
-                }
-                let alive = self
-                    .driver
-                    .connections
-                    .get(conn_index)
-                    .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
-                if !alive {
-                    continue;
-                }
+        if self.driver.recv_starved.is_empty() {
+            return;
+        }
+
+        // Arbitrate each parked connection:
+        //
+        // - Fallback in flight: stays parked untouched — a multishot armed
+        //   alongside the outstanding one-shot could append out of order
+        //   (io_uring does not order independent SQEs). The fallback's
+        //   completion re-parks it and a later pass hands off.
+        // - Partial message on the plaintext accumulator path: prefer a
+        //   fallback recv EVEN IF buffers were replenished. Re-arming the
+        //   multishot moves at most one ring's worth before parking again —
+        //   with responses larger than the ring that park/re-arm churn is
+        //   the pathology (per-pass throughput = ring capacity × pass
+        //   rate), while a fallback moves one `fallback_chunk` (> ring
+        //   capacity) per pass and never closes the TCP window. The
+        //   multishot resumes once the message completes and the
+        //   accumulator drains.
+        // - Everything else: re-arm the multishot when buffers came back,
+        //   otherwise keep waiting (nothing is half-delivered).
+        let mut i = 0;
+        while i < self.driver.recv_starved.len() {
+            let conn_index = self.driver.recv_starved[i];
+            if self.driver.recv_fallback_inflight[conn_index as usize] {
+                i += 1;
+                continue;
+            }
+            let alive = self
+                .driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
+            if !alive {
+                self.driver.recv_starved.swap_remove(i);
+                continue;
+            }
+            if self.fallback_eligible(conn_index)
+                && self.driver.try_submit_fallback_recv(conn_index)
+            {
+                self.driver.recv_starved.swap_remove(i);
+                continue;
+            }
+            if replenished {
+                self.driver.recv_starved.swap_remove(i);
                 if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
                     metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                     self.executor.wake_recv(conn_index);
                     self.driver.close_connection(conn_index);
                 }
+                continue;
             }
-            self.driver.recv_starved = still_parked;
-            return;
-        }
-
-        // The ring is genuinely dry — no bids came back this pass. For
-        // parked connections that already hold a partial message in their
-        // accumulator, degrade to a one-shot fallback recv into pool-owned
-        // memory instead of stalling: a parked receiver stops draining the
-        // socket, the kernel receive buffer fills, the TCP window closes,
-        // and recovery is gated on buffer recycling rather than on the
-        // data already queued in the kernel.
-        if self.driver.recv_starved.is_empty() {
-            return;
-        }
-        let mut i = 0;
-        while i < self.driver.recv_starved.len() {
-            let conn_index = self.driver.recv_starved[i];
-            if self.try_start_fallback_recv(conn_index) {
-                self.driver.recv_starved.swap_remove(i);
-            } else {
-                i += 1;
-            }
+            i += 1;
         }
     }
 
-    /// Whether a parked connection is eligible for the fallback recv path
-    /// and, if so, submit one. Eligible = plaintext accumulator route only
-    /// (no TLS, recv sink, zero-copy forward, or direct echo — those paths
-    /// keep the park-until-replenish behavior) with a partial message
-    /// already accumulated and no fallback outstanding.
-    fn try_start_fallback_recv(&mut self, conn_index: u32) -> bool {
+    /// Whether a parked connection may take the fallback recv path:
+    /// plaintext accumulator route only (no TLS, recv sink, zero-copy
+    /// forward, or direct echo — those paths keep the park-until-replenish
+    /// behavior) with a partial message already accumulated. The caller
+    /// has already checked liveness and that no fallback is in flight.
+    fn fallback_eligible(&mut self, conn_index: u32) -> bool {
         let ci = conn_index as usize;
-        if self.driver.recv_fallback_inflight[ci] {
-            return false;
-        }
-        let alive = self
-            .driver
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
-        if !alive {
-            return false;
-        }
         let is_tls = self
             .driver
             .tls_table
@@ -797,10 +796,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Only degrade when a message is half-delivered; an empty
         // accumulator means nothing is torn and the connection can simply
         // wait for replenish (holds were flushed above).
-        if self.driver.accumulators.data(conn_index).is_empty() {
-            return false;
-        }
-        self.driver.try_submit_fallback_recv(conn_index)
+        !self.driver.accumulators.data(conn_index).is_empty()
     }
 
     /// Completion of a fallback one-shot recv (`OpTag::RecvFallback`).
@@ -3863,17 +3859,35 @@ mod tests {
     }
 
     #[test]
-    fn replenish_rearms_multishot_instead_of_fallback() {
+    fn partial_message_prefers_fallback_over_rearm() {
         let mut el = make_test_loop();
         let conn_index = park_connection(&mut el);
         assert!(el.driver.accumulators.append(conn_index, b"part"));
+
+        // Buffers came back — but re-arming a connection with a partial
+        // message would only move one ring's worth before parking again
+        // (the churn cycle). The fallback must win the arbitration.
+        el.driver.pending_replenish.push(0);
+        el.flush_replenish_and_rearm();
+
+        assert!(
+            el.driver.recv_fallback_inflight[conn_index as usize],
+            "partial-message connection must take the fallback path"
+        );
+        assert!(el.driver.recv_starved.is_empty());
+    }
+
+    #[test]
+    fn empty_accumulator_rearms_multishot_on_replenish() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
 
         el.driver.pending_replenish.push(0);
         el.flush_replenish_and_rearm();
 
         assert!(
             !el.driver.recv_fallback_inflight[conn_index as usize],
-            "fallback submitted although buffers were replenished"
+            "nothing half-delivered — multishot re-arm expected"
         );
         assert!(el.driver.recv_starved.is_empty());
     }
@@ -3929,8 +3943,9 @@ mod tests {
             el.driver.pending_recv_bufs[conn_index as usize].is_none(),
             "hold not flushed"
         );
-        // The freed bid revived the multishot path — no fallback needed.
-        assert!(!el.driver.recv_fallback_inflight[conn_index as usize]);
+        // The flushed hold is a partial message — the fallback continues
+        // draining it (its bid went back to the ring for other conns).
+        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
         assert!(el.driver.recv_starved.is_empty());
     }
 
