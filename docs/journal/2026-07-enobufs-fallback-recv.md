@@ -1,6 +1,6 @@
 # ENOBUFS graceful degradation: fallback one-shot recv for jumbo payloads
 
-- **Status:** open
+- **Status:** closed (GO — #274)
 - **Span:** started 2026-07-16
 
 ## Goal
@@ -126,13 +126,57 @@ Two confounds in the original A/B are being pulled apart:
    consumers, high connection counts, rings genuinely smaller than a
    response).
 
+## Step 3–4 results (2026-07-17, same rig)
+
+The v1 trigger ("submit fallback when the ring is genuinely dry")
+validated to `fallbacks=0` on the small-ring rig — identical throughput
+to main with thousands of parks. The pathology is a park/re-arm churn
+**cycle**, not a dry-ring stall: every pass returns a few bids, the
+multishot re-arms, moves one ring's worth, parks again (per-pass
+movement = ring capacity × pass rate; 64 KiB × ~330/s ≈ the observed
+232 Mbps). Two corrections landed:
+
+1. **Arbitration**: parked connections with a partial message prefer
+   the fallback even when bids were replenished; empty-accumulator
+   connections keep the replenish re-arm path.
+2. **Chunk floor**: one fallback chunk moves per pass, so the chunk —
+   not the ring — is the degraded-mode ceiling and must exceed ring
+   capacity. Floor of 1 MiB (`max(4 × buffer_size, 1 MiB)`).
+
+Validation, 16×4 KiB (64 KiB) provided ring, main vs branch:
+
+| workload | main | fallback | |
+|---|---|---|---|
+| 4 MB GET | 30 req/s, 1.03 Gbps, p50 650 ms, ~33k parks/worker | 216 req/s, 7.25 Gbps, p50 100 ms, parks=2, ~16.6k fallbacks | **7.2×**, within 2.4% of the best adequate-buffer config (7.43 Gbps) |
+| 16 MB GET | 1 req/s, 232 Mbps, p50 10.7 s, ~8k parks/worker | 22 req/s, 3.06 Gbps, p50 906 ms, parks=2, ~3.9k fallbacks | **13×** throughput, 12× p50; 25% below the tuned 64 KiB-buffer config (4.1 Gbps) — residual shared with the general large-value ceiling (~5 Gbps) under separate investigation |
+
+`parks=2` per worker = each connection parks exactly once, then lives
+in fallback mode. redis `total_connections_received` confirms zero
+mid-run disconnects.
+
+Small-op regression check (64 B values, 80/20 GET:SET, pipeline 16,
+default ring — the fallback never engages): main p50/p99 136/211 µs,
+branch 137/209 µs; ~21M ops both; `parks=0 fallbacks=0`. No
+regression. (The BENCHMARKS.md two-machine segcache baseline was not
+rerun — this rig is single-machine loopback; the 64 B A/B is the
+equivalent guard here.)
+
+Known cosmetic issue: `connections N active` in cachecannon's summary
+under-reads by 1–2 on 16 MB fallback runs (`CONNECTIONS_ACTIVE` gauge
+sampled while worker teardown races the final snapshot; redis-side
+counters prove no real disconnect). Follow-up, not a blocker.
+
 ## Outcome
 
-_(open — fallback implemented on `feat/enobufs-fallback-recv` (#274)
-with pool-owned recv targets instead of accumulator spare capacity: the
-sketch's accumulator recv is unsound across close/slot-reuse, see the
-PR. Pending: small-ring validation + segcache baseline, and the
-reopened default-config dip investigation.)_
+**GO — shipped on `feat/enobufs-fallback-recv` (#274).** Design deltas
+from the sketch, both forced by evidence: pool-owned recv targets
+(accumulator spare capacity is unsound across close/slot-reuse);
+arbitration-based trigger + 1 MiB chunk floor (the dry-ring trigger
+never fires in the churn cycle). The park counter (#273) — landed
+first per the plan — both falsified the original dip hypothesis
+(`parks=0` on default configs; that dip is per-CQE buffer size,
+tracked separately) and pinpointed the fallback's two design errors.
+Instrument before you fix.
 
 ## Lessons / open questions
 
