@@ -239,11 +239,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 eprintln!(
                     "[ringline diag] iters={diag_iters} dead={diag_dead_iters} ({dead_pct:.1}%) \
                      cqes_1st_avg={:.2} cqes_2nd_avg={:.2} \
-                     tasks_1st_avg={:.2} tasks_fp_avg={:.2}",
+                     tasks_1st_avg={:.2} tasks_fp_avg={:.2} parks={}",
                     diag_cqes_1st as f64 / diag_iters.max(1) as f64,
                     diag_cqes_2nd as f64 / diag_iters.max(1) as f64,
                     diag_tasks_1st as f64 / diag_iters.max(1) as f64,
                     diag_tasks_fp as f64 / diag_iters.max(1) as f64,
+                    self.driver.recv_park_count,
                 );
                 if loop_diag {
                     eprintln!(
@@ -809,6 +810,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // the worker spun at 100% CPU until a task freed a bid.
                 if !has_more && !self.driver.recv_starved.contains(&conn_index) {
                     self.driver.recv_starved.push(conn_index);
+                    self.driver.recv_park_count += 1;
+                    metrics::POOL.increment(metrics::pool::RECV_PARKED);
                 }
             } else if errno == libc::ECANCELED {
                 return;

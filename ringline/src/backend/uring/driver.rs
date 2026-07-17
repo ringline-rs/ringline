@@ -218,6 +218,11 @@ pub(crate) struct Driver {
     /// pending and the ring was empty — a 100% CPU spin until some task
     /// released a bid.
     pub(crate) recv_starved: Vec<u32>,
+    /// Lifetime count of ENOBUFS parks on this worker (pushes onto
+    /// `recv_starved`). Reported in the shutdown diag line; sustained
+    /// growth means responses exceed the provided ring and receive
+    /// throughput is gated on buffer recycling.
+    pub(crate) recv_park_count: u64,
     /// Arrival timestamp shared by all UDP datagrams queued in one CQE
     /// drain batch. One clock read per batch instead of one per datagram;
     /// precision loss is bounded by the drain duration (microseconds).
@@ -459,6 +464,7 @@ impl Driver {
             tls_out_scratch: Vec::new(),
             next_disk_io_seq: 0,
             recv_starved: Vec::new(),
+            recv_park_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
