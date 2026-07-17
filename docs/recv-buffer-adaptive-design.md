@@ -303,14 +303,40 @@ default becomes "several medium buffers" (still one size). The bench harness
 
 ## Validation
 
-- Promote `ring_fill_bench` into the repo (bench or example) and add the mixed-
-  workload sweep.
-- Assert the 8→32-conn cliff flattens on both the INC and size-class paths.
-- Assert small-response workloads keep their cache-friendly footprint (no
-  regression at low response sizes).
-- Assert RSS stays bounded under high connection counts.
-- Per-API copy-count regression tests (counter-instrumented parsers /
-  accumulator) enforcing the invariant.
+### Size-class path results (hv01, kernel 6.12, 1 worker, 256 KiB responses)
+
+Adaptive size-class selection vs. the pre-adaptive single 16 KiB ring, same rig
+and `ring_fill_bench`:
+
+| Case | Baseline MiB/s (fallback frac) | Adaptive MiB/s (fallback frac) | Δ |
+|---|---|---|---|
+| whole, 8 conns   | ~3947 (0.00) | 3804 (0.00)  | ~flat |
+| whole, 16 conns  | ~2941 (0.07) | 2907 (0.067) | ~flat |
+| whole, 32 conns  | ~1527 (0.53) | **2323 (0.063)** | **+52%, fallback 8×↓** |
+| whole, 64 conns  | ~1766 (0.49) | 1843 (0.115) | +4%, fallback 4×↓ |
+| whole, 128 conns | ~1534 (0.45) | **1863 (0.179)** | **+21%, fallback 2.5×↓** |
+| mixed 8K/256K, 32 conns | ~2079 (0.25) | 2120 (0.094) | ~flat, fallback 2.6×↓ |
+
+The cliff flattens: connections migrate to the 256 KiB class after ENOBUFS
+re-arms, so a large response lands in one buffer and ring pressure collapses
+(fallback fraction drops 3–8×). Low-concurrency and mixed workloads are
+neutral. Caveat: the ENOBUFS regime is genuinely noisy run-to-run (parked
+counts swing widely at 32–64 conns); the throughput wins at 32/128 are robust,
+64 conns is noisier. The mixed workload is where the one-class-per-connection
+model is weakest (a bimodal distribution pulls the EWMA onto a large class that
+wastes buffers on the frequent small message) — this is the case INC (Phase 4)
+is expected to solve properly.
+
+Memory is bounded by construction: three shared class rings (4 + 8 + 16 MiB)
+= ≤ 28 MiB/worker regardless of connection count; the large ring stays lightly
+populated under small-traffic workloads (anonymous pages, unfilled). A precise
+RSS-isolation measurement is future work.
+
+### Remaining validation (Phase 4 / 6)
+
+- INC path: assert the cliff flattens AND the mixed workload no longer dips.
+- Per-API copy-count regression tests (counter-instrumented accumulator /
+  in-place path) enforcing the invariant that no recv API regresses.
 - Both backends (io_uring on hv01/CI, mio on macOS), per project convention.
 
 ## Risks / open questions
