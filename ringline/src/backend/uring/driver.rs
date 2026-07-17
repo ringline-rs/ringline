@@ -11,6 +11,7 @@ use io_uring::cqueue;
 use crate::accumulator::AccumulatorTable;
 use crate::backend::ProvidedBufRing;
 use crate::backend::Ring;
+use crate::backend::SizeClassRings;
 use crate::buffer::fixed::FixedBufferRegistry;
 use crate::buffer::send_copy::SendCopyPool;
 use crate::buffer::send_slab::InFlightSendSlab;
@@ -118,7 +119,10 @@ pub(crate) struct Driver {
     pub(crate) ring: Ring,
     pub(crate) connections: ConnectionTable,
     pub(crate) fixed_buffers: FixedBufferRegistry,
-    pub(crate) provided_bufs: ProvidedBufRing,
+    pub(crate) provided_bufs: SizeClassRings,
+    /// Per-connection current recv size class (index into `provided_bufs`).
+    /// Pinned to 0 for now — a later phase selects it adaptively.
+    pub(crate) recv_class: Vec<u8>,
     /// Provided buffer ring backing UDP multishot recvmsg. `None` when no UDP
     /// sockets are configured.
     pub(crate) udp_provided_bufs: Option<ProvidedBufRing>,
@@ -128,7 +132,13 @@ pub(crate) struct Driver {
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_slab: InFlightSendSlab,
     pub(crate) accumulators: AccumulatorTable,
-    pub(crate) pending_replenish: Vec<u16>,
+    /// Consumed provided-buffer ids awaiting return to the kernel ring, tagged
+    /// with the size class they came from: `(class, bid)`. Drained (grouped by
+    /// class) each tick by `flush_replenish_and_rearm`.
+    pub(crate) pending_replenish: Vec<(u8, u16)>,
+    /// Reused per-class scratch for grouping `pending_replenish` bids at flush
+    /// time — keeps the replenish path allocation-free across ticks.
+    pub(crate) replenish_group_scratch: Vec<u16>,
     /// Per-connection pending recv buffer for zero-copy recv. When `Some`, the
     /// buffer ID has NOT been pushed to `pending_replenish` and must be
     /// replenished when the slot is cleared.
@@ -346,7 +356,7 @@ impl Driver {
         let fixed_buffers =
             FixedBufferRegistry::new(&config.registered_regions, config.max_registered_regions);
 
-        let provided_bufs = ProvidedBufRing::new(
+        let provided_bufs = SizeClassRings::new(
             config.recv_buffer.bgid,
             config.recv_buffer.ring_size,
             config.recv_buffer.buffer_size,
@@ -379,7 +389,10 @@ impl Driver {
         ring.register_files_sparse(
             config.max_connections + udp_count + nvme_max + direct_io_max + fs_max,
         )?;
-        ring.register_buf_ring(&provided_bufs)?;
+        // Register every size-class provided ring (each has its own bgid).
+        for class_ring in provided_bufs.rings() {
+            ring.register_buf_ring(class_ring)?;
+        }
         if let Some(ref udp_bufs) = udp_provided_bufs {
             ring.register_buf_ring(udp_bufs)?;
         }
@@ -454,12 +467,14 @@ impl Driver {
             connections,
             fixed_buffers,
             provided_bufs,
+            recv_class: vec![0u8; config.max_connections as usize],
             udp_provided_bufs,
             udp_pending_replenish: Vec::new(),
             send_copy_pool,
             send_slab,
             accumulators,
             pending_replenish: Vec::with_capacity(config.recv_buffer.ring_size as usize),
+            replenish_group_scratch: Vec::with_capacity(config.recv_buffer.ring_size as usize),
             pending_recv_bufs: vec![None; config.max_connections as usize],
             send_recv_buf_original_lens: vec![0; config.max_connections as usize],
             send_recv_buf_remaining: vec![0; config.max_connections as usize],
@@ -657,6 +672,18 @@ impl Driver {
         }
     }
 
+    /// Arm (or re-arm) the multishot recv for a TCP connection against its
+    /// current size-class provided ring.
+    ///
+    /// The class is read from `recv_class` (pinned to 0 for now) and resolved
+    /// to a bgid via `provided_bufs`. All TCP multishot arm/re-arm sites go
+    /// through here so the class-selection logic lives in one place.
+    pub(crate) fn arm_multishot_recv(&mut self, conn_index: u32) -> io::Result<()> {
+        let class = self.recv_class[conn_index as usize] as usize;
+        let bgid = self.provided_bufs.bgid(class);
+        self.ring.submit_multishot_recv(conn_index, bgid)
+    }
+
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         if let Some(conn) = self.connections.get_mut(conn_index) {
             if matches!(conn.recv_mode, RecvMode::Closed) {
@@ -671,8 +698,9 @@ impl Driver {
         // in-flight forward's bids live in its slab entry (already drained from
         // recv_hold) and are replenished by its own completion handler.
         if self.recv_forward[conn_index as usize] {
+            let class = self.recv_class[conn_index as usize];
             for pending in self.recv_hold[conn_index as usize].drain(..) {
-                self.pending_replenish.push(pending.bid);
+                self.pending_replenish.push((class, pending.bid));
             }
             self.recv_forward[conn_index as usize] = false;
         }
@@ -1520,12 +1548,14 @@ impl Driver {
         // 3. Unregister the provided buffer rings before Driver is dropped
         // (which munmaps the ring memory). Without this, the kernel holds a
         // dangling pointer to the freed mmap region.
-        if self
-            .ring
-            .unregister_buf_ring(self.provided_bufs.bgid())
-            .is_err()
-        {
-            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+        for class in 0..self.provided_bufs.num_classes() {
+            if self
+                .ring
+                .unregister_buf_ring(self.provided_bufs.bgid(class))
+                .is_err()
+            {
+                crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+            }
         }
         if let Some(ref udp_bufs) = self.udp_provided_bufs
             && self.ring.unregister_buf_ring(udp_bufs.bgid()).is_err()
@@ -1605,7 +1635,7 @@ mod field_order_tests {
             .find("pub(crate) ring: Ring,")
             .expect("Driver::ring field signature not found — was it renamed?");
         let provided_pos = src
-            .find("pub(crate) provided_bufs: ProvidedBufRing,")
+            .find("pub(crate) provided_bufs: SizeClassRings,")
             .expect("Driver::provided_bufs field signature not found");
         let send_slab_pos = src
             .find("pub(crate) send_slab: InFlightSendSlab,")

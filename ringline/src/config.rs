@@ -271,7 +271,15 @@ impl Default for Config {
             udp_recv_buffer: RecvBufferConfig {
                 ring_size: 128,
                 buffer_size: 2048,
-                bgid: 1,
+                // The TCP recv path now registers one provided ring per size
+                // class, consuming the contiguous bgid range
+                // [recv_buffer.bgid, recv_buffer.bgid + NUM_SIZE_CLASSES).
+                // With the default recv_buffer.bgid = 0 that is {0, 1, 2}, so
+                // the UDP ring must sit above it (was 1, which now collides
+                // with size class 1). Config validation only checks against
+                // recv_buffer.bgid today; reserving the whole class range is a
+                // later phase.
+                bgid: 3,
             },
             registered_regions: Vec::new(),
             max_registered_regions: 64,

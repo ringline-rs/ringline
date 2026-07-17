@@ -27,7 +27,7 @@ pub(crate) use uring::driver::UdpSocketState;
 #[cfg(has_io_uring)]
 pub(crate) use uring::event_loop::AsyncEventLoop;
 #[cfg(has_io_uring)]
-pub(crate) use uring::provided::ProvidedBufRing;
+pub(crate) use uring::provided::{ProvidedBufRing, SizeClassRings};
 #[cfg(has_io_uring)]
 pub(crate) use uring::ring::Ring;
 

@@ -24,7 +24,11 @@ use crate::nvme::{NVME_URING_CMD_IO, NvmeUringCmd};
 /// ~20 MB of buffer pools allocated per worker.
 pub struct Ring {
     pub(crate) ring: IoUring<squeue::Entry128, cqueue::Entry32>,
-    /// Recv buffer group ID for multishot recv.
+    /// Recv buffer group ID for size class 0. Only the timestamped multishot
+    /// recvmsg path (`submit_multishot_recvmsg`) still reads this — the plain
+    /// multishot recv now takes an explicit `bgid` — so it is dead code unless
+    /// the `timestamps` feature is enabled.
+    #[cfg_attr(not(feature = "timestamps"), allow(dead_code))]
     bgid: u16,
     /// Reusable Entry128 conversion scratch for chain pushes — avoids a
     /// heap allocation per chained send.
@@ -150,6 +154,9 @@ impl Ring {
     /// Submit a multishot recvmsg with provided buffer ring for a connection.
     /// Used when SO_TIMESTAMPING is enabled to receive cmsg ancillary data
     /// (kernel timestamps) alongside TCP payload.
+    ///
+    /// Timestamped recv uses `self.bgid` (size class 0) only for now; multi
+    /// size-class selection is not wired into the recvmsg path yet.
     #[cfg(feature = "timestamps")]
     pub fn submit_multishot_recvmsg(
         &mut self,
@@ -188,10 +195,13 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a multishot recv with provided buffer ring for a connection.
-    pub fn submit_multishot_recv(&mut self, conn_index: u32) -> io::Result<()> {
+    /// Submit a multishot recv with a provided buffer ring for a connection.
+    ///
+    /// `bgid` selects the size-class ring to receive into (resolved by the
+    /// driver from the connection's current recv class).
+    pub fn submit_multishot_recv(&mut self, conn_index: u32, bgid: u16) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvMulti, conn_index, 0);
-        let entry = opcode::RecvMulti::new(Fixed(conn_index), self.bgid)
+        let entry = opcode::RecvMulti::new(Fixed(conn_index), bgid)
             .build()
             .user_data(user_data.raw());
         unsafe {

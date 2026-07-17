@@ -697,16 +697,32 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
                     }
-                    self.driver.pending_replenish.push(pending.bid);
+                    self.driver
+                        .pending_replenish
+                        .push((self.driver.recv_class[conn_index as usize], pending.bid));
                 }
             }
         }
 
         // Commit returned bids up front so re-armed multishots find them.
+        // Group by size class and replenish each class ring separately. The
+        // scratch is taken out of the driver (owned local) so it can be read
+        // while `provided_bufs` is borrowed mutably, then restored for reuse.
         let replenished = if !self.driver.pending_replenish.is_empty() {
-            self.driver
-                .provided_bufs
-                .replenish_batch(&self.driver.pending_replenish);
+            let num_classes = self.driver.provided_bufs.num_classes();
+            let mut scratch = std::mem::take(&mut self.driver.replenish_group_scratch);
+            for class in 0..num_classes {
+                scratch.clear();
+                for &(c, bid) in &self.driver.pending_replenish {
+                    if c as usize == class {
+                        scratch.push(bid);
+                    }
+                }
+                if !scratch.is_empty() {
+                    self.driver.provided_bufs.replenish_batch(class, &scratch);
+                }
+            }
+            self.driver.replenish_group_scratch = scratch;
             self.driver.pending_replenish.clear();
             true
         } else {
@@ -758,7 +774,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             if replenished {
                 self.driver.recv_starved.swap_remove(i);
-                if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+                if self.driver.arm_multishot_recv(conn_index).is_err() {
                     metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                     self.executor.wake_recv(conn_index);
                     self.driver.close_connection(conn_index);
@@ -973,7 +989,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result > 0
                 && let Some(bid) = cqueue::buffer_select(flags)
             {
-                self.driver.pending_replenish.push(bid);
+                self.driver
+                    .pending_replenish
+                    .push((self.driver.recv_class[conn_index as usize], bid));
             }
             return;
         }
@@ -1038,7 +1056,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let bytes_received = result as u32;
         metrics::BYTES.add(metrics::bytes::RECEIVED, bytes_received as u64);
-        let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
+        let (buf_ptr, _) = self
+            .driver
+            .provided_bufs
+            .get_buffer(self.driver.recv_class[conn_index as usize] as usize, bid);
         let data = unsafe { std::slice::from_raw_parts(buf_ptr, bytes_received as usize) };
 
         // NOTE: bid is NOT unconditionally pushed to pending_replenish here.
@@ -1054,7 +1075,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .is_some_and(|t| t.has(conn_index));
 
         if is_tls_conn {
-            self.driver.pending_replenish.push(bid);
+            self.driver
+                .pending_replenish
+                .push((self.driver.recv_class[conn_index as usize], bid));
             {
                 let tls_table = self.driver.tls_table.as_mut().unwrap();
                 let result = crate::tls::feed_tls_recv(
@@ -1173,7 +1196,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.send_recv_buf_remaining[conn_index as usize] = bytes_received;
                 if self.driver.submit_or_queue_send(conn_index, built).is_err() {
                     // SQ full — replenish and give up on this echo.
-                    self.driver.pending_replenish.push(bid);
+                    self.driver
+                        .pending_replenish
+                        .push((self.driver.recv_class[conn_index as usize], bid));
                 }
                 // Do NOT call wake_recv here. DirectEchoFuture only needs to
                 // be woken on connection close (handled by the result <= 0 path
@@ -1181,7 +1206,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             } else {
                 // Plaintext path: route through recv sink if active, else zero-copy/accumulator.
                 if let Some(sink) = &mut self.executor.recv_sinks[conn_index as usize] {
-                    self.driver.pending_replenish.push(bid);
+                    self.driver
+                        .pending_replenish
+                        .push((self.driver.recv_class[conn_index as usize], bid));
                     let remaining_cap = sink.cap - sink.pos;
                     let to_sink = data.len().min(remaining_cap);
                     if to_sink > 0 {
@@ -1231,14 +1258,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             if !self.driver.accumulators.append(conn_index, pending_data) {
                                 accumulator_overflowed = true;
                             }
-                            self.driver.pending_replenish.push(pending.bid);
+                            self.driver
+                                .pending_replenish
+                                .push((self.driver.recv_class[conn_index as usize], pending.bid));
                         }
                         if !accumulator_overflowed
                             && !self.driver.accumulators.append(conn_index, data)
                         {
                             accumulator_overflowed = true;
                         }
-                        self.driver.pending_replenish.push(bid);
+                        self.driver
+                            .pending_replenish
+                            .push((self.driver.recv_class[conn_index as usize], bid));
                         if accumulator_overflowed {
                             // Handler kept returning NeedMore while the peer
                             // streamed past `recv_accumulator_max`. Close the
@@ -1256,7 +1287,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if !has_more
             && let Some(conn) = self.driver.connections.get(conn_index)
             && matches!(conn.recv_mode, RecvMode::Multi)
-            && self.driver.ring.submit_multishot_recv(conn_index).is_err()
+            && self.driver.arm_multishot_recv(conn_index).is_err()
         {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
@@ -1278,7 +1309,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result > 0
                 && let Some(bid) = cqueue::buffer_select(flags)
             {
-                self.driver.pending_replenish.push(bid);
+                self.driver
+                    .pending_replenish
+                    .push((self.driver.recv_class[conn_index as usize], bid));
             }
             return;
         }
@@ -1320,10 +1353,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
 
         let buf_len = result as u32;
-        let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
+        let (buf_ptr, _) = self
+            .driver
+            .provided_bufs
+            .get_buffer(self.driver.recv_class[conn_index as usize] as usize, bid);
         let buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len as usize) };
 
-        self.driver.pending_replenish.push(bid);
+        self.driver
+            .pending_replenish
+            .push((self.driver.recv_class[conn_index as usize], bid));
 
         // Parse the io_uring_recvmsg_out header to extract control data + payload.
         let msg_out = match io_uring::types::RecvMsgOut::parse(buf, &self.driver.recvmsg_msghdr) {
@@ -1485,7 +1523,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
 
                 if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
-                    self.driver.pending_replenish.push(pending.bid);
+                    self.driver
+                        .pending_replenish
+                        .push((self.driver.recv_class[conn_index as usize], pending.bid));
                 }
                 self.driver.accumulators.reset(conn_index);
                 self.arm_recv(conn_index);
@@ -1843,15 +1883,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Replenish the held provided-buffer bids backing a recv-forward entry and
     /// release the slab slot. The bids become available in the `ProvidedBufRing`
     /// again (resuming recv if it was ENOBUFS-stalled).
-    fn release_recv_forward(&mut self, slab_idx: u16) {
+    fn release_recv_forward(&mut self, conn_index: u32, slab_idx: u16) {
         let mut bids = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
         let mut n = 0;
         for &b in self.driver.send_slab.recv_forward_bids(slab_idx) {
             bids[n] = b;
             n += 1;
         }
+        // Held recv-forward buffers were received on this connection's recv
+        // class, so they return to that class ring.
+        let class = self.driver.recv_class[conn_index as usize];
         for &b in &bids[..n] {
-            self.driver.pending_replenish.push(b);
+            self.driver.pending_replenish.push((class, b));
         }
         self.driver.send_slab.release(slab_idx);
     }
@@ -1890,7 +1933,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Fully sent.
             let total = self.driver.send_slab.total_len(slab_idx);
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
-            self.release_recv_forward(slab_idx);
+            self.release_recv_forward(conn_index, slab_idx);
             self.driver.submit_next_queued(conn_index);
             self.driver.note_send_finalized(conn_index);
             self.executor.wake_send(conn_index, Ok(total));
@@ -1917,7 +1960,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Real error — replenish bids, release, and unwind the connection.
-        self.release_recv_forward(slab_idx);
+        self.release_recv_forward(conn_index, slab_idx);
         self.driver.submit_next_queued(conn_index);
         self.driver.note_send_finalized(conn_index);
         let io_result = if result == 0 {
@@ -1941,7 +1984,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if result < 0 {
-            self.release_recv_forward(slab_idx);
+            self.release_recv_forward(conn_index, slab_idx);
             self.driver.submit_next_queued(conn_index);
             self.driver.note_send_finalized(conn_index);
             self.executor
@@ -1982,7 +2025,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // Partial send — resubmit the remainder.
                 let new_remaining = remaining_before - bytes_sent;
                 self.driver.send_recv_buf_remaining[conn_index as usize] = new_remaining;
-                let (buf_ptr, _buf_size) = self.driver.provided_bufs.get_buffer(bid);
+                let (buf_ptr, _buf_size) = self
+                    .driver
+                    .provided_bufs
+                    .get_buffer(self.driver.recv_class[conn_index as usize] as usize, bid);
                 let original_len = self.driver.send_recv_buf_original_lens[conn_index as usize];
                 let offset = original_len - new_remaining;
                 let new_ptr = unsafe { buf_ptr.add(offset as usize) };
@@ -2003,7 +2049,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
                 if unsafe { self.driver.ring.push_sqe(entry) }.is_err() {
                     // SQ full — replenish and give up.
-                    self.driver.pending_replenish.push(bid);
+                    self.driver
+                        .pending_replenish
+                        .push((self.driver.recv_class[conn_index as usize], bid));
                     self.driver.submit_next_queued(conn_index);
                 }
                 return;
@@ -2011,14 +2059,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // Full send complete.
             metrics::BYTES.add(metrics::bytes::SENT, remaining_before as u64);
-            self.driver.pending_replenish.push(bid);
+            self.driver
+                .pending_replenish
+                .push((self.driver.recv_class[conn_index as usize], bid));
             self.driver.submit_next_queued(conn_index);
             self.executor.wake_send(conn_index, Ok(remaining_before));
             return;
         }
 
         // Error or zero-length send.
-        self.driver.pending_replenish.push(bid);
+        self.driver
+            .pending_replenish
+            .push((self.driver.recv_class[conn_index as usize], bid));
         self.driver.submit_next_queued(conn_index);
 
         let io_result = if result == 0 {
@@ -2248,7 +2300,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // never). Close it now instead.
         if !self.executor.connect_waiters[conn_index as usize] {
             if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
-                self.driver.pending_replenish.push(pending.bid);
+                self.driver
+                    .pending_replenish
+                    .push((self.driver.recv_class[conn_index as usize], pending.bid));
             }
             self.driver.accumulators.reset(conn_index);
             if let Some(ref mut tls_table) = self.driver.tls_table {
@@ -2259,7 +2313,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
-            self.driver.pending_replenish.push(pending.bid);
+            self.driver
+                .pending_replenish
+                .push((self.driver.recv_class[conn_index as usize], pending.bid));
         }
         self.driver.accumulators.reset(conn_index);
 
@@ -2344,7 +2400,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Replenish any held zero-copy recv buffer.
         if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
-            self.driver.pending_replenish.push(pending.bid);
+            self.driver
+                .pending_replenish
+                .push((self.driver.recv_class[conn_index as usize], pending.bid));
         }
 
         let was_established = self
@@ -2909,7 +2967,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             return;
         }
-        if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+        if self.driver.arm_multishot_recv(conn_index).is_err() {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
@@ -3109,13 +3167,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if self.driver.connections.get(conn_index).is_none()
                 || self.driver.connections.generation(conn_index) != generation
             {
-                self.release_recv_forward(slab_idx);
+                self.release_recv_forward(conn_index, slab_idx);
                 continue;
             }
             if retries >= 2 {
                 // Give up: forwarded bytes were dropped mid-stream, so close
                 // instead of forwarding the rest of the queue after the gap.
-                self.release_recv_forward(slab_idx);
+                self.release_recv_forward(conn_index, slab_idx);
                 self.driver.drain_conn_send_queue(conn_index);
                 let err = io::Error::other("max retries during recv-forward resubmit");
                 self.executor.wake_send(conn_index, Err(err));
@@ -3651,7 +3709,7 @@ mod tests {
             replenish_before + 1,
             "buffer not replenished on stale connection CQE"
         );
-        assert_eq!(el.driver.pending_replenish[0], bid);
+        assert_eq!(el.driver.pending_replenish[0], (0, bid));
     }
 
     // ── Close path tests ───────────────────────────────────────────
@@ -3693,7 +3751,7 @@ mod tests {
 
         // Write test data into the buffer ring's backing memory so the
         // handler reads it into the accumulator.
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(0, bid);
         unsafe {
             std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
         }
@@ -3717,7 +3775,7 @@ mod tests {
 
         // Buffer should NOT be queued for replenish yet (deferred).
         assert!(
-            !el.driver.pending_replenish.contains(&bid),
+            !el.driver.pending_replenish.contains(&(0, bid)),
             "buffer should NOT be replenished yet (zero-copy deferred)"
         );
     }
@@ -3730,7 +3788,7 @@ mod tests {
         let flags = 1u32 | 2u32; // IORING_CQE_F_BUFFER | IORING_CQE_F_MORE, bid=0
 
         // First recv: bid=0, "hello"
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(0);
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(0, 0);
         unsafe {
             std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
         }
@@ -3738,7 +3796,7 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), 5, flags);
 
         // Second recv: bid=1, " world"
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(1);
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(0, 1);
         unsafe {
             std::ptr::copy_nonoverlapping(b" world".as_ptr(), buf_ptr as *mut u8, 6);
         }
@@ -3747,11 +3805,11 @@ mod tests {
 
         // Both buffers should be replenished (first flushed, second appended directly).
         assert!(
-            el.driver.pending_replenish.contains(&0),
+            el.driver.pending_replenish.contains(&(0, 0)),
             "first buffer should be replenished"
         );
         assert!(
-            el.driver.pending_replenish.contains(&1),
+            el.driver.pending_replenish.contains(&(0, 1)),
             "second buffer should be replenished"
         );
 
@@ -3871,7 +3929,7 @@ mod tests {
         // Buffers came back — but re-arming a connection with a partial
         // message would only move one ring's worth before parking again
         // (the churn cycle). The fallback must win the arbitration.
-        el.driver.pending_replenish.push(0);
+        el.driver.pending_replenish.push((0, 0));
         el.flush_replenish_and_rearm();
 
         assert!(
@@ -3886,7 +3944,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = park_connection(&mut el);
 
-        el.driver.pending_replenish.push(0);
+        el.driver.pending_replenish.push((0, 0));
         el.flush_replenish_and_rearm();
 
         assert!(
@@ -3916,7 +3974,7 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
         assert!(el.driver.recv_starved.contains(&conn_index));
 
-        el.driver.pending_replenish.push(0);
+        el.driver.pending_replenish.push((0, 0));
         el.flush_replenish_and_rearm();
 
         assert!(
@@ -3932,7 +3990,7 @@ mod tests {
         let conn_index = park_connection(&mut el);
 
         // Simulate a zero-copy held buffer with unconsumed partial data.
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(3);
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(0, 3);
         unsafe { std::ptr::copy_nonoverlapping(b"held".as_ptr(), buf_ptr as *mut u8, 4) };
         el.driver.pending_recv_bufs[conn_index as usize] = Some(crate::backend::PendingRecvBuf {
             bid: 3,
@@ -5629,7 +5687,7 @@ mod tests {
 
         // Buffer should be replenished.
         assert!(
-            el.driver.pending_replenish.contains(&bid),
+            el.driver.pending_replenish.contains(&(0, bid)),
             "buffer not replenished after full send"
         );
         // Send waiter should be woken with Ok(100).
@@ -5662,7 +5720,7 @@ mod tests {
 
         // Buffer should be replenished even on error.
         assert!(
-            el.driver.pending_replenish.contains(&bid),
+            el.driver.pending_replenish.contains(&(0, bid)),
             "buffer not replenished after send error"
         );
         assert!(
@@ -5682,7 +5740,7 @@ mod tests {
         let data_len: u32 = 100;
 
         // Write recognizable data into the provided buffer.
-        let (buf_ptr, buf_size) = el.driver.provided_bufs.get_buffer(bid);
+        let (buf_ptr, buf_size) = el.driver.provided_bufs.get_buffer(0, bid);
         assert!(
             buf_size > data_len,
             "test requires buffer_size > data_len to exercise the bug"
@@ -5707,7 +5765,7 @@ mod tests {
 
         // Buffer should NOT be replenished yet (still in-flight).
         assert!(
-            !el.driver.pending_replenish.contains(&bid),
+            !el.driver.pending_replenish.contains(&(0, bid)),
             "buffer replenished prematurely on partial send"
         );
 
@@ -5724,7 +5782,7 @@ mod tests {
 
         // Now the buffer should be replenished.
         assert!(
-            el.driver.pending_replenish.contains(&bid),
+            el.driver.pending_replenish.contains(&(0, bid)),
             "buffer not replenished after retry completed"
         );
     }
@@ -5738,7 +5796,7 @@ mod tests {
         let bid: u16 = 2;
         let data_len: u32 = 100;
 
-        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(0, bid);
         // Fill with pattern so we can verify offset correctness.
         let test_data: Vec<u8> = (0u8..100).collect();
         unsafe {
@@ -5752,20 +5810,20 @@ mod tests {
 
         // First partial: 30 of 100 bytes sent. Remaining = 70. Offset should be 30.
         el.test_dispatch_cqe(ud.raw(), 30, 0);
-        assert!(!el.driver.pending_replenish.contains(&bid));
+        assert!(!el.driver.pending_replenish.contains(&(0, bid)));
         assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 70);
 
         // Second partial: 20 of 70 bytes sent. Remaining = 50. Offset should be 50.
         let ud2 = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
         el.test_dispatch_cqe(ud2.raw(), 20, 0);
-        assert!(!el.driver.pending_replenish.contains(&bid));
+        assert!(!el.driver.pending_replenish.contains(&(0, bid)));
         assert_eq!(el.driver.send_recv_buf_remaining[conn_index as usize], 50);
 
         // Final: 50 of 50 bytes sent. Should complete.
         let ud3 = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
         el.test_dispatch_cqe(ud3.raw(), 50, 0);
         assert!(
-            el.driver.pending_replenish.contains(&bid),
+            el.driver.pending_replenish.contains(&(0, bid)),
             "buffer not replenished after final partial send"
         );
     }
@@ -5782,7 +5840,7 @@ mod tests {
 
         let bid: u16 = 1;
         let data_len: u32 = 50;
-        let (_, _buf_size) = el.driver.provided_bufs.get_buffer(bid);
+        let (_, _buf_size) = el.driver.provided_bufs.get_buffer(0, bid);
 
         // The bug: offset = buf_size - new_remaining = 4096 - 25 = 4071 (WRONG)
         // The fix: offset = original_len - new_remaining = 50 - 25 = 25 (CORRECT)
@@ -5810,7 +5868,7 @@ mod tests {
         el.test_dispatch_cqe(retry_ud.raw(), 25, 0);
 
         assert!(
-            el.driver.pending_replenish.contains(&bid),
+            el.driver.pending_replenish.contains(&(0, bid)),
             "buffer not replenished after partial send retry"
         );
         // Verify the original_len was preserved correctly across retries.
@@ -5836,7 +5894,7 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), 0, 0);
 
         assert!(
-            el.driver.pending_replenish.contains(&bid),
+            el.driver.pending_replenish.contains(&(0, bid)),
             "buffer not replenished on zero-length send"
         );
     }

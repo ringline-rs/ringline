@@ -956,7 +956,9 @@ impl ConnCtx {
                         let result = driver.submit_or_queue_send(conn_index, built);
                         if result.is_err() {
                             // Submit failed — replenish the recv buffer.
-                            driver.pending_replenish.push(pending.bid);
+                            driver
+                                .pending_replenish
+                                .push((driver.recv_class[conn_index as usize], pending.bid));
                         }
                         return result;
                     }
@@ -1698,7 +1700,10 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                                     };
                                     driver.accumulators.append(self.conn_index, remainder);
                                 }
-                                driver.pending_replenish.push(pending.bid);
+                                driver.pending_replenish.push((
+                                    driver.recv_class[self.conn_index as usize],
+                                    pending.bid,
+                                ));
                             }
                             self.f.take();
                             return Poll::Ready(consumed);
@@ -1713,7 +1718,10 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                                     std::slice::from_raw_parts(pending.ptr, pending.len as usize)
                                 };
                                 driver.accumulators.append(self.conn_index, pending_data);
-                                driver.pending_replenish.push(pending.bid);
+                                driver.pending_replenish.push((
+                                    driver.recv_class[self.conn_index as usize],
+                                    pending.bid,
+                                ));
                             }
                             // Fall through to accumulator path below.
                         }
@@ -1727,7 +1735,9 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                     let pending_data =
                         unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
                     driver.accumulators.prepend(self.conn_index, pending_data);
-                    driver.pending_replenish.push(pending.bid);
+                    driver
+                        .pending_replenish
+                        .push((driver.recv_class[self.conn_index as usize], pending.bid));
                     // Fall through to accumulator path below.
                 }
             }
@@ -1838,7 +1848,9 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
                 let pending_data =
                     unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
                 driver.accumulators.append(self.conn_index, pending_data);
-                driver.pending_replenish.push(pending.bid);
+                driver
+                    .pending_replenish
+                    .push((driver.recv_class[self.conn_index as usize], pending.bid));
             }
 
             let data = driver.accumulators.data(self.conn_index);
@@ -2087,7 +2099,9 @@ impl Future for DirectEchoFuture {
                     };
                     driver.send_recv_buf_original_lens[self.conn_index as usize] = pending.len;
                     if driver.submit_or_queue_send(self.conn_index, built).is_err() {
-                        driver.pending_replenish.push(pending.bid);
+                        driver
+                            .pending_replenish
+                            .push((driver.recv_class[self.conn_index as usize], pending.bid));
                     }
                 }
             }

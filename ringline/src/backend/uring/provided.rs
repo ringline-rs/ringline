@@ -165,3 +165,87 @@ impl Drop for ProvidedBufRing {
 
 // Safety: The ring is only accessed from a single worker thread.
 unsafe impl Send for ProvidedBufRing {}
+
+/// Number of provided-buffer size classes.
+///
+/// Class 0 mirrors the configured `recv_buffer` exactly (so existing ring/buf
+/// tuning and the preserved throughput baseline still apply); classes 1+ are
+/// larger fixed-size buffers reserved for the (future) adaptive recv path.
+/// Every connection is pinned to class 0 today (see `Driver::recv_class`), so
+/// classes 1/2 are registered with the kernel but currently unused.
+const NUM_SIZE_CLASSES: usize = 3;
+
+/// A set of provided-buffer rings, one per size class, each with a distinct
+/// `bgid`. Class 0 is the configured recv buffer; classes 1+ are hardcoded
+/// larger buffers.
+///
+/// NOTE (config surface): the class-1/2 geometries below are hardcoded for
+/// now. Lifting them into `Config` is a later phase.
+pub struct SizeClassRings {
+    rings: Vec<ProvidedBufRing>,
+}
+
+impl SizeClassRings {
+    /// Create the per-class provided buffer rings.
+    ///
+    /// Class 0 is built from `(bgid_base, ring_size, buffer_size)` — i.e. the
+    /// configured `recv_buffer` — so it is byte-for-byte identical to the
+    /// single ring this replaces. Classes 1/2 use hardcoded larger buffers.
+    ///
+    /// The class bgids occupy the contiguous range
+    /// `[bgid_base, bgid_base + NUM_SIZE_CLASSES)`.
+    pub fn new(bgid_base: u16, ring_size: u16, buffer_size: u32) -> io::Result<Self> {
+        // Document the bgid range consumed by the size classes. Config
+        // validation currently only guards `udp_recv_buffer.bgid !=
+        // recv_buffer.bgid` (== bgid_base); it does NOT yet account for the
+        // extra class bgids (bgid_base + 1, bgid_base + 2). Widening config
+        // validation to reserve this whole range is a later phase.
+        debug_assert!(
+            bgid_base.checked_add(NUM_SIZE_CLASSES as u16 - 1).is_some(),
+            "size-class bgids [{}, {}] overflow u16",
+            bgid_base,
+            bgid_base as u32 + NUM_SIZE_CLASSES as u32 - 1
+        );
+        let rings = vec![
+            // class 0: the configured recv_buffer (preserves the baseline).
+            ProvidedBufRing::new(bgid_base, ring_size, buffer_size)?,
+            // class 1: hardcoded 128 × 64 KiB.
+            ProvidedBufRing::new(bgid_base + 1, 128, 65536)?,
+            // class 2: hardcoded 64 × 256 KiB.
+            ProvidedBufRing::new(bgid_base + 2, 64, 262144)?,
+        ];
+        debug_assert_eq!(rings.len(), NUM_SIZE_CLASSES);
+        Ok(SizeClassRings { rings })
+    }
+
+    /// Number of size classes.
+    pub fn num_classes(&self) -> usize {
+        self.rings.len()
+    }
+
+    /// Buffer group ID for a size class.
+    pub fn bgid(&self, class: usize) -> u16 {
+        self.rings[class].bgid()
+    }
+
+    /// Ring entry count for a size class.
+    #[allow(dead_code)] // symmetry with ProvidedBufRing; used by diagnostics/tests
+    pub fn ring_entries(&self, class: usize) -> u32 {
+        self.rings[class].ring_entries()
+    }
+
+    /// Pointer and length for a buffer within a size class.
+    pub fn get_buffer(&self, class: usize, bid: u16) -> (*const u8, u32) {
+        self.rings[class].get_buffer(bid)
+    }
+
+    /// Batch replenish buffers into a size class.
+    pub fn replenish_batch(&mut self, class: usize, bids: &[u16]) {
+        self.rings[class].replenish_batch(bids);
+    }
+
+    /// Iterate every class ring (for kernel registration / unregistration).
+    pub fn rings(&self) -> impl Iterator<Item = &ProvidedBufRing> {
+        self.rings.iter()
+    }
+}
