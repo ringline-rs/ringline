@@ -7,8 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (BREAKING — next coordinated release)
+
+- `ParseResult` gains a `NeedAtLeast(usize)` variant and is now
+  `#[non_exhaustive]`. A length-prefixed parser that has seen its header
+  can announce the remaining byte count; the runtime reserves the recv
+  accumulator once at full size instead of doubling through a multi-MB
+  message arriving in chunks (~2× the payload in avoided memcpy). Only
+  code that exhaustively matches `ParseResult` is affected — closures
+  that construct it are untouched.
+- ringline-redis: incomplete bulk-string replies now return
+  `ParseResult::NeedAtLeast` computed from the RESP `$<len>\r\n` header.
+
 ### Added
 
+- `RecvAccumulator::reserve` / `AccumulatorTable::reserve`: record a
+  high-water size target honored by every growth site (`append` and the
+  freeze-merge path), clamped to `max_size` and cleared when the
+  contents drain.
 - Graceful degradation for responses larger than the provided recv ring
   (io_uring backend). A connection whose multishot recv parks on
   `ENOBUFS` with a partial message already accumulated now degrades to
