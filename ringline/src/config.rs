@@ -443,11 +443,35 @@ impl Config {
                         .into(),
                 ));
             }
-            if self.udp_recv_buffer.bgid == self.recv_buffer.bgid {
-                return Err(crate::error::Error::RingSetup(
-                    "udp_recv_buffer.bgid must differ from recv_buffer.bgid".into(),
-                ));
+            // The adaptive recv size classes occupy the contiguous bgid range
+            // [recv_buffer.bgid, recv_buffer.bgid + RECV_SIZE_CLASSES). The UDP
+            // recv ring registers its own bgid and must not land inside that
+            // range, or `register_buf_ring` fails with EEXIST at launch.
+            let class_lo = self.recv_buffer.bgid;
+            let class_hi = self.recv_buffer.bgid.saturating_add(RECV_SIZE_CLASSES);
+            if self.udp_recv_buffer.bgid >= class_lo && self.udp_recv_buffer.bgid < class_hi {
+                return Err(crate::error::Error::RingSetup(format!(
+                    "udp_recv_buffer.bgid ({}) must not fall in the recv size-class bgid \
+                     range [{}, {}); the {} adaptive classes reserve that range",
+                    self.udp_recv_buffer.bgid, class_lo, class_hi, RECV_SIZE_CLASSES
+                )));
             }
+        }
+        // The size-class bgid range must not overflow u16 regardless of UDP use.
+        if self
+            .recv_buffer
+            .bgid
+            .checked_add(RECV_SIZE_CLASSES - 1)
+            .is_none()
+        {
+            return Err(crate::error::Error::RingSetup(format!(
+                "recv_buffer.bgid ({}) too large: the {} size-class bgids \
+                 [{}, {}] overflow u16",
+                self.recv_buffer.bgid,
+                RECV_SIZE_CLASSES,
+                self.recv_buffer.bgid,
+                self.recv_buffer.bgid as u32 + RECV_SIZE_CLASSES as u32 - 1
+            )));
         }
         if self.close_notify_timeout_ms == 0 || self.close_notify_timeout_ms > 60000 {
             return Err(crate::error::Error::RingSetup(
@@ -457,6 +481,14 @@ impl Config {
         Ok(())
     }
 }
+
+/// Number of adaptive recv size classes (io_uring `SizeClassRings`). The class
+/// rings occupy the contiguous buffer-group-id range
+/// `[recv_buffer.bgid, recv_buffer.bgid + RECV_SIZE_CLASSES)`; config validation
+/// reserves that whole range against collisions (e.g. the UDP recv bgid). The
+/// io_uring `SizeClassRings` builds exactly this many rings — the two are kept
+/// in lockstep by a compile-time assertion in `backend/uring/provided.rs`.
+pub(crate) const RECV_SIZE_CLASSES: u16 = 3;
 
 /// Configuration for the provided buffer ring (multishot recv).
 #[derive(Clone)]
@@ -984,6 +1016,40 @@ mod tests {
         })
         .validate()
         .expect("udp_gro with a 128 KiB buffer should be valid");
+    }
+
+    #[test]
+    fn validate_udp_bgid_in_size_class_range_rejected() {
+        // The recv size classes reserve bgids [recv.bgid, recv.bgid +
+        // RECV_SIZE_CLASSES). A UDP bgid inside that range collides with a
+        // class ring at register_buf_ring (EEXIST at launch).
+        let err = udp_config_with(|c| c.udp_recv_buffer.bgid = 1)
+            .validate()
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("size-class bgid"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_udp_bgid_just_past_size_class_range_accepted() {
+        // The first bgid outside the reserved range must be allowed.
+        udp_config_with(|c| c.udp_recv_buffer.bgid = super::RECV_SIZE_CLASSES)
+            .validate()
+            .expect("udp bgid just past the class range should be valid");
+    }
+
+    #[test]
+    fn validate_recv_bgid_overflow_rejected() {
+        // A recv bgid so high that the class range overflows u16 is rejected.
+        let err = config_with(|c| c.recv_buffer.bgid = u16::MAX)
+            .validate()
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("overflow u16"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

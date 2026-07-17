@@ -178,7 +178,9 @@ unsafe impl Send for ProvidedBufRing {}
 /// larger fixed-size buffers reserved for the (future) adaptive recv path.
 /// Every connection is pinned to class 0 today (see `Driver::recv_class`), so
 /// classes 1/2 are registered with the kernel but currently unused.
-const NUM_SIZE_CLASSES: usize = 3;
+// Single source of truth shared with config validation (which reserves the
+// class bgid range). Derived from the same constant so they cannot drift.
+const NUM_SIZE_CLASSES: usize = crate::config::RECV_SIZE_CLASSES as usize;
 
 /// A set of provided-buffer rings, one per size class, each with a distinct
 /// `bgid`. Class 0 is the configured recv buffer; classes 1+ are hardcoded
