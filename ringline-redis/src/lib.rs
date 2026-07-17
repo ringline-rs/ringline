@@ -1199,12 +1199,21 @@ impl Client {
             .conn
             .with_bytes(|bytes| {
                 let len = bytes.len();
+                // Peek the bulk-string header before the parse takes
+                // ownership: RESP announces payload length up front, so an
+                // incomplete parse can tell the runtime exactly how much
+                // more is coming and the recv accumulator reserves once
+                // instead of doubling through a multi-MB value.
+                let hint = bulk_remainder_hint(&bytes);
                 match Value::parse_bytes_with_options(bytes, &options) {
                     Ok((value, consumed)) => {
                         result = Some(Ok(value));
                         ParseResult::Consumed(consumed)
                     }
-                    Err(e) if e.is_incomplete() => ParseResult::Consumed(0),
+                    Err(e) if e.is_incomplete() => match hint {
+                        Some(additional) => ParseResult::NeedAtLeast(additional),
+                        None => ParseResult::Consumed(0),
+                    },
                     Err(e) => {
                         result = Some(Err(Error::Protocol(e)));
                         ParseResult::Consumed(len)
@@ -2551,6 +2560,88 @@ pub(crate) fn parse_bytes_array(value: Value) -> Result<Vec<Bytes>, Error> {
             Ok(result)
         }
         _ => Err(Error::UnexpectedResponse),
+    }
+}
+
+/// For an incomplete reply that starts with a bulk string (`$<len>\r\n…`),
+/// compute how many more bytes complete the frame. Returns `None` when the
+/// head isn't a bulk string, the length header is itself incomplete, the
+/// length is negative (`$-1` null reply), or the frame is already fully
+/// buffered (the parse was incomplete for some other reason).
+///
+/// The hint drives [`ParseResult::NeedAtLeast`]: the runtime reserves the
+/// recv accumulator once at full size instead of doubling through a
+/// multi-MB value arriving in chunks (~2× the payload in avoided memcpy).
+fn bulk_remainder_hint(bytes: &[u8]) -> Option<usize> {
+    let rest = bytes.strip_prefix(b"$")?;
+    // Redis 7's proto-max-bulk-len ceiling is 512MB — 10 digits covers it;
+    // scan a few extra so a corrupt header falls through to the parser's
+    // own error handling rather than being mis-hinted.
+    let digits_end = rest
+        .iter()
+        .take(16)
+        .position(|&b| !b.is_ascii_digit())
+        .unwrap_or(rest.len().min(16));
+    if digits_end == 0 {
+        return None; // "$-1" null reply or malformed — no hint
+    }
+    // Header must be complete: digits followed by CRLF.
+    if rest.len() < digits_end + 2 || &rest[digits_end..digits_end + 2] != b"\r\n" {
+        return None;
+    }
+    let len: usize = std::str::from_utf8(&rest[..digits_end])
+        .ok()?
+        .parse()
+        .ok()?;
+    // '$' + digits + CRLF + payload + trailing CRLF
+    let total = 1 + digits_end + 2 + len.checked_add(2)?;
+    total.checked_sub(bytes.len()).filter(|&a| a > 0)
+}
+
+#[cfg(test)]
+mod bulk_hint_tests {
+    use super::bulk_remainder_hint;
+
+    #[test]
+    fn partial_bulk_reports_remainder() {
+        // $16\r\n + 4 of 16 payload bytes; missing 12 payload + CRLF = 14.
+        let buf = b"$16\r\nabcd";
+        assert_eq!(bulk_remainder_hint(buf), Some(14));
+    }
+
+    #[test]
+    fn header_only_reports_full_payload() {
+        assert_eq!(bulk_remainder_hint(b"$16777216\r\n"), Some(16_777_216 + 2));
+    }
+
+    #[test]
+    fn incomplete_header_no_hint() {
+        assert_eq!(bulk_remainder_hint(b"$167"), None);
+        assert_eq!(bulk_remainder_hint(b"$16777216\r"), None);
+        assert_eq!(bulk_remainder_hint(b"$"), None);
+    }
+
+    #[test]
+    fn null_reply_no_hint() {
+        assert_eq!(bulk_remainder_hint(b"$-1\r"), None);
+    }
+
+    #[test]
+    fn non_bulk_no_hint() {
+        assert_eq!(bulk_remainder_hint(b"+OK\r"), None);
+        assert_eq!(bulk_remainder_hint(b"*2\r\n$3\r\nfo"), None);
+        assert_eq!(bulk_remainder_hint(b""), None);
+    }
+
+    #[test]
+    fn complete_frame_no_hint() {
+        assert_eq!(bulk_remainder_hint(b"$4\r\nabcd\r\n"), None);
+    }
+
+    #[test]
+    fn malformed_header_no_hint() {
+        assert_eq!(bulk_remainder_hint(b"$12x4\r\nzz"), None);
+        assert_eq!(bulk_remainder_hint(b"$99999999999999999999\r\nzz"), None);
     }
 }
 

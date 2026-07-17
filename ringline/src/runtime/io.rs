@@ -30,6 +30,7 @@ use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult};
 /// the `with_data`/`with_bytes` future resolves with `0` regardless of the
 /// parse result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParseResult {
     /// The closure consumed `n` bytes from the buffer.
     ///
@@ -38,6 +39,14 @@ pub enum ParseResult {
     Consumed(usize),
     /// The closure needs more data before it can make progress.
     NeedMore,
+    /// The closure needs at least `additional` more bytes beyond what it
+    /// was shown (e.g. a length-prefixed protocol that has parsed its
+    /// header). Parks exactly like [`NeedMore`](Self::NeedMore), but the
+    /// runtime reserves recv-accumulator capacity for the announced
+    /// remainder up front — one right-sized allocation instead of the
+    /// doubling-regrowth cascade (~2× the payload in extra memcpy for a
+    /// multi-MB message arriving in chunks).
+    NeedAtLeast(usize),
 }
 
 /// Driver + executor state pointer, set before polling each task.
@@ -1736,7 +1745,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                     self.f.take();
                     return Poll::Ready(match result {
                         ParseResult::Consumed(n) => n,
-                        ParseResult::NeedMore => 0,
+                        ParseResult::NeedMore | ParseResult::NeedAtLeast(_) => 0,
                     });
                 }
 
@@ -1757,6 +1766,11 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                     return Poll::Ready(consumed);
                 }
                 _ => {}
+            }
+            // A length-prefixed parser announced the remainder — reserve
+            // once so the arriving chunks append without regrowth.
+            if let ParseResult::NeedAtLeast(additional) = result {
+                driver.accumulators.reserve(self.conn_index, additional);
             }
 
             // NeedMore or Consumed(0) on non-empty data: incomplete parse.
@@ -1834,7 +1848,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
                     self.f.take();
                     return Poll::Ready(match result {
                         ParseResult::Consumed(n) => n,
-                        ParseResult::NeedMore => 0,
+                        ParseResult::NeedMore | ParseResult::NeedAtLeast(_) => 0,
                     });
                 }
 
@@ -1870,6 +1884,12 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
             // NeedMore or Consumed(0) on non-empty data: incomplete parse.
             // Put everything back and use closed state from the lookup above.
             driver.accumulators.put_back(self.conn_index, frozen);
+            // A length-prefixed parser announced the remainder — record the
+            // reserve target so the unfreeze merge allocates once at full
+            // size when the next chunks arrive.
+            if let ParseResult::NeedAtLeast(additional) = result {
+                driver.accumulators.reserve(self.conn_index, additional);
+            }
 
             if is_closed {
                 self.f.take();
