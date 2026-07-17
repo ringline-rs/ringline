@@ -271,18 +271,35 @@ bounded).
 - Domain 2 (`recv_forward`) never shares buffers across connections, so the hold
   is safe.
 
-## Parameters TBD-by-sweep
+## Parameters
 
-Defaulted from an extension of `ring_fill_bench`, not guessed:
+### Size-class geometry (Phase 3 starting default — locked)
 
-- INC buffer size ∈ {64K, 128K, 256K, 512K, 1M} × ring depth.
-- Size-class geometry set (how many classes, their sizes/depths).
-- Sweep matrix: response-size × concurrency × **mixed** small/large workloads
-  (the case INC is meant to win and an all-large sweep cannot reveal).
-- **De-risk early:** the concurrent-region-handout behavior of INC under high
-  fan-in — whether few-large buffers starve parallelism. If so, the INC default
-  is "several medium buffers," still one size, informed by the sweep. Prototype
-  this on hv01 before finalizing the INC provider.
+Chosen from the review sweeps (16 KB buffers fragment a 256 KB response into
+~16 CQEs at ~1.5 GiB/s; a 256 KB buffer holds it in one CQE at ~2.8 GiB/s;
+8 KB responses show no cliff). Three shared classes, bounded per worker:
+
+| Class | Buffer size | Depth | Ring bytes |
+|---|---|---|---|
+| small  | 16 KiB  | 256 | 4 MiB |
+| medium | 64 KiB  | 128 | 8 MiB |
+| large  | 256 KiB | 64  | 16 MiB |
+
+Total ≤ 28 MiB/worker, independent of connection count (shared rings). The
+large ring stays lightly populated for small-traffic workloads. This is a
+*starting* default refined by the Phase 6.3 validation sweep; it is not a
+per-point winner but a robust spread covering the observed range.
+
+### INC geometry — de-risked at the start of Phase 4, not standalone
+
+INC buffer size ∈ {64K,128K,256K,512K,1M} × depth, and the concurrent-region
+handout question (does few-large starve fan-in under high concurrency?) are
+throughput questions best answered by the *real* INC provider driven through
+`ring_fill_bench` with `MODE=mixed`, not a throwaway probe. Phase 4 Task 4.1
+registers INC + a minimal integrated recv and sweeps this **before** the full
+CQE-handling integration (Task 4.2). If few-large starves fan-in, the INC
+default becomes "several medium buffers" (still one size). The bench harness
+(`ring_fill_bench`, committed) already carries the `mixed` mode this needs.
 
 ## Validation
 
