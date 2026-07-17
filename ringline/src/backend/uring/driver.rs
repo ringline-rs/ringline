@@ -98,6 +98,12 @@ pub(crate) struct PendingRecvBuf {
     pub(crate) bid: u16,
     pub(crate) len: u32,
     pub(crate) ptr: *const u8,
+    /// Size class the buffer's `bid` was RECEIVED from. A buffer must be
+    /// replenished to its originating class, not the connection's current
+    /// `recv_class` — adaptive selection can change `recv_class` between when a
+    /// buffer is held and when it is replenished, and pushing the bid to the
+    /// wrong ring double-replenishes it (kernel hands one buffer to two recvs).
+    pub(crate) class: u8,
 }
 
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
@@ -158,6 +164,11 @@ pub(crate) struct Driver {
     /// Stored here rather than in the CQE payload so that buffer sizes > u16::MAX are
     /// supported (the old encoding packed remaining into the high 16 bits of the payload).
     pub(crate) send_recv_buf_remaining: Vec<u32>,
+    /// Per-connection originating size class for the in-flight SendRecvBuf
+    /// operation. Captured at submit time (the buffer's receive-class) and used
+    /// by `handle_send_recv_buf` to resolve the buffer pointer and replenish the
+    /// bid to the correct ring — `recv_class` may have shifted since submit.
+    pub(crate) send_recv_buf_class: Vec<u8>,
     /// Per-connection multi-buffer zero-copy recv hold. When `recv_forward` is
     /// set for a connection, incoming provided buffers are pushed here (bids NOT
     /// replenished) instead of copied into the accumulator, then forwarded back
@@ -507,6 +518,7 @@ impl Driver {
             pending_recv_bufs: vec![None; config.max_connections as usize],
             send_recv_buf_original_lens: vec![0; config.max_connections as usize],
             send_recv_buf_remaining: vec![0; config.max_connections as usize],
+            send_recv_buf_class: vec![0u8; config.max_connections as usize],
             recv_hold: (0..config.max_connections)
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
@@ -755,9 +767,10 @@ impl Driver {
         // in-flight forward's bids live in its slab entry (already drained from
         // recv_hold) and are replenished by its own completion handler.
         if self.recv_forward[conn_index as usize] {
-            let class = self.recv_class[conn_index as usize];
             for pending in self.recv_hold[conn_index as usize].drain(..) {
-                self.pending_replenish.push((class, pending.bid));
+                // Replenish to the buffer's originating class, not the current
+                // recv_class (which may have shifted since the buffer was held).
+                self.pending_replenish.push((pending.class, pending.bid));
             }
             self.recv_forward[conn_index as usize] = false;
         }

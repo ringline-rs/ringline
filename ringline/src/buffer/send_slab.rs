@@ -36,6 +36,10 @@ struct InFlightSendEntry {
     /// into the `ProvidedBufRing` together on the operation CQE. Empty for all
     /// other send paths (which use `pool_slot`/`pool_slots`/`guards`).
     bids: [u16; MAX_IOVECS],
+    /// Originating size class for each held bid (parallel to `bids`). A held
+    /// recv-forward buffer must be replenished to the class it was received
+    /// from, which can differ from the connection's current `recv_class`.
+    bid_classes: [u8; MAX_IOVECS],
     bid_count: u8,
     guards: [Option<GuardBox>; MAX_GUARDS],
     guard_count: u8,
@@ -63,6 +67,7 @@ impl InFlightSendSlab {
                 pool_slots: [u16::MAX; MAX_IOVECS],
                 pool_slot_count: 0,
                 bids: [u16::MAX; MAX_IOVECS],
+                bid_classes: [0u8; MAX_IOVECS],
                 bid_count: 0,
                 guards: [const { None }; MAX_GUARDS],
                 guard_count: 0,
@@ -170,16 +175,19 @@ impl InFlightSendSlab {
     /// Allocate a slot for a zero-copy recv-forward send: one `sendmsg` whose
     /// iovecs point directly into held provided recv buffers (no copy). `bids`
     /// are the provided-buffer ids to replenish together on the operation CQE.
-    /// `iovecs_slice` and `bids` must be the same length and <= MAX_IOVECS.
+    /// `iovecs_slice`, `bids`, and `classes` must be the same length and <=
+    /// MAX_IOVECS. `classes[i]` is the originating size class of `bids[i]`.
     pub fn allocate_recv_forward(
         &mut self,
         conn_index: u32,
         iovecs_slice: &[libc::iovec],
         bids: &[u16],
+        classes: &[u8],
         total_len: u32,
     ) -> Option<(u16, *const libc::msghdr)> {
         debug_assert!(iovecs_slice.len() <= MAX_IOVECS);
         debug_assert_eq!(iovecs_slice.len(), bids.len());
+        debug_assert_eq!(bids.len(), classes.len());
         let idx = self.free_list.pop()?;
         let entry = &mut self.entries[idx as usize];
 
@@ -190,8 +198,9 @@ impl InFlightSendSlab {
         entry.iov_start = 0;
         entry.pool_slot = u16::MAX;
         entry.pool_slot_count = 0;
-        for (i, &bid) in bids.iter().enumerate() {
+        for (i, (&bid, &class)) in bids.iter().zip(classes.iter()).enumerate() {
             entry.bids[i] = bid;
+            entry.bid_classes[i] = class;
         }
         entry.bid_count = bids.len() as u8;
         entry.guard_count = 0;
@@ -213,6 +222,13 @@ impl InFlightSendSlab {
     pub fn recv_forward_bids(&self, idx: u16) -> &[u16] {
         let entry = &self.entries[idx as usize];
         &entry.bids[..entry.bid_count as usize]
+    }
+
+    /// The originating size classes for a recv-forward entry's bids, parallel to
+    /// [`recv_forward_bids`]. Each bid is replenished to its stored class.
+    pub fn recv_forward_bid_classes(&self, idx: u16) -> &[u8] {
+        let entry = &self.entries[idx as usize];
+        &entry.bid_classes[..entry.bid_count as usize]
     }
 
     /// Advance past `bytes_sent` bytes in the iovec array.

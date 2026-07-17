@@ -980,6 +980,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     fn handle_recv_multi(&mut self, ud: UserData, result: i32, flags: u32) {
+        // Invariant: `recv_class[conn_index]` is the armed class for THIS CQE's
+        // buffer. It is mutated only by the trailing `arm_multishot_recv` (the
+        // last thing this function does on re-arm), so every immediate
+        // `get_buffer`/`pending_replenish` of this CQE's `bid` below is
+        // consistent with `recv_class`. Buffers HELD past this call (recv_hold,
+        // pending_recv_bufs, SendRecvBuf) capture their class at receive time
+        // and must NOT read `recv_class` when later replenished.
         let conn_index = ud.conn_index();
         let has_more = cqueue::more(flags);
 
@@ -1161,6 +1168,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 bid,
                 len: bytes_received,
                 ptr: buf_ptr,
+                class: self.driver.recv_class[conn_index as usize],
             });
             self.executor.wake_recv(conn_index);
         } else {
@@ -1194,6 +1202,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 };
                 self.driver.send_recv_buf_original_lens[conn_index as usize] = bytes_received;
                 self.driver.send_recv_buf_remaining[conn_index as usize] = bytes_received;
+                // This CQE's bid was received on the currently-armed class;
+                // capture it so completion replenishes to the right ring.
+                self.driver.send_recv_buf_class[conn_index as usize] =
+                    self.driver.recv_class[conn_index as usize];
                 if self.driver.submit_or_queue_send(conn_index, built).is_err() {
                     // SQ full — replenish and give up on this echo.
                     self.driver
@@ -1247,6 +1259,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             bid,
                             len: bytes_received,
                             ptr: buf_ptr,
+                            class: self.driver.recv_class[conn_index as usize],
                         });
                     } else {
                         // Flush any existing pending buffer to accumulator first.
@@ -1258,9 +1271,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             if !self.driver.accumulators.append(conn_index, pending_data) {
                                 accumulator_overflowed = true;
                             }
+                            // Held buffer: replenish to its origin class.
                             self.driver
                                 .pending_replenish
-                                .push((self.driver.recv_class[conn_index as usize], pending.bid));
+                                .push((pending.class, pending.bid));
                         }
                         if !accumulator_overflowed
                             && !self.driver.accumulators.append(conn_index, data)
@@ -1886,18 +1900,27 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Replenish the held provided-buffer bids backing a recv-forward entry and
     /// release the slab slot. The bids become available in the `ProvidedBufRing`
     /// again (resuming recv if it was ENOBUFS-stalled).
-    fn release_recv_forward(&mut self, conn_index: u32, slab_idx: u16) {
+    fn release_recv_forward(&mut self, _conn_index: u32, slab_idx: u16) {
+        // Replenish each held bid to the class it was RECEIVED from (stored in
+        // the slab entry), not the connection's current recv_class — adaptive
+        // selection may have shifted recv_class while the forward was in flight,
+        // and returning a bid to the wrong ring double-replenishes it.
         let mut bids = [u16::MAX; crate::buffer::send_slab::MAX_IOVECS];
+        let mut classes = [0u8; crate::buffer::send_slab::MAX_IOVECS];
         let mut n = 0;
-        for &b in self.driver.send_slab.recv_forward_bids(slab_idx) {
+        for (&b, &c) in self
+            .driver
+            .send_slab
+            .recv_forward_bids(slab_idx)
+            .iter()
+            .zip(self.driver.send_slab.recv_forward_bid_classes(slab_idx))
+        {
             bids[n] = b;
+            classes[n] = c;
             n += 1;
         }
-        // Held recv-forward buffers were received on this connection's recv
-        // class, so they return to that class ring.
-        let class = self.driver.recv_class[conn_index as usize];
-        for &b in &bids[..n] {
-            self.driver.pending_replenish.push((class, b));
+        for i in 0..n {
+            self.driver.pending_replenish.push((classes[i], bids[i]));
         }
         self.driver.send_slab.release(slab_idx);
     }
@@ -2020,6 +2043,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // field (send_recv_buf_remaining) so that buffer sizes > u16::MAX work.
         let bid = payload as u16;
         let remaining_before = self.driver.send_recv_buf_remaining[conn_index as usize];
+        // The buffer's originating class, captured at submit — recv_class may
+        // have shifted since. Use it to resolve the pointer and replenish.
+        let class = self.driver.send_recv_buf_class[conn_index as usize];
 
         if result > 0 {
             let bytes_sent = result as u32;
@@ -2028,10 +2054,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // Partial send — resubmit the remainder.
                 let new_remaining = remaining_before - bytes_sent;
                 self.driver.send_recv_buf_remaining[conn_index as usize] = new_remaining;
-                let (buf_ptr, _buf_size) = self
-                    .driver
-                    .provided_bufs
-                    .get_buffer(self.driver.recv_class[conn_index as usize] as usize, bid);
+                let (buf_ptr, _buf_size) =
+                    self.driver.provided_bufs.get_buffer(class as usize, bid);
                 let original_len = self.driver.send_recv_buf_original_lens[conn_index as usize];
                 let offset = original_len - new_remaining;
                 let new_ptr = unsafe { buf_ptr.add(offset as usize) };
@@ -2052,9 +2076,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
                 if unsafe { self.driver.ring.push_sqe(entry) }.is_err() {
                     // SQ full — replenish and give up.
-                    self.driver
-                        .pending_replenish
-                        .push((self.driver.recv_class[conn_index as usize], bid));
+                    self.driver.pending_replenish.push((class, bid));
                     self.driver.submit_next_queued(conn_index);
                 }
                 return;
@@ -2062,18 +2084,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // Full send complete.
             metrics::BYTES.add(metrics::bytes::SENT, remaining_before as u64);
-            self.driver
-                .pending_replenish
-                .push((self.driver.recv_class[conn_index as usize], bid));
+            self.driver.pending_replenish.push((class, bid));
             self.driver.submit_next_queued(conn_index);
             self.executor.wake_send(conn_index, Ok(remaining_before));
             return;
         }
 
         // Error or zero-length send.
-        self.driver
-            .pending_replenish
-            .push((self.driver.recv_class[conn_index as usize], bid));
+        self.driver.pending_replenish.push((class, bid));
         self.driver.submit_next_queued(conn_index);
 
         let io_result = if result == 0 {
@@ -3827,6 +3845,66 @@ mod tests {
         assert_eq!(data, b"hello world");
     }
 
+    /// Regression: a held provided buffer must be replenished to the size class
+    /// it was RECEIVED from, even if `recv_class` changed (adaptive migration)
+    /// between the hold and the replenish. Returning it to the current class
+    /// would double-replenish it into the wrong ring — the kernel would then
+    /// hand one buffer to two concurrent recvs (cross-connection corruption).
+    #[test]
+    fn held_buffer_replenishes_to_origin_class_after_class_change() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // First recv on class 0 (bid=0): held in pending_recv_bufs because the
+        // accumulator is empty and no buffer is pending yet.
+        let flags = 1u32 | 2u32; // F_BUFFER | F_MORE, bid=0
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(0, 0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
+        }
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 5, flags);
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
+            "first buffer should be held pending"
+        );
+        assert_eq!(
+            el.driver.pending_recv_bufs[conn_index as usize]
+                .unwrap()
+                .class,
+            0,
+            "held buffer must record its origin class (0)"
+        );
+
+        // Adaptive migration: the connection re-armed on a larger class.
+        el.driver.recv_class[conn_index as usize] = 2;
+
+        // Second recv (bid=1) now arrives on class 2. It flushes the held
+        // class-0 buffer to the accumulator and replenishes it.
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(2, 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b" world".as_ptr(), buf_ptr as *mut u8, 6);
+        }
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 6, flags | (1u32 << 16));
+
+        // The held bid=0 must return to class 0 (its origin), NOT class 2.
+        assert!(
+            el.driver.pending_replenish.contains(&(0, 0)),
+            "held buffer must replenish to origin class 0, got {:?}",
+            el.driver.pending_replenish
+        );
+        assert!(
+            !el.driver.pending_replenish.contains(&(2, 0)),
+            "held buffer must NOT replenish to the changed class 2 (double-replenish bug)"
+        );
+        // The current bid=1 was received on class 2 → replenished there.
+        assert!(
+            el.driver.pending_replenish.contains(&(2, 1)),
+            "current buffer should replenish to its class 2"
+        );
+    }
+
     #[test]
     fn handle_recv_multi_enobufs_does_not_close() {
         let mut el = make_test_loop();
@@ -4002,6 +4080,7 @@ mod tests {
             bid: 3,
             len: 4,
             ptr: buf_ptr,
+            class: 0,
         });
 
         el.flush_replenish_and_rearm();
