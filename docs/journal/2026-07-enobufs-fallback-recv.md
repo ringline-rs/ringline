@@ -92,9 +92,47 @@ self-explanatory from run output instead of requiring a rig bisect.
 4. Re-run the sweep + segcache baseline; close out this entry in the
    implementing PR.
 
+## Step 2 results (2026-07-16, hv01, redis 8.0.2 loopback, GET-only 100% hit, 8 conns × pipeline 4, 4 workers)
+
+Park counter (#273) correlated against the dip on the **default** ring —
+and the correlation is **negative**: the dip reproduces exactly, with
+`parks=0` on every worker in every cell.
+
+| config | 16MB value | parks |
+|---|---|---|
+| default ring (256×16KiB) | 17 req/s, 2.36 Gbps, p50 1.21s | 0 |
+| 4096×64KiB | 30 req/s, 4.10 Gbps, p50 692ms | 0 |
+
+With 8 promptly-consuming connections the 256-bid ring never actually
+runs dry — bids recycle within each drain pass. **The default-config
+large-value dip is not the ENOBUFS park mechanism.** Per this entry's
+own criteria that is a NO-GO for the fallback *as the fix for that
+dip*, and the dip investigation reopens separately.
+
+Two confounds in the original A/B are being pulled apart:
+
+1. The "large ring" config changed bid count (256→4096) *and* buffer
+   size (16KiB→64KiB). Diag arithmetic points at buffer size: in both
+   configs throughput ≈ CQE rate × buffer size (~5.6k CQEs/s/worker ×
+   16KiB ≈ 2.8 Gbps vs ~2.9k × 64KiB ≈ 5.7 Gbps), i.e. the gate looks
+   like per-CQE delivery size, not buffer availability. A 2×2
+   (entries × buffer size, 16MB values) is queued.
+2. The reproduction here used the default ring rather than the
+   deliberately small ring this entry's GO/NO-GO specified. The
+   fallback's own validation — a 16×4KiB (64KiB) ring that any
+   multi-MiB response exceeds by 64–256×, main vs the fallback branch —
+   is queued; parks must appear on main and `fallbacks=` on the branch
+   for the mechanism to be confirmed where it *does* apply (slow
+   consumers, high connection counts, rings genuinely smaller than a
+   response).
+
 ## Outcome
 
-_(open)_
+_(open — fallback implemented on `feat/enobufs-fallback-recv` (#274)
+with pool-owned recv targets instead of accumulator spare capacity: the
+sketch's accumulator recv is unsound across close/slot-reuse, see the
+PR. Pending: small-ring validation + segcache baseline, and the
+reopened default-config dip investigation.)_
 
 ## Lessons / open questions
 
