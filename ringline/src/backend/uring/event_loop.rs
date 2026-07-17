@@ -239,12 +239,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 eprintln!(
                     "[ringline diag] iters={diag_iters} dead={diag_dead_iters} ({dead_pct:.1}%) \
                      cqes_1st_avg={:.2} cqes_2nd_avg={:.2} \
-                     tasks_1st_avg={:.2} tasks_fp_avg={:.2} parks={}",
+                     tasks_1st_avg={:.2} tasks_fp_avg={:.2} parks={} fallbacks={}",
                     diag_cqes_1st as f64 / diag_iters.max(1) as f64,
                     diag_cqes_2nd as f64 / diag_iters.max(1) as f64,
                     diag_tasks_1st as f64 / diag_iters.max(1) as f64,
                     diag_tasks_fp as f64 / diag_iters.max(1) as f64,
                     self.driver.recv_park_count,
+                    self.driver.recv_fallback_count,
                 );
                 if loop_diag {
                     eprintln!(
@@ -680,6 +681,27 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// released by tasks during the poll pass would otherwise sit uncommitted
     /// (and starved connections parked) until the next unrelated CQE.
     fn flush_replenish_and_rearm(&mut self) {
+        // Starved connections holding a zero-copy single-buffer hold
+        // (`pending_recv_bufs`) with data the parser hasn't consumed: flush
+        // the hold into the accumulator so its bid can rejoin the ring.
+        // This both frees a buffer (often enough to revive the multishot
+        // below) and moves the partial message where the fallback path
+        // expects it.
+        if !self.driver.recv_starved.is_empty() {
+            for i in 0..self.driver.recv_starved.len() {
+                let conn_index = self.driver.recv_starved[i];
+                if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
+                    let data =
+                        unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                    if !self.driver.accumulators.append(conn_index, data) {
+                        self.executor.wake_recv(conn_index);
+                        self.driver.close_connection(conn_index);
+                    }
+                    self.driver.pending_replenish.push(pending.bid);
+                }
+            }
+        }
+
         if !self.driver.pending_replenish.is_empty() {
             self.driver
                 .provided_bufs
@@ -687,7 +709,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.pending_replenish.clear();
 
             // Buffers are available again — wake the parked receivers.
+            // Connections with a fallback recv in flight stay parked: a
+            // multishot armed alongside the outstanding one-shot could
+            // append out of order (io_uring does not order independent
+            // SQEs). The fallback's completion re-parks them and a later
+            // flush re-arms the multishot.
+            let mut still_parked = Vec::new();
             while let Some(conn_index) = self.driver.recv_starved.pop() {
+                if self.driver.recv_fallback_inflight[conn_index as usize] {
+                    still_parked.push(conn_index);
+                    continue;
+                }
                 let alive = self
                     .driver
                     .connections
@@ -702,6 +734,178 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.driver.close_connection(conn_index);
                 }
             }
+            self.driver.recv_starved = still_parked;
+            return;
+        }
+
+        // The ring is genuinely dry — no bids came back this pass. For
+        // parked connections that already hold a partial message in their
+        // accumulator, degrade to a one-shot fallback recv into pool-owned
+        // memory instead of stalling: a parked receiver stops draining the
+        // socket, the kernel receive buffer fills, the TCP window closes,
+        // and recovery is gated on buffer recycling rather than on the
+        // data already queued in the kernel.
+        if self.driver.recv_starved.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.driver.recv_starved.len() {
+            let conn_index = self.driver.recv_starved[i];
+            if self.try_start_fallback_recv(conn_index) {
+                self.driver.recv_starved.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Whether a parked connection is eligible for the fallback recv path
+    /// and, if so, submit one. Eligible = plaintext accumulator route only
+    /// (no TLS, recv sink, zero-copy forward, or direct echo — those paths
+    /// keep the park-until-replenish behavior) with a partial message
+    /// already accumulated and no fallback outstanding.
+    fn try_start_fallback_recv(&mut self, conn_index: u32) -> bool {
+        let ci = conn_index as usize;
+        if self.driver.recv_fallback_inflight[ci] {
+            return false;
+        }
+        let alive = self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
+        if !alive {
+            return false;
+        }
+        let is_tls = self
+            .driver
+            .tls_table
+            .as_ref()
+            .is_some_and(|t| t.has(conn_index));
+        let is_direct_echo = self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.direct_echo);
+        if is_tls
+            || is_direct_echo
+            || self.driver.recv_forward[ci]
+            || self.executor.recv_sinks[ci].is_some()
+        {
+            return false;
+        }
+        // Only degrade when a message is half-delivered; an empty
+        // accumulator means nothing is torn and the connection can simply
+        // wait for replenish (holds were flushed above).
+        if self.driver.accumulators.data(conn_index).is_empty() {
+            return false;
+        }
+        self.driver.try_submit_fallback_recv(conn_index)
+    }
+
+    /// Completion of a fallback one-shot recv (`OpTag::RecvFallback`).
+    ///
+    /// The payload carries the fallback pool slot; the recorded
+    /// `(conn_index, generation)` owner is validated before any connection
+    /// state is touched — slots recycle and stale CQEs are normal. The
+    /// pool slot is released here and only here, so the kernel's write
+    /// target stays valid for exactly the life of the operation.
+    fn handle_recv_fallback(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let slot = ud.payload() as u16;
+
+        let pool_ok = self
+            .driver
+            .fallback_recv_pool
+            .as_ref()
+            .is_some_and(|p| p.in_use(slot));
+        if !pool_ok {
+            return;
+        }
+        let (owner_conn, owner_gen) = self.driver.fallback_slot_owner[slot as usize];
+        let stale = owner_conn != conn_index
+            || self.driver.connections.generation(conn_index) != owner_gen
+            || self.driver.connections.get(conn_index).is_none();
+        if stale {
+            // The connection this recv was submitted for is gone; the data
+            // (if any) belongs to a closed socket. Release the slot only.
+            self.driver
+                .fallback_recv_pool
+                .as_mut()
+                .expect("checked in_use above")
+                .release(slot);
+            return;
+        }
+
+        self.driver.recv_fallback_inflight[conn_index as usize] = false;
+
+        if result < 0 {
+            self.driver
+                .fallback_recv_pool
+                .as_mut()
+                .expect("checked in_use above")
+                .release(slot);
+            if -result == libc::ECANCELED {
+                // Cancelled, connection still alive: re-park so a later
+                // flush re-arms the multishot (or retries the fallback) —
+                // otherwise no recv is armed and the connection hangs.
+                if !self.driver.recv_starved.contains(&conn_index) {
+                    self.driver.recv_starved.push(conn_index);
+                }
+                return;
+            }
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+            return;
+        }
+
+        if result == 0 {
+            // TCP FIN mid-message (fallback only runs with a partial
+            // message accumulated): same truncation semantics as the
+            // multishot path for plaintext connections.
+            self.driver
+                .fallback_recv_pool
+                .as_mut()
+                .expect("checked in_use above")
+                .release(slot);
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+            return;
+        }
+
+        let bytes_received = result as u32;
+        metrics::BYTES.add(metrics::bytes::RECEIVED, bytes_received as u64);
+        metrics::BYTES.add(metrics::bytes::FALLBACK_RECEIVED, bytes_received as u64);
+
+        let pool = self
+            .driver
+            .fallback_recv_pool
+            .as_mut()
+            .expect("checked in_use above");
+        let (ptr, _) = pool.current_ptr_remaining(slot);
+        let data = unsafe { std::slice::from_raw_parts(ptr, bytes_received as usize) };
+        let appended = self.driver.accumulators.append(conn_index, data);
+        self.driver
+            .fallback_recv_pool
+            .as_mut()
+            .expect("checked in_use above")
+            .release(slot);
+        if !appended {
+            // Streamed past recv_accumulator_max — close rather than OOM,
+            // matching the multishot overflow path.
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+            return;
+        }
+
+        self.executor.wake_recv(conn_index);
+        // Re-park: the multishot is still dead. The next flush either
+        // re-arms it (replenish arrived) or continues the fallback chain
+        // (parse still incomplete, ring still dry). If the parse completed,
+        // the connection waits parked until bids return — exactly the
+        // pre-fallback steady state.
+        if !self.driver.recv_starved.contains(&conn_index) {
+            self.driver.recv_starved.push(conn_index);
         }
     }
 
@@ -728,6 +932,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         match tag {
             OpTag::RecvMulti => self.handle_recv_multi(ud, result, flags),
+            OpTag::RecvFallback => self.handle_recv_fallback(ud, result),
             OpTag::Send => self.handle_send(ud, result),
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
             OpTag::Close => self.handle_close(ud),
@@ -3604,6 +3809,250 @@ mod tests {
             el.driver.connections.get(conn_index).is_some(),
             "connection closed on ECANCELED"
         );
+    }
+
+    // ── Fallback recv tests ────────────────────────────────────────
+
+    /// Park a connection via an ENOBUFS multishot CQE and return its index.
+    fn park_connection(el: &mut AsyncEventLoop<NoopHandler>) -> u32 {
+        let conn_index = accept_connection(el);
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
+        assert!(el.driver.recv_starved.contains(&conn_index));
+        conn_index
+    }
+
+    #[test]
+    fn dry_flush_submits_fallback_for_partial_message() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"$16\r\npart"));
+
+        // No pending replenish: the ring is dry.
+        assert!(el.driver.pending_replenish.is_empty());
+        el.flush_replenish_and_rearm();
+
+        assert!(
+            el.driver.recv_fallback_inflight[conn_index as usize],
+            "fallback not submitted"
+        );
+        assert!(
+            !el.driver.recv_starved.contains(&conn_index),
+            "connection still parked after fallback submit"
+        );
+        assert_eq!(el.driver.recv_fallback_count, 1);
+        let pool = el.driver.fallback_recv_pool.as_ref().expect("pool built");
+        assert!(pool.in_use(0), "first fallback should occupy slot 0");
+    }
+
+    #[test]
+    fn dry_flush_keeps_waiting_with_empty_accumulator() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+
+        el.flush_replenish_and_rearm();
+
+        assert!(
+            !el.driver.recv_fallback_inflight[conn_index as usize],
+            "fallback submitted with nothing half-delivered"
+        );
+        assert!(
+            el.driver.recv_starved.contains(&conn_index),
+            "connection should stay parked"
+        );
+    }
+
+    #[test]
+    fn replenish_rearms_multishot_instead_of_fallback() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+
+        el.driver.pending_replenish.push(0);
+        el.flush_replenish_and_rearm();
+
+        assert!(
+            !el.driver.recv_fallback_inflight[conn_index as usize],
+            "fallback submitted although buffers were replenished"
+        );
+        assert!(el.driver.recv_starved.is_empty());
+    }
+
+    #[test]
+    fn replenish_does_not_rearm_while_fallback_inflight() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
+
+        // Buffers come back while the fallback is still in flight: the
+        // multishot must NOT be re-armed alongside it.
+        el.driver.pending_replenish.push(0);
+        el.flush_replenish_and_rearm();
+
+        assert!(
+            el.driver.recv_starved.contains(&conn_index),
+            "fallback-inflight connection must stay parked until its CQE"
+        );
+        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
+    }
+
+    #[test]
+    fn dry_flush_moves_held_buffer_to_accumulator_and_revives() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+
+        // Simulate a zero-copy held buffer with unconsumed partial data.
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(3);
+        unsafe { std::ptr::copy_nonoverlapping(b"held".as_ptr(), buf_ptr as *mut u8, 4) };
+        el.driver.pending_recv_bufs[conn_index as usize] = Some(crate::backend::PendingRecvBuf {
+            bid: 3,
+            len: 4,
+            ptr: buf_ptr,
+        });
+
+        el.flush_replenish_and_rearm();
+
+        assert_eq!(el.driver.accumulators.data(conn_index), b"held");
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_none(),
+            "hold not flushed"
+        );
+        // The freed bid revived the multishot path — no fallback needed.
+        assert!(!el.driver.recv_fallback_inflight[conn_index as usize]);
+        assert!(el.driver.recv_starved.is_empty());
+    }
+
+    #[test]
+    fn fallback_completion_appends_wakes_and_reparks() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part-"));
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
+
+        // Write payload into the pool slot the way the kernel would.
+        let pool = el.driver.fallback_recv_pool.as_mut().expect("pool built");
+        let slot: u16 = 0;
+        assert!(pool.in_use(slot));
+        let (ptr, cap) = pool.current_ptr_remaining(slot);
+        assert!(cap >= 5);
+        unsafe { std::ptr::copy_nonoverlapping(b"chunk".as_ptr(), ptr as *mut u8, 5) };
+
+        let ud = UserData::encode(OpTag::RecvFallback, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+
+        assert_eq!(el.driver.accumulators.data(conn_index), b"part-chunk");
+        assert!(
+            !el.driver.recv_fallback_inflight[conn_index as usize],
+            "inflight flag not cleared"
+        );
+        assert!(
+            !el.driver.fallback_recv_pool.as_ref().unwrap().in_use(slot),
+            "pool slot not released"
+        );
+        assert!(
+            el.driver.recv_starved.contains(&conn_index),
+            "connection not re-parked after fallback completion"
+        );
+        assert!(el.driver.connections.get(conn_index).is_some());
+    }
+
+    #[test]
+    fn fallback_completion_eof_closes_connection() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+        el.flush_replenish_and_rearm();
+
+        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+
+        assert!(
+            !el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0),
+            "pool slot not released on EOF"
+        );
+        let closed = el
+            .driver
+            .connections
+            .get(conn_index)
+            .is_none_or(|c| matches!(c.recv_mode, RecvMode::Closed));
+        assert!(closed, "FIN mid-message must close the connection");
+    }
+
+    #[test]
+    fn fallback_completion_error_closes_connection() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+        el.flush_replenish_and_rearm();
+
+        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
+
+        assert!(!el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0));
+        let closed = el
+            .driver
+            .connections
+            .get(conn_index)
+            .is_none_or(|c| matches!(c.recv_mode, RecvMode::Closed));
+        assert!(closed);
+    }
+
+    #[test]
+    fn fallback_completion_ecanceled_reparks_alive_connection() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+        el.flush_replenish_and_rearm();
+
+        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+
+        assert!(!el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0));
+        assert!(!el.driver.recv_fallback_inflight[conn_index as usize]);
+        assert!(
+            el.driver.recv_starved.contains(&conn_index),
+            "cancelled fallback must re-park, not strand the connection"
+        );
+    }
+
+    #[test]
+    fn stale_fallback_completion_releases_slot_only() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"part"));
+        el.flush_replenish_and_rearm();
+        assert!(el.driver.recv_fallback_inflight[conn_index as usize]);
+
+        // Close and release the slot; the generation bumps on release.
+        el.driver.close_connection(conn_index);
+        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+        assert!(el.driver.connections.get(conn_index).is_none());
+
+        // Reuse the slot for a new occupant.
+        let new_index = accept_connection(&mut el);
+        assert_eq!(new_index, conn_index, "test expects slot reuse");
+        assert!(
+            !el.driver.recv_fallback_inflight[new_index as usize],
+            "close must clear the inflight flag for the next occupant"
+        );
+
+        // The stale fallback CQE for the old occupant arrives now.
+        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+
+        assert!(
+            !el.driver.fallback_recv_pool.as_ref().unwrap().in_use(0),
+            "stale CQE must release the pool slot"
+        );
+        assert!(
+            el.driver.accumulators.data(new_index).is_empty(),
+            "stale CQE must not append into the new occupant's accumulator"
+        );
+        assert!(el.driver.connections.get(new_index).is_some());
     }
 
     // ── Connect tests ──────────────────────────────────────────────

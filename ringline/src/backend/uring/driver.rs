@@ -19,6 +19,14 @@ use crate::completion::{OpTag, UserData};
 use crate::config::Config;
 use crate::connection::{ConnectionTable, RecvMode};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
+use crate::metrics;
+
+/// Slots in the lazily-constructed fallback recv pool. At most one
+/// fallback is in flight per connection, so this bounds how many
+/// connections can be in fallback simultaneously; when exhausted the
+/// remaining starved connections stay parked (the pre-fallback status
+/// quo) until slots free up.
+const FALLBACK_RECV_SLOTS: u16 = 32;
 
 /// One in-flight UDP send slot. Owns the `sockaddr` + `iovec` + `msghdr`
 /// triple referenced by a single `sendmsg` SQE; returned to the freelist
@@ -223,6 +231,33 @@ pub(crate) struct Driver {
     /// growth means responses exceed the provided ring and receive
     /// throughput is gated on buffer recycling.
     pub(crate) recv_park_count: u64,
+    /// Per-connection flag: a fallback one-shot recv is in flight. While
+    /// set, the connection must be neither re-armed for multishot recv nor
+    /// given a second fallback — io_uring does not order independent SQEs,
+    /// so two in-flight recvs on one stream could append out of order. The
+    /// flag is cleared only in `handle_recv_fallback` (the fallback's own
+    /// completion) and in `close_connection` (any still-in-flight CQE is
+    /// then generation-checked and releases its pool slot without touching
+    /// connection state).
+    pub(crate) recv_fallback_inflight: Vec<bool>,
+    /// Slot pool backing fallback one-shot recvs. Kernel writes land in
+    /// pool-owned memory whose slot is released only by the fallback CQE —
+    /// stale completions after close/slot-reuse are memory-safe by the same
+    /// lifecycle argument as `send_copy_pool` (SQE memory outlives the op).
+    /// Lazily constructed on first fallback so workloads that never starve
+    /// the provided ring pay nothing.
+    pub(crate) fallback_recv_pool: Option<SendCopyPool>,
+    /// Per-pool-slot owner: `(conn_index, generation)` recorded at submit,
+    /// validated in `handle_recv_fallback` before any connection state is
+    /// touched (slots recycle; stale CQEs are normal).
+    pub(crate) fallback_slot_owner: Vec<(u32, u32)>,
+    /// Size of each fallback recv chunk (bytes). A few multiples of the
+    /// provided-ring buffer size: one event-loop pass moves one chunk per
+    /// starved connection, so this bounds per-pass fallback throughput.
+    pub(crate) fallback_chunk: u32,
+    /// Lifetime count of fallback recv submissions on this worker
+    /// (reported in the shutdown diag line).
+    pub(crate) recv_fallback_count: u64,
     /// Arrival timestamp shared by all UDP datagrams queued in one CQE
     /// drain batch. One clock read per batch instead of one per datagram;
     /// precision loss is bounded by the drain duration (microseconds).
@@ -465,6 +500,13 @@ impl Driver {
             next_disk_io_seq: 0,
             recv_starved: Vec::new(),
             recv_park_count: 0,
+            recv_fallback_inflight: vec![false; config.max_connections as usize],
+            fallback_recv_pool: None,
+            fallback_slot_owner: Vec::new(),
+            // A few provided-ring buffers per chunk: one event-loop pass
+            // moves one chunk per starved connection.
+            fallback_chunk: config.recv_buffer.buffer_size.saturating_mul(4),
+            recv_fallback_count: 0,
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
@@ -625,6 +667,11 @@ impl Driver {
             }
             self.recv_forward[conn_index as usize] = false;
         }
+        // Clear the fallback-recv flag so the slot's next occupant starts
+        // clean. A still-in-flight fallback CQE for this occupant is
+        // generation-checked in handle_recv_fallback and only releases its
+        // pool slot — it can no longer touch connection state.
+        self.recv_fallback_inflight[conn_index as usize] = false;
         // Cancel any active chain — per-SQE resources released as CQEs arrive.
         self.chain_table.cancel(conn_index);
         // Defer the actual `Close` SQE until every queued send has
@@ -740,6 +787,45 @@ impl Driver {
             }
         }
         pushed
+    }
+
+    /// Submit a one-shot fallback recv into a pool slot for a connection
+    /// parked on ENOBUFS with a partial message in its accumulator.
+    ///
+    /// Returns `true` if the SQE was submitted. The caller must have
+    /// already established eligibility (plaintext accumulator path, no
+    /// fallback in flight). On pool exhaustion or a full SQ the connection
+    /// simply stays parked — the pre-fallback status quo — and is retried
+    /// on a later flush.
+    pub(crate) fn try_submit_fallback_recv(&mut self, conn_index: u32) -> bool {
+        let chunk = self.fallback_chunk;
+        let pool = self
+            .fallback_recv_pool
+            .get_or_insert_with(|| SendCopyPool::new(FALLBACK_RECV_SLOTS, chunk));
+        if self.fallback_slot_owner.is_empty() {
+            self.fallback_slot_owner = vec![(u32::MAX, u32::MAX); FALLBACK_RECV_SLOTS as usize];
+        }
+        let Some((slot, ptr, cap)) = pool.alloc_raw() else {
+            return false;
+        };
+        if self
+            .ring
+            .submit_recv_fallback(conn_index, ptr, cap, slot)
+            .is_err()
+        {
+            metrics::RING.increment(metrics::ring::SQE_SUBMIT_FAILURES);
+            self.fallback_recv_pool
+                .as_mut()
+                .expect("pool constructed above")
+                .release(slot);
+            return false;
+        }
+        self.fallback_slot_owner[slot as usize] =
+            (conn_index, self.connections.generation(conn_index));
+        self.recv_fallback_inflight[conn_index as usize] = true;
+        self.recv_fallback_count += 1;
+        metrics::POOL.increment(metrics::pool::RECV_FALLBACK);
+        true
     }
 
     /// Pop the next queued send for a connection and submit it to the ring.
