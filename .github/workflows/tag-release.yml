@@ -30,8 +30,17 @@ jobs:
 
       - name: Parse release type
         id: parse
+        env:
+          # Pass the commit message through the environment, NOT via ${{ }}
+          # interpolation into the script body. GitHub substitutes ${{ }} as
+          # raw text before the shell runs, so a release commit whose body
+          # contains backticks, $(...), or quotes gets executed as shell. A
+          # `release: v0.5.1` body with `ringline` in backticks did exactly
+          # that and killed this step with `ringline: command not found`
+          # (exit 127), so the tag was never created. As an env var the value
+          # is inert data that the regex below matches against safely.
+          MSG: ${{ github.event.head_commit.message }}
         run: |
-          MSG="${{ github.event.head_commit.message }}"
           echo "Commit message: $MSG"
 
           if [[ "$MSG" =~ ^release:\ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
