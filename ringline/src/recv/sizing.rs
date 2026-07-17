@@ -8,18 +8,19 @@
 
 /// Configuration for [`SizingPolicy`]. Fixed-point alpha/downshift avoid float
 /// determinism concerns and are cheap on the hot path.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SizingConfig {
-    pub min: usize,
-    pub max: usize,
+    pub(crate) min: usize,
+    pub(crate) max: usize,
     /// EWMA smoothing factor alpha = alpha_num / alpha_den (0 < alpha <= 1).
-    pub alpha_num: u32,
-    pub alpha_den: u32,
+    pub(crate) alpha_num: u32,
+    pub(crate) alpha_den: u32,
     /// Downshift only when the EWMA falls below current_target * (down_num/down_den).
-    pub downshift_num: u32,
-    pub downshift_den: u32,
+    pub(crate) downshift_num: u32,
+    pub(crate) downshift_den: u32,
 }
 
+#[derive(Debug)]
 pub(crate) struct SizingPolicy {
     cfg: SizingConfig,
     /// EWMA of observed sizes, in bytes.
@@ -30,6 +31,15 @@ pub(crate) struct SizingPolicy {
 
 impl SizingPolicy {
     pub fn new(cfg: SizingConfig) -> Self {
+        debug_assert!(cfg.min <= cfg.max, "SizingConfig: min must be <= max");
+        debug_assert!(
+            cfg.alpha_den != 0 && cfg.alpha_num >= 1 && cfg.alpha_num <= cfg.alpha_den,
+            "SizingConfig: alpha_num/alpha_den must satisfy 0 < alpha <= 1"
+        );
+        debug_assert!(
+            cfg.downshift_den != 0 && cfg.downshift_num <= cfg.downshift_den,
+            "SizingConfig: downshift fraction must be in (0, 1]"
+        );
         SizingPolicy {
             ewma: cfg.min,
             target: cfg.min,
@@ -40,6 +50,9 @@ impl SizingPolicy {
     /// Record an observed arrival/message size and re-evaluate the target.
     pub fn observe(&mut self, size: usize) {
         // ewma += alpha * (size - ewma), fixed-point.
+        // Fixed-point: once |size - ewma| < alpha_den the update rounds to 0, so
+        // ewma settles within < alpha_den bytes of the true value — negligible
+        // at KiB buffer granularity.
         let a_n = self.cfg.alpha_num as usize;
         let a_d = self.cfg.alpha_den as usize;
         if size >= self.ewma {
@@ -74,7 +87,7 @@ impl SizingPolicy {
             let band =
                 self.target * self.cfg.downshift_num as usize / self.cfg.downshift_den as usize;
             if ewma < band {
-                self.target = ewma.max(self.cfg.min);
+                self.target = ewma;
             }
         }
     }
