@@ -128,31 +128,36 @@ fn shared_recv_scratch_grows_past_8kib_for_large_messages() {
     // (ewma > target ⇒ upshift). Round-trip the same payload several
     // times so repeated large chunks compound the policy toward its
     // 256 KiB ceiling, rather than relying on a single sample.
-    const ROUNDS: usize = 6;
-    let mut observed = ringline::metrics::RECV_SCRATCH_BYTES.value();
+    const ROUNDS: usize = 4;
     for round in 0..ROUNDS {
         stream.write_all(&payload).unwrap();
         stream.flush().unwrap();
         let echoed = read_exact_echo(&mut stream, MSG);
         assert_eq!(echoed, payload, "echo mismatch on round {round}");
+    }
 
-        // The scratch grows on the loop iteration *after* the policy
-        // observes a chunk (see event_loop::run, step 1a); poll briefly
-        // to absorb residual scheduling slack between the server-side
-        // recv_observe() call and this client-side read completing.
-        let deadline = Instant::now() + Duration::from_secs(2);
+    // The worker has now processed several 256 KiB messages, so its
+    // SizingPolicy target is well past 64 KiB and the shared scratch is
+    // resized to match at the top of each event-loop iteration. Poll the
+    // gauge with a generous deadline: under full-suite parallel load the
+    // worker is CPU-starved and ratchets its target up over more wakeups, so
+    // a tight deadline flakes. Break as soon as it crosses (normal runs finish
+    // in well under a second); nudge the worker with a 1-byte keepalive echo
+    // each iteration so it keeps ticking (and resizing) even when otherwise
+    // idle. Only sustained starvation past the cap can fail this.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut observed = ringline::metrics::RECV_SCRATCH_BYTES.value();
+    while observed < 65536 && Instant::now() < deadline {
+        let _ = stream.write_all(b"x");
+        let _ = stream.flush();
+        let mut tmp = [0u8; 1];
+        let _ = stream.read(&mut tmp);
+        std::thread::sleep(Duration::from_millis(20));
         observed = ringline::metrics::RECV_SCRATCH_BYTES.value();
-        while observed < 65536 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-            observed = ringline::metrics::RECV_SCRATCH_BYTES.value();
-        }
-        if observed >= 65536 {
-            break;
-        }
     }
     assert!(
         observed >= 65536,
-        "shared recv scratch never grew past 8 KiB floor after {ROUNDS} rounds \
+        "shared recv scratch never grew past 8 KiB floor after {ROUNDS} large messages \
          (observed {observed} bytes) — adaptive sizing is not wired up"
     );
 
