@@ -1208,7 +1208,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 } else {
                     // Zero-copy fast path: if no pending buffer AND accumulator is
                     // empty, hold the kernel buffer in-place instead of copying.
-                    let acc_empty = self.driver.accumulators.data(conn_index).is_empty();
+                    // NOTE: must be the non-merging `is_empty` — `data()` here
+                    // would merge a held frozen remainder on every recv CQE,
+                    // a full-remainder copy per chunk while a large response
+                    // streams in (O(N·K)).
+                    let acc_empty = self.driver.accumulators.is_empty(conn_index);
                     let slot = &mut self.driver.pending_recv_bufs[conn_index as usize];
 
                     if acc_empty && slot.is_none() {
