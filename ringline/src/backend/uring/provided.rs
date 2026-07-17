@@ -99,6 +99,11 @@ impl ProvidedBufRing {
         self.ring_size as u32
     }
 
+    /// Size in bytes of each buffer in this ring.
+    pub fn buf_size_bytes(&self) -> u32 {
+        self.buf_size
+    }
+
     /// Get a pointer and length for a buffer by its ID.
     pub fn get_buffer(&self, bid: u16) -> (*const u8, u32) {
         let offset = bid as usize * self.buf_size as usize;
@@ -226,6 +231,11 @@ impl SizeClassRings {
     /// Buffer group ID for a size class.
     pub fn bgid(&self, class: usize) -> u16 {
         self.rings[class].bgid()
+    }
+
+    /// Buffer size in bytes for a size class.
+    pub fn buffer_size(&self, class: usize) -> u32 {
+        self.rings[class].buf_size_bytes()
     }
 
     /// Ring entry count for a size class.

@@ -1705,6 +1705,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
                                     pending.bid,
                                 ));
                             }
+                            driver.recv_observe(self.conn_index, consumed);
                             self.f.take();
                             return Poll::Ready(consumed);
                         }
@@ -1774,6 +1775,10 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
             match result {
                 ParseResult::Consumed(consumed) if consumed > 0 => {
                     driver.accumulators.consume(self.conn_index, consumed);
+                    // Feed the observed message size into the adaptive recv
+                    // sizing policy (io_uring size classes only).
+                    #[cfg(has_io_uring)]
+                    driver.recv_observe(self.conn_index, consumed);
                     self.f.take();
                     return Poll::Ready(consumed);
                 }
@@ -1783,6 +1788,8 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
             // once so the arriving chunks append without regrowth.
             if let ParseResult::NeedAtLeast(additional) = result {
                 driver.accumulators.reserve(self.conn_index, additional);
+                #[cfg(has_io_uring)]
+                driver.recv_hint(self.conn_index, additional);
             }
 
             // NeedMore or Consumed(0) on non-empty data: incomplete parse.
@@ -1889,6 +1896,10 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
                             .accumulators
                             .put_back(self.conn_index, frozen.slice(consumed..));
                     }
+                    // Feed the observed message size into the adaptive recv
+                    // sizing policy (io_uring size classes only).
+                    #[cfg(has_io_uring)]
+                    driver.recv_observe(self.conn_index, consumed);
                     self.f.take();
                     return Poll::Ready(consumed);
                 }
@@ -1903,6 +1914,8 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
             // size when the next chunks arrive.
             if let ParseResult::NeedAtLeast(additional) = result {
                 driver.accumulators.reserve(self.conn_index, additional);
+                #[cfg(has_io_uring)]
+                driver.recv_hint(self.conn_index, additional);
             }
 
             if is_closed {

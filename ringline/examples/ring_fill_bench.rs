@@ -42,7 +42,10 @@ static DONE_TASKS: AtomicU64 = AtomicU64::new(0);
 static ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
 
 fn env_u64(k: &str, d: u64) -> u64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// In-process echo server: read a 4-byte LE length, write that many bytes.
@@ -106,7 +109,10 @@ impl AsyncEventHandler for Bench {
             for _ in 0..conns {
                 let mode = mode.clone();
                 let _ = ringline::spawn(async move {
-                    let conn = connect(target).expect("connect submit").await.expect("connect");
+                    let conn = connect(target)
+                        .expect("connect submit")
+                        .await
+                        .expect("connect");
                     let deadline = Instant::now() + Duration::from_secs(secs);
                     let mut bytes = 0u64;
                     let mut rounds = 0u64;

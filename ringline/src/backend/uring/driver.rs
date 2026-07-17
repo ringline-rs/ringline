@@ -121,8 +121,14 @@ pub(crate) struct Driver {
     pub(crate) fixed_buffers: FixedBufferRegistry,
     pub(crate) provided_bufs: SizeClassRings,
     /// Per-connection current recv size class (index into `provided_bufs`).
-    /// Pinned to 0 for now — a later phase selects it adaptively.
+    /// Selected adaptively at each multishot arm from `recv_policy`.
     pub(crate) recv_class: Vec<u8>,
+    /// Per-connection adaptive recv-size policy. Fed by parser results
+    /// (`recv_observe`/`recv_hint`) and consulted at each arm to pick a class.
+    pub(crate) recv_policy: Vec<crate::recv::sizing::SizingPolicy>,
+    /// Ascending buffer sizes of each provided-buffer size class, in bytes.
+    /// Built once from `provided_bufs`; indexes align with the class index.
+    pub(crate) recv_class_sizes: Vec<usize>,
     /// Provided buffer ring backing UDP multishot recvmsg. `None` when no UDP
     /// sockets are configured.
     pub(crate) udp_provided_bufs: Option<ProvidedBufRing>,
@@ -331,6 +337,20 @@ pub(crate) struct Driver {
     pub(crate) fs_fd_base: u32,
 }
 
+/// Build a fresh per-connection recv sizing policy spanning the given ascending
+/// class sizes. Alpha = 1/4 (EWMA smoothing), downshift band = 1/2.
+pub(crate) fn new_recv_policy(class_sizes: &[usize]) -> crate::recv::sizing::SizingPolicy {
+    use crate::recv::sizing::{SizingConfig, SizingPolicy};
+    SizingPolicy::new(SizingConfig {
+        min: class_sizes[0],
+        max: class_sizes[class_sizes.len() - 1],
+        alpha_num: 1,
+        alpha_den: 4,
+        downshift_num: 1,
+        downshift_den: 2,
+    })
+}
+
 impl Driver {
     /// Create a new driver for a worker thread.
     #[allow(clippy::too_many_arguments)]
@@ -361,6 +381,11 @@ impl Driver {
             config.recv_buffer.ring_size,
             config.recv_buffer.buffer_size,
         )?;
+        // Ascending buffer size (bytes) of each provided-buffer class, built
+        // once so the adaptive path never hardcodes class geometries.
+        let recv_class_sizes: Vec<usize> = (0..provided_bufs.num_classes())
+            .map(|c| provided_bufs.buffer_size(c) as usize)
+            .collect();
 
         let udp_count = config.udp_bind.len() as u32;
         let udp_provided_bufs = if udp_count > 0 {
@@ -466,6 +491,10 @@ impl Driver {
             ring,
             connections,
             fixed_buffers,
+            recv_policy: (0..config.max_connections)
+                .map(|_| new_recv_policy(&recv_class_sizes))
+                .collect(),
+            recv_class_sizes,
             provided_bufs,
             recv_class: vec![0u8; config.max_connections as usize],
             udp_provided_bufs,
@@ -675,13 +704,41 @@ impl Driver {
     /// Arm (or re-arm) the multishot recv for a TCP connection against its
     /// current size-class provided ring.
     ///
-    /// The class is read from `recv_class` (pinned to 0 for now) and resolved
-    /// to a bgid via `provided_bufs`. All TCP multishot arm/re-arm sites go
-    /// through here so the class-selection logic lives in one place.
+    /// The class is (re)selected here from the connection's [`SizingPolicy`]
+    /// target and resolved to a bgid via `provided_bufs`. All TCP multishot
+    /// arm/re-arm sites go through here so class-selection lives in one place.
+    ///
+    /// Reselecting at every arm is safe: a multishot fully terminates
+    /// (`!IORING_CQE_F_MORE`) before it is re-armed, so no CQEs from the old
+    /// class are in flight when `recv_class` changes.
     pub(crate) fn arm_multishot_recv(&mut self, conn_index: u32) -> io::Result<()> {
-        let class = self.recv_class[conn_index as usize] as usize;
+        let c = conn_index as usize;
+        let target = self.recv_policy[c].target();
+        let class = crate::recv::sizing::class_index_for(&self.recv_class_sizes, target);
+        self.recv_class[c] = class as u8;
         let bgid = self.provided_bufs.bgid(class);
         self.ring.submit_multishot_recv(conn_index, bgid)
+    }
+
+    /// Record an observed consumed-message size for the connection's recv
+    /// sizing policy (upshifts the target toward sustained demand).
+    pub(crate) fn recv_observe(&mut self, conn_index: u32, size: usize) {
+        self.recv_policy[conn_index as usize].observe(size);
+    }
+
+    /// Feed a parser `NeedAtLeast` hint into the connection's recv sizing
+    /// policy (proactively bumps the target without waiting for the EWMA).
+    pub(crate) fn recv_hint(&mut self, conn_index: u32, need: usize) {
+        self.recv_policy[conn_index as usize].hint(need);
+    }
+
+    /// Reset a connection slot's recv sizing state to the smallest class. Called
+    /// when a slot is (re)activated for a new connection so a recycled slot
+    /// never inherits the previous occupant's policy.
+    pub(crate) fn recv_reset_policy(&mut self, conn_index: u32) {
+        let c = conn_index as usize;
+        self.recv_class[c] = 0;
+        self.recv_policy[c] = new_recv_policy(&self.recv_class_sizes);
     }
 
     pub(crate) fn close_connection(&mut self, conn_index: u32) {

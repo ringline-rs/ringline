@@ -1528,6 +1528,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         .push((self.driver.recv_class[conn_index as usize], pending.bid));
                 }
                 self.driver.accumulators.reset(conn_index);
+                // Fresh slot: start recv sizing at the smallest class so a
+                // recycled slot never inherits the prior occupant's policy.
+                self.driver.recv_reset_policy(conn_index);
                 self.arm_recv(conn_index);
 
                 // TLS path: defer accept until handshake completes.
@@ -2318,6 +2321,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .push((self.driver.recv_class[conn_index as usize], pending.bid));
         }
         self.driver.accumulators.reset(conn_index);
+        // Fresh outbound slot: reset recv sizing to the smallest class (covers
+        // both the TLS and plaintext branches below).
+        self.driver.recv_reset_policy(conn_index);
 
         // TLS client path
         if let Some(ref mut tls_table) = self.driver.tls_table
