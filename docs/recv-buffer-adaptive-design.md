@@ -334,6 +334,44 @@ that localhost could not validate (needs a real-NIC retest before committing).
 INC buffer can't recycle until fully consumed, so a retained slice pins it →
 stall); ringline's copy-out-to-accumulator path is compatible.
 
+### Cross-host validation over real 10GbE (hv01 ↔ hv02, closes the fan-in gap)
+
+The localhost prototype couldn't exercise true concurrent buffer contention
+(`max_concurrent_bufs` pinned at 1 — fast-drain artifact). Re-ran the prototype
+split across two hosts over a real 10GbE link (iperf baseline 9.43 Gbps), server
+on hv01, load driver on hv02, 64 connections, INC vs classic across ring depths
+and workloads (whole / mixed / fanin).
+
+**Result: every configuration hit ~1117 MiB/s = 9.37 Gbps — the NIC line rate.**
+INC, classic-16K, classic-256K, all ring depths, all workloads: identical,
+network-bound. Consequences:
+- **Fan-in starvation is refuted even at line rate:** `max_concurrent_bufs`
+  stayed **1** at 64 connections — a single worker cycles buffers faster than
+  connections need them, so ring depth is irrelevant to throughput (only
+  cosmetic `enobufs` churn differs). INC's "needs several-medium-buffers"
+  hypothesis does not hold.
+- **INC has zero throughput advantage at 10GbE** — a single worker is
+  network-bound with *either* path; even fragmented classic-16K saturates.
+
+The localhost cliff (32 conns 1500→2300 MiB/s) is the **CPU/cache-bound
+regime** (localhost has no NIC ceiling). On real 10GbE the NIC caps first, so
+one core has ample headroom and both the pre-adaptive single ring and the
+adaptive path reach line rate for bulk recv. The adaptive size-class work is a
+correct win in the CPU-bound regime (faster-than-10GbE NICs, higher
+core-per-NIC pressure, per-op-cost-sensitive small-op workloads) and neutral
+(never worse) when network-bound.
+
+### Verdict update: NO-GO on INC (data-supported)
+
+INC's complexity is **not justified by available evidence**: at 10GbE it is
+invisible (network-bound), and the fan-in concern that motivated caution does
+not occur. INC would only pay off on NICs faster than a single core can feed via
+the classic/adaptive path (>10GbE + CPU-bound + mixed sizes) — a regime ringline
+does not currently target. The semantics are fully documented above and the
+prototype preserved on `probe/inc-provided-buffers`, so INC can be revisited as
+a focused effort if/when that regime becomes a target. Ship the adaptive
+size-class path; defer INC.
+
 ## Validation
 
 ### Size-class path results (hv01, kernel 6.12, 1 worker, 256 KiB responses)
