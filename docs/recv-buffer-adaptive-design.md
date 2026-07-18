@@ -380,21 +380,44 @@ Single-core ceiling ~22–24 Gbps for all strategies. INC has **4× fewer CQEs**
 The recv ceiling is **per-byte-bound** (the mandatory provided→accumulator copy),
 not per-CQE-bound — and INC does not reduce bytes copied.
 
-### Verdict: NO-GO on INC; ship the adaptive size-class path
+### Cross-host segmented-arrival A/B (corrects the localhost verdict)
 
-Real ringline pays a high per-CQE cost (accumulator append + task wake per
-completion), so *fewer CQEs* is worth a lot — the adaptive path's +52% over the
-old single-16K ring reflects that. But **both** the adaptive size-class path and
-INC deliver "fewer CQEs" (bigger effective buffers), so in real ringline at
-200 GbE they are ~equivalent; INC's unique edge is mixed-workload memory
-efficiency, and the bake-off shows even its throughput side is marginal and
-inconsistent. INC's complexity (per-bid offset machinery + a 6.11 kernel floor)
-is not justified over the already-implemented adaptive path in *any* measured
-regime (10GbE: network-bound; CPU-bound: per-byte-bound). Semantics are fully
-documented above and the prototype is preserved on
-`probe/inc-provided-buffers`, so INC can be revisited if a future regime (very
-fast NIC + heavily mixed sizes + memory-pressure) demands it. **Ship adaptive;
-defer INC.**
+The CPU-bound bake-off above used **localhost** arrival — a whole message lands
+in one burst, so classic buffers always fill completely and never churn.
+Localhost is structurally incapable of reproducing **partial-fill waste**, the
+regime where INC actually matters. Re-tested over a real 10GbE link (recv on
+hv01, segmented 256 KiB from hv02), whole-256K:
+
+| conns | INC 256K | classic 256K | classic 16K |
+|---|---|---|---|
+| 32 ENOBUFS/rearms | **214** | 1355 | 1388 |
+| 64 ENOBUFS/rearms | **308** | 1050 | 2633 |
+| INC `buffer_more` | 44k–106k | 0 | 0 |
+
+Over a real segmented network a 256 KiB response arrives in ~64 KiB TCP bursts.
+Classic provided buffers consume a **whole** buffer per recv regardless of fill,
+so each burst wastes ~75% of a big buffer and the ring exhausts → ENOBUFS →
+fallback. This is confirmed against the shipped size-class path too (cross-host
+whole-256K fallback fraction ~0.46). **No classic geometry escapes it** — 256K
+and 16K churn equally. INC's incremental consumption fills one buffer across
+several recvs (`buffer_more`), giving **~6× fewer ENOBUFS**. Throughput is equal
+here only because 10GbE is network-bound; the ENOBUFS/fallback churn becomes a
+CPU-ceiling cost in the CPU-bound regime (fast NIC), where the size-class path
+cannot escape it and INC can.
+
+### Verdict: GO on INC (Phase 4.2), size-class path lands as the foundation
+
+The earlier NO-GO rested on the localhost bake-off, which measured the one
+regime where INC's advantage disappears — corrected above. INC uniquely
+eliminates the segmented-network partial-fill churn that *no* classic size-class
+geometry can. The adaptive size-class work still lands first: it is correct,
+helps the CPU-bound bursty regime, and its `SizingPolicy` / `RecvBufferProvider`
+/ `RecvDomain` / config-and-bgid machinery are the reusable substrate an INC
+provider plugs into. INC is then integrated as a `CopyOrConsume`-only,
+opt-in / feature-detected (kernel ≥ 6.11) provider using the semantics proven
+above (per-bid offset table + conditional replenish on `!F_BUF_MORE`), with the
+zero-copy hold/forward paths kept on classic rings. Final validation is a
+200 GbE (AWS c8gn) run confirming the CPU-bound throughput win before release.
 
 ## Validation
 

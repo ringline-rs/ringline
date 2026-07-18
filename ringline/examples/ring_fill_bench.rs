@@ -48,9 +48,10 @@ fn env_u64(k: &str, d: u64) -> u64 {
         .unwrap_or(d)
 }
 
-/// In-process echo server: read a 4-byte LE length, write that many bytes.
+/// Echo server: read a 4-byte LE length, write that many bytes. Binds all
+/// interfaces so it works both in-process (localhost) and cross-host.
 fn server(port: u16, max_size: usize) {
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind");
+    let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind");
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let mut stream: TcpStream = match stream {
@@ -104,7 +105,9 @@ impl AsyncEventHandler for Bench {
         let secs = env_u64("SECS", 5);
         let mode = std::env::var("MODE").unwrap_or_else(|_| "whole".into());
         Some(Box::pin(async move {
-            let target: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let target_host = std::env::var("TARGET").unwrap_or_else(|_| "127.0.0.1".into());
+            let target: std::net::SocketAddr =
+                format!("{target_host}:{port}").parse().unwrap();
             let start = Instant::now();
             for _ in 0..conns {
                 let mode = mode.clone();
@@ -171,11 +174,27 @@ fn main() {
     let buf = env_u64("BUF", 16384) as u32;
     let conns = env_u64("CONNS", 1);
     let mode = std::env::var("MODE").unwrap_or_else(|_| "whole".into());
+    // ROLE=server: run only the echo server (for cross-host: server on one box).
+    // ROLE=client: run only the ringline adaptive-recv client against TARGET.
+    // unset: localhost — in-process server + client (default).
+    let role = std::env::var("ROLE").unwrap_or_default();
 
     // Server must be able to serve the largest response any mode will request.
     let max_size = msg.max(large);
-    server(port, max_size);
-    std::thread::sleep(Duration::from_millis(100));
+
+    if role == "server" {
+        server(port, max_size);
+        eprintln!("[ring_fill_bench] echo server on 0.0.0.0:{port}, max {max_size}B — Ctrl-C to stop");
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+
+    if role != "client" {
+        // localhost: start the in-process echo server.
+        server(port, max_size);
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     let config = ConfigBuilder::new()
         .workers(1)
