@@ -290,16 +290,49 @@ large ring stays lightly populated for small-traffic workloads. This is a
 *starting* default refined by the Phase 6.3 validation sweep; it is not a
 per-point winner but a robust spread covering the observed range.
 
-### INC geometry — de-risked at the start of Phase 4, not standalone
+### INC de-risk results (standalone prototype, hv01 6.12)
 
-INC buffer size ∈ {64K,128K,256K,512K,1M} × depth, and the concurrent-region
-handout question (does few-large starve fan-in under high concurrency?) are
-throughput questions best answered by the *real* INC provider driven through
-`ring_fill_bench` with `MODE=mixed`, not a throwaway probe. Phase 4 Task 4.1
-registers INC + a minimal integrated recv and sweeps this **before** the full
-CQE-handling integration (Task 4.2). If few-large starves fan-in, the INC
-default becomes "several medium buffers" (still one size). The bench harness
-(`ring_fill_bench`, committed) already carries the `mixed` mode this needs.
+Prototype on branch `probe/inc-provided-buffers` (`inc_probe.rs`), semantics
+proven by a byte-position verifier (0 mismatches over 128 MiB mixed traffic).
+
+**Proven semantics (the reusable contract for any integration):**
+- Register with flag literal `2` (`IOU_PBUF_RING_INC`; the crate's `sys`
+  constants are private). `register_buf_ring_with_flags` and
+  `cqueue::buffer_more`/`buffer_select` are public.
+- The CQE does **not** carry the offset. Keep a **per-bid running offset**: for
+  a recv CQE selecting `bid=b` with `result=n`, new bytes are at
+  `buf[b] + offset[b]` for `n` bytes; then `offset[b] += n`.
+- Recycle signal = `IORING_CQE_F_BUF_MORE` (bit 16, `cqueue::buffer_more`):
+  **set** → buffer partially consumed, kernel keeps it, do NOT re-provide;
+  **clear** (with `F_BUFFER`) → fully consumed, reset `offset[b]=0` and
+  re-provide the bid (classic ring-entry write + tail commit). ENOBUFS
+  terminates the multishot → re-arm.
+- No ergonomic crate type — raw-drive like `ProvidedBufRing` plus the offset
+  table + conditional replenish above.
+
+**Measured:** ~3.9× fewer CQEs on 256 KiB responses (17.3k→4.4k); mixed
+8K/256K **+24% vs classic-16K** and matches classic-256K throughput *without*
+its 32× small-message memory waste. Fan-in could NOT be truly measured on
+localhost (`max_concurrent_bufs` pinned at 1 — fast-drain artifact); ring-depth
+sweep shows churn falls with depth, throughput peaks at depth 16–64. INC holds
+a buffer per active connection longer than classic, so it needs
+`ring_depth ≳ concurrent-active conns`; "several medium (~64 KiB) buffers" beats
+"few large."
+
+**Verdict: CONDITIONAL GO, marginal.** INC is real and fully characterized, and
+it uniquely handles mixed sizes on one geometry (no per-connection class
+compromise, no big-class memory waste). But the **adaptive size-class path
+already captures most of the win** — INC's incremental advantage is the
+mixed/unpredictable-size connection plus real-NIC memory-waste avoidance, at the
+cost of: a per-bid offset table + conditional-replenish rework of the recv
+completion path; a 6.11 kernel floor (must be opt-in / feature-detected, ringline
+floor is 6.0); harder ring churn when under-provisioned; and a fan-in geometry
+that localhost could not validate (needs a real-NIC retest before committing).
+
+**Recommended geometry if integrated:** ~64 KiB buffers, depth 128–256.
+**Integration guard:** the zero-copy hold/forward paths must never use INC (an
+INC buffer can't recycle until fully consumed, so a retained slice pins it →
+stall); ringline's copy-out-to-accumulator path is compatible.
 
 ## Validation
 
