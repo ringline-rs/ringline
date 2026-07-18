@@ -175,12 +175,19 @@ unsafe impl Send for ProvidedBufRing {}
 ///
 /// Class 0 mirrors the configured `recv_buffer` exactly (so existing ring/buf
 /// tuning and the preserved throughput baseline still apply); classes 1+ are
-/// larger fixed-size buffers reserved for the (future) adaptive recv path.
-/// Every connection is pinned to class 0 today (see `Driver::recv_class`), so
-/// classes 1/2 are registered with the kernel but currently unused.
+/// larger fixed-size buffers. Each connection's class is (re)selected from its
+/// `SizingPolicy` at every multishot arm (see `Driver::arm_multishot_recv`).
 // Single source of truth shared with config validation (which reserves the
 // class bgid range). Derived from the same constant so they cannot drift.
 const NUM_SIZE_CLASSES: usize = crate::config::RECV_SIZE_CLASSES as usize;
+
+// `SizeClassRings::new` hardcodes exactly this many `ProvidedBufRing`s. Keep the
+// count in lockstep with the constant at COMPILE time — bumping
+// `RECV_SIZE_CLASSES` without adding the matching ring geometry is a build error.
+const _: () = assert!(
+    NUM_SIZE_CLASSES == 3,
+    "SizeClassRings::new builds exactly 3 rings; update it if RECV_SIZE_CLASSES changes"
+);
 
 /// A set of provided-buffer rings, one per size class, each with a distinct
 /// `bgid`. Class 0 is the configured recv buffer; classes 1+ are hardcoded

@@ -90,9 +90,11 @@ impl ConnStream {
         if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
             let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
             driver.accumulators.append(conn_index, data);
+            // Origin class (stored at receive time), not the current
+            // `recv_class` — see the identical guard in the uring recv path.
             driver
                 .pending_replenish
-                .push((driver.recv_class[conn_index as usize], pending.bid));
+                .push((pending.class, pending.bid));
         }
         #[cfg(not(has_io_uring))]
         let _ = (driver, conn_index);

@@ -697,9 +697,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         self.executor.wake_recv(conn_index);
                         self.driver.close_connection(conn_index);
                     }
+                    // Replenish to the buffer's ORIGIN class (stored at receive
+                    // time), not the connection's current `recv_class` — the
+                    // starvation upshift may have changed the class since this
+                    // buffer was held, and returning it to the wrong ring
+                    // double-provides a bid there (cross-connection corruption).
                     self.driver
                         .pending_replenish
-                        .push((self.driver.recv_class[conn_index as usize], pending.bid));
+                        .push((pending.class, pending.bid));
                 }
             }
         }
@@ -1539,7 +1544,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
                     self.driver
                         .pending_replenish
-                        .push((self.driver.recv_class[conn_index as usize], pending.bid));
+                        .push((pending.class, pending.bid));
                 }
                 self.driver.accumulators.reset(conn_index);
                 // Fresh slot: start recv sizing at the smallest class so a
@@ -2323,7 +2328,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
                 self.driver
                     .pending_replenish
-                    .push((self.driver.recv_class[conn_index as usize], pending.bid));
+                    .push((pending.class, pending.bid));
             }
             self.driver.accumulators.reset(conn_index);
             if let Some(ref mut tls_table) = self.driver.tls_table {
@@ -2336,7 +2341,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
             self.driver
                 .pending_replenish
-                .push((self.driver.recv_class[conn_index as usize], pending.bid));
+                .push((pending.class, pending.bid));
         }
         self.driver.accumulators.reset(conn_index);
         // Fresh outbound slot: reset recv sizing to the smallest class (covers
@@ -2422,11 +2427,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn handle_close(&mut self, ud: UserData) {
         let conn_index = ud.conn_index();
 
-        // Replenish any held zero-copy recv buffer.
+        // Replenish any held zero-copy recv buffer to its ORIGIN class (stored
+        // at receive time) — `recv_class` may have changed since it was held.
         if let Some(pending) = self.driver.pending_recv_bufs[conn_index as usize].take() {
             self.driver
                 .pending_replenish
-                .push((self.driver.recv_class[conn_index as usize], pending.bid));
+                .push((pending.class, pending.bid));
         }
 
         let was_established = self
@@ -3902,6 +3908,41 @@ mod tests {
         assert!(
             el.driver.pending_replenish.contains(&(2, 1)),
             "current buffer should replenish to its class 2"
+        );
+    }
+
+    #[test]
+    fn held_buffer_replenishes_to_origin_class_on_close() {
+        // Same origin-class invariant as the recv path, but exercised through
+        // `handle_close`: a held buffer must return to the class it was
+        // received under even when the connection closes after an adaptive
+        // class change (the starved-flush and ConnStream paths share this fix).
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Recv on class 0 (bid=0) — held in pending_recv_bufs (empty accumulator).
+        let flags = 1u32 | 2u32; // F_BUFFER | F_MORE, bid=0
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(0, 0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
+        }
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 5, flags);
+        assert!(el.driver.pending_recv_bufs[conn_index as usize].is_some());
+
+        // Adaptive migration to a larger class, then the connection closes.
+        el.driver.recv_class[conn_index as usize] = 2;
+        let ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+
+        assert!(
+            el.driver.pending_replenish.contains(&(0, 0)),
+            "held buffer must replenish to origin class 0 on close, got {:?}",
+            el.driver.pending_replenish
+        );
+        assert!(
+            !el.driver.pending_replenish.contains(&(2, 0)),
+            "held buffer must NOT replenish to the changed class 2 on close"
         );
     }
 

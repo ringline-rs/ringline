@@ -397,6 +397,15 @@ impl Driver {
         let recv_class_sizes: Vec<usize> = (0..provided_bufs.num_classes())
             .map(|c| provided_bufs.buffer_size(c) as usize)
             .collect();
+        // `class_index_for` and `SizingPolicy` (min = class_sizes[0]) assume the
+        // class sizes ascend. Class 0 is the configured `recv_buffer.buffer_size`;
+        // a config larger than the hardcoded class-1 (64 KiB) would break the
+        // ordering and make smaller classes dead. Guard it.
+        debug_assert!(
+            recv_class_sizes.windows(2).all(|w| w[0] <= w[1]),
+            "recv size classes must be ascending, got {recv_class_sizes:?} \
+             (recv_buffer.buffer_size exceeds a hardcoded class?)"
+        );
 
         let udp_count = config.udp_bind.len() as u32;
         let udp_provided_bufs = if udp_count > 0 {
