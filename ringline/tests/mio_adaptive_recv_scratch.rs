@@ -1,4 +1,8 @@
 #![allow(clippy::manual_async_fn)]
+// mio-only: the shared recv scratch is a mio-backend concept, and the
+// RECV_SCRATCH_BYTES gauge it asserts on is never touched on io_uring. Gate the
+// whole file out on the io_uring backend (Linux CI) so it doesn't fail there.
+#![cfg(not(has_io_uring))]
 //! Integration test: the mio backend's shared recv scratch buffer grows
 //! adaptively toward observed message sizes instead of staying pinned at
 //! the fixed 8 KiB floor.
