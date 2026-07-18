@@ -361,16 +361,40 @@ correct win in the CPU-bound regime (faster-than-10GbE NICs, higher
 core-per-NIC pressure, per-op-cost-sensitive small-op workloads) and neutral
 (never worse) when network-bound.
 
-### Verdict update: NO-GO on INC (data-supported)
+### CPU-bound bake-off (the 200 GbE-relevant regime)
 
-INC's complexity is **not justified by available evidence**: at 10GbE it is
-invisible (network-bound), and the fan-in concern that motivated caution does
-not occur. INC would only pay off on NICs faster than a single core can feed via
-the classic/adaptive path (>10GbE + CPU-bound + mixed sizes) — a regime ringline
-does not currently target. The semantics are fully documented above and the
-prototype preserved on `probe/inc-provided-buffers`, so INC can be revisited as
-a focused effort if/when that regime becomes a target. Ship the adaptive
-size-class path; defer INC.
+10GbE only answered fan-in (it is network-bound, so all strategies pin at line
+rate). The regime that matters for a fast NIC (200 GbE) is CPU-bound, for which
+localhost loopback (no NIC ceiling) is the right proxy. Bake-off on hv01
+loopback, INC vs classic, 32/64 conns:
+
+| workload/conns | INC 64K | classic-16K | classic-256K |
+|---|---|---|---|
+| whole 32 | 2920 | 2816 | 2642 |
+| whole 64 | 2746 | 2690 | 2640 |
+| mixed 32 | 2728 | 2812 | **2829** |
+| mixed 64 | 2761 | 2691 | 2683 |
+
+Single-core ceiling ~22–24 Gbps for all strategies. INC has **4× fewer CQEs**
+(65K vs 16K bytes/CQE) but only **+2–10% throughput**, and *loses* on mixed-32.
+The recv ceiling is **per-byte-bound** (the mandatory provided→accumulator copy),
+not per-CQE-bound — and INC does not reduce bytes copied.
+
+### Verdict: NO-GO on INC; ship the adaptive size-class path
+
+Real ringline pays a high per-CQE cost (accumulator append + task wake per
+completion), so *fewer CQEs* is worth a lot — the adaptive path's +52% over the
+old single-16K ring reflects that. But **both** the adaptive size-class path and
+INC deliver "fewer CQEs" (bigger effective buffers), so in real ringline at
+200 GbE they are ~equivalent; INC's unique edge is mixed-workload memory
+efficiency, and the bake-off shows even its throughput side is marginal and
+inconsistent. INC's complexity (per-bid offset machinery + a 6.11 kernel floor)
+is not justified over the already-implemented adaptive path in *any* measured
+regime (10GbE: network-bound; CPU-bound: per-byte-bound). Semantics are fully
+documented above and the prototype is preserved on
+`probe/inc-provided-buffers`, so INC can be revisited if a future regime (very
+fast NIC + heavily mixed sizes + memory-pressure) demands it. **Ship adaptive;
+defer INC.**
 
 ## Validation
 
