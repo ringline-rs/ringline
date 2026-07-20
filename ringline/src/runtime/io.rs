@@ -7,6 +7,8 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 #[cfg(has_io_uring)]
 use std::ops::Deref;
+#[cfg(has_io_uring)]
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -938,6 +940,64 @@ impl ConnCtx {
             conn_index: self.conn_index,
             generation: self.generation,
             f: Some(f),
+        }
+    }
+
+    /// Forward the next `len` received bytes straight to `sink` (Mode A —
+    /// "Forward", zero userspace copy; see `docs/segmented-recv-design.md`).
+    ///
+    /// Opts this connection into *segmented* delivery, then interleaves recv and
+    /// write: arriving provided buffers are held driver-side and written directly
+    /// to `sink` — a **socket** (zero-copy proxy, `send` with `MSG_WAITALL`) or a
+    /// **buffered file** (`pwrite` at an advancing offset starting at 0). No
+    /// intermediate copy into the accumulator or a user buffer. Each held buffer's
+    /// bid is released back to the provided ring on **its own write completion**.
+    ///
+    /// Writes to `sink` are strictly serialized — one in flight at a time — so the
+    /// byte stream cannot be reordered (io_uring does not order independent SQEs);
+    /// a large `len` therefore becomes a sequence of serialized buffer-sized
+    /// writes. Shared-ring safety under fan-in is provided by the low-water
+    /// reserve (`recv_segment_reserve`): when the ring runs low, arriving buffers
+    /// are force-copied and their bids returned immediately, so a slow sink cannot
+    /// deplete the shared ring and starve other connections.
+    ///
+    /// Resolves to `Ok(bytes_forwarded)`. `bytes_forwarded == len` on success; a
+    /// value `< len` means the peer closed (FIN) before `len` bytes arrived — the
+    /// forward is truncated (any received-but-unwritten tail is dropped as the
+    /// connection unwinds). After the forward the delivery domain is reset to the
+    /// default, and any bytes received *past* `len` are preserved at the front of
+    /// the accumulator for the next `with_data`/`with_bytes` read.
+    ///
+    /// # Sink ownership
+    ///
+    /// [`SinkFd`] borrows the target descriptor for the forward's lifetime (it is
+    /// **not** a bare `RawFd` the caller can close mid-forward — that would be a
+    /// use-after-close, since an in-flight write would land on a recycled fd). The
+    /// returned future borrows the `SinkFd`, so the borrow checker keeps the fd
+    /// open until the forward resolves.
+    ///
+    /// # NVMe / `O_DIRECT`
+    ///
+    /// Not supported for zero-copy: provided buffers are mid-ring, unaligned, and
+    /// unregistered, so `O_DIRECT`'s alignment contract cannot be met without an
+    /// intermediate aligned copy (which defeats the purpose). [`SinkFd::file`]
+    /// **rejects** an `O_DIRECT` descriptor with [`io::ErrorKind::InvalidInput`].
+    ///
+    /// io_uring only — Mode A is backed by the provided-buffer ring.
+    #[cfg(has_io_uring)]
+    pub fn forward_to<'a>(&self, sink: &'a SinkFd<'a>, len: usize) -> ForwardToFuture<'a> {
+        with_state(|driver, _executor| {
+            driver.recv_domain[self.conn_index as usize] =
+                crate::recv::domain::RecvDomain::Segmented;
+        });
+        ForwardToFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            len: len as u64,
+            forwarded: 0,
+            sink_fd: sink.fd,
+            is_file: sink.is_file,
+            _sink: PhantomData,
         }
     }
 
@@ -2436,6 +2496,247 @@ impl Future for RecvOwnedSegment {
             executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[idx] = true;
             Poll::Pending
+        })
+    }
+}
+
+// ── Segmented recv (Mode A — Forward to an fd) ───────────────────────
+
+/// A non-raw sink descriptor for [`ConnCtx::forward_to`] (Mode A — "Forward";
+/// see `docs/segmented-recv-design.md`).
+///
+/// Wraps a [`BorrowedFd`] so the descriptor is guaranteed open for the forward's
+/// lifetime — deliberately **not** a bare [`RawFd`] the caller could close
+/// mid-forward, which would be a use-after-close (an in-flight write landing on a
+/// recycled fd; generation guards ring *slots*, not caller fds). The
+/// [`forward_to`](ConnCtx::forward_to) future borrows the `SinkFd`, so the borrow
+/// checker keeps the fd alive until the forward resolves.
+///
+/// Two sink kinds are supported for **zero userspace copy**:
+/// - [`socket`](Self::socket): a stream socket (zero-copy proxy).
+/// - [`file`](Self::file): a **buffered** regular file (`pwrite` at offset).
+///
+/// `O_DIRECT` / NVMe sinks are **not** supported for zero-copy (provided buffers
+/// are unaligned) and are rejected by [`file`](Self::file).
+#[cfg(has_io_uring)]
+#[derive(Debug)]
+pub struct SinkFd<'a> {
+    fd: RawFd,
+    /// Seekable buffered file (`pwrite` at an advancing offset) vs. stream socket
+    /// (`send` with `MSG_WAITALL`, no offset).
+    is_file: bool,
+    /// Ties this handle to the borrowed descriptor's lifetime.
+    _borrow: PhantomData<BorrowedFd<'a>>,
+}
+
+#[cfg(has_io_uring)]
+impl<'a> SinkFd<'a> {
+    /// A **socket** sink (zero-copy proxy). Forwarded bytes are written with
+    /// `send`(`MSG_WAITALL`), so the kernel retries short stream sends in place.
+    pub fn socket(fd: BorrowedFd<'a>) -> Self {
+        SinkFd {
+            fd: fd.as_raw_fd(),
+            is_file: false,
+            _borrow: PhantomData,
+        }
+    }
+
+    /// A **buffered file** sink. Forwarded bytes are written with `pwrite` at an
+    /// offset that advances from 0 as bytes are forwarded; short writes resubmit
+    /// the remainder at the advanced offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if the descriptor was opened with
+    /// `O_DIRECT`: zero-copy forwarding requires buffered I/O because provided
+    /// recv buffers are mid-ring, unaligned, and unregistered — `O_DIRECT`'s
+    /// alignment contract cannot be met without an intermediate aligned copy,
+    /// which defeats the purpose. Use a buffered file (or copy the bytes out via
+    /// Mode C).
+    pub fn file(fd: BorrowedFd<'a>) -> io::Result<Self> {
+        let raw = fd.as_raw_fd();
+        // Reject O_DIRECT: unaligned provided buffers cannot be its source.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::O_DIRECT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "O_DIRECT sink is not supported for zero-copy forward (provided \
+                 buffers are unaligned); use a buffered file",
+            ));
+        }
+        Ok(SinkFd {
+            fd: raw,
+            is_file: true,
+            _borrow: PhantomData,
+        })
+    }
+}
+
+/// Future returned by [`ConnCtx::forward_to`]. Drives the recv/write interleave
+/// that forwards `len` received bytes to the sink, one serialized write at a
+/// time. Borrows the [`SinkFd`] (`'a`) so the sink descriptor stays open for the
+/// whole forward.
+#[cfg(has_io_uring)]
+pub struct ForwardToFuture<'a> {
+    conn_index: u32,
+    generation: u32,
+    /// Total bytes to forward.
+    len: u64,
+    /// Bytes whose write has completed.
+    forwarded: u64,
+    /// Sink descriptor (borrowed via `SinkFd` for `'a`).
+    sink_fd: RawFd,
+    /// File sink (`pwrite` at `forwarded` as the offset) vs. socket sink.
+    is_file: bool,
+    _sink: PhantomData<&'a SinkFd<'a>>,
+}
+
+#[cfg(has_io_uring)]
+impl Future for ForwardToFuture<'_> {
+    type Output = io::Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        with_state(|driver, executor| {
+            let conn = me.conn_index;
+            let idx = conn as usize;
+            // Single pass: consume any completed write, then either park (write in
+            // flight / awaiting data), resolve (done / EOF / stale), or start the
+            // next write. No loop — each poll makes exactly one transition.
+            {
+                // Stale handle (slot closed/reused): the driver already released
+                // any held/in-flight backing on close. Resolve with what we sent.
+                if driver.connections.generation(conn) != me.generation {
+                    return Poll::Ready(Ok(me.forwarded as usize));
+                }
+
+                // Consume a completed write result (set by `handle_forward_write`).
+                if let Some(res) = driver.forward_done[idx].take() {
+                    match res {
+                        Ok(n) => me.forwarded += n as u64,
+                        Err(errno) => {
+                            let _ = driver.settle_forward_end(conn);
+                            return Poll::Ready(Err(io::Error::from_raw_os_error(errno)));
+                        }
+                    }
+                }
+
+                // A write is still in flight — one at a time. Park for its CQE.
+                if driver.forward_write[idx].is_some() {
+                    executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                    executor.recv_waiters[idx] = true;
+                    return Poll::Pending;
+                }
+
+                // Done: forwarded the requested length. Settle carried-over bytes
+                // (received past `len`) into the accumulator and reset the domain.
+                if me.forwarded >= me.len {
+                    if !driver.settle_forward_end(conn) {
+                        executor.wake_recv(conn);
+                        driver.close_connection(conn);
+                        return Poll::Ready(Err(io::Error::other(
+                            "recv accumulator overflow settling forward tail",
+                        )));
+                    }
+                    return Poll::Ready(Ok(me.forwarded as usize));
+                }
+
+                // Start the next write from a held buffer, if any.
+                if let Some(held) = driver.segment_hold[idx].pop_front() {
+                    let remaining = me.len - me.forwarded;
+                    // Determine the prefix to forward and stash any overshoot
+                    // suffix (bytes past `len`) at the front of the accumulator.
+                    let started = match held {
+                        crate::backend::HeldRecvBuf::Pinned { bid, len } => {
+                            if (len as u64) <= remaining {
+                                Some((crate::backend::HeldRecvBuf::Pinned { bid, len }, len))
+                            } else {
+                                let chunk = remaining as u32;
+                                let (ptr, _) = driver.provided_bufs.get_buffer(bid);
+                                // SAFETY: `bid` is pinned (unreplenished) and `len`
+                                // bytes were received into it; the suffix slice
+                                // `[chunk..len]` is valid and copied out now.
+                                let suffix = unsafe {
+                                    std::slice::from_raw_parts(
+                                        ptr.add(chunk as usize),
+                                        (len - chunk) as usize,
+                                    )
+                                };
+                                if !driver.accumulators.append(conn, suffix) {
+                                    driver.pending_replenish.push(bid);
+                                    executor.wake_recv(conn);
+                                    driver.close_connection(conn);
+                                    return Poll::Ready(Err(io::Error::other(
+                                        "recv accumulator overflow stashing forward tail",
+                                    )));
+                                }
+                                Some((
+                                    crate::backend::HeldRecvBuf::Pinned { bid, len: chunk },
+                                    chunk,
+                                ))
+                            }
+                        }
+                        crate::backend::HeldRecvBuf::Owned(bytes) => {
+                            if (bytes.len() as u64) <= remaining {
+                                let total = bytes.len() as u32;
+                                Some((crate::backend::HeldRecvBuf::Owned(bytes), total))
+                            } else {
+                                let chunk = remaining as usize;
+                                let overflow = !driver.accumulators.append(conn, &bytes[chunk..]);
+                                if overflow {
+                                    executor.wake_recv(conn);
+                                    driver.close_connection(conn);
+                                    return Poll::Ready(Err(io::Error::other(
+                                        "recv accumulator overflow stashing forward tail",
+                                    )));
+                                }
+                                let prefix = bytes.slice(0..chunk);
+                                Some((crate::backend::HeldRecvBuf::Owned(prefix), chunk as u32))
+                            }
+                        }
+                    };
+                    let (backing, total) = started.expect("started set on both arms");
+                    let base_offset = if me.is_file { me.forwarded } else { 0 };
+                    match driver.start_forward_write(
+                        conn,
+                        backing,
+                        total,
+                        base_offset,
+                        me.sink_fd,
+                        me.is_file,
+                    ) {
+                        Ok(()) => {
+                            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                            executor.recv_waiters[idx] = true;
+                            return Poll::Pending;
+                        }
+                        Err(e) => {
+                            let _ = driver.settle_forward_end(conn);
+                            return Poll::Ready(Err(e));
+                        }
+                    }
+                }
+
+                // Hold empty. If the recv side is closed (peer FIN), the forward is
+                // truncated — resolve with what we managed to forward.
+                let is_closed = driver
+                    .connections
+                    .get(conn)
+                    .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                    .unwrap_or(true);
+                if is_closed {
+                    let _ = driver.settle_forward_end(conn);
+                    return Poll::Ready(Ok(me.forwarded as usize));
+                }
+
+                // Open and nothing held — park for the next arrival (`wake_recv`).
+                executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                executor.recv_waiters[idx] = true;
+                Poll::Pending
+            }
         })
     }
 }

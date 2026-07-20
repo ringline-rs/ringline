@@ -958,6 +958,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendRecvBufsCoalescedPollOut => {
                 self.handle_send_recv_bufs_coalesced_pollout(ud, result)
             }
+            OpTag::ForwardWrite => self.handle_forward_write(ud, result),
+            OpTag::ForwardWritePollOut => self.handle_forward_write_pollout(ud, result),
             #[cfg(feature = "timestamps")]
             OpTag::RecvMsgMultiTs => self.handle_recv_msg_multi_ts(ud, result, flags),
         }
@@ -2005,6 +2007,151 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .pending_recv_forward_retries
                 .push((conn_index, generation, slab_idx, 0));
         }
+    }
+
+    /// Release the backing of the in-flight forward write, record an error for
+    /// the `ForwardToFuture`, and wake it. A pinned bid returns to the ring.
+    fn fail_forward_write(&mut self, conn_index: u32, errno: i32) {
+        if let Some(crate::backend::HeldRecvBuf::Pinned { bid, .. }) = self.driver.forward_write
+            [conn_index as usize]
+            .take()
+            .map(|s| s.backing)
+        {
+            self.driver.pending_replenish.push(bid);
+        }
+        self.driver.forward_done[conn_index as usize] = Some(Err(errno));
+        self.executor.wake_recv(conn_index);
+    }
+
+    /// Resubmit the remaining bytes of the in-flight forward write (after a short
+    /// write, or after a POLLOUT re-arm). The backing stays held; only the source
+    /// pointer, length, and (for files) offset advance. On submit failure the
+    /// forward is failed (releasing the backing).
+    fn resubmit_forward_write(&mut self, conn_index: u32) {
+        let (sink_fd, is_file, ptr, len, offset, generation) = {
+            let Some(state) = self.driver.forward_write[conn_index as usize].as_ref() else {
+                return;
+            };
+            let (ptr, len) = state.remainder(&self.driver.provided_bufs);
+            (
+                state.sink_fd,
+                state.is_file,
+                ptr,
+                len,
+                state.base_offset + state.written as u64,
+                state.generation,
+            )
+        };
+        let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
+        let res = if is_file {
+            unsafe {
+                self.driver
+                    .ring
+                    .submit_forward_write_file(sink_fd, ptr, len, offset, ud)
+            }
+        } else {
+            unsafe {
+                self.driver
+                    .ring
+                    .submit_forward_write_socket(sink_fd, ptr, len, ud)
+            }
+        };
+        if res.is_err() {
+            // SQ full on a mid-forward resubmit: surface an error so the caller
+            // recovers (a partial forward already reached the sink, so the stream
+            // is desynced and the connection should be torn down).
+            self.fail_forward_write(conn_index, libc::EAGAIN);
+        }
+    }
+
+    /// Handle completion of a segmented-recv Mode A forward write
+    /// (`OpTag::ForwardWrite`). The payload carries the connection generation at
+    /// submit, so a stale completion (slot closed/reused — `close_connection`
+    /// already released the backing) is ignored. On full completion the held bid
+    /// is replenished exactly once and the `ForwardToFuture` is woken; a short
+    /// write resubmits the remainder at the advanced offset; `-EAGAIN` (socket
+    /// sink) arms POLLOUT.
+    fn handle_forward_write(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let submit_gen = ud.payload();
+        let live = self.driver.forward_write[conn_index as usize]
+            .as_ref()
+            .is_some_and(|s| s.generation == submit_gen);
+        if !live {
+            return;
+        }
+
+        if result > 0 {
+            let n = result as u32;
+            let reached_total = {
+                let state = self.driver.forward_write[conn_index as usize]
+                    .as_mut()
+                    .expect("checked live above");
+                state.written = state.written.saturating_add(n);
+                state.written >= state.total
+            };
+            if !reached_total {
+                // Short write — resubmit the remainder (files, or a socket send
+                // the kernel did not fully retry).
+                self.resubmit_forward_write(conn_index);
+                return;
+            }
+            // Fully written: release the backing exactly once and report the
+            // completed byte count to the forward future.
+            let state = self.driver.forward_write[conn_index as usize]
+                .take()
+                .expect("checked live above");
+            let total = state.total;
+            if let crate::backend::HeldRecvBuf::Pinned { bid, .. } = state.backing {
+                self.driver.pending_replenish.push(bid);
+            }
+            metrics::BYTES.add(metrics::bytes::SENT, total as u64);
+            self.driver.forward_done[conn_index as usize] = Some(Ok(total));
+            self.executor.wake_recv(conn_index);
+            return;
+        }
+
+        let errno = -result;
+        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            // Socket sink buffer full: arm POLLOUT, then resubmit when writable.
+            let sink_fd = self.driver.forward_write[conn_index as usize]
+                .as_ref()
+                .expect("checked live above")
+                .sink_fd;
+            let pud = UserData::encode(OpTag::ForwardWritePollOut, conn_index, submit_gen);
+            if self
+                .driver
+                .ring
+                .submit_forward_write_pollout(sink_fd, pud)
+                .is_err()
+            {
+                self.fail_forward_write(conn_index, libc::EAGAIN);
+            }
+            metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
+            return;
+        }
+
+        // Real error (or a 0-byte write, which would otherwise loop forever).
+        let e = if result == 0 { libc::EIO } else { errno };
+        self.fail_forward_write(conn_index, e);
+    }
+
+    /// Handle a POLLOUT CQE armed after a forward write to a socket sink returned
+    /// `-EAGAIN` (`OpTag::ForwardWritePollOut`). Resubmits the remaining bytes.
+    fn handle_forward_write_pollout(&mut self, ud: UserData, result: i32) {
+        let conn_index = ud.conn_index();
+        let submit_gen = ud.payload();
+        let live = self.driver.forward_write[conn_index as usize]
+            .as_ref()
+            .is_some_and(|s| s.generation == submit_gen);
+        if !live {
+            return;
+        }
+        if result < 0 {
+            self.fail_forward_write(conn_index, -result);
+            return;
+        }
+        self.resubmit_forward_write(conn_index);
     }
 
     /// Handle completion of a send from a recv buffer (zero-copy forward).
@@ -4918,6 +5065,362 @@ mod tests {
             entries,
             "exactly one replenish — no leak, no double"
         );
+    }
+
+    // ── Segmented recv Mode A (forward_to / ForwardWrite) ────────────────
+
+    fn make_socketpair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0 as libc::c_int; 2];
+        let r = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(r, 0, "socketpair failed");
+        unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    fn temp_file() -> (std::fs::File, std::path::PathBuf) {
+        let mut path = std::env::temp_dir();
+        let uniq = format!(
+            "ringline-forward-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        path.push(uniq);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("temp file");
+        (f, path)
+    }
+
+    /// (a) Forward a held buffer to a socket sink: the first poll pops the
+    /// buffer, submits a write, and parks with the bid held; the write CQE
+    /// releases the bid exactly once and the future resolves with the bytes
+    /// forwarded, resetting the delivery domain and restoring `free()`.
+    #[test]
+    fn forward_to_socket_releases_bid_on_write_cqe_and_resolves() {
+        use std::os::fd::AsFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
+
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.forward_to(&sinkfd, 5)));
+
+        // First poll: pops the held buffer, submits a write, parks.
+        let p1 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(
+            matches!(p1, std::task::Poll::Pending),
+            "parks on the write CQE"
+        );
+        assert!(
+            el.driver.forward_write[conn_index as usize].is_some(),
+            "one write recorded in flight"
+        );
+        assert!(
+            !el.driver.pending_replenish.contains(&bid),
+            "bid stays held while the write is in flight"
+        );
+        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
+
+        // Simulate the write CQE (all 5 bytes).
+        let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+        assert!(
+            el.driver.forward_write[conn_index as usize].is_none(),
+            "in-flight state cleared on completion"
+        );
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "the write CQE replenishes the held bid exactly once"
+        );
+        assert_eq!(el.driver.forward_done[conn_index as usize], Some(Ok(5)));
+
+        // Re-poll: forwarded == len → resolves, domain reset.
+        let p2 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(
+            matches!(p2, std::task::Poll::Ready(Ok(5))),
+            "resolves with bytes forwarded"
+        );
+        assert_eq!(
+            el.driver.recv_domain[conn_index as usize],
+            crate::recv::domain::RecvDomain::default(),
+            "delivery domain reset after the forward"
+        );
+        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(el.driver.provided_bufs.free(), entries, "free restored");
+    }
+
+    /// (b) File sink: a short write resubmits the remainder at the advanced
+    /// offset (`written` advances, the bid stays held), and the running file
+    /// offset advances across buffers (`base_offset == bytes forwarded so far`).
+    #[test]
+    fn forward_to_file_short_write_resubmits_and_offset_advances() {
+        use std::os::fd::AsFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        // Two 5-byte buffers; forward all 10 bytes.
+        deliver_segment(&mut el, conn_index, 0, b"hello");
+        deliver_segment(&mut el, conn_index, 1, b"world");
+        assert_eq!(el.driver.provided_bufs.free(), entries - 2);
+
+        let (file, path) = temp_file();
+        let sinkfd = crate::runtime::io::SinkFd::file(file.as_fd()).expect("buffered file ok");
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.forward_to(&sinkfd, 10)));
+
+        // Poll: submit write of buffer 0 at offset 0.
+        let _ = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        {
+            let st = el.driver.forward_write[conn_index as usize]
+                .as_ref()
+                .unwrap();
+            assert!(st.is_file);
+            assert_eq!(st.base_offset, 0, "first buffer writes at offset 0");
+            assert_eq!(st.total, 5);
+        }
+
+        // Short write: only 3 of 5 bytes → resubmit remainder, bid still held.
+        let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 3, 0);
+        {
+            let st = el.driver.forward_write[conn_index as usize]
+                .as_ref()
+                .expect("still in flight after a short write");
+            assert_eq!(st.written, 3, "short write advanced `written`");
+            assert_eq!(st.total, 5);
+        }
+        assert!(
+            !el.driver.pending_replenish.contains(&0),
+            "bid 0 stays held across the short-write resubmit"
+        );
+
+        // Remainder completes (2 bytes) → buffer 0 done, bid 0 replenished once.
+        el.test_dispatch_cqe(ud.raw(), 2, 0);
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == 0)
+                .count(),
+            1,
+            "buffer 0 bid replenished exactly once on full completion"
+        );
+
+        // Re-poll: pops buffer 1, submits at the advanced file offset 5.
+        let _ = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        {
+            let st = el.driver.forward_write[conn_index as usize]
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                st.base_offset, 5,
+                "second buffer writes at the advanced offset"
+            );
+            assert_eq!(st.total, 5);
+        }
+        // Complete buffer 1.
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+        let p = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(
+            matches!(p, std::task::Poll::Ready(Ok(10))),
+            "forwarded all 10 bytes"
+        );
+        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "both bids restored"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// (c) Under ring pressure the forward path force-copies at delivery (Mode C
+    /// backing): the bid returns to the ring immediately, so a slow sink cannot
+    /// deplete the shared ring, and the owned backing's write completion does not
+    /// double-replenish.
+    #[test]
+    fn forward_to_owned_backing_does_not_double_replenish() {
+        use std::os::fd::AsFd;
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        // Below the reserve → force-copy: the bid is replenished at delivery.
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+        assert!(matches!(
+            el.driver.segment_hold[conn_index as usize][0],
+            crate::backend::HeldRecvBuf::Owned(_)
+        ));
+        // Commit the delivery-time replenish so `free()` reflects the ring is not
+        // depleted by the (owned) held buffer.
+        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "force-copy returned the bid — the forwarding conn did not deplete the ring"
+        );
+
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.forward_to(&sinkfd, 5)));
+
+        let _ = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        // Complete the write of the owned backing.
+        let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+        assert!(
+            el.driver.pending_replenish.is_empty(),
+            "owned backing carries no bid — the write CQE replenishes nothing"
+        );
+        let p = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(p, std::task::Poll::Ready(Ok(5))));
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "no double replenish"
+        );
+    }
+
+    /// (d) Close mid-forward (a write in flight, its pinned bid held) replenishes
+    /// the bid exactly once; a later stale write CQE for the closed occupant is a
+    /// no-op (no double replenish, no leak).
+    #[test]
+    fn close_mid_forward_replenishes_in_flight_bid_exactly_once() {
+        use std::os::fd::AsFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.forward_to(&sinkfd, 5)));
+        let _ = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(el.driver.forward_write[conn_index as usize].is_some());
+        assert!(!el.driver.pending_replenish.contains(&bid));
+
+        // Close while the write is in flight: the held bid returns to the ring.
+        el.driver.close_connection(conn_index);
+        assert!(
+            el.driver.forward_write[conn_index as usize].is_none(),
+            "close drains the in-flight forward write"
+        );
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "close replenishes the in-flight bid exactly once"
+        );
+
+        // A stale write CQE for the (now closed) occupant must no-op.
+        let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "the stale forward-write CQE does not double-replenish"
+        );
+        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "no leak, no double"
+        );
+    }
+
+    /// `SinkFd::file` rejects an `O_DIRECT` descriptor (unaligned provided
+    /// buffers cannot be a zero-copy source).
+    #[test]
+    fn sink_fd_file_rejects_o_direct() {
+        use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+        let (_f, path) = temp_file();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_DIRECT) };
+        if raw < 0 {
+            // Some filesystems (e.g. tmpfs) reject O_DIRECT open — skip.
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        let err = crate::runtime::io::SinkFd::file(owned.as_fd()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

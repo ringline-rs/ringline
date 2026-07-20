@@ -127,6 +127,50 @@ pub(crate) enum HeldRecvBuf {
     Owned(bytes::Bytes),
 }
 
+/// In-flight segmented-recv Mode A forward write (see
+/// `docs/segmented-recv-design.md`, "Mode A — Forward to an fd"). One per
+/// connection at a time — writes to a sink are serialized (io_uring does not
+/// order independent SQEs, so pipelining would reorder the byte stream). The
+/// backing (a pinned provided-buffer bid or an owned copy) is kept alive here
+/// until the write CQE arrives (SQE memory must outlive the op), then released
+/// exactly once by `handle_forward_write`.
+pub(crate) struct ForwardWriteState {
+    /// Where the bytes being written live. `Pinned` releases its bid on
+    /// completion; `Owned` just drops its heap bytes.
+    pub(crate) backing: HeldRecvBuf,
+    /// Total bytes to write from this backing — the prefix length, which may be
+    /// shorter than the backing buffer when `len` ends mid-buffer (the suffix
+    /// was already stashed into the accumulator by the forward future).
+    pub(crate) total: u32,
+    /// Bytes already written from this backing; advanced on short writes so the
+    /// remainder resubmits at the correct source offset (and file offset).
+    pub(crate) written: u32,
+    /// Absolute file offset for byte 0 of this backing (0 for socket sinks).
+    pub(crate) base_offset: u64,
+    /// Sink fd (a non-fixed raw fd borrowed for the forward's lifetime via the
+    /// non-raw `SinkFd` handle the caller passed to `forward_to`).
+    pub(crate) sink_fd: RawFd,
+    /// Whether the sink is a seekable buffered file (uses `pwrite` at offset)
+    /// rather than a socket (`send` with `MSG_WAITALL`).
+    pub(crate) is_file: bool,
+    /// Connection generation captured at submit; the write CQE carries it in its
+    /// payload so a stale completion (slot closed/reused) is ignored.
+    pub(crate) generation: u32,
+}
+
+impl ForwardWriteState {
+    /// Source pointer + remaining length for the next (re)submission, honoring
+    /// bytes already written on a short write.
+    pub(crate) fn remainder(&self, provided_bufs: &ProvidedBufRing) -> (*const u8, u32) {
+        let base = match &self.backing {
+            HeldRecvBuf::Pinned { bid, .. } => provided_bufs.get_buffer(*bid).0,
+            HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
+        };
+        let ptr = unsafe { base.add(self.written as usize) };
+        (ptr, self.total - self.written)
+    }
+}
+
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
@@ -198,6 +242,16 @@ pub(crate) struct Driver {
     /// under `try_with_state`, or `close_connection` under `&mut Driver`)
     /// replenishes the bid exactly once; the other sees `None` and does nothing.
     pub(crate) segment_pinned: Vec<Option<HeldRecvBuf>>,
+    /// Per-connection in-flight segmented-recv Mode A forward write (see
+    /// [`ForwardWriteState`]). `Some` while a write to the sink is outstanding;
+    /// enforces the one-write-in-flight invariant and keeps the write's backing
+    /// alive until its CQE. `close_connection` drains it (releasing a pinned
+    /// bid); the write CQE clears it on completion.
+    pub(crate) forward_write: Vec<Option<ForwardWriteState>>,
+    /// Per-connection completed-forward-write result, produced by
+    /// `handle_forward_write` and consumed by the `ForwardToFuture`: `Ok(n)` =
+    /// bytes of the just-completed backing, `Err(errno)` = write failure.
+    pub(crate) forward_done: Vec<Option<Result<u32, i32>>>,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
@@ -527,6 +581,8 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             segment_pinned: vec![None; config.max_connections as usize],
+            forward_write: (0..config.max_connections).map(|_| None).collect(),
+            forward_done: (0..config.max_connections).map(|_| None).collect(),
             accept_rx,
             eventfd,
             eventfd_buf: [0u8; 8],
@@ -728,6 +784,109 @@ impl Driver {
         // The pin slot should already be None (close drains it), but clear it
         // defensively for a slot reused without an intervening close-drain.
         self.segment_pinned[conn_index as usize] = None;
+        // Mode A forward state — cleared defensively (close drains any pinned
+        // bid). A leftover `forward_done` result must not bleed into a reused
+        // slot's forward.
+        self.forward_write[conn_index as usize] = None;
+        self.forward_done[conn_index as usize] = None;
+    }
+
+    /// Settle a connection when a Mode A `forward_to` finishes: any provided
+    /// buffers still held in `segment_hold` carry stream bytes *past* the
+    /// forwarded region, so their bytes are preserved by copying them into the
+    /// accumulator (in arrival order) before the bid is replenished — exactly
+    /// like the `with_segments` under-drain path. The delivery domain is then
+    /// reset so subsequent `with_data`/`with_bytes` reads see those bytes first.
+    ///
+    /// Returns `false` if the accumulator overflowed (`recv_accumulator_max`),
+    /// in which case the caller must close the connection.
+    #[must_use]
+    pub(crate) fn settle_forward_end(&mut self, conn_index: u32) -> bool {
+        let mut ok = true;
+        while let Some(held) = self.segment_hold[conn_index as usize].pop_front() {
+            match held {
+                HeldRecvBuf::Pinned { bid, len } => {
+                    let (ptr, _) = self.provided_bufs.get_buffer(bid);
+                    let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                    if ok && !self.accumulators.append(conn_index, data) {
+                        ok = false;
+                    }
+                    // Replenish the bid regardless (pushing outside the overflow
+                    // guard avoids a leak on breach).
+                    self.pending_replenish.push(bid);
+                }
+                HeldRecvBuf::Owned(bytes) => {
+                    if ok && !self.accumulators.append(conn_index, &bytes[..]) {
+                        ok = false;
+                    }
+                }
+            }
+        }
+        self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
+        ok
+    }
+
+    /// Submit the first write of a segmented-recv Mode A forward `backing`
+    /// (`total` bytes) to `sink_fd` and record the in-flight state. One write is
+    /// in flight per connection; the completion handler releases the backing.
+    ///
+    /// On submission failure the backing is released here (a pinned bid returns
+    /// to the ring) and the error is propagated — the forward future surfaces it
+    /// to the caller.
+    pub(crate) fn start_forward_write(
+        &mut self,
+        conn_index: u32,
+        backing: HeldRecvBuf,
+        total: u32,
+        base_offset: u64,
+        sink_fd: RawFd,
+        is_file: bool,
+    ) -> io::Result<()> {
+        debug_assert!(
+            self.forward_write[conn_index as usize].is_none(),
+            "start_forward_write while a forward write is already in flight"
+        );
+        let generation = self.connections.generation(conn_index);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::ForwardWrite,
+            conn_index,
+            generation,
+        );
+        let ptr = match &backing {
+            HeldRecvBuf::Pinned { bid, .. } => self.provided_bufs.get_buffer(*bid).0,
+            HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
+        };
+        let res = if is_file {
+            unsafe {
+                self.ring
+                    .submit_forward_write_file(sink_fd, ptr, total, base_offset, ud)
+            }
+        } else {
+            unsafe {
+                self.ring
+                    .submit_forward_write_socket(sink_fd, ptr, total, ud)
+            }
+        };
+        match res {
+            Ok(()) => {
+                self.forward_write[conn_index as usize] = Some(ForwardWriteState {
+                    backing,
+                    total,
+                    written: 0,
+                    base_offset,
+                    sink_fd,
+                    is_file,
+                    generation,
+                });
+                Ok(())
+            }
+            Err(e) => {
+                if let HeldRecvBuf::Pinned { bid, .. } = backing {
+                    self.pending_replenish.push(bid);
+                }
+                Err(e)
+            }
+        }
     }
 
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
@@ -777,6 +936,18 @@ impl Driver {
         {
             self.pending_replenish.push(bid);
         }
+        // Reclaim the backing of an in-flight Mode A forward write. A pinned bid
+        // returns to the ring; an owned copy just drops. A still-in-flight write
+        // CQE for this occupant then finds `forward_write[conn] == None` (or a
+        // reused slot with a mismatched generation) and no-ops — the bid is
+        // released exactly once, here. Clear any completed-write result too.
+        if let Some(HeldRecvBuf::Pinned { bid, .. }) = self.forward_write[conn_index as usize]
+            .take()
+            .map(|s| s.backing)
+        {
+            self.pending_replenish.push(bid);
+        }
+        self.forward_done[conn_index as usize] = None;
         // Clear the fallback-recv flag so the slot's next occupant starts
         // clean. A still-in-flight fallback CQE for this occupant is
         // generation-checked in handle_recv_fallback and only releases its

@@ -78,6 +78,15 @@ pub enum OpTag {
     /// accumulator (the provided ring is smaller than one response).
     /// Payload = fallback pool slot to release on completion.
     RecvFallback = 28,
+    /// Segmented-recv Mode A forward write: a `write`/`send` whose source is a
+    /// held provided recv buffer (or an owned copy), written directly to an
+    /// arbitrary sink fd (socket or buffered file). One write in flight per
+    /// connection (tracked in `Driver::forward_write`). Payload = the
+    /// connection generation at submit time (validates stale completions).
+    ForwardWrite = 29,
+    /// PollAdd for POLLOUT after a forward write to a socket sink returned
+    /// `-EAGAIN`. Payload = the connection generation at submit time.
+    ForwardWritePollOut = 30,
 }
 
 impl OpTag {
@@ -112,6 +121,8 @@ impl OpTag {
             26 => Some(OpTag::SendRecvBufsCoalesced),
             27 => Some(OpTag::SendRecvBufsCoalescedPollOut),
             28 => Some(OpTag::RecvFallback),
+            29 => Some(OpTag::ForwardWrite),
+            30 => Some(OpTag::ForwardWritePollOut),
             _ => None,
         }
     }

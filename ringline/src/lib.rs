@@ -248,6 +248,9 @@ pub use runtime::io::Deadline;
 pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
+/// Future returned by [`ConnCtx::forward_to()`] (segmented recv, Mode A).
+#[cfg(has_io_uring)]
+pub use runtime::io::ForwardToFuture;
 /// Handle to a spawned task's return value, obtained from [`spawn_with_handle()`].
 pub use runtime::io::JoinHandle;
 /// Result of a parse closure: consumed bytes or need more data.
@@ -271,6 +274,9 @@ pub use runtime::io::SegConsumed;
 pub use runtime::io::SegmentReader;
 /// Future that completes when a send finishes.
 pub use runtime::io::SendFuture;
+/// Non-raw sink descriptor for [`ConnCtx::forward_to()`] (segmented recv, Mode A).
+#[cfg(has_io_uring)]
+pub use runtime::io::SinkFd;
 /// Future returned by [`sleep()`].
 pub use runtime::io::SleepFuture;
 /// Future returned by [`timeout()`].
