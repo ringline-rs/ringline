@@ -1133,18 +1133,41 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         } else if self.driver.recv_domain[conn_index as usize]
             == crate::recv::domain::RecvDomain::Segmented
         {
-            // Segmented delivery (Mode B/C): hold the provided buffer in-place
-            // (bid NOT replenished, no accumulator copy) for a future segment
-            // reader to consume. `on_handout()` already counted this bid above;
-            // the buffer stays pinned in the ring until the reader (later
-            // increment) or `close_connection` drains the hold. Backpressure is
-            // natural — unreplenished bids deplete the ring (ENOBUFS) until a
-            // reader releases them, exactly like the recv-forward hold. TLS is
-            // excluded (handled above), so this only runs on plaintext.
-            self.driver.segment_hold[conn_index as usize].push_back(crate::backend::HeldRecvBuf {
-                bid,
-                len: bytes_received,
-            });
+            // Segmented delivery (Mode B/C). Consult the aggregate low-water
+            // reserve on the shared per-worker recv ring (see
+            // `docs/segmented-recv-design.md`, "Backpressure and ring safety").
+            // `on_handout()` above already counted this bid, so `free()` reflects
+            // this delivery.
+            let reserve = self.driver.recv_segment_reserve;
+            let free = self.driver.provided_bufs.free();
+            match crate::recv::occupancy::delivery_decision(free, reserve) {
+                crate::recv::occupancy::Delivery::ZeroCopyOk => {
+                    // Above the reserve: hold the provided buffer in-place (bid
+                    // NOT replenished, no accumulator copy) for a future segment
+                    // reader. The buffer stays pinned until the reader or
+                    // `close_connection` drains the hold. Backpressure is natural
+                    // — unreplenished bids deplete the ring (ENOBUFS) until a
+                    // reader releases them, exactly like the recv-forward hold.
+                    self.driver.segment_hold[conn_index as usize].push_back(
+                        crate::backend::HeldRecvBuf::Pinned {
+                            bid,
+                            len: bytes_received,
+                        },
+                    );
+                }
+                crate::recv::occupancy::Delivery::ForceCopy => {
+                    // At/below the reserve: copy the bytes into an owned `Bytes`
+                    // and replenish the bid IMMEDIATELY so the ring recovers and
+                    // holders cannot deplete it. `on_handout()` counted the bid at
+                    // buffer_select; this replenish balances it (net-zero pin), so
+                    // the outstanding/free accounting stays consistent. INC
+                    // ordering: copy before replenish, no await between.
+                    let owned = bytes::Bytes::copy_from_slice(data);
+                    self.driver.segment_hold[conn_index as usize]
+                        .push_back(crate::backend::HeldRecvBuf::Owned(owned));
+                    self.driver.pending_replenish.push(bid);
+                }
+            }
             self.executor.wake_recv(conn_index);
         } else if self.driver.recv_forward[conn_index as usize] {
             // Zero-copy recv-forward path: hold the provided buffer in-place
@@ -3422,6 +3445,11 @@ mod tests {
             .pin_to_core(false)
             .sq_entries(32)
             .recv_buffer(16, 4096)
+            // Reserve 0: the shared 16-buffer ring never hits the low-water mark
+            // in these unit tests, so segmented deliveries stay zero-copy
+            // (Pinned) as the existing assertions expect. Force-copy behavior is
+            // covered by dedicated tests that raise the reserve explicitly.
+            .recv_segment_reserve(0)
             .max_connections(16)
             .send_pool(16, 16384)
             .send_slab_slots(8)
@@ -3435,9 +3463,24 @@ mod tests {
         test_config_builder().build().expect("valid config")
     }
 
+    /// A test config with an explicit segmented-recv low-water reserve. With the
+    /// 16-buffer test ring, `reserve == 16` forces every segmented delivery to
+    /// Mode C (Owned copy), while a small reserve keeps early deliveries Pinned.
+    fn config_with_reserve(reserve: u32) -> Config {
+        test_config_builder()
+            .recv_segment_reserve(reserve)
+            .build()
+            .expect("valid config")
+    }
+
     /// Create a test event loop. Requires Linux with io_uring support.
     fn make_test_loop() -> AsyncEventLoop<NoopHandler> {
-        let config = test_config();
+        make_test_loop_with_config(test_config())
+    }
+
+    /// Create a test event loop from an explicit config (e.g. to exercise the
+    /// segmented-recv low-water reserve, which `test_config` pins to 0).
+    fn make_test_loop_with_config(config: Config) -> AsyncEventLoop<NoopHandler> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         assert!(eventfd >= 0, "eventfd creation failed");
@@ -3822,8 +3865,15 @@ mod tests {
         );
         let hold = &el.driver.segment_hold[conn_index as usize];
         assert_eq!(hold.len(), 1, "buffer should be held in segment_hold");
-        assert_eq!(hold[0].bid, bid);
-        assert_eq!(hold[0].len, bytes_received as u32);
+        match &hold[0] {
+            crate::backend::HeldRecvBuf::Pinned { bid: hbid, len } => {
+                assert_eq!(*hbid, bid);
+                assert_eq!(*len, bytes_received as u32);
+            }
+            crate::backend::HeldRecvBuf::Owned(_) => {
+                panic!("above the reserve, delivery must be Pinned (zero-copy)")
+            }
+        }
 
         // (b) The held buffer is accounted against the ring's free count.
         assert_eq!(
@@ -4527,6 +4577,346 @@ mod tests {
         assert!(
             done,
             "closed connection with an empty hold yields Ok(0) EOF"
+        );
+    }
+
+    // ── Segmented recv low-water reserve (force-copy under ring pressure) ──
+
+    /// (a) At/below the reserve, a segmented delivery is force-copied into an
+    /// OWNED segment (correct bytes) and its bid is replenished IMMEDIATELY —
+    /// holding an owned segment does not pin the ring, so `free()` recovers at
+    /// delivery.
+    #[test]
+    fn segmented_force_copy_at_reserve_delivers_owned_and_replenishes_immediately() {
+        // reserve == ring size (16): free is always <= reserve → every delivery
+        // force-copies (Mode C).
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        let entries = el.driver.provided_bufs.ring_entries();
+        assert_eq!(el.driver.provided_bufs.free(), entries);
+
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+
+        // Held as an OWNED copy (not pinned), with the correct bytes.
+        let hold = &el.driver.segment_hold[conn_index as usize];
+        assert_eq!(hold.len(), 1, "buffer held in segment_hold");
+        match &hold[0] {
+            crate::backend::HeldRecvBuf::Owned(b) => {
+                assert_eq!(&b[..], b"hello", "owned segment carries the received bytes")
+            }
+            crate::backend::HeldRecvBuf::Pinned { .. } => {
+                panic!("at/below the reserve, delivery must be Owned (force-copy)")
+            }
+        }
+        // The bid was replenished IMMEDIATELY (queued at delivery), before any
+        // consumer runs — so the pinned-buffer count never grows under pressure.
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "force-copy replenishes the bid at delivery"
+        );
+        // Committing the queued replenish restores the full ring while the owned
+        // segment is STILL held — proving the hold pins nothing.
+        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "holding an owned segment does not pin the ring — free recovered at delivery"
+        );
+        assert_eq!(
+            el.driver.segment_hold[conn_index as usize].len(),
+            1,
+            "the owned segment is still held after its bid returned to the ring"
+        );
+    }
+
+    /// (b) Above the reserve, delivery is still Pinned (zero-copy) as before — the
+    /// bid is NOT replenished until consumed.
+    #[test]
+    fn segmented_zero_copy_when_ring_above_reserve_stays_pinned() {
+        // reserve 4, ring 16: the first delivery leaves free = 15 > 4 → Pinned.
+        let mut el = make_test_loop_with_config(config_with_reserve(4));
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        let entries = el.driver.provided_bufs.ring_entries();
+
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+
+        let hold = &el.driver.segment_hold[conn_index as usize];
+        assert_eq!(hold.len(), 1);
+        match &hold[0] {
+            crate::backend::HeldRecvBuf::Pinned { bid: hbid, len } => {
+                assert_eq!(*hbid, bid);
+                assert_eq!(*len, 5);
+            }
+            crate::backend::HeldRecvBuf::Owned(_) => {
+                panic!("above the reserve, delivery must stay Pinned (zero-copy)")
+            }
+        }
+        assert!(
+            !el.driver.pending_replenish.contains(&bid),
+            "a pinned delivery does not replenish while held"
+        );
+        // Pinned: the buffer is still outstanding.
+        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
+    }
+
+    /// (c1) An owned held segment consumed via the reader returns the correct
+    /// bytes, never enters the pin slot, and its drop replenishes nothing (no
+    /// bid) — the ring stays balanced with no double-replenish.
+    #[test]
+    fn owned_segment_via_reader_returns_bytes_and_drop_does_not_replenish() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+        // Commit the force-copy's delivery-time replenish so the ring is full.
+        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(el.driver.provided_bufs.free(), entries);
+
+        // Read the owned segment out via the lending-iterator reader.
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(reader.next());
+        let seg = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(seg))) => seg,
+            _ => panic!("expected an owned segment from the hold"),
+        };
+        with_driver_state(&mut el, || {
+            assert_eq!(&seg[..], b"hello", "owned segment derefs to the bytes");
+            assert_eq!(seg.len(), 5);
+        });
+        // Owned segments never use the pin slot.
+        assert!(
+            el.driver.segment_pinned[conn_index as usize].is_none(),
+            "owned segment must not occupy the pin slot"
+        );
+        // Drop the owned segment: no bid, so nothing is replenished.
+        with_driver_state(&mut el, || drop(seg));
+        assert!(
+            el.driver.pending_replenish.is_empty(),
+            "dropping an owned segment replenishes nothing"
+        );
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "ring stays balanced (no double-replenish)"
+        );
+    }
+
+    /// (c2) An owned held segment consumed via `recv_owned_segment` returns the
+    /// correct bytes and does not replenish a second time (the bid was already
+    /// returned at delivery).
+    #[test]
+    fn recv_owned_segment_over_owned_hold_returns_bytes_no_double_replenish() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"world");
+        // Force-copy queued the bid exactly once at delivery; do NOT commit yet so
+        // we can prove the consume path does not queue it again.
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1
+        );
+
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.recv_owned_segment()));
+        let waker = noop_waker();
+        let owned = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(b))) => b,
+            other => panic!("expected owned bytes, got {other:?}"),
+        };
+        assert_eq!(&owned[..], b"world");
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "consuming an owned hold entry must not replenish its bid again"
+        );
+        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(el.driver.provided_bufs.free(), entries, "balanced");
+    }
+
+    /// (c3) `with_segments` over two OWNED held buffers presents them in order,
+    /// full-drains, and replenishes nothing at settle (owned entries hold no bid)
+    /// — the ring stays balanced.
+    #[test]
+    fn with_segments_owned_entries_full_drain_replenishes_nothing() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        deliver_segment(&mut el, conn_index, 0, b"AAA");
+        deliver_segment(&mut el, conn_index, 1, b"BBB");
+        // Both force-copied: each queued its bid at delivery. Commit them so the
+        // ring is full before consuming.
+        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        assert_eq!(r.len(), 2, "both force-copied bids queued at delivery");
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(el.driver.provided_bufs.free(), entries);
+
+        let seen: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen_cb = Rc::clone(&seen);
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.with_segments(
+            move |chain| {
+                for s in chain.iter() {
+                    seen_cb.borrow_mut().push(s.to_vec());
+                }
+                SegConsumed(chain.total_len())
+            }
+        )));
+        let waker = noop_waker();
+        let n = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(n)) => n,
+            other => panic!("expected Ready(Ok(6)), got {other:?}"),
+        };
+        assert_eq!(n, 6);
+        assert_eq!(
+            *seen.borrow(),
+            vec![b"AAA".to_vec(), b"BBB".to_vec()],
+            "owned segments presented in arrival order"
+        );
+        assert!(el.driver.accumulators.data(conn_index).is_empty());
+        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
+        assert!(
+            el.driver.pending_replenish.is_empty(),
+            "owned settle replenishes nothing (bids already returned at delivery)"
+        );
+        assert_eq!(el.driver.provided_bufs.free(), entries, "ring balanced");
+    }
+
+    /// (c4) `with_segments` under-drain over an OWNED held buffer copies the
+    /// remainder from the owned bytes into the accumulator front, in order, and
+    /// replenishes nothing.
+    #[test]
+    fn with_segments_owned_under_drain_gathers_remainder_from_owned_bytes() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        deliver_segment(&mut el, conn_index, 0, b"hello");
+        deliver_segment(&mut el, conn_index, 1, b"world");
+        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(el.driver.provided_bufs.free(), entries);
+
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut fut = std::pin::pin!(
+            with_driver_state(&mut el, || conn.with_segments(|_chain| SegConsumed(3)))
+        ); // consume "hel" only
+        let waker = noop_waker();
+        let n = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(n)) => n,
+            other => panic!("expected Ready(Ok(3)), got {other:?}"),
+        };
+        assert_eq!(n, 3);
+        assert_eq!(
+            el.driver.accumulators.data(conn_index),
+            b"loworld",
+            "under-drain remainder gathered from the owned bytes, in order"
+        );
+        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
+        assert!(
+            el.driver.pending_replenish.is_empty(),
+            "owned under-drain settle replenishes nothing"
+        );
+        assert_eq!(el.driver.provided_bufs.free(), entries, "balanced");
+    }
+
+    /// (d) Closing a connection with an OWNED segment still held must not
+    /// double-replenish: the owned entry carries no bid (already returned at
+    /// delivery), so close drains the hold without queueing a replenish.
+    #[test]
+    fn close_with_owned_segment_held_does_not_double_replenish() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+        // The bid was queued exactly once at delivery (force-copy).
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1
+        );
+        assert!(matches!(
+            el.driver.segment_hold[conn_index as usize][0],
+            crate::backend::HeldRecvBuf::Owned(_)
+        ));
+
+        // Close while the owned segment is still held.
+        el.driver.close_connection(conn_index);
+        assert!(
+            el.driver.segment_hold[conn_index as usize].is_empty(),
+            "close drains the hold"
+        );
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "close must NOT re-queue an owned entry's bid (no bid to return)"
+        );
+        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "exactly one replenish — no leak, no double"
         );
     }
 

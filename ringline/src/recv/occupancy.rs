@@ -8,10 +8,12 @@
 //! delivery, so a well-behaved connection is never starved of a buffer by
 //! connections holding segments.
 //!
-//! No I/O; unit-tested on both backends. **Inert until Mode B delivery exists**
-//! (Phase 2) — nothing holds provided buffers across an await yet, so the
-//! io_uring path does not consult this in Phase 1.
-#![allow(dead_code)]
+//! No I/O; unit-tested on both backends. Consulted by the io_uring segmented
+//! recv hold branch (`handle_recv_multi`): once the shared ring's `free()` drops
+//! to the reserve, deliveries force-copy (Mode C) instead of pinning. The mio
+//! backend has no provided-buffer ring, so it does not consult this (dead there
+//! outside the unit tests).
+#![cfg_attr(not(has_io_uring), allow(dead_code))]
 
 /// Whether a fresh recv delivery may be handed out zero-copy (held) or must be
 /// copied at delivery.

@@ -99,19 +99,32 @@ pub(crate) struct PendingRecvBuf {
     pub(crate) ptr: *const u8,
 }
 
-/// A provided recv buffer held in the ring for segmented delivery (Mode B/C).
+/// A held received buffer for segmented delivery (Mode B/C), in one of two
+/// backings depending on ring pressure at delivery time.
 ///
-/// Held for a `Segmented` connection: the bid is NOT replenished, so the buffer
-/// stays pinned in the provided ring until a future segment reader consumes it
-/// (later increment) or the connection closes (`close_connection` drains the
-/// hold). The backing pointer is derivable via `provided_bufs.get_buffer(bid)`,
-/// so only the id and length are stored.
-#[derive(Clone, Copy)]
-pub(crate) struct HeldRecvBuf {
-    pub(crate) bid: u16,
-    /// Bytes received into this buffer. The segment reader slices the buffer to
-    /// this length; close-drain only needs the bid.
-    pub(crate) len: u32,
+/// - [`Pinned`](Self::Pinned): a provided-buffer bid pinned in the ring — the
+///   bid is NOT replenished, so the buffer stays in the provided ring until a
+///   segment reader consumes it or the connection closes (`close_connection`
+///   drains the hold). The backing pointer is derivable via
+///   `provided_bufs.get_buffer(bid)`, so only the id and length are stored. This
+///   is the zero-copy delivery, used while the ring is above the low-water
+///   reserve.
+/// - [`Owned`](Self::Owned): an owned copy of the received bytes. When the ring
+///   is at/below `recv_segment_reserve` the bytes are copied at delivery and the
+///   bid is returned to the ring immediately (Mode C), so this entry pins
+///   nothing and needs no replenish when consumed or on close.
+#[derive(Clone)]
+pub(crate) enum HeldRecvBuf {
+    /// A provided-buffer bid pinned in the ring (zero-copy hold).
+    Pinned {
+        bid: u16,
+        /// Bytes received into this buffer. The segment reader slices the buffer
+        /// to this length; close-drain only needs the bid.
+        len: u32,
+    },
+    /// An owned copy of the received bytes; its bid was already replenished at
+    /// delivery, so consuming or dropping this entry replenishes nothing.
+    Owned(bytes::Bytes),
 }
 
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
@@ -228,6 +241,11 @@ pub(crate) struct Driver {
     pub(crate) tcp_nodelay: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
+    /// Aggregate low-water reserve for segmented recv (Config::recv_segment_reserve).
+    /// When `provided_bufs.free() <= recv_segment_reserve`, an arriving segmented
+    /// buffer is force-copied (Mode C) and its bid replenished immediately instead
+    /// of pinned, so held segments cannot deplete the shared ring under fan-in.
+    pub(crate) recv_segment_reserve: u32,
     /// Whether SO_TIMESTAMPING is enabled for connections.
     #[cfg(feature = "timestamps")]
     pub(crate) timestamps: bool,
@@ -522,6 +540,7 @@ impl Driver {
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),
             tcp_nodelay: config.tcp_nodelay,
             send_zc_threshold: config.send_zc_threshold,
+            recv_segment_reserve: config.recv_segment_reserve,
             #[cfg(feature = "timestamps")]
             timestamps: config.timestamps,
             #[cfg(feature = "timestamps")]
@@ -736,7 +755,12 @@ impl Driver {
         // for slot reuse.
         if self.recv_domain[conn_index as usize] == crate::recv::domain::RecvDomain::Segmented {
             for held in self.segment_hold[conn_index as usize].drain(..) {
-                self.pending_replenish.push(held.bid);
+                // Pinned entries pin a bid that must return to the ring; Owned
+                // entries already replenished their bid at delivery, so dropping
+                // the owned `Bytes` is all that is needed.
+                if let HeldRecvBuf::Pinned { bid, .. } = held {
+                    self.pending_replenish.push(bid);
+                }
             }
             self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
         }
@@ -748,8 +772,10 @@ impl Driver {
         // no-ops), the slot is still `Some` and we replenish it here. Unconditional
         // (not gated on the domain, which was just reset above): a pinned bid must
         // return to the ring regardless.
-        if let Some(pinned) = self.segment_pinned[conn_index as usize].take() {
-            self.pending_replenish.push(pinned.bid);
+        if let Some(HeldRecvBuf::Pinned { bid, .. }) =
+            self.segment_pinned[conn_index as usize].take()
+        {
+            self.pending_replenish.push(bid);
         }
         // Clear the fallback-recv flag so the slot's next occupant starts
         // clean. A still-in-flight fallback CQE for this occupant is
