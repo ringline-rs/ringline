@@ -881,6 +881,66 @@ impl ConnCtx {
         }
     }
 
+    /// Process the connection's buffered recv data as an **ordered chain of
+    /// borrowed segments** via a callback (Mode B "Borrow", the B1 callback face
+    /// — see `docs/segmented-recv-design.md`).
+    ///
+    /// Opts this connection into *segmented* delivery, then hands the callback a
+    /// [`SegChain`] presenting, **in order**:
+    /// 1. the current accumulator contents (if any) as the leading segment, then
+    /// 2. each held provided buffer, in arrival order.
+    ///
+    /// The callback borrows those slices for the call only (they cannot escape,
+    /// like [`with_data`](Self::with_data)) and returns a [`SegConsumed`] — the
+    /// number of bytes it consumed **from the front** of that concatenation.
+    ///
+    /// After the callback returns, the runtime settles state so that all
+    /// un-consumed bytes end up contiguously at the **front of the accumulator**,
+    /// in order:
+    /// - fully-consumed accumulator bytes are dropped from the front;
+    /// - each held buffer wholly consumed by the callback is replenished to the
+    ///   ring;
+    /// - any remainder — a partially-consumed buffer, plus buffers the callback
+    ///   did not reach (under-drain) — is **copied into the accumulator** and its
+    ///   bids replenished.
+    ///
+    /// So the fully-draining consumer (h2/grpc: extend-each + consume-all) pays
+    /// **zero** ringline copies, while an under-draining or whole-frame consumer
+    /// degrades to the [`with_data`](Self::with_data) copy — never a deadlock or a
+    /// bid leak. The next `with_segments` / `with_data` / `with_bytes` call sees
+    /// the carried-over bytes first, in order.
+    ///
+    /// Resolves to `Ok(n)` = total bytes consumed this call. A callback that
+    /// returns [`SegConsumed(0)`](SegConsumed) (it needs a bigger frame than is
+    /// buffered) gathers everything to the accumulator and **parks** for more
+    /// data — the `NeedMore` idiom, bounded by `recv_accumulator_max` (an
+    /// over-run closes the connection). Resolves to `Ok(0)` at EOF (recv side
+    /// closed with nothing to present) or for a stale handle (slot reused).
+    ///
+    /// This deliberately does **not** reuse [`ParseResult`]: its `NeedMore` grows
+    /// the heap accumulator by ring depth, which is the wrong bound here.
+    ///
+    /// Call this **before** the connection starts receiving; it flips the delivery
+    /// domain but does not retroactively segment bytes already gathered into the
+    /// accumulator.
+    ///
+    /// io_uring only — segmented delivery is backed by the provided-buffer ring.
+    #[cfg(has_io_uring)]
+    pub fn with_segments<F>(&self, f: F) -> WithSegmentsFuture<F>
+    where
+        F: FnMut(&SegChain<'_>) -> SegConsumed,
+    {
+        with_state(|driver, _executor| {
+            driver.recv_domain[self.conn_index as usize] =
+                crate::recv::domain::RecvDomain::Segmented;
+        });
+        WithSegmentsFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            f: Some(f),
+        }
+    }
+
     /// Install a recv sink so that CQE data is written directly to the
     /// target buffer instead of the per-connection accumulator.
     ///
@@ -2019,6 +2079,11 @@ impl SegmentReader<'_> {
     /// Parks when no buffer is held and the connection is still open, resuming
     /// when the recv completion handler holds a buffer and calls `wake_recv`
     /// (the same waiter mechanism as [`ConnCtx::with_data`]).
+    // This is a *lending* iterator: `next` borrows `&mut self` and yields a
+    // segment tied to that borrow, which `std::iter::Iterator` cannot express.
+    // The name is deliberate (it reads as an iterator to callers); it genuinely
+    // cannot implement the trait.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> SegmentNext<'_> {
         SegmentNext {
             conn_index: self.conn_index,
@@ -2286,6 +2351,213 @@ impl Future for RecvOwnedSegment {
 
             // Open and nothing held yet — park as a recv waiter, resumed by
             // `handle_recv_multi`'s `wake_recv` on the next arrival.
+            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[idx] = true;
+            Poll::Pending
+        })
+    }
+}
+
+// ── Segmented recv (Mode B — Borrow, B1 callback face) ───────────────
+
+/// Bytes a [`with_segments`](ConnCtx::with_segments) callback consumed from the
+/// **front** of the presented [`SegChain`].
+///
+/// This is deliberately *not* [`ParseResult`]: `with_segments` re-presents
+/// carried-over bytes bounded by ring depth, so the only signal it needs is
+/// "how many front bytes did you take". `SegConsumed(0)` is the "need a bigger
+/// frame" case (the runtime gathers the chain to the accumulator and parks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegConsumed(pub usize);
+
+/// An ordered, borrowed view of a connection's buffered recv data, handed to a
+/// [`with_segments`](ConnCtx::with_segments) callback.
+///
+/// The chain presents, **in order**, the accumulator remainder (if any) as the
+/// leading segment followed by each held provided buffer in arrival order — so a
+/// consumer walking [`iter`](Self::iter) never sees a later byte before an
+/// earlier one. The slices borrow driver-internal memory for the callback's
+/// duration only; they cannot escape (lifetime `'a`, like `with_data`).
+pub struct SegChain<'a> {
+    /// Ordered borrowed segments: accumulator-first, then held buffers.
+    segs: &'a [&'a [u8]],
+}
+
+impl<'a> SegChain<'a> {
+    /// Iterate the segments in order (accumulator remainder first, then held
+    /// provided buffers in arrival order).
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.segs.iter().copied()
+    }
+
+    /// Total number of bytes across all segments.
+    pub fn total_len(&self) -> usize {
+        self.segs.iter().map(|s| s.len()).sum()
+    }
+}
+
+/// Future returned by [`ConnCtx::with_segments`]. Resolves to the total bytes
+/// the callback consumed this call (`Ok(0)` at EOF / on a stale handle).
+#[cfg(has_io_uring)]
+pub struct WithSegmentsFuture<F> {
+    conn_index: u32,
+    /// See `WithDataFuture` for the role of `generation`.
+    generation: u32,
+    f: Option<F>,
+}
+
+#[cfg(has_io_uring)]
+impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFuture<F> {
+    type Output = io::Result<usize>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_state(|driver, executor| {
+            let conn = self.conn_index;
+            let idx = conn as usize;
+
+            // Stale future (slot closed-then-reused): surface EOF so the caller's
+            // read loop terminates rather than reading the new occupant's data.
+            if driver.connections.generation(conn) != self.generation {
+                self.f.take();
+                return Poll::Ready(Ok(0));
+            }
+
+            // Flush a leftover single-buffer zero-copy recv (from a pre-`segments`
+            // `with_data` cycle on this slot) into the accumulator so it is
+            // presented accumulator-first, in order, ahead of any held buffers.
+            if let Some(pending) = driver.pending_recv_bufs[idx].take() {
+                let pending_data =
+                    unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                // Intermediate buffer shuffle: on breach the authoritative cap
+                // check below (during settle) closes the connection.
+                let _ = driver.accumulators.append(conn, pending_data);
+                driver.pending_replenish.push(pending.bid);
+            }
+
+            // Nothing to present yet?
+            let acc_empty = driver.accumulators.is_empty(conn);
+            let hold_empty = driver.segment_hold[idx].is_empty();
+            if acc_empty && hold_empty {
+                let is_closed = driver
+                    .connections
+                    .get(conn)
+                    .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                    .unwrap_or(true);
+                if is_closed {
+                    self.f.take();
+                    return Poll::Ready(Ok(0));
+                }
+                // Open + nothing buffered → park; `handle_recv_multi` holds a
+                // buffer and calls `wake_recv` on the next arrival.
+                executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                executor.recv_waiters[idx] = true;
+                return Poll::Pending;
+            }
+
+            // Gather the ordered borrowed view: accumulator remainder first, then
+            // each held provided buffer. `held_meta` records (bid, len) by value so
+            // the settle below can run after the borrows are released.
+            let hold_len = driver.segment_hold[idx].len();
+            let mut slices: Vec<&[u8]> = Vec::with_capacity(1 + hold_len);
+            let mut held_meta: Vec<(u16, u32)> = Vec::with_capacity(hold_len);
+            let acc = driver.accumulators.data(conn);
+            let acc_len = acc.len();
+            if !acc.is_empty() {
+                slices.push(acc);
+            }
+            for held in &driver.segment_hold[idx] {
+                // `get_buffer` returns a raw pointer (no borrow tie), so the held
+                // slice does not alias the `provided_bufs` field borrow.
+                let (ptr, _) = driver.provided_bufs.get_buffer(held.bid);
+                let s = unsafe { std::slice::from_raw_parts(ptr, held.len as usize) };
+                slices.push(s);
+                held_meta.push((held.bid, held.len));
+            }
+
+            // Present to the callback; clamp its answer to what we actually showed.
+            let consumed = {
+                let chain = SegChain { segs: &slices };
+                let total = chain.total_len();
+                let f = self
+                    .f
+                    .as_mut()
+                    .expect("WithSegmentsFuture polled after Ready");
+                let SegConsumed(c) = f(&chain);
+                c.min(total)
+            };
+            // Release the accumulator/provided-buffer borrows before mutating.
+            drop(slices);
+
+            // ── Settle ──────────────────────────────────────────────────────
+            // All held buffers are being resolved this call, so drain the hold up
+            // front; each bid is either replenished (consumed) or gathered +
+            // replenished (remainder). Net: hold empties, un-consumed bytes live
+            // contiguously at the accumulator front, in order.
+            driver.segment_hold[idx].clear();
+
+            let mut rem_n = consumed;
+            // (1) Consume from the accumulator front (O(1) advance). If only part
+            // of the accumulator was consumed, `rem_n` is now 0 and every held
+            // buffer is untouched → gathered behind the accumulator remainder.
+            let acc_consumed = rem_n.min(acc_len);
+            driver.accumulators.consume(conn, acc_consumed);
+            rem_n -= acc_consumed;
+
+            // (2) Walk the held buffers in order.
+            let mut overflowed = false;
+            for (bid, len) in held_meta {
+                let len = len as usize;
+                if rem_n >= len {
+                    // Wholly consumed by the callback — just replenish.
+                    rem_n -= len;
+                    driver.pending_replenish.push(bid);
+                } else {
+                    // Partially consumed (or untouched, when rem_n == 0): copy the
+                    // unconsumed remainder [rem_n..len] into the accumulator, in
+                    // order, then replenish. Push the bid even on breach so it is
+                    // never leaked.
+                    if !overflowed {
+                        let (ptr, _) = driver.provided_bufs.get_buffer(bid);
+                        let remainder =
+                            unsafe { std::slice::from_raw_parts(ptr.add(rem_n), len - rem_n) };
+                        if !driver.accumulators.append(conn, remainder) {
+                            overflowed = true;
+                        }
+                    }
+                    rem_n = 0;
+                    driver.pending_replenish.push(bid);
+                }
+            }
+
+            if overflowed {
+                // The under-drain gather streamed past `recv_accumulator_max`
+                // (a misbehaving whole-frame consumer). Close rather than OOM;
+                // held bids were already queued for replenish above.
+                self.f.take();
+                driver.close_connection(conn);
+                return Poll::Ready(Ok(0));
+            }
+
+            if consumed > 0 {
+                // Progress made — return it. Any carried-over remainder now sits at
+                // the accumulator front and is re-presented next call.
+                self.f.take();
+                return Poll::Ready(Ok(consumed));
+            }
+
+            // consumed == 0 (need a bigger frame): everything is gathered to the
+            // accumulator. Park for more data (bounded by recv_accumulator_max),
+            // or surface EOF if the recv side already closed. This mirrors
+            // `with_data`'s NeedMore idiom — never a busy loop.
+            let is_closed = driver
+                .connections
+                .get(conn)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+            if is_closed {
+                self.f.take();
+                return Poll::Ready(Ok(0));
+            }
             executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[idx] = true;
             Poll::Pending

@@ -3398,6 +3398,7 @@ mod tests {
     use crate::completion::{OpTag, UserData};
     use crate::config::Config;
     use crate::runtime::io::ConnCtx;
+    use crate::runtime::io::SegConsumed;
     use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -4299,6 +4300,233 @@ mod tests {
         assert!(
             done,
             "closed connection with an empty hold yields EOF (Ok(None))"
+        );
+    }
+
+    // ── Segmented recv B1 callback (with_segments / SegChain) ────────────
+
+    /// (a) Two held buffers are presented to the callback IN ORDER; a callback
+    /// that consumes everything replenishes both bids, leaves the accumulator
+    /// empty, and restores the ring's free count.
+    #[test]
+    fn with_segments_presents_two_held_buffers_in_order_full_drain() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        // Two arrivals held in order.
+        deliver_segment(&mut el, conn_index, 0, b"AAA");
+        deliver_segment(&mut el, conn_index, 1, b"BBB");
+        assert_eq!(el.driver.provided_bufs.free(), entries - 2);
+
+        let seen: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen_cb = Rc::clone(&seen);
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.with_segments(
+            move |chain| {
+                for s in chain.iter() {
+                    seen_cb.borrow_mut().push(s.to_vec());
+                }
+                SegConsumed(chain.total_len()) // full drain
+            }
+        )));
+        let waker = noop_waker();
+        let n = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(n)) => n,
+            other => panic!("expected Ready(Ok(n)), got {other:?}"),
+        };
+
+        assert_eq!(n, 6, "full drain consumes all presented bytes");
+        assert_eq!(
+            *seen.borrow(),
+            vec![b"AAA".to_vec(), b"BBB".to_vec()],
+            "segments presented in arrival order"
+        );
+        assert!(
+            el.driver.accumulators.data(conn_index).is_empty(),
+            "full drain leaves the accumulator empty"
+        );
+        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
+        assert!(el.driver.pending_replenish.contains(&0));
+        assert!(el.driver.pending_replenish.contains(&1));
+        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "both held bids replenished — free restored"
+        );
+    }
+
+    /// (b) Under-drain: the callback consumes only part of the first buffer; the
+    /// remainder of that buffer plus the un-reached buffer gather to the FRONT of
+    /// the accumulator, in order, and both bids are replenished.
+    #[test]
+    fn with_segments_under_drain_gathers_remainder_to_accumulator_front() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        deliver_segment(&mut el, conn_index, 0, b"hello");
+        deliver_segment(&mut el, conn_index, 1, b"world");
+        assert_eq!(el.driver.provided_bufs.free(), entries - 2);
+
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut fut = std::pin::pin!(
+            with_driver_state(&mut el, || conn.with_segments(|_chain| SegConsumed(3)))
+        ); // consume "hel" only
+        let waker = noop_waker();
+        let n = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(n)) => n,
+            other => panic!("expected Ready(Ok(3)), got {other:?}"),
+        };
+        assert_eq!(n, 3);
+
+        // Remainder "lo" + un-reached "world" now live contiguously at the front
+        // of the accumulator, in order.
+        assert_eq!(
+            el.driver.accumulators.data(conn_index),
+            b"loworld",
+            "under-drain remainder gathers to the accumulator front, in order"
+        );
+        assert!(
+            el.driver.segment_hold[conn_index as usize].is_empty(),
+            "hold is drained after settle"
+        );
+        assert!(el.driver.pending_replenish.contains(&0));
+        assert!(el.driver.pending_replenish.contains(&1));
+        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "both bids replenished despite the gather — free restored"
+        );
+    }
+
+    /// (c) Accumulator-first ordering: pre-seed the accumulator, then a held
+    /// buffer arrives; the SegChain presents the accumulator bytes BEFORE the
+    /// held buffer. A `SegConsumed(0)` (need-more) gathers everything and parks.
+    #[test]
+    fn with_segments_presents_accumulator_before_held_and_parks_on_need_more() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        // Pre-seed the accumulator, then hold a later-arriving buffer.
+        assert!(el.driver.accumulators.append(conn_index, b"ACC"));
+        deliver_segment(&mut el, conn_index, 0, b"HELD");
+
+        let seen: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen_cb = Rc::clone(&seen);
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.with_segments(
+            move |chain| {
+                for s in chain.iter() {
+                    seen_cb.borrow_mut().push(s.to_vec());
+                }
+                SegConsumed(0) // need a bigger frame
+            }
+        )));
+        let waker = noop_waker();
+        let p = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+
+        assert!(
+            matches!(p, std::task::Poll::Pending),
+            "SegConsumed(0) parks for more data"
+        );
+        assert_eq!(
+            *seen.borrow(),
+            vec![b"ACC".to_vec(), b"HELD".to_vec()],
+            "accumulator remainder presented BEFORE the held buffer"
+        );
+        assert!(
+            el.executor.recv_waiters[conn_index as usize],
+            "need-more registers a recv waiter"
+        );
+        // Everything gathered to the accumulator front, in order; hold empty.
+        assert_eq!(el.driver.accumulators.data(conn_index), b"ACCHELD");
+        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
+        assert!(el.driver.pending_replenish.contains(&0));
+    }
+
+    /// (d) Park on an empty hold, then resume when a buffer arrives; and EOF on a
+    /// closed connection with nothing to present.
+    #[test]
+    fn with_segments_parks_then_resumes_and_reports_eof() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        // with_segments opts into Segmented itself.
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn
+            .with_segments(|chain| SegConsumed(chain.total_len()))));
+        let waker = noop_waker();
+
+        // First poll: nothing to present, connection open → parks.
+        let p1 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(matches!(p1, std::task::Poll::Pending), "parks on empty");
+        assert_eq!(
+            el.driver.recv_domain[conn_index as usize],
+            crate::recv::domain::RecvDomain::Segmented,
+            "with_segments sets the Segmented domain"
+        );
+        assert!(el.executor.recv_waiters[conn_index as usize]);
+
+        // A buffer arrives; wake fires.
+        deliver_segment(&mut el, conn_index, 0, b"data");
+        assert!(!el.executor.recv_waiters[conn_index as usize]);
+
+        // Second poll: resumes, consumes everything.
+        let n = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(n)) => n,
+            other => panic!("expected Ready(Ok(4)), got {other:?}"),
+        };
+        assert_eq!(n, 4);
+        assert!(el.driver.accumulators.data(conn_index).is_empty());
+
+        // EOF: a fresh closed connection with nothing held yields Ok(0).
+        let c2 = accept_connection(&mut el);
+        let g2 = el.driver.connections.generation(c2);
+        el.driver.recv_domain[c2 as usize] = crate::recv::domain::RecvDomain::Segmented;
+        el.driver.close_connection(c2);
+        let conn2 = ConnCtx::new(c2, g2);
+        let mut eof = std::pin::pin!(with_driver_state(&mut el, || conn2
+            .with_segments(|chain| SegConsumed(chain.total_len()))));
+        let done = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            matches!(eof.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(0)))
+        });
+        assert!(
+            done,
+            "closed connection with an empty hold yields Ok(0) EOF"
         );
     }
 
