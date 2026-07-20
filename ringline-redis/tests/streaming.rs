@@ -362,6 +362,111 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
 
     run_set_stream(addr).await?;
     run_pool_stream(addr).await?;
+    run_borrow_get(addr).await?;
+
+    Ok(())
+}
+
+// ── Borrow GET (Mode-B recv_get_discard / recv_get_segments) ───────────────
+
+async fn run_borrow_get(addr: SocketAddr) -> Result<(), String> {
+    // (a) hit: recv_get_discard returns the value length (no copy).
+    {
+        let mut client = connect(addr).await?;
+        client
+            .fire_get(b"stream:small", 1)
+            .map_err(|e| format!("fire: {e}"))?;
+        let meta = client
+            .recv_get_discard()
+            .await
+            .map_err(|e| format!("recv_get_discard: {e}"))?;
+        if meta.value_len != Some(SMALL.len()) {
+            return Err(format!(
+                "borrow hit len: got {:?}, want {}",
+                meta.value_len,
+                SMALL.len()
+            ));
+        }
+        if meta.user_data != 1 {
+            return Err("borrow user_data mismatch".into());
+        }
+    }
+
+    // (b) miss: `$-1` → value_len None.
+    {
+        let mut client = connect(addr).await?;
+        client
+            .fire_get(b"stream:absent", 2)
+            .map_err(|e| format!("fire: {e}"))?;
+        let meta = client
+            .recv_get_discard()
+            .await
+            .map_err(|e| format!("recv miss: {e}"))?;
+        if meta.value_len.is_some() {
+            return Err(format!("borrow miss should be None, got {:?}", meta.value_len));
+        }
+    }
+
+    // (c) recv_get_segments delivers the exact value bytes (zero-copy borrow),
+    // reassembling a large value that spans many provided buffers.
+    {
+        let large = large_value();
+        let mut client = connect(addr).await?;
+        client
+            .fire_get(b"stream:large", 3)
+            .map_err(|e| format!("fire: {e}"))?;
+        let mut collected = Vec::new();
+        let meta = client
+            .recv_get_segments(|seg| collected.extend_from_slice(seg))
+            .await
+            .map_err(|e| format!("recv_get_segments: {e}"))?;
+        if meta.value_len != Some(large.len()) {
+            return Err(format!(
+                "borrow large len: got {:?}, want {}",
+                meta.value_len,
+                large.len()
+            ));
+        }
+        if collected != large {
+            return Err("borrow large value bytes mismatch".into());
+        }
+    }
+
+    // (d) pipelined: fire several GETs, recv in order — exercises the inter-reply
+    // boundary gathering (the only copy on the path).
+    {
+        let mut client = connect(addr).await?;
+        client
+            .fire_get(b"stream:small", 10)
+            .map_err(|e| format!("fire: {e}"))?;
+        client
+            .fire_get(b"stream:absent", 11)
+            .map_err(|e| format!("fire: {e}"))?;
+        client
+            .fire_get(b"stream:small", 12)
+            .map_err(|e| format!("fire: {e}"))?;
+        let m0 = client
+            .recv_get_discard()
+            .await
+            .map_err(|e| format!("pipe 0: {e}"))?;
+        let m1 = client
+            .recv_get_discard()
+            .await
+            .map_err(|e| format!("pipe 1: {e}"))?;
+        let m2 = client
+            .recv_get_discard()
+            .await
+            .map_err(|e| format!("pipe 2: {e}"))?;
+        if m0.user_data != 10 || m0.value_len != Some(SMALL.len()) {
+            return Err(format!("pipe 0 mismatch: {m0:?}"));
+        }
+        if m1.user_data != 11 || m1.value_len.is_some() {
+            return Err(format!("pipe 1 (miss) mismatch: {m1:?}"));
+        }
+        if m2.user_data != 12 || m2.value_len != Some(SMALL.len()) {
+            return Err(format!("pipe 2 mismatch: {m2:?}"));
+        }
+    }
 
     Ok(())
 }

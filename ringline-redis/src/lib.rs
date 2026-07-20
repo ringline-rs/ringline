@@ -383,6 +383,20 @@ pub enum CompletedOp {
     },
 }
 
+/// Result metadata from a Mode-B borrow GET
+/// ([`recv_get_discard`](Client::recv_get_discard) /
+/// [`recv_get_segments`](Client::recv_get_segments)): the value length (`None`
+/// for a miss) and the fired `user_data`. The value bytes are never retained —
+/// they are parsed from borrowed, zero-copy segments and released.
+#[cfg(has_io_uring)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetMeta {
+    /// Value length in bytes, or `None` for a cache miss (`$-1`).
+    pub value_len: Option<usize>,
+    /// The `user_data` passed to the corresponding [`fire_get`](Client::fire_get).
+    pub user_data: u64,
+}
+
 // ── ClientBuilder ───────────────────────────────────────────────────────
 
 type ResultCallback = Box<dyn Fn(&CommandResult)>;
@@ -1183,6 +1197,165 @@ impl Client {
         };
 
         Ok(op)
+    }
+
+    /// Recv the next pending GET as a Mode-B **borrow-and-discard**: the value
+    /// body is parsed from borrowed, zero-copy segments and released without ever
+    /// being gathered into a contiguous buffer or [`Bytes`]. Returns the value
+    /// length (`None` = miss) and the fired `user_data`.
+    ///
+    /// The next pending fire/recv op MUST be a GET (fired via
+    /// [`fire_get`](Self::fire_get)); a non-GET pending op yields
+    /// [`Error::UnexpectedResponse`].
+    ///
+    /// Zero value copy: under pipelining only the few-byte boundary remainder
+    /// between this reply and the next is gathered. io_uring only (segmented recv).
+    #[cfg(has_io_uring)]
+    pub async fn recv_get_discard(&mut self) -> Result<GetMeta, Error> {
+        self.recv_get_segments(|_| {}).await
+    }
+
+    /// Like [`recv_get_discard`](Self::recv_get_discard), but invokes `on_value`
+    /// on each borrowed span of value bytes, in order — for a checksum or
+    /// validator that must not retain the value. Still zero value copy.
+    #[cfg(has_io_uring)]
+    pub async fn recv_get_segments(
+        &mut self,
+        mut on_value: impl FnMut(&[u8]),
+    ) -> Result<GetMeta, Error> {
+        self.flush()?;
+        let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
+        if !matches!(pending.kind, PendingOpKind::Get) {
+            // This specialized recv only decodes a GET reply. A different pending
+            // kind is caller misuse (mixed op kinds); surface it.
+            return Err(Error::UnexpectedResponse);
+        }
+        self.flushed_count = self.flushed_count.saturating_sub(1);
+
+        // RESP GET reply parse state, carried across `with_segments` calls. Each
+        // call consumes every value byte it is shown (so nothing is re-gathered)
+        // and stops only at the reply boundary, leaving the next reply's bytes to
+        // be gathered — the only copy on the path.
+        enum Phase {
+            Header,
+            Value,
+            Trailing,
+            Done,
+        }
+        let mut phase = Phase::Header;
+        let mut header_buf: Vec<u8> = Vec::with_capacity(16);
+        let mut value_remaining: usize = 0;
+        let mut trailing_remaining: usize = 0;
+        // Ok(Some(len)) = hit, Ok(None) = miss, Err = server error / unexpected.
+        let mut outcome: Result<Option<usize>, Error> = Ok(None);
+        let mut total_consumed: usize = 0;
+
+        loop {
+            let n = self
+                .conn
+                .with_segments(|chain| {
+                    let mut consumed = 0usize;
+                    'outer: for slice in chain.iter() {
+                        let mut pos = 0usize;
+                        while pos < slice.len() {
+                            match phase {
+                                Phase::Header => {
+                                    header_buf.push(slice[pos]);
+                                    pos += 1;
+                                    consumed += 1;
+                                    match parse_get_header(&header_buf) {
+                                        Ok(None) => {} // need more header bytes
+                                        Ok(Some(GetHeader::Nil)) => {
+                                            outcome = Ok(None);
+                                            phase = Phase::Done;
+                                            break 'outer;
+                                        }
+                                        Ok(Some(GetHeader::Bulk { len, .. })) => {
+                                            value_remaining = len;
+                                            trailing_remaining = 2;
+                                            outcome = Ok(Some(len));
+                                            phase = Phase::Value;
+                                        }
+                                        Err(e) => {
+                                            outcome = Err(e);
+                                            phase = Phase::Done;
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                                Phase::Value => {
+                                    let take = value_remaining.min(slice.len() - pos);
+                                    if take > 0 {
+                                        on_value(&slice[pos..pos + take]);
+                                    }
+                                    value_remaining -= take;
+                                    pos += take;
+                                    consumed += take;
+                                    if value_remaining == 0 {
+                                        phase = Phase::Trailing;
+                                    }
+                                }
+                                Phase::Trailing => {
+                                    let take = trailing_remaining.min(slice.len() - pos);
+                                    trailing_remaining -= take;
+                                    pos += take;
+                                    consumed += take;
+                                    if trailing_remaining == 0 {
+                                        phase = Phase::Done;
+                                        break 'outer;
+                                    }
+                                }
+                                Phase::Done => break 'outer,
+                            }
+                        }
+                    }
+                    ringline::SegConsumed(consumed)
+                })
+                .await?;
+            total_consumed += n;
+            if matches!(phase, Phase::Done) {
+                break;
+            }
+            if n == 0 {
+                // EOF before the reply completed (short FIN) — desynced.
+                let _ = self.conn.end_segments();
+                return Err(Error::ConnectionClosed);
+            }
+        }
+
+        // Restore the default read path (the next reply's leftover bytes were
+        // already gathered into the accumulator by the last `with_segments`
+        // settle, and are presented to the following read).
+        self.conn.end_segments()?;
+
+        // Metrics, mirroring `recv()`.
+        let ttfb_ns = self.compute_ttfb(pending.send_ts);
+        let latency_ns = match pending.start {
+            Some(start) => self.finish_timing(pending.send_ts, start),
+            None => 0,
+        };
+        let (success, hit) = match &outcome {
+            Ok(Some(_)) => (true, Some(true)),
+            Ok(None) => (true, Some(false)),
+            Err(_) => (false, None),
+        };
+        self.record(&CommandResult {
+            command: CommandType::Get,
+            latency_ns,
+            hit,
+            success,
+            ttfb_ns,
+            tx_bytes: pending.tx_bytes,
+            rx_bytes: total_consumed as u32,
+        });
+
+        match outcome {
+            Ok(value_len) => Ok(GetMeta {
+                value_len,
+                user_data: pending.user_data,
+            }),
+            Err(e) => Err(e),
+        }
     }
 
     // ── Internal protocol methods (pub(crate), &self) ───────────────────
