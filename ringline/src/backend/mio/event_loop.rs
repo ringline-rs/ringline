@@ -841,6 +841,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // MSG_CTRUNC means we lost the cmsg but the payload is intact —
             // treat it as a single datagram rather than dropping it.
             let segment_size = if msg.msg_flags & libc::MSG_CTRUNC == 0 && msg.msg_controllen > 0 {
+                // `msg_controllen` is `size_t` on Linux (cast redundant) but
+                // `socklen_t` (u32) on macOS (cast required) — allow the
+                // platform-conditional cast so both clippy jobs pass.
+                #[allow(clippy::unnecessary_cast)]
                 let clen = msg.msg_controllen as usize;
                 crate::backend::udp_gro::parse_segment_size(&control[..clen]).unwrap_or(0)
             } else {

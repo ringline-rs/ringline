@@ -1130,6 +1130,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
             }
+        } else if self.driver.recv_domain[conn_index as usize]
+            == crate::recv::domain::RecvDomain::Segmented
+        {
+            // Segmented delivery (Mode B/C): hold the provided buffer in-place
+            // (bid NOT replenished, no accumulator copy) for a future segment
+            // reader to consume. `on_handout()` already counted this bid above;
+            // the buffer stays pinned in the ring until the reader (later
+            // increment) or `close_connection` drains the hold. Backpressure is
+            // natural — unreplenished bids deplete the ring (ENOBUFS) until a
+            // reader releases them, exactly like the recv-forward hold. TLS is
+            // excluded (handled above), so this only runs on plaintext.
+            self.driver.segment_hold[conn_index as usize].push_back(crate::backend::HeldRecvBuf {
+                bid,
+                len: bytes_received,
+            });
+            self.executor.wake_recv(conn_index);
         } else if self.driver.recv_forward[conn_index as usize] {
             // Zero-copy recv-forward path: hold the provided buffer in-place
             // (bid NOT replenished) for scatter-gather forwarding via
@@ -1492,6 +1508,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.driver.pending_replenish.push(pending.bid);
                 }
                 self.driver.accumulators.reset(conn_index);
+                self.driver.reset_segment_state(conn_index);
                 self.arm_recv(conn_index);
 
                 // TLS path: defer accept until handshake completes.
@@ -2266,6 +2283,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.pending_replenish.push(pending.bid);
         }
         self.driver.accumulators.reset(conn_index);
+        self.driver.reset_segment_state(conn_index);
 
         // TLS client path
         if let Some(ref mut tls_table) = self.driver.tls_table
@@ -3759,6 +3777,77 @@ mod tests {
             el.driver.provided_bufs.free(),
             entries,
             "replenish must restore free (balanced accounting)"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_segmented_holds_buffer_and_close_drains() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        // Opt this connection into segmented delivery.
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        let entries = el.driver.provided_bufs.ring_entries();
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "all buffers free before any recv"
+        );
+
+        let bid: u16 = 0;
+        let flags = 1u32 | 2u32 | ((bid as u32) << 16); // F_BUFFER | F_MORE, bid=0
+        let bytes_received = 5i32;
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"hello".as_ptr(), buf_ptr as *mut u8, 5);
+        }
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), bytes_received, flags);
+
+        // (a) Buffer went to the segment hold, NOT the accumulator or the
+        // single-buffer zero-copy slot, and is NOT queued for replenish.
+        assert!(
+            el.driver.accumulators.data(conn_index).is_empty(),
+            "segmented recv must not append to the accumulator"
+        );
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_none(),
+            "segmented recv must not use the single-buffer zero-copy slot"
+        );
+        assert!(
+            !el.driver.pending_replenish.contains(&bid),
+            "held segment bid must NOT be replenished while held"
+        );
+        let hold = &el.driver.segment_hold[conn_index as usize];
+        assert_eq!(hold.len(), 1, "buffer should be held in segment_hold");
+        assert_eq!(hold[0].bid, bid);
+        assert_eq!(hold[0].len, bytes_received as u32);
+
+        // (b) The held buffer is accounted against the ring's free count.
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries - 1,
+            "held segment must decrement free by one"
+        );
+
+        // (c) Close drains the hold: the bid is queued for replenish and the
+        // hold is emptied; committing the replenish restores the ring.
+        el.driver.close_connection(conn_index);
+        assert!(
+            el.driver.segment_hold[conn_index as usize].is_empty(),
+            "close must drain the segment hold"
+        );
+        assert!(
+            el.driver.pending_replenish.contains(&bid),
+            "close must queue the held bid for replenish"
+        );
+        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "free must return to ring_entries after the held bid is replenished"
         );
     }
 

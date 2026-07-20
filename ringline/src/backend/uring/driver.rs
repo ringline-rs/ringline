@@ -99,6 +99,22 @@ pub(crate) struct PendingRecvBuf {
     pub(crate) ptr: *const u8,
 }
 
+/// A provided recv buffer held in the ring for segmented delivery (Mode B/C).
+///
+/// Held for a `Segmented` connection: the bid is NOT replenished, so the buffer
+/// stays pinned in the provided ring until a future segment reader consumes it
+/// (later increment) or the connection closes (`close_connection` drains the
+/// hold). The backing pointer is derivable via `provided_bufs.get_buffer(bid)`,
+/// so only the id and length are stored.
+#[derive(Clone, Copy)]
+pub(crate) struct HeldRecvBuf {
+    pub(crate) bid: u16,
+    /// Bytes received into this buffer. Read by the segment reader (later
+    /// increment); close-drain only needs the bid.
+    #[allow(dead_code)]
+    pub(crate) len: u32,
+}
+
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
@@ -151,6 +167,17 @@ pub(crate) struct Driver {
     pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
     /// Per-connection opt-in flag for the zero-copy recv-forward path.
     pub(crate) recv_forward: Vec<bool>,
+    /// Per-connection recv delivery domain (segmented-recv). `CopyOrConsume`
+    /// (default) uses the accumulator / single-buffer zero-copy path;
+    /// `Segmented` holds arriving provided buffers in `segment_hold` instead.
+    /// Reset at slot (re)activation and on close.
+    pub(crate) recv_domain: Vec<crate::recv::domain::RecvDomain>,
+    /// Per-connection held provided buffers for `Segmented` connections. Bids
+    /// pushed here are pinned in the ring (NOT replenished, no accumulator copy)
+    /// until a reader consumes them (later increment) or the connection closes.
+    /// `close_connection` is currently the only drain path — it returns each
+    /// held bid to `pending_replenish`.
+    pub(crate) segment_hold: Vec<std::collections::VecDeque<HeldRecvBuf>>,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
@@ -467,6 +494,13 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             recv_forward: vec![false; config.max_connections as usize],
+            recv_domain: vec![
+                crate::recv::domain::RecvDomain::default();
+                config.max_connections as usize
+            ],
+            segment_hold: (0..config.max_connections)
+                .map(|_| std::collections::VecDeque::new())
+                .collect(),
             accept_rx,
             eventfd,
             eventfd_buf: [0u8; 8],
@@ -657,6 +691,15 @@ impl Driver {
         }
     }
 
+    /// Reset segmented-recv delivery state for a (re)activated connection slot.
+    /// The hold is already drained by `close_connection`, so this is defensive;
+    /// it also restores the domain to the default in case a slot is reused
+    /// without an intervening close.
+    pub(crate) fn reset_segment_state(&mut self, conn_index: u32) {
+        self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
+        self.segment_hold[conn_index as usize].clear();
+    }
+
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         if let Some(conn) = self.connections.get_mut(conn_index) {
             if matches!(conn.recv_mode, RecvMode::Closed) {
@@ -675,6 +718,16 @@ impl Driver {
                 self.pending_replenish.push(pending.bid);
             }
             self.recv_forward[conn_index as usize] = false;
+        }
+        // Drain any held segmented-recv buffers so their bids return to the
+        // ring — nothing consumes held buffers yet, so close is the only drain
+        // path; without this a Segmented connection leaks bids. Reset the domain
+        // for slot reuse.
+        if self.recv_domain[conn_index as usize] == crate::recv::domain::RecvDomain::Segmented {
+            for held in self.segment_hold[conn_index as usize].drain(..) {
+                self.pending_replenish.push(held.bid);
+            }
+            self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
         }
         // Clear the fallback-recv flag so the slot's next occupant starts
         // clean. A still-in-flight fallback CQE for this occupant is
