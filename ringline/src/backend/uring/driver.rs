@@ -979,19 +979,17 @@ impl Driver {
             }
             self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
         }
-        // Reclaim a bid checked out to a live `RecvSegment` (a parked task holding
-        // a segment across an await). `take()` is the single-release discriminant:
-        // if the segment's `Drop` already ran in-poll it took the slot (None here,
-        // no double-replenish); if the future is being dropped in the *unguarded*
-        // `drain_completions` (CURRENT_DRIVER == None, so `RecvSegment::drop`
-        // no-ops), the slot is still `Some` and we replenish it here. Unconditional
-        // (not gated on the domain, which was just reset above): a pinned bid must
-        // return to the ring regardless.
-        if let Some(HeldRecvBuf::Pinned { bid, .. }) =
-            self.segment_pinned[conn_index as usize].take()
-        {
-            self.pending_replenish.push(bid);
-        }
+        // A bid checked out to a live `RecvSegment` (a parked task holding a
+        // segment across an await) must NOT be reclaimed here. `RecvSegment::deref`
+        // reads that bid's provided buffer directly, and a parked task can still
+        // resume and deref it between now and the `Close` CQE — returning the bid
+        // to the ring now would let another connection's recv overwrite a buffer a
+        // live segment is still reading (a safe-API data leak). The bid stays
+        // pinned in `segment_pinned[conn]` until `handle_close`, which reclaims it
+        // after `remove_connection` has dropped the future (and with it the
+        // segment). `RecvSegment::drop` running in-poll before then still releases
+        // it (the pin slot is the single-release discriminant); if the drop runs
+        // unguarded during teardown it no-ops and `handle_close` does the release.
         // An in-flight Mode A forward write's backing is still owned by the kernel
         // (it is the write's *source* memory) until the write CQE arrives —
         // reclaiming it now would either return a provided bid to the ring while

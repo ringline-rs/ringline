@@ -2731,6 +2731,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.pending_replenish.push(pending.bid);
         }
 
+        // Reclaim a bid still pinned by a live `RecvSegment` (Mode B). The future
+        // is dropped just below by `remove_connection`, which drops the segment —
+        // but that `Drop` runs unguarded here (`CURRENT_DRIVER == None`) and
+        // no-ops, so the release is done explicitly. `close_connection`
+        // deliberately did NOT reclaim this bid (a parked task could still have
+        // deref'd it before this point); by now the connection is fully closing
+        // and no live segment can read the buffer, so it is safe to return. If an
+        // in-poll `RecvSegment::drop`/`into_owned` already released it, the slot is
+        // `None` and this is a no-op (single-release via the pin slot).
+        if let Some(crate::backend::HeldRecvBuf::Pinned { bid, .. }) =
+            self.driver.segment_pinned[conn_index as usize].take()
+        {
+            self.driver.pending_replenish.push(bid);
+        }
+
         let was_established = self
             .driver
             .connections
@@ -4411,8 +4426,15 @@ mod tests {
         });
     }
 
+    /// Regression for the Mode B RecvSegment UAF: closing a connection while a
+    /// `RecvSegment` is still checked out must NOT return its pinned bid to the
+    /// ring. The segment's `deref` still reads that provided buffer, and a parked
+    /// task can resume and read it before the `Close` CQE — recycling the bid at
+    /// close time would let another connection's recv overwrite live data. The
+    /// release is deferred: an in-poll drop (here) releases exactly once via the
+    /// pin slot; teardown via `handle_close` is covered by the next test.
     #[test]
-    fn close_while_segment_pinned_replenishes_bid_exactly_once() {
+    fn close_while_segment_pinned_defers_bid_release() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
@@ -4438,26 +4460,27 @@ mod tests {
             "segment is pinned"
         );
 
-        // Close while the segment is still checked out. close_connection drains
-        // the pin slot (the single-release discriminant) and replenishes the bid.
+        // Close while the segment is still checked out: the bid must stay pinned.
         el.driver.close_connection(conn_index);
         assert!(
-            el.driver.segment_pinned[conn_index as usize].is_none(),
-            "close drains the pin slot"
+            el.driver.segment_pinned[conn_index as usize].is_some(),
+            "close must not drain the pin slot while a live segment can read it"
         );
-        assert_eq!(
-            el.driver
-                .pending_replenish
-                .iter()
-                .filter(|&&b| b == bid)
-                .count(),
-            1,
-            "close replenishes the pinned bid exactly once"
+        assert!(
+            !el.driver.pending_replenish.contains(&bid),
+            "the pinned bid must not return to the ring at close time"
         );
 
-        // Dropping the now-stale segment must NOT double-replenish: the guarded
-        // drop sees an empty pin slot (close already took it) → no-op.
-        with_driver_state(&mut el, || drop(seg));
+        // The segment is still valid after close (reads its own buffer, not
+        // recycled memory); dropping it in-poll then releases the bid exactly once.
+        with_driver_state(&mut el, || {
+            assert_eq!(
+                &seg[..],
+                b"hello",
+                "the live segment still reads its own buffer after close"
+            );
+            drop(seg);
+        });
         assert_eq!(
             el.driver
                 .pending_replenish
@@ -4465,7 +4488,11 @@ mod tests {
                 .filter(|&&b| b == bid)
                 .count(),
             1,
-            "drop after close must not double-replenish the bid"
+            "in-poll drop after close replenishes the bid exactly once"
+        );
+        assert!(
+            el.driver.segment_pinned[conn_index as usize].is_none(),
+            "the pin slot is cleared by the drop"
         );
 
         let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
@@ -4474,6 +4501,73 @@ mod tests {
             el.driver.provided_bufs.free(),
             entries,
             "free returns to ring_entries — no leak, no double-replenish"
+        );
+    }
+
+    /// The other Mode B UAF-fix half: when a connection is torn down (the `Close`
+    /// CQE → `handle_close` → the future, and with it the segment, is dropped) the
+    /// pinned bid must be reclaimed exactly once — the unguarded `RecvSegment::drop`
+    /// during teardown no-ops (`CURRENT_DRIVER == None`), so `handle_close` does the
+    /// release. Without it the bid would leak.
+    #[test]
+    fn handle_close_reclaims_pinned_segment_bid_on_teardown() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(reader.next());
+        let seg = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(seg))) => seg,
+            _ => panic!("expected a pinned segment"),
+        };
+
+        // Close, then let the Close CQE tear the connection down. The bid is still
+        // pinned at close time; `handle_close` reclaims it.
+        el.driver.close_connection(conn_index);
+        assert!(
+            !el.driver.pending_replenish.contains(&bid),
+            "bid not returned at close time"
+        );
+        let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
+        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "handle_close reclaims the pinned segment bid exactly once"
+        );
+
+        // The slot is released; the now-stale segment's unguarded drop no-ops (no
+        // double-replenish).
+        drop(seg);
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "stale segment drop after teardown does not double-replenish"
+        );
+        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "no leak, no double"
         );
     }
 
