@@ -16,8 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (owned chunks), and `collect()` (the one materialization). Bounded to the
   parsed bulk length with an error on a short FIN; dropping a stream mid-value
   poisons (closes) the connection. io_uring only. Pooled/sharded/cluster `get`
-  stay materialized. (memcache streaming, `get_cas`, streaming `set`, and
-  `recv_streaming` fire/recv integration are deferred.)
+  stay materialized. (`get_cas`, streaming `set`, and `recv_streaming` fire/recv
+  integration are deferred.)
+- `ringline-memcache`: streaming GET — `Client::get_stream(key) -> Option<StreamValue>`
+  (single-connection `Client` only). Mirrors the redis streaming API for the
+  memcache wire format (`VALUE <key> <flags> <bytes>\r\n<data>\r\nEND\r\n`):
+  the client parses the `VALUE` header, then streams the `<bytes>` value body
+  over the runtime's segmented-recv API. `StreamValue` exposes `flags()`, `len()`,
+  `discard()` (consume without a gather copy), `next_segment()` (owned chunks),
+  and `collect()` (the one materialization). Bounded to the parsed length with an
+  error on a short FIN; dropping a stream mid-value poisons (closes) the
+  connection. A miss (bare `END\r\n`) returns `Ok(None)`. io_uring only. The
+  multi-key `gets(keys)` stays eager; pooled/sharded `get` stay materialized.
+  (`get_cas` streaming and streaming `set` are deferred.)
 - `ConnCtx::end_segments()` — end segmented-recv delivery and restore the default
   `with_data`/`with_bytes` read path (gathering any still-held segments into the
   accumulator). io_uring only.
