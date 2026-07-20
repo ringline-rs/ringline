@@ -167,7 +167,7 @@ impl SegmentReader<'_> {
   **compile error** — drop-before-next and non-escape are structural, not
   documented. `!Send`/`!Clone` via `PhantomData<*const ()>`. (It cannot be a
   `futures::Stream`/`for` loop — that's inherent to lending iterators.)
-- To *keep* a segment, `.to_owned() -> Bytes` (Mode C copy). No zero-copy retain.
+- To *keep* a segment, `.into_owned() -> Bytes` (Mode C copy). No zero-copy retain.
 
 Consumers: validators/checksummers, load generators, length-delimited value
 bodies (`ValueStream` below is a `SegmentReader` bounded to a parsed length).
@@ -186,10 +186,10 @@ by a **close/EOF CQE processed in the unguarded `drain_completions`**, where
   replenish (origin class) and clear the slot; `None` → no-op.
 - **`close_connection` drains `segment_pinned[conn]`** under its `&mut Driver`
   (like it drains `recv_hold`).
-- **Single-release discriminant.** Because `to_owned(self)`/`collect()` copy and
+- **Single-release discriminant.** Because `into_owned(self)`/`collect()` copy and
   replenish *then* let `self` drop, and close may drop a parked future whose
   segment already replenished, the guard carries a `released` flag (or
-  `ManuallyDrop`): replenish happens exactly once. This closes the `to_owned`
+  `ManuallyDrop`): replenish happens exactly once. This closes the `into_owned`
   double-replenish seam and the close/normal-drop race together.
 
 ## Mode C — Own (one copy, freely holdable)
@@ -198,7 +198,7 @@ by a **close/EOF CQE processed in the unguarded `drain_completions`**, where
 impl ConnCtx {
     pub async fn recv_owned_segment(&self) -> io::Result<Option<Bytes>>;
 }
-impl RecvSegment<'_> { pub fn to_owned(self) -> Bytes; } // copy + release-once
+impl RecvSegment<'_> { pub fn into_owned(self) -> Bytes; } // copy + release-once
 ```
 
 - Copy at delivery: `copy_nonoverlapping` from `buf_backing[bid]` into an owned
@@ -307,7 +307,7 @@ close-drain + single-release discriminant), or copied and replenished at deliver
 - **Copy before replenish**, no await between (INC template).
 - **Replenish to origin class** (`PendingRecvBuf.class`), never live `recv_class`.
 - **Exactly one replenish per bid** — enforced by the single-release discriminant
-  across the guard drop, `to_owned`/`collect`, Mode-A write CQE, and
+  across the guard drop, `into_owned`/`collect`, Mode-A write CQE, and
   `close_connection`. No double-replenish, no leak.
 - **`outstanding`/free count updated at every hand-out and every replenish.**
 - Generation guards connection *slots*, not bid lifetime — never rely on it to

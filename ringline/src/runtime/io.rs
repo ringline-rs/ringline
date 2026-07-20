@@ -849,6 +849,38 @@ impl ConnCtx {
         }
     }
 
+    /// Await the next received segment as an owned, freely holdable [`Bytes`]
+    /// (Mode C — "Own", copy-at-delivery; see `docs/segmented-recv-design.md`).
+    ///
+    /// Opts this connection into *segmented* delivery (like [`segments`](Self::segments)),
+    /// then, for each arriving provided buffer, **copies** its bytes into an owned
+    /// heap `Bytes` and replenishes the bid **immediately at delivery** — the copy
+    /// *is* the release, so this path never pins the ring and cannot deplete it by
+    /// holding (unlike a [`RecvSegment`], which pins until dropped). The returned
+    /// `Bytes` is `Send`, `Clone`, and retainable indefinitely.
+    ///
+    /// Resolves to:
+    /// - `Ok(Some(bytes))` — one received buffer, copied and owned.
+    /// - `Ok(None)` — end of stream: the recv side is closed (peer FIN) with no
+    ///   held buffers remaining, or the connection slot was reused (stale handle).
+    ///
+    /// Parks when no buffer is held and the connection is still open, resuming
+    /// when the recv completion handler holds a buffer and calls `wake_recv` (the
+    /// same waiter mechanism as [`segments`](Self::segments) / [`with_data`](Self::with_data)).
+    ///
+    /// io_uring only — segmented delivery is backed by the provided-buffer ring.
+    #[cfg(has_io_uring)]
+    pub fn recv_owned_segment(&self) -> RecvOwnedSegment {
+        with_state(|driver, _executor| {
+            driver.recv_domain[self.conn_index as usize] =
+                crate::recv::domain::RecvDomain::Segmented;
+        });
+        RecvOwnedSegment {
+            conn_index: self.conn_index,
+            generation: self.generation,
+        }
+    }
+
     /// Install a recv sink so that CQE data is written directly to the
     /// target buffer instead of the per-connection accumulator.
     ///
@@ -2073,8 +2105,8 @@ impl<'a> Future for SegmentNext<'a> {
 ///   double-replenish or leak.
 /// - **borrow-scoped** (`&'a mut` the reader): it cannot escape the async scope,
 ///   so the "holdable ⇒ copied-at-delivery" invariant holds structurally. To
-///   *keep* the bytes past the scope, a later increment adds `to_owned()` (Mode C
-///   copy); there is no zero-copy retain.
+///   *keep* the bytes past the scope, [`into_owned()`](Self::into_owned) copies
+///   (Mode C); there is no zero-copy retain.
 ///
 /// # Drop / release soundness
 ///
@@ -2107,6 +2139,54 @@ impl RecvSegment<'_> {
     /// Whether this segment carries no bytes.
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Copy this segment's bytes into an owned heap [`Bytes`] and release the
+    /// pinned provided buffer (Mode C — "Own"; see `docs/segmented-recv-design.md`).
+    /// Consumes the segment.
+    ///
+    /// This is a **real copy**, not an alias: the returned `Bytes` owns freshly
+    /// allocated heap memory with no release-on-drop tie to the ring, so it is
+    /// freely `Send`, `Clone`, and holdable past the connection's lifetime —
+    /// unlike the borrowed [`RecvSegment`], which cannot escape the runtime. This
+    /// is the same single copy the accumulator path pays today. (Deliberately
+    /// *not* `Bytes::from_owner` over the provided buffer — that would keep the
+    /// bid pinned, which Mode C exists to avoid.)
+    ///
+    /// # Release-exactly-once
+    ///
+    /// The copy is taken first (INC ordering: copy-before-replenish, no await
+    /// between), then this method `take()`s the driver pin slot
+    /// (`segment_pinned[conn]`, the single-release discriminant — the **same**
+    /// guard as [`RecvSegment::drop`]) and queues the bid for replenish. Because
+    /// `self` is consumed by value, its `Drop` runs at the end of this method and
+    /// finds the pin slot already `None` (or holding a different bid, after a
+    /// slot reuse) → it no-ops. So the bid is replenished **exactly once**: here.
+    // Consumes `self` by design: the conversion *is* the release (it `take()`s the
+    // pin slot), so a `&self` signature would be unsound — the borrow would leave
+    // the bid pinned and let `Drop` also try to release it. Named `into_owned`
+    // (not `to_owned`) because it consumes: `into_*` is the by-value convention.
+    pub fn into_owned(self) -> Bytes {
+        // Copy before replenish (INC template), no await between.
+        let owned = Bytes::copy_from_slice(&self[..]);
+        // Release the pin — identical guard to `Drop`; `take()` is the single
+        // release. Uses `try_with_state` for the same reason `Drop` does (this
+        // normally runs in-poll, but staying symmetric keeps it panic-free).
+        try_with_state(|driver, _executor| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
+            match driver.segment_pinned[self.conn_index as usize] {
+                Some(held) if held.bid == self.bid => {
+                    driver.segment_pinned[self.conn_index as usize] = None;
+                    driver.pending_replenish.push(self.bid);
+                }
+                _ => {}
+            }
+        });
+        owned
+        // `self` drops here: `Drop`'s guard now sees an empty (or different) pin
+        // slot → no-op. Exactly one replenish, from the `take()` above.
     }
 }
 
@@ -2150,6 +2230,66 @@ impl Drop for RecvSegment<'_> {
         });
         // When `try_with_state` returned `None` (unguarded drop), the bid stays
         // pinned and `close_connection` replenishes it — still exactly once.
+    }
+}
+
+// ── Segmented recv (Mode C — Own, copy-at-delivery) ──────────────────
+
+/// Future returned by [`ConnCtx::recv_owned_segment`]. Copies each arriving
+/// provided buffer into an owned [`Bytes`] and replenishes its bid at delivery,
+/// so it never pins the ring (the ring-safe owned-delivery path).
+#[cfg(has_io_uring)]
+pub struct RecvOwnedSegment {
+    conn_index: u32,
+    generation: u32,
+}
+
+#[cfg(has_io_uring)]
+impl Future for RecvOwnedSegment {
+    type Output = io::Result<Option<Bytes>>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_state(|driver, executor| {
+            let conn = self.conn_index;
+            let idx = conn as usize;
+
+            // Stale handle (slot closed-then-reused): surface EOF rather than
+            // reading the new occupant's held buffers.
+            if driver.connections.generation(conn) != self.generation {
+                return Poll::Ready(Ok(None));
+            }
+
+            // A held buffer is available: COPY it into an owned `Bytes` and
+            // replenish the bid immediately. The copy is the release — this path
+            // never touches `segment_pinned`, so it can never deplete the ring by
+            // holding. (INC ordering: copy-before-replenish, no await between.)
+            if let Some(held) = driver.segment_hold[idx].pop_front() {
+                let (ptr, _) = driver.provided_bufs.get_buffer(held.bid);
+                // SAFETY: `bid` is held (not yet replenished), and `held.len`
+                // bytes were received into its backing buffer. The slice is
+                // consumed by the copy below before `driver` is mutated.
+                let slice = unsafe { std::slice::from_raw_parts(ptr, held.len as usize) };
+                let owned = Bytes::copy_from_slice(slice);
+                driver.pending_replenish.push(held.bid);
+                return Poll::Ready(Ok(Some(owned)));
+            }
+
+            // Hold empty. If the recv side is closed (peer FIN), this is EOF.
+            let is_closed = driver
+                .connections
+                .get(conn)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+            if is_closed {
+                return Poll::Ready(Ok(None));
+            }
+
+            // Open and nothing held yet — park as a recv waiter, resumed by
+            // `handle_recv_multi`'s `wake_recv` on the next arrival.
+            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[idx] = true;
+            Poll::Pending
+        })
     }
 }
 
