@@ -2495,10 +2495,11 @@ impl Client {
 // underlying `recv_owned_segment` / `end_segments` methods are `#[cfg(has_io_uring)]`.
 // This crate's build.rs emits `has_io_uring` in lockstep with `ringline`.
 //
-// SCOPE (v1): redis `get_stream` on the single-connection `Client` only.
-// Deferred (documented, not implemented here): memcache streaming, `get_cas`,
-// streaming `set`, and `recv_streaming()` fire/recv integration. Pooled /
-// sharded / cluster clients intentionally keep the materialized `get`.
+// SCOPE (v1): redis `get_stream` on the single-connection `Client` (here) and on
+// `Pool` (see `pool.rs`, which reuses this `ValueStream` machinery with
+// poison-eviction). Deferred: `recv_streaming()` fire/recv integration, and
+// `ShardedClient` streaming. `ClusterClient` streaming stays out of scope
+// (MOVED/ASK re-read cannot be expressed by a length-bounded single-conn stream).
 
 #[cfg(has_io_uring)]
 impl Client {

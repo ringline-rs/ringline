@@ -361,6 +361,115 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
     }
 
     run_set_stream(addr).await?;
+    run_pool_stream(addr).await?;
+
+    Ok(())
+}
+
+// ── Pooled streaming get_stream (poison-eviction) ──────────────────────────
+
+async fn run_pool_stream(addr: SocketAddr) -> Result<(), String> {
+    use ringline_redis::{Pool, PoolConfig};
+
+    // `pool_size == 1` forces every checkout onto the SAME slot, so the poison
+    // path below actually re-checks-out the poisoned connection (with 2+ slots
+    // round-robin would dodge it, never exercising the eviction).
+    let mut pool = Pool::new(PoolConfig {
+        addr,
+        pool_size: 1,
+        connect_timeout_ms: 0,
+        tls_server_name: None,
+        password: None,
+        username: None,
+    });
+
+    let expected_large = large_value();
+
+    // (a) happy path: pooled streaming collect() reassembles the large value
+    //     across many recv buffers, just like the single-connection Client.
+    {
+        let stream = pool
+            .get_stream(b"stream:large")
+            .await
+            .map_err(|e| format!("pool large get_stream: {e}"))?
+            .ok_or("pool large: None")?;
+        if stream.len() != LARGE_LEN {
+            return Err(format!("pool large len: {}", stream.len()));
+        }
+        let collected = stream
+            .collect()
+            .await
+            .map_err(|e| format!("pool large collect: {e}"))?;
+        if collected.as_ref() != expected_large.as_slice() {
+            return Err("pool large collect mismatch".into());
+        }
+    }
+
+    // A drained stream leaves the connection HEALTHY: the next pooled op reuses
+    // the same slot (no reconnect) and returns correct results.
+    {
+        let small = pool
+            .client()
+            .await
+            .map_err(|e| format!("pool client after healthy stream: {e}"))?
+            .get(b"stream:small")
+            .await
+            .map_err(|e| format!("pool get after healthy stream: {e}"))?
+            .ok_or("pool get after healthy stream: None")?;
+        if small.as_ref() != SMALL {
+            return Err("pool desync after healthy stream".into());
+        }
+    }
+
+    // (b) undrained drop POISONS the pooled connection. The pool must evict the
+    //     slot and lazily reconnect on the next checkout — never hand the
+    //     desynced connection back out.
+    {
+        let mut stream = pool
+            .get_stream(b"stream:poison")
+            .await
+            .map_err(|e| format!("pool poison get_stream: {e}"))?
+            .ok_or("pool poison: None")?;
+        let first = stream
+            .next_segment()
+            .await
+            .map_err(|e| format!("pool poison next_segment: {e}"))?
+            .ok_or("pool poison: first chunk None")?;
+        if first.len() >= POISON_LEN {
+            return Err("pool poison value did not span multiple buffers".into());
+        }
+        // `stream` dropped here undrained → pooled connection poisoned (close()).
+    }
+
+    // The NEXT pooled op must get a healthy, freshly reconnected connection with
+    // CORRECT results — proving the abandoned inbound value bytes did not desync
+    // a reused connection (the whole point of the eviction).
+    let after_poison = pool
+        .get_stream(b"stream:small")
+        .await
+        .map_err(|e| format!("pool get_stream after poison: {e}"))?
+        .ok_or("pool after poison: None")?
+        .collect()
+        .await
+        .map_err(|e| format!("pool collect after poison: {e}"))?;
+    if after_poison.as_ref() != SMALL {
+        return Err("pool desync after poison-evict-reconnect".into());
+    }
+
+    // A second op on the reconnected slot confirms steady-state reuse (a large
+    // value, so any residual desync from the abandoned poison read would surface
+    // as a mismatch).
+    let again = pool
+        .client()
+        .await
+        .map_err(|e| format!("pool client 2: {e}"))?
+        .get(b"stream:large")
+        .await
+        .map_err(|e| format!("pool get large after poison: {e}"))?
+        .ok_or("pool get large after poison: None")?;
+    if again.as_ref() != expected_large.as_slice() {
+        return Err("pool desync on reconnected slot".into());
+    }
 
     Ok(())
 }

@@ -1688,6 +1688,33 @@ impl ConnCtx {
                 .unwrap_or(false)
         })
     }
+
+    /// Whether this handle still refers to a live, usable connection.
+    ///
+    /// Returns `false` if the slot has been released and its generation bumped
+    /// (a stale handle after slot reuse) **or** if the connection is closing
+    /// (`close()` was called — `recv_mode` is `Closed` — even before the Close
+    /// CQE has released the slot). Because a proactive `close()` flips the mode
+    /// synchronously, this is a *deterministic* poison probe: a caller that owns
+    /// a `ConnCtx` copy (e.g. a connection pool) can detect an
+    /// undrained-`ValueStream` poison on the very next turn, without waiting for
+    /// the Close CQE to bump the generation.
+    ///
+    /// A clean, fully-drained streaming read (which restores the default read
+    /// path via `end_segments`) leaves the connection `Multi`/armed, so this
+    /// returns `true` and the connection stays reusable.
+    pub fn is_alive(&self) -> bool {
+        with_state(|driver, _| {
+            driver
+                .connections
+                .get(self.conn_index)
+                .map(|cs| {
+                    cs.generation == self.generation
+                        && !matches!(cs.recv_mode, crate::connection::RecvMode::Closed)
+                })
+                .unwrap_or(false)
+        })
+    }
 }
 
 // ── AsyncSendBuilder ─────────────────────────────────────────────────

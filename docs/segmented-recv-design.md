@@ -318,10 +318,39 @@ close-drain + single-release discriminant), or copied and replenished at deliver
 Single-value framing is length-delimited: the header is tiny and lands in one
 buffer, the value length is known once parsed, so the value body streams with
 **no cross-segment parser changes** — the client parses the header contiguously,
-then bounds a `ValueStream` (a `SegmentReader`) to `len`. **Streaming is offered
-only on the single-connection `Client`**; `Pool`/`ShardedClient`/`ClusterClient`
-`get`/`gets` stay **materialized** (`Option<Bytes>`), which also confines the
-poison hazard to caller-owned connections and sidesteps MOVED/ASK re-read.
+then bounds a `ValueStream` (a `SegmentReader`) to `len`. Streaming is offered on
+the single-connection `Client` and — since the poison hazard turned out to be
+cleanly evictable (see *Pooled streaming*) — on `Pool`. `ShardedClient` streaming
+is a documented follow-up; `ClusterClient`/multi-key `get`/`gets` stay
+**materialized** (`Option<Bytes>`), which sidesteps MOVED/ASK re-read.
+
+### Pooled streaming (poison is evictable, so `Pool` can stream)
+
+The original hazard was: a pooled `get_stream` lends out a `ValueStream`
+borrowing a *pooled* connection; an undrained drop poisons it (`close()`), and a
+desynced connection must never be returned to the pool as reusable. This is
+soundly handled without touching the shared `ValueStream` machinery:
+
+- **The borrow enforces exclusivity.** `Pool::get_stream(&mut self) ->
+  ValueStream<'_>` borrows `&mut Pool` for the stream's whole lifetime, so no
+  other pool operation can run while a stream is live — the streamed connection
+  cannot be handed to a second caller mid-read (a compile error). The ephemeral
+  `Client` the stream borrows is parked in a `Pool` field (stable address) for
+  the duration.
+- **Poison is detected deterministically, then evicted.** `close()` flips the
+  slot's `recv_mode` to `Closed` *synchronously* (before the Close CQE bumps the
+  generation), so the new `ConnCtx::is_alive()` reports the connection dead on
+  the very next turn. The pool re-checks the streamed slot at the top of every
+  checkout (`reconcile_stream_slot`): a poisoned slot is marked `Disconnected`
+  and lazily reconnected on next use; a cleanly drained stream (which restores
+  the default read path via `end_segments`) leaves the connection alive and it is
+  reused with no reconnect. The existing generation-staleness path is a
+  *backstop*, not the primary signal — `is_alive` closes the pre-CQE window where
+  the generation still matches.
+- **Cluster stays out.** A MOVED/ASK redirect must re-issue the read on another
+  node mid-response; a length-bounded single-connection `ValueStream` cannot
+  express that, so `ClusterClient` streaming remains out of scope. `ShardedClient`
+  is the same borrow/eviction shape applied per shard — deferred, not blocked.
 
 **No forced materialization.** A GET consumer that discards or validates (a load
 generator like cachecannon, a proxy, a checksum tool) pays **no** copy:
@@ -382,7 +411,10 @@ Constraints (from review):
   (length-delimited handoff; parser sees the header only).
 - TLS zero-copy recv — impossible (rustls owns its buffer).
 - `ConnStream` `poll_fill_buf` — stays gathered.
-- Multi-value cache replies, and `Pool`/`Sharded`/`Cluster` `get` — stay eager.
+- Multi-value cache replies, and `ShardedClient`/`ClusterClient` single-value
+  streaming — stay eager (`ShardedClient` is a deferred follow-up; `ClusterClient`
+  is blocked by MOVED/ASK re-read). `Pool` single-value streaming **is** offered
+  (poison is evictable — see *Pooled streaming*).
 - NVMe / O_DIRECT zero-copy forward sink — Mode C fallback (alignment).
 - UDP / QUIC / h3 / ping — already datagram/segment-shaped.
 
@@ -433,7 +465,9 @@ Constraints (from review):
    `discard`/`next_segment`/`collect`/`forward_to`), single-value `Client`-only,
    `recv_streaming()` opt-in, `get_cas` (no `gets` collision), bounded-`len` +
    short-FIN error, poison=`close()`, `SegmentSource` length contract. Breaking
-   client change → major release. Pooled/sharded/cluster `get` stay materialized.
+   client change → major release. `Pool::get_stream` added (poison-eviction via
+   `ConnCtx::is_alive` + `reconcile_stream_slot`); `ShardedClient` deferred,
+   `ClusterClient` out of scope (MOVED/ASK re-read).
 6. **`ConnStream` review** — `poll_read` drains segments; `poll_fill_buf` stays
    gathered; no `BufRead` behavior change.
 
