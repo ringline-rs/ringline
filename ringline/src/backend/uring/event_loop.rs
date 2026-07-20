@@ -2965,6 +2965,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
         };
+        // The bid is checked out of the UDP ring; account it against occupancy so
+        // `free()` and the double-replenish tripwire stay accurate. It is
+        // replenished exactly once — immediately below on a parse/drop, or when
+        // the consumer reads the queued datagram.
+        self.driver.udp_provided_bufs.as_mut().unwrap().on_handout();
 
         // SAFETY: The buffer pointer belongs to the UDP provided buffer ring
         // and remains valid until we replenish the bid below.
@@ -3138,6 +3143,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
         };
+        // The bid is checked out of the UDP ring; account it against occupancy so
+        // `free()` and the double-replenish tripwire stay accurate. It is
+        // replenished exactly once — immediately below on a parse/drop, or when
+        // the consumer reads the queued datagram.
+        self.driver.udp_provided_bufs.as_mut().unwrap().on_handout();
 
         let payload_len = result as u32;
         let buf_ptr = {
