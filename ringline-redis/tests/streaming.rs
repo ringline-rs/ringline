@@ -43,6 +43,12 @@ const SMALL: &[u8] = b"hello-streaming-world";
 const LARGE_LEN: usize = 100_000;
 const POISON_LEN: usize = 20_000;
 
+/// The `stream:short` reply CLAIMS this many value bytes in its `$<len>\r\n`
+/// header but only sends `SHORT_SENT` of them before the peer FINs — exercising
+/// the "peer closes mid-value" short-read path.
+const SHORT_CLAIMED_LEN: usize = 1000;
+const SHORT_SENT: &[u8] = b"0123456789";
+
 fn large_value() -> Vec<u8> {
     (0..LARGE_LEN).map(|i| (i % 251) as u8).collect()
 }
@@ -59,13 +65,20 @@ fn bulk_reply(value: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Reply bytes for a requested key.
-fn decide(key: &[u8]) -> Vec<u8> {
+/// Reply bytes for a requested key, plus whether the server should CLOSE the
+/// connection (send a FIN) right after this reply.
+fn decide(key: &[u8]) -> (Vec<u8>, bool) {
     match key {
-        b"stream:small" => bulk_reply(SMALL),
-        b"stream:large" => bulk_reply(&large_value()),
-        b"stream:poison" => bulk_reply(&poison_value()),
-        _ => b"$-1\r\n".to_vec(),
+        b"stream:small" => (bulk_reply(SMALL), false),
+        b"stream:large" => (bulk_reply(&large_value()), false),
+        b"stream:poison" => (bulk_reply(&poison_value()), false),
+        b"stream:short" => {
+            // Claim SHORT_CLAIMED_LEN bytes but send only SHORT_SENT, then FIN.
+            let mut out = format!("${SHORT_CLAIMED_LEN}\r\n").into_bytes();
+            out.extend_from_slice(SHORT_SENT);
+            (out, true)
+        }
+        _ => (b"$-1\r\n".to_vec(), false),
     }
 }
 
@@ -83,11 +96,19 @@ impl AsyncEventHandler for StreamStubServer {
                         let len = bytes.len();
                         match Value::parse_bytes(bytes) {
                             Ok((val, consumed)) => {
+                                let mut close_after = false;
                                 if let Value::Array(items) = &val
                                     && let Some(Value::BulkString(key)) = items.get(1)
                                 {
-                                    let reply = decide(&key[..]);
+                                    let (reply, should_close) = decide(&key[..]);
                                     let _ = conn.send_nowait(&reply);
+                                    close_after = should_close;
+                                }
+                                if close_after {
+                                    // Send has been queued; closing the connection
+                                    // FINs after the queued bytes drain, giving the
+                                    // client a short reply followed by peer EOF.
+                                    conn.close();
                                 }
                                 ParseResult::Consumed(consumed)
                             }
@@ -259,13 +280,35 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
         return Err("desync after nil".into());
     }
 
-    // NOTE: a short-FIN test (server claims N bytes, sends fewer, then closes)
-    // is DEFERRED. `ValueStream::refill` maps a runtime `None` (EOF) to an error
-    // — correct by construction — but the underlying runtime does not currently
-    // surface EOF to a parked `recv_owned_segment` reader when the peer FINs on a
-    // *segmented* connection (the FIN CQE is not observed on the segmented recv),
-    // so the scenario hangs rather than erroring. This is a runtime segmented-recv
-    // gap to fix separately, not a defect in this client code.
+    // ── (c') short FIN: server claims N bytes, sends fewer, then closes ───
+    // The header parses fine and a `ValueStream` is created, but the value body
+    // is truncated by a peer FIN mid-stream. `ValueStream::refill` maps the
+    // runtime EOF (`recv_owned_segment() -> Ok(None)`) to a short-read error, so
+    // `collect()` must ERROR (not hang, not return truncated bytes). Regression
+    // for: a parked segmented reader must observe a peer FIN as EOF.
+    {
+        let stream = client
+            .get_stream(b"stream:short")
+            .await
+            .map_err(|e| format!("short get_stream: {e}"))?
+            .ok_or("short: unexpected None")?;
+        // Header claimed SHORT_CLAIMED_LEN value bytes.
+        if stream.len() != SHORT_CLAIMED_LEN {
+            return Err(format!(
+                "short len: {} != {SHORT_CLAIMED_LEN}",
+                stream.len()
+            ));
+        }
+        match stream.collect().await {
+            Ok(v) => {
+                return Err(format!(
+                    "short: expected an error on truncated value, got {} bytes",
+                    v.len()
+                ));
+            }
+            Err(_) => { /* expected: peer FIN mid-value surfaces as an error */ }
+        }
+    }
 
     // ── (d) undrained drop poisons the connection ────────────────────────
     {

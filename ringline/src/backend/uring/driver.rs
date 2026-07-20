@@ -1020,6 +1020,32 @@ impl Driver {
         {
             self.close_notify_armed.swap_remove(pos);
         }
+        // If a multishot recv is still armed on this connection, cancel it
+        // before closing. Closing the fixed descriptor alone removes its
+        // fixed-file table slot but does NOT drop the socket's last reference
+        // while an in-flight recv SQE still pins it — so the kernel never sends
+        // the peer a FIN and a parked reader on the other end hangs forever.
+        // Cancelling the recv (by its `RecvMulti` user_data, which is immune to
+        // Close reordering since it targets the request, not the fd) releases
+        // that reference so the subsequent Close actually FINs. The recv's
+        // ECANCELED completion is a no-op (generation/slot checks in
+        // `handle_recv_multi`). Skipped when the recv already self-terminated
+        // (e.g. a peer FIN drove this close) — nothing to cancel.
+        let recv_armed = self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_multishot_armed);
+        if recv_armed {
+            let recv_ud = crate::completion::UserData::encode(
+                crate::completion::OpTag::RecvMulti,
+                conn_index,
+                0,
+            );
+            let _ = self.ring.submit_async_cancel(recv_ud.raw(), conn_index);
+            if let Some(cs) = self.connections.get_mut(conn_index) {
+                cs.recv_multishot_armed = false;
+            }
+        }
         if self.ring.submit_close(conn_index).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
             // Queue this connection for retry on a later tick. (An earlier

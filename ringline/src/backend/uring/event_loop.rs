@@ -762,6 +762,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
                     self.executor.wake_recv(conn_index);
                     self.driver.close_connection(conn_index);
+                } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.recv_multishot_armed = true;
                 }
                 continue;
             }
@@ -968,6 +970,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn handle_recv_multi(&mut self, ud: UserData, result: i32, flags: u32) {
         let conn_index = ud.conn_index();
         let has_more = cqueue::more(flags);
+
+        // A completion without `IORING_CQE_F_MORE` means the kernel terminated
+        // this multishot recv. Record that the recv is no longer armed so the
+        // close path knows it need not cancel it (a re-arm below sets it back).
+        if !has_more && let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = false;
+        }
 
         if self.driver.connections.get(conn_index).is_none() {
             // Connection already released — but if result > 0, the kernel
@@ -1299,11 +1308,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if !has_more
             && let Some(conn) = self.driver.connections.get(conn_index)
             && matches!(conn.recv_mode, RecvMode::Multi)
-            && self.driver.ring.submit_multishot_recv(conn_index).is_err()
         {
-            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
+            if self.driver.ring.submit_multishot_recv(conn_index).is_err() {
+                metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+                self.executor.wake_recv(conn_index);
+                self.driver.close_connection(conn_index);
+            } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.recv_multishot_armed = true;
+            }
         }
     }
 
@@ -3105,6 +3117,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
+        } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = true;
         }
     }
 
@@ -4497,6 +4511,108 @@ mod tests {
         assert!(
             done,
             "closed connection with an empty hold yields EOF (Ok(None))"
+        );
+    }
+
+    /// Regression: a parked `recv_owned_segment` reader must resolve to
+    /// `Ok(None)` when a peer-FIN (`result == 0`) multishot completion arrives
+    /// while it is parked — matching `with_data`/`with_bytes` EOF behavior — and
+    /// the provided-buffer accounting must stay balanced (no bid leak). Guards
+    /// against a segmented reader hanging forever on a mid-stream peer close.
+    #[test]
+    fn parked_recv_owned_segment_resolves_none_on_fin_completion() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        // Model an armed multishot recv (accept_connection injects CQEs directly
+        // and does not arm one).
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = true;
+        }
+
+        // Park the reader: empty hold, connection open → Pending + recv waiter.
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || conn.recv_owned_segment()));
+        let waker = noop_waker();
+        let p1 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(
+            matches!(p1, std::task::Poll::Pending),
+            "parks on empty hold"
+        );
+        assert!(
+            el.executor.recv_waiters[conn_index as usize],
+            "parked reader registers a recv waiter"
+        );
+
+        // Deliver a peer FIN: multishot recv completion with result == 0 and no
+        // F_MORE. This must wake the parked reader and close the recv side.
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert!(
+            !el.executor.recv_waiters[conn_index as usize],
+            "FIN wakes the parked segmented reader"
+        );
+
+        // Second poll now observes the closed recv side and resolves to EOF.
+        let done = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(None)))
+        });
+        assert!(done, "FIN while parked yields Ok(None), not a hang");
+
+        // No held buffers were leaked: the ring's free count is fully restored.
+        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "provided-buffer accounting balanced after FIN + close"
+        );
+
+        // The self-terminated multishot must be marked disarmed (a FIN
+        // completion carries no F_MORE), so the close path issues no needless
+        // recv-cancel.
+        let armed = el
+            .driver
+            .connections
+            .get(conn_index)
+            .map(|c| c.recv_multishot_armed);
+        assert!(
+            armed != Some(true),
+            "a FIN completion clears the armed flag"
+        );
+    }
+
+    /// A *proactive* close (peer has NOT sent a FIN, so the multishot recv is
+    /// still armed) must clear the armed flag as part of finalizing the close —
+    /// the code path that cancels the still-armed recv so the kernel drops its
+    /// socket reference and actually FINs the peer.
+    #[test]
+    fn proactive_close_clears_armed_recv_flag() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = true;
+        }
+
+        // No queued sends (accept_connection leaves the send queue empty), so
+        // close_connection finalizes immediately (submits the recv-cancel +
+        // Close SQEs).
+        el.driver.close_connection(conn_index);
+
+        let armed = el
+            .driver
+            .connections
+            .get(conn_index)
+            .map(|c| c.recv_multishot_armed);
+        assert!(
+            armed != Some(true),
+            "finalizing a proactive close disarms (cancels) the still-armed recv"
         );
     }
 
