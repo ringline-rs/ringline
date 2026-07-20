@@ -202,6 +202,14 @@ pub enum Error {
     /// [`ClientBuilder::max_in_flight`].
     #[error("too many in-flight operations")]
     TooManyInFlight,
+
+    /// A streaming [`set_stream`](Client::set_stream) value source produced a
+    /// different number of bytes than the declared length. Because the command
+    /// framing (which declares the bulk length) is already on the wire, the
+    /// framing is now irrecoverably desynced, so the connection is closed —
+    /// matching the read-side poison rule.
+    #[error("streaming value length mismatch")]
+    LengthMismatch,
 }
 
 impl Error {
@@ -2362,6 +2370,116 @@ impl Client {
             rx_bytes,
         });
         result
+    }
+}
+
+// ── Streaming SET (send-side, single-connection Client only) ──────────────
+//
+// `set_stream` writes a large value from a caller-provided [`SegmentSource`]
+// without gathering it into one contiguous buffer: the RESP command framing
+// (which declares the value's bulk length) is sent, then value chunks are pulled
+// from the source and streamed to the wire, then the trailing `\r\n`, then the
+// `+OK` reply is read. Works on both backends (send works everywhere); v1 copies
+// each chunk into the send pool (`send`) — zero-copy guarded streaming is a later
+// optimization.
+
+/// A source of exactly `len` value bytes for a streaming
+/// [`set_stream`](Client::set_stream), yielded in chunks.
+///
+/// The client pulls chunks with [`next_chunk`](SegmentSource::next_chunk) until
+/// it returns `Ok(None)` (exhausted), counting bytes as it goes. If the total
+/// number of bytes yielded differs from the `len` passed to `set_stream`, the
+/// send is a protocol desync and the connection is closed
+/// ([`Error::LengthMismatch`]).
+///
+/// `next_chunk` is **synchronous** by design: it avoids the `async_fn_in_trait`
+/// public-API lint and keeps v1 simple. A source backed by async I/O should
+/// pre-buffer each chunk before yielding it. (An async pull is a documented
+/// follow-up.)
+pub trait SegmentSource {
+    /// Yield the next chunk of value bytes, or `Ok(None)` once exhausted. An
+    /// empty chunk is skipped (treated as "no bytes this call", not end).
+    fn next_chunk(&mut self) -> Result<Option<Bytes>, Error>;
+}
+
+/// A [`SegmentSource`] that yields chunks from an in-memory iterator of
+/// [`Bytes`]. Convenience for callers that already have their value in chunks
+/// (or a single chunk); the streaming win is that ringline never gathers them
+/// into one contiguous buffer.
+impl<I: Iterator<Item = Bytes>> SegmentSource for I {
+    fn next_chunk(&mut self) -> Result<Option<Bytes>, Error> {
+        Ok(self.next())
+    }
+}
+
+impl Client {
+    /// Streaming SET (single-connection [`Client`] only).
+    ///
+    /// Sends the RESP `SET` command with the value bulk header declaring `len`
+    /// (`*3\r\n$3\r\nSET\r\n$<klen>\r\n<key>\r\n$<len>\r\n`), then streams exactly
+    /// `len` value bytes pulled from `src`, then the trailing `\r\n`, and reads
+    /// the `+OK` reply. The value is never gathered into one contiguous buffer on
+    /// the client side.
+    ///
+    /// # Length contract
+    ///
+    /// `len` is authoritative: it is written into the bulk-string header. The
+    /// client counts the bytes pulled from `src` and returns
+    /// [`Error::LengthMismatch`] (after closing the connection) if `src` yields
+    /// fewer or more than `len` bytes — because a partial/oversized value frame
+    /// is already on the wire and the connection is irrecoverably desynced (same
+    /// discipline as the read-side poison rule).
+    ///
+    /// # Backends
+    ///
+    /// Works on both io_uring and mio. v1 copies each chunk into the send pool
+    /// via [`ConnCtx::send`](ringline::ConnCtx::send) (awaited per chunk for
+    /// backpressure). Zero-copy guarded streaming is a later optimization.
+    pub async fn set_stream(
+        &mut self,
+        key: &[u8],
+        len: usize,
+        mut src: impl SegmentSource,
+    ) -> Result<(), Error> {
+        // Command framing with the value bulk header declaring `len`:
+        // `*3\r\n$3\r\nSET\r\n$<klen>\r\n<key>\r\n$<len>\r\n`.
+        self.encode_buf.clear();
+        append_set_guard_prefix(&mut self.encode_buf, key, len);
+        self.conn.send_nowait(&self.encode_buf)?;
+
+        // Stream the value body, enforcing the length contract.
+        let mut sent = 0usize;
+        while let Some(chunk) = src.next_chunk()? {
+            if chunk.is_empty() {
+                continue;
+            }
+            sent += chunk.len();
+            if sent > len {
+                // Over-produce: the value frame is already too long → desync.
+                self.conn.close();
+                return Err(Error::LengthMismatch);
+            }
+            // `send` copies into the pool synchronously and returns a future that
+            // resolves when the bytes reach the socket — awaiting bounds in-flight
+            // sends to one, so a large value can't exhaust the send pool.
+            self.conn.send(&chunk)?.await?;
+        }
+        if sent != len {
+            // Under-produce: header declared `len`, source gave fewer → desync.
+            self.conn.close();
+            return Err(Error::LengthMismatch);
+        }
+
+        // Trailing `\r\n`, then the `+OK` reply.
+        self.conn.send_nowait(b"\r\n")?;
+        let value = self.read_value().await?;
+        if let Value::Error(ref msg) = value {
+            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
+        }
+        match value {
+            Value::SimpleString(_) | Value::Null => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
+        }
     }
 }
 

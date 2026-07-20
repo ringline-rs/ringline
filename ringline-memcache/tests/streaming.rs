@@ -17,8 +17,9 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use bytes::Bytes;
 use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
-use ringline_memcache::Client;
+use ringline_memcache::{Client, Error};
 
 // ── Config ───────────────────────────────────────────────────────────────
 
@@ -41,9 +42,21 @@ fn test_config() -> Config {
 
 const SMALL: &[u8] = b"hello-streaming-world";
 const SMALL_FLAGS: u32 = 7;
+const SMALL_CAS: u64 = 424_242;
 const LARGE_LEN: usize = 100_000;
 const LARGE_FLAGS: u32 = 0xABCD;
+const LARGE_CAS: u64 = 9_876_543_210;
 const POISON_LEN: usize = 20_000;
+
+/// Streaming-SET value: a deterministic pattern of `SET_LEN` bytes the client
+/// streams via `set_stream` and the stub server re-derives to verify it received
+/// the exact bytes.
+const SET_LEN: usize = 100_000;
+const SET_FLAGS: u32 = 0x1234;
+const SET_EXPTIME: u32 = 0;
+fn set_value() -> Vec<u8> {
+    (0..SET_LEN).map(|i| (i % 251) as u8).collect()
+}
 
 /// The `stream:short` reply CLAIMS this many value bytes in its `VALUE` header
 /// but only sends `SHORT_SENT` of them before the peer FINs — exercising the
@@ -67,6 +80,31 @@ fn value_reply(key: &[u8], value: &[u8], flags: u32) -> Vec<u8> {
     out.extend_from_slice(value);
     out.extend_from_slice(b"\r\nEND\r\n");
     out
+}
+
+/// Encode a memcache `gets` hit reply (5-token VALUE line, with the extra
+/// `<cas>`): `VALUE <key> <flags> <bytes> <cas>\r\n<data>\r\nEND\r\n`.
+fn cas_value_reply(key: &[u8], value: &[u8], flags: u32, cas: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + 64);
+    out.extend_from_slice(b"VALUE ");
+    out.extend_from_slice(key);
+    out.extend_from_slice(format!(" {} {} {}\r\n", flags, value.len(), cas).as_bytes());
+    out.extend_from_slice(value);
+    out.extend_from_slice(b"\r\nEND\r\n");
+    out
+}
+
+/// Reply bytes for a `gets <key>` request (CAS-carrying), plus a close flag.
+fn decide_cas(key: &[u8]) -> (Vec<u8>, bool) {
+    match key {
+        b"stream:small" => (cas_value_reply(key, SMALL, SMALL_FLAGS, SMALL_CAS), false),
+        b"stream:large" => (
+            cas_value_reply(key, &large_value(), LARGE_FLAGS, LARGE_CAS),
+            false,
+        ),
+        // Cache miss: bare END.
+        _ => (b"END\r\n".to_vec(), false),
+    }
 }
 
 /// Reply bytes for a requested key, plus whether the server should CLOSE the
@@ -106,13 +144,21 @@ impl AsyncEventHandler for StreamStubServer {
             loop {
                 let n = conn
                     .with_bytes(|bytes| {
-                        // Parse one `get <key>\r\n` line per call.
+                        // Parse one command line per call.
                         let Some(cr) = find_crlf(&bytes) else {
                             return ParseResult::NeedMore;
                         };
                         let line = &bytes[..cr];
-                        let consumed = cr + 2;
-                        if let Some(key) = line.strip_prefix(b"get ") {
+                        let header_len = cr + 2;
+                        if let Some(key) = line.strip_prefix(b"gets ") {
+                            // `gets <key>` — CAS-carrying reply.
+                            let (reply, should_close) = decide_cas(key);
+                            let _ = conn.send_nowait(&reply);
+                            if should_close {
+                                conn.close();
+                            }
+                            ParseResult::Consumed(header_len)
+                        } else if let Some(key) = line.strip_prefix(b"get ") {
                             let (reply, should_close) = decide(key);
                             let _ = conn.send_nowait(&reply);
                             if should_close {
@@ -121,8 +167,37 @@ impl AsyncEventHandler for StreamStubServer {
                                 // client a short reply followed by peer EOF.
                                 conn.close();
                             }
+                            ParseResult::Consumed(header_len)
+                        } else if line.starts_with(b"set ") {
+                            // `set <key> <flags> <exp> <len>\r\n<value>\r\n`.
+                            // Wait for the whole command (header + value + CRLF)
+                            // before replying, then verify the exact value bytes.
+                            let mut fields = line.split(|&b| b == b' ').filter(|f| !f.is_empty());
+                            let _set = fields.next();
+                            let _key = fields.next();
+                            let _flags = fields.next();
+                            let _exp = fields.next();
+                            let len: usize = fields
+                                .next()
+                                .and_then(|t| std::str::from_utf8(t).ok())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            let total = header_len + len + 2; // value + trailing CRLF
+                            if bytes.len() < total {
+                                return ParseResult::NeedMore;
+                            }
+                            let value = &bytes[header_len..header_len + len];
+                            let reply: &[u8] = if value == set_value().as_slice() {
+                                b"STORED\r\n"
+                            } else {
+                                b"SERVER_ERROR value mismatch\r\n"
+                            };
+                            let _ = conn.send_nowait(reply);
+                            ParseResult::Consumed(total)
+                        } else {
+                            // Unknown line — consume it.
+                            ParseResult::Consumed(header_len)
                         }
-                        ParseResult::Consumed(consumed)
                     })
                     .await;
                 if n == 0 {
@@ -354,6 +429,195 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
         match pclient.get(b"stream:small").await {
             Ok(_) => return Err("poison: next op unexpectedly succeeded".into()),
             Err(_) => { /* expected */ }
+        }
+    }
+
+    run_get_cas(addr).await?;
+    run_set_stream(addr).await?;
+
+    Ok(())
+}
+
+// ── get_cas (streaming get-with-CAS) ──────────────────────────────────────
+
+async fn run_get_cas(addr: SocketAddr) -> Result<(), String> {
+    let mut client = connect(addr).await?;
+
+    // (a) small: flags + cas + collect() == SMALL.
+    {
+        let stream = client
+            .get_cas(b"stream:small")
+            .await
+            .map_err(|e| format!("small get_cas: {e}"))?
+            .ok_or("small get_cas: unexpected None")?;
+        if stream.len() != SMALL.len() {
+            return Err(format!("cas small len: {}", stream.len()));
+        }
+        if stream.flags() != SMALL_FLAGS {
+            return Err(format!("cas small flags: {}", stream.flags()));
+        }
+        if stream.cas() != SMALL_CAS {
+            return Err(format!("cas small cas: {} != {SMALL_CAS}", stream.cas()));
+        }
+        let collected = stream
+            .collect()
+            .await
+            .map_err(|e| format!("cas small collect: {e}"))?;
+        if collected.as_ref() != SMALL {
+            return Err("cas small collect mismatch".into());
+        }
+    }
+
+    // (b) large: cas + multi-buffer collect().
+    let expected_large = large_value();
+    {
+        let stream = client
+            .get_cas(b"stream:large")
+            .await
+            .map_err(|e| format!("large get_cas: {e}"))?
+            .ok_or("large get_cas: None")?;
+        if stream.len() != LARGE_LEN {
+            return Err(format!("cas large len: {}", stream.len()));
+        }
+        if stream.flags() != LARGE_FLAGS {
+            return Err(format!("cas large flags: {}", stream.flags()));
+        }
+        if stream.cas() != LARGE_CAS {
+            return Err(format!("cas large cas: {} != {LARGE_CAS}", stream.cas()));
+        }
+        let collected = stream
+            .collect()
+            .await
+            .map_err(|e| format!("cas large collect: {e}"))?;
+        if collected.len() != LARGE_LEN || collected.as_ref() != expected_large.as_slice() {
+            return Err("cas large collect mismatch".into());
+        }
+    }
+
+    // (b') discard() leaves the connection usable.
+    {
+        let stream = client
+            .get_cas(b"stream:large")
+            .await
+            .map_err(|e| format!("cas discard get_cas: {e}"))?
+            .ok_or("cas discard: None")?;
+        stream
+            .discard()
+            .await
+            .map_err(|e| format!("cas discard: {e}"))?;
+    }
+    let after = client
+        .get(b"stream:small")
+        .await
+        .map_err(|e| format!("cas get after discard: {e}"))?
+        .ok_or("cas get after discard: None")?;
+    if after.data.as_ref() != SMALL {
+        return Err("cas desync after discard".into());
+    }
+
+    // (c) miss → Ok(None), connection still usable.
+    let miss = client
+        .get_cas(b"stream:miss")
+        .await
+        .map_err(|e| format!("cas miss get_cas: {e}"))?
+        .is_some();
+    if miss {
+        return Err("cas miss: expected None".into());
+    }
+    let after_miss = client
+        .get(b"stream:small")
+        .await
+        .map_err(|e| format!("cas get after miss: {e}"))?
+        .ok_or("cas get after miss: None")?;
+    if after_miss.data.as_ref() != SMALL {
+        return Err("cas desync after miss".into());
+    }
+
+    Ok(())
+}
+
+// ── set_stream (streaming SET) ────────────────────────────────────────────
+
+/// Split `value` into `chunk` -byte `Bytes` pieces (an `Iterator<Item = Bytes>`,
+/// which is a `SegmentSource` via the blanket impl).
+fn chunked(value: &[u8], chunk: usize) -> std::vec::IntoIter<Bytes> {
+    value
+        .chunks(chunk)
+        .map(Bytes::copy_from_slice)
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+async fn run_set_stream(addr: SocketAddr) -> Result<(), String> {
+    let value = set_value();
+
+    // (a) happy path: server verifies the exact streamed value → STORED.
+    {
+        let mut client = connect(addr).await?;
+        client
+            .set_stream(
+                b"stream:setlarge",
+                SET_FLAGS,
+                SET_EXPTIME,
+                SET_LEN,
+                chunked(&value, 7000),
+            )
+            .await
+            .map_err(|e| format!("set_stream: {e}"))?;
+        // Connection still usable after a successful streaming set.
+        let after = client
+            .get(b"stream:small")
+            .await
+            .map_err(|e| format!("get after set_stream: {e}"))?
+            .ok_or("get after set_stream: None")?;
+        if after.data.as_ref() != SMALL {
+            return Err("desync after set_stream".into());
+        }
+    }
+
+    // (b) under-produce: source yields fewer than `len` bytes → LengthMismatch,
+    // and the connection is poisoned (next op errors).
+    {
+        let mut client = connect(addr).await?;
+        let short = value[..SET_LEN - 100].to_vec();
+        match client
+            .set_stream(
+                b"stream:setlarge",
+                SET_FLAGS,
+                SET_EXPTIME,
+                SET_LEN,
+                chunked(&short, 7000),
+            )
+            .await
+        {
+            Err(Error::LengthMismatch) => { /* expected */ }
+            Err(e) => return Err(format!("under-produce: wrong error {e}")),
+            Ok(()) => return Err("under-produce: unexpectedly succeeded".into()),
+        }
+        match client.get(b"stream:small").await {
+            Ok(_) => return Err("under-produce: next op unexpectedly succeeded".into()),
+            Err(_) => { /* expected: poisoned */ }
+        }
+    }
+
+    // (c) over-produce: source yields more than `len` bytes → LengthMismatch.
+    {
+        let mut client = connect(addr).await?;
+        let mut over = value.clone();
+        over.extend_from_slice(b"EXTRA-BYTES");
+        match client
+            .set_stream(
+                b"stream:setlarge",
+                SET_FLAGS,
+                SET_EXPTIME,
+                SET_LEN,
+                chunked(&over, 7000),
+            )
+            .await
+        {
+            Err(Error::LengthMismatch) => { /* expected */ }
+            Err(e) => return Err(format!("over-produce: wrong error {e}")),
+            Ok(()) => return Err("over-produce: unexpectedly succeeded".into()),
         }
     }
 

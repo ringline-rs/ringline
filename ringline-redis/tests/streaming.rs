@@ -16,9 +16,10 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use bytes::Bytes;
 use resp_proto::Value;
 use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
-use ringline_redis::Client;
+use ringline_redis::{Client, Error};
 
 // ── Config ───────────────────────────────────────────────────────────────
 
@@ -42,6 +43,14 @@ fn test_config() -> Config {
 const SMALL: &[u8] = b"hello-streaming-world";
 const LARGE_LEN: usize = 100_000;
 const POISON_LEN: usize = 20_000;
+
+/// Streaming-SET value: a deterministic pattern of `SET_LEN` bytes the client
+/// streams via `set_stream` and the stub server re-derives to verify it received
+/// the exact bytes.
+const SET_LEN: usize = 100_000;
+fn set_value() -> Vec<u8> {
+    (0..SET_LEN).map(|i| (i % 251) as u8).collect()
+}
 
 /// The `stream:short` reply CLAIMS this many value bytes in its `$<len>\r\n`
 /// header but only sends `SHORT_SENT` of them before the peer FINs — exercising
@@ -98,11 +107,25 @@ impl AsyncEventHandler for StreamStubServer {
                             Ok((val, consumed)) => {
                                 let mut close_after = false;
                                 if let Value::Array(items) = &val
-                                    && let Some(Value::BulkString(key)) = items.get(1)
+                                    && let Some(Value::BulkString(verb)) = items.first()
                                 {
-                                    let (reply, should_close) = decide(&key[..]);
-                                    let _ = conn.send_nowait(&reply);
-                                    close_after = should_close;
+                                    if verb.eq_ignore_ascii_case(b"SET") {
+                                        // `SET <key> <value>` (streaming set): verify
+                                        // the exact value bytes, reply +OK / -ERR.
+                                        let reply: &[u8] = match items.get(2) {
+                                            Some(Value::BulkString(v))
+                                                if v[..] == set_value()[..] =>
+                                            {
+                                                b"+OK\r\n"
+                                            }
+                                            _ => b"-ERR value mismatch\r\n",
+                                        };
+                                        let _ = conn.send_nowait(reply);
+                                    } else if let Some(Value::BulkString(key)) = items.get(1) {
+                                        let (reply, should_close) = decide(&key[..]);
+                                        let _ = conn.send_nowait(&reply);
+                                        close_after = should_close;
+                                    }
                                 }
                                 if close_after {
                                     // Send has been queued; closing the connection
@@ -334,6 +357,78 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
         match pclient.get(b"stream:small").await {
             Ok(_) => return Err("poison: next op unexpectedly succeeded".into()),
             Err(_) => { /* expected */ }
+        }
+    }
+
+    run_set_stream(addr).await?;
+
+    Ok(())
+}
+
+// ── set_stream (streaming SET) ────────────────────────────────────────────
+
+/// Split `value` into `chunk`-byte `Bytes` pieces (an `Iterator<Item = Bytes>`,
+/// which is a `SegmentSource` via the blanket impl).
+fn chunked(value: &[u8], chunk: usize) -> std::vec::IntoIter<Bytes> {
+    value
+        .chunks(chunk)
+        .map(Bytes::copy_from_slice)
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+async fn run_set_stream(addr: SocketAddr) -> Result<(), String> {
+    let value = set_value();
+
+    // (a) happy path: server verifies the exact streamed value → +OK.
+    {
+        let mut client = connect(addr).await?;
+        client
+            .set_stream(b"stream:setlarge", SET_LEN, chunked(&value, 7000))
+            .await
+            .map_err(|e| format!("set_stream: {e}"))?;
+        // Connection still usable after a successful streaming set.
+        let after = client
+            .get(b"stream:small")
+            .await
+            .map_err(|e| format!("get after set_stream: {e}"))?
+            .ok_or("get after set_stream: None")?;
+        if after.as_ref() != SMALL {
+            return Err("desync after set_stream".into());
+        }
+    }
+
+    // (b) under-produce: source yields fewer than `len` bytes → LengthMismatch,
+    // and the connection is poisoned (next op errors).
+    {
+        let mut client = connect(addr).await?;
+        let short = value[..SET_LEN - 100].to_vec();
+        match client
+            .set_stream(b"stream:setlarge", SET_LEN, chunked(&short, 7000))
+            .await
+        {
+            Err(Error::LengthMismatch) => { /* expected */ }
+            Err(e) => return Err(format!("under-produce: wrong error {e}")),
+            Ok(()) => return Err("under-produce: unexpectedly succeeded".into()),
+        }
+        match client.get(b"stream:small").await {
+            Ok(_) => return Err("under-produce: next op unexpectedly succeeded".into()),
+            Err(_) => { /* expected: poisoned */ }
+        }
+    }
+
+    // (c) over-produce: source yields more than `len` bytes → LengthMismatch.
+    {
+        let mut client = connect(addr).await?;
+        let mut over = value.clone();
+        over.extend_from_slice(b"EXTRA-BYTES");
+        match client
+            .set_stream(b"stream:setlarge", SET_LEN, chunked(&over, 7000))
+            .await
+        {
+            Err(Error::LengthMismatch) => { /* expected */ }
+            Err(e) => return Err(format!("over-produce: wrong error {e}")),
+            Ok(()) => return Err("over-produce: unexpectedly succeeded".into()),
         }
     }
 
