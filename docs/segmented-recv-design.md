@@ -393,8 +393,19 @@ Constraints (from review):
 - **Copy accounting:** extend recv copy counters; assert gather counts drop to
   zero on Mode A/B paths.
 - **Throughput:** `ring_fill_bench` gains `MODE=forward` (A) and `MODE=segments`
-  (B); re-run the 200 GbE 64 MB sweep. Hypothesis: Mode A large-object throughput
+  (B); re-run the 200 GbE sweep. Hypothesis: Mode A large-object throughput
   toward ~2× per core; halves worker count to saturate 200 GbE.
+
+  **Measured (2026-07-20, c8gn.16xlarge pair, MSG=1 MiB, BUF=256 KiB):** the
+  hypothesis holds. In the copy-bound regime (4 workers, both below the NIC) the
+  zero-copy paths deliver **+43 % (`segments`) / +52 % (`forward`)** per-core
+  throughput over the accumulator baseline (`whole`): ~95 Gbps → ~136 / ~144 Gbps.
+  At 8 workers `segments`/`forward` **saturate the 200 GbE NIC (187 Gbps line
+  rate)** while `whole` stays copy-bound at ~147 Gbps (+27 %). (`forward` parks
+  heavily at 16 MiB objects — the deferred `recv_hold` cap; `segments` holds at
+  187 Gbps, +29 %.) Loopback (CPU-bound) showed the same shape at +34 %; a cheap
+  37 Gbps cross-host box was NIC-bound (all modes equal), confirming the win is a
+  copy-bound-regime phenomenon.
 - **Backpressure:** a fan-in test (f.e. 256 conns, class-2 large values) must show
   no starvation/deadlock — the low-water reserve forces copy and everyone
   progresses; a slow-`forward_to` test must not stall other connections.
