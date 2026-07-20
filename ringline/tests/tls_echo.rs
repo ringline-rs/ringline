@@ -635,3 +635,138 @@ fn tls_info_accessors() {
         "sni_hostname() should reflect the client's SNI value"
     );
 }
+
+// ── Test 4: Segmented recv over TLS (copy-per-chunk owned segments) ──────
+
+// Segmented recv (`ConnCtx::segments()`) is io_uring-only; the reader is backed
+// by the provided-buffer ring. On a TLS connection the decrypted plaintext can
+// never be zero-copy (rustls owns its plaintext buffer), so each drained chunk
+// is delivered as an *owned* `RecvSegment`. This test drives that path
+// end-to-end: a segmented reader on the server reassembles a multi-chunk value
+// pushed over TLS and echoes it back, and a clean TLS close surfaces `Ok(None)`
+// (EOF) to the parked reader rather than hanging.
+#[cfg(has_io_uring)]
+static TLS_SEG_SAW_EOF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(has_io_uring)]
+struct TlsSegmentedHandler;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsSegmentedHandler {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Opt this TLS connection into segmented delivery: decrypted
+            // plaintext arrives as owned segments in the hold, not the
+            // accumulator.
+            let mut reader = conn.segments();
+            loop {
+                match reader.next().await {
+                    Ok(Some(seg)) => {
+                        // Echo each decrypted plaintext segment straight back;
+                        // the client reassembles and byte-compares.
+                        let _ = conn.send_nowait(&seg);
+                    }
+                    Ok(None) => {
+                        // Clean TLS close surfaced as EOF (not a hang).
+                        TLS_SEG_SAW_EOF.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsSegmentedHandler
+    }
+}
+
+#[cfg(has_io_uring)]
+#[test]
+fn tls_segmented_recv_reassembles_and_eofs() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    TLS_SEG_SAW_EOF.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let (certs, key) = generate_self_signed();
+    let server_config = server_tls_config(certs.clone(), key);
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_config))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<TlsSegmentedHandler>()
+        .expect("launch failed");
+
+    wait_for_server(&addr);
+
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // A multi-chunk value: larger than rustls's internal plaintext buffer so the
+    // server's drain loop produces several owned segments across several TLS
+    // records. A non-constant pattern makes any mis-ordering detectable.
+    const SIZE: usize = 100 * 1024;
+    let msg: Vec<u8> = (0..SIZE)
+        .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+        .collect();
+
+    {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        stream.write_all(&msg).unwrap();
+        stream.flush().unwrap();
+
+        let mut buf = vec![0u8; SIZE];
+        let mut total = 0;
+        while total < SIZE {
+            match stream.read(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) => panic!("TLS read error: {e}"),
+            }
+        }
+        assert_eq!(total, SIZE, "short read reassembling segmented echo");
+        assert_eq!(buf, msg, "segmented TLS echo byte-exact mismatch");
+    }
+
+    // Clean TLS close: send close_notify then FIN. The server's parked segmented
+    // reader must wake and surface Ok(None) (EOF), not hang.
+    tls_conn.send_close_notify();
+    tls_conn.write_tls(&mut tcp).unwrap();
+    let _ = tcp.shutdown(std::net::Shutdown::Both);
+
+    // Wait (bounded) for the handler to observe EOF; a hang would leave this
+    // false until the timeout.
+    let mut saw_eof = false;
+    for _ in 0..300 {
+        if TLS_SEG_SAW_EOF.load(std::sync::atomic::Ordering::SeqCst) {
+            saw_eof = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        saw_eof,
+        "segmented TLS reader did not observe EOF (Ok(None)) after clean close"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}

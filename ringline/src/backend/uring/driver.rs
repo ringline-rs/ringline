@@ -300,6 +300,12 @@ pub(crate) struct Driver {
     /// buffer is force-copied (Mode C) and its bid replenished immediately instead
     /// of pinned, so held segments cannot deplete the shared ring under fan-in.
     pub(crate) recv_segment_reserve: u32,
+    /// Upper bound on outstanding recv bytes per connection (mirrors
+    /// `AccumulatorTable`'s per-accumulator `max_size`). Used to bound held TLS
+    /// plaintext delivered as owned segments in the segmented recv domain, where
+    /// the bytes never touch the accumulator but the same flood-kill contract
+    /// (`Config::recv_accumulator_max`) must hold.
+    pub(crate) recv_accumulator_max: usize,
     /// Whether SO_TIMESTAMPING is enabled for connections.
     #[cfg(feature = "timestamps")]
     pub(crate) timestamps: bool,
@@ -597,6 +603,7 @@ impl Driver {
             tcp_nodelay: config.tcp_nodelay,
             send_zc_threshold: config.send_zc_threshold,
             recv_segment_reserve: config.recv_segment_reserve,
+            recv_accumulator_max: config.recv_accumulator_max,
             #[cfg(feature = "timestamps")]
             timestamps: config.timestamps,
             #[cfg(feature = "timestamps")]

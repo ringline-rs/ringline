@@ -1067,12 +1067,45 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .is_some_and(|t| t.has(conn_index));
 
         if is_tls_conn {
+            // The ciphertext bid is replenished immediately (TLS decrypts into
+            // rustls's own buffer, so the provided buffer is free at feed time);
+            // TLS segments never pin the ring.
             self.driver.pending_replenish.push(bid);
             {
+                // Route decrypted plaintext by recv domain. In the segmented
+                // domain, each drained plaintext chunk becomes an owned segment
+                // pushed to this connection's hold (copy-per-chunk — rustls owns
+                // the plaintext, so TLS recv can never be zero-copy; see
+                // `docs/segmented-recv-design.md`, "## TLS"). Otherwise it lands
+                // in the recv accumulator (the default with_data/with_bytes path).
+                let is_segmented = self.driver.recv_domain[conn_index as usize]
+                    == crate::recv::domain::RecvDomain::Segmented;
+                let recv_accumulator_max = self.driver.recv_accumulator_max;
                 let tls_table = self.driver.tls_table.as_mut().unwrap();
+                let sink = if is_segmented {
+                    // Bound total outstanding held plaintext exactly as the
+                    // accumulator path bounds its buffer (recv_accumulator_max):
+                    // an unbounded plaintext flood must still kill the connection.
+                    // TLS holds are always `Owned`, but sum defensively.
+                    let hold = &mut self.driver.segment_hold[conn_index as usize];
+                    let outstanding: usize = hold
+                        .iter()
+                        .map(|h| match h {
+                            crate::backend::HeldRecvBuf::Owned(b) => b.len(),
+                            crate::backend::HeldRecvBuf::Pinned { len, .. } => *len as usize,
+                        })
+                        .sum();
+                    crate::tls::PlaintextSink::Segments {
+                        hold,
+                        outstanding,
+                        max: recv_accumulator_max,
+                    }
+                } else {
+                    crate::tls::PlaintextSink::Accumulator(&mut self.driver.accumulators)
+                };
                 let result = crate::tls::feed_tls_recv(
                     tls_table,
-                    &mut self.driver.accumulators,
+                    sink,
                     &mut self.driver.send_copy_pool,
                     conn_index,
                     data,
