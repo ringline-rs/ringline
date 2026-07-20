@@ -246,12 +246,16 @@ fn main() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    // FWD_CAP: Mode A forward_to held-buffer cap (default 64). Set very high to
+    // effectively disable the throttle for a before/after comparison.
+    let fwd_cap = env_u64("FWD_CAP", 64) as usize;
     let config = ConfigBuilder::new()
         .workers(workers)
         .pin_to_core(true)
         .sq_entries(1024)
         .recv_buffer(ring, buf)
         .max_connections((conns + 8) as u32)
+        .forward_hold_cap(fwd_cap)
         .build()
         .expect("valid config");
 
@@ -274,10 +278,11 @@ fn main() {
     let ring_empty = POOL.value(pool::BUFFER_RING_EMPTY).unwrap_or(0);
     let parked = POOL.value(pool::RECV_PARKED).unwrap_or(0);
     let fallbacks = POOL.value(pool::RECV_FALLBACK).unwrap_or(0);
+    let throttled = POOL.value(pool::FORWARD_THROTTLED).unwrap_or(0);
 
     println!(
         "RESULT mode={mode} workers={workers} msg={msg} conns={conns} ring={ring} buf={buf} rounds={rounds} \
-         MiB/s={mib_s:.1} ring_empty={ring_empty} parked={parked} fallbacks={fallbacks} \
+         MiB/s={mib_s:.1} ring_empty={ring_empty} parked={parked} fallbacks={fallbacks} throttled={throttled} \
          fallback_rx_frac={:.3} elapsed_s={elapsed_s:.2} rx_bytes={received}",
         if received > 0 {
             fallback_rx as f64 / received as f64

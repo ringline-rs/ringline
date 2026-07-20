@@ -21,7 +21,7 @@ pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(3);
 pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(5);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
-pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(6);
+pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(7);
 
 #[metric(name = "ringline/udp", description = "UDP counters")]
 pub static UDP: ShardedCounterGroup = ShardedCounterGroup::new(4);
@@ -89,6 +89,14 @@ pub mod pool {
     /// degradation path that keeps draining the socket when a single
     /// response exceeds the provided ring.
     pub const RECV_FALLBACK: usize = 5;
+    /// A Mode A `forward_to` connection reached its `forward_hold_cap` held-buffer
+    /// backlog and had its multishot recv cancelled (TCP window closed) to
+    /// backpressure the source — re-armed once writes drain the hold below the
+    /// cap. Sustained counts mean the sink is slower than the source for large
+    /// objects; unlike `RECV_PARKED` (ENOBUFS starvation) this is *deliberate*
+    /// per-connection backpressure that prevents one slow forward from depleting
+    /// the shared recv ring.
+    pub const FORWARD_THROTTLED: usize = 6;
 }
 
 /// Counter slot indices for UDP metrics.
@@ -146,6 +154,11 @@ pub fn init_metadata() {
     POOL.insert_metadata(pool::SEND_EAGAIN, "op".into(), "send_eagain".into());
     POOL.insert_metadata(pool::RECV_PARKED, "op".into(), "recv_parked".into());
     POOL.insert_metadata(pool::RECV_FALLBACK, "op".into(), "recv_fallback".into());
+    POOL.insert_metadata(
+        pool::FORWARD_THROTTLED,
+        "op".into(),
+        "forward_throttled".into(),
+    );
 
     UDP.insert_metadata(
         udp::DATAGRAMS_RECEIVED,
@@ -196,6 +209,7 @@ mod tests {
             pool::SEND_EAGAIN,
             pool::RECV_PARKED,
             pool::RECV_FALLBACK,
+            pool::FORWARD_THROTTLED,
         ] {
             assert!(POOL.increment(idx), "POOL[{idx}] out of bounds");
         }

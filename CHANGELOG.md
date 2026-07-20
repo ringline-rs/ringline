@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `ConnCtx::end_segments()` — end segmented-recv delivery and restore the default
   `with_data`/`with_bytes` read path (gathering any still-held segments into the
   accumulator). io_uring only.
+- `ConfigBuilder::forward_hold_cap` (default 64, 2× `MAX_IOVECS`) — per-connection
+  held-buffer cap for Mode A `forward_to`. When a forwarding connection's held
+  buffers reach the cap (a slow/high-latency sink, or a very large object), its
+  multishot recv is cancelled so its TCP receive window closes and the source
+  stops sending; the recv is re-armed once writes drain the hold below the cap.
+  This bounds one slow forward so it cannot deplete the shared per-worker recv
+  ring and `ENOBUFS`-starve other connections. New `forward_throttled` pool metric
+  counts throttle events. io_uring only.
 
 ## [0.5.1] - 2026-07-17
 

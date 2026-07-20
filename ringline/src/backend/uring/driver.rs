@@ -252,6 +252,24 @@ pub(crate) struct Driver {
     /// `handle_forward_write` and consumed by the `ForwardToFuture`: `Ok(n)` =
     /// bytes of the just-completed backing, `Err(errno)` = write failure.
     pub(crate) forward_done: Vec<Option<Result<u32, i32>>>,
+    /// Per-connection flag: `true` while a Mode A `forward_to` is driving this
+    /// connection (set by `ConnCtx::forward_to`, cleared by `settle_forward_end`
+    /// / `reset_segment_state` / `close_connection`). Gates the `forward_hold_cap`
+    /// throttle so it applies only to forwarding connections, not to pure Mode B
+    /// segment readers that share the `Segmented` domain and `segment_hold`.
+    pub(crate) forward_recv_active: Vec<bool>,
+    /// Per-connection flag: `true` while a forwarding connection's multishot recv
+    /// has been throttled (cancelled) because its `segment_hold` reached
+    /// `forward_hold_cap`. Set at the throttle point in the recv handler; cleared
+    /// when the recv is re-armed after the hold drains below the cap
+    /// (`maybe_rearm_throttled_forward`) or on `settle_forward_end` / close.
+    /// Gates re-arm so the starved-connection path does not fight the throttle.
+    pub(crate) forward_hold_throttled: Vec<bool>,
+    /// Per-connection held-buffer cap for Mode A `forward_to`
+    /// (`Config::forward_hold_cap`). When a forwarding connection's `segment_hold`
+    /// length reaches this, its multishot recv is cancelled (TCP window closes)
+    /// and re-armed once the hold drains below the cap.
+    pub(crate) forward_hold_cap: usize,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
@@ -589,6 +607,9 @@ impl Driver {
             segment_pinned: vec![None; config.max_connections as usize],
             forward_write: (0..config.max_connections).map(|_| None).collect(),
             forward_done: (0..config.max_connections).map(|_| None).collect(),
+            forward_recv_active: vec![false; config.max_connections as usize],
+            forward_hold_throttled: vec![false; config.max_connections as usize],
+            forward_hold_cap: config.forward_hold_cap,
             accept_rx,
             eventfd,
             eventfd_buf: [0u8; 8],
@@ -796,6 +817,8 @@ impl Driver {
         // slot's forward.
         self.forward_write[conn_index as usize] = None;
         self.forward_done[conn_index as usize] = None;
+        self.forward_recv_active[conn_index as usize] = false;
+        self.forward_hold_throttled[conn_index as usize] = false;
     }
 
     /// Settle a connection when a Mode A `forward_to` finishes: any provided
@@ -830,6 +853,32 @@ impl Driver {
             }
         }
         self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
+        // If the forward throttled its recv (hold reached `forward_hold_cap`), its
+        // multishot was cancelled. Re-arm it so the connection's subsequent
+        // `with_data`/`with_bytes` reads resume — the domain is now the default,
+        // so newly received bytes land in the accumulator. If the recv is still
+        // armed (its ECANCELED not yet observed, or it was never throttled),
+        // nothing to do. On a re-arm failure the connection is left unarmed; the
+        // caller's next read errors and closes it (standard recovery).
+        self.forward_recv_active[conn_index as usize] = false;
+        if self.forward_hold_throttled[conn_index as usize] {
+            self.forward_hold_throttled[conn_index as usize] = false;
+            let armed = self
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_multishot_armed);
+            let open = self
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
+            if !armed
+                && open
+                && self.ring.submit_multishot_recv(conn_index).is_ok()
+                && let Some(cs) = self.connections.get_mut(conn_index)
+            {
+                cs.recv_multishot_armed = true;
+            }
+        }
         ok
     }
 
@@ -955,6 +1004,13 @@ impl Driver {
             self.pending_replenish.push(bid);
         }
         self.forward_done[conn_index as usize] = None;
+        // Clear the Mode A forward flags for slot reuse. Any held bids were
+        // already drained above (segment_hold / segment_pinned / forward_write);
+        // the throttle flag just tracks recv-arm state and needs no bid release.
+        // A throttle-cancel's ECANCELED (if still in flight) is a no-op in
+        // `handle_recv_multi` (result < 0 / generation checks).
+        self.forward_recv_active[conn_index as usize] = false;
+        self.forward_hold_throttled[conn_index as usize] = false;
         // Clear the fallback-recv flag so the slot's next occupant starts
         // clean. A still-in-flight fallback CQE for this occupant is
         // generation-checked in handle_recv_fallback and only releases its

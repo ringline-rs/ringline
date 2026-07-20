@@ -1025,6 +1025,11 @@ impl ConnCtx {
         with_state(|driver, _executor| {
             driver.recv_domain[self.conn_index as usize] =
                 crate::recv::domain::RecvDomain::Segmented;
+            // Mark this connection as a forwarder so the recv handler applies the
+            // `forward_hold_cap` throttle (bounded hold + TCP-window backpressure)
+            // — distinguishing it from a pure Mode B segment reader that also uses
+            // the `Segmented` domain but is drained by a `SegmentReader`.
+            driver.forward_recv_active[self.conn_index as usize] = true;
         });
         ForwardToFuture {
             conn_index: self.conn_index,
