@@ -2574,12 +2574,20 @@ impl Client {
         // read cursor is a single monotonic position across header + body.
         let mut acc: Option<Vec<u8>> = None;
         loop {
-            let seg = match self.conn.recv_owned_segment().await? {
-                Some(b) => b,
-                None => {
+            let seg = match self.conn.recv_owned_segment().await {
+                Ok(Some(b)) => b,
+                Ok(None) => {
                     // Peer closed before any header arrived.
                     let _ = self.conn.end_segments();
                     return Err(Error::ConnectionClosed);
+                }
+                Err(e) => {
+                    // Recv I/O error mid-header: the read is broken and the
+                    // connection is still in the segmented domain. Poison it
+                    // (close) so it is not reused stuck in that domain / desynced,
+                    // rather than leaking the error while leaving the domain set.
+                    self.conn.close();
+                    return Err(e.into());
                 }
             };
             let combined: Bytes = match acc.take() {
