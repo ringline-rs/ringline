@@ -883,6 +883,42 @@ impl ConnCtx {
         }
     }
 
+    /// End segmented-recv delivery on this connection and restore the default
+    /// [`with_data`](Self::with_data) / [`with_bytes`](Self::with_bytes) path.
+    ///
+    /// [`segments`](Self::segments) and [`recv_owned_segment`](Self::recv_owned_segment)
+    /// leave the connection in the *segmented* domain: arriving buffers are held
+    /// for the segment reader instead of being gathered into the accumulator. A
+    /// consumer that has finished pulling its segments **must** call this before
+    /// issuing an ordinary `with_data`/`with_bytes` read — otherwise that read
+    /// would never observe further data (it keeps getting held as segments).
+    ///
+    /// Any buffers still held (bytes received *past* what the consumer pulled) are
+    /// gathered, in arrival order, into the front of the accumulator so the next
+    /// read sees them first.
+    ///
+    /// Returns an error (and closes the connection) if gathering the leftover
+    /// segments overflows the recv accumulator bound (`recv_accumulator_max`).
+    ///
+    /// io_uring only — segmented delivery is backed by the provided-buffer ring.
+    #[cfg(has_io_uring)]
+    pub fn end_segments(&self) -> io::Result<()> {
+        // `settle_forward_end` is the shared "drain held segments into the
+        // accumulator, reset the delivery domain to default" routine (named for
+        // its first caller, the Mode A `forward_to` completion). Reused here for
+        // the streaming-value read side, which needs the identical settle.
+        let ok = with_state(|driver, _executor| driver.settle_forward_end(self.conn_index));
+        if ok {
+            Ok(())
+        } else {
+            self.close();
+            Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "recv accumulator overflow while ending segmented recv",
+            ))
+        }
+    }
+
     /// Process the connection's buffered recv data as an **ordered chain of
     /// borrowed segments** via a callback (Mode B "Borrow", the B1 callback face
     /// — see `docs/segmented-recv-design.md`).

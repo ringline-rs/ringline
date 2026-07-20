@@ -2365,6 +2365,346 @@ impl Client {
     }
 }
 
+// ── Streaming GET (segmented recv, single-connection Client only) ─────────
+//
+// `get_stream` returns a `ValueStream` instead of a materialized `Bytes`: the
+// value body is delivered as segments over the runtime's segmented-recv API
+// (`ConnCtx::recv_owned_segment`), so a consumer that discards or streams the
+// value never forces the whole thing into one contiguous allocation. Only
+// `collect()` materializes.
+//
+// io_uring only — segmented recv is backed by the provided-buffer ring, and the
+// underlying `recv_owned_segment` / `end_segments` methods are `#[cfg(has_io_uring)]`.
+// This crate's build.rs emits `has_io_uring` in lockstep with `ringline`.
+//
+// SCOPE (v1): redis `get_stream` on the single-connection `Client` only.
+// Deferred (documented, not implemented here): memcache streaming, `get_cas`,
+// streaming `set`, and `recv_streaming()` fire/recv integration. Pooled /
+// sharded / cluster clients intentionally keep the materialized `get`.
+
+#[cfg(has_io_uring)]
+impl Client {
+    /// Streaming GET (single-connection [`Client`] only).
+    ///
+    /// Like [`get`](Self::get), but the value body is delivered as a
+    /// [`ValueStream`] of segments rather than a single materialized [`Bytes`].
+    /// A consumer that only needs to discard or checksum the value pays no
+    /// gather copy; [`ValueStream::collect`] is the one materialization.
+    ///
+    /// Returns `Ok(None)` for a missing key (`$-1\r\n` nil reply).
+    ///
+    /// # Sequential use only
+    ///
+    /// The returned stream borrows `&mut self`, so a second concurrent stream (or
+    /// any other client call) while it is alive is a compile error. `get_stream`
+    /// must be called on an *idle* connection — not interleaved with pending
+    /// `fire_*` operations or a half-read pipeline, whose responses would arrive
+    /// ahead of the GET reply and desync the segmented read.
+    ///
+    /// # Dropping mid-stream poisons the connection
+    ///
+    /// If a [`ValueStream`] is dropped before its value (and the trailing
+    /// delimiter) is fully consumed — via [`collect`](ValueStream::collect),
+    /// [`discard`](ValueStream::discard), or reading
+    /// [`next_segment`](ValueStream::next_segment) to the end — the undrained
+    /// wire bytes cannot be drained synchronously in `Drop`, so the connection is
+    /// **closed** (its slot generation bumped). The next operation on this client
+    /// then fails, matching the "poison = close" recovery discipline.
+    pub async fn get_stream(
+        &mut self,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Option<ValueStream<'_>>, Error> {
+        let key = key.as_ref();
+        // Fire the GET, then opt the connection into segmented delivery. The
+        // reply body then arrives as held segments instead of being gathered
+        // into the accumulator. `recv_owned_segment()` sets the domain
+        // synchronously (before we await), so the reply can't be processed under
+        // the default path first.
+        self.encode_buf.clear();
+        Self::encode_request_into(&Request::get(key), &mut self.encode_buf);
+        self.conn.send_nowait(&self.encode_buf)?;
+
+        // Read the tiny `$<len>\r\n` (or `$-1\r\n`) bulk-string header. It always
+        // fits in the first received buffer; the rare split-across-buffers case is
+        // handled by accumulating into `acc` and retrying.
+        //
+        // Demarcation is exact: `parse_get_header` measures only the header bytes
+        // (`header_len`), never the value. Everything after `header_len` in the
+        // buffer we already pulled is value-body bytes, handed to the stream as an
+        // O(1) `Bytes::slice` — so no value byte is lost or double-read, and the
+        // read cursor is a single monotonic position across header + body.
+        let mut acc: Option<Vec<u8>> = None;
+        loop {
+            let seg = match self.conn.recv_owned_segment().await? {
+                Some(b) => b,
+                None => {
+                    // Peer closed before any header arrived.
+                    let _ = self.conn.end_segments();
+                    return Err(Error::ConnectionClosed);
+                }
+            };
+            let combined: Bytes = match acc.take() {
+                None => seg,
+                Some(mut a) => {
+                    a.extend_from_slice(&seg);
+                    Bytes::from(a)
+                }
+            };
+            match parse_get_header(&combined) {
+                Ok(Some(GetHeader::Nil)) => {
+                    // Missing key. `$-1\r\n` carries no value/trailing; restore
+                    // the default read path so the next command works.
+                    self.conn.end_segments()?;
+                    return Ok(None);
+                }
+                Ok(Some(GetHeader::Bulk { len, header_len })) => {
+                    let leftover = combined.slice(header_len..);
+                    return Ok(Some(ValueStream::new(self, len, leftover)));
+                }
+                Ok(None) => {
+                    // Header not yet complete — stash and pull the next buffer.
+                    acc = Some(combined.to_vec());
+                }
+                Err(e) => {
+                    // Server error reply (e.g. `-WRONGTYPE`) or malformed header.
+                    // In sequential use the whole reply line is in `combined`;
+                    // restore the read path and surface the error.
+                    let _ = self.conn.end_segments();
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Parsed shape of a GET reply header.
+#[cfg(has_io_uring)]
+enum GetHeader {
+    /// `$-1\r\n` — the key does not exist.
+    Nil,
+    /// `$<len>\r\n` — a bulk string of `len` value bytes follows (then a trailing
+    /// CRLF). `header_len` is the byte length of the `$<len>\r\n` header itself.
+    Bulk { len: usize, header_len: usize },
+}
+
+/// Position of the first `\r\n` in `buf` (the index of the `\r`), or `None`.
+#[cfg(has_io_uring)]
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
+}
+
+/// Parse a GET bulk-string reply header from the **front** of `buf`, measuring
+/// only the header (`$<len>\r\n` / `$-1\r\n`) — the value body and trailing CRLF
+/// are left for the caller to stream, so the header/value split loses no byte.
+///
+/// - `Ok(None)` — the header line is not yet fully buffered (need more bytes).
+/// - `Ok(Some(..))` — a nil or bulk header.
+/// - `Err(Error::Redis(_))` — a server error reply (`-...\r\n`).
+/// - `Err(Error::UnexpectedResponse)` — a non-bulk, non-error reply, or a
+///   malformed length.
+#[cfg(has_io_uring)]
+fn parse_get_header(buf: &[u8]) -> Result<Option<GetHeader>, Error> {
+    match buf.first() {
+        None => Ok(None),
+        Some(b'$') => {
+            let Some(cr) = find_crlf(buf) else {
+                return Ok(None);
+            };
+            let digits = &buf[1..cr];
+            let header_len = cr + 2; // '$' .. through the "\r\n"
+            if digits == b"-1" {
+                return Ok(Some(GetHeader::Nil));
+            }
+            let s = std::str::from_utf8(digits).map_err(|_| Error::UnexpectedResponse)?;
+            let len: usize = s.parse().map_err(|_| Error::UnexpectedResponse)?;
+            Ok(Some(GetHeader::Bulk { len, header_len }))
+        }
+        Some(b'-') => {
+            let Some(cr) = find_crlf(buf) else {
+                return Ok(None);
+            };
+            Err(Error::Redis(
+                String::from_utf8_lossy(&buf[1..cr]).into_owned(),
+            ))
+        }
+        Some(_) => Err(Error::UnexpectedResponse),
+    }
+}
+
+/// A streaming Redis GET value (see [`Client::get_stream`]).
+///
+/// Borrows the [`Client`] exclusively (`&mut`) and is bounded to the value length
+/// parsed from the `$<len>\r\n` header, so it can neither over-read into a
+/// following reply nor be used concurrently with another client operation.
+///
+/// The value body is delivered via the runtime's segmented-recv API. In v1 each
+/// [`next_segment`](Self::next_segment) chunk (and the [`collect`](Self::collect)
+/// gather) is an owned [`Bytes`] copied at delivery (Mode C). A zero-copy
+/// [`discard`](Self::discard) over the borrowed `segments()` reader is a
+/// documented follow-up; v1 `discard` still copies each chunk at delivery but
+/// performs no *gather* copy.
+#[cfg(has_io_uring)]
+pub struct ValueStream<'a> {
+    client: &'a mut Client,
+    /// Full bulk-string length from the header.
+    len: usize,
+    /// Value bytes not yet handed to the caller.
+    value_left: usize,
+    /// Trailing CRLF bytes not yet consumed (starts at 2).
+    trail_left: usize,
+    /// Bytes pulled from the wire but not yet consumed (value + maybe trailing +,
+    /// in non-sequential misuse, following-reply bytes which are discarded).
+    buf: Bytes,
+    /// Set once value + trailing CRLF are fully consumed and the recv domain has
+    /// been restored. `false` at drop time ⇒ the stream was abandoned mid-value ⇒
+    /// poison (close) the connection.
+    finished: bool,
+}
+
+#[cfg(has_io_uring)]
+impl<'a> ValueStream<'a> {
+    fn new(client: &'a mut Client, len: usize, leftover: Bytes) -> Self {
+        Self {
+            client,
+            len,
+            value_left: len,
+            trail_left: 2,
+            buf: leftover,
+            finished: false,
+        }
+    }
+
+    /// The value length in bytes, from the `$<len>\r\n` header.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the value is zero-length.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Pull the next non-empty received buffer into `self.buf`.
+    ///
+    /// A `None` from the runtime here means the peer closed (FIN) before the
+    /// whole value + trailing CRLF arrived — a **short FIN**, surfaced as an
+    /// error (never a truncated value), per the design's bounded-`len` contract.
+    async fn refill(&mut self) -> Result<(), Error> {
+        loop {
+            match self.client.conn.recv_owned_segment().await {
+                Ok(Some(b)) if !b.is_empty() => {
+                    self.buf = b;
+                    return Ok(());
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => return Err(Error::ConnectionClosed),
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+    }
+
+    /// The next chunk of the value body, or `Ok(None)` once the whole value has
+    /// been delivered. Chunks are owned [`Bytes`] (Mode C copy-at-delivery); the
+    /// caller may hold them freely.
+    ///
+    /// After the final chunk the trailing CRLF is consumed and the connection is
+    /// restored for the next command, so a caller need not read past the last
+    /// value byte — though calling again simply returns `Ok(None)`.
+    pub async fn next_segment(&mut self) -> Result<Option<Bytes>, Error> {
+        if self.value_left == 0 {
+            self.finish().await?;
+            return Ok(None);
+        }
+        if self.buf.is_empty() {
+            self.refill().await?;
+        }
+        let take = self.value_left.min(self.buf.len());
+        let chunk = self.buf.split_to(take);
+        self.value_left -= take;
+        if self.value_left == 0 {
+            self.finish().await?;
+        }
+        Ok(Some(chunk))
+    }
+
+    /// Materialize the whole value into one contiguous [`Bytes`] (the copy).
+    ///
+    /// Single-buffer values return an O(1) `Bytes` slice with no extra gather;
+    /// multi-buffer values are gathered into one allocation (still one logical
+    /// copy of the value from the caller's perspective).
+    pub async fn collect(mut self) -> Result<Bytes, Error> {
+        // Fast path: the whole value is already contiguous in `buf`.
+        if self.buf.len() >= self.value_left {
+            let out = self.buf.split_to(self.value_left);
+            self.value_left = 0;
+            self.finish().await?;
+            return Ok(out);
+        }
+        let mut out = bytes::BytesMut::with_capacity(self.len);
+        while self.value_left > 0 {
+            if self.buf.is_empty() {
+                self.refill().await?;
+            }
+            let take = self.value_left.min(self.buf.len());
+            out.extend_from_slice(&self.buf.split_to(take));
+            self.value_left -= take;
+        }
+        self.finish().await?;
+        Ok(out.freeze())
+    }
+
+    /// Consume and release the whole value without materializing it, leaving the
+    /// connection usable for the next command. No gather copy.
+    pub async fn discard(mut self) -> Result<(), Error> {
+        while self.value_left > 0 {
+            if self.buf.is_empty() {
+                self.refill().await?;
+            }
+            let take = self.value_left.min(self.buf.len());
+            let _ = self.buf.split_to(take);
+            self.value_left -= take;
+        }
+        self.finish().await
+    }
+
+    /// Consume the trailing CRLF, restore the default `with_data`/`with_bytes`
+    /// read path, and mark the stream finished so `Drop` does not poison the
+    /// connection.
+    async fn finish(&mut self) -> Result<(), Error> {
+        if self.finished {
+            return Ok(());
+        }
+        while self.trail_left > 0 {
+            if self.buf.is_empty() {
+                self.refill().await?;
+            }
+            let take = self.trail_left.min(self.buf.len());
+            let _ = self.buf.split_to(take);
+            self.trail_left -= take;
+        }
+        // Restore the default read path. Any bytes still in `self.buf` past the
+        // trailing CRLF would belong to a *following* reply — none exist in the
+        // documented sequential use; they are dropped rather than reinjected.
+        self.client.conn.end_segments()?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Drop for ValueStream<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Abandoned mid-value (or a short FIN left the stream broken):
+            // undrained bytes remain inbound and the wire cannot be drained
+            // synchronously here, so poison the connection. `close()` bumps the
+            // slot generation, making the client's stored handle stale so the
+            // next operation fails.
+            self.client.conn.close();
+        }
+    }
+}
+
 // ── Timestamp helper ────────────────────────────────────────────────────
 
 /// Get the current time as nanoseconds since epoch using CLOCK_REALTIME.

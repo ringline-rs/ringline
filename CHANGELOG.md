@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `ringline-redis`: streaming GET — `Client::get_stream(key) -> Option<ValueStream>`
+  (single-connection `Client` only). The value body is delivered over the
+  runtime's segmented-recv API instead of being materialized: `ValueStream`
+  exposes `len()`, `discard()` (consume without a gather copy), `next_segment()`
+  (owned chunks), and `collect()` (the one materialization). Bounded to the
+  parsed bulk length with an error on a short FIN; dropping a stream mid-value
+  poisons (closes) the connection. io_uring only. Pooled/sharded/cluster `get`
+  stay materialized. (memcache streaming, `get_cas`, streaming `set`, and
+  `recv_streaming` fire/recv integration are deferred.)
+- `ConnCtx::end_segments()` — end segmented-recv delivery and restore the default
+  `with_data`/`with_bytes` read path (gathering any still-held segments into the
+  accumulator). io_uring only.
+
 ## [0.5.1] - 2026-07-17
 
 Coordinated patch release. The fix is in core `ringline`; all client
