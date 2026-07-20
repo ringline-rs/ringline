@@ -266,8 +266,10 @@ pub use runtime::io::RecvSegment;
 /// Future returned by [`resolve()`].
 pub use runtime::io::ResolveFuture;
 /// Ordered borrowed view of buffered recv data for [`ConnCtx::with_segments()`].
+#[cfg(has_io_uring)]
 pub use runtime::io::SegChain;
 /// Bytes consumed by a [`ConnCtx::with_segments()`] callback.
+#[cfg(has_io_uring)]
 pub use runtime::io::SegConsumed;
 /// Async lending iterator over received provided buffers (segmented recv, Mode B).
 #[cfg(has_io_uring)]

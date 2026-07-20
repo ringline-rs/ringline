@@ -2818,6 +2818,7 @@ impl Future for ForwardToFuture<'_> {
 /// carried-over bytes bounded by ring depth, so the only signal it needs is
 /// "how many front bytes did you take". `SegConsumed(0)` is the "need a bigger
 /// frame" case (the runtime gathers the chain to the accumulator and parks).
+#[cfg(has_io_uring)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegConsumed(pub usize);
 
@@ -2829,11 +2830,13 @@ pub struct SegConsumed(pub usize);
 /// consumer walking [`iter`](Self::iter) never sees a later byte before an
 /// earlier one. The slices borrow driver-internal memory for the callback's
 /// duration only; they cannot escape (lifetime `'a`, like `with_data`).
+#[cfg(has_io_uring)]
 pub struct SegChain<'a> {
     /// Ordered borrowed segments: accumulator-first, then held buffers.
     segs: &'a [&'a [u8]],
 }
 
+#[cfg(has_io_uring)]
 impl<'a> SegChain<'a> {
     /// Iterate the segments in order (accumulator remainder first, then held
     /// provided buffers in arrival order).
