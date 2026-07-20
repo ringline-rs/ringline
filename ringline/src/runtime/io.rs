@@ -2,7 +2,11 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::Future;
 use std::io;
+#[cfg(has_io_uring)]
+use std::marker::PhantomData;
 use std::net::SocketAddr;
+#[cfg(has_io_uring)]
+use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -813,6 +817,35 @@ impl ConnCtx {
             conn_index: self.conn_index,
             generation: self.generation,
             f: Some(f),
+        }
+    }
+
+    /// Borrow a segmented-recv reader (Mode B "Borrow", the sound lending-iterator
+    /// face — see `docs/segmented-recv-design.md`).
+    ///
+    /// Opts this connection into *segmented* delivery: arriving provided buffers
+    /// are held in-place (no copy into the accumulator, bid not replenished) and
+    /// surfaced one at a time as zero-copy [`RecvSegment`]s via
+    /// [`SegmentReader::next`]. A segment is `!Send`, `!Clone`, and borrows the
+    /// reader exclusively (`&mut`), so it cannot escape the runtime or outlive the
+    /// buffer's pin — the "holdable ⇒ copied" invariant is enforced structurally.
+    ///
+    /// Call this **before** the connection starts receiving: it flips the delivery
+    /// domain but does not retroactively segment bytes already gathered into the
+    /// accumulator under the default `with_data`/`with_bytes` path.
+    ///
+    /// io_uring only — segmented delivery is backed by the provided-buffer ring.
+    #[cfg(has_io_uring)]
+    pub fn segments(&self) -> SegmentReader<'_> {
+        with_state(|driver, _executor| {
+            driver.recv_domain[self.conn_index as usize] =
+                crate::recv::domain::RecvDomain::Segmented;
+        });
+        SegmentReader {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            _borrow: PhantomData,
+            _not_send: PhantomData,
         }
     }
 
@@ -1902,6 +1935,221 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })
+    }
+}
+
+// ── Segmented recv (Mode B — Borrow) ─────────────────────────────────
+
+/// An async **lending iterator** over a connection's received provided buffers,
+/// obtained from [`ConnCtx::segments`] (io_uring only).
+///
+/// Each [`next`](Self::next) yields one zero-copy [`RecvSegment`] borrowing the
+/// reader exclusively (`&mut self`). Because the segment holds that `&mut`
+/// borrow, calling `next` again while a segment is alive is a **compile error** —
+/// so "drop the previous segment before pulling the next" and "the segment cannot
+/// escape the runtime" are enforced by the borrow checker, not by convention.
+/// This is why it cannot be a `futures::Stream`/`for` loop (inherent to lending
+/// iterators). Typical use:
+///
+/// ```ignore
+/// let mut r = conn.segments();
+/// while let Some(seg) = r.next().await? {
+///     process(&seg);        // seg: Deref<Target = [u8]>, held across the await below
+///     downstream.send(&seg).await?;
+/// }                          // loop ends at EOF (peer FIN, hold drained)
+/// ```
+///
+/// The reader is itself `!Send`/`!Clone`/non-`Copy`: it is bound to the worker
+/// thread's driver and to the connection it was created for.
+#[cfg(has_io_uring)]
+pub struct SegmentReader<'a> {
+    conn_index: u32,
+    /// Generation snapshot from the originating `ConnCtx`; a stale reader (slot
+    /// reused) resolves `next` to `Ok(None)` (EOF) rather than reading the new
+    /// occupant's buffers.
+    generation: u32,
+    /// Ties the reader to the `ConnCtx` borrow it came from.
+    _borrow: PhantomData<&'a ()>,
+    /// `!Send` + `!Sync`: a provided buffer is thread-affine and driver-released.
+    _not_send: PhantomData<*const ()>,
+}
+
+#[cfg(has_io_uring)]
+impl SegmentReader<'_> {
+    /// Await the next received segment.
+    ///
+    /// Resolves to:
+    /// - `Ok(Some(seg))` — a held provided buffer, handed out as a zero-copy
+    ///   [`RecvSegment`] pinned until it is dropped.
+    /// - `Ok(None)` — end of stream: the recv side is closed (peer FIN) and no
+    ///   held buffers remain, or the connection slot was reused (stale reader).
+    ///
+    /// Parks when no buffer is held and the connection is still open, resuming
+    /// when the recv completion handler holds a buffer and calls `wake_recv`
+    /// (the same waiter mechanism as [`ConnCtx::with_data`]).
+    pub fn next(&mut self) -> SegmentNext<'_> {
+        SegmentNext {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            _borrow: PhantomData,
+        }
+    }
+}
+
+/// Future returned by [`SegmentReader::next`]. Borrows the reader (`&mut`) for
+/// `'a`; the yielded [`RecvSegment`] shares that borrow, keeping the reader
+/// exclusively locked while the segment is alive.
+#[cfg(has_io_uring)]
+pub struct SegmentNext<'a> {
+    conn_index: u32,
+    generation: u32,
+    _borrow: PhantomData<&'a mut ()>,
+}
+
+#[cfg(has_io_uring)]
+impl<'a> Future for SegmentNext<'a> {
+    type Output = io::Result<Option<RecvSegment<'a>>>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_state(|driver, executor| {
+            let conn = self.conn_index;
+            let idx = conn as usize;
+
+            // Stale reader (slot closed-then-reused for a different connection):
+            // surface EOF so the caller's `while let Some` loop terminates rather
+            // than reading the new occupant's held buffers.
+            if driver.connections.generation(conn) != self.generation {
+                return Poll::Ready(Ok(None));
+            }
+
+            // A held buffer is available: check it out into the pin slot and hand
+            // it to a `RecvSegment`. The one-live-segment contract (enforced by
+            // `&mut self` on the reader) guarantees the pin slot is empty here.
+            if let Some(held) = driver.segment_hold[idx].pop_front() {
+                debug_assert!(
+                    driver.segment_pinned[idx].is_none(),
+                    "pin slot occupied while checking out a new segment"
+                );
+                driver.segment_pinned[idx] = Some(held);
+                return Poll::Ready(Ok(Some(RecvSegment {
+                    conn_index: conn,
+                    generation: self.generation,
+                    bid: held.bid,
+                    len: held.len,
+                    _borrow: PhantomData,
+                    _not_send: PhantomData,
+                })));
+            }
+
+            // Hold empty. If the recv side is closed (peer FIN), this is EOF.
+            let is_closed = driver
+                .connections
+                .get(conn)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+            if is_closed {
+                return Poll::Ready(Ok(None));
+            }
+
+            // Open and nothing held yet — park as a recv waiter. `handle_recv_multi`
+            // pushes into `segment_hold` and calls `wake_recv` on the next arrival.
+            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[idx] = true;
+            Poll::Pending
+        })
+    }
+}
+
+/// A single received provided buffer, borrowed zero-copy from the ring.
+///
+/// Yielded by [`SegmentReader::next`]. Derefs to the received bytes (`&[u8]`).
+/// The backing buffer stays pinned in the provided-buffer ring for the segment's
+/// whole lifetime — its bid is **not** replenished until the segment is dropped
+/// (or the connection closes). By construction it is:
+///
+/// - **`!Send` / `!Sync`** (`PhantomData<*const ()>`): a provided buffer is
+///   thread-affine and released only by its owning worker's driver.
+/// - **`!Clone` / non-`Copy`**: exactly one release per bid; a clone would
+///   double-replenish or leak.
+/// - **borrow-scoped** (`&'a mut` the reader): it cannot escape the async scope,
+///   so the "holdable ⇒ copied-at-delivery" invariant holds structurally. To
+///   *keep* the bytes past the scope, a later increment adds `to_owned()` (Mode C
+///   copy); there is no zero-copy retain.
+///
+/// # Drop / release soundness
+///
+/// A segment's `Drop` does **not** always run inside an executor poll: a parked
+/// task holding a segment can be dropped by a close/EOF CQE handled in the
+/// *unguarded* `drain_completions` (where `CURRENT_DRIVER` is `None`). So `Drop`
+/// uses [`try_with_state`]: when the driver is reachable it replenishes the bid
+/// and clears the driver's pin slot; when it is not, it no-ops and
+/// `close_connection` reclaims the pinned bid instead. The driver pin slot
+/// (`segment_pinned[conn]`) is the single-release discriminant — whoever `take()`s
+/// it first replenishes, so the bid is returned exactly once across the
+/// drop/close race and any slot-reuse.
+#[cfg(has_io_uring)]
+pub struct RecvSegment<'a> {
+    conn_index: u32,
+    generation: u32,
+    bid: u16,
+    len: u32,
+    _borrow: PhantomData<&'a mut ()>,
+    _not_send: PhantomData<*const ()>,
+}
+
+#[cfg(has_io_uring)]
+impl RecvSegment<'_> {
+    /// The number of received bytes in this segment.
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether this segment carries no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Deref for RecvSegment<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // The buffer is pinned in the ring (bid not replenished) for this
+        // segment's lifetime, so the pointer is valid and `len <= buf capacity`.
+        let ptr = with_state(|driver, _executor| driver.provided_bufs.get_buffer(self.bid).0);
+        // SAFETY: `ptr` points into the provided-buffer backing for `bid`, which
+        // stays pinned until this segment drops; `len` bytes were received into it.
+        // The returned slice borrows `self`, so it cannot outlive the pin.
+        unsafe { std::slice::from_raw_parts(ptr, self.len as usize) }
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Drop for RecvSegment<'_> {
+    fn drop(&mut self) {
+        // May run inside a poll (driver reachable) or in the unguarded
+        // `drain_completions` while a parked task is torn down (driver == None).
+        try_with_state(|driver, _executor| {
+            // Slot recycled to a new connection: the bid was already replenished
+            // by the old occupant's `close_connection`. Do nothing.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
+            // Reclaim only if the pin slot still holds *this* segment's buffer.
+            // If `close_connection` already drained it (None), or it somehow holds
+            // a different bid, do not replenish — that avoids the drop/close
+            // double-replenish. `take()` makes this the single release.
+            match driver.segment_pinned[self.conn_index as usize] {
+                Some(held) if held.bid == self.bid => {
+                    driver.segment_pinned[self.conn_index as usize] = None;
+                    driver.pending_replenish.push(self.bid);
+                }
+                _ => {}
+            }
+        });
+        // When `try_with_state` returned `None` (unguarded drop), the bid stays
+        // pinned and `close_connection` replenishes it — still exactly once.
     }
 }
 

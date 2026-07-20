@@ -109,9 +109,8 @@ pub(crate) struct PendingRecvBuf {
 #[derive(Clone, Copy)]
 pub(crate) struct HeldRecvBuf {
     pub(crate) bid: u16,
-    /// Bytes received into this buffer. Read by the segment reader (later
-    /// increment); close-drain only needs the bid.
-    #[allow(dead_code)]
+    /// Bytes received into this buffer. The segment reader slices the buffer to
+    /// this length; close-drain only needs the bid.
     pub(crate) len: u32,
 }
 
@@ -175,9 +174,17 @@ pub(crate) struct Driver {
     /// Per-connection held provided buffers for `Segmented` connections. Bids
     /// pushed here are pinned in the ring (NOT replenished, no accumulator copy)
     /// until a reader consumes them (later increment) or the connection closes.
-    /// `close_connection` is currently the only drain path — it returns each
-    /// held bid to `pending_replenish`.
+    /// A reader consumes them (`SegmentReader::next`) or the connection closes.
+    /// `close_connection` drains any still-held bids to `pending_replenish`.
     pub(crate) segment_hold: Vec<std::collections::VecDeque<HeldRecvBuf>>,
+    /// Per-connection pin slot: the single provided buffer currently checked out
+    /// to a live `RecvSegment` (moved here out of `segment_hold` by
+    /// `SegmentReader::next`). The B2 lending-iterator contract is one live
+    /// segment at a time, so a single `Option` suffices. This is the
+    /// single-release discriminant: whoever `take()`s it (the segment's `Drop`
+    /// under `try_with_state`, or `close_connection` under `&mut Driver`)
+    /// replenishes the bid exactly once; the other sees `None` and does nothing.
+    pub(crate) segment_pinned: Vec<Option<HeldRecvBuf>>,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
@@ -501,6 +508,7 @@ impl Driver {
             segment_hold: (0..config.max_connections)
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
+            segment_pinned: vec![None; config.max_connections as usize],
             accept_rx,
             eventfd,
             eventfd_buf: [0u8; 8],
@@ -698,6 +706,9 @@ impl Driver {
     pub(crate) fn reset_segment_state(&mut self, conn_index: u32) {
         self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
         self.segment_hold[conn_index as usize].clear();
+        // The pin slot should already be None (close drains it), but clear it
+        // defensively for a slot reused without an intervening close-drain.
+        self.segment_pinned[conn_index as usize] = None;
     }
 
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
@@ -728,6 +739,17 @@ impl Driver {
                 self.pending_replenish.push(held.bid);
             }
             self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
+        }
+        // Reclaim a bid checked out to a live `RecvSegment` (a parked task holding
+        // a segment across an await). `take()` is the single-release discriminant:
+        // if the segment's `Drop` already ran in-poll it took the slot (None here,
+        // no double-replenish); if the future is being dropped in the *unguarded*
+        // `drain_completions` (CURRENT_DRIVER == None, so `RecvSegment::drop`
+        // no-ops), the slot is still `Some` and we replenish it here. Unconditional
+        // (not gated on the domain, which was just reset above): a pinned bid must
+        // return to the ring regardless.
+        if let Some(pinned) = self.segment_pinned[conn_index as usize].take() {
+            self.pending_replenish.push(pinned.bid);
         }
         // Clear the fallback-recv flag so the slot's next occupant starts
         // clean. A still-in-flight fallback CQE for this occupant is

@@ -3851,6 +3851,254 @@ mod tests {
         );
     }
 
+    // ── Segmented recv reader (SegmentReader / RecvSegment, Mode B2) ────
+
+    /// A minimal no-op waker for driving `SegmentReader::next` in tests. The
+    /// futures park via `recv_waiters` and are re-polled manually, so the waker
+    /// is never actually invoked.
+    fn noop_waker() -> std::task::Waker {
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+        unsafe fn no_op(_: *const ()) {}
+        unsafe fn clone_fn(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, no_op, no_op, no_op);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    /// Run `f` with the worker's `CURRENT_DRIVER` thread-local pointing at
+    /// `el`'s driver/executor — the same mechanism the real event loop installs
+    /// around task polls — so futures/`Drop` impls that call `with_state` /
+    /// `try_with_state` observe a live driver. `f` must not touch `el` directly
+    /// (it aliases the raw pointers installed here); use `with_state` inside.
+    fn with_driver_state<R>(el: &mut AsyncEventLoop<NoopHandler>, f: impl FnOnce() -> R) -> R {
+        let driver_ptr = &mut el.driver as *mut Driver;
+        let executor_ptr = &mut el.executor as *mut crate::runtime::Executor;
+        let mut ds = DriverState {
+            driver: unsafe { NonNull::new_unchecked(driver_ptr) },
+            executor: unsafe { NonNull::new_unchecked(executor_ptr) },
+        };
+        let _guard = unsafe { set_driver_state_guarded(&mut ds) };
+        f()
+    }
+
+    /// Deliver one segmented recv buffer to `conn_index` via a synthetic
+    /// multishot-recv CQE (`bid`, `data`). The connection must already be in the
+    /// `Segmented` domain. Mirrors the real `handle_recv_multi` hold path.
+    fn deliver_segment(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+        bid: u16,
+        data: &[u8],
+    ) {
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr as *mut u8, data.len());
+        }
+        let flags = 1u32 | 2u32 | ((bid as u32) << 16); // F_BUFFER | F_MORE
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), data.len() as i32, flags);
+    }
+
+    #[test]
+    fn segment_reader_hands_out_segment_bytes_and_drop_replenishes() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+
+        // Opt in and deliver one buffer; it lands in the hold, not the accumulator.
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
+
+        // Drive the reader: next() moves the held buffer into the pin slot and
+        // hands out a segment.
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(reader.next());
+        let seg = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(seg))) => seg,
+            _ => panic!("expected a segment from a non-empty hold"),
+        };
+
+        // (a) The segment derefs to the received bytes.
+        with_driver_state(&mut el, || {
+            assert_eq!(&seg[..], b"hello", "segment bytes must match received data");
+            assert_eq!(seg.len(), 5);
+            assert!(!seg.is_empty());
+        });
+        // Checked out: hold emptied into the pin slot, still one buffer outstanding.
+        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
+        assert!(el.driver.segment_pinned[conn_index as usize].is_some());
+        assert_eq!(el.driver.provided_bufs.free(), entries - 1);
+
+        // (b) Dropping the segment (in-poll / guarded) replenishes its bid and
+        // clears the pin slot; committing the replenish restores the ring.
+        with_driver_state(&mut el, || drop(seg));
+        assert!(
+            el.driver.segment_pinned[conn_index as usize].is_none(),
+            "drop clears pin slot"
+        );
+        assert!(
+            el.driver.pending_replenish.contains(&bid),
+            "drop queues the bid for replenish"
+        );
+        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "free restored after drop-replenish"
+        );
+    }
+
+    #[test]
+    fn segment_reader_next_parks_then_resumes_on_recv() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(reader.next());
+
+        // First poll: hold empty, connection open → parks as a recv waiter.
+        let p1 = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(
+            matches!(p1, std::task::Poll::Pending),
+            "next parks on an empty hold"
+        );
+        assert!(
+            el.executor.recv_waiters[conn_index as usize],
+            "parked next registers a recv waiter"
+        );
+
+        // Simulate a recv arrival: the hold gets a buffer and wake_recv fires.
+        deliver_segment(&mut el, conn_index, 0, b"world");
+        assert!(
+            !el.executor.recv_waiters[conn_index as usize],
+            "wake_recv cleared the recv waiter on delivery"
+        );
+
+        // Second poll: the buffer is now held → resumes with a segment.
+        let seg = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(seg))) => seg,
+            _ => panic!("expected a segment after the simulated recv"),
+        };
+        with_driver_state(&mut el, || {
+            assert_eq!(
+                &seg[..],
+                b"world",
+                "resumed segment carries the delivered bytes"
+            );
+            drop(seg);
+        });
+    }
+
+    #[test]
+    fn close_while_segment_pinned_replenishes_bid_exactly_once() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let entries = el.driver.provided_bufs.ring_entries();
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        // Deliver and check out a segment so its bid sits in the pin slot.
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"hello");
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(reader.next());
+        let seg = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(seg))) => seg,
+            _ => panic!("expected a pinned segment"),
+        };
+        assert!(
+            el.driver.segment_pinned[conn_index as usize].is_some(),
+            "segment is pinned"
+        );
+
+        // Close while the segment is still checked out. close_connection drains
+        // the pin slot (the single-release discriminant) and replenishes the bid.
+        el.driver.close_connection(conn_index);
+        assert!(
+            el.driver.segment_pinned[conn_index as usize].is_none(),
+            "close drains the pin slot"
+        );
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "close replenishes the pinned bid exactly once"
+        );
+
+        // Dropping the now-stale segment must NOT double-replenish: the guarded
+        // drop sees an empty pin slot (close already took it) → no-op.
+        with_driver_state(&mut el, || drop(seg));
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == bid)
+                .count(),
+            1,
+            "drop after close must not double-replenish the bid"
+        );
+
+        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        el.driver.provided_bufs.replenish_batch(&to_replenish);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "free returns to ring_entries — no leak, no double-replenish"
+        );
+    }
+
+    #[test]
+    fn segment_reader_next_returns_none_at_eof() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        // Close the connection (recv side) with nothing held.
+        el.driver.close_connection(conn_index);
+
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(reader.next());
+        let done = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(None)))
+        });
+        assert!(
+            done,
+            "closed connection with an empty hold yields EOF (Ok(None))"
+        );
+    }
+
     #[test]
     fn handle_recv_multi_second_completion_flushes_to_accumulator() {
         let mut el = make_test_loop();
