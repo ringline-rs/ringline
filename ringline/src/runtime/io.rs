@@ -2221,6 +2221,40 @@ impl SegmentReader<'_> {
     }
 }
 
+#[cfg(has_io_uring)]
+impl Drop for SegmentReader<'_> {
+    fn drop(&mut self) {
+        // Auto-settle on drop: if the reader is dropped while the connection is
+        // still in the segmented domain (i.e. `end_segments()` was not called —
+        // the common pattern drops the reader first, then calls `end_segments`),
+        // drain any still-held segments into the accumulator and restore the
+        // default `with_data`/`with_bytes` read path. Without this, held bytes
+        // would be stranded and a subsequent ordinary read would hang (arriving
+        // buffers keep being held as segments). A live `RecvSegment` borrows the
+        // reader `&mut`, so by here the pin slot is empty (the segment dropped
+        // first) — only the hold needs draining.
+        //
+        // `try_with_state`: a reader owned by a parked task can be dropped in the
+        // *unguarded* `drain_completions` during teardown (`CURRENT_DRIVER` is
+        // `None`), where there is nothing to settle — the connection is closing
+        // and `handle_close` reclaims the held bids. On accumulator overflow while
+        // settling, poison (close) the connection.
+        try_with_state(|driver, _executor| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return; // slot reused — nothing of ours to settle.
+            }
+            if driver.recv_domain[self.conn_index as usize]
+                != crate::recv::domain::RecvDomain::Segmented
+            {
+                return; // already settled (end_segments() was called).
+            }
+            if !driver.settle_forward_end(self.conn_index) {
+                driver.close_connection(self.conn_index);
+            }
+        });
+    }
+}
+
 /// Future returned by [`SegmentReader::next`]. Borrows the reader (`&mut`) for
 /// `'a`; the yielded [`RecvSegment`] shares that borrow, keeping the reader
 /// exclusively locked while the segment is alive.
@@ -2247,18 +2281,28 @@ impl<'a> Future for SegmentNext<'a> {
                 return Poll::Ready(Ok(None));
             }
 
-            // A held buffer is available: hand it to a `RecvSegment`. The
-            // one-live-segment contract (enforced by `&mut self` on the reader)
-            // guarantees the pin slot is empty here.
+            // One live pinned segment per connection at a time. A *single* reader
+            // is kept sound by `&mut self` (a live `RecvSegment` borrows the reader
+            // exclusively, so `next` cannot be called again). But `segments()`
+            // takes `&self`, so a second concurrent `SegmentReader` on the same
+            // connection could reach here with the pin slot already occupied —
+            // overwriting it would orphan the first segment's bid (a ring leak).
+            // Refuse rather than leak: surface the misuse as an error instead of
+            // handing out a second pinned segment.
+            if driver.segment_pinned[idx].is_some() {
+                return Poll::Ready(Err(io::Error::other(
+                    "a segmented-recv segment is already checked out — only one \
+                     SegmentReader/RecvSegment may be live per connection at a time",
+                )));
+            }
+
+            // A held buffer is available: hand it to a `RecvSegment`.
             if let Some(held) = driver.segment_hold[idx].pop_front() {
                 match held {
                     crate::backend::HeldRecvBuf::Pinned { bid, len } => {
-                        // Zero-copy: check the bid out into the pin slot; the
-                        // segment's Drop / into_owned releases it exactly once.
-                        debug_assert!(
-                            driver.segment_pinned[idx].is_none(),
-                            "pin slot occupied while checking out a new segment"
-                        );
+                        // Zero-copy: check the bid out into the (guaranteed-empty)
+                        // pin slot; the segment's Drop / into_owned releases it
+                        // exactly once.
                         driver.segment_pinned[idx] =
                             Some(crate::backend::HeldRecvBuf::Pinned { bid, len });
                         return Poll::Ready(Ok(Some(RecvSegment {

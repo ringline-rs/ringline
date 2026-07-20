@@ -4652,6 +4652,108 @@ mod tests {
         assert!(eof, "reader reports EOF after draining the held data");
     }
 
+    /// Medium: a second concurrent `SegmentReader` on the same connection must not
+    /// overwrite the pin slot (which would orphan the first segment's bid — a ring
+    /// leak). Its `next()` errors instead, consuming nothing.
+    #[test]
+    fn second_concurrent_segment_reader_errors_rather_than_leaking() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        deliver_segment(&mut el, conn_index, 0, b"hello");
+        deliver_segment(&mut el, conn_index, 1, b"world");
+
+        let conn = ConnCtx::new(conn_index, generation);
+        let waker = noop_waker();
+
+        // Reader A checks out the first segment → pins bid 0.
+        let mut reader_a = with_driver_state(&mut el, || conn.segments());
+        let mut fut_a = std::pin::pin!(reader_a.next());
+        let seg_a = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut_a.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(s))) => s,
+            _ => panic!("reader A: expected a pinned segment"),
+        };
+        assert!(matches!(
+            el.driver.segment_pinned[conn_index as usize],
+            Some(crate::backend::HeldRecvBuf::Pinned { bid: 0, .. })
+        ));
+
+        // Reader B tries to check out a second segment while A's is still live: the
+        // pin slot is occupied → error, and it must NOT pop the next held buffer.
+        let mut reader_b = with_driver_state(&mut el, || conn.segments());
+        let mut fut_b = std::pin::pin!(reader_b.next());
+        let res_b = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut_b.as_mut().poll(&mut cx)
+        });
+        assert!(
+            matches!(res_b, std::task::Poll::Ready(Err(_))),
+            "a second concurrent reader must error, not overwrite the pin slot"
+        );
+        assert!(
+            matches!(
+                el.driver.segment_pinned[conn_index as usize],
+                Some(crate::backend::HeldRecvBuf::Pinned { bid: 0, .. })
+            ),
+            "reader A's bid stays pinned (not overwritten)"
+        );
+        assert_eq!(
+            el.driver.segment_hold[conn_index as usize].len(),
+            1,
+            "reader B must not consume the held buffer on the error path"
+        );
+
+        // Cleanup: dropping A's segment releases bid 0 exactly once — no leak.
+        with_driver_state(&mut el, || drop(seg_a));
+        assert_eq!(
+            el.driver
+                .pending_replenish
+                .iter()
+                .filter(|&&b| b == 0)
+                .count(),
+            1,
+        );
+    }
+
+    /// Medium: dropping a `SegmentReader` while the connection is still in the
+    /// segmented domain (no explicit `end_segments`) auto-settles — held bytes are
+    /// gathered into the accumulator and the default read path is restored — so a
+    /// later ordinary read neither hangs nor loses data.
+    #[test]
+    fn segment_reader_drop_auto_settles_held_data() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        deliver_segment(&mut el, conn_index, 0, b"hello");
+        deliver_segment(&mut el, conn_index, 1, b"world");
+
+        let conn = ConnCtx::new(conn_index, generation);
+        // Create a reader, consume nothing, drop it — guarded (CURRENT_DRIVER set),
+        // as it would be inside a real task poll.
+        with_driver_state(&mut el, || {
+            let reader = conn.segments();
+            drop(reader);
+        });
+
+        assert_eq!(
+            el.driver.recv_domain[conn_index as usize],
+            crate::recv::domain::RecvDomain::default(),
+            "reader drop restores the default read path"
+        );
+        assert_eq!(
+            el.driver.accumulators.data(conn_index),
+            b"helloworld",
+            "held segments are gathered into the accumulator, in order, on drop"
+        );
+    }
+
     #[test]
     fn segment_reader_next_returns_none_at_eof() {
         let mut el = make_test_loop();
@@ -6337,6 +6439,7 @@ mod tests {
         // Buffers came back — but re-arming a connection with a partial
         // message would only move one ring's worth before parking again
         // (the churn cycle). The fallback must win the arbitration.
+        el.driver.provided_bufs.on_handout(); // a replenished bid was handed out first
         el.driver.pending_replenish.push(0);
         el.flush_replenish_and_rearm();
 
@@ -6352,6 +6455,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = park_connection(&mut el);
 
+        el.driver.provided_bufs.on_handout(); // a replenished bid was handed out first
         el.driver.pending_replenish.push(0);
         el.flush_replenish_and_rearm();
 
@@ -6382,6 +6486,7 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
         assert!(el.driver.recv_starved.contains(&conn_index));
 
+        el.driver.provided_bufs.on_handout(); // a replenished bid was handed out first
         el.driver.pending_replenish.push(0);
         el.flush_replenish_and_rearm();
 
@@ -6400,6 +6505,7 @@ mod tests {
         // Simulate a zero-copy held buffer with unconsumed partial data.
         let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(3);
         unsafe { std::ptr::copy_nonoverlapping(b"held".as_ptr(), buf_ptr as *mut u8, 4) };
+        el.driver.provided_bufs.on_handout(); // bid 3 was handed out before being held
         el.driver.pending_recv_bufs[conn_index as usize] = Some(crate::backend::PendingRecvBuf {
             bid: 3,
             len: 4,

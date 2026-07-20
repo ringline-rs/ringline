@@ -146,6 +146,17 @@ impl ProvidedBufRing {
             self.push_entry(bid);
         }
         if !bids.is_empty() {
+            // Tripwire: replenishing more buffers than are outstanding means a bid
+            // was returned to the ring more than once (a double-replenish) — the
+            // recurring failure mode for the zero-copy hold/segment/forward paths.
+            // `saturating_sub` keeps `free()` sane in release; this catches the bug
+            // in debug/tests before it can silently corrupt ring accounting.
+            debug_assert!(
+                self.outstanding >= bids.len() as u32,
+                "double-replenish: returning {} buffers but only {} outstanding",
+                bids.len(),
+                self.outstanding,
+            );
             self.outstanding = self.outstanding.saturating_sub(bids.len() as u32);
             self.commit_tail();
         }
@@ -227,10 +238,23 @@ mod tests {
         assert_eq!(ring.free(), 8);
     }
 
+    /// Replenishing more than are outstanding is a double-replenish; the debug
+    /// tripwire fires in debug builds (where tests normally run).
     #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "double-replenish")]
+    fn double_replenish_trips_debug_assert() {
+        let mut ring = ProvidedBufRing::new(0, 4, 4096).expect("ring");
+        // Nothing outstanding → returning 3 buffers is a double-replenish.
+        ring.replenish_batch(&[0, 1, 2]);
+    }
+
+    /// In release builds (tripwire compiled out) the `saturating_sub` still keeps
+    /// `free()` from underflowing.
+    #[test]
+    #[cfg(not(debug_assertions))]
     fn replenish_saturates_never_underflows() {
         let mut ring = ProvidedBufRing::new(0, 4, 4096).expect("ring");
-        // Replenishing with nothing outstanding must not underflow free().
         ring.replenish_batch(&[0, 1, 2]);
         assert_eq!(ring.free(), 4);
         assert_eq!(ring.ring_entries(), 4);
