@@ -964,21 +964,16 @@ impl Driver {
             }
             self.recv_forward[conn_index as usize] = false;
         }
-        // Drain any held segmented-recv buffers so their bids return to the
-        // ring — nothing consumes held buffers yet, so close is the only drain
-        // path; without this a Segmented connection leaks bids. Reset the domain
-        // for slot reuse.
-        if self.recv_domain[conn_index as usize] == crate::recv::domain::RecvDomain::Segmented {
-            for held in self.segment_hold[conn_index as usize].drain(..) {
-                // Pinned entries pin a bid that must return to the ring; Owned
-                // entries already replenished their bid at delivery, so dropping
-                // the owned `Bytes` is all that is needed.
-                if let HeldRecvBuf::Pinned { bid, .. } = held {
-                    self.pending_replenish.push(bid);
-                }
-            }
-            self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
-        }
+        // Do NOT drain held segmented-recv buffers here. When a peer FIN drives
+        // this close, a parked Mode B reader must still consume the bytes already
+        // held — draining them now (before the woken reader is polled) would
+        // discard a fully-received response and surface an empty EOF (the
+        // data+FIN-loss bug): a data CQE and the FIN can land in the same batch,
+        // and `close_connection` runs before `poll_ready_tasks`. The reader drains
+        // the hold (replenishing each bid as it consumes, seeing EOF once the hold
+        // is empty and the connection is `Closed`); any buffers it never reaches
+        // are reclaimed at `handle_close` (teardown), symmetric to `segment_pinned`.
+        // The delivery domain is reset at slot reuse (`reset_segment_state`).
         // A bid checked out to a live `RecvSegment` (a parked task holding a
         // segment across an await) must NOT be reclaimed here. `RecvSegment::deref`
         // reads that bid's provided buffer directly, and a parked task can still

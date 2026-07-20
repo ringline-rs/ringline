@@ -2746,6 +2746,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.pending_replenish.push(bid);
         }
 
+        // Drain any segmented-recv buffers still held (a Mode B reader that never
+        // finished consuming them, or a Mode A forward aborted by close).
+        // `close_connection` deliberately left these so a post-FIN reader could
+        // consume them; by teardown no consumer remains, so reclaim each Pinned
+        // bid (Owned entries just drop). Symmetric to the `segment_pinned` reclaim
+        // above and the `pending_recv_bufs` reclaim.
+        for held in self.driver.segment_hold[conn_index as usize]
+            .drain(..)
+            .collect::<Vec<_>>()
+        {
+            if let crate::backend::HeldRecvBuf::Pinned { bid, .. } = held {
+                self.driver.pending_replenish.push(bid);
+            }
+        }
+
         let was_established = self
             .driver
             .connections
@@ -4191,7 +4206,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_recv_multi_segmented_holds_buffer_and_close_drains() {
+    fn handle_recv_multi_segmented_holds_buffer_and_teardown_drains() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
@@ -4248,16 +4263,32 @@ mod tests {
             "held segment must decrement free by one"
         );
 
-        // (c) Close drains the hold: the bid is queued for replenish and the
-        // hold is emptied; committing the replenish restores the ring.
+        // (c) Close does NOT drain the hold — a post-FIN reader must still be able
+        // to consume the already-received bytes (see the data+FIN-loss regression
+        // test). The held bid stays out of the ring.
+        let generation = el.driver.connections.generation(conn_index);
         el.driver.close_connection(conn_index);
+        assert_eq!(
+            el.driver.segment_hold[conn_index as usize].len(),
+            1,
+            "close must NOT drain the segment hold (a reader may still consume it)"
+        );
+        assert!(
+            !el.driver.pending_replenish.contains(&bid),
+            "the held bid must not return to the ring at close time"
+        );
+
+        // (d) Teardown (the Close CQE → handle_close) reclaims any unconsumed held
+        // buffers; committing the replenish restores the ring.
+        let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
+        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
         assert!(
             el.driver.segment_hold[conn_index as usize].is_empty(),
-            "close must drain the segment hold"
+            "handle_close drains the unconsumed hold"
         );
         assert!(
             el.driver.pending_replenish.contains(&bid),
-            "close must queue the held bid for replenish"
+            "handle_close queues the held bid for replenish"
         );
         let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
         el.driver.provided_bufs.replenish_batch(&to_replenish);
@@ -4569,6 +4600,56 @@ mod tests {
             entries,
             "no leak, no double"
         );
+    }
+
+    /// Regression for the Mode B data+FIN-loss bug: a data CQE and the peer FIN can
+    /// arrive in the same batch, so `close_connection` runs before the woken reader
+    /// is polled. The already-received bytes must NOT be discarded — the reader must
+    /// still deliver them, then report EOF.
+    #[test]
+    fn segment_reader_delivers_held_data_after_close_then_eof() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        // A response buffer is received (held), then the peer FIN closes the conn
+        // before the reader runs.
+        let bid: u16 = 0;
+        deliver_segment(&mut el, conn_index, bid, b"response");
+        el.driver.close_connection(conn_index);
+
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut reader = with_driver_state(&mut el, || conn.segments());
+        let waker = noop_waker();
+
+        // The reader still sees the held response — the data was not lost at close.
+        {
+            let mut fut = std::pin::pin!(reader.next());
+            let seg = match with_driver_state(&mut el, || {
+                let mut cx = std::task::Context::from_waker(&waker);
+                fut.as_mut().poll(&mut cx)
+            }) {
+                std::task::Poll::Ready(Ok(Some(seg))) => seg,
+                _ => panic!("expected the held response segment after close"),
+            };
+            with_driver_state(&mut el, || {
+                assert_eq!(
+                    &seg[..],
+                    b"response",
+                    "held response delivered after close, not lost"
+                );
+                drop(seg);
+            });
+        }
+
+        // Next poll: hold drained + connection `Closed` → clean EOF.
+        let mut fut = std::pin::pin!(reader.next());
+        let eof = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(None)))
+        });
+        assert!(eof, "reader reports EOF after draining the held data");
     }
 
     #[test]
@@ -5417,13 +5498,14 @@ mod tests {
         assert_eq!(el.driver.provided_bufs.free(), entries, "balanced");
     }
 
-    /// (d) Closing a connection with an OWNED segment still held must not
+    /// (d) Tearing down a connection with an OWNED segment still held must not
     /// double-replenish: the owned entry carries no bid (already returned at
-    /// delivery), so close drains the hold without queueing a replenish.
+    /// delivery), so draining it at `handle_close` queues no replenish.
     #[test]
     fn close_with_owned_segment_held_does_not_double_replenish() {
         let mut el = make_test_loop_with_config(config_with_reserve(16));
         let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
         let entries = el.driver.provided_bufs.ring_entries();
         el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
 
@@ -5443,11 +5525,19 @@ mod tests {
             crate::backend::HeldRecvBuf::Owned(_)
         ));
 
-        // Close while the owned segment is still held.
+        // Close leaves the hold for a possible reader; teardown drains it. The
+        // owned entry carries no bid, so neither step re-queues a replenish.
         el.driver.close_connection(conn_index);
+        assert_eq!(
+            el.driver.segment_hold[conn_index as usize].len(),
+            1,
+            "close must not drain the hold"
+        );
+        let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
+        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
         assert!(
             el.driver.segment_hold[conn_index as usize].is_empty(),
-            "close drains the hold"
+            "handle_close drains the owned hold"
         );
         assert_eq!(
             el.driver
@@ -5456,7 +5546,7 @@ mod tests {
                 .filter(|&&b| b == bid)
                 .count(),
             1,
-            "close must NOT re-queue an owned entry's bid (no bid to return)"
+            "teardown must NOT re-queue an owned entry's bid (no bid to return)"
         );
         let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
         el.driver.provided_bufs.replenish_batch(&r);
@@ -6025,7 +6115,10 @@ mod tests {
         assert!(el.driver.forward_hold_throttled[conn_index as usize]);
         assert_eq!(el.driver.provided_bufs.free(), entries - 2);
 
-        // Close while throttled: held bids return to the ring, flags cleared.
+        // Close while throttled clears the forwarder flags but does NOT drain the
+        // held bids (a reader could still consume them post-FIN); teardown reclaims
+        // any it never reaches.
+        let generation = el.driver.connections.generation(conn_index);
         el.driver.close_connection(conn_index);
         assert!(
             !el.driver.forward_hold_throttled[conn_index as usize],
@@ -6035,6 +6128,15 @@ mod tests {
             !el.driver.forward_recv_active[conn_index as usize],
             "forwarder flag cleared on close"
         );
+        assert_eq!(
+            el.driver.segment_hold[conn_index as usize].len(),
+            2,
+            "close does not drain the held bids"
+        );
+
+        // Teardown (the Close CQE → handle_close) reclaims the held bids.
+        let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
+        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
         assert_eq!(
             el.driver
                 .pending_replenish
