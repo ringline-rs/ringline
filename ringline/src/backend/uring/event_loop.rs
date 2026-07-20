@@ -2118,6 +2118,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             self.driver.pending_replenish.push(bid);
         }
+        // On a closing connection this is the cancelled-write's (ECANCELED) CQE:
+        // the backing is now released, so continue the deferred close instead of
+        // waking the doomed forward future.
+        if self.driver.send_queues[conn_index as usize].close_pending {
+            self.driver.try_finalize_close(conn_index);
+            return;
+        }
         self.driver.forward_done[conn_index as usize] = Some(Err(errno));
         self.executor.wake_recv(conn_index);
     }
@@ -2242,6 +2249,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
+        // If the connection is closing, `close_connection` cancelled this write;
+        // stop forwarding regardless of the result. Reclaim the backing (the CQE
+        // means the kernel is done reading it) and drive the deferred close — do
+        // not resubmit a short write, arm POLLOUT, or wake the doomed future.
+        let closing = self.driver.send_queues[conn_index as usize].close_pending;
+
         if result > 0 {
             let n = result as u32;
             let reached_total = {
@@ -2251,20 +2264,26 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 state.written = state.written.saturating_add(n);
                 state.written >= state.total
             };
-            if !reached_total {
+            if !reached_total && !closing {
                 // Short write — resubmit the remainder (files, or a socket send
                 // the kernel did not fully retry).
                 self.resubmit_forward_write(conn_index);
                 return;
             }
-            // Fully written: release the backing exactly once and report the
-            // completed byte count to the forward future.
+            // Fully written (or closing — stop forwarding): release the backing
+            // exactly once.
             let state = self.driver.forward_write[conn_index as usize]
                 .take()
                 .expect("checked live above");
             let total = state.total;
             if let crate::backend::HeldRecvBuf::Pinned { bid, .. } = state.backing {
                 self.driver.pending_replenish.push(bid);
+            }
+            if closing {
+                // The forward write was the last thing pinning this slot; its bid
+                // is now released, so continue the deferred close.
+                self.driver.try_finalize_close(conn_index);
+                return;
             }
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.driver.forward_done[conn_index as usize] = Some(Ok(total));
@@ -2278,7 +2297,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         let errno = -result;
-        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+        if !closing && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
             // Socket sink buffer full: arm POLLOUT, then resubmit when writable.
             let sink_fd = self.driver.forward_write[conn_index as usize]
                 .as_ref()
@@ -2315,6 +2334,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         if result < 0 {
             self.fail_forward_write(conn_index, -result);
+            return;
+        }
+        // A closing connection cancelled its forward write; even if this POLLOUT
+        // raced in writable, stop forwarding — reclaim the backing and finalize
+        // the close rather than resubmitting onto a doomed connection.
+        if self.driver.send_queues[conn_index as usize].close_pending {
+            self.fail_forward_write(conn_index, libc::ECANCELED);
             return;
         }
         self.resubmit_forward_write(conn_index);
@@ -5621,11 +5647,15 @@ mod tests {
         );
     }
 
-    /// (d) Close mid-forward (a write in flight, its pinned bid held) replenishes
-    /// the bid exactly once; a later stale write CQE for the closed occupant is a
-    /// no-op (no double replenish, no leak).
+    /// (d) Close mid-forward must NOT return the in-flight write's source bid to
+    /// the ring while the kernel is still reading it (invariant #1). Regression
+    /// for the CRITICAL Mode A UAF: `close_connection` cancels the write and holds
+    /// the backing until the (ECANCELED) CQE lands, which releases the bid exactly
+    /// once and drives the deferred close. Returning the bid at close time would
+    /// let another connection's recv overwrite a buffer the kernel is still
+    /// DMA-reading.
     #[test]
-    fn close_mid_forward_replenishes_in_flight_bid_exactly_once() {
+    fn close_mid_forward_defers_bid_release_until_write_cqe() {
         use std::os::fd::AsFd;
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
@@ -5647,11 +5677,26 @@ mod tests {
         assert!(el.driver.forward_write[conn_index as usize].is_some());
         assert!(!el.driver.pending_replenish.contains(&bid));
 
-        // Close while the write is in flight: the held bid returns to the ring.
+        // Close while the write is in flight: the backing is STILL held (the
+        // kernel is reading it) and the bid is NOT yet back in the ring.
         el.driver.close_connection(conn_index);
         assert!(
+            el.driver.forward_write[conn_index as usize].is_some(),
+            "close must not drain the in-flight forward write early — the kernel \
+             still owns its source buffer"
+        );
+        assert!(
+            !el.driver.pending_replenish.contains(&bid),
+            "the in-flight source bid must not return to the ring before the write CQE"
+        );
+
+        // The cancelled write's CQE (ECANCELED) lands: now the kernel is done, so
+        // the bid is replenished exactly once and the deferred close proceeds.
+        let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+        assert!(
             el.driver.forward_write[conn_index as usize].is_none(),
-            "close drains the in-flight forward write"
+            "the write CQE releases the backing"
         );
         assert_eq!(
             el.driver
@@ -5660,11 +5705,10 @@ mod tests {
                 .filter(|&&b| b == bid)
                 .count(),
             1,
-            "close replenishes the in-flight bid exactly once"
+            "the write CQE replenishes the in-flight bid exactly once"
         );
 
-        // A stale write CQE for the (now closed) occupant must no-op.
-        let ud = UserData::encode(OpTag::ForwardWrite, conn_index, generation);
+        // A further stale write CQE for the (now released) occupant must no-op.
         el.test_dispatch_cqe(ud.raw(), 5, 0);
         assert_eq!(
             el.driver
@@ -5673,7 +5717,7 @@ mod tests {
                 .filter(|&&b| b == bid)
                 .count(),
             1,
-            "the stale forward-write CQE does not double-replenish"
+            "a stale forward-write CQE does not double-replenish"
         );
         let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
         el.driver.provided_bufs.replenish_batch(&r);

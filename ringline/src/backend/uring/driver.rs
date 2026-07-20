@@ -992,18 +992,41 @@ impl Driver {
         {
             self.pending_replenish.push(bid);
         }
-        // Reclaim the backing of an in-flight Mode A forward write. A pinned bid
-        // returns to the ring; an owned copy just drops. A still-in-flight write
-        // CQE for this occupant then finds `forward_write[conn] == None` (or a
-        // reused slot with a mismatched generation) and no-ops — the bid is
-        // released exactly once, here. Clear any completed-write result too.
-        if let Some(HeldRecvBuf::Pinned { bid, .. }) = self.forward_write[conn_index as usize]
-            .take()
-            .map(|s| s.backing)
-        {
-            self.pending_replenish.push(bid);
+        // An in-flight Mode A forward write's backing is still owned by the kernel
+        // (it is the write's *source* memory) until the write CQE arrives —
+        // reclaiming it now would either return a provided bid to the ring while
+        // the kernel is still DMA-reading it (another connection's recv could then
+        // overwrite it: cross-connection corruption / info leak) or free an Owned
+        // copy the kernel is still reading (use-after-free). Both violate
+        // invariant #1 (SQE memory must outlive the op). So do NOT reclaim it here.
+        // Instead cancel the in-flight write so a stuck sink cannot pin the bid and
+        // slot forever, and leave `forward_write[conn]` in place: the (possibly
+        // ECANCELED) CQE is handled by `handle_forward_write` / `fail_forward_write`,
+        // which replenish the bid exactly once and drive this deferred close
+        // forward. `try_finalize_close` will not submit the `Close` SQE — and so the
+        // slot is not reused and the captured generation stays valid — while
+        // `forward_write[conn]` is still `Some`.
+        if let Some(state) = self.forward_write[conn_index as usize].as_ref() {
+            let write_gen = state.generation;
+            // The in-flight op is either the write itself or its POLLOUT re-arm;
+            // cancel both user_data variants (the non-matching one is a harmless
+            // ENOENT whose `Cancel` CQE is ignored).
+            let write_ud = crate::completion::UserData::encode(
+                crate::completion::OpTag::ForwardWrite,
+                conn_index,
+                write_gen,
+            );
+            let pollout_ud = crate::completion::UserData::encode(
+                crate::completion::OpTag::ForwardWritePollOut,
+                conn_index,
+                write_gen,
+            );
+            let _ = self.ring.submit_async_cancel(write_ud.raw(), conn_index);
+            let _ = self.ring.submit_async_cancel(pollout_ud.raw(), conn_index);
+        } else {
+            // No forward write in flight — safe to clear a stale completed result.
+            self.forward_done[conn_index as usize] = None;
         }
-        self.forward_done[conn_index as usize] = None;
         // Clear the Mode A forward flags for slot reuse. Any held bids were
         // already drained above (segment_hold / segment_pinned / forward_write);
         // the throttle flag just tracks recv-arm state and needs no bid release.
@@ -1066,8 +1089,14 @@ impl Driver {
     /// from `note_send_finalized` after each per-send CQE.
     pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
         let state = &self.send_queues[conn_index as usize];
-        let drained = !state.in_flight && state.queue.is_empty();
-        if !(state.close_pending && drained) {
+        let sends_drained = !state.in_flight && state.queue.is_empty();
+        // An in-flight Mode A forward write still owns a provided buffer (or Owned
+        // copy) the kernel is reading as the write source; do not submit `Close`
+        // (which recycles the slot) until its CQE has landed and released the
+        // backing. `handle_forward_write` / `fail_forward_write` re-drive this
+        // finalize once `forward_write[conn]` is cleared.
+        let forward_drained = self.forward_write[conn_index as usize].is_none();
+        if !(state.close_pending && sends_drained && forward_drained) {
             return;
         }
         self.send_queues[conn_index as usize].close_pending = false;
