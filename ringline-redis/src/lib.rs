@@ -2439,8 +2439,37 @@ impl Client {
         &mut self,
         key: &[u8],
         len: usize,
-        mut src: impl SegmentSource,
+        src: impl SegmentSource,
     ) -> Result<(), Error> {
+        // Every failure between the first byte of the value frame reaching the
+        // wire and a *complete* reply being read leaves a partial/desynced frame
+        // the server is still parsing — a pooled connection reused after that
+        // feeds the next caller's bytes into this frame's value. So poison (close)
+        // the connection on any such error, matching the over/under-produce and
+        // read-side poison discipline. A well-formed reply that merely *reports*
+        // an error (a Redis error string, or an unexpected type) means the frame
+        // was fully sent and the wire is synced — that path must NOT poison.
+        match self.write_set_frame_and_read(key, len, src).await {
+            Ok(Value::SimpleString(_)) | Ok(Value::Null) => Ok(()),
+            Ok(Value::Error(msg)) => Err(Error::Redis(String::from_utf8_lossy(&msg).into_owned())),
+            Ok(_) => Err(Error::UnexpectedResponse),
+            Err(e) => {
+                self.conn.close();
+                Err(e)
+            }
+        }
+    }
+
+    /// Write the streamed `SET` frame and read its reply. Every `?` here is a
+    /// wire-desync condition ([`set_stream`](Self::set_stream) poisons on it);
+    /// classifying the returned [`Value`] happens in the caller, after a complete
+    /// reply has been read (so a server error reply does not poison).
+    async fn write_set_frame_and_read(
+        &mut self,
+        key: &[u8],
+        len: usize,
+        mut src: impl SegmentSource,
+    ) -> Result<Value, Error> {
         // Command framing with the value bulk header declaring `len`:
         // `*3\r\n$3\r\nSET\r\n$<klen>\r\n<key>\r\n$<len>\r\n`.
         self.encode_buf.clear();
@@ -2456,7 +2485,6 @@ impl Client {
             sent += chunk.len();
             if sent > len {
                 // Over-produce: the value frame is already too long → desync.
-                self.conn.close();
                 return Err(Error::LengthMismatch);
             }
             // `send` copies into the pool synchronously and returns a future that
@@ -2466,20 +2494,12 @@ impl Client {
         }
         if sent != len {
             // Under-produce: header declared `len`, source gave fewer → desync.
-            self.conn.close();
             return Err(Error::LengthMismatch);
         }
 
         // Trailing `\r\n`, then the `+OK` reply.
         self.conn.send_nowait(b"\r\n")?;
-        let value = self.read_value().await?;
-        if let Value::Error(ref msg) = value {
-            return Err(Error::Redis(String::from_utf8_lossy(msg).into_owned()));
-        }
-        match value {
-            Value::SimpleString(_) | Value::Null => Ok(()),
-            _ => Err(Error::UnexpectedResponse),
-        }
+        self.read_value().await
     }
 }
 

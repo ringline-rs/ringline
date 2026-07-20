@@ -1642,12 +1642,45 @@ impl Client {
         flags: u32,
         exptime: u32,
         len: usize,
-        mut src: impl SegmentSource,
+        src: impl SegmentSource,
     ) -> Result<(), Error> {
-        // Header: `set <key> <flags> <exptime> <len>\r\n` (rejects oversized keys
-        // before any byte hits the wire).
+        // Header: `set <key> <flags> <exptime> <len>\r\n`. Build and validate it
+        // first — an oversized key is rejected here, before any byte hits the
+        // wire, so that error does NOT poison the connection.
         self.encode_buf.clear();
         append_set_guard_prefix(&mut self.encode_buf, key, len, flags, exptime)?;
+
+        // From the first send onward a partial value frame can be on the wire;
+        // any error before a *complete* reply is read leaves the connection
+        // desynced — a pooled reuse would feed the next caller's bytes into this
+        // frame's value. So poison (close) on any such error, matching the
+        // over/under-produce and read-side poison discipline. A complete reply
+        // (even a server error line, or an unexpected type) means the frame was
+        // fully sent and the wire is synced — that path must NOT poison.
+        match self.write_set_frame_and_read(len, src).await {
+            Ok(response) => {
+                check_error_bytes(&response)?;
+                match response {
+                    McResponseBytes::Stored => Ok(()),
+                    _ => Err(Error::UnexpectedResponse),
+                }
+            }
+            Err(e) => {
+                self.conn.close();
+                Err(e)
+            }
+        }
+    }
+
+    /// Write the streamed `set` frame (header already built in `encode_buf`) and
+    /// read its reply. Every `?` here is a wire-desync condition
+    /// ([`set_stream`](Self::set_stream) poisons on it); classifying the reply
+    /// happens in the caller, after a complete reply has been read.
+    async fn write_set_frame_and_read(
+        &mut self,
+        len: usize,
+        mut src: impl SegmentSource,
+    ) -> Result<McResponseBytes, Error> {
         self.conn.send_nowait(&self.encode_buf)?;
 
         // Stream the value body, enforcing the length contract.
@@ -1659,7 +1692,6 @@ impl Client {
             sent += chunk.len();
             if sent > len {
                 // Over-produce: the value frame is already too long → desync.
-                self.conn.close();
                 return Err(Error::LengthMismatch);
             }
             // `send` copies into the pool synchronously and returns a future that
@@ -1669,18 +1701,12 @@ impl Client {
         }
         if sent != len {
             // Under-produce: header declared `len`, source gave fewer → desync.
-            self.conn.close();
             return Err(Error::LengthMismatch);
         }
 
         // Trailing `\r\n`, then the `STORED\r\n` reply.
         self.conn.send_nowait(b"\r\n")?;
-        let response = self.read_response().await?;
-        check_error_bytes(&response)?;
-        match response {
-            McResponseBytes::Stored => Ok(()),
-            _ => Err(Error::UnexpectedResponse),
-        }
+        self.read_response().await
     }
 }
 

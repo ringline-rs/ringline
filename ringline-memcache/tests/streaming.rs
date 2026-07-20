@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
-use ringline_memcache::{Client, Error};
+use ringline_memcache::{Client, Error, SegmentSource};
 
 // ── Config ───────────────────────────────────────────────────────────────
 
@@ -618,6 +618,52 @@ async fn run_set_stream(addr: SocketAddr) -> Result<(), String> {
             Err(Error::LengthMismatch) => { /* expected */ }
             Err(e) => return Err(format!("over-produce: wrong error {e}")),
             Ok(()) => return Err("over-produce: unexpectedly succeeded".into()),
+        }
+    }
+
+    // (d) source error mid-stream: `next_chunk` returns an error after the value
+    // header (and some value bytes) are already on the wire. The error must
+    // propagate AND the connection must be poisoned (closed) — otherwise a pooled
+    // reuse would feed the next caller's bytes into this half-written frame.
+    // Regression for the set_stream no-poison bug.
+    {
+        /// Yields `ok_chunks` 1 KiB chunks, then errors — a value source that
+        /// fails partway (I/O, decode, etc.).
+        struct FailingSource {
+            ok_chunks: usize,
+        }
+        impl SegmentSource for FailingSource {
+            fn next_chunk(&mut self) -> Result<Option<Bytes>, Error> {
+                if self.ok_chunks == 0 {
+                    return Err(Error::Io(std::io::Error::other("source boom")));
+                }
+                self.ok_chunks -= 1;
+                Ok(Some(Bytes::from_static(&[b'x'; 1000])))
+            }
+        }
+
+        let mut client = connect(addr).await?;
+        match client
+            .set_stream(
+                b"stream:setlarge",
+                SET_FLAGS,
+                SET_EXPTIME,
+                SET_LEN,
+                FailingSource { ok_chunks: 2 },
+            )
+            .await
+        {
+            Err(Error::Io(_)) => { /* expected: the source error propagated */ }
+            Err(e) => return Err(format!("source-error: wrong error {e}")),
+            Ok(()) => return Err("source-error: unexpectedly succeeded".into()),
+        }
+        // Poisoned: the next op on this connection must fail rather than run on a
+        // desynced connection.
+        match client.get(b"stream:small").await {
+            Ok(_) => {
+                return Err("source-error: next op succeeded — connection not poisoned".into());
+            }
+            Err(_) => { /* expected: poisoned */ }
         }
     }
 
