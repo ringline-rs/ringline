@@ -973,6 +973,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result > 0
                 && let Some(bid) = cqueue::buffer_select(flags)
             {
+                self.driver.provided_bufs.on_handout();
                 self.driver.pending_replenish.push(bid);
             }
             return;
@@ -1036,6 +1037,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         };
 
+        self.driver.provided_bufs.on_handout();
         let bytes_received = result as u32;
         metrics::BYTES.add(metrics::bytes::RECEIVED, bytes_received as u64);
         let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
@@ -1278,6 +1280,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result > 0
                 && let Some(bid) = cqueue::buffer_select(flags)
             {
+                self.driver.provided_bufs.on_handout();
                 self.driver.pending_replenish.push(bid);
             }
             return;
@@ -1319,6 +1322,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         };
 
+        self.driver.provided_bufs.on_handout();
         let buf_len = result as u32;
         let (buf_ptr, _) = self.driver.provided_bufs.get_buffer(bid);
         let buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len as usize) };
@@ -3719,6 +3723,42 @@ mod tests {
         assert!(
             !el.driver.pending_replenish.contains(&bid),
             "buffer should NOT be replenished yet (zero-copy deferred)"
+        );
+    }
+
+    #[test]
+    fn handle_recv_multi_handout_decrements_free_then_replenish_restores() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let entries = el.driver.provided_bufs.ring_entries();
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "all buffers free before any recv"
+        );
+
+        let bid: u16 = 0;
+        let flags = 1u32 | 2u32 | ((bid as u32) << 16); // F_BUFFER | F_MORE, bid=0
+        let (buf_ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"hi".as_ptr(), buf_ptr as *mut u8, 2);
+        }
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 2, flags);
+
+        // Handout accounted: exactly one fewer free.
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries - 1,
+            "recv handout must decrement free by one"
+        );
+
+        // The consume path returns the bid via replenish_batch; free is restored.
+        el.driver.provided_bufs.replenish_batch(&[bid]);
+        assert_eq!(
+            el.driver.provided_bufs.free(),
+            entries,
+            "replenish must restore free (balanced accounting)"
         );
     }
 

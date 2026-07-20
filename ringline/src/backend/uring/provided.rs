@@ -109,11 +109,9 @@ impl ProvidedBufRing {
     /// from the ring). Call exactly once per recv completion that selected a
     /// buffer, before it is processed.
     ///
-    /// Wired into the recv completion handlers in Phase 2 (Mode B), where a
-    /// consumer (`free()`-based backpressure) reads the count and the handout
-    /// accounting is validated end-to-end under real recv traffic against the
-    /// `outstanding <= ring_size` assertion. Unused in Phase 1.
-    #[allow(dead_code)]
+    /// Wired at every main-ring `buffer_select` in the recv completion handlers;
+    /// balanced against `replenish_batch`. The `outstanding <= ring_size`
+    /// assertion is exercised end-to-end by the recv test suite.
     #[inline]
     pub fn on_handout(&mut self) {
         self.outstanding += 1;
