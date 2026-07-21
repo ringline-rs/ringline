@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use resp_proto::Value;
 use ringline::{AsyncEventHandler, Config, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder};
-use ringline_redis::{Client, Error, SegmentSource};
+use ringline_redis::{Client, Error, OpKind, SegmentSource};
 
 // ── Config ───────────────────────────────────────────────────────────────
 
@@ -127,7 +127,12 @@ impl AsyncEventHandler for StreamStubServer {
                                             _ => b"-ERR value mismatch\r\n",
                                         };
                                         let _ = conn.send_nowait(reply);
+                                    } else if verb.eq_ignore_ascii_case(b"DEL") {
+                                        // `DEL <key>`: reply with the deleted-key
+                                        // count (a RESP integer).
+                                        let _ = conn.send_nowait(b":1\r\n");
                                     } else if let Some(Value::BulkString(key)) = items.get(1) {
+                                        // `GET <key>`.
                                         let (reply, should_close) = decide(&key[..]);
                                         let _ = conn.send_nowait(&reply);
                                         close_after = should_close;
@@ -369,6 +374,156 @@ async fn run_client(addr: SocketAddr) -> Result<(), String> {
     run_set_stream(addr).await?;
     run_pool_stream(addr).await?;
     run_borrow_get(addr).await?;
+    run_recv_meta(addr).await?;
+
+    Ok(())
+}
+
+// ── recv_meta (uniform zero-copy metadata for GET/SET/DEL) ─────────────────
+
+async fn run_recv_meta(addr: SocketAddr) -> Result<(), String> {
+    // (a) GET hit → kind Get, success, value_len Some(len), user_data preserved.
+    {
+        let mut client = connect(addr).await?;
+        client
+            .fire_get(b"stream:small", 1)
+            .map_err(|e| format!("fire: {e}"))?;
+        let m = client
+            .recv_meta()
+            .await
+            .map_err(|e| format!("get hit recv_meta: {e}"))?;
+        if m.kind != OpKind::Get
+            || !m.success
+            || m.value_len != Some(SMALL.len())
+            || m.user_data != 1
+        {
+            return Err(format!("get hit meta wrong: {m:?}"));
+        }
+    }
+
+    // (b) GET miss → success, value_len None.
+    {
+        let mut client = connect(addr).await?;
+        client
+            .fire_get(b"stream:absent", 2)
+            .map_err(|e| format!("fire: {e}"))?;
+        let m = client
+            .recv_meta()
+            .await
+            .map_err(|e| format!("get miss recv_meta: {e}"))?;
+        if !m.success || m.value_len.is_some() {
+            return Err(format!("get miss meta wrong: {m:?}"));
+        }
+    }
+
+    // (c) GET large spanning many provided buffers → value_len Some(large len).
+    {
+        let large = large_value();
+        let mut client = connect(addr).await?;
+        client
+            .fire_get(b"stream:large", 3)
+            .map_err(|e| format!("fire: {e}"))?;
+        let m = client
+            .recv_meta()
+            .await
+            .map_err(|e| format!("get large recv_meta: {e}"))?;
+        if m.value_len != Some(large.len()) {
+            return Err(format!("get large meta wrong: {m:?}"));
+        }
+    }
+
+    // (d) SET ok (stub verifies the exact value → +OK) → kind Set, success.
+    {
+        let mut client = connect(addr).await?;
+        client
+            .fire_set(b"k:set", &set_value(), 4)
+            .map_err(|e| format!("fire: {e}"))?;
+        let m = client
+            .recv_meta()
+            .await
+            .map_err(|e| format!("set recv_meta: {e}"))?;
+        if m.kind != OpKind::Set || !m.success || m.value_len.is_some() {
+            return Err(format!("set meta wrong: {m:?}"));
+        }
+    }
+
+    // (e) DEL (stub replies `:1`) → kind Del, success, value_len None.
+    {
+        let mut client = connect(addr).await?;
+        client
+            .fire_del(b"k:del", 5)
+            .map_err(|e| format!("fire: {e}"))?;
+        let m = client
+            .recv_meta()
+            .await
+            .map_err(|e| format!("del recv_meta: {e}"))?;
+        if m.kind != OpKind::Del || !m.success || m.value_len.is_some() {
+            return Err(format!("del meta wrong: {m:?}"));
+        }
+    }
+
+    // (f) unexpected reply type to a GET → Err(UnexpectedResponse) + poison
+    // (next op on the connection fails).
+    {
+        let mut client = connect(addr).await?;
+        client
+            .fire_get(b"borrow:unexpected", 6)
+            .map_err(|e| format!("fire: {e}"))?;
+        match client.recv_meta().await {
+            Ok(m) => return Err(format!("unexpected reply should Err, got {m:?}")),
+            Err(Error::UnexpectedResponse) => { /* expected */ }
+            Err(e) => return Err(format!("unexpected reply wrong error: {e}")),
+        }
+        if client.get(b"stream:small").await.is_ok() {
+            return Err("recv_meta unexpected: next op unexpectedly succeeded".into());
+        }
+    }
+
+    // (g) mixed pipeline: GET, SET, DEL, GET — metadata returns in order with the
+    // right kinds/user_data (no peek, one uniform call).
+    {
+        let mut client = connect(addr).await?;
+        client
+            .fire_get(b"stream:small", 10)
+            .map_err(|e| format!("fire: {e}"))?;
+        client
+            .fire_set(b"k:set", &set_value(), 11)
+            .map_err(|e| format!("fire: {e}"))?;
+        client
+            .fire_del(b"k:del", 12)
+            .map_err(|e| format!("fire: {e}"))?;
+        client
+            .fire_get(b"stream:absent", 13)
+            .map_err(|e| format!("fire: {e}"))?;
+        let m0 = client
+            .recv_meta()
+            .await
+            .map_err(|e| format!("pipe0: {e}"))?;
+        let m1 = client
+            .recv_meta()
+            .await
+            .map_err(|e| format!("pipe1: {e}"))?;
+        let m2 = client
+            .recv_meta()
+            .await
+            .map_err(|e| format!("pipe2: {e}"))?;
+        let m3 = client
+            .recv_meta()
+            .await
+            .map_err(|e| format!("pipe3: {e}"))?;
+        if m0.kind != OpKind::Get || m0.user_data != 10 || m0.value_len != Some(SMALL.len()) {
+            return Err(format!("pipe0 (get) wrong: {m0:?}"));
+        }
+        if m1.kind != OpKind::Set || m1.user_data != 11 || !m1.success {
+            return Err(format!("pipe1 (set) wrong: {m1:?}"));
+        }
+        if m2.kind != OpKind::Del || m2.user_data != 12 || !m2.success {
+            return Err(format!("pipe2 (del) wrong: {m2:?}"));
+        }
+        if m3.kind != OpKind::Get || m3.user_data != 13 || m3.value_len.is_some() {
+            return Err(format!("pipe3 (get miss) wrong: {m3:?}"));
+        }
+    }
 
     Ok(())
 }
