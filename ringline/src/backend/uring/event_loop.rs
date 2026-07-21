@@ -2932,6 +2932,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result > 0
                 && let Some(bid) = cqueue::buffer_select(flags)
             {
+                // Count the handout so the replenish's occupancy decrement is
+                // balanced. `replenish_batch` only decrements when the ring is
+                // Some, so guard the increment the same way.
+                if let Some(r) = self.driver.udp_provided_bufs.as_mut() {
+                    r.on_handout();
+                }
                 self.driver.udp_pending_replenish.push(bid);
             }
             return;
@@ -3105,6 +3111,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if result > 0
                 && let Some(bid) = cqueue::buffer_select(flags)
             {
+                // Count the handout so the replenish's occupancy decrement is
+                // balanced. `replenish_batch` only decrements when the ring is
+                // Some, so guard the increment the same way.
+                if let Some(r) = self.driver.udp_provided_bufs.as_mut() {
+                    r.on_handout();
+                }
                 self.driver.udp_pending_replenish.push(bid);
             }
             return;
@@ -3122,6 +3134,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // until ENOBUFS (a remote peer sending empty datagrams could
             // drain the ring entirely).
             if let Some(bid) = cqueue::buffer_select(flags) {
+                // The ring is Some here (guarded by the `udp_bgid` match above).
+                // Count the handout so the replenish's occupancy decrement is
+                // balanced.
+                self.driver.udp_provided_bufs.as_mut().unwrap().on_handout();
                 self.driver.udp_pending_replenish.push(bid);
             }
             let errno = -result;
