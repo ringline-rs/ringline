@@ -429,6 +429,9 @@ pub struct RespMeta {
     /// Server error text (`-...`, including `MOVED`/`ASK`) when the reply was a
     /// server error; `None` on success or an unexpected-type failure.
     pub error: Option<String>,
+    /// Measured request latency in nanoseconds (0 if this client was built
+    /// without request timing). Also delivered to the `on_result` callback.
+    pub latency_ns: u64,
 }
 
 // ── ClientBuilder ───────────────────────────────────────────────────────
@@ -1265,7 +1268,8 @@ impl Client {
             return Err(Error::UnexpectedResponse);
         }
         self.flushed_count = self.flushed_count.saturating_sub(1);
-        let (outcome, _consumed) = self.run_get_state_machine(&pending, on_value).await?;
+        let (outcome, _consumed, _latency_ns) =
+            self.run_get_state_machine(&pending, on_value).await?;
         match outcome {
             Ok(value_len) => Ok(GetMeta {
                 value_len,
@@ -1295,7 +1299,7 @@ impl Client {
         &mut self,
         pending: &PendingOp,
         mut on_value: impl FnMut(&[u8]),
-    ) -> Result<(Result<Option<usize>, Error>, usize), Error> {
+    ) -> Result<(Result<Option<usize>, Error>, usize, u64), Error> {
         // RESP GET reply parse state, carried across `with_segments` calls. Each
         // call consumes every value byte it is shown (so nothing is re-gathered)
         // and stops only at the reply boundary, leaving the next reply's bytes to
@@ -1430,7 +1434,7 @@ impl Client {
             return Err(Error::UnexpectedResponse);
         }
 
-        Ok((outcome, total_consumed))
+        Ok((outcome, total_consumed, latency_ns))
     }
 
     /// Read the next pending reply as zero-copy metadata, for ANY op kind (GET /
@@ -1452,7 +1456,8 @@ impl Client {
         self.flushed_count = self.flushed_count.saturating_sub(1);
         match pending.kind {
             PendingOpKind::Get => {
-                let (outcome, _consumed) = self.run_get_state_machine(&pending, |_| {}).await?;
+                let (outcome, _consumed, latency_ns) =
+                    self.run_get_state_machine(&pending, |_| {}).await?;
                 let meta = match outcome {
                     Ok(value_len) => RespMeta {
                         kind: OpKind::Get,
@@ -1460,6 +1465,7 @@ impl Client {
                         value_len,
                         success: true,
                         error: None,
+                        latency_ns,
                     },
                     Err(Error::Redis(msg)) => RespMeta {
                         kind: OpKind::Get,
@@ -1467,6 +1473,7 @@ impl Client {
                         value_len: None,
                         success: false,
                         error: Some(msg),
+                        latency_ns,
                     },
                     // Only `Ok(..)` or `Err(Redis)` reach here; desync/connection
                     // errors were returned as the outer `Err` by the helper.
@@ -1538,6 +1545,7 @@ impl Client {
             value_len: None,
             success,
             error,
+            latency_ns,
         })
     }
 
