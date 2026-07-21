@@ -1,7 +1,7 @@
 # Self-adaptive recv buffering: segmented delivery + adaptive size classes
 
-- **Status:** open (design seed — intent recorded before building)
-- **Span:** started 2026-07-20
+- **Status:** **NO-GO / retired** (2026-07-21 — GO gate measured and not met; see Outcome)
+- **Span:** 2026-07-20 → 2026-07-21
 
 ## Goal
 
@@ -77,7 +77,55 @@ adaptive-sizing layer on #286's foundation.
 
 ## Outcome
 
-_(open)_
+**NO-GO (measured 2026-07-21).** The GO gate — a mixed small+huge workload
+showing fixed-buffer waste that adaptive sizing removes — was **not met on any
+path**. Retired; do not re-pay without a re-eval trigger below. Evidence (ringline
+`main` post-#286; 2× c8gn.16xlarge @ 200 GbE + loopback `ring_fill_bench`):
+
+1. **The memory premise is false.** A 256 KiB-buffer ring serving 8 KB responses
+   uses the *same* RSS (~11 MB) as a 16 KiB ring — big provided buffers cost
+   virtual address space, not resident memory (demand paging faults in only the
+   touched bytes). The core adaptive justification ("big buffers waste memory on
+   small responses") does not hold. If big buffers are RSS-free, there is nothing
+   to shrink toward → nothing for adaptive sizing to optimize.
+2. **Discard path (`recv_meta` / segments): line rate regardless of geometry.**
+   cachecannon's borrow-and-discard GET saturates 200 GbE at 64 MB with the
+   *default 16 KiB* ring at high fan-in; fallback-recv (#274) rescues the (heavy)
+   ring parking with no throughput loss. This answers the seed's open question:
+   the discard path does *not* need bigger buffers.
+3. **Copying path (`with_data` materialize — the real-consumer path): 16 K ≥ 256 K.**
+   Isolated cross-host `ring_fill_bench MODE=whole`, 3 reps, fan-in 32/128/512,
+   large + mixed: 256 KiB was consistently *slower* than 16 KiB (e.g. large /
+   128 conns: 37 vs 30 Gbps). #274 + #286 eliminated the small-buffer starvation
+   cliff that motivated #284; bigger buffers now only add memcpy/cache/page
+   overhead. **The buffer-size story inverted.**
+4. **cachecannon's override obsoleted.** cachecannon's `runner.rs` 256 KiB
+   value-size-derived `recv_buffer` made *zero* difference vs ringline's default
+   16 KiB at line rate against valkey 9.1.0 (io-threads=16): 201 Gbps, 3/3 reps
+   byte-identical, at 1M/16M/64M. Removed downstream (cachecannon "perf: drop the
+   recv-buffer override").
+
+## Re-evaluation criteria (what would flip this to GO)
+
+Revisit only if one of these is *measured*, not assumed:
+
+- **A — Faster NICs (400/800 GbE):** at higher line rates the per-CQE processing
+  rate of a 16 KiB ring (~4096 CQEs per 64 MB response) may become a
+  single-core bottleneck, reviving "bigger buffers = fewer CQEs." Re-run the
+  copying-path sweep at the new line rate.
+- **B — Resident (not virtual) memory pressure:** a very-high-connection-count
+  deployment where the demand-paging assumption breaks (buffers touched enough
+  that big fixed rings cost real RSS / TLB / fault overhead). Measure RSS + fault
+  rate at scale.
+- **C — A mixed workload where a fixed size measurably loses on a still-copying /
+  gather path** (h2/http body assembly, TLS): 16 KiB fragmenting huge responses
+  below line rate *and* a fixed large size regressing the small ones. Neither was
+  observed here; a new path could change it.
+- **D — A mandatory-hold zero-copy consumer** that cannot force-copy/fallback
+  under ring pressure, where a small ring genuinely starves at line rate.
+
+Absent one of these, a single fixed default (ringline's 16 KiB) suffices and the
+adaptive size-class machinery stays retired.
 
 ## Lessons / open questions
 
