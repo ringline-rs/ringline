@@ -397,6 +397,40 @@ pub struct GetMeta {
     pub user_data: u64,
 }
 
+/// The kind of operation a reply corresponds to (a public mirror of the
+/// internal `PendingOpKind`), surfaced on [`RespMeta`].
+#[cfg(has_io_uring)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    /// A `GET` reply.
+    Get,
+    /// A `SET` reply.
+    Set,
+    /// A `DEL` reply.
+    Del,
+}
+
+/// Zero-copy metadata for a completed reply of any kind, from
+/// [`recv_meta`](Client::recv_meta). The value body is drained (never
+/// materialized); only its length and the control metadata are surfaced — all a
+/// load generator needs. A server error reply is reported here (in `error`, with
+/// `success = false`), not as a transport `Err`.
+#[cfg(has_io_uring)]
+#[derive(Debug, Clone)]
+pub struct RespMeta {
+    /// What was fired — taken from the pending op, not inferred from the wire.
+    pub kind: OpKind,
+    /// The `user_data` passed to the corresponding `fire_*`.
+    pub user_data: u64,
+    /// GET hit → `Some(value byte length)`; GET miss / SET / DEL / error → `None`.
+    pub value_len: Option<usize>,
+    /// `true` unless the reply was a server error or an unexpected reply type.
+    pub success: bool,
+    /// Server error text (`-...`, including `MOVED`/`ASK`) when the reply was a
+    /// server error; `None` on success or an unexpected-type failure.
+    pub error: Option<String>,
+}
+
 // ── ClientBuilder ───────────────────────────────────────────────────────
 
 type ResultCallback = Box<dyn Fn(&CommandResult)>;
@@ -1221,7 +1255,7 @@ impl Client {
     #[cfg(has_io_uring)]
     pub async fn recv_get_segments(
         &mut self,
-        mut on_value: impl FnMut(&[u8]),
+        on_value: impl FnMut(&[u8]),
     ) -> Result<GetMeta, Error> {
         self.flush()?;
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
@@ -1231,7 +1265,37 @@ impl Client {
             return Err(Error::UnexpectedResponse);
         }
         self.flushed_count = self.flushed_count.saturating_sub(1);
+        let (outcome, _consumed) = self.run_get_state_machine(&pending, on_value).await?;
+        match outcome {
+            Ok(value_len) => Ok(GetMeta {
+                value_len,
+                user_data: pending.user_data,
+            }),
+            // A server error (`-ERR`/`-WRONGTYPE`) is wire-aligned; surface it as
+            // `Err` so the connection stays usable. Desync/connection errors were
+            // already turned into the OUTER `Err` (and poisoned) by the helper.
+            Err(e) => Err(e),
+        }
+    }
 
+    /// Runs the RESP GET reply state machine on an already-popped GET `pending`,
+    /// draining the value via `on_value` (Mode-B borrow-and-discard). Shared by
+    /// [`recv_get_segments`](Self::recv_get_segments) and
+    /// [`recv_meta`](Self::recv_meta).
+    ///
+    /// Returns `(outcome, total_consumed)` where `outcome` is `Ok(Some(len))` =
+    /// hit, `Ok(None)` = miss, or `Err(Error::Redis(_))` = a wire-aligned server
+    /// error. Restores the default read path (`end_segments`) and records `GET`
+    /// metrics. A desync (`Error::UnexpectedResponse` — only partially consumed,
+    /// rest left on the wire) or a short FIN (`Error::ConnectionClosed`) is
+    /// returned as the OUTER `Err`; the desync case also POISONS the connection
+    /// (close + clear pipeline) so it is never reused.
+    #[cfg(has_io_uring)]
+    async fn run_get_state_machine(
+        &mut self,
+        pending: &PendingOp,
+        mut on_value: impl FnMut(&[u8]),
+    ) -> Result<(Result<Option<usize>, Error>, usize), Error> {
         // RESP GET reply parse state, carried across `with_segments` calls. Each
         // call consumes every value byte it is shown (so nothing is re-gathered)
         // and stops only at the reply boundary, leaving the next reply's bytes to
@@ -1349,31 +1413,132 @@ impl Client {
             rx_bytes: total_consumed as u32,
         });
 
-        match outcome {
-            Ok(value_len) => Ok(GetMeta {
-                value_len,
-                user_data: pending.user_data,
-            }),
-            Err(e) => {
-                // A reply whose first byte is not `$`/`-` (`UnexpectedResponse`)
-                // is only *partially* consumed by the byte-at-a-time header
-                // parse: `parse_get_header`'s catch-all errors on the first byte,
-                // so the rest of the reply is left on the wire. We cannot know
-                // how many bytes to skip for an arbitrary reply type, so the
-                // connection is desynced and MUST NOT be reused — poison it
-                // (close) and clear the pipeline, mirroring `recv()`'s broken-read
-                // path. A genuine server error (`-ERR`/`-WRONGTYPE`,
-                // `Error::Redis`) consumed its whole `\r\n`-terminated line via
-                // the `-` arm, so the wire stays aligned and the connection (and
-                // its remaining pending ops) are still valid — do not poison.
-                if matches!(e, Error::UnexpectedResponse) {
-                    self.conn.close();
-                    self.pending.clear();
-                    self.flushed_count = 0;
-                }
-                Err(e)
-            }
+        // A reply whose first byte is not `$`/`-` (`UnexpectedResponse`) is only
+        // *partially* consumed by the byte-at-a-time header parse:
+        // `parse_get_header`'s catch-all errors on the first byte, so the rest of
+        // the reply is left on the wire. We cannot know how many bytes to skip for
+        // an arbitrary reply type, so the connection is desynced and MUST NOT be
+        // reused — poison it (close) and clear the pipeline, mirroring `recv()`'s
+        // broken-read path. A genuine server error (`-ERR`/`-WRONGTYPE`,
+        // `Error::Redis`) consumed its whole `\r\n`-terminated line via the `-`
+        // arm, so the wire stays aligned and the connection stays valid — surface
+        // it as the inner `outcome` `Err`, not the outer one.
+        if let Err(Error::UnexpectedResponse) = &outcome {
+            self.conn.close();
+            self.pending.clear();
+            self.flushed_count = 0;
+            return Err(Error::UnexpectedResponse);
         }
+
+        Ok((outcome, total_consumed))
+    }
+
+    /// Read the next pending reply as zero-copy metadata, for ANY op kind (GET /
+    /// SET / DEL). GET drains the value body via the borrow-and-discard segmented
+    /// path; SET/DEL read the small reply normally. The value bytes are never
+    /// materialized — only the header / control metadata is surfaced
+    /// ([`RespMeta`]), which is all a load generator needs.
+    ///
+    /// A server error reply (`-ERR`/`-MOVED`/`-ASK`) is reported as
+    /// `Ok(RespMeta { success: false, error: Some(..) })` so the caller can
+    /// inspect it (e.g. cluster redirects). `Err` is reserved for
+    /// connection/desync failures — a GET desync poisons the connection.
+    ///
+    /// io_uring only (segmented recv).
+    #[cfg(has_io_uring)]
+    pub async fn recv_meta(&mut self) -> Result<RespMeta, Error> {
+        self.flush()?;
+        let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
+        self.flushed_count = self.flushed_count.saturating_sub(1);
+        match pending.kind {
+            PendingOpKind::Get => {
+                let (outcome, _consumed) = self.run_get_state_machine(&pending, |_| {}).await?;
+                let meta = match outcome {
+                    Ok(value_len) => RespMeta {
+                        kind: OpKind::Get,
+                        user_data: pending.user_data,
+                        value_len,
+                        success: true,
+                        error: None,
+                    },
+                    Err(Error::Redis(msg)) => RespMeta {
+                        kind: OpKind::Get,
+                        user_data: pending.user_data,
+                        value_len: None,
+                        success: false,
+                        error: Some(msg),
+                    },
+                    // Only `Ok(..)` or `Err(Redis)` reach here; desync/connection
+                    // errors were returned as the outer `Err` by the helper.
+                    Err(e) => return Err(e),
+                };
+                Ok(meta)
+            }
+            PendingOpKind::Set => self.recv_meta_simple(&pending, OpKind::Set).await,
+            PendingOpKind::Del => self.recv_meta_simple(&pending, OpKind::Del).await,
+        }
+    }
+
+    /// Read a small SET/DEL reply and classify it into [`RespMeta`], mirroring
+    /// `recv()`'s SET/DEL classification, without materializing anything the
+    /// caller keeps. Unlike the GET segmented path, `read_value` consumes a
+    /// *complete* RESP value, so an unexpected reply type is wire-aligned and is
+    /// reported as `success = false` WITHOUT poisoning. A broken read clears the
+    /// pipeline and returns `Err` (mirroring `recv()`).
+    #[cfg(has_io_uring)]
+    async fn recv_meta_simple(
+        &mut self,
+        pending: &PendingOp,
+        kind: OpKind,
+    ) -> Result<RespMeta, Error> {
+        let resp = match self.read_value().await {
+            Ok(v) => v,
+            Err(e) => {
+                self.pending.clear();
+                self.flushed_count = 0;
+                return Err(e);
+            }
+        };
+        let ttfb_ns = self.compute_ttfb(pending.send_ts);
+        let latency_ns = match pending.start {
+            Some(start) => self.finish_timing(pending.send_ts, start),
+            None => 0,
+        };
+        let rx_bytes = self.last_rx_bytes.get();
+        let (success, error) = match resp {
+            Value::Error(msg) => (false, Some(String::from_utf8_lossy(&msg).into_owned())),
+            other => {
+                // Wire-aligned (a full RESP value was consumed): an unexpected
+                // type is a benign per-op failure, not a desync — do not poison.
+                let ok = match kind {
+                    OpKind::Set => matches!(other, Value::SimpleString(_) | Value::Null),
+                    OpKind::Del => matches!(other, Value::Integer(_)),
+                    OpKind::Get => false,
+                };
+                (ok, None)
+            }
+        };
+        let command = match kind {
+            OpKind::Set => CommandType::Set,
+            OpKind::Del => CommandType::Del,
+            OpKind::Get => CommandType::Get,
+        };
+        self.record(&CommandResult {
+            command,
+            latency_ns,
+            hit: None,
+            success,
+            ttfb_ns,
+            tx_bytes: pending.tx_bytes,
+            rx_bytes,
+        });
+        Ok(RespMeta {
+            kind,
+            user_data: pending.user_data,
+            value_len: None,
+            success,
+            error,
+        })
     }
 
     // ── Internal protocol methods (pub(crate), &self) ───────────────────
