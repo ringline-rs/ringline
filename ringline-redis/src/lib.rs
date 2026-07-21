@@ -399,7 +399,6 @@ pub struct GetMeta {
 
 /// The kind of operation a reply corresponds to (a public mirror of the
 /// internal `PendingOpKind`), surfaced on [`RespMeta`].
-#[cfg(has_io_uring)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
     /// A `GET` reply.
@@ -415,7 +414,6 @@ pub enum OpKind {
 /// materialized); only its length and the control metadata are surfaced — all a
 /// load generator needs. A server error reply is reported here (in `error`, with
 /// `success = false`), not as a transport `Err`.
-#[cfg(has_io_uring)]
 #[derive(Debug, Clone)]
 pub struct RespMeta {
     /// What was fired — taken from the pending op, not inferred from the wire.
@@ -1437,6 +1435,146 @@ impl Client {
         Ok((outcome, total_consumed, latency_ns))
     }
 
+    /// Runs the RESP GET reply state machine on an already-popped GET `pending`
+    /// over the mio accumulator (`with_bytes`): parses the header, then drains
+    /// the value body incrementally so the accumulator stays bounded (~one
+    /// kernel-drain burst), never materializing the value. The mio counterpart
+    /// of [`run_get_state_machine`](Self::run_get_state_machine) — SAME parse and
+    /// poison semantics, minus provided-buffer zero-copy (a `read()` copy per
+    /// burst is unavoidable on mio). Intentionally duplicates the state machine
+    /// (over `with_bytes` vs `with_segments`) to leave the reviewed io_uring path
+    /// untouched.
+    ///
+    /// Returns `(outcome, total_consumed, latency_ns)`; a desync
+    /// (`UnexpectedResponse`) poisons; a short FIN returns `ConnectionClosed`.
+    #[cfg(not(has_io_uring))]
+    async fn run_get_drain_mio(
+        &mut self,
+        pending: &PendingOp,
+    ) -> Result<(Result<Option<usize>, Error>, usize, u64), Error> {
+        enum Phase {
+            Header,
+            Value,
+            Trailing,
+            Done,
+        }
+        let mut phase = Phase::Header;
+        let mut header_buf: Vec<u8> = Vec::with_capacity(16);
+        let mut value_remaining: usize = 0;
+        let mut trailing_remaining: usize = 0;
+        let mut outcome: Result<Option<usize>, Error> = Ok(None);
+        let mut total_consumed: usize = 0;
+
+        loop {
+            let n = self
+                .conn
+                .with_bytes(|bytes| {
+                    let mut consumed = 0usize;
+                    let mut pos = 0usize;
+                    while pos < bytes.len() {
+                        match phase {
+                            Phase::Header => {
+                                header_buf.push(bytes[pos]);
+                                pos += 1;
+                                consumed += 1;
+                                match parse_get_header(&header_buf) {
+                                    Ok(None) => {} // need more header bytes
+                                    Ok(Some(GetHeader::Nil)) => {
+                                        outcome = Ok(None);
+                                        phase = Phase::Done;
+                                        break;
+                                    }
+                                    Ok(Some(GetHeader::Bulk { len, .. })) => {
+                                        value_remaining = len;
+                                        trailing_remaining = 2;
+                                        outcome = Ok(Some(len));
+                                        phase = Phase::Value;
+                                    }
+                                    Err(e) => {
+                                        outcome = Err(e);
+                                        phase = Phase::Done;
+                                        break;
+                                    }
+                                }
+                            }
+                            Phase::Value => {
+                                // Drain what's present; the accumulator front is
+                                // freed on `Consumed`, so a huge value never needs
+                                // to be resident.
+                                let take = value_remaining.min(bytes.len() - pos);
+                                value_remaining -= take;
+                                pos += take;
+                                consumed += take;
+                                if value_remaining == 0 {
+                                    phase = Phase::Trailing;
+                                }
+                            }
+                            Phase::Trailing => {
+                                let take = trailing_remaining.min(bytes.len() - pos);
+                                trailing_remaining -= take;
+                                pos += take;
+                                consumed += take;
+                                if trailing_remaining == 0 {
+                                    phase = Phase::Done;
+                                    break;
+                                }
+                            }
+                            Phase::Done => break,
+                        }
+                    }
+                    if consumed == 0 {
+                        ParseResult::NeedMore
+                    } else {
+                        ParseResult::Consumed(consumed)
+                    }
+                })
+                .await;
+            total_consumed += n;
+            if matches!(phase, Phase::Done) {
+                break;
+            }
+            if n == 0 {
+                // EOF before the reply completed (short FIN) — desynced.
+                return Err(Error::ConnectionClosed);
+            }
+        }
+
+        // Metrics, mirroring `recv()` and the io_uring GET path.
+        let ttfb_ns = self.compute_ttfb(pending.send_ts);
+        let latency_ns = match pending.start {
+            Some(start) => self.finish_timing(pending.send_ts, start),
+            None => 0,
+        };
+        let (success, hit) = match &outcome {
+            Ok(Some(_)) => (true, Some(true)),
+            Ok(None) => (true, Some(false)),
+            Err(_) => (false, None),
+        };
+        self.record(&CommandResult {
+            command: CommandType::Get,
+            latency_ns,
+            hit,
+            success,
+            ttfb_ns,
+            tx_bytes: pending.tx_bytes,
+            rx_bytes: total_consumed as u32,
+        });
+
+        // Same poison discipline as the io_uring path: an unexpected reply type
+        // (first byte not `$`/`-`) is only partially consumed (the header parse
+        // stops on that byte), leaving the rest on the wire → desync, poison. A
+        // server error (`-...`) consumed its whole line → wire aligned, surfaced
+        // as the inner `outcome` Err.
+        if let Err(Error::UnexpectedResponse) = &outcome {
+            self.conn.close();
+            self.pending.clear();
+            self.flushed_count = 0;
+            return Err(Error::UnexpectedResponse);
+        }
+
+        Ok((outcome, total_consumed, latency_ns))
+    }
+
     /// Read the next pending reply as zero-copy metadata, for ANY op kind (GET /
     /// SET / DEL). GET drains the value body via the borrow-and-discard segmented
     /// path; SET/DEL read the small reply normally. The value bytes are never
@@ -1449,15 +1587,20 @@ impl Client {
     /// connection/desync failures — a GET desync poisons the connection.
     ///
     /// io_uring only (segmented recv).
-    #[cfg(has_io_uring)]
     pub async fn recv_meta(&mut self) -> Result<RespMeta, Error> {
         self.flush()?;
         let pending = self.pending.pop_front().ok_or(Error::NoPending)?;
         self.flushed_count = self.flushed_count.saturating_sub(1);
         match pending.kind {
             PendingOpKind::Get => {
+                // io_uring: zero-copy borrow-and-discard over provided buffers.
+                // mio: header-parse + streaming drain over `with_bytes` — bounded
+                // memory (never materializes the value), same `RespMeta` contract.
+                #[cfg(has_io_uring)]
                 let (outcome, _consumed, latency_ns) =
                     self.run_get_state_machine(&pending, |_| {}).await?;
+                #[cfg(not(has_io_uring))]
+                let (outcome, _consumed, latency_ns) = self.run_get_drain_mio(&pending).await?;
                 let meta = match outcome {
                     Ok(value_len) => RespMeta {
                         kind: OpKind::Get,
@@ -1492,7 +1635,6 @@ impl Client {
     /// *complete* RESP value, so an unexpected reply type is wire-aligned and is
     /// reported as `success = false` WITHOUT poisoning. A broken read clears the
     /// pipeline and returns `Err` (mirroring `recv()`).
-    #[cfg(has_io_uring)]
     async fn recv_meta_simple(
         &mut self,
         pending: &PendingOp,
@@ -2989,17 +3131,21 @@ impl Client {
 }
 
 /// Parsed shape of a GET reply header.
-#[cfg(has_io_uring)]
 enum GetHeader {
     /// `$-1\r\n` — the key does not exist.
     Nil,
     /// `$<len>\r\n` — a bulk string of `len` value bytes follows (then a trailing
     /// CRLF). `header_len` is the byte length of the `$<len>\r\n` header itself.
-    Bulk { len: usize, header_len: usize },
+    /// `header_len` is used only by the io_uring `get_stream` path; the mio GET
+    /// drainer parses the header byte-at-a-time and ignores it.
+    Bulk {
+        len: usize,
+        #[cfg_attr(not(has_io_uring), allow(dead_code))]
+        header_len: usize,
+    },
 }
 
 /// Position of the first `\r\n` in `buf` (the index of the `\r`), or `None`.
-#[cfg(has_io_uring)]
 fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
 }
@@ -3013,7 +3159,6 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
 /// - `Err(Error::Redis(_))` — a server error reply (`-...\r\n`).
 /// - `Err(Error::UnexpectedResponse)` — a non-bulk, non-error reply, or a
 ///   malformed length.
-#[cfg(has_io_uring)]
 fn parse_get_header(buf: &[u8]) -> Result<Option<GetHeader>, Error> {
     match buf.first() {
         None => Ok(None),
