@@ -7,11 +7,26 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# `has_io_uring` is emitted by this crate's build.rs to gate the io_uring-only
+# zero-copy recv path (the HTTP/2 pump feeds the h2 codec via
+# `ConnCtx::with_segments`). Register it for check-cfg so the cfg is recognized
+# on backends/targets where build.rs does not emit it (mio, macOS), matching
+# `ringline`'s own stanza.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(has_io_uring)"]
+
 [features]
 gzip = ["dep:flate2"]
 zstd = ["dep:zstd"]
 brotli = ["dep:brotli"]
 compression = ["gzip", "zstd", "brotli"]
+# Forward the runtime's mio-backend override. Needed so this crate's build.rs
+# sees `CARGO_FEATURE_FORCE_MIO` and gates the io_uring-only segmented recv path
+# out in lockstep with `ringline` being built as mio — otherwise a workspace
+# `--features force-mio` build (CI clippy-mio) would compile `with_segments`
+# against a mio `ringline` that lacks it.
+force-mio = ["ringline/force-mio"]
 
 [dependencies]
 bytes = { workspace = true }

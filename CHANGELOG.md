@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `ringline-redis`: streaming GET — `Client::get_stream(key) -> Option<ValueStream>`
+  (single-connection `Client` only). The value body is delivered over the
+  runtime's segmented-recv API instead of being materialized: `ValueStream`
+  exposes `len()`, `discard()` (consume without a gather copy), `next_segment()`
+  (owned chunks), and `collect()` (the one materialization). Bounded to the
+  parsed bulk length with an error on a short FIN; dropping a stream mid-value
+  poisons (closes) the connection. io_uring only. Pooled/sharded/cluster `get`
+  stay materialized. (`recv_streaming` fire/recv integration is deferred.)
+- `ringline-memcache`: streaming GET — `Client::get_stream(key) -> Option<StreamValue>`
+  (single-connection `Client` only). Mirrors the redis streaming API for the
+  memcache wire format (`VALUE <key> <flags> <bytes>\r\n<data>\r\nEND\r\n`):
+  the client parses the `VALUE` header, then streams the `<bytes>` value body
+  over the runtime's segmented-recv API. `StreamValue` exposes `flags()`, `len()`,
+  `discard()` (consume without a gather copy), `next_segment()` (owned chunks),
+  and `collect()` (the one materialization). Bounded to the parsed length with an
+  error on a short FIN; dropping a stream mid-value poisons (closes) the
+  connection. A miss (bare `END\r\n`) returns `Ok(None)`. io_uring only. The
+  multi-key `gets(keys)` stays eager; pooled/sharded `get` stay materialized.
+- `ringline-memcache`: streaming get-with-CAS —
+  `Client::get_cas(key) -> Option<CasStreamValue>` (single-connection `Client`
+  only). The CAS-carrying mirror of `get_stream`: issues `gets <key>`, parses the
+  5-token `VALUE <key> <flags> <bytes> <cas>\r\n` header (CAS exposed via
+  `CasStreamValue::cas()`), then streams the value body exactly like `get_stream`
+  (bounded to `<bytes>`, `\r\nEND\r\n` trailer, short-FIN error, undrained-drop
+  poison). A miss (bare `END\r\n`) returns `Ok(None)`. io_uring only.
+- `ringline-redis` / `ringline-memcache`: streaming SET — `Client::set_stream`
+  writes a large value from a caller-provided `SegmentSource` (a synchronous
+  chunk-yielding trait, blanket-implemented for `Iterator<Item = Bytes>`) without
+  gathering it into one contiguous buffer. The command framing declares the value
+  length up front; the client streams chunks, then reads the reply. `len` is the
+  authoritative contract: if the source yields fewer or more bytes, the connection
+  is closed and `Error::LengthMismatch` is returned (a partial frame is already on
+  the wire — the same poison discipline as the read side). Single-connection
+  `Client` only; works on both backends (v1 copies each chunk into the send pool —
+  zero-copy guarded streaming is a later optimization).
+- `ConnCtx::end_segments()` — end segmented-recv delivery and restore the default
+  `with_data`/`with_bytes` read path (gathering any still-held segments into the
+  accumulator). io_uring only.
+- `ConfigBuilder::forward_hold_cap` (default 64, 2× `MAX_IOVECS`) — per-connection
+  held-buffer cap for Mode A `forward_to`. When a forwarding connection's held
+  buffers reach the cap (a slow/high-latency sink, or a very large object), its
+  multishot recv is cancelled so its TCP receive window closes and the source
+  stops sending; the recv is re-armed once writes drain the hold below the cap.
+  This bounds one slow forward so it cannot deplete the shared per-worker recv
+  ring and `ENOBUFS`-starve other connections. New `forward_throttled` pool metric
+  counts throttle events. io_uring only.
+
 ## [0.5.1] - 2026-07-17
 
 Coordinated patch release. The fix is in core `ringline`; all client

@@ -282,21 +282,50 @@ pub enum TlsRecvResult {
     Closed,
 }
 
-/// Drain all currently-decrypted plaintext from a TLS connection directly into
-/// the connection's recv accumulator, with no intermediate scratch buffer.
+/// Where decrypted TLS plaintext chunks are delivered by [`drain_tls_plaintext`].
+///
+/// TLS recv is *copy-per-chunk*: rustls owns its decrypted-plaintext buffer, so
+/// the bytes must be copied out either way — there is no zero-copy TLS recv (see
+/// `docs/segmented-recv-design.md`, "## TLS"). The sink chooses the destination
+/// of that copy based on the connection's recv domain.
+pub(crate) enum PlaintextSink<'a> {
+    /// Default path: append each chunk into the connection's contiguous recv
+    /// accumulator (one copy). Bounded by the accumulator's `max_size`
+    /// (`Config::recv_accumulator_max`); `append` returning `false` is the
+    /// flood-kill signal.
+    Accumulator(&'a mut AccumulatorTable),
+    /// Segmented recv domain (io_uring only): each drained plaintext chunk is
+    /// copied into an owned [`Bytes`] and pushed as a `HeldRecvBuf::Owned`
+    /// segment to the connection's hold. TLS segments are *always* owned — the
+    /// decrypt copy is the release, so they never pin the provided ring. The
+    /// same outstanding bound as the accumulator path is enforced: `outstanding`
+    /// tracks total held owned bytes and `max` mirrors `recv_accumulator_max`;
+    /// exceeding it is the flood-kill signal.
+    #[cfg(has_io_uring)]
+    Segments {
+        hold: &'a mut std::collections::VecDeque<crate::backend::HeldRecvBuf>,
+        outstanding: usize,
+        max: usize,
+    },
+}
+
+/// Drain all currently-decrypted plaintext from a TLS connection into `sink`,
+/// with no intermediate scratch buffer.
 ///
 /// rustls's `Reader` implements `BufRead`: `fill_buf()` exposes the decrypted
 /// plaintext in rustls's own buffer, and `consume()` advances past what we copied.
-/// This is one copy (rustls buffer -> accumulator) vs. the previous two
-/// (rustls -> scratch -> accumulator).
-/// Returns `false` if the accumulator hit `recv_accumulator_max` — the
+/// The chunk `fill_buf` returns is *not* one ≤16 KiB record — it is as much
+/// contiguous plaintext as rustls has buffered, so segment sizes are arbitrary.
+///
+/// Returns `false` if the sink hit its outstanding bound (accumulator
+/// `max_size`, or the held-plaintext `max` for the segmented domain) — the
 /// plaintext was NOT consumed from rustls, and the caller must treat the
-/// connection as broken (the plaintext recv path closes in this situation;
-/// silently consuming would put a permanent gap in the byte stream).
+/// connection as broken (silently consuming would put a permanent gap in the
+/// byte stream; an unbounded plaintext flood must kill the connection).
 #[must_use]
 fn drain_tls_plaintext(
     tls_conn: &mut TlsConn,
-    accumulators: &mut AccumulatorTable,
+    sink: &mut PlaintextSink<'_>,
     conn_index: u32,
 ) -> bool {
     use std::io::BufRead;
@@ -309,8 +338,29 @@ fn drain_tls_plaintext(
             Err(_) => break,
         };
         let n = chunk.len();
-        if !accumulators.append(conn_index, chunk) {
-            return false;
+        match sink {
+            PlaintextSink::Accumulator(accumulators) => {
+                if !accumulators.append(conn_index, chunk) {
+                    return false;
+                }
+            }
+            #[cfg(has_io_uring)]
+            PlaintextSink::Segments {
+                hold,
+                outstanding,
+                max,
+            } => {
+                // Bound total outstanding held plaintext exactly as the
+                // accumulator path bounds its buffer: an over-limit chunk is
+                // NOT consumed from rustls, and the caller kills the connection.
+                if outstanding.saturating_add(n) > *max {
+                    return false;
+                }
+                hold.push_back(crate::backend::HeldRecvBuf::Owned(
+                    bytes::Bytes::copy_from_slice(chunk),
+                ));
+                *outstanding += n;
+            }
         }
         reader.consume(n);
     }
@@ -322,10 +372,14 @@ fn drain_tls_plaintext(
 /// Any TLS output produced (handshake responses, alerts) is appended to
 /// `out_sends`; the caller must route those through the per-connection send
 /// queue whatever the return value (dropping them leaks their pool slots).
+///
+/// `sink` selects where decrypted plaintext lands: the recv accumulator (the
+/// default `with_data`/`with_bytes` path) or, for a connection in the segmented
+/// recv domain, owned segments pushed to its hold (see [`PlaintextSink`]).
 #[cfg(has_io_uring)]
 pub fn feed_tls_recv(
     tls_table: &mut TlsTable,
-    accumulators: &mut AccumulatorTable,
+    mut sink: PlaintextSink<'_>,
     send_copy_pool: &mut SendCopyPool,
     conn_index: u32,
     ciphertext: &[u8],
@@ -373,7 +427,7 @@ pub fn feed_tls_recv(
         // Drain plaintext after each call so rustls's internal
         // buffer has room for the next `read_tls`.
         if state.plaintext_bytes_to_read() > 0
-            && !drain_tls_plaintext(tls_conn, accumulators, conn_index)
+            && !drain_tls_plaintext(tls_conn, &mut sink, conn_index)
         {
             return TlsRecvResult::Error(rustls::Error::General(
                 "recv accumulator limit exceeded".into(),
@@ -396,8 +450,7 @@ pub fn feed_tls_recv(
     // Drain any remaining plaintext that the final state machine
     // tick produced (e.g. from a record whose ciphertext was
     // entirely buffered earlier in the loop).
-    if state.plaintext_bytes_to_read() > 0
-        && !drain_tls_plaintext(tls_conn, accumulators, conn_index)
+    if state.plaintext_bytes_to_read() > 0 && !drain_tls_plaintext(tls_conn, &mut sink, conn_index)
     {
         return TlsRecvResult::Error(rustls::Error::General(
             "recv accumulator limit exceeded".into(),
@@ -746,6 +799,10 @@ pub fn feed_tls_recv_mio(
         None => return TlsRecvResult::Closed,
     };
 
+    // The mio backend has no provided-buffer ring; segmented recv is io_uring
+    // only. Plaintext always lands in the accumulator here.
+    let mut sink = PlaintextSink::Accumulator(accumulators);
+
     let was_handshaking = !tls_conn.handshake_complete;
     let mut peer_closed = false;
     let mut remaining = ciphertext;
@@ -781,7 +838,7 @@ pub fn feed_tls_recv_mio(
 
         // Read decrypted plaintext into accumulator.
         if state.plaintext_bytes_to_read() > 0
-            && !drain_tls_plaintext(tls_conn, accumulators, conn_index)
+            && !drain_tls_plaintext(tls_conn, &mut sink, conn_index)
         {
             return TlsRecvResult::Error(rustls::Error::General(
                 "recv accumulator limit exceeded".into(),
@@ -926,4 +983,225 @@ fn borrow_conn_and_buf(
     conn_index: u32,
 ) -> (&mut Option<TlsConn>, &mut Vec<u8>) {
     (&mut table.conns[conn_index as usize], &mut table.write_buf)
+}
+
+// ── Segmented recv routing (io_uring only) ──────────────────────────────
+
+/// Focused unit tests for the TLS-plaintext → `segment_hold` routing added for
+/// segmented recv over TLS. Drives a real in-memory rustls handshake (no
+/// networking), then feeds the server ciphertext and drains its plaintext into a
+/// [`PlaintextSink::Segments`], asserting decrypted plaintext lands as owned
+/// segments and that the outstanding-plaintext bound kills an over-limit flood.
+#[cfg(all(test, has_io_uring))]
+mod segmented_tls_tests {
+    use super::*;
+    use crate::backend::HeldRecvBuf;
+    use std::collections::VecDeque;
+    use std::io::Cursor;
+
+    fn test_certs() -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+        (vec![cert_der], key.into())
+    }
+
+    /// Move all of `from`'s pending TLS output into `to`, driving `to`'s state
+    /// machine. Used to pump a handshake to completion.
+    fn pump(from: &mut TlsConnKind, to: &mut TlsConnKind) {
+        let mut buf = Vec::new();
+        while from.wants_write() {
+            from.write_tls(&mut buf).unwrap();
+        }
+        if buf.is_empty() {
+            return;
+        }
+        let mut cursor = Cursor::new(&buf[..]);
+        while (cursor.position() as usize) < buf.len() {
+            let n = to.read_tls(&mut cursor).unwrap();
+            if n == 0 {
+                break;
+            }
+            to.process_new_packets().unwrap();
+        }
+    }
+
+    /// A completed in-memory TLS session: (server, client), both past handshake.
+    fn handshaked() -> (TlsConnKind, TlsConnKind) {
+        let (certs, key) = test_certs();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs.clone(), key)
+                .unwrap(),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        for c in &certs {
+            roots.add(c.clone()).unwrap();
+        }
+        let client_config: Arc<rustls::ClientConfig> = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+            .into();
+        let server_name: rustls::pki_types::ServerName<'_> = "localhost".try_into().unwrap();
+
+        let mut server = TlsConnKind::Server(ServerConnection::new(server_config).unwrap());
+        let mut client =
+            TlsConnKind::Client(ClientConnection::new(client_config, server_name).unwrap());
+
+        for _ in 0..30 {
+            pump(&mut client, &mut server);
+            pump(&mut server, &mut client);
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(
+            !client.is_handshaking() && !server.is_handshaking(),
+            "in-memory TLS handshake did not complete"
+        );
+        (server, client)
+    }
+
+    fn wrap_server(server: TlsConnKind) -> TlsConn {
+        TlsConn {
+            conn: server,
+            handshake_complete: true,
+            peer_sent_close_notify: false,
+            close_notify_sent: false,
+        }
+    }
+
+    fn held_len(hold: &VecDeque<HeldRecvBuf>) -> usize {
+        hold.iter()
+            .map(|h| match h {
+                HeldRecvBuf::Owned(b) => b.len(),
+                HeldRecvBuf::Pinned { len, .. } => *len as usize,
+            })
+            .sum()
+    }
+
+    // A multi-record plaintext value pushed over TLS is delivered to a Segments
+    // sink as one-or-more OWNED segments that reassemble byte-exactly, and the
+    // provided-buffer ring is never pinned (Owned entries only).
+    #[test]
+    fn plaintext_routes_to_owned_segments_and_reassembles() {
+        let (server, mut client) = handshaked();
+        let mut tls_conn = wrap_server(server);
+
+        // Larger than one TLS record (~16 KiB plaintext) so the drain produces
+        // several chunks/segments. Non-constant pattern flags mis-ordering.
+        const SIZE: usize = 40 * 1024;
+        let plaintext: Vec<u8> = (0..SIZE)
+            .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+            .collect();
+        client.writer().write_all(&plaintext).unwrap();
+        let mut cipher = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut cipher).unwrap();
+        }
+
+        // Feed ciphertext + drain plaintext into the segment hold, mirroring the
+        // interleave in `feed_tls_recv` (drain after each read so rustls frees
+        // buffer space for the next chunk).
+        let mut hold: VecDeque<HeldRecvBuf> = VecDeque::new();
+        let mut cursor = Cursor::new(&cipher[..]);
+        while (cursor.position() as usize) < cipher.len() {
+            let n = tls_conn.conn.read_tls(&mut cursor).unwrap();
+            if n == 0 {
+                break;
+            }
+            let pt = tls_conn
+                .conn
+                .process_new_packets()
+                .unwrap()
+                .plaintext_bytes_to_read();
+            if pt > 0 {
+                let outstanding = held_len(&hold);
+                let mut sink = PlaintextSink::Segments {
+                    hold: &mut hold,
+                    outstanding,
+                    max: usize::MAX,
+                };
+                assert!(
+                    drain_tls_plaintext(&mut tls_conn, &mut sink, 0),
+                    "drain must succeed under an unbounded sink"
+                );
+            }
+        }
+        // Final drain for any plaintext buffered by the last packet.
+        {
+            let outstanding = held_len(&hold);
+            let mut sink = PlaintextSink::Segments {
+                hold: &mut hold,
+                outstanding,
+                max: usize::MAX,
+            };
+            assert!(drain_tls_plaintext(&mut tls_conn, &mut sink, 0));
+        }
+
+        assert!(
+            !hold.is_empty(),
+            "expected at least one held segment for a {SIZE}-byte value"
+        );
+        // TLS is copy-per-chunk: every segment must be Owned (never pins the ring).
+        assert!(
+            hold.iter().all(|h| matches!(h, HeldRecvBuf::Owned(_))),
+            "TLS plaintext segments must all be Owned (no ring pin)"
+        );
+        // Reassemble in arrival order and byte-compare.
+        let mut reassembled = Vec::with_capacity(SIZE);
+        for h in &hold {
+            if let HeldRecvBuf::Owned(b) = h {
+                reassembled.extend_from_slice(b);
+            }
+        }
+        assert_eq!(reassembled, plaintext, "segmented TLS plaintext mismatch");
+    }
+
+    // The outstanding-plaintext bound is enforced: a chunk that would push held
+    // plaintext past `max` is NOT consumed and the drain returns false (the
+    // caller's connection-kill signal), mirroring the accumulator `append`
+    // contract.
+    #[test]
+    fn plaintext_over_bound_returns_false() {
+        let (server, mut client) = handshaked();
+        let mut tls_conn = wrap_server(server);
+
+        // One small record of plaintext (single chunk).
+        let plaintext = vec![0x5Au8; 2048];
+        client.writer().write_all(&plaintext).unwrap();
+        let mut cipher = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut cipher).unwrap();
+        }
+        let mut cursor = Cursor::new(&cipher[..]);
+        while (cursor.position() as usize) < cipher.len() {
+            let n = tls_conn.conn.read_tls(&mut cursor).unwrap();
+            if n == 0 {
+                break;
+            }
+            tls_conn.conn.process_new_packets().unwrap();
+        }
+
+        // max below the chunk size: the first chunk breaches the bound, is left
+        // unconsumed in rustls, and drain reports the flood.
+        let mut hold: VecDeque<HeldRecvBuf> = VecDeque::new();
+        let mut sink = PlaintextSink::Segments {
+            hold: &mut hold,
+            outstanding: 0,
+            max: 1024,
+        };
+        assert!(
+            !drain_tls_plaintext(&mut tls_conn, &mut sink, 0),
+            "over-limit plaintext must return false (connection-kill signal)"
+        );
+        assert!(
+            hold.is_empty(),
+            "no segment should be held once the bound is breached"
+        );
+    }
 }

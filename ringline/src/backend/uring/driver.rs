@@ -99,6 +99,78 @@ pub(crate) struct PendingRecvBuf {
     pub(crate) ptr: *const u8,
 }
 
+/// A held received buffer for segmented delivery (Mode B/C), in one of two
+/// backings depending on ring pressure at delivery time.
+///
+/// - [`Pinned`](Self::Pinned): a provided-buffer bid pinned in the ring — the
+///   bid is NOT replenished, so the buffer stays in the provided ring until a
+///   segment reader consumes it or the connection closes (`close_connection`
+///   drains the hold). The backing pointer is derivable via
+///   `provided_bufs.get_buffer(bid)`, so only the id and length are stored. This
+///   is the zero-copy delivery, used while the ring is above the low-water
+///   reserve.
+/// - [`Owned`](Self::Owned): an owned copy of the received bytes. When the ring
+///   is at/below `recv_segment_reserve` the bytes are copied at delivery and the
+///   bid is returned to the ring immediately (Mode C), so this entry pins
+///   nothing and needs no replenish when consumed or on close.
+#[derive(Clone)]
+pub(crate) enum HeldRecvBuf {
+    /// A provided-buffer bid pinned in the ring (zero-copy hold).
+    Pinned {
+        bid: u16,
+        /// Bytes received into this buffer. The segment reader slices the buffer
+        /// to this length; close-drain only needs the bid.
+        len: u32,
+    },
+    /// An owned copy of the received bytes; its bid was already replenished at
+    /// delivery, so consuming or dropping this entry replenishes nothing.
+    Owned(bytes::Bytes),
+}
+
+/// In-flight segmented-recv Mode A forward write (see
+/// `docs/segmented-recv-design.md`, "Mode A — Forward to an fd"). One per
+/// connection at a time — writes to a sink are serialized (io_uring does not
+/// order independent SQEs, so pipelining would reorder the byte stream). The
+/// backing (a pinned provided-buffer bid or an owned copy) is kept alive here
+/// until the write CQE arrives (SQE memory must outlive the op), then released
+/// exactly once by `handle_forward_write`.
+pub(crate) struct ForwardWriteState {
+    /// Where the bytes being written live. `Pinned` releases its bid on
+    /// completion; `Owned` just drops its heap bytes.
+    pub(crate) backing: HeldRecvBuf,
+    /// Total bytes to write from this backing — the prefix length, which may be
+    /// shorter than the backing buffer when `len` ends mid-buffer (the suffix
+    /// was already stashed into the accumulator by the forward future).
+    pub(crate) total: u32,
+    /// Bytes already written from this backing; advanced on short writes so the
+    /// remainder resubmits at the correct source offset (and file offset).
+    pub(crate) written: u32,
+    /// Absolute file offset for byte 0 of this backing (0 for socket sinks).
+    pub(crate) base_offset: u64,
+    /// Sink fd (a non-fixed raw fd borrowed for the forward's lifetime via the
+    /// non-raw `SinkFd` handle the caller passed to `forward_to`).
+    pub(crate) sink_fd: RawFd,
+    /// Whether the sink is a seekable buffered file (uses `pwrite` at offset)
+    /// rather than a socket (`send` with `MSG_WAITALL`).
+    pub(crate) is_file: bool,
+    /// Connection generation captured at submit; the write CQE carries it in its
+    /// payload so a stale completion (slot closed/reused) is ignored.
+    pub(crate) generation: u32,
+}
+
+impl ForwardWriteState {
+    /// Source pointer + remaining length for the next (re)submission, honoring
+    /// bytes already written on a short write.
+    pub(crate) fn remainder(&self, provided_bufs: &ProvidedBufRing) -> (*const u8, u32) {
+        let base = match &self.backing {
+            HeldRecvBuf::Pinned { bid, .. } => provided_bufs.get_buffer(*bid).0,
+            HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
+        };
+        let ptr = unsafe { base.add(self.written as usize) };
+        (ptr, self.total - self.written)
+    }
+}
+
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
@@ -151,6 +223,53 @@ pub(crate) struct Driver {
     pub(crate) recv_hold: Vec<std::collections::VecDeque<PendingRecvBuf>>,
     /// Per-connection opt-in flag for the zero-copy recv-forward path.
     pub(crate) recv_forward: Vec<bool>,
+    /// Per-connection recv delivery domain (segmented-recv). `CopyOrConsume`
+    /// (default) uses the accumulator / single-buffer zero-copy path;
+    /// `Segmented` holds arriving provided buffers in `segment_hold` instead.
+    /// Reset at slot (re)activation and on close.
+    pub(crate) recv_domain: Vec<crate::recv::domain::RecvDomain>,
+    /// Per-connection held provided buffers for `Segmented` connections. Bids
+    /// pushed here are pinned in the ring (NOT replenished, no accumulator copy)
+    /// until a reader consumes them (later increment) or the connection closes.
+    /// A reader consumes them (`SegmentReader::next`) or the connection closes.
+    /// `close_connection` drains any still-held bids to `pending_replenish`.
+    pub(crate) segment_hold: Vec<std::collections::VecDeque<HeldRecvBuf>>,
+    /// Per-connection pin slot: the single provided buffer currently checked out
+    /// to a live `RecvSegment` (moved here out of `segment_hold` by
+    /// `SegmentReader::next`). The B2 lending-iterator contract is one live
+    /// segment at a time, so a single `Option` suffices. This is the
+    /// single-release discriminant: whoever `take()`s it (the segment's `Drop`
+    /// under `try_with_state`, or `close_connection` under `&mut Driver`)
+    /// replenishes the bid exactly once; the other sees `None` and does nothing.
+    pub(crate) segment_pinned: Vec<Option<HeldRecvBuf>>,
+    /// Per-connection in-flight segmented-recv Mode A forward write (see
+    /// [`ForwardWriteState`]). `Some` while a write to the sink is outstanding;
+    /// enforces the one-write-in-flight invariant and keeps the write's backing
+    /// alive until its CQE. `close_connection` drains it (releasing a pinned
+    /// bid); the write CQE clears it on completion.
+    pub(crate) forward_write: Vec<Option<ForwardWriteState>>,
+    /// Per-connection completed-forward-write result, produced by
+    /// `handle_forward_write` and consumed by the `ForwardToFuture`: `Ok(n)` =
+    /// bytes of the just-completed backing, `Err(errno)` = write failure.
+    pub(crate) forward_done: Vec<Option<Result<u32, i32>>>,
+    /// Per-connection flag: `true` while a Mode A `forward_to` is driving this
+    /// connection (set by `ConnCtx::forward_to`, cleared by `settle_forward_end`
+    /// / `reset_segment_state` / `close_connection`). Gates the `forward_hold_cap`
+    /// throttle so it applies only to forwarding connections, not to pure Mode B
+    /// segment readers that share the `Segmented` domain and `segment_hold`.
+    pub(crate) forward_recv_active: Vec<bool>,
+    /// Per-connection flag: `true` while a forwarding connection's multishot recv
+    /// has been throttled (cancelled) because its `segment_hold` reached
+    /// `forward_hold_cap`. Set at the throttle point in the recv handler; cleared
+    /// when the recv is re-armed after the hold drains below the cap
+    /// (`maybe_rearm_throttled_forward`) or on `settle_forward_end` / close.
+    /// Gates re-arm so the starved-connection path does not fight the throttle.
+    pub(crate) forward_hold_throttled: Vec<bool>,
+    /// Per-connection held-buffer cap for Mode A `forward_to`
+    /// (`Config::forward_hold_cap`). When a forwarding connection's `segment_hold`
+    /// length reaches this, its multishot recv is cancelled (TCP window closes)
+    /// and re-armed once the hold drains below the cap.
+    pub(crate) forward_hold_cap: usize,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<(RawFd, SocketAddr)>>,
     pub(crate) eventfd: RawFd,
     pub(crate) eventfd_buf: [u8; 8],
@@ -194,6 +313,17 @@ pub(crate) struct Driver {
     pub(crate) tcp_nodelay: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
+    /// Aggregate low-water reserve for segmented recv (Config::recv_segment_reserve).
+    /// When `provided_bufs.free() <= recv_segment_reserve`, an arriving segmented
+    /// buffer is force-copied (Mode C) and its bid replenished immediately instead
+    /// of pinned, so held segments cannot deplete the shared ring under fan-in.
+    pub(crate) recv_segment_reserve: u32,
+    /// Upper bound on outstanding recv bytes per connection (mirrors
+    /// `AccumulatorTable`'s per-accumulator `max_size`). Used to bound held TLS
+    /// plaintext delivered as owned segments in the segmented recv domain, where
+    /// the bytes never touch the accumulator but the same flood-kill contract
+    /// (`Config::recv_accumulator_max`) must hold.
+    pub(crate) recv_accumulator_max: usize,
     /// Whether SO_TIMESTAMPING is enabled for connections.
     #[cfg(feature = "timestamps")]
     pub(crate) timestamps: bool,
@@ -467,6 +597,19 @@ impl Driver {
                 .map(|_| std::collections::VecDeque::new())
                 .collect(),
             recv_forward: vec![false; config.max_connections as usize],
+            recv_domain: vec![
+                crate::recv::domain::RecvDomain::default();
+                config.max_connections as usize
+            ],
+            segment_hold: (0..config.max_connections)
+                .map(|_| std::collections::VecDeque::new())
+                .collect(),
+            segment_pinned: vec![None; config.max_connections as usize],
+            forward_write: (0..config.max_connections).map(|_| None).collect(),
+            forward_done: (0..config.max_connections).map(|_| None).collect(),
+            forward_recv_active: vec![false; config.max_connections as usize],
+            forward_hold_throttled: vec![false; config.max_connections as usize],
+            forward_hold_cap: config.forward_hold_cap,
             accept_rx,
             eventfd,
             eventfd_buf: [0u8; 8],
@@ -480,6 +623,8 @@ impl Driver {
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),
             tcp_nodelay: config.tcp_nodelay,
             send_zc_threshold: config.send_zc_threshold,
+            recv_segment_reserve: config.recv_segment_reserve,
+            recv_accumulator_max: config.recv_accumulator_max,
             #[cfg(feature = "timestamps")]
             timestamps: config.timestamps,
             #[cfg(feature = "timestamps")]
@@ -657,6 +802,149 @@ impl Driver {
         }
     }
 
+    /// Reset segmented-recv delivery state for a (re)activated connection slot.
+    /// The hold is already drained by `close_connection`, so this is defensive;
+    /// it also restores the domain to the default in case a slot is reused
+    /// without an intervening close.
+    pub(crate) fn reset_segment_state(&mut self, conn_index: u32) {
+        self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
+        self.segment_hold[conn_index as usize].clear();
+        // The pin slot should already be None (close drains it), but clear it
+        // defensively for a slot reused without an intervening close-drain.
+        self.segment_pinned[conn_index as usize] = None;
+        // Mode A forward state — cleared defensively (close drains any pinned
+        // bid). A leftover `forward_done` result must not bleed into a reused
+        // slot's forward.
+        self.forward_write[conn_index as usize] = None;
+        self.forward_done[conn_index as usize] = None;
+        self.forward_recv_active[conn_index as usize] = false;
+        self.forward_hold_throttled[conn_index as usize] = false;
+    }
+
+    /// Settle a connection when a Mode A `forward_to` finishes: any provided
+    /// buffers still held in `segment_hold` carry stream bytes *past* the
+    /// forwarded region, so their bytes are preserved by copying them into the
+    /// accumulator (in arrival order) before the bid is replenished — exactly
+    /// like the `with_segments` under-drain path. The delivery domain is then
+    /// reset so subsequent `with_data`/`with_bytes` reads see those bytes first.
+    ///
+    /// Returns `false` if the accumulator overflowed (`recv_accumulator_max`),
+    /// in which case the caller must close the connection.
+    #[must_use]
+    pub(crate) fn settle_forward_end(&mut self, conn_index: u32) -> bool {
+        let mut ok = true;
+        while let Some(held) = self.segment_hold[conn_index as usize].pop_front() {
+            match held {
+                HeldRecvBuf::Pinned { bid, len } => {
+                    let (ptr, _) = self.provided_bufs.get_buffer(bid);
+                    let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                    if ok && !self.accumulators.append(conn_index, data) {
+                        ok = false;
+                    }
+                    // Replenish the bid regardless (pushing outside the overflow
+                    // guard avoids a leak on breach).
+                    self.pending_replenish.push(bid);
+                }
+                HeldRecvBuf::Owned(bytes) => {
+                    if ok && !self.accumulators.append(conn_index, &bytes[..]) {
+                        ok = false;
+                    }
+                }
+            }
+        }
+        self.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::default();
+        // If the forward throttled its recv (hold reached `forward_hold_cap`), its
+        // multishot was cancelled. Re-arm it so the connection's subsequent
+        // `with_data`/`with_bytes` reads resume — the domain is now the default,
+        // so newly received bytes land in the accumulator. If the recv is still
+        // armed (its ECANCELED not yet observed, or it was never throttled),
+        // nothing to do. On a re-arm failure the connection is left unarmed; the
+        // caller's next read errors and closes it (standard recovery).
+        self.forward_recv_active[conn_index as usize] = false;
+        if self.forward_hold_throttled[conn_index as usize] {
+            self.forward_hold_throttled[conn_index as usize] = false;
+            let armed = self
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_multishot_armed);
+            let open = self
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
+            if !armed
+                && open
+                && self.ring.submit_multishot_recv(conn_index).is_ok()
+                && let Some(cs) = self.connections.get_mut(conn_index)
+            {
+                cs.recv_multishot_armed = true;
+            }
+        }
+        ok
+    }
+
+    /// Submit the first write of a segmented-recv Mode A forward `backing`
+    /// (`total` bytes) to `sink_fd` and record the in-flight state. One write is
+    /// in flight per connection; the completion handler releases the backing.
+    ///
+    /// On submission failure the backing is released here (a pinned bid returns
+    /// to the ring) and the error is propagated — the forward future surfaces it
+    /// to the caller.
+    pub(crate) fn start_forward_write(
+        &mut self,
+        conn_index: u32,
+        backing: HeldRecvBuf,
+        total: u32,
+        base_offset: u64,
+        sink_fd: RawFd,
+        is_file: bool,
+    ) -> io::Result<()> {
+        debug_assert!(
+            self.forward_write[conn_index as usize].is_none(),
+            "start_forward_write while a forward write is already in flight"
+        );
+        let generation = self.connections.generation(conn_index);
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::ForwardWrite,
+            conn_index,
+            generation,
+        );
+        let ptr = match &backing {
+            HeldRecvBuf::Pinned { bid, .. } => self.provided_bufs.get_buffer(*bid).0,
+            HeldRecvBuf::Owned(bytes) => bytes.as_ptr(),
+        };
+        let res = if is_file {
+            unsafe {
+                self.ring
+                    .submit_forward_write_file(sink_fd, ptr, total, base_offset, ud)
+            }
+        } else {
+            unsafe {
+                self.ring
+                    .submit_forward_write_socket(sink_fd, ptr, total, ud)
+            }
+        };
+        match res {
+            Ok(()) => {
+                self.forward_write[conn_index as usize] = Some(ForwardWriteState {
+                    backing,
+                    total,
+                    written: 0,
+                    base_offset,
+                    sink_fd,
+                    is_file,
+                    generation,
+                });
+                Ok(())
+            }
+            Err(e) => {
+                if let HeldRecvBuf::Pinned { bid, .. } = backing {
+                    self.pending_replenish.push(bid);
+                }
+                Err(e)
+            }
+        }
+    }
+
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         if let Some(conn) = self.connections.get_mut(conn_index) {
             if matches!(conn.recv_mode, RecvMode::Closed) {
@@ -676,6 +964,69 @@ impl Driver {
             }
             self.recv_forward[conn_index as usize] = false;
         }
+        // Do NOT drain held segmented-recv buffers here. When a peer FIN drives
+        // this close, a parked Mode B reader must still consume the bytes already
+        // held — draining them now (before the woken reader is polled) would
+        // discard a fully-received response and surface an empty EOF (the
+        // data+FIN-loss bug): a data CQE and the FIN can land in the same batch,
+        // and `close_connection` runs before `poll_ready_tasks`. The reader drains
+        // the hold (replenishing each bid as it consumes, seeing EOF once the hold
+        // is empty and the connection is `Closed`); any buffers it never reaches
+        // are reclaimed at `handle_close` (teardown), symmetric to `segment_pinned`.
+        // The delivery domain is reset at slot reuse (`reset_segment_state`).
+        // A bid checked out to a live `RecvSegment` (a parked task holding a
+        // segment across an await) must NOT be reclaimed here. `RecvSegment::deref`
+        // reads that bid's provided buffer directly, and a parked task can still
+        // resume and deref it between now and the `Close` CQE — returning the bid
+        // to the ring now would let another connection's recv overwrite a buffer a
+        // live segment is still reading (a safe-API data leak). The bid stays
+        // pinned in `segment_pinned[conn]` until `handle_close`, which reclaims it
+        // after `remove_connection` has dropped the future (and with it the
+        // segment). `RecvSegment::drop` running in-poll before then still releases
+        // it (the pin slot is the single-release discriminant); if the drop runs
+        // unguarded during teardown it no-ops and `handle_close` does the release.
+        // An in-flight Mode A forward write's backing is still owned by the kernel
+        // (it is the write's *source* memory) until the write CQE arrives —
+        // reclaiming it now would either return a provided bid to the ring while
+        // the kernel is still DMA-reading it (another connection's recv could then
+        // overwrite it: cross-connection corruption / info leak) or free an Owned
+        // copy the kernel is still reading (use-after-free). Both violate
+        // invariant #1 (SQE memory must outlive the op). So do NOT reclaim it here.
+        // Instead cancel the in-flight write so a stuck sink cannot pin the bid and
+        // slot forever, and leave `forward_write[conn]` in place: the (possibly
+        // ECANCELED) CQE is handled by `handle_forward_write` / `fail_forward_write`,
+        // which replenish the bid exactly once and drive this deferred close
+        // forward. `try_finalize_close` will not submit the `Close` SQE — and so the
+        // slot is not reused and the captured generation stays valid — while
+        // `forward_write[conn]` is still `Some`.
+        if let Some(state) = self.forward_write[conn_index as usize].as_ref() {
+            let write_gen = state.generation;
+            // The in-flight op is either the write itself or its POLLOUT re-arm;
+            // cancel both user_data variants (the non-matching one is a harmless
+            // ENOENT whose `Cancel` CQE is ignored).
+            let write_ud = crate::completion::UserData::encode(
+                crate::completion::OpTag::ForwardWrite,
+                conn_index,
+                write_gen,
+            );
+            let pollout_ud = crate::completion::UserData::encode(
+                crate::completion::OpTag::ForwardWritePollOut,
+                conn_index,
+                write_gen,
+            );
+            let _ = self.ring.submit_async_cancel(write_ud.raw(), conn_index);
+            let _ = self.ring.submit_async_cancel(pollout_ud.raw(), conn_index);
+        } else {
+            // No forward write in flight — safe to clear a stale completed result.
+            self.forward_done[conn_index as usize] = None;
+        }
+        // Clear the Mode A forward flags for slot reuse. Any held bids were
+        // already drained above (segment_hold / segment_pinned / forward_write);
+        // the throttle flag just tracks recv-arm state and needs no bid release.
+        // A throttle-cancel's ECANCELED (if still in flight) is a no-op in
+        // `handle_recv_multi` (result < 0 / generation checks).
+        self.forward_recv_active[conn_index as usize] = false;
+        self.forward_hold_throttled[conn_index as usize] = false;
         // Clear the fallback-recv flag so the slot's next occupant starts
         // clean. A still-in-flight fallback CQE for this occupant is
         // generation-checked in handle_recv_fallback and only releases its
@@ -731,8 +1082,14 @@ impl Driver {
     /// from `note_send_finalized` after each per-send CQE.
     pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
         let state = &self.send_queues[conn_index as usize];
-        let drained = !state.in_flight && state.queue.is_empty();
-        if !(state.close_pending && drained) {
+        let sends_drained = !state.in_flight && state.queue.is_empty();
+        // An in-flight Mode A forward write still owns a provided buffer (or Owned
+        // copy) the kernel is reading as the write source; do not submit `Close`
+        // (which recycles the slot) until its CQE has landed and released the
+        // backing. `handle_forward_write` / `fail_forward_write` re-drive this
+        // finalize once `forward_write[conn]` is cleared.
+        let forward_drained = self.forward_write[conn_index as usize].is_none();
+        if !(state.close_pending && sends_drained && forward_drained) {
             return;
         }
         self.send_queues[conn_index as usize].close_pending = false;
@@ -747,6 +1104,32 @@ impl Driver {
             .position(|&i| i == conn_index)
         {
             self.close_notify_armed.swap_remove(pos);
+        }
+        // If a multishot recv is still armed on this connection, cancel it
+        // before closing. Closing the fixed descriptor alone removes its
+        // fixed-file table slot but does NOT drop the socket's last reference
+        // while an in-flight recv SQE still pins it — so the kernel never sends
+        // the peer a FIN and a parked reader on the other end hangs forever.
+        // Cancelling the recv (by its `RecvMulti` user_data, which is immune to
+        // Close reordering since it targets the request, not the fd) releases
+        // that reference so the subsequent Close actually FINs. The recv's
+        // ECANCELED completion is a no-op (generation/slot checks in
+        // `handle_recv_multi`). Skipped when the recv already self-terminated
+        // (e.g. a peer FIN drove this close) — nothing to cancel.
+        let recv_armed = self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_multishot_armed);
+        if recv_armed {
+            let recv_ud = crate::completion::UserData::encode(
+                crate::completion::OpTag::RecvMulti,
+                conn_index,
+                0,
+            );
+            let _ = self.ring.submit_async_cancel(recv_ud.raw(), conn_index);
+            if let Some(cs) = self.connections.get_mut(conn_index) {
+                cs.recv_multishot_armed = false;
+            }
         }
         if self.ring.submit_close(conn_index).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);

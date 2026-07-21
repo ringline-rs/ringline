@@ -7,10 +7,24 @@ license.workspace = true
 repository.workspace = true
 description = "Redis (RESP) client for the ringline io_uring runtime"
 
+# `has_io_uring` is emitted by this crate's build.rs to gate the io_uring-only
+# streaming API (`get_stream`/`ValueStream`). Register it for check-cfg so the
+# cfg is recognized on backends/targets where build.rs does not emit it (mio,
+# macOS), matching `ringline`'s own stanza.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(has_io_uring)"]
+
 [features]
 default = ["metrics"]
 metrics = ["dep:histogram"]
 timestamps = ["ringline/timestamps", "dep:libc"]
+# Forward the runtime's mio-backend override. Needed so this crate's build.rs
+# sees `CARGO_FEATURE_FORCE_MIO` and gates the io_uring-only streaming API
+# (`get_stream`/`ValueStream`) out in lockstep with `ringline` being built as
+# mio — otherwise a workspace `--features force-mio` build (CI clippy-mio) would
+# compile `get_stream` against a mio `ringline` that lacks `recv_owned_segment`.
+force-mio = ["ringline/force-mio"]
 
 [dependencies]
 bytes = { workspace = true }

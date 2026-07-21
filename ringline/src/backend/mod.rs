@@ -21,6 +21,8 @@ pub(crate) mod uring;
 #[cfg(has_io_uring)]
 pub(crate) use uring::driver::Driver;
 #[cfg(has_io_uring)]
+pub(crate) use uring::driver::HeldRecvBuf;
+#[cfg(has_io_uring)]
 pub(crate) use uring::driver::PendingRecvBuf;
 #[cfg(has_io_uring)]
 pub(crate) use uring::driver::UdpSocketState;

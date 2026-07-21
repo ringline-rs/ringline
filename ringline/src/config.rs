@@ -91,6 +91,47 @@ pub struct Config {
     /// will close legitimate slow-consumer workloads (where kernel recv
     /// CQEs batch faster than the handler runs).
     pub(crate) recv_accumulator_max: usize,
+    /// Aggregate low-water reserve for segmented recv (see
+    /// `docs/segmented-recv-design.md`, "Backpressure and ring safety").
+    ///
+    /// When a `Segmented` connection receives a provided buffer, the runtime
+    /// consults the shared per-worker recv ring's live free-buffer count. If
+    /// `free() <= recv_segment_reserve`, the buffer is **force-copied** into an
+    /// owned `Bytes` and its bid returned to the ring immediately (Mode C at
+    /// delivery) instead of being pinned as a zero-copy held segment. This
+    /// guarantees a well-behaved connection is never `ENOBUFS`-starved by other
+    /// connections holding segments under fan-in, at the cost of a copy while the
+    /// ring is under pressure. Above the reserve, delivery stays zero-copy
+    /// (pinned).
+    ///
+    /// Larger values reserve more headroom (copy sooner, safer under fan-in);
+    /// `0` force-copies only when the ring is fully drained. Tune relative to
+    /// `recv_buffer` ring_size; a value `>=` ring_size makes segmented delivery
+    /// always copy. Must be `<= 65535` (the maximum provided-ring size).
+    ///
+    /// **Default: 64** (a quarter of the default 256-buffer recv ring).
+    pub(crate) recv_segment_reserve: u32,
+    /// Per-connection held-buffer cap for a Mode A `forward_to` connection (see
+    /// `docs/segmented-recv-design.md`, "Mode A — Forward to an fd").
+    ///
+    /// A `forward_to` connection holds arriving provided buffers in-place until
+    /// each is written to the sink. A slow or high-latency sink (or a very large
+    /// object) would otherwise let one forwarding connection accumulate an
+    /// unbounded backlog of held buffers, pinning much of the shared per-worker
+    /// recv ring (and growing heap when the low-water reserve force-copies) and
+    /// starving every other connection on the worker. When a forwarding
+    /// connection's held-buffer count reaches this cap, the runtime cancels its
+    /// multishot recv so its TCP receive window closes and the peer stops sending
+    /// (natural backpressure to the source); the recv is re-armed once the hold
+    /// drains below the cap as writes complete. This bounds one slow forward to at
+    /// most `forward_hold_cap` held buffers.
+    ///
+    /// Larger values allow more recv in flight (higher single-forward throughput)
+    /// at the cost of more pinned ring buffers / held heap under a slow sink;
+    /// smaller values apply backpressure sooner. Must be `>= 1`.
+    ///
+    /// **Default: 64** (2× `MAX_IOVECS`, the per-`sendmsg` iovec bound).
+    pub(crate) forward_hold_cap: usize,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly
     /// close the incoming fd if every worker is full) rather than
@@ -280,6 +321,8 @@ impl Default for Config {
             max_connections: 16000,
             recv_accumulator_capacity: 4096,
             recv_accumulator_max: usize::MAX,
+            recv_segment_reserve: 64,
+            forward_hold_cap: 64,
             accept_queue_capacity: 1024,
             conn_chunk_size: 1,
             send_copy_count: 1024,
@@ -363,6 +406,23 @@ impl Config {
         if self.send_copy_count == 0 {
             return Err(crate::error::Error::RingSetup(
                 "send_copy_count must be > 0".into(),
+            ));
+        }
+        // The provided ring can hold at most u16::MAX buffers, so a reserve above
+        // that is nonsensical (it would force-copy every segmented delivery). A
+        // reserve >= the configured ring_size is *allowed* (it simply makes
+        // segmented delivery always copy) — it is not coupled here so small rings
+        // stay valid.
+        if self.recv_segment_reserve > u16::MAX as u32 {
+            return Err(crate::error::Error::RingSetup(
+                "recv_segment_reserve must be <= 65535 (the maximum provided-ring size)".into(),
+            ));
+        }
+        // A cap of 0 would throttle a forward before it can hold its first
+        // buffer, deadlocking the forward (nothing to write, never re-armed).
+        if self.forward_hold_cap == 0 {
+            return Err(crate::error::Error::RingSetup(
+                "forward_hold_cap must be >= 1".into(),
             ));
         }
         if self.sq_entries == 0 || !self.sq_entries.is_power_of_two() {
@@ -643,6 +703,41 @@ impl ConfigBuilder {
     /// `usize::MAX` (the default) disables the cap.
     pub fn recv_accumulator_max(mut self, n: usize) -> Self {
         self.config.recv_accumulator_max = n;
+        self
+    }
+
+    /// Set the aggregate low-water reserve for segmented recv.
+    ///
+    /// When the shared per-worker recv ring's free-buffer count drops to this
+    /// value or below, arriving buffers for `Segmented` connections are
+    /// force-copied into owned `Bytes` (and their bids returned to the ring
+    /// immediately) instead of being pinned as zero-copy held segments — so
+    /// connections holding segments cannot deplete the ring and `ENOBUFS`-starve
+    /// well-behaved connections under fan-in. Above the reserve, delivery stays
+    /// zero-copy. `0` force-copies only when the ring is fully drained. Tune
+    /// relative to the `recv_buffer` ring size; must be `<= 65535`.
+    ///
+    /// Default: 64 (a quarter of the default 256-buffer recv ring).
+    pub fn recv_segment_reserve(mut self, reserve: u32) -> Self {
+        self.config.recv_segment_reserve = reserve;
+        self
+    }
+
+    /// Set the per-connection held-buffer cap for Mode A `forward_to`
+    /// connections.
+    ///
+    /// When a forwarding connection has this many provided buffers held awaiting
+    /// writes to the sink, the runtime cancels its multishot recv (closing its
+    /// TCP receive window so the source stops sending) and re-arms it once the
+    /// hold drains below the cap as writes complete — bounding one slow forward
+    /// to `forward_hold_cap` held buffers so it cannot deplete the shared
+    /// per-worker recv ring and starve other connections. Larger values allow
+    /// more recv in flight (higher single-forward throughput) at the cost of more
+    /// pinned ring buffers / held heap under a slow sink. Must be `>= 1`.
+    ///
+    /// Default: 64 (2× `MAX_IOVECS`).
+    pub fn forward_hold_cap(mut self, cap: usize) -> Self {
+        self.config.forward_hold_cap = cap;
         self
     }
 

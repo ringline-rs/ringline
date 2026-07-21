@@ -79,6 +79,17 @@ pub struct ConnectionState {
     /// path, reducing per-message latency from ~2 event-loop iterations to ~1.
     #[cfg(has_io_uring)]
     pub direct_echo: bool,
+    /// Whether a plain multishot `RecvMulti` SQE is currently in-flight in the
+    /// kernel (armed). Set when the multishot is (re-)armed; cleared when a
+    /// completion arrives without `IORING_CQE_F_MORE` (the kernel terminated
+    /// the multishot). On a proactive close this tells the close path it must
+    /// cancel the still-armed recv so its reference on the socket file is
+    /// dropped and the kernel actually sends the peer a FIN — closing the fixed
+    /// descriptor alone does not, since the in-flight recv pins the socket.
+    /// (Only tracked for the plain `RecvMulti` path, not the timestamped
+    /// `RecvMsgMulti` path.)
+    #[cfg(has_io_uring)]
+    pub recv_multishot_armed: bool,
 }
 
 impl Default for ConnectionState {
@@ -102,6 +113,8 @@ impl ConnectionState {
             recv_timestamp_ns: 0,
             #[cfg(has_io_uring)]
             direct_echo: false,
+            #[cfg(has_io_uring)]
+            recv_multishot_armed: false,
         }
     }
 
@@ -133,6 +146,7 @@ impl ConnectionState {
         #[cfg(has_io_uring)]
         {
             self.direct_echo = false;
+            self.recv_multishot_armed = false;
         }
         self.generation = self.generation.wrapping_add(1);
     }

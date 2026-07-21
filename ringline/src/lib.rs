@@ -157,6 +157,7 @@ pub mod metrics;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod nvme;
 pub mod process;
+pub(crate) mod recv;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod region_registry;
 pub(crate) mod resolver;
@@ -247,16 +248,37 @@ pub use runtime::io::Deadline;
 pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
+/// Future returned by [`ConnCtx::forward_to()`] (segmented recv, Mode A).
+#[cfg(has_io_uring)]
+pub use runtime::io::ForwardToFuture;
 /// Handle to a spawned task's return value, obtained from [`spawn_with_handle()`].
 pub use runtime::io::JoinHandle;
 /// Result of a parse closure: consumed bytes or need more data.
 pub use runtime::io::ParseResult;
+/// Future returned by [`ConnCtx::recv_owned_segment()`] (segmented recv, Mode C).
+#[cfg(has_io_uring)]
+pub use runtime::io::RecvOwnedSegment;
 /// Future that resolves when recv data is available (sink, accumulator, or close).
 pub use runtime::io::RecvReadyFuture;
+/// A single zero-copy received provided buffer (segmented recv, Mode B).
+#[cfg(has_io_uring)]
+pub use runtime::io::RecvSegment;
 /// Future returned by [`resolve()`].
 pub use runtime::io::ResolveFuture;
+/// Ordered borrowed view of buffered recv data for [`ConnCtx::with_segments()`].
+#[cfg(has_io_uring)]
+pub use runtime::io::SegChain;
+/// Bytes consumed by a [`ConnCtx::with_segments()`] callback.
+#[cfg(has_io_uring)]
+pub use runtime::io::SegConsumed;
+/// Async lending iterator over received provided buffers (segmented recv, Mode B).
+#[cfg(has_io_uring)]
+pub use runtime::io::SegmentReader;
 /// Future that completes when a send finishes.
 pub use runtime::io::SendFuture;
+/// Non-raw sink descriptor for [`ConnCtx::forward_to()`] (segmented recv, Mode A).
+#[cfg(has_io_uring)]
+pub use runtime::io::SinkFd;
 /// Future returned by [`sleep()`].
 pub use runtime::io::SleepFuture;
 /// Future returned by [`timeout()`].
@@ -269,6 +291,9 @@ pub use runtime::io::UdpRecvFuture;
 pub use runtime::io::WithBytesFuture;
 /// Future that provides received data.
 pub use runtime::io::WithDataFuture;
+/// Future returned by [`ConnCtx::with_segments()`] (segmented recv, Mode B).
+#[cfg(has_io_uring)]
+pub use runtime::io::WithSegmentsFuture;
 /// Initiate an outbound TCP connection from any async task.
 pub use runtime::io::connect;
 /// Initiate an outbound TLS connection from any async task.

@@ -2,7 +2,13 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::Future;
 use std::io;
+#[cfg(has_io_uring)]
+use std::marker::PhantomData;
 use std::net::SocketAddr;
+#[cfg(has_io_uring)]
+use std::ops::Deref;
+#[cfg(has_io_uring)]
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -816,6 +822,226 @@ impl ConnCtx {
         }
     }
 
+    /// Borrow a segmented-recv reader (Mode B "Borrow", the sound lending-iterator
+    /// face — see `docs/segmented-recv-design.md`).
+    ///
+    /// Opts this connection into *segmented* delivery: arriving provided buffers
+    /// are held in-place (no copy into the accumulator, bid not replenished) and
+    /// surfaced one at a time as zero-copy [`RecvSegment`]s via
+    /// [`SegmentReader::next`]. A segment is `!Send`, `!Clone`, and borrows the
+    /// reader exclusively (`&mut`), so it cannot escape the runtime or outlive the
+    /// buffer's pin — the "holdable ⇒ copied" invariant is enforced structurally.
+    ///
+    /// Call this **before** the connection starts receiving: it flips the delivery
+    /// domain but does not retroactively segment bytes already gathered into the
+    /// accumulator under the default `with_data`/`with_bytes` path.
+    ///
+    /// io_uring only — segmented delivery is backed by the provided-buffer ring.
+    #[cfg(has_io_uring)]
+    pub fn segments(&self) -> SegmentReader<'_> {
+        with_state(|driver, _executor| {
+            driver.recv_domain[self.conn_index as usize] =
+                crate::recv::domain::RecvDomain::Segmented;
+        });
+        SegmentReader {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            _borrow: PhantomData,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Await the next received segment as an owned, freely holdable [`Bytes`]
+    /// (Mode C — "Own", copy-at-delivery; see `docs/segmented-recv-design.md`).
+    ///
+    /// Opts this connection into *segmented* delivery (like [`segments`](Self::segments)),
+    /// then, for each arriving provided buffer, **copies** its bytes into an owned
+    /// heap `Bytes` and replenishes the bid **immediately at delivery** — the copy
+    /// *is* the release, so this path never pins the ring and cannot deplete it by
+    /// holding (unlike a [`RecvSegment`], which pins until dropped). The returned
+    /// `Bytes` is `Send`, `Clone`, and retainable indefinitely.
+    ///
+    /// Resolves to:
+    /// - `Ok(Some(bytes))` — one received buffer, copied and owned.
+    /// - `Ok(None)` — end of stream: the recv side is closed (peer FIN) with no
+    ///   held buffers remaining, or the connection slot was reused (stale handle).
+    ///
+    /// Parks when no buffer is held and the connection is still open, resuming
+    /// when the recv completion handler holds a buffer and calls `wake_recv` (the
+    /// same waiter mechanism as [`segments`](Self::segments) / [`with_data`](Self::with_data)).
+    ///
+    /// io_uring only — segmented delivery is backed by the provided-buffer ring.
+    #[cfg(has_io_uring)]
+    pub fn recv_owned_segment(&self) -> RecvOwnedSegment {
+        with_state(|driver, _executor| {
+            driver.recv_domain[self.conn_index as usize] =
+                crate::recv::domain::RecvDomain::Segmented;
+        });
+        RecvOwnedSegment {
+            conn_index: self.conn_index,
+            generation: self.generation,
+        }
+    }
+
+    /// End segmented-recv delivery on this connection and restore the default
+    /// [`with_data`](Self::with_data) / [`with_bytes`](Self::with_bytes) path.
+    ///
+    /// [`segments`](Self::segments) and [`recv_owned_segment`](Self::recv_owned_segment)
+    /// leave the connection in the *segmented* domain: arriving buffers are held
+    /// for the segment reader instead of being gathered into the accumulator. A
+    /// consumer that has finished pulling its segments **must** call this before
+    /// issuing an ordinary `with_data`/`with_bytes` read — otherwise that read
+    /// would never observe further data (it keeps getting held as segments).
+    ///
+    /// Any buffers still held (bytes received *past* what the consumer pulled) are
+    /// gathered, in arrival order, into the front of the accumulator so the next
+    /// read sees them first.
+    ///
+    /// Returns an error (and closes the connection) if gathering the leftover
+    /// segments overflows the recv accumulator bound (`recv_accumulator_max`).
+    ///
+    /// io_uring only — segmented delivery is backed by the provided-buffer ring.
+    #[cfg(has_io_uring)]
+    pub fn end_segments(&self) -> io::Result<()> {
+        // `settle_forward_end` is the shared "drain held segments into the
+        // accumulator, reset the delivery domain to default" routine (named for
+        // its first caller, the Mode A `forward_to` completion). Reused here for
+        // the streaming-value read side, which needs the identical settle.
+        let ok = with_state(|driver, _executor| driver.settle_forward_end(self.conn_index));
+        if ok {
+            Ok(())
+        } else {
+            self.close();
+            Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "recv accumulator overflow while ending segmented recv",
+            ))
+        }
+    }
+
+    /// Process the connection's buffered recv data as an **ordered chain of
+    /// borrowed segments** via a callback (Mode B "Borrow", the B1 callback face
+    /// — see `docs/segmented-recv-design.md`).
+    ///
+    /// Opts this connection into *segmented* delivery, then hands the callback a
+    /// [`SegChain`] presenting, **in order**:
+    /// 1. the current accumulator contents (if any) as the leading segment, then
+    /// 2. each held provided buffer, in arrival order.
+    ///
+    /// The callback borrows those slices for the call only (they cannot escape,
+    /// like [`with_data`](Self::with_data)) and returns a [`SegConsumed`] — the
+    /// number of bytes it consumed **from the front** of that concatenation.
+    ///
+    /// After the callback returns, the runtime settles state so that all
+    /// un-consumed bytes end up contiguously at the **front of the accumulator**,
+    /// in order:
+    /// - fully-consumed accumulator bytes are dropped from the front;
+    /// - each held buffer wholly consumed by the callback is replenished to the
+    ///   ring;
+    /// - any remainder — a partially-consumed buffer, plus buffers the callback
+    ///   did not reach (under-drain) — is **copied into the accumulator** and its
+    ///   bids replenished.
+    ///
+    /// So the fully-draining consumer (h2/grpc: extend-each + consume-all) pays
+    /// **zero** ringline copies, while an under-draining or whole-frame consumer
+    /// degrades to the [`with_data`](Self::with_data) copy — never a deadlock or a
+    /// bid leak. The next `with_segments` / `with_data` / `with_bytes` call sees
+    /// the carried-over bytes first, in order.
+    ///
+    /// Resolves to `Ok(n)` = total bytes consumed this call. A callback that
+    /// returns [`SegConsumed(0)`](SegConsumed) (it needs a bigger frame than is
+    /// buffered) gathers everything to the accumulator and **parks** for more
+    /// data — the `NeedMore` idiom, bounded by `recv_accumulator_max` (an
+    /// over-run closes the connection). Resolves to `Ok(0)` at EOF (recv side
+    /// closed with nothing to present) or for a stale handle (slot reused).
+    ///
+    /// This deliberately does **not** reuse [`ParseResult`]: its `NeedMore` grows
+    /// the heap accumulator by ring depth, which is the wrong bound here.
+    ///
+    /// Call this **before** the connection starts receiving; it flips the delivery
+    /// domain but does not retroactively segment bytes already gathered into the
+    /// accumulator.
+    ///
+    /// io_uring only — segmented delivery is backed by the provided-buffer ring.
+    #[cfg(has_io_uring)]
+    pub fn with_segments<F>(&self, f: F) -> WithSegmentsFuture<F>
+    where
+        F: FnMut(&SegChain<'_>) -> SegConsumed,
+    {
+        with_state(|driver, _executor| {
+            driver.recv_domain[self.conn_index as usize] =
+                crate::recv::domain::RecvDomain::Segmented;
+        });
+        WithSegmentsFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            f: Some(f),
+        }
+    }
+
+    /// Forward the next `len` received bytes straight to `sink` (Mode A —
+    /// "Forward", zero userspace copy; see `docs/segmented-recv-design.md`).
+    ///
+    /// Opts this connection into *segmented* delivery, then interleaves recv and
+    /// write: arriving provided buffers are held driver-side and written directly
+    /// to `sink` — a **socket** (zero-copy proxy, `send` with `MSG_WAITALL`) or a
+    /// **buffered file** (`pwrite` at an advancing offset starting at 0). No
+    /// intermediate copy into the accumulator or a user buffer. Each held buffer's
+    /// bid is released back to the provided ring on **its own write completion**.
+    ///
+    /// Writes to `sink` are strictly serialized — one in flight at a time — so the
+    /// byte stream cannot be reordered (io_uring does not order independent SQEs);
+    /// a large `len` therefore becomes a sequence of serialized buffer-sized
+    /// writes. Shared-ring safety under fan-in is provided by the low-water
+    /// reserve (`recv_segment_reserve`): when the ring runs low, arriving buffers
+    /// are force-copied and their bids returned immediately, so a slow sink cannot
+    /// deplete the shared ring and starve other connections.
+    ///
+    /// Resolves to `Ok(bytes_forwarded)`. `bytes_forwarded == len` on success; a
+    /// value `< len` means the peer closed (FIN) before `len` bytes arrived — the
+    /// forward is truncated (any received-but-unwritten tail is dropped as the
+    /// connection unwinds). After the forward the delivery domain is reset to the
+    /// default, and any bytes received *past* `len` are preserved at the front of
+    /// the accumulator for the next `with_data`/`with_bytes` read.
+    ///
+    /// # Sink ownership
+    ///
+    /// [`SinkFd`] borrows the target descriptor for the forward's lifetime (it is
+    /// **not** a bare `RawFd` the caller can close mid-forward — that would be a
+    /// use-after-close, since an in-flight write would land on a recycled fd). The
+    /// returned future borrows the `SinkFd`, so the borrow checker keeps the fd
+    /// open until the forward resolves.
+    ///
+    /// # NVMe / `O_DIRECT`
+    ///
+    /// Not supported for zero-copy: provided buffers are mid-ring, unaligned, and
+    /// unregistered, so `O_DIRECT`'s alignment contract cannot be met without an
+    /// intermediate aligned copy (which defeats the purpose). [`SinkFd::file`]
+    /// **rejects** an `O_DIRECT` descriptor with [`io::ErrorKind::InvalidInput`].
+    ///
+    /// io_uring only — Mode A is backed by the provided-buffer ring.
+    #[cfg(has_io_uring)]
+    pub fn forward_to<'a>(&self, sink: &'a SinkFd<'a>, len: usize) -> ForwardToFuture<'a> {
+        with_state(|driver, _executor| {
+            driver.recv_domain[self.conn_index as usize] =
+                crate::recv::domain::RecvDomain::Segmented;
+            // Mark this connection as a forwarder so the recv handler applies the
+            // `forward_hold_cap` throttle (bounded hold + TCP-window backpressure)
+            // — distinguishing it from a pure Mode B segment reader that also uses
+            // the `Segmented` domain but is drained by a `SegmentReader`.
+            driver.forward_recv_active[self.conn_index as usize] = true;
+        });
+        ForwardToFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            len: len as u64,
+            forwarded: 0,
+            sink_fd: sink.fd,
+            is_file: sink.is_file,
+            _sink: PhantomData,
+        }
+    }
+
     /// Install a recv sink so that CQE data is written directly to the
     /// target buffer instead of the per-connection accumulator.
     ///
@@ -1462,6 +1688,33 @@ impl ConnCtx {
                 .unwrap_or(false)
         })
     }
+
+    /// Whether this handle still refers to a live, usable connection.
+    ///
+    /// Returns `false` if the slot has been released and its generation bumped
+    /// (a stale handle after slot reuse) **or** if the connection is closing
+    /// (`close()` was called — `recv_mode` is `Closed` — even before the Close
+    /// CQE has released the slot). Because a proactive `close()` flips the mode
+    /// synchronously, this is a *deterministic* poison probe: a caller that owns
+    /// a `ConnCtx` copy (e.g. a connection pool) can detect an
+    /// undrained-`ValueStream` poison on the very next turn, without waiting for
+    /// the Close CQE to bump the generation.
+    ///
+    /// A clean, fully-drained streaming read (which restores the default read
+    /// path via `end_segments`) leaves the connection `Multi`/armed, so this
+    /// returns `true` and the connection stays reusable.
+    pub fn is_alive(&self) -> bool {
+        with_state(|driver, _| {
+            driver
+                .connections
+                .get(self.conn_index)
+                .map(|cs| {
+                    cs.generation == self.generation
+                        && !matches!(cs.recv_mode, crate::connection::RecvMode::Closed)
+                })
+                .unwrap_or(false)
+        })
+    }
 }
 
 // ── AsyncSendBuilder ─────────────────────────────────────────────────
@@ -1900,6 +2153,957 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
 
             executor.owner_task[self.conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
             executor.recv_waiters[self.conn_index as usize] = true;
+            Poll::Pending
+        })
+    }
+}
+
+// ── Segmented recv (Mode B — Borrow) ─────────────────────────────────
+
+/// An async **lending iterator** over a connection's received provided buffers,
+/// obtained from [`ConnCtx::segments`] (io_uring only).
+///
+/// Each [`next`](Self::next) yields one zero-copy [`RecvSegment`] borrowing the
+/// reader exclusively (`&mut self`). Because the segment holds that `&mut`
+/// borrow, calling `next` again while a segment is alive is a **compile error** —
+/// so "drop the previous segment before pulling the next" and "the segment cannot
+/// escape the runtime" are enforced by the borrow checker, not by convention.
+/// This is why it cannot be a `futures::Stream`/`for` loop (inherent to lending
+/// iterators). Typical use:
+///
+/// ```ignore
+/// let mut r = conn.segments();
+/// while let Some(seg) = r.next().await? {
+///     process(&seg);        // seg: Deref<Target = [u8]>, held across the await below
+///     downstream.send(&seg).await?;
+/// }                          // loop ends at EOF (peer FIN, hold drained)
+/// ```
+///
+/// The reader is itself `!Send`/`!Clone`/non-`Copy`: it is bound to the worker
+/// thread's driver and to the connection it was created for.
+#[cfg(has_io_uring)]
+pub struct SegmentReader<'a> {
+    conn_index: u32,
+    /// Generation snapshot from the originating `ConnCtx`; a stale reader (slot
+    /// reused) resolves `next` to `Ok(None)` (EOF) rather than reading the new
+    /// occupant's buffers.
+    generation: u32,
+    /// Ties the reader to the `ConnCtx` borrow it came from.
+    _borrow: PhantomData<&'a ()>,
+    /// `!Send` + `!Sync`: a provided buffer is thread-affine and driver-released.
+    _not_send: PhantomData<*const ()>,
+}
+
+#[cfg(has_io_uring)]
+impl SegmentReader<'_> {
+    /// Await the next received segment.
+    ///
+    /// Resolves to:
+    /// - `Ok(Some(seg))` — a held provided buffer, handed out as a zero-copy
+    ///   [`RecvSegment`] pinned until it is dropped.
+    /// - `Ok(None)` — end of stream: the recv side is closed (peer FIN) and no
+    ///   held buffers remain, or the connection slot was reused (stale reader).
+    ///
+    /// Parks when no buffer is held and the connection is still open, resuming
+    /// when the recv completion handler holds a buffer and calls `wake_recv`
+    /// (the same waiter mechanism as [`ConnCtx::with_data`]).
+    // This is a *lending* iterator: `next` borrows `&mut self` and yields a
+    // segment tied to that borrow, which `std::iter::Iterator` cannot express.
+    // The name is deliberate (it reads as an iterator to callers); it genuinely
+    // cannot implement the trait.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> SegmentNext<'_> {
+        SegmentNext {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            _borrow: PhantomData,
+        }
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Drop for SegmentReader<'_> {
+    fn drop(&mut self) {
+        // Auto-settle on drop: if the reader is dropped while the connection is
+        // still in the segmented domain (i.e. `end_segments()` was not called —
+        // the common pattern drops the reader first, then calls `end_segments`),
+        // drain any still-held segments into the accumulator and restore the
+        // default `with_data`/`with_bytes` read path. Without this, held bytes
+        // would be stranded and a subsequent ordinary read would hang (arriving
+        // buffers keep being held as segments). A live `RecvSegment` borrows the
+        // reader `&mut`, so by here the pin slot is empty (the segment dropped
+        // first) — only the hold needs draining.
+        //
+        // `try_with_state`: a reader owned by a parked task can be dropped in the
+        // *unguarded* `drain_completions` during teardown (`CURRENT_DRIVER` is
+        // `None`), where there is nothing to settle — the connection is closing
+        // and `handle_close` reclaims the held bids. On accumulator overflow while
+        // settling, poison (close) the connection.
+        try_with_state(|driver, _executor| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return; // slot reused — nothing of ours to settle.
+            }
+            if driver.recv_domain[self.conn_index as usize]
+                != crate::recv::domain::RecvDomain::Segmented
+            {
+                return; // already settled (end_segments() was called).
+            }
+            if !driver.settle_forward_end(self.conn_index) {
+                driver.close_connection(self.conn_index);
+            }
+        });
+    }
+}
+
+/// Future returned by [`SegmentReader::next`]. Borrows the reader (`&mut`) for
+/// `'a`; the yielded [`RecvSegment`] shares that borrow, keeping the reader
+/// exclusively locked while the segment is alive.
+#[cfg(has_io_uring)]
+pub struct SegmentNext<'a> {
+    conn_index: u32,
+    generation: u32,
+    _borrow: PhantomData<&'a mut ()>,
+}
+
+#[cfg(has_io_uring)]
+impl<'a> Future for SegmentNext<'a> {
+    type Output = io::Result<Option<RecvSegment<'a>>>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_state(|driver, executor| {
+            let conn = self.conn_index;
+            let idx = conn as usize;
+
+            // Stale reader (slot closed-then-reused for a different connection):
+            // surface EOF so the caller's `while let Some` loop terminates rather
+            // than reading the new occupant's held buffers.
+            if driver.connections.generation(conn) != self.generation {
+                return Poll::Ready(Ok(None));
+            }
+
+            // One live pinned segment per connection at a time. A *single* reader
+            // is kept sound by `&mut self` (a live `RecvSegment` borrows the reader
+            // exclusively, so `next` cannot be called again). But `segments()`
+            // takes `&self`, so a second concurrent `SegmentReader` on the same
+            // connection could reach here with the pin slot already occupied —
+            // overwriting it would orphan the first segment's bid (a ring leak).
+            // Refuse rather than leak: surface the misuse as an error instead of
+            // handing out a second pinned segment.
+            if driver.segment_pinned[idx].is_some() {
+                return Poll::Ready(Err(io::Error::other(
+                    "a segmented-recv segment is already checked out — only one \
+                     SegmentReader/RecvSegment may be live per connection at a time",
+                )));
+            }
+
+            // A held buffer is available: hand it to a `RecvSegment`.
+            if let Some(held) = driver.segment_hold[idx].pop_front() {
+                match held {
+                    crate::backend::HeldRecvBuf::Pinned { bid, len } => {
+                        // Zero-copy: check the bid out into the (guaranteed-empty)
+                        // pin slot; the segment's Drop / into_owned releases it
+                        // exactly once.
+                        driver.segment_pinned[idx] =
+                            Some(crate::backend::HeldRecvBuf::Pinned { bid, len });
+                        return Poll::Ready(Ok(Some(RecvSegment {
+                            conn_index: conn,
+                            generation: self.generation,
+                            backing: SegBacking::Pinned { bid, len },
+                            _borrow: PhantomData,
+                            _not_send: PhantomData,
+                        })));
+                    }
+                    crate::backend::HeldRecvBuf::Owned(bytes) => {
+                        // Force-copied at delivery: no pin slot involved; the
+                        // owned segment's Drop is a no-op.
+                        return Poll::Ready(Ok(Some(RecvSegment {
+                            conn_index: conn,
+                            generation: self.generation,
+                            backing: SegBacking::Owned(bytes),
+                            _borrow: PhantomData,
+                            _not_send: PhantomData,
+                        })));
+                    }
+                }
+            }
+
+            // Hold empty. If the recv side is closed (peer FIN), this is EOF.
+            let is_closed = driver
+                .connections
+                .get(conn)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+            if is_closed {
+                return Poll::Ready(Ok(None));
+            }
+
+            // Open and nothing held yet — park as a recv waiter. `handle_recv_multi`
+            // pushes into `segment_hold` and calls `wake_recv` on the next arrival.
+            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[idx] = true;
+            Poll::Pending
+        })
+    }
+}
+
+/// A single received provided buffer, borrowed zero-copy from the ring.
+///
+/// Yielded by [`SegmentReader::next`]. Derefs to the received bytes (`&[u8]`).
+/// The backing buffer stays pinned in the provided-buffer ring for the segment's
+/// whole lifetime — its bid is **not** replenished until the segment is dropped
+/// (or the connection closes). By construction it is:
+///
+/// - **`!Send` / `!Sync`** (`PhantomData<*const ()>`): a provided buffer is
+///   thread-affine and released only by its owning worker's driver.
+/// - **`!Clone` / non-`Copy`**: exactly one release per bid; a clone would
+///   double-replenish or leak.
+/// - **borrow-scoped** (`&'a mut` the reader): it cannot escape the async scope,
+///   so the "holdable ⇒ copied-at-delivery" invariant holds structurally. To
+///   *keep* the bytes past the scope, [`into_owned()`](Self::into_owned) copies
+///   (Mode C); there is no zero-copy retain.
+///
+/// # Drop / release soundness
+///
+/// A segment's `Drop` does **not** always run inside an executor poll: a parked
+/// task holding a segment can be dropped by a close/EOF CQE handled in the
+/// *unguarded* `drain_completions` (where `CURRENT_DRIVER` is `None`). So `Drop`
+/// uses [`try_with_state`]: when the driver is reachable it replenishes the bid
+/// and clears the driver's pin slot; when it is not, it no-ops and
+/// `close_connection` reclaims the pinned bid instead. The driver pin slot
+/// (`segment_pinned[conn]`) is the single-release discriminant — whoever `take()`s
+/// it first replenishes, so the bid is returned exactly once across the
+/// drop/close race and any slot-reuse.
+#[cfg(has_io_uring)]
+pub struct RecvSegment<'a> {
+    conn_index: u32,
+    generation: u32,
+    /// Where this segment's bytes live: a pinned provided buffer (zero-copy,
+    /// released via the driver pin slot on drop/`into_owned`) or an owned copy
+    /// (force-copied at delivery under ring pressure; its bid was already
+    /// replenished, so drop/`into_owned` touch no ring state).
+    backing: SegBacking,
+    _borrow: PhantomData<&'a mut ()>,
+    _not_send: PhantomData<*const ()>,
+}
+
+/// Backing store for a [`RecvSegment`] — one of the two segmented-recv
+/// deliveries (see `docs/segmented-recv-design.md`, "Backpressure and ring
+/// safety").
+#[cfg(has_io_uring)]
+enum SegBacking {
+    /// A provided buffer pinned in the ring. The bid is released exactly once via
+    /// the driver pin slot (`segment_pinned[conn]`) on drop or `into_owned`.
+    Pinned { bid: u16, len: u32 },
+    /// An owned copy of the received bytes. The bid was replenished at delivery,
+    /// so this segment pins nothing: drop is a no-op and `into_owned` just hands
+    /// back the bytes.
+    Owned(Bytes),
+}
+
+#[cfg(has_io_uring)]
+impl RecvSegment<'_> {
+    /// The number of received bytes in this segment.
+    pub fn len(&self) -> usize {
+        match &self.backing {
+            SegBacking::Pinned { len, .. } => *len as usize,
+            SegBacking::Owned(b) => b.len(),
+        }
+    }
+
+    /// Whether this segment carries no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copy this segment's bytes into an owned heap [`Bytes`] and release the
+    /// pinned provided buffer (Mode C — "Own"; see `docs/segmented-recv-design.md`).
+    /// Consumes the segment.
+    ///
+    /// This is a **real copy**, not an alias: the returned `Bytes` owns freshly
+    /// allocated heap memory with no release-on-drop tie to the ring, so it is
+    /// freely `Send`, `Clone`, and holdable past the connection's lifetime —
+    /// unlike the borrowed [`RecvSegment`], which cannot escape the runtime. This
+    /// is the same single copy the accumulator path pays today. (Deliberately
+    /// *not* `Bytes::from_owner` over the provided buffer — that would keep the
+    /// bid pinned, which Mode C exists to avoid.)
+    ///
+    /// # Release-exactly-once
+    ///
+    /// The copy is taken first (INC ordering: copy-before-replenish, no await
+    /// between), then this method `take()`s the driver pin slot
+    /// (`segment_pinned[conn]`, the single-release discriminant — the **same**
+    /// guard as [`RecvSegment::drop`]) and queues the bid for replenish. Because
+    /// `self` is consumed by value, its `Drop` runs at the end of this method and
+    /// finds the pin slot already `None` (or holding a different bid, after a
+    /// slot reuse) → it no-ops. So the bid is replenished **exactly once**: here.
+    // Consumes `self` by design: the conversion *is* the release (it `take()`s the
+    // pin slot), so a `&self` signature would be unsound — the borrow would leave
+    // the bid pinned and let `Drop` also try to release it. Named `into_owned`
+    // (not `to_owned`) because it consumes: `into_*` is the by-value convention.
+    pub fn into_owned(self) -> Bytes {
+        match &self.backing {
+            SegBacking::Owned(b) => {
+                // Already owned (force-copied at delivery): no pin to release. The
+                // clone is an O(1) refcount bump; `self`'s `Drop` no-ops for Owned.
+                b.clone()
+            }
+            SegBacking::Pinned { bid, len } => {
+                let (bid, len) = (*bid, *len);
+                // Copy before replenish (INC template), no await between.
+                let owned = with_state(|driver, _executor| {
+                    let (ptr, _) = driver.provided_bufs.get_buffer(bid);
+                    // SAFETY: the bid is pinned (not yet replenished) and `len`
+                    // bytes were received into its backing buffer.
+                    let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                    Bytes::copy_from_slice(slice)
+                });
+                // Release the pin — identical guard to `Drop`; `take()` is the
+                // single release. Uses `try_with_state` for the same reason `Drop`
+                // does (this normally runs in-poll, but staying symmetric keeps it
+                // panic-free).
+                try_with_state(|driver, _executor| {
+                    if driver.connections.generation(self.conn_index) != self.generation {
+                        return;
+                    }
+                    match driver.segment_pinned[self.conn_index as usize] {
+                        Some(crate::backend::HeldRecvBuf::Pinned {
+                            bid: pinned_bid, ..
+                        }) if pinned_bid == bid => {
+                            driver.segment_pinned[self.conn_index as usize] = None;
+                            driver.pending_replenish.push(bid);
+                        }
+                        _ => {}
+                    }
+                });
+                owned
+            }
+        }
+        // `self` drops here: for Pinned the pin slot is now `None` (or holds a
+        // different bid after a slot reuse) → `Drop` no-ops; for Owned, `Drop` is
+        // inherently a no-op. Exactly one replenish either way.
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Deref for RecvSegment<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match &self.backing {
+            // Owned bytes (force-copied at delivery) — borrow them directly.
+            SegBacking::Owned(b) => &b[..],
+            SegBacking::Pinned { bid, len } => {
+                // The buffer is pinned in the ring (bid not replenished) for this
+                // segment's lifetime, so the pointer is valid and `len <= buf cap`.
+                let ptr = with_state(|driver, _executor| driver.provided_bufs.get_buffer(*bid).0);
+                // SAFETY: `ptr` points into the provided-buffer backing for `bid`,
+                // which stays pinned until this segment drops; `len` bytes were
+                // received into it. The returned slice borrows `self`, so it
+                // cannot outlive the pin.
+                unsafe { std::slice::from_raw_parts(ptr, *len as usize) }
+            }
+        }
+    }
+}
+
+#[cfg(has_io_uring)]
+impl Drop for RecvSegment<'_> {
+    fn drop(&mut self) {
+        // Owned segments (force-copied at delivery) pin nothing: the bid was
+        // already replenished, so there is nothing to release — just drop the
+        // owned `Bytes`. Only the pinned backing touches the ring.
+        let bid = match &self.backing {
+            SegBacking::Pinned { bid, .. } => *bid,
+            SegBacking::Owned(_) => return,
+        };
+        // May run inside a poll (driver reachable) or in the unguarded
+        // `drain_completions` while a parked task is torn down (driver == None).
+        try_with_state(|driver, _executor| {
+            // Slot recycled to a new connection: the bid was already replenished
+            // by the old occupant's `close_connection`. Do nothing.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
+            // Reclaim only if the pin slot still holds *this* segment's buffer.
+            // If `close_connection` already drained it (None), or it somehow holds
+            // a different bid, do not replenish — that avoids the drop/close
+            // double-replenish. `take()` makes this the single release.
+            match driver.segment_pinned[self.conn_index as usize] {
+                Some(crate::backend::HeldRecvBuf::Pinned {
+                    bid: pinned_bid, ..
+                }) if pinned_bid == bid => {
+                    driver.segment_pinned[self.conn_index as usize] = None;
+                    driver.pending_replenish.push(bid);
+                }
+                _ => {}
+            }
+        });
+        // When `try_with_state` returned `None` (unguarded drop), the bid stays
+        // pinned and `close_connection` replenishes it — still exactly once.
+    }
+}
+
+// ── Segmented recv (Mode C — Own, copy-at-delivery) ──────────────────
+
+/// Future returned by [`ConnCtx::recv_owned_segment`]. Copies each arriving
+/// provided buffer into an owned [`Bytes`] and replenishes its bid at delivery,
+/// so it never pins the ring (the ring-safe owned-delivery path).
+#[cfg(has_io_uring)]
+pub struct RecvOwnedSegment {
+    conn_index: u32,
+    generation: u32,
+}
+
+#[cfg(has_io_uring)]
+impl Future for RecvOwnedSegment {
+    type Output = io::Result<Option<Bytes>>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_state(|driver, executor| {
+            let conn = self.conn_index;
+            let idx = conn as usize;
+
+            // Stale handle (slot closed-then-reused): surface EOF rather than
+            // reading the new occupant's held buffers.
+            if driver.connections.generation(conn) != self.generation {
+                return Poll::Ready(Ok(None));
+            }
+
+            // A held buffer is available: COPY it into an owned `Bytes` and
+            // replenish the bid immediately. The copy is the release — this path
+            // never touches `segment_pinned`, so it can never deplete the ring by
+            // holding. (INC ordering: copy-before-replenish, no await between.)
+            if let Some(held) = driver.segment_hold[idx].pop_front() {
+                match held {
+                    crate::backend::HeldRecvBuf::Pinned { bid, len } => {
+                        let (ptr, _) = driver.provided_bufs.get_buffer(bid);
+                        // SAFETY: `bid` is held (not yet replenished), and `len`
+                        // bytes were received into its backing buffer. The slice is
+                        // consumed by the copy below before `driver` is mutated.
+                        let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                        let owned = Bytes::copy_from_slice(slice);
+                        driver.pending_replenish.push(bid);
+                        return Poll::Ready(Ok(Some(owned)));
+                    }
+                    crate::backend::HeldRecvBuf::Owned(bytes) => {
+                        // Already owned (force-copied at delivery): its bid was
+                        // replenished at delivery, so just hand back the bytes.
+                        return Poll::Ready(Ok(Some(bytes)));
+                    }
+                }
+            }
+
+            // Hold empty. If the recv side is closed (peer FIN), this is EOF.
+            let is_closed = driver
+                .connections
+                .get(conn)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+            if is_closed {
+                return Poll::Ready(Ok(None));
+            }
+
+            // Open and nothing held yet — park as a recv waiter, resumed by
+            // `handle_recv_multi`'s `wake_recv` on the next arrival.
+            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[idx] = true;
+            Poll::Pending
+        })
+    }
+}
+
+// ── Segmented recv (Mode A — Forward to an fd) ───────────────────────
+
+/// A non-raw sink descriptor for [`ConnCtx::forward_to`] (Mode A — "Forward";
+/// see `docs/segmented-recv-design.md`).
+///
+/// Wraps a [`BorrowedFd`] so the descriptor is guaranteed open for the forward's
+/// lifetime — deliberately **not** a bare [`RawFd`] the caller could close
+/// mid-forward, which would be a use-after-close (an in-flight write landing on a
+/// recycled fd; generation guards ring *slots*, not caller fds). The
+/// [`forward_to`](ConnCtx::forward_to) future borrows the `SinkFd`, so the borrow
+/// checker keeps the fd alive until the forward resolves.
+///
+/// Two sink kinds are supported for **zero userspace copy**:
+/// - [`socket`](Self::socket): a stream socket (zero-copy proxy).
+/// - [`file`](Self::file): a **buffered** regular file (`pwrite` at offset).
+///
+/// `O_DIRECT` / NVMe sinks are **not** supported for zero-copy (provided buffers
+/// are unaligned) and are rejected by [`file`](Self::file).
+#[cfg(has_io_uring)]
+#[derive(Debug)]
+pub struct SinkFd<'a> {
+    fd: RawFd,
+    /// Seekable buffered file (`pwrite` at an advancing offset) vs. stream socket
+    /// (`send` with `MSG_WAITALL`, no offset).
+    is_file: bool,
+    /// Ties this handle to the borrowed descriptor's lifetime.
+    _borrow: PhantomData<BorrowedFd<'a>>,
+}
+
+#[cfg(has_io_uring)]
+impl<'a> SinkFd<'a> {
+    /// A **socket** sink (zero-copy proxy). Forwarded bytes are written with
+    /// `send`(`MSG_WAITALL`), so the kernel retries short stream sends in place.
+    pub fn socket(fd: BorrowedFd<'a>) -> Self {
+        SinkFd {
+            fd: fd.as_raw_fd(),
+            is_file: false,
+            _borrow: PhantomData,
+        }
+    }
+
+    /// A **buffered file** sink. Forwarded bytes are written with `pwrite` at an
+    /// offset that advances from 0 as bytes are forwarded; short writes resubmit
+    /// the remainder at the advanced offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if the descriptor was opened with
+    /// `O_DIRECT`: zero-copy forwarding requires buffered I/O because provided
+    /// recv buffers are mid-ring, unaligned, and unregistered — `O_DIRECT`'s
+    /// alignment contract cannot be met without an intermediate aligned copy,
+    /// which defeats the purpose. Use a buffered file (or copy the bytes out via
+    /// Mode C).
+    pub fn file(fd: BorrowedFd<'a>) -> io::Result<Self> {
+        let raw = fd.as_raw_fd();
+        // Reject O_DIRECT: unaligned provided buffers cannot be its source.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::O_DIRECT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "O_DIRECT sink is not supported for zero-copy forward (provided \
+                 buffers are unaligned); use a buffered file",
+            ));
+        }
+        Ok(SinkFd {
+            fd: raw,
+            is_file: true,
+            _borrow: PhantomData,
+        })
+    }
+}
+
+/// Future returned by [`ConnCtx::forward_to`]. Drives the recv/write interleave
+/// that forwards `len` received bytes to the sink, one serialized write at a
+/// time. Borrows the [`SinkFd`] (`'a`) so the sink descriptor stays open for the
+/// whole forward.
+#[cfg(has_io_uring)]
+pub struct ForwardToFuture<'a> {
+    conn_index: u32,
+    generation: u32,
+    /// Total bytes to forward.
+    len: u64,
+    /// Bytes whose write has completed.
+    forwarded: u64,
+    /// Sink descriptor (borrowed via `SinkFd` for `'a`).
+    sink_fd: RawFd,
+    /// File sink (`pwrite` at `forwarded` as the offset) vs. socket sink.
+    is_file: bool,
+    _sink: PhantomData<&'a SinkFd<'a>>,
+}
+
+#[cfg(has_io_uring)]
+impl Future for ForwardToFuture<'_> {
+    type Output = io::Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        with_state(|driver, executor| {
+            let conn = me.conn_index;
+            let idx = conn as usize;
+            // Single pass: consume any completed write, then either park (write in
+            // flight / awaiting data), resolve (done / EOF / stale), or start the
+            // next write. No loop — each poll makes exactly one transition.
+            {
+                // Stale handle (slot closed/reused): the driver already released
+                // any held/in-flight backing on close. Resolve with what we sent.
+                if driver.connections.generation(conn) != me.generation {
+                    return Poll::Ready(Ok(me.forwarded as usize));
+                }
+
+                // Consume a completed write result (set by `handle_forward_write`).
+                if let Some(res) = driver.forward_done[idx].take() {
+                    match res {
+                        Ok(n) => me.forwarded += n as u64,
+                        Err(errno) => {
+                            let _ = driver.settle_forward_end(conn);
+                            return Poll::Ready(Err(io::Error::from_raw_os_error(errno)));
+                        }
+                    }
+                }
+
+                // A write is still in flight — one at a time. Park for its CQE.
+                if driver.forward_write[idx].is_some() {
+                    executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                    executor.recv_waiters[idx] = true;
+                    return Poll::Pending;
+                }
+
+                // Done: forwarded the requested length. Settle carried-over bytes
+                // (received past `len`) into the accumulator and reset the domain.
+                if me.forwarded >= me.len {
+                    if !driver.settle_forward_end(conn) {
+                        executor.wake_recv(conn);
+                        driver.close_connection(conn);
+                        return Poll::Ready(Err(io::Error::other(
+                            "recv accumulator overflow settling forward tail",
+                        )));
+                    }
+                    return Poll::Ready(Ok(me.forwarded as usize));
+                }
+
+                // Start the next write from a held buffer, if any.
+                if let Some(held) = driver.segment_hold[idx].pop_front() {
+                    let remaining = me.len - me.forwarded;
+                    // Determine the prefix to forward and stash any overshoot
+                    // suffix (bytes past `len`) at the front of the accumulator.
+                    let started = match held {
+                        crate::backend::HeldRecvBuf::Pinned { bid, len } => {
+                            if (len as u64) <= remaining {
+                                Some((crate::backend::HeldRecvBuf::Pinned { bid, len }, len))
+                            } else {
+                                let chunk = remaining as u32;
+                                let (ptr, _) = driver.provided_bufs.get_buffer(bid);
+                                // SAFETY: `bid` is pinned (unreplenished) and `len`
+                                // bytes were received into it; the suffix slice
+                                // `[chunk..len]` is valid and copied out now.
+                                let suffix = unsafe {
+                                    std::slice::from_raw_parts(
+                                        ptr.add(chunk as usize),
+                                        (len - chunk) as usize,
+                                    )
+                                };
+                                if !driver.accumulators.append(conn, suffix) {
+                                    driver.pending_replenish.push(bid);
+                                    executor.wake_recv(conn);
+                                    driver.close_connection(conn);
+                                    return Poll::Ready(Err(io::Error::other(
+                                        "recv accumulator overflow stashing forward tail",
+                                    )));
+                                }
+                                Some((
+                                    crate::backend::HeldRecvBuf::Pinned { bid, len: chunk },
+                                    chunk,
+                                ))
+                            }
+                        }
+                        crate::backend::HeldRecvBuf::Owned(bytes) => {
+                            if (bytes.len() as u64) <= remaining {
+                                let total = bytes.len() as u32;
+                                Some((crate::backend::HeldRecvBuf::Owned(bytes), total))
+                            } else {
+                                let chunk = remaining as usize;
+                                let overflow = !driver.accumulators.append(conn, &bytes[chunk..]);
+                                if overflow {
+                                    executor.wake_recv(conn);
+                                    driver.close_connection(conn);
+                                    return Poll::Ready(Err(io::Error::other(
+                                        "recv accumulator overflow stashing forward tail",
+                                    )));
+                                }
+                                let prefix = bytes.slice(0..chunk);
+                                Some((crate::backend::HeldRecvBuf::Owned(prefix), chunk as u32))
+                            }
+                        }
+                    };
+                    let (backing, total) = started.expect("started set on both arms");
+                    let base_offset = if me.is_file { me.forwarded } else { 0 };
+                    match driver.start_forward_write(
+                        conn,
+                        backing,
+                        total,
+                        base_offset,
+                        me.sink_fd,
+                        me.is_file,
+                    ) {
+                        Ok(()) => {
+                            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                            executor.recv_waiters[idx] = true;
+                            return Poll::Pending;
+                        }
+                        Err(e) => {
+                            let _ = driver.settle_forward_end(conn);
+                            return Poll::Ready(Err(e));
+                        }
+                    }
+                }
+
+                // Hold empty. If the recv side is closed (peer FIN), the forward is
+                // truncated — resolve with what we managed to forward.
+                let is_closed = driver
+                    .connections
+                    .get(conn)
+                    .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                    .unwrap_or(true);
+                if is_closed {
+                    let _ = driver.settle_forward_end(conn);
+                    return Poll::Ready(Ok(me.forwarded as usize));
+                }
+
+                // Open and nothing held — park for the next arrival (`wake_recv`).
+                executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                executor.recv_waiters[idx] = true;
+                Poll::Pending
+            }
+        })
+    }
+}
+
+// ── Segmented recv (Mode B — Borrow, B1 callback face) ───────────────
+
+/// Bytes a [`with_segments`](ConnCtx::with_segments) callback consumed from the
+/// **front** of the presented [`SegChain`].
+///
+/// This is deliberately *not* [`ParseResult`]: `with_segments` re-presents
+/// carried-over bytes bounded by ring depth, so the only signal it needs is
+/// "how many front bytes did you take". `SegConsumed(0)` is the "need a bigger
+/// frame" case (the runtime gathers the chain to the accumulator and parks).
+#[cfg(has_io_uring)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegConsumed(pub usize);
+
+/// An ordered, borrowed view of a connection's buffered recv data, handed to a
+/// [`with_segments`](ConnCtx::with_segments) callback.
+///
+/// The chain presents, **in order**, the accumulator remainder (if any) as the
+/// leading segment followed by each held provided buffer in arrival order — so a
+/// consumer walking [`iter`](Self::iter) never sees a later byte before an
+/// earlier one. The slices borrow driver-internal memory for the callback's
+/// duration only; they cannot escape (lifetime `'a`, like `with_data`).
+#[cfg(has_io_uring)]
+pub struct SegChain<'a> {
+    /// Ordered borrowed segments: accumulator-first, then held buffers.
+    segs: &'a [&'a [u8]],
+}
+
+#[cfg(has_io_uring)]
+impl<'a> SegChain<'a> {
+    /// Iterate the segments in order (accumulator remainder first, then held
+    /// provided buffers in arrival order).
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.segs.iter().copied()
+    }
+
+    /// Total number of bytes across all segments.
+    pub fn total_len(&self) -> usize {
+        self.segs.iter().map(|s| s.len()).sum()
+    }
+}
+
+/// By-value record of a held segment, captured during gather so the settle step
+/// can run after the borrowed [`SegChain`] slices are released. `Pinned` carries
+/// the bid+len so the remainder can be re-read from the (still-pinned) provided
+/// buffer and the bid replenished; `Owned` carries the bytes themselves (an O(1)
+/// refcount clone of the held copy), which keep the remainder alive after the
+/// hold is cleared and need no replenish.
+#[cfg(has_io_uring)]
+enum SegSettle {
+    Pinned { bid: u16, len: usize },
+    Owned(Bytes),
+}
+
+/// Future returned by [`ConnCtx::with_segments`]. Resolves to the total bytes
+/// the callback consumed this call (`Ok(0)` at EOF / on a stale handle).
+#[cfg(has_io_uring)]
+pub struct WithSegmentsFuture<F> {
+    conn_index: u32,
+    /// See `WithDataFuture` for the role of `generation`.
+    generation: u32,
+    f: Option<F>,
+}
+
+#[cfg(has_io_uring)]
+impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFuture<F> {
+    type Output = io::Result<usize>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_state(|driver, executor| {
+            let conn = self.conn_index;
+            let idx = conn as usize;
+
+            // Stale future (slot closed-then-reused): surface EOF so the caller's
+            // read loop terminates rather than reading the new occupant's data.
+            if driver.connections.generation(conn) != self.generation {
+                self.f.take();
+                return Poll::Ready(Ok(0));
+            }
+
+            // Flush a leftover single-buffer zero-copy recv (from a pre-`segments`
+            // `with_data` cycle on this slot) into the accumulator so it is
+            // presented accumulator-first, in order, ahead of any held buffers.
+            if let Some(pending) = driver.pending_recv_bufs[idx].take() {
+                let pending_data =
+                    unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                // Intermediate buffer shuffle: on breach the authoritative cap
+                // check below (during settle) closes the connection.
+                let _ = driver.accumulators.append(conn, pending_data);
+                driver.pending_replenish.push(pending.bid);
+            }
+
+            // Nothing to present yet?
+            let acc_empty = driver.accumulators.is_empty(conn);
+            let hold_empty = driver.segment_hold[idx].is_empty();
+            if acc_empty && hold_empty {
+                let is_closed = driver
+                    .connections
+                    .get(conn)
+                    .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                    .unwrap_or(true);
+                if is_closed {
+                    self.f.take();
+                    return Poll::Ready(Ok(0));
+                }
+                // Open + nothing buffered → park; `handle_recv_multi` holds a
+                // buffer and calls `wake_recv` on the next arrival.
+                executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+                executor.recv_waiters[idx] = true;
+                return Poll::Pending;
+            }
+
+            // Gather the ordered borrowed view: accumulator remainder first, then
+            // each held provided buffer. `held_meta` records (bid, len) by value so
+            // the settle below can run after the borrows are released.
+            let hold_len = driver.segment_hold[idx].len();
+            let mut slices: Vec<&[u8]> = Vec::with_capacity(1 + hold_len);
+            let mut held_meta: Vec<SegSettle> = Vec::with_capacity(hold_len);
+            let acc = driver.accumulators.data(conn);
+            let acc_len = acc.len();
+            if !acc.is_empty() {
+                slices.push(acc);
+            }
+            for held in &driver.segment_hold[idx] {
+                match held {
+                    crate::backend::HeldRecvBuf::Pinned { bid, len } => {
+                        // `get_buffer` returns a raw pointer (no borrow tie), so the
+                        // held slice does not alias the `provided_bufs` field borrow.
+                        let (ptr, _) = driver.provided_bufs.get_buffer(*bid);
+                        let s = unsafe { std::slice::from_raw_parts(ptr, *len as usize) };
+                        slices.push(s);
+                        held_meta.push(SegSettle::Pinned {
+                            bid: *bid,
+                            len: *len as usize,
+                        });
+                    }
+                    crate::backend::HeldRecvBuf::Owned(b) => {
+                        // Borrow the owned bytes for the chain; keep an O(1)
+                        // refcount clone in `held_meta` so the remainder survives
+                        // the `segment_hold.clear()` below (which drops the
+                        // original).
+                        slices.push(&b[..]);
+                        held_meta.push(SegSettle::Owned(b.clone()));
+                    }
+                }
+            }
+
+            // Present to the callback; clamp its answer to what we actually showed.
+            let consumed = {
+                let chain = SegChain { segs: &slices };
+                let total = chain.total_len();
+                let f = self
+                    .f
+                    .as_mut()
+                    .expect("WithSegmentsFuture polled after Ready");
+                let SegConsumed(c) = f(&chain);
+                c.min(total)
+            };
+            // Release the accumulator/provided-buffer borrows before mutating.
+            drop(slices);
+
+            // ── Settle ──────────────────────────────────────────────────────
+            // All held buffers are being resolved this call, so drain the hold up
+            // front; each bid is either replenished (consumed) or gathered +
+            // replenished (remainder). Net: hold empties, un-consumed bytes live
+            // contiguously at the accumulator front, in order.
+            driver.segment_hold[idx].clear();
+
+            let mut rem_n = consumed;
+            // (1) Consume from the accumulator front (O(1) advance). If only part
+            // of the accumulator was consumed, `rem_n` is now 0 and every held
+            // buffer is untouched → gathered behind the accumulator remainder.
+            let acc_consumed = rem_n.min(acc_len);
+            driver.accumulators.consume(conn, acc_consumed);
+            rem_n -= acc_consumed;
+
+            // (2) Walk the held buffers in order.
+            let mut overflowed = false;
+            for meta in held_meta {
+                match meta {
+                    SegSettle::Pinned { bid, len } => {
+                        if rem_n >= len {
+                            // Wholly consumed by the callback — just replenish.
+                            rem_n -= len;
+                            driver.pending_replenish.push(bid);
+                        } else {
+                            // Partially consumed (or untouched, when rem_n == 0):
+                            // copy the unconsumed remainder [rem_n..len] into the
+                            // accumulator, in order, then replenish. Push the bid
+                            // even on breach so it is never leaked.
+                            if !overflowed {
+                                let (ptr, _) = driver.provided_bufs.get_buffer(bid);
+                                let remainder = unsafe {
+                                    std::slice::from_raw_parts(ptr.add(rem_n), len - rem_n)
+                                };
+                                if !driver.accumulators.append(conn, remainder) {
+                                    overflowed = true;
+                                }
+                            }
+                            rem_n = 0;
+                            driver.pending_replenish.push(bid);
+                        }
+                    }
+                    SegSettle::Owned(bytes) => {
+                        let len = bytes.len();
+                        if rem_n >= len {
+                            // Wholly consumed; the bid was replenished at delivery,
+                            // so there is nothing to return to the ring here.
+                            rem_n -= len;
+                        } else {
+                            // Copy the unconsumed remainder into the accumulator,
+                            // in order. No replenish (owned copy holds no bid).
+                            if !overflowed && !driver.accumulators.append(conn, &bytes[rem_n..]) {
+                                overflowed = true;
+                            }
+                            rem_n = 0;
+                        }
+                    }
+                }
+            }
+
+            if overflowed {
+                // The under-drain gather streamed past `recv_accumulator_max`
+                // (a misbehaving whole-frame consumer). Close rather than OOM;
+                // held bids were already queued for replenish above.
+                self.f.take();
+                driver.close_connection(conn);
+                return Poll::Ready(Ok(0));
+            }
+
+            if consumed > 0 {
+                // Progress made — return it. Any carried-over remainder now sits at
+                // the accumulator front and is re-presented next call.
+                self.f.take();
+                return Poll::Ready(Ok(consumed));
+            }
+
+            // consumed == 0 (need a bigger frame): everything is gathered to the
+            // accumulator. Park for more data (bounded by recv_accumulator_max),
+            // or surface EOF if the recv side already closed. This mirrors
+            // `with_data`'s NeedMore idiom — never a busy loop.
+            let is_closed = driver
+                .connections
+                .get(conn)
+                .map(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+                .unwrap_or(true);
+            if is_closed {
+                self.f.take();
+                return Poll::Ready(Ok(0));
+            }
+            executor.owner_task[idx] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.recv_waiters[idx] = true;
             Poll::Pending
         })
     }

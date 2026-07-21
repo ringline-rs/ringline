@@ -23,6 +23,11 @@ pub struct ProvidedBufRing {
     tail: u16,
     /// Mask for ring index wrapping.
     mask: u16,
+    /// Buffers handed out to a completion (kernel-selected) and not yet
+    /// replenished. `ring_size - outstanding` buffers are free in the ring for
+    /// the kernel to pick. Maintained by `on_handout` (at recv completion) and
+    /// `replenish_batch` (on return). Backpressure decisions read `free()`.
+    outstanding: u32,
 }
 
 /// An io_uring buf_ring entry (matches kernel struct io_uring_buf).
@@ -72,6 +77,7 @@ impl ProvidedBufRing {
             buf_size,
             tail: 0,
             mask: ring_size - 1,
+            outstanding: 0,
         };
 
         // Pre-fill the ring with all buffers
@@ -99,6 +105,33 @@ impl ProvidedBufRing {
         self.ring_size as u32
     }
 
+    /// Record that the kernel handed one buffer to a completion (consumed one
+    /// from the ring). Call exactly once per recv completion that selected a
+    /// buffer, before it is processed.
+    ///
+    /// Wired at every main-ring `buffer_select` in the recv completion handlers;
+    /// balanced against `replenish_batch`. The `outstanding <= ring_size`
+    /// assertion is exercised end-to-end by the recv test suite.
+    #[inline]
+    pub fn on_handout(&mut self) {
+        self.outstanding += 1;
+        debug_assert!(
+            self.outstanding <= self.ring_size as u32,
+            "provided-ring handout exceeds ring size ({} > {})",
+            self.outstanding,
+            self.ring_size
+        );
+    }
+
+    /// Buffers currently available in the ring for the kernel to select.
+    ///
+    /// Consumed by the segmented-recv low-water reserve (the hold branch in
+    /// `handle_recv_multi` via `recv::occupancy::delivery_decision`).
+    #[inline]
+    pub fn free(&self) -> u32 {
+        self.ring_entries().saturating_sub(self.outstanding)
+    }
+
     /// Get a pointer and length for a buffer by its ID.
     pub fn get_buffer(&self, bid: u16) -> (*const u8, u32) {
         let offset = bid as usize * self.buf_size as usize;
@@ -106,12 +139,25 @@ impl ProvidedBufRing {
         (ptr, self.buf_size)
     }
 
-    /// Batch replenish multiple buffers.
+    /// Batch replenish multiple buffers. Returns them to the ring and accounts
+    /// them against `outstanding` (the sole replenish accounting point).
     pub fn replenish_batch(&mut self, bids: &[u16]) {
         for &bid in bids {
             self.push_entry(bid);
         }
         if !bids.is_empty() {
+            // Tripwire: replenishing more buffers than are outstanding means a bid
+            // was returned to the ring more than once (a double-replenish) — the
+            // recurring failure mode for the zero-copy hold/segment/forward paths.
+            // `saturating_sub` keeps `free()` sane in release; this catches the bug
+            // in debug/tests before it can silently corrupt ring accounting.
+            debug_assert!(
+                self.outstanding >= bids.len() as u32,
+                "double-replenish: returning {} buffers but only {} outstanding",
+                bids.len(),
+                self.outstanding,
+            );
+            self.outstanding = self.outstanding.saturating_sub(bids.len() as u32);
             self.commit_tail();
         }
     }
@@ -165,3 +211,61 @@ impl Drop for ProvidedBufRing {
 
 // Safety: The ring is only accessed from a single worker thread.
 unsafe impl Send for ProvidedBufRing {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn occupancy_tracks_handout_and_replenish() {
+        let mut ring = ProvidedBufRing::new(0, 8, 4096).expect("ring");
+        // All 8 buffers start free (pre-filled), none outstanding.
+        assert_eq!(ring.ring_entries(), 8);
+        assert_eq!(ring.free(), 8);
+
+        // Hand out 3.
+        for _ in 0..3 {
+            ring.on_handout();
+        }
+        assert_eq!(ring.free(), 5);
+
+        // Replenish 2 (bids are arbitrary here; accounting is by count).
+        ring.replenish_batch(&[0, 1]);
+        assert_eq!(ring.free(), 7);
+
+        // Replenish the last outstanding one.
+        ring.replenish_batch(&[2]);
+        assert_eq!(ring.free(), 8);
+    }
+
+    /// Replenishing more than are outstanding is a double-replenish; the debug
+    /// tripwire fires in debug builds (where tests normally run).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "double-replenish")]
+    fn double_replenish_trips_debug_assert() {
+        let mut ring = ProvidedBufRing::new(0, 4, 4096).expect("ring");
+        // Nothing outstanding → returning 3 buffers is a double-replenish.
+        ring.replenish_batch(&[0, 1, 2]);
+    }
+
+    /// In release builds (tripwire compiled out) the `saturating_sub` still keeps
+    /// `free()` from underflowing.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn replenish_saturates_never_underflows() {
+        let mut ring = ProvidedBufRing::new(0, 4, 4096).expect("ring");
+        ring.replenish_batch(&[0, 1, 2]);
+        assert_eq!(ring.free(), 4);
+        assert_eq!(ring.ring_entries(), 4);
+    }
+
+    #[test]
+    fn free_reaches_zero_when_fully_drained() {
+        let mut ring = ProvidedBufRing::new(0, 4, 4096).expect("ring");
+        for _ in 0..4 {
+            ring.on_handout();
+        }
+        assert_eq!(ring.free(), 0);
+    }
+}
