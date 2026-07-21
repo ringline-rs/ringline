@@ -1686,7 +1686,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-memcache"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "bytes",
  "histogram 0.11.5",
@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "ringline-redis"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "bytes",
  "criterion",

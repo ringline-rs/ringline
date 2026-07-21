@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-21
+
+Coordinated minor release (additive — no breaking API changes). Core `ringline` 0.5.2 lands segmented zero-copy recv (Modes A/B/C) + occupancy; `ringline-redis` and `-memcache` 0.6.4 add the streaming/borrow clients (`recv_meta`, `get_stream`/`set_stream`, `OpKind`/`RespMeta`, memcache `get_cas`). Other client crates unchanged since 0.5.1 (`ringline-ping` / `-h2` / `-h3` / `-quic` / `-http` / `-grpc` stay 0.5.2).
+
 ### Added
 
 - `ringline-redis`: streaming GET — `Client::get_stream(key) -> Option<ValueStream>`
