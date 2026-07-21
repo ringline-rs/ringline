@@ -1354,7 +1354,25 @@ impl Client {
                 value_len,
                 user_data: pending.user_data,
             }),
-            Err(e) => Err(e),
+            Err(e) => {
+                // A reply whose first byte is not `$`/`-` (`UnexpectedResponse`)
+                // is only *partially* consumed by the byte-at-a-time header
+                // parse: `parse_get_header`'s catch-all errors on the first byte,
+                // so the rest of the reply is left on the wire. We cannot know
+                // how many bytes to skip for an arbitrary reply type, so the
+                // connection is desynced and MUST NOT be reused — poison it
+                // (close) and clear the pipeline, mirroring `recv()`'s broken-read
+                // path. A genuine server error (`-ERR`/`-WRONGTYPE`,
+                // `Error::Redis`) consumed its whole `\r\n`-terminated line via
+                // the `-` arm, so the wire stays aligned and the connection (and
+                // its remaining pending ops) are still valid — do not poison.
+                if matches!(e, Error::UnexpectedResponse) {
+                    self.conn.close();
+                    self.pending.clear();
+                    self.flushed_count = 0;
+                }
+                Err(e)
+            }
         }
     }
 
@@ -3641,5 +3659,82 @@ mod audit_tests {
         assert!(!Error::Redis("ERR wrong number of arguments".into()).is_transient());
         assert!(!Error::Redis("MOVED 1234 127.0.0.1:7000".into()).is_transient());
         assert!(!Error::Redis("WRONGTYPE Operation against a key".into()).is_transient());
+    }
+}
+
+/// Locks the `parse_get_header` contract that `recv_get_segments`'s poison
+/// decision depends on. The Mode-B state machine feeds the header **one byte at
+/// a time** and stops the instant `parse_get_header` returns non-`Ok(None)`, so:
+///
+/// - An unexpected reply type (`:`/`+`/`*`, …) errors on the **first byte** with
+///   `UnexpectedResponse` — only 1 byte is consumed, the rest of the reply is
+///   left on the wire, and we cannot know how many bytes to skip. The connection
+///   is desynced, so `recv_get_segments` **must poison** it.
+/// - A genuine server error (`-...\r\n`) errors only once the whole `\r\n`-
+///   terminated line is buffered (`Error::Redis`), so the wire stays aligned and
+///   the connection is **reusable** — it must NOT be poisoned.
+///
+/// If this contract ever flips, the poison logic silently evicts healthy
+/// connections (a `-ERR` reported as `UnexpectedResponse`) or, far worse, returns
+/// a desynced connection to the pool (a `:`/`+`/`*` reply reported as `Redis`).
+#[cfg(all(test, has_io_uring))]
+mod get_header_poison_contract_tests {
+    use super::*;
+
+    #[test]
+    fn unexpected_reply_types_error_on_first_byte() {
+        // Desync trigger: the catch-all fires before any CRLF, so only the
+        // leading byte would be consumed. Both the 1-byte prefix and the full
+        // reply must classify as `UnexpectedResponse` → poison.
+        for reply in [
+            &b":"[..],
+            &b":5\r\n"[..],
+            &b"+"[..],
+            &b"+OK\r\n"[..],
+            &b"*"[..],
+            &b"*1\r\n"[..],
+        ] {
+            assert!(
+                matches!(parse_get_header(reply), Err(Error::UnexpectedResponse)),
+                "reply {reply:?} must be UnexpectedResponse (desync → poison)"
+            );
+        }
+    }
+
+    #[test]
+    fn server_error_reply_is_redis_and_waits_for_full_line() {
+        // The `-` arm returns `Ok(None)` until the whole line is buffered, so
+        // the full error line is consumed (wire aligned) before it errors.
+        assert!(matches!(parse_get_header(b"-WRONGTYPE"), Ok(None)));
+        assert!(matches!(
+            parse_get_header(b"-WRONGTYPE Operation\r\n"),
+            Err(Error::Redis(_))
+        ));
+    }
+
+    #[test]
+    fn bulk_and_nil_headers_still_parse() {
+        assert!(matches!(
+            parse_get_header(b"$-1\r\n"),
+            Ok(Some(GetHeader::Nil))
+        ));
+        assert!(matches!(
+            parse_get_header(b"$3\r\n"),
+            Ok(Some(GetHeader::Bulk { len: 3, .. }))
+        ));
+        // Header not yet complete → need more bytes (not an error).
+        assert!(matches!(parse_get_header(b"$3"), Ok(None)));
+    }
+
+    #[test]
+    fn malformed_bulk_length_is_unexpected_not_redis() {
+        // A malformed `$` length is wire-aligned (full `$..\r\n` consumed) but
+        // still classifies as `UnexpectedResponse`; poisoning it is acceptable
+        // (a malformed server reply is exceptional), and it must never be a
+        // reusable `Redis` error.
+        assert!(matches!(
+            parse_get_header(b"$abc\r\n"),
+            Err(Error::UnexpectedResponse)
+        ));
     }
 }

@@ -87,6 +87,12 @@ fn decide(key: &[u8]) -> (Vec<u8>, bool) {
             out.extend_from_slice(SHORT_SENT);
             (out, true)
         }
+        b"borrow:unexpected" => {
+            // A non-`$`/`-` reply type (RESP integer) to a GET. The borrow-GET's
+            // byte-at-a-time header parse errors on the first byte, leaving
+            // `5\r\n` on the wire → the connection is desynced and must poison.
+            (b":5\r\n".to_vec(), false)
+        }
         _ => (b"$-1\r\n".to_vec(), false),
     }
 }
@@ -403,7 +409,10 @@ async fn run_borrow_get(addr: SocketAddr) -> Result<(), String> {
             .await
             .map_err(|e| format!("recv miss: {e}"))?;
         if meta.value_len.is_some() {
-            return Err(format!("borrow miss should be None, got {:?}", meta.value_len));
+            return Err(format!(
+                "borrow miss should be None, got {:?}",
+                meta.value_len
+            ));
         }
     }
 
@@ -465,6 +474,28 @@ async fn run_borrow_get(addr: SocketAddr) -> Result<(), String> {
         }
         if m2.user_data != 12 || m2.value_len != Some(SMALL.len()) {
             return Err(format!("pipe 2 mismatch: {m2:?}"));
+        }
+    }
+
+    // (e) an unexpected reply type (`:`/`+`/`*`) to a borrow-GET is only
+    // partially consumed by the header parse → the connection is desynced and
+    // MUST be poisoned, so the next op on it fails rather than reading the stray
+    // bytes as the head of a bogus reply. (A genuine `-ERR` stays reusable — see
+    // the `get_header_poison_contract_tests` unit tests.)
+    {
+        let mut client = connect(addr).await?;
+        client
+            .fire_get(b"borrow:unexpected", 20)
+            .map_err(|e| format!("fire: {e}"))?;
+        match client.recv_get_discard().await {
+            Ok(m) => return Err(format!("unexpected-reply borrow should Err, got {m:?}")),
+            Err(Error::UnexpectedResponse) => { /* expected */ }
+            Err(e) => return Err(format!("unexpected-reply borrow wrong error: {e}")),
+        }
+        // Poisoned: the next op must fail (stale slot after the close()), not run
+        // on the desynced connection.
+        if client.get(b"stream:small").await.is_ok() {
+            return Err("unexpected-reply borrow: next op unexpectedly succeeded".into());
         }
     }
 
