@@ -3132,7 +3132,7 @@ impl Client {
 
 /// Parsed shape of a GET reply header.
 enum GetHeader {
-    /// `$-1\r\n` — the key does not exist.
+    /// The key does not exist: RESP2 `$-1\r\n` or RESP3 `_\r\n`.
     Nil,
     /// `$<len>\r\n` — a bulk string of `len` value bytes follows (then a trailing
     /// CRLF). `header_len` is the byte length of the `$<len>\r\n` header itself.
@@ -3174,6 +3174,15 @@ fn parse_get_header(buf: &[u8]) -> Result<Option<GetHeader>, Error> {
             let s = std::str::from_utf8(digits).map_err(|_| Error::UnexpectedResponse)?;
             let len: usize = s.parse().map_err(|_| Error::UnexpectedResponse)?;
             Ok(Some(GetHeader::Bulk { len, header_len }))
+        }
+        Some(b'_') => {
+            // RESP3 null (`_\r\n`) — a GET miss on a RESP3 (`HELLO 3`)
+            // connection, where RESP2 would send `$-1\r\n`. Wait for the CRLF
+            // so the drain consumes the full 3-byte frame, then report a miss.
+            if find_crlf(buf).is_none() {
+                return Ok(None);
+            }
+            Ok(Some(GetHeader::Nil))
         }
         Some(b'-') => {
             let Some(cr) = find_crlf(buf) else {
@@ -3995,6 +4004,26 @@ mod audit_tests {
 /// If this contract ever flips, the poison logic silently evicts healthy
 /// connections (a `-ERR` reported as `UnexpectedResponse`) or, far worse, returns
 /// a desynced connection to the pool (a `:`/`+`/`*` reply reported as `Redis`).
+#[cfg(test)]
+mod get_header_resp3_tests {
+    use super::*;
+
+    #[test]
+    fn resp3_null_header_is_a_miss() {
+        // RESP3 GET miss is `_\r\n` (vs RESP2 `$-1\r\n`). It must classify as a
+        // miss, not an `UnexpectedResponse`. `parse_get_header` feeds both the
+        // io_uring and mio GET drains, so this is not io_uring-gated.
+        assert!(matches!(
+            parse_get_header(b"_\r\n"),
+            Ok(Some(GetHeader::Nil))
+        ));
+        // The bare `_` (no CRLF yet) must report "need more bytes" so the drain
+        // loops consume exactly the 3-byte frame — never over-reading into the
+        // next pipelined reply.
+        assert!(matches!(parse_get_header(b"_"), Ok(None)));
+    }
+}
+
 #[cfg(all(test, has_io_uring))]
 mod get_header_poison_contract_tests {
     use super::*;
