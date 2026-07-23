@@ -10,6 +10,11 @@ pub struct SendCopyPool {
     slot_offset: Vec<u32>, // current byte offset within slot (advances on partial send)
     slot_remaining: Vec<u32>, // bytes remaining to send
     in_use: Vec<bool>,     // double-free protection
+    // Whether this slot holds the final chunk of its logical send. A send
+    // larger than one slot is split across several slots; only the last one
+    // is marked, so the send waiter is woken once per logical send rather
+    // than once per chunk. Independent single-slot sends are always final.
+    slot_end_of_send: Vec<bool>,
 }
 
 impl SendCopyPool {
@@ -27,6 +32,7 @@ impl SendCopyPool {
             slot_offset: vec![0u32; n],
             slot_remaining: vec![0u32; n],
             in_use: vec![false; n],
+            slot_end_of_send: vec![true; n],
         }
     }
 
@@ -49,6 +55,7 @@ impl SendCopyPool {
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = data.len() as u32;
         self.in_use[idx as usize] = true;
+        self.slot_end_of_send[idx as usize] = true;
         Some((idx, ptr, data.len() as u32))
     }
 
@@ -83,6 +90,7 @@ impl SendCopyPool {
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = total_len as u32;
         self.in_use[idx as usize] = true;
+        self.slot_end_of_send[idx as usize] = true;
         Some((idx, out_ptr, total_len as u32))
     }
 
@@ -103,6 +111,7 @@ impl SendCopyPool {
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = 0;
         self.in_use[idx as usize] = true;
+        self.slot_end_of_send[idx as usize] = true;
         let ptr = self.backing.as_mut_ptr().wrapping_add(offset);
         Some((idx, ptr, self.slot_size))
     }
@@ -171,6 +180,18 @@ impl SendCopyPool {
         let i = slot as usize;
         debug_assert!(self.in_use[i]);
         self.slot_offset[i] + self.slot_remaining[i]
+    }
+
+    /// Mark whether this slot holds the final chunk of its logical send.
+    /// Defaults to `true` on allocation; `DriverCtx::send` clears it on every
+    /// chunk but the last when a send is split across slots.
+    pub fn set_end_of_send(&mut self, slot: u16, end_of_send: bool) {
+        self.slot_end_of_send[slot as usize] = end_of_send;
+    }
+
+    /// Whether this slot holds the final chunk of its logical send.
+    pub fn is_end_of_send(&self, slot: u16) -> bool {
+        self.slot_end_of_send[slot as usize]
     }
 
     /// Bytes per slot.

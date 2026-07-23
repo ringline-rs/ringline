@@ -1236,12 +1236,21 @@ impl Driver {
         // single-submit path below.
         let coalescable =
             |b: &crate::handler::BuiltSend| b.pool_slot != u16::MAX && b.slab_idx == u16::MAX;
+        // Coalesce at most one logical send's tail per op: stop the run after
+        // the first chunk marked end-of-send. Otherwise a single coalesced
+        // completion could span two independent pipelined sends, and only one
+        // of their two waiters would ever be woken.
         let n = {
-            let q = &self.send_queues[ci].queue;
             let mut n = 0;
             while n < MAX_IOVECS {
-                match q.get(n) {
-                    Some(b) if coalescable(b) => n += 1,
+                match self.send_queues[ci].queue.get(n) {
+                    Some(b) if coalescable(b) => {
+                        let pool_slot = b.pool_slot;
+                        n += 1;
+                        if self.send_copy_pool.is_end_of_send(pool_slot) {
+                            break;
+                        }
+                    }
                     _ => break,
                 }
             }
@@ -1268,12 +1277,19 @@ impl Driver {
                 };
                 total += len;
             }
+            // The coalesced op carries the final chunk of a logical send only
+            // if its last gathered chunk does; the completion handler wakes the
+            // waiter on that.
+            let end_of_send = self.send_copy_pool.is_end_of_send(pool_slots[n - 1]);
             // Only commit to coalescing if the slab has room; otherwise fall
             // through to single-submit (nothing popped yet).
-            if let Some((slab_idx, msg_ptr)) =
-                self.send_slab
-                    .allocate_coalesced(conn_index, &iovecs[..n], &pool_slots[..n], total)
-            {
+            if let Some((slab_idx, msg_ptr)) = self.send_slab.allocate_coalesced(
+                conn_index,
+                &iovecs[..n],
+                &pool_slots[..n],
+                total,
+                end_of_send,
+            ) {
                 for _ in 0..n {
                     self.send_queues[ci].queue.pop_front();
                 }
@@ -1433,6 +1449,9 @@ impl Driver {
             &mut self.send_copy_pool,
         );
         state.in_flight = false;
+        // Abandon any partially-accumulated logical send so the next one
+        // starts from zero.
+        state.acked_bytes = 0;
         // The queue is now empty and nothing is in flight — fire a deferred
         // close if one was pending so the connection can't leak.
         self.try_finalize_close(conn_index);
