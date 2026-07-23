@@ -1708,7 +1708,19 @@ impl Client {
         // happily produced. Use `usize::MAX` — the `RecvAccumulator`'s own
         // capacity is the genuine backstop — and let the server be the
         // authority on what's too large.
-        let options = resp_proto::ParseOptions::new().max_bulk_string_len(usize::MAX);
+        // Also lift the collection caps well above resp-proto's 1024 defaults:
+        // a real server returns arrays far larger than that (a big `LRANGE`,
+        // `FT.SEARCH` with large `k`, an oversized `SCAN` batch), and hitting
+        // the cap surfaces as a protocol error that closes the connection.
+        // Unlike `max_bulk_string_len` (whose bytes must actually arrive, so the
+        // accumulator is the real backstop), array parsing pre-allocates
+        // `Vec::with_capacity(announced_len)`, so this stays a bounded ceiling
+        // rather than `usize::MAX` to keep a hostile length from OOMing.
+        const MAX_COLLECTION: usize = 1 << 20;
+        let options = resp_proto::ParseOptions::new()
+            .max_bulk_string_len(usize::MAX)
+            .max_collection_elements(MAX_COLLECTION)
+            .max_total_items(MAX_COLLECTION);
         let n = self
             .conn
             .with_bytes(|bytes| {
