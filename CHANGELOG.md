@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-07-23
+
+Coordinated release of two `io_uring` correctness fixes surfaced by the cachecannon
+valkey-search harness (cachecannon/cachecannon#116). Core `ringline` 0.5.3 fixes a
+multi-chunk send-completion wake race; `ringline-redis` 0.6.6 lifts the recv-side
+collection cap. Other client crates are unchanged (`ringline-memcache` stays 0.6.4;
+`-ping` / `-h2` / `-h3` / `-quic` / `-http` / `-grpc` stay 0.5.2).
+
+### Fixed
+
+- `ringline` (core): send-completion wake race for a logical send larger than one
+  send-copy pool slot (16 KiB). Such a send is split into several chunks serialized
+  through the per-connection send queue, but a connection has a single send waiter;
+  it was woken on the *first* chunk's completion (a short byte count) and consumed, so
+  the remaining chunks' completions found no waiter and were dropped, hanging a caller
+  awaiting the full logical send. Each logical send's final chunk now carries an
+  `end_of_send` marker and the waiter is woken exactly once, on that completion, with
+  the whole logical byte count — while independent pipelined sends on one connection
+  still each wake with their own count. Timing/kernel-sensitive: deterministic on
+  Linux 6.1 aarch64, masked on 6.12 x86. (#299)
+- `ringline-redis`: `read_value` (behind `Client::cmd` and `Pipeline::execute`) no
+  longer caps array replies at resp-proto's 1024-element default, which surfaced as a
+  `CollectionTooLarge` protocol error that closed the connection on a large `LRANGE`,
+  an `FT.SEARCH` with large `k`, or a `SCAN` batch that overshot `COUNT`. The
+  collection caps are lifted to a bounded `1 << 20` — not `usize::MAX`, since array
+  parsing pre-allocates `Vec::with_capacity(announced_len)`, so an uncapped limit
+  would be an OOM vector on a hostile announced length. (#298)
+
 ## [ringline-redis 0.6.5] - 2026-07-22
 
 Per-crate patch release (`ringline-redis` only; other crates unchanged). Adds
