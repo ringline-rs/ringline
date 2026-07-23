@@ -38,6 +38,18 @@ pub(crate) struct ConnSendState {
     /// `close_pending` is true, the runtime force-closes the connection.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_notify_deadline: Option<std::time::Instant>,
+    /// Bytes acknowledged so far for the in-progress logical send.
+    ///
+    /// A logical send larger than one send-pool slot is split into
+    /// several `BuiltSend` chunks that complete as separate CQEs, but the
+    /// connection has exactly one send waiter. Waking that waiter on the
+    /// first chunk's completion reports a short byte count while the
+    /// remaining chunks are still queued or in flight, and consumes the
+    /// waiter so their completions are dropped. Instead, each chunk's
+    /// completion accumulates here; the waiter is woken exactly once, when
+    /// the send queue fully drains, reporting the whole logical byte count.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub acked_bytes: u32,
 }
 
 impl ConnSendState {
@@ -49,6 +61,7 @@ impl ConnSendState {
             close_pending: false,
             close_send_count: 0,
             close_notify_deadline: None,
+            acked_bytes: 0,
         }
     }
 }
@@ -238,12 +251,18 @@ impl<'a> DriverCtx<'a> {
 
         // Chunk data that exceeds the send copy slot size. Each chunk gets its
         // own pool slot and SQE; the per-connection send queue ensures they are
-        // transmitted in order.
-        for chunk in data.chunks(slot_size) {
+        // transmitted in order. Only the final chunk is marked end-of-send, so
+        // the waiter is woken once for the whole logical send rather than once
+        // per chunk (which would report a short count and, for pipelined sends,
+        // wake the wrong future).
+        let mut chunks = data.chunks(slot_size).peekable();
+        while let Some(chunk) = chunks.next() {
             let (slot, ptr, len) = self
                 .send_copy_pool
                 .copy_in(chunk)
                 .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
+            self.send_copy_pool
+                .set_end_of_send(slot, chunks.peek().is_none());
 
             let user_data = crate::completion::UserData::encode(
                 crate::completion::OpTag::Send,

@@ -1760,8 +1760,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             let total = self.driver.send_copy_pool.original_len(pool_slot);
+            // Read the end-of-send flag before releasing the slot.
+            let end_of_send = self.driver.send_copy_pool.is_end_of_send(pool_slot);
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.driver.send_copy_pool.release(pool_slot);
+
+            // Accumulate this chunk's bytes against the logical send.
+            self.driver.send_queues[conn_index as usize].acked_bytes += total;
 
             // Pop the next queued send (if any) into the kernel,
             // *then* check whether a deferred close should fire —
@@ -1771,8 +1776,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.submit_next_queued(conn_index);
             self.driver.note_send_finalized(conn_index);
 
-            // Wake the send waiter.
-            self.executor.wake_send(conn_index, Ok(total));
+            // Wake the send waiter once, when this logical send's final chunk
+            // completes, reporting its whole byte count. Intermediate chunks of
+            // a multi-slot send only accumulate; waking on one would report a
+            // short count, and pipelined independent sends share this queue so
+            // waking on queue-drain would wake the wrong future.
+            if end_of_send {
+                let acked =
+                    std::mem::take(&mut self.driver.send_queues[conn_index as usize].acked_bytes);
+                self.executor.wake_send(conn_index, Ok(acked));
+            }
             return;
         }
 
@@ -1911,11 +1924,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             // Fully sent.
             let total = self.driver.send_slab.total_len(slab_idx);
+            // Read the end-of-send flag before releasing the slab entry.
+            let end_of_send = self.driver.send_slab.is_end_of_send(slab_idx);
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.release_coalesced(slab_idx);
+
+            // Accumulate these chunks' bytes against the logical send, and wake
+            // the waiter once, when the entry carrying the send's final chunk
+            // completes, reporting the whole logical byte count. See
+            // `ConnSendState::acked_bytes`.
+            self.driver.send_queues[conn_index as usize].acked_bytes += total;
             self.driver.submit_next_queued(conn_index);
             self.driver.note_send_finalized(conn_index);
-            self.executor.wake_send(conn_index, Ok(total));
+            if end_of_send {
+                let acked =
+                    std::mem::take(&mut self.driver.send_queues[conn_index as usize].acked_bytes);
+                self.executor.wake_send(conn_index, Ok(acked));
+            }
             return;
         }
 
@@ -3993,6 +4018,139 @@ mod tests {
             el.executor.io_results[conn_index as usize].is_some(),
             "send result not stored"
         );
+    }
+
+    #[test]
+    fn handle_send_multichunk_wakes_once_with_total() {
+        // A logical send larger than one pool slot is split into several
+        // chunks that complete as separate CQEs, but the connection has a
+        // single send waiter. The waiter must be woken exactly once — when
+        // the whole logical send has drained — reporting the full byte
+        // count, not the first chunk's short count.
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.executor.send_waiters[conn_index as usize] = true;
+
+        // Chunk 0 is in flight; chunk 1 is queued behind it. Distinct sizes
+        // so the summed total can't be mistaken for either chunk alone.
+        let chunk0 = vec![b'a'; 16384];
+        let chunk1 = vec![b'b'; 4096];
+        let total = (chunk0.len() + chunk1.len()) as u32;
+        let (slot0, _p0, _l0) = el.driver.send_copy_pool.copy_in(&chunk0).unwrap();
+        let (slot1, ptr1, len1) = el.driver.send_copy_pool.copy_in(&chunk1).unwrap();
+        // One logical send split across two slots: only the last is end-of-send.
+        el.driver.send_copy_pool.set_end_of_send(slot0, false);
+        el.driver.send_copy_pool.set_end_of_send(slot1, true);
+
+        // Queue chunk 1 as a real BuiltSend behind the in-flight chunk 0.
+        let ud1 = UserData::encode(OpTag::Send, conn_index, slot1 as u32);
+        let entry1 = io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr1, len1)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
+            .build()
+            .user_data(ud1.raw());
+        el.driver.send_queues[conn_index as usize]
+            .queue
+            .push_back(crate::handler::BuiltSend {
+                entry: entry1,
+                pool_slot: slot1,
+                slab_idx: u16::MAX,
+                total_len: chunk1.len() as u32,
+            });
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        // Chunk 0 completes. The waiter must NOT be woken yet.
+        let ud0 = UserData::encode(OpTag::Send, conn_index, slot0 as u32);
+        el.test_dispatch_cqe(ud0.raw(), chunk0.len() as i32, 0);
+        assert!(
+            el.executor.send_waiters[conn_index as usize],
+            "send waiter woken on the first chunk of a multi-chunk send"
+        );
+        assert!(
+            el.executor.io_results[conn_index as usize].is_none(),
+            "send result stored before the logical send drained"
+        );
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].acked_bytes,
+            chunk0.len() as u32,
+            "first chunk's bytes not accumulated"
+        );
+
+        // Chunk 1 completes and drains the queue. The waiter wakes once,
+        // reporting the whole logical send, and the accumulator resets.
+        el.test_dispatch_cqe(ud1.raw(), chunk1.len() as i32, 0);
+        assert!(
+            !el.executor.send_waiters[conn_index as usize],
+            "send waiter not woken after the queue drained"
+        );
+        match &el.executor.io_results[conn_index as usize] {
+            Some(crate::runtime::IoResult::Send(Ok(n))) => assert_eq!(
+                *n, total,
+                "waiter woken with a short count instead of the full logical send"
+            ),
+            _ => panic!("expected Send(Ok(_)) result after the logical send drained"),
+        }
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].acked_bytes, 0,
+            "accumulator not reset after the logical send completed"
+        );
+    }
+
+    #[test]
+    fn handle_send_pipelined_independent_sends_wake_separately() {
+        // Two independent conn.send() calls pipelined on one connection share
+        // the per-connection send queue but each has its own waiter/result.
+        // Unlike chunks of one logical send, each must wake with its own byte
+        // count, not a running total. (Regression: joining two sends hung when
+        // the fix woke once on queue-drain and conflated the two.)
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.executor.send_waiters[conn_index as usize] = true;
+
+        // Each is its own logical send, so both slots are end-of-send (the
+        // copy_in default).
+        let a = b"HELLO";
+        let b = b"WORLD";
+        let (slot_a, _pa, _la) = el.driver.send_copy_pool.copy_in(a).unwrap();
+        let (slot_b, ptr_b, len_b) = el.driver.send_copy_pool.copy_in(b).unwrap();
+
+        // Send A is in flight; send B is queued behind it.
+        let ud_b = UserData::encode(OpTag::Send, conn_index, slot_b as u32);
+        let entry_b = io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr_b, len_b)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
+            .build()
+            .user_data(ud_b.raw());
+        el.driver.send_queues[conn_index as usize]
+            .queue
+            .push_back(crate::handler::BuiltSend {
+                entry: entry_b,
+                pool_slot: slot_b,
+                slab_idx: u16::MAX,
+                total_len: b.len() as u32,
+            });
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        // A completes: its waiter wakes with A's own byte count, not accumulated.
+        let ud_a = UserData::encode(OpTag::Send, conn_index, slot_a as u32);
+        el.test_dispatch_cqe(ud_a.raw(), a.len() as i32, 0);
+        match &el.executor.io_results[conn_index as usize] {
+            Some(crate::runtime::IoResult::Send(Ok(n))) => {
+                assert_eq!(*n, a.len() as u32, "send A woke with the wrong count")
+            }
+            _ => panic!("send A's waiter was not woken"),
+        }
+
+        // The future consumes A's result; the next send re-arms the waiter.
+        el.executor.io_results[conn_index as usize] = None;
+        el.executor.send_waiters[conn_index as usize] = true;
+
+        // B completes: its waiter wakes with B's own count, not A + B.
+        el.test_dispatch_cqe(ud_b.raw(), b.len() as i32, 0);
+        match &el.executor.io_results[conn_index as usize] {
+            Some(crate::runtime::IoResult::Send(Ok(n))) => {
+                assert_eq!(*n, b.len() as u32, "send B woke with an accumulated count")
+            }
+            _ => panic!("send B's waiter was not woken"),
+        }
     }
 
     // ── ZC send path tests ─────────────────────────────────────────

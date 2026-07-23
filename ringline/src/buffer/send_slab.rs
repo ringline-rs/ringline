@@ -41,6 +41,12 @@ struct InFlightSendEntry {
     guard_count: u8,
     conn_index: u32,
     total_len: u32,
+    /// Whether the last chunk gathered into this send is the final chunk of
+    /// its logical send. A coalesced entry that ends mid logical-send (the run
+    /// hit MAX_IOVECS before the send's last chunk) is not end-of-send, so the
+    /// send waiter is woken only when the entry that carries the final chunk
+    /// completes. Single (non-coalesced) sends are always end-of-send.
+    end_of_send: bool,
     pending_notifs: u8,
     awaiting_notifications: bool,
     in_use: bool,
@@ -68,6 +74,7 @@ impl InFlightSendSlab {
                 guard_count: 0,
                 conn_index: 0,
                 total_len: 0,
+                end_of_send: true,
                 pending_notifs: 0,
                 awaiting_notifications: false,
                 in_use: false,
@@ -108,6 +115,7 @@ impl InFlightSendSlab {
         entry.guard_count = guard_count;
         entry.conn_index = conn_index;
         entry.total_len = total_len;
+        entry.end_of_send = true;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -130,6 +138,7 @@ impl InFlightSendSlab {
         iovecs_slice: &[libc::iovec],
         pool_slots: &[u16],
         total_len: u32,
+        end_of_send: bool,
     ) -> Option<(u16, *const libc::msghdr)> {
         debug_assert!(iovecs_slice.len() <= MAX_IOVECS);
         debug_assert_eq!(iovecs_slice.len(), pool_slots.len());
@@ -149,6 +158,7 @@ impl InFlightSendSlab {
         entry.guard_count = 0;
         entry.conn_index = conn_index;
         entry.total_len = total_len;
+        entry.end_of_send = end_of_send;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -197,6 +207,7 @@ impl InFlightSendSlab {
         entry.guard_count = 0;
         entry.conn_index = conn_index;
         entry.total_len = total_len;
+        entry.end_of_send = true;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -312,6 +323,11 @@ impl InFlightSendSlab {
     /// Get the total original send length for an entry.
     pub fn total_len(&self, idx: u16) -> u32 {
         self.entries[idx as usize].total_len
+    }
+
+    /// Whether this entry carries the final chunk of its logical send.
+    pub fn is_end_of_send(&self, idx: u16) -> bool {
+        self.entries[idx as usize].end_of_send
     }
 
     /// Get the connection index for an entry.
