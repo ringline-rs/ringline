@@ -1,0 +1,94 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Daily; catches regressions in the wire-facing parsers continuously.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds to run each target"
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - h2_frame
+          - h2_hpack
+          - h2_connection
+          - h3_frame
+          - h3_qpack
+          - grpc_message
+          - grpc_connection
+          - http1_response
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      # The `@cargo-fuzz` tag shorthand can resolve with an empty tool input
+      # (observed in run 32181559223: "no tool specified" warning, step
+      # succeeds without installing) — use the explicit `tool:` form.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      # Corpus persistence: caches are immutable, so each run saves under a
+      # fresh run-id key and the next run restores the newest entry via the
+      # prefix restore-key. Checkout provides the committed seeds; the cache
+      # overlays everything coverage-guided fuzzing has discovered since.
+      - name: Restore accumulated corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      # --target is explicit because cargo-fuzz defaults to the triple it was
+      # itself built for; the prebuilt install-action binary is musl, and
+      # ASan can't link against static musl (run 32182376513).
+      - name: Run fuzz target
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            --target x86_64-unknown-linux-gnu -- \
+            -max_total_time=${{ github.event.inputs.max_total_time || 300 }} \
+            -rss_limit_mb=4096 \
+            -timeout=30
+
+      # Keep the persisted corpus tight: rewrite it as the minimal set of
+      # entries that preserves coverage before saving.
+      - name: Minimize corpus
+        run: |
+          cargo +nightly fuzz cmin ${{ matrix.target }} \
+            --target x86_64-unknown-linux-gnu
+
+      # Save even when the fuzz step failed: a crash-finding run has usually
+      # also discovered new coverage worth keeping (the crash input itself is
+      # preserved separately via the artifact upload below).
+      - name: Save accumulated corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

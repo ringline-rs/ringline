@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Fuzzing: eight cargo-fuzz/libFuzzer targets covering the wire-facing parsers
+  (h2 frame/HPACK/connection, h3 frame/QPACK, gRPC message/connection, HTTP/1.1
+  response), in an excluded `fuzz/` workspace with committed seed corpora, plus
+  a daily fuzz CI workflow with cross-run corpus persistence (#263, #303,
+  #305, #307).
+- `ringline-http`: off-by-default `fuzzing` feature exposing `#[doc(hidden)]`
+  wrappers for the crate-private HTTP/1.1 parsers; no internal types are
+  exported and there is no behavior change without the feature (#263).
+
 ### Fixed
 
 - `ringline` (core): listener creation is delayed until every worker has
@@ -17,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   such as `AddrInUse` may take longer to return than before. Errors from a worker
   event loop after the listener becomes live remain observable through its join
   handle.
+
+- `ringline-http`: chunked-decoding arithmetic overflow on a chunk-size line
+  near `usize::MAX` (e.g. `FFFFFFFFFFFFFFFc\r\n`). Reachable when
+  `set_max_chunk_size` is raised to disable the cap (the default 16 MiB cap
+  rejects such sizes first): debug builds panicked on peer-controlled input;
+  release builds silently wrapped the chunk length. The framing offsets now use
+  checked arithmetic and reject the chunk as invalid. Found by the first
+  persistent-corpus fuzz CI run (#308).
 
 ## [0.5.3] - 2026-07-23
 

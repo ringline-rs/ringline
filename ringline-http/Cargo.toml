@@ -21,6 +21,9 @@ gzip = ["dep:flate2"]
 zstd = ["dep:zstd"]
 brotli = ["dep:brotli"]
 compression = ["gzip", "zstd", "brotli"]
+# Exposes doc(hidden) entry points into the crate-private HTTP/1.1 parsers
+# for the fuzz harness in ../fuzz. Never enable outside fuzzing.
+fuzzing = []
 # Forward the runtime's mio-backend override. Needed so this crate's build.rs
 # sees `CARGO_FEATURE_FORCE_MIO` and gates the io_uring-only segmented recv path
 # out in lockstep with `ringline` being built as mio — otherwise a workspace

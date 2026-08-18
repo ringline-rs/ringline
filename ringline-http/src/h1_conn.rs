@@ -974,9 +974,17 @@ fn decode_chunk(data: &[u8], max_chunk_size: usize, max_trailer_section: usize) 
         }
     }
 
+    // `size` is peer-controlled up to `max_chunk_size`, and the setter
+    // accepts any cap (including usize::MAX to disable it) — checked math so
+    // a near-usize::MAX declared size is rejected instead of overflowing.
     let chunk_start = crlf + 2;
-    let chunk_end = chunk_start + size;
-    let total = chunk_end + 2; // trailing \r\n
+    let (chunk_end, total) = match chunk_start
+        .checked_add(size)
+        .and_then(|end| Some((end, end.checked_add(2)?))) // trailing \r\n
+    {
+        Some(v) => v,
+        None => return ChunkResult::Invalid("chunk size overflows usize"),
+    };
 
     if data.len() < total {
         return ChunkResult::NeedMore;
@@ -997,6 +1005,46 @@ fn decode_chunk(data: &[u8], max_chunk_size: usize, max_trailer_section: usize) 
 
 fn find_crlf(data: &[u8]) -> Option<usize> {
     (0..data.len().saturating_sub(1)).find(|&i| data[i] == b'\r' && data[i + 1] == b'\n')
+}
+
+/// Fuzzing-only entry point for the crate-private response-header parser.
+/// The internal types stay private; results are consumed so the sanitizer
+/// sees every field. Never call outside the fuzz harness.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_response_headers(data: &[u8]) {
+    if let Ok(parsed) = parse_response_headers(data) {
+        std::hint::black_box((
+            parsed.status,
+            parsed.content_length,
+            parsed.chunked,
+            parsed.connection_close,
+            parsed.content_encoding.as_deref().map(str::len),
+        ));
+        for (name, value) in &parsed.headers {
+            std::hint::black_box(name.len() + value.len());
+        }
+    }
+}
+
+/// Fuzzing-only entry point for the crate-private chunked-transfer decoder.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_decode_chunk(data: &[u8], max_chunk_size: usize, max_trailer_section: usize) {
+    match decode_chunk(data, max_chunk_size, max_trailer_section) {
+        ChunkResult::Complete {
+            data: payload,
+            consumed,
+            is_last,
+        } => {
+            assert!(consumed <= data.len(), "decode_chunk consumed past input");
+            std::hint::black_box((payload.iter().fold(0u8, |a, &b| a ^ b), is_last));
+        }
+        ChunkResult::NeedMore => {}
+        ChunkResult::Invalid(reason) => {
+            std::hint::black_box(reason);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1080,6 +1128,20 @@ mod tests {
                 assert!(!is_last);
             }
             ChunkResult::NeedMore | ChunkResult::Invalid(_) => panic!("expected Complete"),
+        }
+    }
+
+    #[test]
+    fn decode_chunk_huge_size_rejected_without_overflow() {
+        // Fuzzer finding (fuzz run 32185137405): a chunk-size line near
+        // usize::MAX made `chunk_start + size` overflow when the caller's
+        // `max_chunk_size` doesn't cap it (the setter accepts any value).
+        let data = b"\nFFFFFFFFFFFFFFFc\r\nTOK\n";
+        match decode_chunk(data, usize::MAX, usize::MAX) {
+            ChunkResult::Invalid(_) => {}
+            ChunkResult::NeedMore | ChunkResult::Complete { .. } => {
+                panic!("expected Invalid for overflowing chunk size")
+            }
         }
     }
 
