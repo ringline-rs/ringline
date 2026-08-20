@@ -20,6 +20,9 @@ exclude = ["fuzz"]
 [workspace.package]
 authors = ["Brian Martin <brayniac@gmail.com>"]
 edition = "2024"
+# Minimum supported Rust version. Edition 2024 required 1.85, and let-chains
+# in the core crate require 1.88; this records the real floor explicitly.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/brayniac/ringline"
 

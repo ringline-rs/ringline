@@ -3683,14 +3683,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.pending_close_retries.is_empty() {
             return;
         }
-        let retries: Vec<_> = self.driver.pending_close_retries.drain(..).collect();
-        let tick_mod = self.driver.tick_count % 4;
+        // Backoff: attempt only every 4th tick. On the other three there is
+        // nothing to do at all — the previous form drained the whole queue and
+        // pushed every entry straight back unchanged, which is pure work.
+        if !self.driver.tick_count.is_multiple_of(4) {
+            return;
+        }
+        let retries = std::mem::take(&mut self.driver.pending_close_retries);
         for (conn_index, retry) in retries {
-            if tick_mod != 0 {
-                // Not this tick — keep the entry queued.
-                self.driver.pending_close_retries.push((conn_index, retry));
-                continue;
-            }
             if self.driver.ring.submit_close(conn_index).is_err() {
                 self.driver
                     .pending_close_retries
@@ -4500,7 +4500,7 @@ mod tests {
             el.driver.pending_replenish.contains(&bid),
             "handle_close queues the held bid for replenish"
         );
-        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -4607,7 +4607,7 @@ mod tests {
             el.driver.pending_replenish.contains(&bid),
             "drop queues the bid for replenish"
         );
-        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -4736,7 +4736,7 @@ mod tests {
             "the pin slot is cleared by the drop"
         );
 
-        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -4803,7 +4803,7 @@ mod tests {
             1,
             "stale segment drop after teardown does not double-replenish"
         );
-        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -5036,7 +5036,7 @@ mod tests {
 
         // (b) Commit the replenish, then overwrite the underlying buffer: the owned
         // Bytes must be unaffected — proving it is a real copy, not an alias.
-        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -5111,7 +5111,7 @@ mod tests {
             1,
             "bid replenished at delivery, before the owned Bytes is dropped"
         );
-        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -5243,7 +5243,7 @@ mod tests {
         assert!(done, "FIN while parked yields Ok(None), not a hang");
 
         // No held buffers were leaked: the ring's free count is fully restored.
-        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -5347,7 +5347,7 @@ mod tests {
         assert!(el.driver.segment_hold[conn_index as usize].is_empty());
         assert!(el.driver.pending_replenish.contains(&0));
         assert!(el.driver.pending_replenish.contains(&1));
-        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -5398,7 +5398,7 @@ mod tests {
         );
         assert!(el.driver.pending_replenish.contains(&0));
         assert!(el.driver.pending_replenish.contains(&1));
-        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -5563,7 +5563,7 @@ mod tests {
         );
         // Committing the queued replenish restores the full ring while the owned
         // segment is STILL held — proving the hold pins nothing.
-        let to_replenish: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let to_replenish: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&to_replenish);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -5623,7 +5623,7 @@ mod tests {
         let bid: u16 = 0;
         deliver_segment(&mut el, conn_index, bid, b"hello");
         // Commit the force-copy's delivery-time replenish so the ring is full.
-        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries);
 
@@ -5705,7 +5705,7 @@ mod tests {
             1,
             "consuming an owned hold entry must not replenish its bid again"
         );
-        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries, "balanced");
     }
@@ -5728,7 +5728,7 @@ mod tests {
         deliver_segment(&mut el, conn_index, 1, b"BBB");
         // Both force-copied: each queued its bid at delivery. Commit them so the
         // ring is full before consuming.
-        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         assert_eq!(r.len(), 2, "both force-copied bids queued at delivery");
         el.driver.provided_bufs.replenish_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries);
@@ -5780,7 +5780,7 @@ mod tests {
 
         deliver_segment(&mut el, conn_index, 0, b"hello");
         deliver_segment(&mut el, conn_index, 1, b"world");
-        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries);
 
@@ -5860,7 +5860,7 @@ mod tests {
             1,
             "teardown must NOT re-queue an owned entry's bid (no bid to return)"
         );
-        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -5980,7 +5980,7 @@ mod tests {
             crate::recv::domain::RecvDomain::default(),
             "delivery domain reset after the forward"
         );
-        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&r);
         assert_eq!(el.driver.provided_bufs.free(), entries, "free restored");
     }
@@ -6074,7 +6074,7 @@ mod tests {
             matches!(p, std::task::Poll::Ready(Ok(10))),
             "forwarded all 10 bytes"
         );
-        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -6106,7 +6106,7 @@ mod tests {
         ));
         // Commit the delivery-time replenish so `free()` reflects the ring is not
         // depleted by the (owned) held buffer.
-        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -6215,7 +6215,7 @@ mod tests {
             1,
             "a stale forward-write CQE does not double-replenish"
         );
-        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),
@@ -6472,7 +6472,7 @@ mod tests {
         let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, 0);
         el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
 
-        let r: Vec<u16> = el.driver.pending_replenish.drain(..).collect();
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
         el.driver.provided_bufs.replenish_batch(&r);
         assert_eq!(
             el.driver.provided_bufs.free(),

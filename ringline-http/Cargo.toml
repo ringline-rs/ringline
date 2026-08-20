@@ -2,6 +2,7 @@
 name = "ringline-http"
 version = "0.5.3"
 edition = "2024"
+rust-version = "1.88"
 description = "Async HTTP/1.1 and HTTP/2 client for the ringline io_uring runtime"
 authors.workspace = true
 license.workspace = true

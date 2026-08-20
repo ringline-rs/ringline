@@ -2,6 +2,7 @@
 name = "ringline-h2"
 version = "0.5.2"
 edition = "2024"
+rust-version = "1.88"
 description = "Sans-IO HTTP/2 client framing layer"
 authors.workspace = true
 license.workspace = true

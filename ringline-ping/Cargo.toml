@@ -2,6 +2,7 @@
 name = "ringline-ping"
 version = "0.5.3"
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
