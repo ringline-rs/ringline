@@ -30,7 +30,7 @@ jobs:
           - grpc_connection
           - http1_response
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -50,7 +50,7 @@ jobs:
       # prefix restore-key. Checkout provides the committed seeds; the cache
       # overlays everything coverage-guided fuzzing has discovered since.
       - name: Restore accumulated corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -80,7 +80,7 @@ jobs:
       # preserved separately via the artifact upload below).
       - name: Save accumulated corpus
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
