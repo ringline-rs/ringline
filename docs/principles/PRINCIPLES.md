@@ -34,10 +34,12 @@ launch time, at launch time in preference to per-request. A backend is selected
 when the binary is built. Configuration is validated once, at construction, and
 is immutable thereafter.
 
-The benefit is not speed in isolation but predictability. A runtime that cannot
-change shape under load cannot surprise an operator with a different regime at
-hour six, and it cannot hide a slow path behind a branch that is only taken
-sometimes.
+The benefit is not speed in isolation but predictability. What is fixed early is
+the *envelope*: which shapes the runtime can take, and what bounds them. Buffers
+may still grow within a configured ceiling, and a threshold may still steer a
+request down one of two known paths. What is excluded is the runtime deciding
+for itself to occupy a shape nobody declared, so that an operator meets a
+regime at hour six that was not visible at hour one.
 
 This forecloses genuine flexibility, and that cost is accepted deliberately.
 Where adaptation is genuinely needed, it belongs in an explicit, observable loop
@@ -45,14 +47,19 @@ rather than in implicit runtime polymorphism.
 
 ## 3. Partition rather than share
 
-State belongs to one thread. Work is not migrated between threads, and no
-structure on the hot path is shared across them. Where two threads would
-otherwise contend for a resource, each is given its own.
+Mutable state belongs to one thread. Work is not migrated between threads, and
+where two threads would otherwise contend for a resource, each is given its own.
 
-Sharing is cheap to write and expensive to reason about: it converts a local
+Sharing that is written is expensive to reason about: it converts a local
 question about one thread's behaviour into a global question about all of them,
 and it does so exactly at the load where the answer matters. Duplication is the
 price paid for keeping the question local.
+
+Sharing that is only read is a different matter, and the distinction is worth
+keeping. A flag that every worker consults and almost nobody writes costs a
+cache line that stays valid; partitioning it would buy nothing. So the rule is
+not that nothing is shared — it is that anything shared and written is
+deliberate, and that contention is demonstrated before duplication is paid for.
 
 ## 4. Account for copies and syscalls
 
