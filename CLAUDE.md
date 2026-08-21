@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+The design stances behind the rules below are written up separately in
+[docs/principles/PRINCIPLES.md](docs/principles/PRINCIPLES.md). This file says
+what to do; that one says why, and is the place to argue with a decision rather
+than work around it.
+
 ## Build & Test Commands
 
 ```bash
