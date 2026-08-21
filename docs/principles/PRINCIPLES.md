@@ -145,16 +145,25 @@ Breaking changes are batched into deliberate releases rather than released
 individually as they arise, so that a consumer pays the upgrade cost on a
 schedule they can plan for.
 
-## 10. Prefer the reversible commitment
+## 10. An obligation the caller must keep is declared in the signature
 
-Structural decisions are made so that they can be undone, and are undone while
-undoing them is still cheap. A decision that has become expensive to reverse
-should be recognised as such early, and either committed to explicitly or
-replaced before the cost grows.
+Principle 1 concerns what this library owes the kernel. This one concerns what
+it hands back to the people using it.
 
-Effort spent defending a structural choice because it was expensive to build is
-effort spent on the wrong question. The relevant question is only ever whether
-it is the right structure now.
+Where an operation is only correct if the caller does something — keeps a buffer
+alive past the call, aligns it, guarantees it is not aliased — that requirement
+belongs in the signature, as an `unsafe fn` with the obligation written down. It
+does not belong hidden behind a safe wrapper that cannot actually uphold it.
+
+A safe signature is a promise that no use of it can cause undefined behaviour.
+Applying one to an operation whose safety depends on the caller does not make
+the obligation go away; it makes it invisible, and moves the eventual failure
+somewhere far from the code responsible for it. The discomfort of an `unsafe`
+keyword at the call site is the mechanism working.
+
+The same reasoning applies to panics. An operation that will abort on some
+inputs says so, and a caller who cannot guarantee those inputs is given a
+fallible variant instead of being left to discover the panic in production.
 
 ---
 
