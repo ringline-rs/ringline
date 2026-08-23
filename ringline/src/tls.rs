@@ -134,10 +134,29 @@ impl TlsConnKind {
     }
 }
 
+// rustls accepts at most 16 KiB of plaintext per record and permits up to
+// 2 KiB of ciphertext expansion, plus the five-byte record header. Admission
+// uses this conservative bound because exhausting the pool after rustls has
+// consumed plaintext cannot be retried without corrupting the TLS stream.
+const TLS_MAX_PLAINTEXT_FRAGMENT: usize = 16_384;
+const TLS_RECORD_HEADER: usize = 5;
+const TLS_MAX_CIPHERTEXT_OVERHEAD: usize = 2_048;
+
+fn tls_ciphertext_capacity(plaintext_len: usize, max_fragment_size: Option<usize>) -> usize {
+    let fragment_plaintext = max_fragment_size
+        .map(|size| size.saturating_sub(TLS_RECORD_HEADER))
+        .unwrap_or(TLS_MAX_PLAINTEXT_FRAGMENT)
+        .max(1);
+    let records = plaintext_len.div_ceil(fragment_plaintext);
+    plaintext_len
+        .saturating_add(records.saturating_mul(TLS_RECORD_HEADER + TLS_MAX_CIPHERTEXT_OVERHEAD))
+}
+
 /// Per-connection TLS state.
 pub struct TlsConn {
     pub conn: TlsConnKind,
     pub handshake_complete: bool,
+    max_fragment_size: Option<usize>,
     /// True once the peer's close_notify alert has been processed. A TCP
     /// FIN arriving while this is false is a truncation (possibly an
     /// attacker-injected FIN) and must not look like a clean EOF.
@@ -195,10 +214,12 @@ impl TlsTable {
             .server_config
             .as_ref()
             .expect("create() called without server_config");
+        let max_fragment_size = server_config.max_fragment_size;
         let conn = ServerConnection::new(server_config.clone())?;
         self.conns[conn_index as usize] = Some(TlsConn {
             conn: TlsConnKind::Server(conn),
             handshake_complete: false,
+            max_fragment_size,
             peer_sent_close_notify: false,
             close_notify_sent: false,
         });
@@ -215,10 +236,12 @@ impl TlsTable {
             .client_config
             .as_ref()
             .expect("create_client() called without client_config");
+        let max_fragment_size = client_config.max_fragment_size;
         let conn = ClientConnection::new(client_config.clone(), server_name)?;
         self.conns[conn_index as usize] = Some(TlsConn {
             conn: TlsConnKind::Client(conn),
             handshake_complete: false,
+            max_fragment_size,
             peer_sent_close_notify: false,
             close_notify_sent: false,
         });
@@ -228,6 +251,19 @@ impl TlsTable {
     /// Get a mutable reference to the TLS connection at the given index.
     pub fn get_mut(&mut self, conn_index: u32) -> Option<&mut TlsConn> {
         self.conns[conn_index as usize].as_mut()
+    }
+
+    /// Conservative pool capacity required before TLS mutates its record state.
+    pub(crate) fn ciphertext_capacity(
+        &self,
+        conn_index: u32,
+        plaintext_len: usize,
+    ) -> Option<usize> {
+        let conn = self.conns.get(conn_index as usize)?.as_ref()?;
+        Some(tls_ciphertext_capacity(
+            plaintext_len,
+            conn.max_fragment_size,
+        ))
     }
 
     /// Check if a connection has TLS state.
@@ -1001,6 +1037,12 @@ mod segmented_tls_tests {
     use std::collections::VecDeque;
     use std::io::Cursor;
 
+    #[test]
+    fn bounded_ciphertext_capacity_includes_record_expansion() {
+        assert_eq!(tls_ciphertext_capacity(16_384, None), 18_437);
+        assert_eq!(tls_ciphertext_capacity(28, Some(32)), 4_134);
+    }
+
     fn test_certs() -> (
         Vec<rustls::pki_types::CertificateDer<'static>>,
         rustls::pki_types::PrivateKeyDer<'static>,
@@ -1072,6 +1114,7 @@ mod segmented_tls_tests {
         TlsConn {
             conn: server,
             handshake_complete: true,
+            max_fragment_size: None,
             peer_sent_close_notify: false,
             close_notify_sent: false,
         }

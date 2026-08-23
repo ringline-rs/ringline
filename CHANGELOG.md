@@ -17,9 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- `ringline` (core): worker setup errors and panic payloads are preserved through
-  launch rollback, and bounded logical sends retain exact identity and resource
-  ownership across partial writes, cancellation, half-close, and teardown.
+- `ringline` (core): worker bootstrap failures retain their diagnostic message
+  through launch rollback and are returned from `launch()` as `Error::Io`.
+  Worker panics, including panics after startup, are likewise converted to
+  `Error::Io` results instead of propagating as thread-panic payloads from
+  `JoinHandle::join()`.
+- `ringline` (core): bounded logical sends retain exact identity and resource
+  ownership across partial writes, cancellation, half-close, and teardown. TLS
+  admission now accounts conservatively for ciphertext record expansion before
+  rustls consumes plaintext, so transient send-pool pressure parks safely on
+  both backends.
+- `ringline` (core): copied `send()` reserves every chunk transactionally, so
+  pool pressure no longer commits a prefix before returning an error.
+- `ringline` (io_uring): submission-queue saturation after an attempted flush is
+  reported as `WouldBlock` (previously `Other`).
 
 ## [0.5.5] - 2026-08-19
 

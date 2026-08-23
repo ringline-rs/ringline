@@ -250,6 +250,15 @@ impl<'a> DriverCtx<'a> {
 
         if !self.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.tls_table };
+            if let Some(capacity) = tls_table.ciphertext_capacity(conn.index, data.len()) {
+                let required = capacity.div_ceil(self.send_copy_pool.slot_size() as usize);
+                if self.send_copy_pool.free_count() < required {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "send copy pool exhausted",
+                    ));
+                }
+            }
             if tls_table.get_mut(conn.index).is_some() {
                 let sends =
                     crate::tls::encrypt_to_sends(tls_table, self.send_copy_pool, conn.index, data)?;
@@ -1988,8 +1997,16 @@ impl<'a> DriverCtx<'a> {
             ));
         }
 
+        let capacity = if !self.tls_table.is_null() {
+            let tls_table = unsafe { &*self.tls_table };
+            tls_table
+                .ciphertext_capacity(conn.index, data.len())
+                .unwrap_or(data.len())
+        } else {
+            data.len()
+        };
         let slot_size = self.send_copy_pool.slot_size() as usize;
-        let required = data.len().div_ceil(slot_size);
+        let required = capacity.div_ceil(slot_size);
         let slots = self
             .send_copy_pool
             .reserve_slots(required)

@@ -3303,17 +3303,21 @@ impl Future for BackpressuredSendFuture<'_> {
                 return Poll::Ready(Ok(0));
             }
 
+            let admission_len = driver
+                .tls_table
+                .as_ref()
+                .and_then(|tls| tls.ciphertext_capacity(this.conn_index, this.data.len()))
+                .unwrap_or(this.data.len());
             let slot_size = driver.send_copy_pool.slot_size() as usize;
             let slot_count = driver.send_copy_pool.slot_count();
             let total_capacity = slot_size.saturating_mul(slot_count);
-            if this.data.len() > total_capacity {
+            if admission_len > total_capacity {
                 this.registration.take();
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
                         "logical send size {} exceeds send pool capacity {}",
-                        this.data.len(),
-                        total_capacity
+                        admission_len, total_capacity
                     ),
                 )));
             }
@@ -3326,7 +3330,7 @@ impl Future for BackpressuredSendFuture<'_> {
             if !executor.send_capacity_turn(waiter_id) {
                 return Poll::Pending;
             }
-            let required = this.data.len().div_ceil(slot_size);
+            let required = admission_len.div_ceil(slot_size);
             if driver.send_copy_pool.free_count() < required {
                 return Poll::Pending;
             }
