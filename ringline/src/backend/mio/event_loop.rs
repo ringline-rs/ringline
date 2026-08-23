@@ -21,6 +21,14 @@ use crate::runtime::{CURRENT_TASK_ID, Executor};
 
 use super::driver::WAKE_TOKEN;
 
+fn clone_io_error(error: &io::Error) -> io::Error {
+    if let Some(code) = error.raw_os_error() {
+        io::Error::from_raw_os_error(code)
+    } else {
+        io::Error::new(error.kind(), error.to_string())
+    }
+}
+
 /// Mio-based event loop (one per worker thread).
 pub(crate) struct AsyncEventLoop<A: AsyncEventHandler> {
     driver: Driver,
@@ -759,13 +767,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// forever while send().await had already reported success.
     fn fail_connection_on_send_error(&mut self, conn_index: u32, e: io::Error) {
         let bounded_ids = self.driver.pending_bounded_send_ids(conn_index as usize);
-        let error_kind = e.kind();
-        let error_message = e.to_string();
         self.driver.clear_pending_sends(conn_index as usize);
         self.executor.wake_send_capacity();
         for id in bounded_ids {
             self.executor
-                .complete_bounded_send(id, Err(io::Error::new(error_kind, error_message.clone())));
+                .complete_bounded_send(id, Err(clone_io_error(&e)));
         }
         self.executor.wake_send(conn_index, Err(e));
         self.executor.wake_recv(conn_index);
@@ -1163,5 +1169,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Drain any wakeups that happened during polling.
         executor.collect_wakeups();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cloned_io_error_retains_raw_os_error() {
+        let source = std::io::Error::from_raw_os_error(libc::ECONNRESET);
+        let cloned = super::clone_io_error(&source);
+
+        assert_eq!(cloned.kind(), std::io::ErrorKind::ConnectionReset);
+        assert_eq!(cloned.raw_os_error(), Some(libc::ECONNRESET));
     }
 }

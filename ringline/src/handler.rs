@@ -64,6 +64,13 @@ impl ConnSendState {
             acked_bytes: 0,
         }
     }
+
+    #[cfg(has_io_uring)]
+    pub(crate) fn fail_terminal_send(&mut self) {
+        self.in_flight = false;
+        self.shutdown_pending = false;
+        self.close_pending = true;
+    }
 }
 
 /// Opaque connection token handed to the handler.
@@ -3741,5 +3748,21 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         self.chain.total_bytes += built.total_len;
         self.chain.built.push(built);
         self.chain
+    }
+}
+
+#[cfg(all(test, has_io_uring))]
+mod send_queue_tests {
+    #[test]
+    fn terminal_queue_failure_marks_connection_for_close() {
+        let mut state = super::ConnSendState::new();
+        state.in_flight = true;
+        state.shutdown_pending = true;
+
+        state.fail_terminal_send();
+
+        assert!(!state.in_flight);
+        assert!(!state.shutdown_pending);
+        assert!(state.close_pending);
     }
 }

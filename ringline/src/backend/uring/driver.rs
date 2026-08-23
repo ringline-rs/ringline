@@ -1339,8 +1339,7 @@ impl Driver {
                                 ),
                             ));
                         }
-                        state.in_flight = false;
-                        state.shutdown_pending = false;
+                        state.fail_terminal_send();
                         self.try_finalize_close(conn_index);
                         return false;
                     }
@@ -1379,8 +1378,7 @@ impl Driver {
                                 ),
                             ));
                         }
-                        state.in_flight = false;
-                        state.shutdown_pending = false;
+                        state.fail_terminal_send();
                         // If a deferred close was pending, fire it now that
                         // the queue is drained.
                         self.try_finalize_close(conn_index);

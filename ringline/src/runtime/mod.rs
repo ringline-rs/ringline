@@ -873,6 +873,7 @@ impl Executor {
         self.send_capacity
             .borrow_mut()
             .remove_connection(conn_index);
+        self.send_capacity.borrow_mut().wake_head();
         self.drain_send_capacity_wakes();
         if idx < self.recv_waiters.len() {
             // If a *standalone* task was awaiting recv/send/connect on this
@@ -1260,6 +1261,25 @@ mod tests {
         assert!(exec.send_capacity_turn(survivor.id()));
         assert!(exec.task_slab.take_ready(2).is_some());
     }
+
+    #[test]
+    fn connection_removal_wakes_unrelated_fifo_head() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.task_slab
+            .spawn(2, Box::pin(std::future::pending::<()>()));
+        let future = exec.task_slab.take_ready(2).unwrap();
+        exec.task_slab.park(2, future);
+
+        let survivor = exec.enqueue_send_capacity(2, 4, 2);
+        assert!(exec.send_capacity_turn(survivor.id()));
+
+        // Connection 1 may own pool permits even though connection 2 owns
+        // the FIFO head. Closing 1 releases capacity and must wake 2.
+        exec.remove_connection(1);
+
+        assert!(exec.task_slab.take_ready(2).is_some());
+    }
+
     #[test]
     fn collect_wakeups_transitions_parked_to_ready() {
         // A std Waker pushes only the raw id onto the thread-local queue.
