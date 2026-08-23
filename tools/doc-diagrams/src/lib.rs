@@ -730,7 +730,27 @@ fn stage(svg: &mut String, x: u32, y: u32, w: u32, h: u32, number: &str, label: 
 fn arrow(svg: &mut String, x1: u32, y1: u32, x2: u32, y2: u32, label: &str) {
     svg.push_str(&format!("<line x1=\"{x1}\" y1=\"{y1}\" x2=\"{x2}\" y2=\"{y2}\" stroke=\"#4D4D4D\" stroke-width=\"1.4\" marker-end=\"url(#arrow)\"/>\n"));
     if !label.is_empty() {
-        text(svg, (x1 + x2) / 2, (y1 + y2) / 2 - 8, label, 13, false);
+        let dx = f64::from(x2) - f64::from(x1);
+        let dy = f64::from(y2) - f64::from(y1);
+        let length = dx.hypot(dy);
+        let (mut normal_x, mut normal_y) = (dy / length, -dx / length);
+        if normal_y > 0.0 || (normal_y.abs() < f64::EPSILON && normal_x < 0.0) {
+            normal_x = -normal_x;
+            normal_y = -normal_y;
+        }
+        let x = ((f64::from(x1 + x2) / 2.0) + normal_x * 18.0).round() as u32;
+        let y = ((f64::from(y1 + y2) / 2.0) + normal_y * 18.0 + 5.0).round() as u32;
+        svg.push_str(&format!(
+            concat!(
+                "<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" ",
+                "data-role=\"arrow-label\" font-family=\"sans-serif\" font-size=\"13\" ",
+                "fill=\"#222\" stroke=\"white\" stroke-width=\"6\" stroke-linejoin=\"round\" ",
+                "paint-order=\"stroke\">{}</text>\n"
+            ),
+            x,
+            y,
+            escape(label)
+        ));
     }
 }
 
@@ -797,6 +817,31 @@ mod tests {
         assert!(validate_svg_geometry(&off_canvas).is_err());
         assert!(validate_svg_geometry("<svg>").is_err());
     }
+
+    #[test]
+    fn arrow_labels_are_centered_with_connector_clearance() {
+        let mut horizontal = String::new();
+        arrow(&mut horizontal, 100, 100, 200, 100, "horizontal");
+        assert!(
+            horizontal
+                .contains("x=\"150\" y=\"87\" text-anchor=\"middle\" data-role=\"arrow-label\"")
+        );
+        assert!(horizontal.contains("paint-order=\"stroke\""));
+
+        let mut vertical = String::new();
+        arrow(&mut vertical, 100, 100, 100, 200, "vertical");
+        assert!(
+            vertical
+                .contains("x=\"118\" y=\"155\" text-anchor=\"middle\" data-role=\"arrow-label\"")
+        );
+
+        let mut reverse = String::new();
+        arrow(&mut reverse, 200, 100, 100, 100, "reverse");
+        assert!(
+            reverse.contains("x=\"150\" y=\"87\" text-anchor=\"middle\" data-role=\"arrow-label\"")
+        );
+    }
+
     #[test]
     fn rendered_mio_disk_pool_has_source_claims() {
         for meaning in [

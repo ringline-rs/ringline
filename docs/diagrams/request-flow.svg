@@ -43,23 +43,23 @@
 <text x="120" y="791" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">7</text>
 <text x="207" y="799" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">parse + send</text>
 <line x1="1100" y1="208" x2="955" y2="208" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="1027" y="200" font-family="sans-serif" font-size="13" fill="#222">accepted fd</text>
+<text x="1028" y="195" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">accepted fd</text>
 <line x1="655" y1="225" x2="575" y2="300" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="615" y="254" font-family="sans-serif" font-size="13" fill="#222">generation-tagged ConnCtx</text>
+<text x="603" y="254" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">generation-tagged ConnCtx</text>
 <line x1="475" y1="336" x2="195" y2="365" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="335" y="342" font-family="sans-serif" font-size="13" fill="#222">established</text>
+<text x="333" y="338" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">established</text>
 <line x1="295" y1="398" x2="375" y2="493" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="335" y="437" font-family="sans-serif" font-size="13" fill="#222">await bytes</text>
+<text x="349" y="439" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">await bytes</text>
 <line x1="575" y1="493" x2="655" y2="595" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="615" y="536" font-family="sans-serif" font-size="13" fill="#222">arm receive</text>
+<text x="629" y="538" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">arm receive</text>
 <line x1="955" y1="595" x2="1090" y2="595" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="1022" y="587" font-family="sans-serif" font-size="13" fill="#222">SQE / interest</text>
+<text x="1023" y="582" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">SQE / interest</text>
 <line x1="1090" y1="625" x2="955" y2="625" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="1022" y="617" font-family="sans-serif" font-size="13" fill="#222">CQE / readiness</text>
+<text x="1023" y="612" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">CQE / readiness</text>
 <line x1="655" y1="615" x2="575" y2="698" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="615" y="648" font-family="sans-serif" font-size="13" fill="#222">completion</text>
+<text x="602" y="649" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">completion</text>
 <line x1="375" y1="698" x2="295" y2="793" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="335" y="737" font-family="sans-serif" font-size="13" fill="#222">ready task</text>
+<text x="321" y="739" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">ready task</text>
 <rect x="650" y="725" width="310" height="62" fill="#EDEDED" stroke="#4D4D4D" stroke-width="1.4"/>
 <line x1="701" y1="725" x2="701" y2="787" stroke="#9E9E9E"/>
 <line x1="753" y1="725" x2="753" y2="787" stroke="#9E9E9E"/>
@@ -68,9 +68,9 @@
 <line x1="908" y1="725" x2="908" y2="787" stroke="#9E9E9E"/>
 <text x="805" y="762" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">per-connection ordered send queue</text>
 <line x1="295" y1="810" x2="650" y2="756" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="472" y="775" font-family="sans-serif" font-size="13" fill="#222">response</text>
+<text x="470" y="770" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">response</text>
 <line x1="960" y1="756" x2="1090" y2="756" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="1025" y="748" font-family="sans-serif" font-size="13" fill="#222">one send in flight</text>
+<text x="1025" y="743" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">one send in flight</text>
 <rect x="1090" y="710" width="250" height="95" rx="12" fill="white" stroke="#4D4D4D" stroke-width="2.4" stroke-dasharray="8 5"/>
 <text x="1215" y="763" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">peer socket</text>
 <text x="730" y="850" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">return/panic → deferred close → slot generation increments</text>
