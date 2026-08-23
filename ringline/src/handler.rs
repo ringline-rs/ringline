@@ -1997,38 +1997,29 @@ impl<'a> DriverCtx<'a> {
             ));
         }
 
-        let capacity = if !self.tls_table.is_null() {
-            let tls_table = unsafe { &*self.tls_table };
-            tls_table
-                .ciphertext_capacity(conn.index, data.len())
-                .unwrap_or(data.len())
-        } else {
-            data.len()
-        };
         let slot_size = self.send_copy_pool.slot_size() as usize;
-        let required = capacity.div_ceil(slot_size);
-        let slots = self
-            .send_copy_pool
-            .reserve_slots(required)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "send copy pool exhausted"))?;
-
-        let queued = if !self.tls_table.is_null() {
+        let (queued, slots) = if !self.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.tls_table };
             if tls_table.has(conn.index) {
-                match crate::tls::encrypt_for_send_mio(tls_table, conn.index, data) {
-                    Ok(ciphertext) => ciphertext,
-                    Err(error) => {
-                        for slot in slots {
-                            self.send_copy_pool.release(slot);
-                        }
-                        return Err(error);
-                    }
-                }
+                crate::tls::encrypt_for_send_mio_bounded(
+                    tls_table,
+                    self.send_copy_pool,
+                    conn.index,
+                    data,
+                )?
             } else {
-                data.to_vec()
+                let required = data.len().div_ceil(slot_size);
+                let slots = self.send_copy_pool.reserve_slots(required).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "send copy pool exhausted")
+                })?;
+                (data.to_vec(), slots)
             }
         } else {
-            data.to_vec()
+            let required = data.len().div_ceil(slot_size);
+            let slots = self.send_copy_pool.reserve_slots(required).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "send copy pool exhausted")
+            })?;
+            (data.to_vec(), slots)
         };
 
         let idx = conn.index as usize;

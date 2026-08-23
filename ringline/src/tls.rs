@@ -1013,6 +1013,36 @@ pub fn encrypt_for_send_mio(
     Ok(ciphertext)
 }
 
+/// Reserve the complete conservative ciphertext capacity before rustls consumes
+/// plaintext. A `WouldBlock` result therefore leaves TLS sequence state intact
+/// and is safe for the bounded-send future to retry after capacity is released.
+#[cfg(not(has_io_uring))]
+pub(crate) fn encrypt_for_send_mio_bounded(
+    tls_table: &mut TlsTable,
+    send_copy_pool: &mut SendCopyPool,
+    conn_index: u32,
+    plaintext: &[u8],
+) -> io::Result<(Vec<u8>, Vec<u16>)> {
+    let capacity = tls_table
+        .ciphertext_capacity(conn_index, plaintext.len())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "no TLS state for connection")
+        })?;
+    let required = capacity.div_ceil(send_copy_pool.slot_size() as usize);
+    let slots = send_copy_pool
+        .reserve_slots(required)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "send copy pool exhausted"))?;
+    match encrypt_for_send_mio(tls_table, conn_index, plaintext) {
+        Ok(ciphertext) => Ok((ciphertext, slots)),
+        Err(error) => {
+            for slot in slots {
+                send_copy_pool.release(slot);
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Borrow a connection slot and the shared write_buf from a TlsTable simultaneously.
 /// This is the borrow-splitting helper: `conns[i]` and `write_buf` are disjoint fields.
 #[cfg(not(has_io_uring))]
@@ -1248,5 +1278,101 @@ mod segmented_tls_tests {
             hold.is_empty(),
             "no segment should be held once the bound is breached"
         );
+    }
+}
+
+#[cfg(all(test, not(has_io_uring)))]
+mod bounded_mio_tls_tests {
+    use super::*;
+    use crate::buffer::send_copy::SendCopyPool;
+    use std::io::{Cursor, Read};
+
+    fn pump(from: &mut TlsConnKind, to: &mut TlsConnKind) {
+        let mut wire = Vec::new();
+        while from.wants_write() {
+            from.write_tls(&mut wire).unwrap();
+        }
+        if !wire.is_empty() {
+            to.read_tls(&mut Cursor::new(wire)).unwrap();
+            to.process_new_packets().unwrap();
+        }
+    }
+
+    fn custom_fragment_session() -> (TlsTable, TlsConnKind) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key.into())
+            .unwrap();
+        server_config.max_fragment_size = Some(32);
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let mut client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.max_fragment_size = Some(32);
+        let client_config = Arc::new(client_config);
+
+        let mut server =
+            TlsConnKind::Server(rustls::ServerConnection::new(Arc::new(server_config)).unwrap());
+        let mut table = TlsTable::new(1, None, Some(client_config));
+        table
+            .create_client(0, "localhost".try_into().unwrap())
+            .unwrap();
+        for _ in 0..30 {
+            let client = &mut table.get_mut(0).unwrap().conn;
+            pump(client, &mut server);
+            pump(&mut server, client);
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!table.get_mut(0).unwrap().conn.is_handshaking());
+        assert!(!server.is_handshaking());
+        (table, server)
+    }
+
+    fn decrypt(peer: &mut TlsConnKind, ciphertext: &[u8], plaintext_len: usize) -> Vec<u8> {
+        peer.read_tls(&mut Cursor::new(ciphertext)).unwrap();
+        peer.process_new_packets().unwrap();
+        let mut plaintext = vec![0; plaintext_len];
+        peer.reader().read_exact(&mut plaintext).unwrap();
+        plaintext
+    }
+
+    #[test]
+    fn custom_fragment_ciphertext_stays_within_admission_bound() {
+        let (mut table, mut peer) = custom_fragment_session();
+        let plaintext = vec![0x5a; 28];
+        let bound = table.ciphertext_capacity(0, plaintext.len()).unwrap();
+
+        let ciphertext = encrypt_for_send_mio(&mut table, 0, &plaintext).unwrap();
+
+        assert!(ciphertext.len() <= bound);
+        assert_eq!(decrypt(&mut peer, &ciphertext, plaintext.len()), plaintext);
+    }
+
+    #[test]
+    fn bounded_pressure_returns_would_block_before_tls_mutation() {
+        let (mut table, mut peer) = custom_fragment_session();
+        let plaintext = vec![0xa5; 28];
+        let mut pool = SendCopyPool::new(2, 4096);
+        let (occupied, _, _) = pool.alloc_raw().unwrap();
+
+        let error = encrypt_for_send_mio_bounded(&mut table, &mut pool, 0, &plaintext)
+            .expect_err("one free slot cannot cover the conservative ciphertext bound");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        pool.release(occupied);
+        let (ciphertext, slots) =
+            encrypt_for_send_mio_bounded(&mut table, &mut pool, 0, &plaintext).unwrap();
+        assert_eq!(decrypt(&mut peer, &ciphertext, plaintext.len()), plaintext);
+        for slot in slots {
+            pool.release(slot);
+        }
     }
 }
