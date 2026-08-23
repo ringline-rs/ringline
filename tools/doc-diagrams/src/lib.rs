@@ -561,6 +561,11 @@ fn render_runtime() -> String {
     svg
 }
 
+fn paired_edge_offsets(midpoint: u32, separation: u32) -> (u32, u32) {
+    let half = separation / 2;
+    (midpoint - half, midpoint + half)
+}
+
 fn render_request_flow() -> String {
     let mut svg = canvas(1460, 880, "Ringline connection and request flow");
     text(
@@ -638,15 +643,32 @@ fn render_request_flow() -> String {
     );
     stage(&mut svg, 95, 760, 200, 66, "7", "parse + send", "#FBB4AE");
 
+    let (backend_upper, backend_lower) = paired_edge_offsets(595, 28);
+    let (parse_upper, parse_lower) = paired_edge_offsets(793, 24);
+
     arrow(&mut svg, 1100, 208, 955, 208, "accepted fd");
     arrow(&mut svg, 655, 225, 575, 300, "generation-tagged ConnCtx");
     arrow(&mut svg, 475, 336, 195, 365, "established");
     arrow(&mut svg, 295, 398, 375, 493, "await bytes");
-    arrow(&mut svg, 575, 493, 655, 595, "arm receive");
-    arrow(&mut svg, 955, 595, 1090, 595, "SQE / interest");
-    arrow(&mut svg, 1090, 625, 955, 625, "CQE / readiness");
-    arrow(&mut svg, 655, 615, 575, 698, "completion");
-    arrow(&mut svg, 375, 698, 295, 793, "ready task");
+    arrow(&mut svg, 575, 493, 655, backend_upper, "arm receive");
+    arrow(
+        &mut svg,
+        955,
+        backend_upper,
+        1090,
+        backend_upper,
+        "SQE / interest",
+    );
+    arrow(
+        &mut svg,
+        1090,
+        backend_lower,
+        955,
+        backend_lower,
+        "CQE / readiness",
+    );
+    arrow(&mut svg, 655, backend_lower, 575, 698, "completion");
+    arrow(&mut svg, 375, 698, 295, parse_upper, "ready task");
 
     queue(
         &mut svg,
@@ -656,7 +678,7 @@ fn render_request_flow() -> String {
         62,
         "per-connection ordered send queue",
     );
-    arrow(&mut svg, 295, 810, 650, 756, "response");
+    arrow(&mut svg, 295, parse_lower, 650, 756, "response");
     arrow(&mut svg, 960, 756, 1090, 756, "one send in flight");
     external_box(&mut svg, 1090, 710, 250, 95, "peer socket");
     centered(
@@ -840,6 +862,17 @@ mod tests {
         assert!(
             reverse.contains("x=\"150\" y=\"87\" text-anchor=\"middle\" data-role=\"arrow-label\"")
         );
+    }
+
+    #[test]
+    fn paired_connectors_are_symmetric_around_edge_midpoint() {
+        assert_eq!(paired_edge_offsets(595, 28), (581, 609));
+        assert_eq!(paired_edge_offsets(793, 24), (781, 805));
+
+        let diagram = render_request_flow();
+        for coordinate in ["y2=\"581\"", "y1=\"609\"", "y2=\"781\"", "y1=\"805\""] {
+            assert!(diagram.contains(coordinate), "missing {coordinate}");
+        }
     }
 
     #[test]
