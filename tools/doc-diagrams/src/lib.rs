@@ -1,0 +1,813 @@
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+pub struct DiagramSet {
+    pub runtime: String,
+    pub request_flow: String,
+}
+
+struct Claim {
+    path: &'static str,
+    needle: &'static str,
+    meaning: &'static str,
+}
+
+const CLAIMS: &[Claim] = &[
+    Claim {
+        path: "ringline/src/worker.rs",
+        needle: "crossbeam_channel::bounded::<(RawFd, SocketAddr)>",
+        meaning: "bounded accepted-fd queue",
+    },
+    Claim {
+        path: "ringline/src/worker.rs",
+        needle: ".name(format!(\"ringline-worker-{worker_id}\"))",
+        meaning: "literal worker thread name",
+    },
+    Claim {
+        path: "ringline/src/worker.rs",
+        needle: ".name(\"ringline-acceptor\".to_string())",
+        meaning: "literal acceptor thread name",
+    },
+    Claim {
+        path: "ringline/src/worker.rs",
+        needle: "event_loop.prepare_run()",
+        meaning: "workers prepare before launch commits",
+    },
+    Claim {
+        path: "ringline/src/acceptor.rs",
+        needle: "try_send((fd, peer_addr))",
+        meaning: "acceptor never blocks on a full worker queue",
+    },
+    Claim {
+        path: "ringline/src/acceptor.rs",
+        needle: "config.worker_wake_handles[worker_idx].wake()",
+        meaning: "acceptor wakes the selected worker",
+    },
+    Claim {
+        path: "ringline/src/backend/uring/ring.rs",
+        needle: "submit_and_wait(&self, min_complete: u32)",
+        meaning: "io_uring submit/completion boundary",
+    },
+    Claim {
+        path: "ringline/src/backend/uring/event_loop.rs",
+        needle: "fn spawn_accept_task",
+        meaning: "io_uring connection task creation",
+    },
+    Claim {
+        path: "ringline/src/backend/mio/event_loop.rs",
+        needle: "fn spawn_accept_task",
+        meaning: "Mio connection task creation",
+    },
+    Claim {
+        path: "ringline/src/backend/mio/event_loop.rs",
+        needle: ".poll(&mut self.driver.events",
+        meaning: "Mio readiness wait",
+    },
+    Claim {
+        path: "ringline/src/runtime/io.rs",
+        needle: "pub fn with_data<F:",
+        meaning: "buffered receive API",
+    },
+    Claim {
+        path: "ringline/src/runtime/mod.rs",
+        needle: "pub(crate) fn wake_recv",
+        meaning: "receive completion wakes task owner",
+    },
+    Claim {
+        path: "ringline/src/handler.rs",
+        needle: "pub queue: VecDeque<BuiltSend>",
+        meaning: "per-connection ordered send queue",
+    },
+    Claim {
+        path: "ringline/src/handler.rs",
+        needle: "pub in_flight: bool",
+        meaning: "one in-flight send per connection",
+    },
+    Claim {
+        path: "ringline/src/tls.rs",
+        needle: "HandshakeJustCompleted",
+        meaning: "TLS handshake gates application task",
+    },
+    Claim {
+        path: "ringline/src/wakeup.rs",
+        needle: "pub(crate) fn create_wake_fd",
+        meaning: "cross-thread wake endpoint",
+    },
+    Claim {
+        path: "ringline/src/backend/mio/event_loop.rs",
+        needle: "DiskIoPool::start(",
+        meaning: "Mio disk I/O pool creation",
+    },
+    Claim {
+        path: "ringline/src/disk_io_pool.rs",
+        needle: ".name(format!(\"ringline-disk-io-{i}\"))",
+        meaning: "literal Mio disk I/O thread name",
+    },
+    Claim {
+        path: "ringline/src/disk_io_pool.rs",
+        needle: "req.wake_handle.wake()",
+        meaning: "Mio disk I/O response wake",
+    },
+    Claim {
+        path: "ringline/build.rs",
+        needle: "cargo:rustc-cfg=has_io_uring",
+        meaning: "compile-time backend selection",
+    },
+];
+
+pub fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("tool crate must be two levels below workspace root")
+        .to_path_buf()
+}
+
+pub fn verify_source_claims(root: &Path) -> io::Result<()> {
+    for claim in CLAIMS {
+        let path = root.join(claim.path);
+        let source = fs::read_to_string(&path)?;
+        if !source.contains(claim.needle) {
+            return Err(io::Error::other(format!(
+                "diagram claim drifted: {} ({}) no longer contains {:?}",
+                claim.meaning,
+                path.display(),
+                claim.needle
+            )));
+        }
+    }
+
+    let build = fs::read_to_string(root.join("ringline/build.rs"))?;
+    if !build.contains("target_os == \"linux\"") || !build.contains("CARGO_FEATURE_FORCE_MIO") {
+        return Err(io::Error::other(
+            "backend diagram requires Linux and force-mio compile-time selection",
+        ));
+    }
+
+    let worker = fs::read_to_string(root.join("ringline/src/worker.rs"))?;
+    require_order(
+        &worker,
+        "startup_rx.recv()",
+        "create_listener(addr, self.config.backlog)",
+        "every worker reports readiness before the TCP listener is created",
+    )?;
+    require_order(
+        &worker,
+        "create_listener(addr, self.config.backlog)",
+        ".name(\"ringline-acceptor\".to_string())",
+        "the listener is created before the acceptor thread starts",
+    )?;
+
+    let runtime = fs::read_to_string(root.join("ringline/src/runtime/mod.rs"))?;
+    require_order_after(
+        &runtime,
+        "pub(crate) fn wake_recv",
+        "self.owner_task[idx].unwrap_or(conn_index)",
+        "self.wake_task(task_id)",
+        "receive wake resolves and wakes the owning task",
+    )?;
+
+    let uring_loop = fs::read_to_string(root.join("ringline/src/backend/uring/event_loop.rs"))?;
+    let mio_loop = fs::read_to_string(root.join("ringline/src/backend/mio/event_loop.rs"))?;
+    for (source, backend) in [(&uring_loop, "io_uring"), (&mio_loop, "Mio")] {
+        require_order_after(
+            source,
+            "TlsRecvResult::HandshakeJustCompleted",
+            "cs.established = true",
+            "self.spawn_accept_task(conn_index)",
+            &format!("{backend} TLS handshake gates the accepted task"),
+        )?;
+        require_order_after(
+            source,
+            "// Drain DNS resolve responses.",
+            "rx.try_recv()",
+            "deliver_resolve",
+            &format!("{backend} resolver responses return through the worker loop"),
+        )?;
+        require_order_after(
+            source,
+            "// Drain process spawn responses.",
+            "rx.try_recv()",
+            "deliver_spawn",
+            &format!("{backend} spawn responses return through the worker loop"),
+        )?;
+        require_order_after(
+            source,
+            "// Drain blocking responses.",
+            "rx.try_recv()",
+            "deliver_blocking",
+            &format!("{backend} blocking responses return through the worker loop"),
+        )?;
+    }
+    require_order_after(
+        &mio_loop,
+        "if let Some(ref rx) = self.driver.disk_io_rx",
+        "rx.try_recv()",
+        "response.seq",
+        "Mio drains disk I/O responses in the worker loop",
+    )?;
+    require_order_after(
+        &uring_loop,
+        "pub(crate) fn run",
+        "submit_and_wait(min_complete)",
+        "self.drain_completions()",
+        "io_uring waits for and then drains completions",
+    )?;
+    require_order_after(
+        &uring_loop,
+        "fn handle_close",
+        "self.executor.remove_connection(conn_index)",
+        "self.driver.connections.release(conn_index)",
+        "io_uring removes the task before recycling the connection slot",
+    )?;
+    require_order_after(
+        &mio_loop,
+        "pub(crate) fn run",
+        ".poll(&mut self.driver.events",
+        "for event in self.driver.events.iter()",
+        "Mio polls before dispatching readiness events",
+    )?;
+    require_order_after(
+        &mio_loop,
+        "fn drain_pending_closes",
+        "self.executor.remove_connection(conn_index)",
+        "self.driver.finish_close(conn_index)",
+        "Mio removes the task before backend close and slot recycling",
+    )?;
+    let mio_driver = fs::read_to_string(root.join("ringline/src/backend/mio/driver.rs"))?;
+    require_order_after(
+        &mio_driver,
+        "pub(crate) fn finish_close",
+        "self.tcp_streams[idx].take()",
+        "self.connections.release(conn_index)",
+        "Mio closes the socket before recycling the connection slot",
+    )?;
+
+    let manifest = fs::read_to_string(root.join("ringline/Cargo.toml"))?;
+    if manifest.contains("crossbeam-deque") {
+        return Err(io::Error::other(
+            "runtime diagram assumes no work-stealing deque dependency",
+        ));
+    }
+    Ok(())
+}
+
+fn require_order(source: &str, before: &str, after: &str, meaning: &str) -> io::Result<()> {
+    let before_pos = source.find(before).ok_or_else(|| {
+        io::Error::other(format!(
+            "diagram claim drifted: missing {before:?} ({meaning})"
+        ))
+    })?;
+    let after_pos = source.find(after).ok_or_else(|| {
+        io::Error::other(format!(
+            "diagram claim drifted: missing {after:?} ({meaning})"
+        ))
+    })?;
+    if before_pos >= after_pos {
+        return Err(io::Error::other(format!(
+            "diagram claim drifted: expected {before:?} before {after:?} ({meaning})"
+        )));
+    }
+    Ok(())
+}
+
+fn require_order_after(
+    source: &str,
+    anchor: &str,
+    before: &str,
+    after: &str,
+    meaning: &str,
+) -> io::Result<()> {
+    let anchor_pos = source.find(anchor).ok_or_else(|| {
+        io::Error::other(format!(
+            "diagram claim drifted: missing anchor {anchor:?} ({meaning})"
+        ))
+    })?;
+    require_order(&source[anchor_pos..], before, after, meaning)
+}
+
+fn svg_number(node: roxmltree::Node<'_, '_>, attribute: &str) -> io::Result<f64> {
+    node.attribute(attribute)
+        .ok_or_else(|| {
+            io::Error::other(format!("SVG {} lacks {attribute}", node.tag_name().name()))
+        })?
+        .parse::<f64>()
+        .map_err(|error| io::Error::other(format!("invalid SVG {attribute}: {error}")))
+}
+
+fn validate_svg_geometry(svg: &str) -> io::Result<()> {
+    let document = roxmltree::Document::parse(svg)
+        .map_err(|error| io::Error::other(format!("invalid SVG XML: {error}")))?;
+    let root = document.root_element();
+    if root.tag_name().name() != "svg" {
+        return Err(io::Error::other("diagram root is not svg"));
+    }
+    let view_box: Vec<f64> = root
+        .attribute("viewBox")
+        .ok_or_else(|| io::Error::other("SVG lacks viewBox"))?
+        .split_whitespace()
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .map_err(|error| io::Error::other(format!("invalid SVG viewBox: {error}")))
+        })
+        .collect::<io::Result<_>>()?;
+    if view_box.len() != 4 || view_box[2] <= 0.0 || view_box[3] <= 0.0 {
+        return Err(io::Error::other(
+            "SVG viewBox must contain x y width height",
+        ));
+    }
+    let (min_x, min_y, max_x, max_y) = (
+        view_box[0],
+        view_box[1],
+        view_box[0] + view_box[2],
+        view_box[1] + view_box[3],
+    );
+    let bounded = |value: f64, low: f64, high: f64| value >= low && value <= high;
+    let check = |name: &str, left: f64, top: f64, right: f64, bottom: f64| {
+        if bounded(left, min_x, max_x)
+            && bounded(right, min_x, max_x)
+            && bounded(top, min_y, max_y)
+            && bounded(bottom, min_y, max_y)
+        {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "SVG {name} is outside viewBox: ({left}, {top})..({right}, {bottom})"
+            )))
+        }
+    };
+
+    for node in root.descendants().filter(|node| node.is_element()) {
+        match node.tag_name().name() {
+            "rect"
+                if node
+                    .attribute("width")
+                    .is_some_and(|value| value.ends_with('%')) => {}
+            "rect" => {
+                let x = svg_number(node, "x")?;
+                let y = svg_number(node, "y")?;
+                check(
+                    "rect",
+                    x,
+                    y,
+                    x + svg_number(node, "width")?,
+                    y + svg_number(node, "height")?,
+                )?;
+            }
+            "circle" => {
+                let x = svg_number(node, "cx")?;
+                let y = svg_number(node, "cy")?;
+                let radius = svg_number(node, "r")?;
+                check("circle", x - radius, y - radius, x + radius, y + radius)?;
+            }
+            "line" => {
+                let x1 = svg_number(node, "x1")?;
+                let y1 = svg_number(node, "y1")?;
+                let x2 = svg_number(node, "x2")?;
+                let y2 = svg_number(node, "y2")?;
+                check("line", x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2))?;
+            }
+            "text" => {
+                let x = svg_number(node, "x")?;
+                let y = svg_number(node, "y")?;
+                let size = svg_number(node, "font-size")?;
+                let estimated_width =
+                    node.text().unwrap_or_default().chars().count() as f64 * size * 0.62;
+                let (left, right) = if node.attribute("text-anchor") == Some("middle") {
+                    (x - estimated_width / 2.0, x + estimated_width / 2.0)
+                } else {
+                    (x, x + estimated_width)
+                };
+                check("text", left, y - size, right, y + size * 0.25)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub fn render_all(root: &Path) -> io::Result<DiagramSet> {
+    verify_source_claims(root)?;
+    let diagrams = DiagramSet {
+        runtime: render_runtime(),
+        request_flow: render_request_flow(),
+    };
+    validate_svg_geometry(&diagrams.runtime)?;
+    validate_svg_geometry(&diagrams.request_flow)?;
+    Ok(diagrams)
+}
+
+pub fn write_all(root: &Path, check: bool) -> io::Result<()> {
+    let diagrams = render_all(root)?;
+    let output = root.join("docs/diagrams");
+    let files = [
+        (output.join("runtime.svg"), diagrams.runtime),
+        (output.join("request-flow.svg"), diagrams.request_flow),
+    ];
+
+    if check {
+        for (path, expected) in files {
+            let actual = fs::read_to_string(&path)?;
+            if actual != expected {
+                return Err(io::Error::other(format!(
+                    "{} is stale; run cargo run -p doc-diagrams",
+                    path.display()
+                )));
+            }
+        }
+    } else {
+        fs::create_dir_all(output)?;
+        for (path, contents) in files {
+            fs::write(path, contents)?;
+        }
+    }
+    Ok(())
+}
+
+fn render_runtime() -> String {
+    let mut svg = canvas(1280, 760, "Ringline runtime topology");
+    text(
+        &mut svg,
+        50,
+        55,
+        "Runtime startup and connection ownership",
+        28,
+        false,
+    );
+    text(
+        &mut svg,
+        50,
+        84,
+        "Workers become ready before the listener exists.",
+        16,
+        false,
+    );
+
+    external_box(&mut svg, 60, 135, 190, 70, "caller / application");
+    box_(
+        &mut svg,
+        310,
+        125,
+        220,
+        90,
+        "RinglineBuilder",
+        "#CCEBC5",
+        false,
+    );
+    arrow(&mut svg, 250, 170, 310, 170, "launch");
+
+    box_(
+        &mut svg,
+        610,
+        105,
+        250,
+        70,
+        "prepare N workers",
+        "#CCEBC5",
+        false,
+    );
+    box_(
+        &mut svg,
+        610,
+        205,
+        250,
+        70,
+        "bind + listen",
+        "#CCEBC5",
+        false,
+    );
+    arrow(&mut svg, 530, 170, 610, 140, "spawn");
+    arrow(&mut svg, 735, 175, 735, 205, "all ready");
+
+    box_(
+        &mut svg,
+        935,
+        205,
+        260,
+        70,
+        "ringline-acceptor",
+        "#F2F2F2",
+        true,
+    );
+    arrow(&mut svg, 860, 240, 935, 240, "listener fd");
+    external_box(&mut svg, 935, 105, 260, 60, "network peers");
+    arrow(&mut svg, 1065, 165, 1065, 205, "TCP bytes");
+
+    queue(&mut svg, 930, 345, 270, 62, "bounded fd queue + wake");
+    arrow(&mut svg, 1065, 275, 1065, 345, "try_send + wake");
+
+    box_(
+        &mut svg,
+        540,
+        470,
+        660,
+        190,
+        "ringline-worker-i",
+        "#F2F2F2",
+        true,
+    );
+    box_(
+        &mut svg,
+        575,
+        520,
+        180,
+        80,
+        "backend Driver",
+        "#CCEBC5",
+        false,
+    );
+    box_(&mut svg, 780, 520, 170, 80, "Executor", "#CCEBC5", false);
+    box_(
+        &mut svg,
+        975,
+        520,
+        190,
+        80,
+        "handler instance",
+        "#FBB4AE",
+        false,
+    );
+    arrow(&mut svg, 1065, 407, 1065, 470, "accepted fd");
+    arrow(&mut svg, 755, 560, 780, 560, "events");
+    arrow(&mut svg, 950, 560, 975, 560, "poll task");
+
+    box_(
+        &mut svg,
+        60,
+        470,
+        390,
+        190,
+        "optional auxiliary pools",
+        "#F2F2F2",
+        false,
+    );
+    text(&mut svg, 90, 520, "ringline-resolver-i", 17, true);
+    text(&mut svg, 90, 555, "ringline-spawner-i", 17, true);
+    text(&mut svg, 90, 590, "ringline-blocking-i", 17, true);
+    text(&mut svg, 90, 625, "ringline-disk-io-i (Mio)", 17, true);
+    arrow(&mut svg, 450, 565, 540, 565, "response queue + wake");
+
+    text(
+        &mut svg,
+        50,
+        720,
+        "No shared Driver • no work stealing • no cross-worker task migration",
+        16,
+        false,
+    );
+    svg.push_str("</svg>\n");
+    svg
+}
+
+fn render_request_flow() -> String {
+    let mut svg = canvas(1460, 880, "Ringline connection and request flow");
+    text(
+        &mut svg,
+        50,
+        55,
+        "One connection, one long-lived task",
+        28,
+        false,
+    );
+    text(
+        &mut svg,
+        50,
+        84,
+        "Backend events wake the owning task; they do not call application code directly.",
+        16,
+        false,
+    );
+
+    lane(&mut svg, 70, 125, 250, 680, "connection owner");
+    lane(&mut svg, 350, 125, 250, 680, "portable runtime");
+    lane(&mut svg, 630, 125, 350, 680, "backend");
+    lane(&mut svg, 1010, 125, 380, 680, "kernel / peer");
+
+    stage(
+        &mut svg,
+        655,
+        175,
+        300,
+        66,
+        "1",
+        "accept fd + allocate slot",
+        "#CCEBC5",
+    );
+    stage(
+        &mut svg,
+        375,
+        270,
+        200,
+        66,
+        "2",
+        "TLS handshake?",
+        "#CCEBC5",
+    );
+    stage(&mut svg, 95, 365, 200, 66, "3", "on_accept task", "#FBB4AE");
+    stage(
+        &mut svg,
+        375,
+        460,
+        200,
+        66,
+        "4",
+        "with_data / park",
+        "#FBB4AE",
+    );
+    stage(
+        &mut svg,
+        655,
+        555,
+        300,
+        80,
+        "5",
+        "io_uring: submit_and_wait + CQE\nMio: poll + readiness",
+        "#CCEBC5",
+    );
+    stage(
+        &mut svg,
+        375,
+        665,
+        200,
+        66,
+        "6",
+        "wake_recv + poll",
+        "#CCEBC5",
+    );
+    stage(&mut svg, 95, 760, 200, 66, "7", "parse + send", "#FBB4AE");
+
+    arrow(&mut svg, 1100, 208, 955, 208, "accepted fd");
+    arrow(&mut svg, 655, 225, 575, 300, "generation-tagged ConnCtx");
+    arrow(&mut svg, 475, 336, 195, 365, "established");
+    arrow(&mut svg, 295, 398, 375, 493, "await bytes");
+    arrow(&mut svg, 575, 493, 655, 595, "arm receive");
+    arrow(&mut svg, 955, 595, 1090, 595, "SQE / interest");
+    arrow(&mut svg, 1090, 625, 955, 625, "CQE / readiness");
+    arrow(&mut svg, 655, 615, 575, 698, "completion");
+    arrow(&mut svg, 375, 698, 295, 793, "ready task");
+
+    queue(
+        &mut svg,
+        650,
+        725,
+        310,
+        62,
+        "per-connection ordered send queue",
+    );
+    arrow(&mut svg, 295, 810, 650, 756, "response");
+    arrow(&mut svg, 960, 756, 1090, 756, "one send in flight");
+    external_box(&mut svg, 1090, 710, 250, 95, "peer socket");
+    centered(
+        &mut svg,
+        730,
+        850,
+        "return/panic → deferred close → slot generation increments",
+        15,
+        false,
+    );
+    svg.push_str("</svg>\n");
+    svg
+}
+
+fn canvas(width: u32, height: u32, title: &str) -> String {
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\" role=\"img\" aria-labelledby=\"title desc\">\n<title id=\"title\">{}</title>\n<desc id=\"desc\">Generated from assertions against Ringline source code.</desc>\n<defs><marker id=\"arrow\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M 0 0 L 10 5 L 0 10 z\" fill=\"#4D4D4D\"/></marker></defs>\n<rect width=\"100%\" height=\"100%\" fill=\"white\"/>\n",
+        escape(title)
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn box_(svg: &mut String, x: u32, y: u32, w: u32, h: u32, label: &str, fill: &str, literal: bool) {
+    svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" rx=\"12\" fill=\"{fill}\" stroke=\"#4D4D4D\" stroke-width=\"1.4\"/>\n"));
+    centered(svg, x + w / 2, y + h / 2 + 6, label, 17, literal);
+}
+
+fn external_box(svg: &mut String, x: u32, y: u32, w: u32, h: u32, label: &str) {
+    svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" rx=\"12\" fill=\"white\" stroke=\"#4D4D4D\" stroke-width=\"2.4\" stroke-dasharray=\"8 5\"/>\n"));
+    centered(svg, x + w / 2, y + h / 2 + 6, label, 17, false);
+}
+
+fn queue(svg: &mut String, x: u32, y: u32, w: u32, h: u32, label: &str) {
+    svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" fill=\"#EDEDED\" stroke=\"#4D4D4D\" stroke-width=\"1.4\"/>\n"));
+    for i in 1..6 {
+        let xx = x + (w * i / 6);
+        svg.push_str(&format!(
+            "<line x1=\"{xx}\" y1=\"{y}\" x2=\"{xx}\" y2=\"{}\" stroke=\"#9E9E9E\"/>\n",
+            y + h
+        ));
+    }
+    centered(svg, x + w / 2, y + h / 2 + 6, label, 15, false);
+}
+
+fn lane(svg: &mut String, x: u32, y: u32, w: u32, h: u32, label: &str) {
+    svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" fill=\"#F7F7F7\" stroke=\"#BDBDBD\"/>\n"));
+    centered(svg, x + w / 2, y + 30, label, 17, false);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage(svg: &mut String, x: u32, y: u32, w: u32, h: u32, number: &str, label: &str, fill: &str) {
+    svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" rx=\"12\" fill=\"{fill}\" stroke=\"#4D4D4D\" stroke-width=\"1.4\"/>\n"));
+    svg.push_str(&format!(
+        "<circle cx=\"{}\" cy=\"{}\" r=\"15\" fill=\"white\" stroke=\"#4D4D4D\"/>\n",
+        x + 25,
+        y + 25
+    ));
+    centered(svg, x + 25, y + 31, number, 14, false);
+    for (i, line) in label.split('\n').enumerate() {
+        centered(
+            svg,
+            x + w / 2 + 12,
+            y + h / 2 + 6 + (i as u32 * 20),
+            line,
+            15,
+            false,
+        );
+    }
+}
+
+fn arrow(svg: &mut String, x1: u32, y1: u32, x2: u32, y2: u32, label: &str) {
+    svg.push_str(&format!("<line x1=\"{x1}\" y1=\"{y1}\" x2=\"{x2}\" y2=\"{y2}\" stroke=\"#4D4D4D\" stroke-width=\"1.4\" marker-end=\"url(#arrow)\"/>\n"));
+    if !label.is_empty() {
+        text(svg, (x1 + x2) / 2, (y1 + y2) / 2 - 8, label, 13, false);
+    }
+}
+
+fn centered(svg: &mut String, x: u32, y: u32, label: &str, size: u32, literal: bool) {
+    let family = if literal { "monospace" } else { "sans-serif" };
+    svg.push_str(&format!("<text x=\"{x}\" y=\"{y}\" text-anchor=\"middle\" font-family=\"{family}\" font-size=\"{size}\" fill=\"#222\">{}</text>\n", escape(label)));
+}
+
+fn text(svg: &mut String, x: u32, y: u32, label: &str, size: u32, literal: bool) {
+    let family = if literal { "monospace" } else { "sans-serif" };
+    svg.push_str(&format!("<text x=\"{x}\" y=\"{y}\" font-family=\"{family}\" font-size=\"{size}\" fill=\"#222\">{}</text>\n", escape(label)));
+}
+
+fn escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_claims_match_ringline_runtime() {
+        let root = workspace_root();
+        verify_source_claims(&root).unwrap();
+    }
+
+    #[test]
+    fn generated_diagrams_are_stable_and_complete() {
+        let root = workspace_root();
+        let first = render_all(&root).unwrap();
+        let second = render_all(&root).unwrap();
+        assert_eq!(first.runtime, second.runtime);
+        assert_eq!(first.request_flow, second.request_flow);
+        assert!(first.runtime.contains("ringline-acceptor"));
+        assert!(first.runtime.contains("ringline-worker-i"));
+        assert!(first.request_flow.contains("submit_and_wait"));
+        assert!(first.request_flow.contains("on_accept"));
+        assert_eq!(first.runtime.matches("<svg").count(), 1);
+        assert_eq!(first.runtime.matches("</svg>").count(), 1);
+        assert_eq!(first.request_flow.matches("<svg").count(), 1);
+        assert_eq!(first.request_flow.matches("</svg>").count(), 1);
+    }
+
+    #[test]
+    fn ordered_claims_reject_semantic_drift() {
+        let source = "anchor then after then before";
+        assert!(require_order_after(source, "anchor", "before", "after", "test").is_err());
+        assert!(
+            require_order_after("anchor before after", "anchor", "before", "after", "test").is_ok()
+        );
+    }
+
+    #[test]
+    fn generated_diagrams_are_valid_svg_with_bounded_geometry() {
+        let diagrams = render_all(&workspace_root()).unwrap();
+        validate_svg_geometry(&diagrams.runtime).unwrap();
+        validate_svg_geometry(&diagrams.request_flow).unwrap();
+
+        let off_canvas = diagrams.runtime.replace("x=\"60\"", "x=\"9999\"");
+        assert!(validate_svg_geometry(&off_canvas).is_err());
+        assert!(validate_svg_geometry("<svg>").is_err());
+    }
+    #[test]
+    fn rendered_mio_disk_pool_has_source_claims() {
+        for meaning in [
+            "Mio disk I/O pool creation",
+            "literal Mio disk I/O thread name",
+            "Mio disk I/O response wake",
+        ] {
+            assert!(
+                CLAIMS.iter().any(|claim| claim.meaning == meaning),
+                "missing source claim for {meaning}"
+            );
+        }
+    }
+}

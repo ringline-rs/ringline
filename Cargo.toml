@@ -12,6 +12,7 @@ members = [
     "ringline-http",
     "ringline-bench",
     "ringline-benchmarks",
+    "tools/doc-diagrams",
 ]
 # The fuzz harness is its own workspace (nightly-only, own lockfile) so it
 # cannot perturb --locked CI for the main workspace.

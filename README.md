@@ -1,21 +1,20 @@
 # ringline
 
-**io_uring-native async I/O runtime for Linux.**
+**Thread-per-core async I/O with an io_uring backend for Linux and a portable
+Mio backend.**
 
-ringline is a thread-per-core I/O framework built directly on io_uring.
-It provides an async/await API (`AsyncEventHandler`) on a single-threaded
-executor with no work-stealing.
+ringline is a thread-per-core I/O framework. It provides an async/await API
+(`AsyncEventHandler`) on a single-threaded executor with no work-stealing.
 
 ## What ringline is
 
-- An io_uring-native runtime that exploits advanced kernel features: multishot
+- An io_uring backend that exploits advanced kernel features: multishot
   recv, ring-provided buffers, SendMsgZc (zero-copy send), fixed file table
+- A Mio backend for non-Linux targets and Linux builds using `force-mio`
 - Thread-per-core with CPU pinning — no work-stealing, no task migration
-- Linux 6.0+ only — no epoll/kqueue/IOCP fallback, no portability tax
 
 ## What ringline is NOT
 
-- A cross-platform runtime (Linux only, io_uring required)
 - A Tokio replacement (different abstractions, not API-compatible)
 - A general-purpose task scheduler (all tasks are `!Send`, pinned to cores)
 
@@ -53,6 +52,12 @@ fn main() -> Result<(), ringline::Error> {
 
 ## Architecture
 
+For the code-derived runtime and request lifecycle diagrams, see
+[Architecture](docs/architecture.md). For the technology tradeoffs behind the
+Linux backend, see [Why consider io_uring?](docs/io-uring-primer.md).
+
+The io_uring backend has this worker-local shape:
+
 ```
                       ┌─────────────────────────────┐
                       │        Acceptor Thread       │
@@ -73,12 +78,13 @@ fn main() -> Result<(), ringline::Error> {
    └─────────────┘       └─────────────┘       └─────────────┘
 ```
 
-Each worker thread owns:
+Each worker thread owns its backend driver, executor, connection table, and
+handler instance. On the io_uring backend, each worker also owns:
+
 - A dedicated **io_uring** instance (SQ + CQ)
 - A **ring-provided buffer pool** for recv (kernel selects buffers at completion time)
 - A **send copy pool** for small sends and a **send slab** for scatter-gather zero-copy sends
 - A **fixed file table** for O(1) fd lookups (no per-syscall fd table traversal)
-- A **connection table** with generation-based stale detection
 
 ## io_uring Features Used
 
@@ -120,8 +126,9 @@ Each worker thread owns:
 
 ## Platform Requirements
 
-- **Linux 6.0+** (io_uring with required features)
-- **x86_64** or **ARM64**
+- The io_uring backend requires **Linux 6.0+** on **x86_64** or **ARM64**.
+- Other supported Unix targets use Mio. Linux builds can select Mio with
+  `--features force-mio`.
 
 ## MSRV
 

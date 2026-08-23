@@ -26,6 +26,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  doc-diagrams:
+    name: Documentation diagrams
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --locked -p doc-diagrams -- --check
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
