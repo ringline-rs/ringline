@@ -71,6 +71,14 @@ No runtime behavior changes are in scope.
   viewer because its sandbox failed before loading either SVG. XML validation,
   viewport-bound checks, deterministic hashes, and an independent human review
   cover that step instead.
+- **Friction** — Text placed beside shapes or along arrow paths is often not
+  visually balanced: labels can be off-center, too close to borders, or cross
+  nearby shapes and connectors even when every element remains inside the SVG
+  viewport. The skills should treat label layout as a first-class constraint:
+  use explicit anchors, center labels against their intended shape or segment,
+  enforce minimum padding from borders and arrow paths, and run collision checks
+  between text bounds, shapes, and connectors. Viewport-bound validation alone
+  does not catch these presentation defects.
 - **Confirmation** — Requiring exact source claims before rendering exposed
   three incorrect source markers during the first test run. The resulting
   generator now fails at the architecture boundary rather than producing a
