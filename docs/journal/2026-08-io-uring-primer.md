@@ -79,6 +79,15 @@ No runtime behavior changes are in scope.
   enforce minimum padding from borders and arrow paths, and run collision checks
   between text bounds, shapes, and connectors. Viewport-bound validation alone
   does not catch these presentation defects.
+- **Friction** — Connector attachment points are often chosen independently,
+  which produces an unbalanced edge when several arrows enter or leave the same
+  shape: one arrow remains centered while the others are pushed to one side.
+  The skills should lay out connectors per edge as a group. A single connector
+  belongs at the midpoint; two should receive equal offsets on either side of
+  the midpoint; larger sets should be distributed evenly and symmetrically,
+  while preserving corner padding and enough separation for arrowheads and
+  labels. This grouped-edge rule should be part of routing and collision checks,
+  rather than left to manual coordinate adjustment.
 - **Confirmation** — Requiring exact source claims before rendering exposed
   three incorrect source markers during the first test run. The resulting
   generator now fails at the architecture boundary rather than producing a
