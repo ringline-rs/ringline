@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `ringline` (core): `ConnCtx::with_data_result` exposes terminal transport
+  receive errors without changing `with_data` EOF compatibility.
+- `ringline` (core): `ConnCtx::send_backpressured` provides FIFO, cancel-safe
+  copied-send admission bounded by the configured send-copy pool on both Mio
+  and io_uring backends.
+
+### Fixed
+
+- `ringline` (core): worker setup errors and panic payloads are preserved through
+  launch rollback, and bounded logical sends retain exact identity and resource
+  ownership across partial writes, cancellation, half-close, and teardown.
+
 ## [0.5.5] - 2026-08-19
 
 Coordinated client release picking up parser fixes from the protocol crates.

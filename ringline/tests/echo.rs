@@ -2714,6 +2714,406 @@ fn async_join_basic() {
     }
 }
 
+/// Two logical sends contend for a one-slot copy pool. The second future must
+/// park until the first send releases its slot, then resume without the caller
+/// retrying (which could duplicate a response prefix).
+struct BackpressuredJoinHandler;
+
+impl AsyncEventHandler for BackpressuredJoinHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            let first = conn.send_backpressured(b"FIRST---");
+            let second = conn.send_backpressured(b"SECOND--");
+            let (first, second) = ringline::join(first, second).await;
+            assert_eq!(first.expect("first send failed"), 8);
+            assert_eq!(second.expect("second send failed"), 8);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BackpressuredJoinHandler
+    }
+}
+
+#[test]
+fn backpressured_send_waits_for_pool_capacity_without_duplication() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(1, 8)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BackpressuredJoinHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+
+    let mut received = [0; 16];
+    stream.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"FIRST---SECOND--");
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+/// Constructing and moving a bounded-send future must not reserve a FIFO
+/// position. An unpolled future may be retained while later work completes.
+struct BackpressuredLazyConstructionHandler;
+
+impl AsyncEventHandler for BackpressuredLazyConstructionHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            if conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await
+                == 0
+            {
+                return;
+            }
+
+            let unpolled = conn.send_backpressured(b"BLOCKED-");
+            let moved_without_poll = Some(unpolled);
+            assert_eq!(
+                conn.send_backpressured(b"ACTIVE--")
+                    .await
+                    .expect("active send blocked behind an unpolled future"),
+                8
+            );
+            drop(moved_without_poll);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BackpressuredLazyConstructionHandler
+    }
+}
+
+#[test]
+fn backpressured_send_construction_is_lazy_and_unpolled_drop_is_inert() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(1, 8)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BackpressuredLazyConstructionHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+    let mut received = [0; 8];
+    stream.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"ACTIVE--");
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+/// Moving an unpolled future into a standalone task must register that
+/// polling task, not the connection task that happened to construct it.
+struct BackpressuredMovedFutureHandler;
+
+impl AsyncEventHandler for BackpressuredMovedFutureHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            if conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await
+                == 0
+            {
+                return;
+            }
+
+            let mut first = Box::pin(conn.send_backpressured(b"FIRST---"));
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            let moved = conn.send_backpressured(b"MOVED---");
+            let moved = ringline::spawn_with_handle(moved).expect("standalone spawn failed");
+            let (first_result, moved_result) = ringline::join(first, moved).await;
+            assert_eq!(first_result.expect("first send failed"), 8);
+            assert_eq!(moved_result.expect("moved send failed"), 8);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BackpressuredMovedFutureHandler
+    }
+}
+
+#[test]
+fn backpressured_send_registers_the_first_polling_task_after_move() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(1, 8)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BackpressuredMovedFutureHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+    let mut received = [0; 16];
+    stream.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"FIRST---MOVED---");
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+/// Moving a bounded-send future after its first poll transfers responsibility
+/// for every later capacity/completion wake to the task that most recently
+/// polled it on this worker.
+static REPOLLED_MOVED_SEND_COMPLETED: AtomicU32 = AtomicU32::new(0);
+
+struct BackpressuredRepollMovedFutureHandler;
+
+impl AsyncEventHandler for BackpressuredRepollMovedFutureHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            if conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await
+                == 0
+            {
+                return;
+            }
+
+            let mut moved = Box::pin(conn.send_backpressured(b"MOVED---"));
+            std::future::poll_fn(|cx| {
+                assert!(moved.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            let moved = ringline::spawn_with_handle(moved).expect("standalone spawn failed");
+            assert_eq!(moved.await.expect("moved send failed"), 8);
+            REPOLLED_MOVED_SEND_COMPLETED.store(1, Ordering::Release);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BackpressuredRepollMovedFutureHandler
+    }
+}
+
+#[test]
+fn backpressured_send_refreshes_owner_after_first_poll_move() {
+    REPOLLED_MOVED_SEND_COMPLETED.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(1, 8)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BackpressuredRepollMovedFutureHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+    let mut received = [0; 8];
+    stream.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"MOVED---");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while REPOLLED_MOVED_SEND_COMPLETED.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        REPOLLED_MOVED_SEND_COMPLETED.load(Ordering::Acquire),
+        1,
+        "completion woke the task that polled the future before it moved"
+    );
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+/// A completion belongs to the logical send that submitted it even if that
+/// future is canceled. It must not resolve a newer future on the connection.
+static CANCELED_SUBMISSION_RESULT: AtomicU32 = AtomicU32::new(0);
+
+struct BackpressuredCanceledSubmissionHandler;
+
+impl AsyncEventHandler for BackpressuredCanceledSubmissionHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            if conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await
+                == 0
+            {
+                return;
+            }
+
+            let mut canceled = Box::pin(conn.send_backpressured(b"CANCELED"));
+            std::future::poll_fn(|cx| {
+                assert!(canceled.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(canceled);
+
+            let sent = conn
+                .send_backpressured(b"NEXT")
+                .await
+                .expect("next logical send failed");
+            CANCELED_SUBMISSION_RESULT.store(if sent == 4 { 1 } else { 2 }, Ordering::Release);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BackpressuredCanceledSubmissionHandler
+    }
+}
+
+#[test]
+fn canceled_submitted_backpressured_send_cannot_complete_the_next_send() {
+    CANCELED_SUBMISSION_RESULT.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(1, 8)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BackpressuredCanceledSubmissionHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+    let mut received = [0; 12];
+    stream.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"CANCELEDNEXT");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while CANCELED_SUBMISSION_RESULT.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        CANCELED_SUBMISSION_RESULT.load(Ordering::Acquire),
+        1,
+        "stale completion resolved the next logical send"
+    );
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+/// An over-capacity logical response must fail before any prefix reaches the
+/// wire; a subsequent valid send proves that the connection and pool survive.
+struct BackpressuredOversizeHandler;
+
+impl AsyncEventHandler for BackpressuredOversizeHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            if n == 0 {
+                return;
+            }
+
+            let error = conn
+                .send_backpressured(b"TOO-LARGE")
+                .await
+                .expect_err("oversize send unexpectedly succeeded");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            conn.send_backpressured(b"SURVIVES")
+                .await
+                .expect("valid send after oversize failed");
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BackpressuredOversizeHandler
+    }
+}
+
+#[test]
+fn backpressured_send_rejects_oversize_before_writing() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(1, 8)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BackpressuredOversizeHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+
+    let mut received = [0; 8];
+    stream.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"SURVIVES");
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
 /// Handler that joins three futures: send_await + sleep + with_data.
 struct Join3Handler;
 
@@ -5259,5 +5659,246 @@ fn connection_task_panic_does_not_kill_worker() {
     for h in handles {
         // The worker should exit cleanly; the panic was caught.
         let _ = h.join();
+    }
+}
+
+#[cfg(unix)]
+static TRANSPORT_RECV_RESULT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(unix)]
+struct TransportRecvErrorHandler;
+
+#[cfg(unix)]
+impl AsyncEventHandler for TransportRecvErrorHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            let observed = match conn
+                .with_data_result(|data| ParseResult::Consumed(data.len()))
+                .await
+            {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    1
+                }
+                Err(_) => 2,
+                Ok(_) => 3,
+            };
+            TRANSPORT_RECV_RESULT.store(observed, Ordering::Release);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TransportRecvErrorHandler
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn with_data_result_surfaces_tcp_reset() {
+    use std::os::fd::AsRawFd;
+
+    TRANSPORT_RECV_RESULT.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .bind(addr.parse().unwrap())
+        .launch::<TransportRecvErrorHandler>()
+        .expect("launch failed");
+
+    let stream = (0..200)
+        .find_map(|_| match TcpStream::connect(&addr) {
+            Ok(stream) => Some(stream),
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(10));
+                None
+            }
+        })
+        .expect("server did not accept connection");
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let result = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&linger) as libc::socklen_t,
+        )
+    };
+    assert_eq!(result, 0, "setsockopt(SO_LINGER) failed");
+    drop(stream);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while TRANSPORT_RECV_RESULT.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(TRANSPORT_RECV_RESULT.load(Ordering::Acquire), 1);
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+static BACKPRESSURE_SHUTDOWN_ARMED: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(not(has_io_uring))]
+static BACKPRESSURE_HALF_CLOSE_STATE: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(not(has_io_uring))]
+struct BackpressureHalfCloseHandler;
+
+#[cfg(not(has_io_uring))]
+impl AsyncEventHandler for BackpressureHalfCloseHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            if conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await
+                == 0
+            {
+                return;
+            }
+
+            let mut submitted = Box::pin(conn.send_backpressured(b"FIRST---"));
+            std::future::poll_fn(|cx| {
+                assert!(submitted.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let mut queued = Box::pin(conn.send_backpressured(b"SECOND--"));
+            std::future::poll_fn(|cx| {
+                assert!(queued.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            BACKPRESSURE_HALF_CLOSE_STATE.store(1, Ordering::Release);
+
+            conn.shutdown_write();
+            let (submitted, queued) = ringline::join(submitted, queued).await;
+            let correct = matches!(submitted, Ok(8)) && queued.is_err();
+            BACKPRESSURE_HALF_CLOSE_STATE.store(if correct { 2 } else { 3 }, Ordering::Release);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BackpressureHalfCloseHandler
+    }
+}
+
+#[test]
+#[cfg(not(has_io_uring))]
+fn mio_half_close_completes_submitted_send_and_cancels_capacity_waiter() {
+    BACKPRESSURE_HALF_CLOSE_STATE.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(1, 8)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BackpressureHalfCloseHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+    let mut received = [0; 8];
+    stream.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"FIRST---");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while BACKPRESSURE_HALF_CLOSE_STATE.load(Ordering::Acquire) < 2
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        BACKPRESSURE_HALF_CLOSE_STATE.load(Ordering::Acquire),
+        2,
+        "half-close left a submitted or capacity-waiting bounded send stuck"
+    );
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+struct BackpressureShutdownHandler;
+
+impl AsyncEventHandler for BackpressureShutdownHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            if conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await
+                == 0
+            {
+                return;
+            }
+            let first_payload = vec![b'A'; 1024 * 1024];
+            let second_payload = vec![b'B'; 1024 * 1024];
+            let mut first = Box::pin(conn.send_backpressured(&first_payload));
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let mut second = Box::pin(conn.send_backpressured(&second_payload));
+            std::future::poll_fn(|cx| {
+                assert!(second.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            BACKPRESSURE_SHUTDOWN_ARMED.store(1, Ordering::Release);
+            let _ = ringline::join(first, second).await;
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        BackpressureShutdownHandler
+    }
+}
+
+#[test]
+fn shutdown_drops_parked_backpressured_send_without_hanging() {
+    BACKPRESSURE_SHUTDOWN_ARMED.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(1, 1024 * 1024)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<BackpressureShutdownHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream.write_all(b"go").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while BACKPRESSURE_SHUTDOWN_ARMED.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(BACKPRESSURE_SHUTDOWN_ARMED.load(Ordering::Acquire), 1);
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
     }
 }

@@ -365,7 +365,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let idx = conn_index as usize;
             self.driver.tcp_streams[idx] = Some(mio_stream);
             self.driver.accumulators.reset(conn_index);
-            self.driver.pending_sends[idx].clear();
+            self.driver.clear_pending_sends(idx);
             self.driver.writable[idx] = false;
 
             // TLS path: defer accept until handshake completes in handle_readable.
@@ -527,12 +527,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         self.driver.tcp_streams[idx] = Some(stream);
                         break;
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.driver.tcp_streams[idx] = Some(stream);
+                        let generation = self.driver.connections.generation(conn_index);
                         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                             cs.recv_mode = RecvMode::Closed;
                         }
-                        self.executor.wake_recv(conn_index);
+                        self.executor.fail_recv(conn_index, generation, error);
                         break;
                     }
                 };
@@ -660,12 +661,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;
                 }
-                Err(_) => {
-                    // Read error — mark as closed.
+                Err(error) => {
+                    // Preserve the exact non-WouldBlock transport error.
+                    let generation = self.driver.connections.generation(conn_index);
                     if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                         cs.recv_mode = RecvMode::Closed;
                     }
-                    self.executor.wake_recv(conn_index);
+                    self.executor.fail_recv(conn_index, generation, error);
                     break;
                 }
             }
@@ -743,7 +745,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Normal writable — mark writable and flush sends.
         self.driver.writable[idx] = true;
-        if let Err(e) = self.driver.flush_sends(conn_index) {
+        let flush_result = self.driver.flush_sends(conn_index);
+        self.executor.wake_send_capacity();
+        if let Err(e) = flush_result {
             self.fail_connection_on_send_error(conn_index, e);
         }
     }
@@ -754,7 +758,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// error was swallowed — the queue was retried every loop iteration
     /// forever while send().await had already reported success.
     fn fail_connection_on_send_error(&mut self, conn_index: u32, e: io::Error) {
-        self.driver.pending_sends[conn_index as usize].clear();
+        let bounded_ids = self.driver.pending_bounded_send_ids(conn_index as usize);
+        let error_kind = e.kind();
+        let error_message = e.to_string();
+        self.driver.clear_pending_sends(conn_index as usize);
+        self.executor.wake_send_capacity();
+        for id in bounded_ids {
+            self.executor
+                .complete_bounded_send(id, Err(io::Error::new(error_kind, error_message.clone())));
+        }
         self.executor.wake_send(conn_index, Err(e));
         self.executor.wake_recv(conn_index);
         self.driver.close_connection(conn_index);
@@ -883,11 +895,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Register writable interest so mio tells us when we can write.
             self.driver.register_writable(conn_index);
             // If we already know the socket is writable, try flushing now.
-            if self.driver.writable[idx]
-                && let Err(e) = self.driver.flush_sends(conn_index)
-            {
-                self.fail_connection_on_send_error(conn_index, e);
-                continue;
+            if self.driver.writable[idx] {
+                let flush_result = self.driver.flush_sends(conn_index);
+                self.executor.wake_send_capacity();
+                if let Err(e) = flush_result {
+                    self.fail_connection_on_send_error(conn_index, e);
+                    continue;
+                }
             }
             if !self.driver.pending_sends[idx].is_empty() && !self.driver.sends_dirty_flag[idx] {
                 self.driver.sends_dirty_flag[idx] = true;
@@ -915,6 +929,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn drain_send_completions(&mut self) {
         loop {
             let mut delivered = false;
+            while let Some((id, result)) = self.driver.bounded_send_completions.pop_front() {
+                self.executor.complete_bounded_send(id, result);
+                delivered = true;
+            }
             let dirty = std::mem::take(&mut self.driver.completions_dirty);
             for conn_index in dirty {
                 let idx = conn_index as usize;

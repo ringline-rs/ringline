@@ -806,6 +806,17 @@ impl ConnCtx {
         }
     }
 
+    /// Result-aware form of `with_data` that preserves non-WouldBlock
+    /// transport read failures. Clean EOF remains `Ok(0)`.
+    pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
+        &self,
+        f: F,
+    ) -> WithDataResultFuture<F> {
+        WithDataResultFuture {
+            inner: self.with_data(f),
+        }
+    }
+
     /// Wait until recv data is available, then provide it as zero-copy `Bytes`.
     ///
     /// Like [`with_data()`](Self::with_data), but the closure receives a `Bytes`
@@ -1425,6 +1436,25 @@ impl ConnCtx {
         })
     }
 
+    /// Send one logical buffer with bounded, FIFO copy-pool backpressure.
+    ///
+    /// Construction is inert. On its first poll, the future registers the
+    /// polling task in the worker-local FIFO. Unlike `send`, transient pool
+    /// pressure parks this future. The whole
+    /// logical buffer is admitted before submission, so callers never retry
+    /// and cannot duplicate or truncate a response. A buffer larger than the
+    /// configured pool capacity fails with `InvalidInput` before any bytes are
+    /// submitted.
+    pub fn send_backpressured<'a>(&self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
+        BackpressuredSendFuture {
+            conn_index: self.conn_index,
+            generation: self.generation,
+            registration: None,
+            data,
+            submitted: false,
+        }
+    }
+
     // ── Connect ──────────────────────────────────────────────────────
 
     /// Initiate an outbound TCP connection and await the result.
@@ -1541,9 +1571,13 @@ impl ConnCtx {
     ///
     /// Sends a TCP FIN to the peer. The read side remains open.
     pub fn shutdown_write(&self) {
-        with_state(|driver, _| {
-            let mut ctx = driver.make_ctx();
-            ctx.shutdown_write(self.token());
+        with_state(|driver, executor| {
+            executor.fail_bounded_capacity_for_connection(self.conn_index, self.generation);
+            {
+                let mut ctx = driver.make_ctx();
+                ctx.shutdown_write(self.token());
+            }
+            executor.wake_send_capacity();
         })
     }
 
@@ -2045,6 +2079,48 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
             executor.recv_waiters[self.conn_index as usize] = true;
             Poll::Pending
         })
+    }
+}
+
+/// Result-aware wrapper around [`WithDataFuture`].
+pub struct WithDataResultFuture<F> {
+    inner: WithDataFuture<F>,
+}
+
+impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataResultFuture<F> {
+    type Output = io::Result<usize>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let conn_index = self.inner.conn_index;
+        let generation = self.inner.generation;
+        let buffered = with_state(|driver, _executor| {
+            let accumulator_has_data = !driver.accumulators.is_empty(conn_index);
+            #[cfg(has_io_uring)]
+            let pending_has_data = driver.pending_recv_bufs[conn_index as usize].is_some();
+            #[cfg(not(has_io_uring))]
+            let pending_has_data = false;
+            accumulator_has_data || pending_has_data
+        });
+        if !buffered
+            && let Some(error) =
+                with_state(|_driver, executor| executor.take_recv_error(conn_index, generation))
+        {
+            return Poll::Ready(Err(error));
+        }
+
+        match Pin::new(&mut self.inner).poll(cx) {
+            Poll::Ready(0) => {
+                if let Some(error) =
+                    with_state(|_driver, executor| executor.take_recv_error(conn_index, generation))
+                {
+                    Poll::Ready(Err(error))
+                } else {
+                    Poll::Ready(Ok(0))
+                }
+            }
+            Poll::Ready(consumed) => Poll::Ready(Ok(consumed)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -3168,6 +3244,116 @@ impl Future for RecvReadyFuture {
 }
 
 // ── SendFuture ───────────────────────────────────────────────────────
+
+/// Future returned by [`ConnCtx::send_backpressured`]. It owns no bytes and
+/// does not register for capacity until first poll. The caller's slice is
+/// copied only after this waiter reaches the FIFO head and the configured send
+/// pool can admit the complete logical buffer. Once submitted, a unique
+/// operation ID routes its completion; dropping the future abandons only that
+/// operation.
+pub struct BackpressuredSendFuture<'a> {
+    conn_index: u32,
+    generation: u32,
+    registration: Option<super::SendCapacityRegistration>,
+    data: &'a [u8],
+    submitted: bool,
+}
+
+impl Future for BackpressuredSendFuture<'_> {
+    type Output = io::Result<u32>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let task_id = CURRENT_TASK_ID.with(|current| current.get());
+        if this.registration.is_none() {
+            this.registration = Some(with_state(|_driver, executor| {
+                executor.enqueue_send_capacity(this.conn_index, this.generation, task_id)
+            }));
+        }
+        let registration = this
+            .registration
+            .as_mut()
+            .expect("registered on first poll");
+        // This !Send future can move only between tasks on the same worker.
+        // Refresh before observing state so every later wake targets this poller.
+        registration.refresh_owner(task_id);
+        if let Some(result) = registration.take_result() {
+            return Poll::Ready(result);
+        }
+        with_state(|driver, executor| {
+            if driver.connections.generation(this.conn_index) != this.generation {
+                this.registration.take();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "connection closed",
+                )));
+            }
+
+            if this.submitted {
+                return this
+                    .registration
+                    .as_mut()
+                    .expect("submitted send retains its identity")
+                    .take_result()
+                    .map_or(Poll::Pending, Poll::Ready);
+            }
+
+            if this.data.is_empty() {
+                this.registration.take();
+                return Poll::Ready(Ok(0));
+            }
+
+            let slot_size = driver.send_copy_pool.slot_size() as usize;
+            let slot_count = driver.send_copy_pool.slot_count();
+            let total_capacity = slot_size.saturating_mul(slot_count);
+            if this.data.len() > total_capacity {
+                this.registration.take();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "logical send size {} exceeds send pool capacity {}",
+                        this.data.len(),
+                        total_capacity
+                    ),
+                )));
+            }
+
+            let waiter_id = this
+                .registration
+                .as_ref()
+                .expect("registered on first poll")
+                .id();
+            if !executor.send_capacity_turn(waiter_id) {
+                return Poll::Pending;
+            }
+            let required = this.data.len().div_ceil(slot_size);
+            if driver.send_copy_pool.free_count() < required {
+                return Poll::Pending;
+            }
+
+            let mut ctx = driver.make_ctx();
+            match ctx.send_backpressured(
+                ConnToken::new(this.conn_index, this.generation),
+                this.data,
+                waiter_id,
+            ) {
+                Ok(()) => {
+                    this.submitted = true;
+                    this.registration
+                        .as_mut()
+                        .expect("registered before submission")
+                        .admit();
+                    Poll::Pending
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+                Err(error) => {
+                    this.registration.take();
+                    Poll::Ready(Err(error))
+                }
+            }
+        })
+    }
+}
 
 /// Future that awaits send completion. The SQE was already submitted eagerly
 /// by [`ConnCtx::send`] — this future only waits for the CQE result.
