@@ -8164,6 +8164,66 @@ mod tests {
     }
 
     #[test]
+    fn submit_next_queued_sq_full_closes_torn_bounded_send() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        let mut registration = el
+            .executor
+            .enqueue_send_capacity(conn_index, generation, conn_index);
+        let operation_id = registration.id();
+        registration.admit();
+
+        let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(b"tail").unwrap();
+        el.driver
+            .send_copy_pool
+            .set_bounded_send_id(slot, Some(operation_id));
+        let free_before = el.driver.send_copy_pool.free_count();
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
+            .build()
+            .user_data(ud.raw());
+        el.driver.send_queues[conn_index as usize]
+            .queue
+            .push_back(crate::handler::BuiltSend {
+                entry,
+                pool_slot: slot,
+                slab_idx: u16::MAX,
+                total_len: len,
+            });
+        // The preceding chunk already completed; this queued tail is the
+        // continuation whose failed submission would otherwise tear the stream.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        // First failure rejects the queued tail. The second rejects the Close
+        // SQE, proving the terminal path reaches close retry scheduling.
+        el.driver.ring.force_push_failures(2);
+
+        el.driver.submit_next_queued(conn_index);
+
+        assert_eq!(el.driver.send_copy_pool.free_count(), free_before + 1);
+        assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
+        assert!(!el.driver.send_queues[conn_index as usize].in_flight);
+        assert_eq!(
+            el.driver.pending_close_retries,
+            vec![(conn_index, 0)],
+            "terminal queue failure did not schedule connection close retry"
+        );
+        let (failed_id, error) = el
+            .driver
+            .bounded_send_failures
+            .pop_front()
+            .expect("bounded operation identity was lost");
+        assert_eq!(failed_id, operation_id);
+        el.executor.complete_bounded_send(failed_id, Err(error));
+        assert!(registration.take_result().unwrap().is_err());
+        // The slot is reclaimed only by the eventual Close CQE.
+        assert!(el.driver.connections.get(conn_index).is_some());
+    }
+
+    #[test]
     fn drain_conn_send_queue_finalizes_deferred_close() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
