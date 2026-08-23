@@ -498,7 +498,7 @@ fn render_runtime() -> String {
     queue(&mut svg, 930, 345, 270, 62, "bounded fd queue + wake");
     arrow(&mut svg, 1065, 275, 1065, 345, "try_send + wake");
 
-    box_(
+    group_box(
         &mut svg,
         540,
         470,
@@ -533,7 +533,7 @@ fn render_runtime() -> String {
     arrow(&mut svg, 755, 560, 780, 560, "events");
     arrow(&mut svg, 950, 560, 975, 560, "poll task");
 
-    box_(
+    group_box(
         &mut svg,
         60,
         470,
@@ -567,7 +567,7 @@ fn paired_edge_offsets(midpoint: u32, separation: u32) -> (u32, u32) {
 }
 
 fn render_request_flow() -> String {
-    let mut svg = canvas(1460, 880, "Ringline connection and request flow");
+    let mut svg = canvas(1460, 920, "Ringline connection and request flow");
     text(
         &mut svg,
         50,
@@ -585,10 +585,10 @@ fn render_request_flow() -> String {
         false,
     );
 
-    lane(&mut svg, 70, 125, 250, 680, "connection owner");
-    lane(&mut svg, 350, 125, 250, 680, "portable runtime");
-    lane(&mut svg, 630, 125, 350, 680, "backend");
-    lane(&mut svg, 1010, 125, 380, 680, "kernel / peer");
+    lane(&mut svg, 70, 125, 250, 720, "connection owner");
+    lane(&mut svg, 350, 125, 250, 720, "portable runtime");
+    lane(&mut svg, 630, 125, 350, 720, "backend");
+    lane(&mut svg, 1010, 125, 380, 720, "kernel / peer");
 
     stage(
         &mut svg,
@@ -684,7 +684,7 @@ fn render_request_flow() -> String {
     centered(
         &mut svg,
         730,
-        850,
+        890,
         "return/panic → deferred close → slot generation increments",
         15,
         false,
@@ -706,6 +706,22 @@ fn box_(svg: &mut String, x: u32, y: u32, w: u32, h: u32, label: &str, fill: &st
     centered(svg, x + w / 2, y + h / 2 + 6, label, 17, literal);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn group_box(
+    svg: &mut String,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    label: &str,
+    fill: &str,
+    literal: bool,
+) {
+    svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" rx=\"12\" fill=\"{fill}\" stroke=\"#4D4D4D\" stroke-width=\"1.4\"/>\n"));
+    let family = if literal { "monospace" } else { "sans-serif" };
+    svg.push_str(&format!("<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" data-role=\"group-label\" font-family=\"{family}\" font-size=\"17\" fill=\"#222\">{}</text>\n", x + w / 2, y - 18, escape(label)));
+}
+
 fn external_box(svg: &mut String, x: u32, y: u32, w: u32, h: u32, label: &str) {
     svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" rx=\"12\" fill=\"white\" stroke=\"#4D4D4D\" stroke-width=\"2.4\" stroke-dasharray=\"8 5\"/>\n"));
     centered(svg, x + w / 2, y + h / 2 + 6, label, 17, false);
@@ -725,7 +741,7 @@ fn queue(svg: &mut String, x: u32, y: u32, w: u32, h: u32, label: &str) {
 
 fn lane(svg: &mut String, x: u32, y: u32, w: u32, h: u32, label: &str) {
     svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" fill=\"#F7F7F7\" stroke=\"#BDBDBD\"/>\n"));
-    centered(svg, x + w / 2, y + 30, label, 17, false);
+    svg.push_str(&format!("<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" data-role=\"lane-label\" font-family=\"sans-serif\" font-size=\"17\" fill=\"#222\">{}</text>\n", x + w / 2, y - 13, escape(label)));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -873,6 +889,31 @@ mod tests {
         for coordinate in ["y2=\"581\"", "y1=\"609\"", "y2=\"781\"", "y1=\"805\""] {
             assert!(diagram.contains(coordinate), "missing {coordinate}");
         }
+    }
+
+    #[test]
+    fn nested_layers_separate_parent_labels_and_contain_children() {
+        let runtime = render_runtime();
+        for expected in [
+            "x=\"870\" y=\"452\" text-anchor=\"middle\" data-role=\"group-label\" font-family=\"monospace\" font-size=\"17\" fill=\"#222\">ringline-worker-i",
+            "x=\"255\" y=\"452\" text-anchor=\"middle\" data-role=\"group-label\" font-family=\"sans-serif\" font-size=\"17\" fill=\"#222\">optional auxiliary pools",
+        ] {
+            assert!(
+                runtime.contains(expected),
+                "group label must sit above its children: {expected}"
+            );
+        }
+
+        let request_flow = render_request_flow();
+        assert_eq!(request_flow.matches("data-role=\"lane-label\"").count(), 4);
+        assert_eq!(request_flow.matches("height=\"720\"").count(), 4);
+
+        let lane_bottom = 125 + 720;
+        let final_stage_bottom = 760 + 66;
+        assert!(
+            final_stage_bottom < lane_bottom,
+            "child stage must fit inside its lane"
+        );
     }
 
     #[test]

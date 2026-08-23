@@ -88,6 +88,16 @@ No runtime behavior changes are in scope.
   while preserving corner padding and enough separation for arrowheads and
   labels. This grouped-edge rule should be part of routing and collision checks,
   rather than left to manual coordinate adjustment.
+- **Friction** — Nested visual layers are not consistently composed as a
+  hierarchy. Parent labels can be interleaved with child labels, and child
+  shapes can cross the bounds of their parent container even though every
+  individual element is valid. The skills should validate containment and
+  non-overlap at each semantic layer: children stay inside the parent content
+  area, siblings do not collide, and parent headers occupy a dedicated region
+  outside the visual block of their children. Higher-level labels should be
+  spatially distinct from lower-level content, rather than mixed into the same
+  text rhythm merely because all strings technically fit.
+
 - **Confirmation** — Requiring exact source claims before rendering exposed
   three incorrect source markers during the first test run. The resulting
   generator now fails at the architecture boundary rather than producing a

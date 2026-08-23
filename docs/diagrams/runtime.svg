@@ -37,7 +37,7 @@
 <line x1="1065" y1="275" x2="1065" y2="345" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
 <text x="1083" y="315" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">try_send + wake</text>
 <rect x="540" y="470" width="660" height="190" rx="12" fill="#F2F2F2" stroke="#4D4D4D" stroke-width="1.4"/>
-<text x="870" y="571" text-anchor="middle" font-family="monospace" font-size="17" fill="#222">ringline-worker-i</text>
+<text x="870" y="452" text-anchor="middle" data-role="group-label" font-family="monospace" font-size="17" fill="#222">ringline-worker-i</text>
 <rect x="575" y="520" width="180" height="80" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
 <text x="665" y="566" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">backend Driver</text>
 <rect x="780" y="520" width="170" height="80" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
@@ -51,7 +51,7 @@
 <line x1="950" y1="560" x2="975" y2="560" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
 <text x="963" y="547" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">poll task</text>
 <rect x="60" y="470" width="390" height="190" rx="12" fill="#F2F2F2" stroke="#4D4D4D" stroke-width="1.4"/>
-<text x="255" y="571" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">optional auxiliary pools</text>
+<text x="255" y="452" text-anchor="middle" data-role="group-label" font-family="sans-serif" font-size="17" fill="#222">optional auxiliary pools</text>
 <text x="90" y="520" font-family="monospace" font-size="17" fill="#222">ringline-resolver-i</text>
 <text x="90" y="555" font-family="monospace" font-size="17" fill="#222">ringline-spawner-i</text>
 <text x="90" y="590" font-family="monospace" font-size="17" fill="#222">ringline-blocking-i</text>
