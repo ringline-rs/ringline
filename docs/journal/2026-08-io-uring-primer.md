@@ -98,6 +98,14 @@ No runtime behavior changes are in scope.
   spatially distinct from lower-level content, rather than mixed into the same
   text rhythm merely because all strings technically fit.
 
+- **Friction** — Combining materially different execution variants in one flow
+  makes shared lifecycle stages look like shared backend mechanics. When two
+  implementations use different operation vocabularies or event paths, the
+  skills should prefer separate panels, ordered in a clear comparison axis
+  such as top/bottom. Repeating the portable stages is less confusing than
+  interleaving backend-specific labels inside one node; shared behavior can be
+  explained in adjacent prose rather than compressed into the chart.
+
 - **Confirmation** — Requiring exact source claims before rendering exposed
   three incorrect source markers during the first test run. The resulting
   generator now fails at the architecture boundary rather than producing a

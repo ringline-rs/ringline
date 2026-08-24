@@ -141,19 +141,25 @@ work is still completing.
 ![Connection request and response flow](diagrams/request-flow.svg)
 
 This diagram is also generated and checked against code-level architecture
-constraints. Its text equivalent is: an accepted descriptor enters a worker's
+constraints. It uses two vertically stacked panels rather than mixing backend
+terms: the io_uring lifecycle is on top and the Mio lifecycle is below. Each
+panel repeats the portable connection-task stages so its backend event path can
+be read independently.
+
+Their shared text equivalent is: an accepted descriptor enters a worker's
 bounded channel; the worker allocates and initializes a generation-tagged slot,
 arms receive, and either starts TLS or marks the plaintext connection
 established. Once established, the worker places one `on_accept(ConnCtx)`
 future in the connection task slab. That task parses buffered input immediately
 or registers itself as the connection's receive waiter and parks. A backend
-receive completion/readiness event makes bytes available and calls
-`Executor::wake_recv`; the executor wakes the recorded owner task and polls the
-same future again. The handler parses a request and submits a response through
-the per-connection send queue. A send completion advances that queue and, for
-an awaited send, calls `wake_send`. When the handler future returns or panics,
-the runtime closes that connection, clears executor state, and eventually
-releases the slot with a new generation.
+event makes bytes available and calls `Executor::wake_recv`; the executor wakes
+the recorded owner task and polls the same future again. In the top panel, SQEs
+produce CQEs; in the bottom panel, registered interests produce readiness
+events. Both paths wake the same portable task owner. The handler parses a
+request and submits a response through the per-connection send queue. A send
+completion advances that queue and, for an awaited send, calls `wake_send`.
+When the handler future returns or panics, the runtime closes that connection,
+clears executor state, and eventually releases the slot with a new generation.
 
 `ConnCtx::with_data` lends a byte slice; `ConnCtx::with_bytes` lends a
 refcounted `Bytes` value whose slices can outlive the parse callback. Their

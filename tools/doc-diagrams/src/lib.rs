@@ -566,8 +566,44 @@ fn paired_edge_offsets(midpoint: u32, separation: u32) -> (u32, u32) {
     (midpoint - half, midpoint + half)
 }
 
+#[derive(Clone, Copy)]
+enum RequestBackend {
+    IoUring,
+    Mio,
+}
+
+impl RequestBackend {
+    fn panel_label(self) -> &'static str {
+        match self {
+            Self::IoUring => "io_uring request flow",
+            Self::Mio => "Mio request flow",
+        }
+    }
+
+    fn wait_label(self) -> &'static str {
+        match self {
+            Self::IoUring => "submit_and_wait + CQE",
+            Self::Mio => "poll + readiness",
+        }
+    }
+
+    fn submit_label(self) -> &'static str {
+        match self {
+            Self::IoUring => "SQE",
+            Self::Mio => "interest",
+        }
+    }
+
+    fn completion_label(self) -> &'static str {
+        match self {
+            Self::IoUring => "CQE",
+            Self::Mio => "readiness",
+        }
+    }
+}
+
 fn render_request_flow() -> String {
-    let mut svg = canvas(1460, 920, "Ringline connection and request flow");
+    let mut svg = canvas(1460, 1620, "Ringline connection and request flow");
     text(
         &mut svg,
         50,
@@ -580,117 +616,120 @@ fn render_request_flow() -> String {
         &mut svg,
         50,
         84,
-        "Backend events wake the owning task; they do not call application code directly.",
+        "Each backend has its own event path into the same portable task lifecycle.",
         16,
         false,
     );
 
-    lane(&mut svg, 70, 125, 250, 720, "connection owner");
-    lane(&mut svg, 350, 125, 250, 720, "portable runtime");
-    lane(&mut svg, 630, 125, 350, 720, "backend");
-    lane(&mut svg, 1010, 125, 380, 720, "kernel / peer");
+    render_request_flow_panel(&mut svg, 0, RequestBackend::IoUring);
+    render_request_flow_panel(&mut svg, 800, RequestBackend::Mio);
+    svg.push_str("</svg>\n");
+    svg
+}
+
+fn render_request_flow_panel(svg: &mut String, offset: u32, backend: RequestBackend) {
+    let y = |value: u32| value + offset;
+    svg.push_str(&format!(
+        "<text x=\"730\" y=\"{}\" text-anchor=\"middle\" data-role=\"backend-panel\" font-family=\"sans-serif\" font-size=\"21\" font-weight=\"bold\" fill=\"#222\">{}</text>\n",
+        y(115),
+        backend.panel_label()
+    ));
+
+    lane(svg, 70, y(160), 250, 590, "connection owner");
+    lane(svg, 350, y(160), 250, 590, "portable runtime");
+    lane(svg, 630, y(160), 350, 590, "backend");
+    lane(svg, 1010, y(160), 380, 590, "kernel / peer");
 
     stage(
-        &mut svg,
+        svg,
         655,
-        175,
+        y(190),
         300,
-        66,
+        54,
         "1",
         "accept fd + allocate slot",
         "#CCEBC5",
     );
+    stage(svg, 375, y(270), 200, 54, "2", "TLS handshake?", "#CCEBC5");
+    stage(svg, 95, y(350), 200, 54, "3", "on_accept task", "#FBB4AE");
     stage(
-        &mut svg,
+        svg,
         375,
-        270,
+        y(430),
         200,
-        66,
-        "2",
-        "TLS handshake?",
-        "#CCEBC5",
-    );
-    stage(&mut svg, 95, 365, 200, 66, "3", "on_accept task", "#FBB4AE");
-    stage(
-        &mut svg,
-        375,
-        460,
-        200,
-        66,
+        54,
         "4",
         "with_data / park",
         "#FBB4AE",
     );
     stage(
-        &mut svg,
+        svg,
         655,
-        555,
+        y(510),
         300,
-        80,
+        60,
         "5",
-        "io_uring: submit_and_wait + CQE\nMio: poll + readiness",
+        backend.wait_label(),
         "#CCEBC5",
     );
     stage(
-        &mut svg,
+        svg,
         375,
-        665,
+        y(600),
         200,
-        66,
+        54,
         "6",
         "wake_recv + poll",
         "#CCEBC5",
     );
-    stage(&mut svg, 95, 760, 200, 66, "7", "parse + send", "#FBB4AE");
+    stage(svg, 95, y(680), 200, 54, "7", "parse + send", "#FBB4AE");
 
-    let (backend_upper, backend_lower) = paired_edge_offsets(595, 28);
-    let (parse_upper, parse_lower) = paired_edge_offsets(793, 24);
+    let (backend_upper, backend_lower) = paired_edge_offsets(y(540), 24);
+    let (parse_upper, parse_lower) = paired_edge_offsets(y(707), 20);
 
-    arrow(&mut svg, 1100, 208, 955, 208, "accepted fd");
-    arrow(&mut svg, 655, 225, 575, 300, "generation-tagged ConnCtx");
-    arrow(&mut svg, 475, 336, 195, 365, "established");
-    arrow(&mut svg, 295, 398, 375, 493, "await bytes");
-    arrow(&mut svg, 575, 493, 655, backend_upper, "arm receive");
+    arrow(svg, 1100, y(217), 955, y(217), "accepted fd");
+    arrow(svg, 655, y(230), 575, y(297), "generation-tagged ConnCtx");
+    arrow(svg, 475, y(324), 195, y(350), "established");
+    arrow(svg, 295, y(377), 375, y(457), "await bytes");
+    arrow(svg, 575, y(457), 655, backend_upper, "arm receive");
     arrow(
-        &mut svg,
+        svg,
         955,
         backend_upper,
         1090,
         backend_upper,
-        "SQE / interest",
+        backend.submit_label(),
     );
     arrow(
-        &mut svg,
+        svg,
         1090,
         backend_lower,
         955,
         backend_lower,
-        "CQE / readiness",
+        backend.completion_label(),
     );
-    arrow(&mut svg, 655, backend_lower, 575, 698, "completion");
-    arrow(&mut svg, 375, 698, 295, parse_upper, "ready task");
+    arrow(svg, 655, backend_lower, 575, y(627), "completion");
+    arrow(svg, 375, y(627), 295, parse_upper, "ready task");
 
     queue(
-        &mut svg,
+        svg,
         650,
-        725,
+        y(675),
         310,
         62,
         "per-connection ordered send queue",
     );
-    arrow(&mut svg, 295, parse_lower, 650, 756, "response");
-    arrow(&mut svg, 960, 756, 1090, 756, "one send in flight");
-    external_box(&mut svg, 1090, 710, 250, 95, "peer socket");
+    arrow(svg, 295, parse_lower, 650, y(706), "response");
+    arrow(svg, 960, y(706), 1090, y(706), "one send in flight");
+    external_box(svg, 1090, y(665), 250, 90, "peer socket");
     centered(
-        &mut svg,
+        svg,
         730,
-        890,
+        y(780),
         "return/panic → deferred close → slot generation increments",
         15,
         false,
     );
-    svg.push_str("</svg>\n");
-    svg
 }
 
 fn canvas(width: u32, height: u32, title: &str) -> String {
@@ -882,13 +921,38 @@ mod tests {
 
     #[test]
     fn paired_connectors_are_symmetric_around_edge_midpoint() {
-        assert_eq!(paired_edge_offsets(595, 28), (581, 609));
-        assert_eq!(paired_edge_offsets(793, 24), (781, 805));
+        assert_eq!(paired_edge_offsets(540, 24), (528, 552));
+        assert_eq!(paired_edge_offsets(707, 20), (697, 717));
 
         let diagram = render_request_flow();
-        for coordinate in ["y2=\"581\"", "y1=\"609\"", "y2=\"781\"", "y1=\"805\""] {
+        for coordinate in [
+            "y2=\"528\"",
+            "y1=\"552\"",
+            "y2=\"697\"",
+            "y1=\"717\"",
+            "y2=\"1328\"",
+            "y1=\"1352\"",
+            "y2=\"1497\"",
+            "y1=\"1517\"",
+        ] {
             assert!(diagram.contains(coordinate), "missing {coordinate}");
         }
+    }
+
+    #[test]
+    fn request_flow_uses_separate_io_uring_and_mio_panels() {
+        let diagram = render_request_flow();
+        assert_eq!(diagram.matches("data-role=\"backend-panel\"").count(), 2);
+        let uring = diagram.find("io_uring request flow").unwrap();
+        let mio = diagram.find("Mio request flow").unwrap();
+        assert!(uring < mio, "io_uring panel must be above Mio");
+        assert_eq!(diagram.matches("submit_and_wait + CQE").count(), 1);
+        assert_eq!(diagram.matches("poll + readiness").count(), 1);
+        assert!(
+            !diagram.contains("io_uring: submit_and_wait + CQE\nMio: poll + readiness"),
+            "backend operations must not share a stage"
+        );
+        assert_eq!(diagram.matches("data-role=\"lane-label\"").count(), 8);
     }
 
     #[test]
@@ -905,11 +969,11 @@ mod tests {
         }
 
         let request_flow = render_request_flow();
-        assert_eq!(request_flow.matches("data-role=\"lane-label\"").count(), 4);
-        assert_eq!(request_flow.matches("height=\"720\"").count(), 4);
+        assert_eq!(request_flow.matches("data-role=\"lane-label\"").count(), 8);
+        assert_eq!(request_flow.matches("height=\"590\"").count(), 8);
 
-        let lane_bottom = 125 + 720;
-        let final_stage_bottom = 760 + 66;
+        let lane_bottom = 160 + 590;
+        let final_stage_bottom = 680 + 54;
         assert!(
             final_stage_bottom < lane_bottom,
             "child stage must fit inside its lane"
