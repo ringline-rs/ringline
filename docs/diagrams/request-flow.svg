@@ -55,7 +55,7 @@
 <line x1="955" y1="528" x2="1090" y2="528" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
 <text x="1023" y="515" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">SQE</text>
 <line x1="1090" y1="552" x2="955" y2="552" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="1023" y="539" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">CQE</text>
+<text x="1023" y="575" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">CQE</text>
 <line x1="655" y1="552" x2="575" y2="627" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
 <text x="603" y="581" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">completion</text>
 <line x1="375" y1="627" x2="295" y2="697" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
@@ -102,8 +102,8 @@
 <rect x="655" y="1310" width="300" height="74" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
 <circle cx="680" cy="1335" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="680" y="1341" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">5</text>
-<text x="817" y="1353" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">poll readiness</text>
-<text x="817" y="1373" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">read until EAGAIN</text>
+<text x="817" y="1343" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">poll readiness</text>
+<text x="817" y="1363" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">read until EAGAIN</text>
 <rect x="375" y="1400" width="200" height="54" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
 <circle cx="400" cy="1425" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="400" y="1431" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">6</text>
@@ -125,7 +125,7 @@
 <line x1="955" y1="1328" x2="1090" y2="1328" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
 <text x="1023" y="1315" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">interest</text>
 <line x1="1090" y1="1352" x2="955" y2="1352" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
-<text x="1023" y="1339" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">readiness</text>
+<text x="1023" y="1375" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">readiness</text>
 <line x1="655" y1="1352" x2="575" y2="1427" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
 <text x="603" y="1381" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">completion</text>
 <line x1="375" y1="1427" x2="295" y2="1497" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>

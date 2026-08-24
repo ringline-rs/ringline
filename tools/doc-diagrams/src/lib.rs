@@ -721,13 +721,14 @@ fn render_request_flow_panel(svg: &mut String, offset: u32, backend: RequestBack
         backend_upper,
         backend.submit_label(),
     );
-    arrow(
+    arrow_with_label_offset(
         svg,
         1090,
         backend_lower,
         955,
         backend_lower,
         backend.completion_label(),
+        -18.0,
     );
     arrow(svg, 655, backend_lower, 575, y(627), "completion");
     arrow(svg, 375, y(627), 295, parse_upper, "ready task");
@@ -813,11 +814,14 @@ fn stage(svg: &mut String, x: u32, y: u32, w: u32, h: u32, number: &str, label: 
         y + 25
     ));
     centered(svg, x + 25, y + 31, number, 14, false);
-    for (i, line) in label.split('\n').enumerate() {
+    let lines: Vec<_> = label.split('\n').collect();
+    let line_span = (lines.len().saturating_sub(1) as u32) * 20;
+    let first_baseline = y + h / 2 + 6 - line_span / 2;
+    for (i, line) in lines.into_iter().enumerate() {
         centered(
             svg,
             x + w / 2 + 12,
-            y + h / 2 + 6 + (i as u32 * 20),
+            first_baseline + (i as u32 * 20),
             line,
             15,
             false,
@@ -826,6 +830,19 @@ fn stage(svg: &mut String, x: u32, y: u32, w: u32, h: u32, number: &str, label: 
 }
 
 fn arrow(svg: &mut String, x1: u32, y1: u32, x2: u32, y2: u32, label: &str) {
+    arrow_with_label_offset(svg, x1, y1, x2, y2, label, 18.0);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arrow_with_label_offset(
+    svg: &mut String,
+    x1: u32,
+    y1: u32,
+    x2: u32,
+    y2: u32,
+    label: &str,
+    label_offset: f64,
+) {
     svg.push_str(&format!("<line x1=\"{x1}\" y1=\"{y1}\" x2=\"{x2}\" y2=\"{y2}\" stroke=\"#4D4D4D\" stroke-width=\"1.4\" marker-end=\"url(#arrow)\"/>\n"));
     if !label.is_empty() {
         let dx = f64::from(x2) - f64::from(x1);
@@ -836,8 +853,8 @@ fn arrow(svg: &mut String, x1: u32, y1: u32, x2: u32, y2: u32, label: &str) {
             normal_x = -normal_x;
             normal_y = -normal_y;
         }
-        let x = ((f64::from(x1 + x2) / 2.0) + normal_x * 18.0).round() as u32;
-        let y = ((f64::from(y1 + y2) / 2.0) + normal_y * 18.0 + 5.0).round() as u32;
+        let x = ((f64::from(x1 + x2) / 2.0) + normal_x * label_offset).round() as u32;
+        let y = ((f64::from(y1 + y2) / 2.0) + normal_y * label_offset + 5.0).round() as u32;
         svg.push_str(&format!(
             concat!(
                 "<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" ",
@@ -941,6 +958,14 @@ mod tests {
     }
 
     #[test]
+    fn multiline_stage_labels_are_centered_as_a_group() {
+        let mut svg = String::new();
+        stage(&mut svg, 100, 100, 300, 74, "5", "first\nsecond", "#fff");
+        assert!(svg.contains("x=\"262\" y=\"133\""));
+        assert!(svg.contains("x=\"262\" y=\"153\""));
+    }
+
+    #[test]
     fn paired_connectors_are_symmetric_around_edge_midpoint() {
         assert_eq!(paired_edge_offsets(540, 24), (528, 552));
         assert_eq!(paired_edge_offsets(707, 20), (697, 717));
@@ -957,6 +982,13 @@ mod tests {
             "y1=\"1517\"",
         ] {
             assert!(diagram.contains(coordinate), "missing {coordinate}");
+        }
+        for (label, y) in [("CQE", 575), ("readiness", 1375)] {
+            let line = diagram
+                .lines()
+                .find(|line| line.ends_with(&format!(">{label}</text>")))
+                .unwrap();
+            assert!(line.contains(&format!("y=\"{y}\"")), "{line}");
         }
     }
 
