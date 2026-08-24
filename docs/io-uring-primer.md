@@ -133,6 +133,59 @@ These figures isolate only the assumed crossing cost. They do not say io_uring
 uses less total CPU: CQ processing, ring synchronization, cache behavior,
 copying, networking, and SQPOLL can erase or reverse the modeled difference.
 
+### Measured local example
+
+The following is one machine's result, not a portable prediction. Ringline's
+64-byte echo server ran on the physical P cores of an Intel Core i5-13500H;
+the Tokio load generator ran on separate E cores. Each cell is the median of
+three five-second measurements after a two-second warmup. Closed-loop rows
+have one outstanding request per connection. CPU is aggregate server CPU, so
+400% means four fully occupied cores; HWM is peak resident memory. The host
+used Ubuntu 6.8.0-138 and the `powersave` governor.
+
+Ubuntu's kernel has a known inverted reserved-field check in provided-buffer
+registration (Launchpad #2162843). To make this local experiment possible,
+the benchmark used an uncommitted, ABI-invalid diagnostic patch that sets one
+reserved field nonzero; no project source or published result should adopt
+that workaround. Treat these numbers as a comparison of Ringline's two paths
+on this host, not as results from a supported production kernel.
+
+| Workers | Clients / offered rate | Backend | Throughput | p50 | p99 | Server CPU | HWM |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 closed | io_uring | 44.6k/s | 22.3 us | 26.7 us | 34% | 79.8 MiB |
+| 1 | 1 closed | Mio | 41.2k/s | 23.8 us | 28.3 us | 40% | 75.6 MiB |
+| 1 | 64 closed | io_uring | 183.7k/s | 263 us | 765 us | 99% | 79.8 MiB |
+| 1 | 64 closed | Mio | 156.0k/s | 399 us | 780 us | 100% | 75.6 MiB |
+| 1 | 512 closed | io_uring | 232.3k/s | 1.24 ms | 24.0 ms | 99% | 79.9 MiB |
+| 1 | 512 closed | Mio | 155.0k/s | 3.29 ms | 4.66 ms | 100% | 75.7 MiB |
+| 2 | 64 closed | io_uring | 459.3k/s | 131 us | 463 us | 190% | 155.7 MiB |
+| 2 | 64 closed | Mio | 254.0k/s | 204 us | 801 us | 169% | 147.4 MiB |
+| 2 | 512 closed | io_uring | 450.5k/s | 1.09 ms | 4.42 ms | 189% | 155.8 MiB |
+| 2 | 512 closed | Mio | 247.9k/s | 1.71 ms | 5.62 ms | 160% | 147.6 MiB |
+| 4 | 64 closed | io_uring | 498.3k/s | 125 us | 253 us | 275% | 307.6 MiB |
+| 4 | 64 closed | Mio | 485.9k/s | 122 us | 255 us | 355% | 291.0 MiB |
+| 4 | 512 closed | io_uring | 645.5k/s | 732 us | 1.80 ms | 337% | 307.6 MiB |
+| 4 | 512 closed | Mio | 539.4k/s | 877 us | 2.31 ms | 383% | 291.4 MiB |
+| 4 | 64 @ 20k/s | io_uring | 20.0k/s | 1.42 ms | 2.72 ms | 40% | 307.6 MiB |
+| 4 | 64 @ 20k/s | Mio | 20.0k/s | 1.57 ms | 2.83 ms | 72% | 291.0 MiB |
+| 4 | 64 @ 500k/s | io_uring | 500.0k/s | 1.14 ms | 2.80 ms | 73% | 307.6 MiB |
+| 4 | 64 @ 500k/s | Mio | 500.0k/s | 1.16 ms | 2.90 ms | 93% | 291.3 MiB |
+
+The result is not uniformly favorable. At one worker and 512 connections,
+io_uring delivered much more throughput and a lower median, but its p99 was
+far worse (24.0 ms versus 4.66 ms). At four workers and 64 connections, both
+paths reached about 0.5 million operations/s, while io_uring used about 0.8
+fewer CPU cores and about 17 MiB more peak resident memory. The open-loop
+latencies include load-generator scheduling lag and are useful only as a
+same-run comparison.
+
+Ringline's existing metrics count CQEs, failures, bytes, pool pressure, and
+connection lifecycle—not backend syscalls. The syscall table above therefore
+remains an analytical model. Exact uninstrumented syscall counts require
+dedicated counters around both backends' kernel-entry wrappers; CQE or
+event-loop iteration counts are not substitutes.
+
+
 ### Fewer repeated submissions
 
 Multishot accept, receive, read, and poll operations can produce several CQEs

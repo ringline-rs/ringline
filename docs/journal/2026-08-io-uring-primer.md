@@ -50,25 +50,41 @@ The outcome remains open until the pull request lands. The branch contains:
 
 No runtime behavior changes are in scope.
 
-The requested local io_uring-versus-Mio benchmark could not proceed on the
-2026-08-24 test host (Intel Core i5-13500H, Ubuntu 6.8.0-138.138-generic).
-Ringline's `io_uring_setup` call succeeded with 256 SQ entries, and sparse
-buffer and file registration also succeeded. `IORING_REGISTER_PBUF_RING` then
-returned `EINVAL`, so the native Ringline server failed before binding. The
-root cause is an inverted reserved-field check in Ubuntu's downstream
-`io_uring/kbuf.c`: it rejects a correctly zeroed `io_uring_buf_reg::resv` array.
-The regression is tracked as Launchpad bug `#2162843`. Ubuntu introduced it in
-backport commit `cff3ace786c7` on 2026-06-21; the first affected package is
-`6.8.0-136.136`, dated 2026-07-01. `6.8.0-134.134` retains the correct manual
-check, while `6.8.0-136.136`, `-137.137`, and `-138.138` contain the inversion.
-The originating upstream commit `172484907285` uses `!mem_is_zero(...)` and is
-correct; the error entered when Ubuntu adapted that helper to `memchr_inv(...)`
-without removing the negation.
-A syscall-only probe confirmed that both userspace-backed and kernel-allocated
-PBUF registration fail when `resv[0]` is zero and succeed when it is one. The
-nonzero value violates the ABI and is diagnostic evidence, not a workaround.
-The forced-Mio binary built successfully, but running only that side would not
-produce a comparison. No performance numbers were recorded.
+The requested local io_uring-versus-Mio benchmark initially could not proceed on
+the 2026-08-24 test host (Intel Core i5-13500H, Ubuntu
+6.8.0-138.138-generic). Ringline's `io_uring_setup` call succeeded, but
+`IORING_REGISTER_PBUF_RING` returned `EINVAL`. The root cause is Ubuntu
+Launchpad bug `#2162843`: downstream commit `cff3ace786c7` inverted the
+reserved-field test. The first affected package is `6.8.0-136.136`; upstream
+commit `172484907285` is correct. A syscall-only probe confirmed that zeroed
+reserved fields fail and an ABI-invalid nonzero field succeeds.
+
+With explicit approval, a local-only copy of `io-uring` 0.7.12 set
+`io_uring_buf_reg.resv[0] = 1` solely to bypass that inverted Ubuntu test.
+The copy lived under `/tmp`, was selected only by Cargo command-line
+configuration, and was never added to the repository.
+
+The completed matrix pinned server workers to P-core logical CPUs `0,2,4,6`
+and the Tokio load generator to E-core CPUs `8-15`. It compared 1, 2, and 4
+workers at 1, 64, and 512 closed-loop connections, plus 4-worker fixed-rate
+20k/s and 500k/s cases. Each configuration used three alternating-order runs,
+a two-second warmup, a five-second measurement, and 64-byte messages. Raw CSV
+is retained locally at `/tmp/ringline-bench-results.csv`; the primer records
+median throughput, latency, aggregate server CPU, and peak RSS.
+
+The result was workload-dependent. Two workers at 64 and 512 connections
+delivered about 81% more throughput than Mio. Four workers at 64 connections
+converged near 0.5M requests/s, while io_uring used about 275% aggregate CPU
+versus Mio's 355%. Four workers at 512 connections delivered 645k/s versus
+539k/s. io_uring used roughly 4 MiB, 8 MiB, and 17 MiB more peak RSS at 1, 2,
+and 4 workers. One-worker/512-client io_uring had much worse p99 despite higher
+throughput, so the evidence is not uniformly favorable.
+
+Source inspection corrected one measurement assumption: Ringline metrics count
+CQEs, failures, bytes, pool pressure, and connection lifecycle, but not
+`io_uring_enter` or Mio syscalls. A traced diagnostic was discarded because
+it distorted throughput. Exact syscall counts remain analytical until native
+backend counters are added.
 
 ## Lessons / open questions
 
@@ -82,13 +98,10 @@ produce a comparison. No performance numbers were recorded.
   and independent review replace that unavailable preview step.
 - After merge, change this entry to shipped and record the pull request and
   merge commit.
-- Re-run the local four-P-core benchmark after installing an Ubuntu kernel that
-  fixes the inverted PBUF reserved-field check, or an unaffected upstream
-  kernel. Use logical CPUs `0,2,4,6` for the four physical P cores and `8-15`
-  for load generation; compare 1, 2, and 4 server workers at 1, 64, and 512
-  closed-loop connections, followed by fixed-rate 4-worker trials. Preserve the
-  failed syscall trace and reserved-field probe as the reason this run has no
-  data.
+- Repeat the local four-P-core benchmark on a fixed Ubuntu or unaffected
+  upstream kernel before treating the diagnostic-patch numbers as publishable
+  performance evidence. Preserve the failed syscall trace and reserved-field
+  probe as provenance for why the local workaround existed.
 
 ## Skill Feedback
 
