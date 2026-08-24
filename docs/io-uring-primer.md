@@ -84,13 +84,17 @@ operations can also be offloaded to kernel worker threads when they cannot
 complete non-blockingly, so io_uring is not threadless. Measure the actual
 request mix rather than treating concurrency alone as the reason to switch.
 
-### Reusable, bounded buffers
+### Kernel integration with reusable buffers
 
 Known request-size limits make buffer ownership and memory use explicit. A
 service can choose its maximum number of in-flight requests and preallocate a
 corresponding pool, rather than allocate in proportion to an unbounded input
-queue.
+queue. That is an application design technique, not an io_uring feature:
+Pelikan has used preallocated I/O and request-object pools with readiness-based
+event loops since its earliest versions. The same bounded-pool discipline
+applies to epoll, Mio, and io_uring.
 
+What io_uring adds is kernel integration with those reusable buffers.
 Registered buffers pin and map application memory once, avoiding repeated
 validation, pinning, and mapping for each operation. Upstream documentation
 says they are most useful for frequent small I/O that repeatedly uses the
@@ -117,14 +121,20 @@ multishot request eventually terminates—for example on an error,
 cancellation, or receive-buffer exhaustion—and the application must detect
 the final CQE and rearm if appropriate ([`io_uring_multishot(7)`]).
 
-### Locality and ownership
+### Architecture that complements io_uring
 
-One ring per event-loop thread allows request state, buffers, and queue
-pointers to have a single owner. It also enables optimizations such as
-`IORING_SETUP_SINGLE_ISSUER`. Current upstream guidance describes a ring per
-thread as the idiomatic arrangement and discourages sharing a ring between
-threads because sharing requires synchronization and prevents optimizations
-([`io_uring_setup_flags(7)`]).
+Thread-per-core ownership, CPU affinity, NUMA placement, and keeping request
+state and buffers local are runtime architecture choices. They are not
+io_uring features, and a readiness-based event loop can use the same design.
+Pelikan already does so with its epoll/Mio path.
+
+io_uring fits that architecture particularly well when each event-loop thread
+owns one ring. The ring then has a single submitting owner, avoids
+application-side synchronization around shared submission state, and can use
+facilities such as `IORING_SETUP_SINGLE_ISSUER`. Current upstream guidance
+describes a ring per thread as the idiomatic arrangement and discourages
+sharing a ring between threads because sharing requires synchronization and
+prevents those ring-level optimizations ([`io_uring_setup_flags(7)`]).
 
 ## What it does not guarantee
 

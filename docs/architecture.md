@@ -131,6 +131,12 @@ zero-copy sends. Conversely, the io_uring loop is completion-driven rather
 than a readiness loop. Both backends preserve the same user-visible ordering
 and lifetime rules.
 
+Both backends use bounded, reusable application-managed buffers; pooling is
+not unique to io_uring. The io_uring backend additionally registers/provides
+selected pools to the kernel so a CQE can identify the buffer chosen for a
+receive. Likewise, worker-local ownership is shared architecture; one ring per
+worker is the io_uring-specific mapping of that architecture.
+
 ## Connection and request lifecycle
 
 Each connection occupies a `ConnectionTable` slot. `ConnCtx` and `ConnToken`
@@ -154,10 +160,13 @@ future in the connection task slab. That task parses buffered input immediately
 or registers itself as the connection's receive waiter and parks. A backend
 event makes bytes available and calls `Executor::wake_recv`; the executor wakes
 the recorded owner task and polls the same future again. In the top panel, SQEs
-produce CQEs; in the bottom panel, registered interests produce readiness
-events. Both paths wake the same portable task owner. The handler parses a
-request and submits a response through the per-connection send queue. A send
-completion advances that queue and, for an awaited send, calls `wake_send`.
+produce CQEs. In the bottom panel, `mio::Poll` produces a readability event;
+the event loop immediately drains `read` until it returns `WouldBlock`
+(`EAGAIN`), then wakes the task that was waiting for receive data. In both
+panels, the subsequent poll is a poll of the owner task's Rust future, not
+another operating-system readiness poll. The handler parses a request and
+submits a response through the per-connection send queue. A send completion
+advances that queue and, for an awaited send, calls `wake_send`.
 When the handler future returns or panics, the runtime closes that connection,
 clears executor state, and eventually releases the slot with a new generation.
 

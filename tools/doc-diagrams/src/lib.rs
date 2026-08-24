@@ -235,6 +235,27 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
         "self.driver.finish_close(conn_index)",
         "Mio removes the task before backend close and slot recycling",
     )?;
+    require_order_after(
+        &mio_loop,
+        "// Plaintext path.",
+        "loop {",
+        "match stream.read(recv_buf)",
+        "Mio drains readable plaintext sockets in a read loop",
+    )?;
+    require_order_after(
+        &mio_loop,
+        "match stream.read(recv_buf)",
+        "self.executor.wake_recv(conn_index)",
+        "Err(ref e) if e.kind() == io::ErrorKind::WouldBlock",
+        "Mio makes received bytes visible and drains until EAGAIN",
+    )?;
+    require_order_after(
+        &mio_loop,
+        "// 6. Collect wakeups and poll ready tasks.",
+        "self.executor.collect_wakeups()",
+        "self.poll_ready_tasks()",
+        "Mio polls the owner task after collecting receive wakes",
+    )?;
     let mio_driver = fs::read_to_string(root.join("ringline/src/backend/mio/driver.rs"))?;
     require_order_after(
         &mio_driver,
@@ -583,7 +604,7 @@ impl RequestBackend {
     fn wait_label(self) -> &'static str {
         match self {
             Self::IoUring => "submit_and_wait + CQE",
-            Self::Mio => "poll + readiness",
+            Self::Mio => "poll readiness\nread until EAGAIN",
         }
     }
 
@@ -667,19 +688,19 @@ fn render_request_flow_panel(svg: &mut String, offset: u32, backend: RequestBack
         655,
         y(510),
         300,
-        60,
+        74,
         "5",
         backend.wait_label(),
         "#CCEBC5",
     );
     stage(
         svg,
-        375,
+        355,
         y(600),
-        200,
+        240,
         54,
         "6",
-        "wake_recv + poll",
+        "wake_recv + poll owner task",
         "#CCEBC5",
     );
     stage(svg, 95, y(680), 200, 54, "7", "parse + send", "#FBB4AE");
@@ -947,7 +968,12 @@ mod tests {
         let mio = diagram.find("Mio request flow").unwrap();
         assert!(uring < mio, "io_uring panel must be above Mio");
         assert_eq!(diagram.matches("submit_and_wait + CQE").count(), 1);
-        assert_eq!(diagram.matches("poll + readiness").count(), 1);
+        assert_eq!(diagram.matches("read until EAGAIN").count(), 1);
+        assert_eq!(diagram.matches("wake_recv + poll owner task").count(), 2);
+        assert!(
+            !diagram.contains("wake_recv + poll</text>"),
+            "task polling must not be confused with Mio readiness polling"
+        );
         assert!(
             !diagram.contains("io_uring: submit_and_wait + CQE\nMio: poll + readiness"),
             "backend operations must not share a stage"

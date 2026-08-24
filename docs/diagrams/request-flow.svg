@@ -30,14 +30,14 @@
 <circle cx="400" cy="455" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="400" y="461" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">4</text>
 <text x="487" y="463" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">with_data / park</text>
-<rect x="655" y="510" width="300" height="60" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<rect x="655" y="510" width="300" height="74" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
 <circle cx="680" cy="535" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="680" y="541" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">5</text>
-<text x="817" y="546" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">submit_and_wait + CQE</text>
-<rect x="375" y="600" width="200" height="54" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
-<circle cx="400" cy="625" r="15" fill="white" stroke="#4D4D4D"/>
-<text x="400" y="631" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">6</text>
-<text x="487" y="633" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">wake_recv + poll</text>
+<text x="817" y="553" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">submit_and_wait + CQE</text>
+<rect x="355" y="600" width="240" height="54" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<circle cx="380" cy="625" r="15" fill="white" stroke="#4D4D4D"/>
+<text x="380" y="631" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">6</text>
+<text x="487" y="633" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">wake_recv + poll owner task</text>
 <rect x="95" y="680" width="200" height="54" rx="12" fill="#FBB4AE" stroke="#4D4D4D" stroke-width="1.4"/>
 <circle cx="120" cy="705" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="120" y="711" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">7</text>
@@ -99,14 +99,15 @@
 <circle cx="400" cy="1255" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="400" y="1261" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">4</text>
 <text x="487" y="1263" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">with_data / park</text>
-<rect x="655" y="1310" width="300" height="60" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<rect x="655" y="1310" width="300" height="74" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
 <circle cx="680" cy="1335" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="680" y="1341" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">5</text>
-<text x="817" y="1346" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">poll + readiness</text>
-<rect x="375" y="1400" width="200" height="54" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
-<circle cx="400" cy="1425" r="15" fill="white" stroke="#4D4D4D"/>
-<text x="400" y="1431" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">6</text>
-<text x="487" y="1433" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">wake_recv + poll</text>
+<text x="817" y="1353" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">poll readiness</text>
+<text x="817" y="1373" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">read until EAGAIN</text>
+<rect x="355" y="1400" width="240" height="54" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<circle cx="380" cy="1425" r="15" fill="white" stroke="#4D4D4D"/>
+<text x="380" y="1431" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">6</text>
+<text x="487" y="1433" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">wake_recv + poll owner task</text>
 <rect x="95" y="1480" width="200" height="54" rx="12" fill="#FBB4AE" stroke="#4D4D4D" stroke-width="1.4"/>
 <circle cx="120" cy="1505" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="120" y="1511" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">7</text>
