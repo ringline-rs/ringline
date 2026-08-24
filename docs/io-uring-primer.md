@@ -61,13 +61,28 @@ small operations less dominated by submission overhead. It does not require
 large batches: a latency-sensitive loop can submit promptly while still
 combining work already available.
 
-### High concurrency without a thread per request
+### Less readiness choreography at high concurrency
 
-One event-loop thread can keep many accepts, receives, sends, timeouts, file
-operations, and polls outstanding. Completion delivery tells the loop which
-operation made progress. Some operations can still be offloaded to kernel
-worker threads when they cannot complete non-blockingly, so `io_uring` is not
-threadless.
+This is not a thread-count advantage over epoll. An epoll event loop can also
+manage many connections on one thread; neither design requires a thread per
+request ([`epoll(7)`]).
+
+The difference is what crosses the kernel boundary. epoll reports that a file
+descriptor is ready, after which userspace issues `accept`, `read`, or `write`,
+handles partial progress and `EAGAIN`, and maintains or rearms interest state.
+io_uring submits the operation itself, and its CQE identifies that operation
+and carries the result. Multishot operations can produce several completions
+from one submission. For a service doing frequent small, bounded operations,
+that can reduce repeated control syscalls and readiness bookkeeping while
+batching submission and completion work ([`io_uring_multishot(7)`]).
+
+That advantage is workload-dependent, not a higher connection-count ceiling.
+epoll already returns batches of ready descriptors, has mature behavior, and
+can match or beat io_uring when sockets are usually ready, batches are small,
+or io_uring's setup and completion machinery do not amortize. Some io_uring
+operations can also be offloaded to kernel worker threads when they cannot
+complete non-blockingly, so io_uring is not threadless. Measure the actual
+request mix rather than treating concurrency alone as the reason to switch.
 
 ### Reusable, bounded buffers
 
@@ -254,6 +269,7 @@ capacity limit from socket or kernel failure.
 [`io_uring_cancelation(7)`]: https://man7.org/linux/man-pages/man7/io_uring_cancelation.7.html
 [`io_uring_queue_init_params(3)`]: https://man7.org/linux/man-pages/man3/io_uring_queue_init_params.3.html
 [`io_uring_prep_send_zc(3)`]: https://man7.org/linux/man-pages/man3/io_uring_prep_send_zc.3.html
+[`epoll(7)`]: https://man7.org/linux/man-pages/man7/epoll.7.html
 [Jens Axboe's design paper]: https://www.kernel.dk/io_uring.pdf
 [LWN's history]: https://lwn.net/Articles/810414/
 [kernel `MSG_ZEROCOPY` documentation]: https://www.kernel.org/doc/html/latest/networking/msg_zerocopy.html
