@@ -57,6 +57,13 @@ buffer and file registration also succeeded. `IORING_REGISTER_PBUF_RING` then
 returned `EINVAL`, so the native Ringline server failed before binding. The
 root cause is an inverted reserved-field check in Ubuntu's downstream
 `io_uring/kbuf.c`: it rejects a correctly zeroed `io_uring_buf_reg::resv` array.
+The regression is tracked as Launchpad bug `#2162843`. Ubuntu introduced it in
+backport commit `cff3ace786c7` on 2026-06-21; the first affected package is
+`6.8.0-136.136`, dated 2026-07-01. `6.8.0-134.134` retains the correct manual
+check, while `6.8.0-136.136`, `-137.137`, and `-138.138` contain the inversion.
+The originating upstream commit `172484907285` uses `!mem_is_zero(...)` and is
+correct; the error entered when Ubuntu adapted that helper to `memchr_inv(...)`
+without removing the negation.
 A syscall-only probe confirmed that both userspace-backed and kernel-allocated
 PBUF registration fail when `resv[0]` is zero and succeed when it is one. The
 nonzero value violates the ABI and is diagnostic evidence, not a workaround.
