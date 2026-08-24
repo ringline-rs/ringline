@@ -34,10 +34,10 @@
 <circle cx="680" cy="535" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="680" y="541" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">5</text>
 <text x="817" y="553" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">submit_and_wait + CQE</text>
-<rect x="355" y="600" width="240" height="54" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
-<circle cx="380" cy="625" r="15" fill="white" stroke="#4D4D4D"/>
-<text x="380" y="631" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">6</text>
-<text x="487" y="633" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">wake_recv + poll owner task</text>
+<rect x="375" y="600" width="200" height="54" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<circle cx="400" cy="625" r="15" fill="white" stroke="#4D4D4D"/>
+<text x="400" y="631" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">6</text>
+<text x="487" y="633" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">schedule owner task</text>
 <rect x="95" y="680" width="200" height="54" rx="12" fill="#FBB4AE" stroke="#4D4D4D" stroke-width="1.4"/>
 <circle cx="120" cy="705" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="120" y="711" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">7</text>
@@ -71,8 +71,8 @@
 <text x="472" y="699" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">response</text>
 <line x1="960" y1="706" x2="1090" y2="706" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
 <text x="1025" y="693" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">one send in flight</text>
-<rect x="1090" y="665" width="250" height="90" rx="12" fill="white" stroke="#4D4D4D" stroke-width="2.4" stroke-dasharray="8 5"/>
-<text x="1215" y="716" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">peer socket</text>
+<rect x="1090" y="660" width="250" height="80" rx="12" fill="white" stroke="#4D4D4D" stroke-width="2.4" stroke-dasharray="8 5"/>
+<text x="1215" y="706" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">peer socket</text>
 <text x="730" y="780" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">return/panic → deferred close → slot generation increments</text>
 <text x="730" y="915" text-anchor="middle" data-role="backend-panel" font-family="sans-serif" font-size="21" font-weight="bold" fill="#222">Mio request flow</text>
 <rect x="70" y="960" width="250" height="590" fill="#F7F7F7" stroke="#BDBDBD"/>
@@ -104,10 +104,10 @@
 <text x="680" y="1341" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">5</text>
 <text x="817" y="1353" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">poll readiness</text>
 <text x="817" y="1373" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">read until EAGAIN</text>
-<rect x="355" y="1400" width="240" height="54" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
-<circle cx="380" cy="1425" r="15" fill="white" stroke="#4D4D4D"/>
-<text x="380" y="1431" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">6</text>
-<text x="487" y="1433" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">wake_recv + poll owner task</text>
+<rect x="375" y="1400" width="200" height="54" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<circle cx="400" cy="1425" r="15" fill="white" stroke="#4D4D4D"/>
+<text x="400" y="1431" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">6</text>
+<text x="487" y="1433" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">schedule owner task</text>
 <rect x="95" y="1480" width="200" height="54" rx="12" fill="#FBB4AE" stroke="#4D4D4D" stroke-width="1.4"/>
 <circle cx="120" cy="1505" r="15" fill="white" stroke="#4D4D4D"/>
 <text x="120" y="1511" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#222">7</text>
@@ -141,7 +141,7 @@
 <text x="472" y="1499" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">response</text>
 <line x1="960" y1="1506" x2="1090" y2="1506" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
 <text x="1025" y="1493" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">one send in flight</text>
-<rect x="1090" y="1465" width="250" height="90" rx="12" fill="white" stroke="#4D4D4D" stroke-width="2.4" stroke-dasharray="8 5"/>
-<text x="1215" y="1516" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">peer socket</text>
+<rect x="1090" y="1460" width="250" height="80" rx="12" fill="white" stroke="#4D4D4D" stroke-width="2.4" stroke-dasharray="8 5"/>
+<text x="1215" y="1506" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">peer socket</text>
 <text x="730" y="1580" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">return/panic → deferred close → slot generation increments</text>
 </svg>

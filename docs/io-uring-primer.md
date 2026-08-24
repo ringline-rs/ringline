@@ -61,80 +61,152 @@ small operations less dominated by submission overhead. It does not require
 large batches: a latency-sensitive loop can submit promptly while still
 combining work already available.
 
-### Less readiness choreography at high concurrency
+### More operations outstanding at high concurrency
 
 This is not a thread-count advantage over epoll. An epoll event loop can also
 manage many connections on one thread; neither design requires a thread per
 request ([`epoll(7)`]).
 
-The difference is what crosses the kernel boundary. epoll reports that a file
-descriptor is ready, after which userspace issues `accept`, `read`, or `write`,
-handles partial progress and `EAGAIN`, and maintains or rearms interest state.
-io_uring submits the operation itself, and its CQE identifies that operation
-and carries the result. Multishot operations can produce several completions
-from one submission. For a service doing frequent small, bounded operations,
-that can reduce repeated control syscalls and readiness bookkeeping while
-batching submission and completion work ([`io_uring_multishot(7)`]).
+The distinction is where synchronous work sits. epoll reports that a file
+descriptor is ready, so the event-loop thread then calls `accept`, `recv`, or
+`send` for each ready descriptor. Nonblocking `recv` does not wait for data,
+but the call still has to finish its copying, accounting, protocol-stack work,
+and error handling before that thread issues the next call. Those costs are
+therefore serialized on the event-loop thread across file descriptors.
 
-That advantage is workload-dependent, not a higher connection-count ceiling.
-epoll already returns batches of ready descriptors, has mature behavior, and
-can match or beat io_uring when sockets are usually ready, batches are small,
-or io_uring's setup and completion machinery do not amortize. Some io_uring
-operations can also be offloaded to kernel worker threads when they cannot
-complete non-blockingly, so io_uring is not threadless. Measure the actual
-request mix rather than treating concurrency alone as the reason to switch.
+io_uring lets the loop describe operations for many descriptors first and
+consume their results later. The kernel can make progress on those outstanding
+operations without requiring the event loop to finish one data syscall before
+issuing the next. A CQE identifies the operation and carries its result, while
+multishot operations can produce several completions from one submission. This
+can reduce control syscalls, readiness bookkeeping, and time spent in
+per-descriptor synchronous calls ([`io_uring_multishot(7)`]).
 
-### Kernel integration with reusable buffers
+This is not a guarantee that socket operations execute simultaneously. Some
+complete inline during submission, some progress in the network stack, and
+operations that cannot complete nonblockingly may use kernel worker threads.
+epoll can match or beat io_uring when sockets are usually ready, batches are
+small, or ring management does not amortize. Connection count alone is not the
+reason to switch; request rate, batch size, and time spent inside each data call
+determine the opportunity.
 
-Known request-size limits make buffer ownership and memory use explicit. A
-service can choose its maximum number of in-flight requests and preallocate a
-corresponding pool, rather than allocate in proportion to an unbounded input
-queue. That is an application design technique, not an io_uring feature:
-Pelikan has used preallocated I/O and request-object pools with readiness-based
-event loops since its earliest versions. The same bounded-pool discipline
-applies to epoll, Mio, and io_uring.
+### Worked example, not benchmark data
 
-What io_uring adds is kernel integration with those reusable buffers.
-Registered buffers pin and map application memory once, avoiding repeated
-validation, pinning, and mapping for each operation. Upstream documentation
-says they are most useful for frequent small I/O that repeatedly uses the
-same buffers ([`io_uring_registered_buffers(7)`]).
+The following model illustrates fixed application syscall crossings. It is not
+a performance result. Assume one bounded request and response per transaction,
+one ready descriptor and one drain per transaction, one successful `recv` and
+`send`, one final `recv` returning `EAGAIN` for an edge-triggered drain,
+prearmed multishot receive for io_uring, and one `io_uring_enter` that
+publishes available sends and waits for each batch.
+Let `R` be requests per second and `B` the average completed batch size.
 
-Provided-buffer rings solve a different receive-side problem. Multiple
-pending operations share a pool, and the kernel selects a buffer only when
-data arrives. The CQE identifies the selected buffer. If the pool is empty,
-the operation reports `-ENOBUFS`; this gives the service an observable point
-at which to apply backpressure or shed load
-([`io_uring_provided_buffers(7)`]).
+| Model | Approximate application syscalls | Event-loop CPU path | System-wide CPU trade-off |
+| --- | ---: | --- | --- |
+| epoll, level-triggered | `2R + ceil(R/B)` | Each `recv` and `send` completes serially on the loop | Low setup cost; repeated entry/exit and readiness bookkeeping |
+| epoll, edge-triggered drain | `3R + ceil(R/B)` | Adds the terminal `EAGAIN` call for each drained descriptor | More calls in this model, but fewer readiness notifications can offset them |
+| io_uring, batched + multishot receive | `ceil(R/B)` | Publishes SQEs and processes CQEs; no application data syscall per request | Ring processing and operation state replace much of the syscall overhead |
+| io_uring with active SQPOLL | potentially zero submission calls while active | Shared-memory publication and CQ processing | A kernel polling thread can consume substantial CPU, including when idle |
 
-These mechanisms do not make capacity automatic. SQ depth limits how many
-entries can be submitted in one batch, not the total number of operations
-that can remain in flight. The application must separately bound accepted
-work, outstanding operations, and buffers
-([`io_uring_queue_init_params(3)`]).
+The numeric examples use whole batches, rounding `R/B` upward:
+
+| Scenario | Connections | Request rate | Average batch | epoll LT calls/s | epoll ET calls/s | io_uring enters/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Small, sparse | 100 | 1,000/s | 1 | 3,000 | 4,000 | 1,000 |
+| Large, sparse | 100,000 | 1,000/s | 1 | 3,000 | 4,000 | 1,000 |
+| Small, busy | 100 | 1,000,000/s | 64 | 2,015,625 | 3,015,625 | 15,625 |
+| Large, busy | 100,000 | 5,000,000/s | 256 | 10,019,532 | 15,019,532 | 19,532 |
+
+The first two rows deliberately produce the same counts: idle connection count
+does not create syscall savings by itself. To show scale rather than predict
+hardware, assume each application syscall entry/exit has a fixed 200 ns CPU
+cost and exclude payload copying, protocol processing, CQ/SQ processing, and
+all other work:
+
+| Scenario | epoll LT fixed cost | epoll ET fixed cost | io_uring fixed cost |
+| --- | ---: | ---: | ---: |
+| Small, sparse | 0.0006 CPU-seconds/s | 0.0008 CPU-seconds/s | 0.0002 CPU-seconds/s |
+| Large, sparse | 0.0006 CPU-seconds/s | 0.0008 CPU-seconds/s | 0.0002 CPU-seconds/s |
+| Small, busy | 0.403 CPU-seconds/s | 0.603 CPU-seconds/s | 0.003 CPU-seconds/s |
+| Large, busy | 2.004 CPU-seconds/s | 3.004 CPU-seconds/s | 0.004 CPU-seconds/s |
+
+These figures isolate only the assumed crossing cost. They do not say io_uring
+uses less total CPU: CQ processing, ring synchronization, cache behavior,
+copying, networking, and SQPOLL can erase or reverse the modeled difference.
 
 ### Fewer repeated submissions
 
-Multishot accept, receive, read, and poll operations can produce several
-CQEs from one SQE. This reduces rearming traffic for busy servers. A
-multishot request eventually terminates—for example on an error,
-cancellation, or receive-buffer exhaustion—and the application must detect
-the final CQE and rearm if appropriate ([`io_uring_multishot(7)`]).
+Multishot accept, receive, read, and poll operations can produce several CQEs
+from one SQE. This reduces rearming traffic for busy servers. A multishot
+request eventually terminates—for example on an error, cancellation, or
+receive-buffer exhaustion—and the application must detect the final CQE and
+rearm if appropriate ([`io_uring_multishot(7)`]).
 
-### Architecture that complements io_uring
+## Complementary application architecture
+
+### Bounded pools are not an io_uring feature
+
+Known request-size limits let a service preallocate I/O buffers and request
+objects, bound in-flight work, and define overload behavior. Pelikan has used
+that discipline with readiness-based event loops since its earliest versions.
+io_uring does not introduce pooling, bounded memory, backpressure, or clear
+ownership; epoll and Mio can use exactly the same techniques.
+
+Once an application has a reusable pool, io_uring can integrate it with the
+kernel in two distinct ways. Fixed registered buffers pay memory validation,
+pinning, and mapping costs at registration rather than on every eligible I/O.
+A provided-buffer ring instead registers buffer descriptors so the kernel can
+select an available buffer and return its ID in a CQE
+([`io_uring_registered_buffers(7)`], [`io_uring_register_buf_ring(3)`]).
+Neither mechanism creates the application pool or chooses its capacity.
+
+### Illustrative memory accounting
+
+Consider 100,000 established connections, but only 16,384 simultaneously
+active requests; a 4 KiB receive slot and 256-byte request object per active
+request; 4,096 readiness/SQ entries; 8,192 CQ entries; and a modeled 16-byte
+readiness-event slot. Use standard 64-byte SQEs, 16-byte CQEs, and 16-byte
+`io_uring_buf` descriptors. This table shows selected userspace allocations,
+not measured RSS:
+
+| Memory component | epoll/Mio | io_uring |
+| --- | ---: | ---: |
+| Application receive pool | 64 MiB | 64 MiB |
+| Request-object pool | 4 MiB | 4 MiB |
+| Readiness-event array | about 64 KiB | — |
+| SQE array | — | 256 KiB |
+| CQE array | — | 128 KiB |
+| Provided-buffer descriptors | — | 256 KiB |
+| Ring headers and SQ index array | — | tens of KiB |
+| Approximate userspace total shown | about 68.1 MiB | about 68.7 MiB |
+
+The dominant pools are shared application architecture. In this example
+io_uring adds roughly 0.6 MiB of visible control storage, while extended
+128-byte SQEs or 32-byte CQEs double their respective rows
+([`io_uring_setup_flags(7)`]). Real totals also include per-operation state,
+send buffers, allocator overhead, kernel ring accounting, and socket buffers;
+the last category can dominate and exists with either backend.
+
+Registered memory can remain pinned. Kernels before Linux 5.12 charge fixed
+registered buffers against `RLIMIT_MEMLOCK`; Linux 5.12 and later with native
+io_uring workers use cgroup memory accounting instead
+([`io_uring_registered_buffers(7)`]).
+Queue depth and outstanding-operation limits therefore require an explicit
+memory budget. A thread-per-connection design can additionally consume large
+virtual and resident stack space, but epoll/Mio does not require that design
+and should not be burdened with that comparison.
+
+### Locality is not an io_uring feature
 
 Thread-per-core ownership, CPU affinity, NUMA placement, and keeping request
-state and buffers local are runtime architecture choices. They are not
-io_uring features, and a readiness-based event loop can use the same design.
-Pelikan already does so with its epoll/Mio path.
+state and buffers local are runtime architecture choices. Pelikan already
+applies them to its epoll/Mio path.
 
-io_uring fits that architecture particularly well when each event-loop thread
+io_uring maps naturally onto that architecture when each event-loop thread
 owns one ring. The ring then has a single submitting owner, avoids
 application-side synchronization around shared submission state, and can use
-facilities such as `IORING_SETUP_SINGLE_ISSUER`. Current upstream guidance
-describes a ring per thread as the idiomatic arrangement and discourages
-sharing a ring between threads because sharing requires synchronization and
-prevents those ring-level optimizations ([`io_uring_setup_flags(7)`]).
+`IORING_SETUP_SINGLE_ISSUER`. That is an io_uring optimization enabled by
+local ownership, not the source of locality itself
+([`io_uring_setup_flags(7)`]).
 
 ## What it does not guarantee
 
@@ -278,6 +350,7 @@ capacity limit from socket or kernel failure.
 [`io_uring_multishot(7)`]: https://man7.org/linux/man-pages/man7/io_uring_multishot.7.html
 [`io_uring_cancelation(7)`]: https://man7.org/linux/man-pages/man7/io_uring_cancelation.7.html
 [`io_uring_queue_init_params(3)`]: https://man7.org/linux/man-pages/man3/io_uring_queue_init_params.3.html
+[`io_uring_register_buf_ring(3)`]: https://man7.org/linux/man-pages/man3/io_uring_register_buf_ring.3.html
 [`io_uring_prep_send_zc(3)`]: https://man7.org/linux/man-pages/man3/io_uring_prep_send_zc.3.html
 [`epoll(7)`]: https://man7.org/linux/man-pages/man7/epoll.7.html
 [Jens Axboe's design paper]: https://www.kernel.dk/io_uring.pdf

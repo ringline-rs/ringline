@@ -695,12 +695,12 @@ fn render_request_flow_panel(svg: &mut String, offset: u32, backend: RequestBack
     );
     stage(
         svg,
-        355,
+        375,
         y(600),
-        240,
+        200,
         54,
         "6",
-        "wake_recv + poll owner task",
+        "schedule owner task",
         "#CCEBC5",
     );
     stage(svg, 95, y(680), 200, 54, "7", "parse + send", "#FBB4AE");
@@ -742,7 +742,7 @@ fn render_request_flow_panel(svg: &mut String, offset: u32, backend: RequestBack
     );
     arrow(svg, 295, parse_lower, 650, y(706), "response");
     arrow(svg, 960, y(706), 1090, y(706), "one send in flight");
-    external_box(svg, 1090, y(665), 250, 90, "peer socket");
+    external_box(svg, 1090, y(660), 250, 80, "peer socket");
     centered(
         svg,
         730,
@@ -969,7 +969,7 @@ mod tests {
         assert!(uring < mio, "io_uring panel must be above Mio");
         assert_eq!(diagram.matches("submit_and_wait + CQE").count(), 1);
         assert_eq!(diagram.matches("read until EAGAIN").count(), 1);
-        assert_eq!(diagram.matches("wake_recv + poll owner task").count(), 2);
+        assert_eq!(diagram.matches("schedule owner task").count(), 2);
         assert!(
             !diagram.contains("wake_recv + poll</text>"),
             "task polling must not be confused with Mio readiness polling"
@@ -979,6 +979,22 @@ mod tests {
             "backend operations must not share a stage"
         );
         assert_eq!(diagram.matches("data-role=\"lane-label\"").count(), 8);
+    }
+
+    #[test]
+    fn primer_separates_modeled_costs_from_backend_independent_design() {
+        let primer = fs::read_to_string(workspace_root().join("docs/io-uring-primer.md")).unwrap();
+        for expected in [
+            "Worked example, not benchmark data",
+            "10,019,532",
+            "Approximate userspace total shown",
+            "does not introduce pooling",
+        ] {
+            assert!(
+                primer.contains(expected),
+                "missing primer contract: {expected}"
+            );
+        }
     }
 
     #[test]
@@ -997,6 +1013,13 @@ mod tests {
         let request_flow = render_request_flow();
         assert_eq!(request_flow.matches("data-role=\"lane-label\"").count(), 8);
         assert_eq!(request_flow.matches("height=\"590\"").count(), 8);
+        for y in [660, 1460] {
+            let peer = format!("x=\"1090\" y=\"{y}\" width=\"250\" height=\"80\"");
+            assert!(
+                request_flow.contains(&peer),
+                "peer socket box must fit inside its parent lane: {peer}"
+            );
+        }
 
         let lane_bottom = 160 + 590;
         let final_stage_bottom = 680 + 54;
