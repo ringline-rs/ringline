@@ -55,4 +55,4 @@ reconstructed from the commit history (2026-02-20 through v0.4.0).
 | [2026-07 — Correctness audit and v0.4.0](2026-07-correctness-audit.md) | Jul 2026 · PRs #236–#255 · v0.4.0 | ~35 audit fixes in stacked PRs, send-completion design doc, perf follow-ups |
 | [2026-07 — ENOBUFS graceful degradation: fallback one-shot recv](2026-07-enobufs-fallback-recv.md) | Jul 2026 · PR #274 | Park counter + fallback recv into accumulator memory for responses larger than the provided ring |
 | [2026-07 — Fuzzing the wire-facing parsers](2026-07-fuzzing.md) | Jul 2026 · PR #263 | Eight cargo-fuzz targets for h2/h3/http1/grpc parsing + daily fuzz CI |
-| [2026-08 — io_uring primer and code-derived runtime diagrams](2026-08-io-uring-primer.md) | Aug 2026 | Technology-first io_uring guidance, Ringline architecture, and generated diagram checks |
+| [2026-08 — io_uring primer and code-derived runtime diagrams](2026-08-io-uring-primer.md) | Aug 2026 · PR #319 | Technology-first io_uring guidance, Ringline architecture, and generated diagram checks |

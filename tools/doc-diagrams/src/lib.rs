@@ -116,6 +116,19 @@ const CLAIMS: &[Claim] = &[
     },
 ];
 
+/// The kernel floor `ringline/build.rs` enforces for the io_uring backend.
+/// Docs that advertise the floor are checked against this same constant so a
+/// bump in build.rs cannot leave stale version prose behind.
+const MIN_IOURING_KERNEL: (u32, u32) = (6, 0);
+
+/// Docs that state the io_uring kernel floor in prose.
+const KERNEL_FLOOR_DOCS: &[&str] = &[
+    "README.md",
+    "ringline/README.md",
+    "docs/architecture.md",
+    "docs/io-uring-primer.md",
+];
+
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -128,9 +141,11 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     for claim in CLAIMS {
         let path = root.join(claim.path);
         let source = fs::read_to_string(&path)?;
-        if !source.contains(claim.needle) {
+        if !strip_whitespace(&source).contains(&strip_whitespace(claim.needle)) {
             return Err(io::Error::other(format!(
-                "diagram claim drifted: {} ({}) no longer contains {:?}",
+                "diagram claim drifted: {} ({}) no longer contains {:?} (compared ignoring \
+                 whitespace); if the code legitimately changed, update the claim table in \
+                 tools/doc-diagrams/src/lib.rs",
                 claim.meaning,
                 path.display(),
                 claim.needle
@@ -143,6 +158,28 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
         return Err(io::Error::other(
             "backend diagram requires Linux and force-mio compile-time selection",
         ));
+    }
+
+    let floor_needle = format!(
+        "(major, minor) >= ({}, {})",
+        MIN_IOURING_KERNEL.0, MIN_IOURING_KERNEL.1
+    );
+    if !build.contains(&floor_needle) {
+        return Err(io::Error::other(format!(
+            "kernel-floor claim drifted: ringline/build.rs no longer checks {floor_needle:?}; \
+             update MIN_IOURING_KERNEL in tools/doc-diagrams/src/lib.rs and every doc listed \
+             in KERNEL_FLOOR_DOCS"
+        )));
+    }
+    let floor_text = format!("{}.{}", MIN_IOURING_KERNEL.0, MIN_IOURING_KERNEL.1);
+    for doc in KERNEL_FLOOR_DOCS {
+        let contents = fs::read_to_string(root.join(doc))?;
+        if !contents.contains(&floor_text) {
+            return Err(io::Error::other(format!(
+                "kernel-floor claim drifted: {doc} no longer mentions kernel {floor_text} \
+                 while ringline/build.rs enforces it"
+            )));
+        }
     }
 
     let worker = fs::read_to_string(root.join("ringline/src/worker.rs"))?;
@@ -274,15 +311,24 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Match ignoring all whitespace so a rustfmt reflow cannot break a claim
+/// whose code is unchanged.
+fn strip_whitespace(input: &str) -> String {
+    input.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn require_order(source: &str, before: &str, after: &str, meaning: &str) -> io::Result<()> {
-    let before_pos = source.find(before).ok_or_else(|| {
+    let source = strip_whitespace(source);
+    let before_pos = source.find(&strip_whitespace(before)).ok_or_else(|| {
         io::Error::other(format!(
-            "diagram claim drifted: missing {before:?} ({meaning})"
+            "diagram claim drifted: missing {before:?} ({meaning}); if the code legitimately \
+             changed, update the ordered claims in tools/doc-diagrams/src/lib.rs"
         ))
     })?;
-    let after_pos = source.find(after).ok_or_else(|| {
+    let after_pos = source.find(&strip_whitespace(after)).ok_or_else(|| {
         io::Error::other(format!(
-            "diagram claim drifted: missing {after:?} ({meaning})"
+            "diagram claim drifted: missing {after:?} ({meaning}); if the code legitimately \
+             changed, update the ordered claims in tools/doc-diagrams/src/lib.rs"
         ))
     })?;
     if before_pos >= after_pos {
@@ -300,9 +346,11 @@ fn require_order_after(
     after: &str,
     meaning: &str,
 ) -> io::Result<()> {
-    let anchor_pos = source.find(anchor).ok_or_else(|| {
+    let source = strip_whitespace(source);
+    let anchor_pos = source.find(&strip_whitespace(anchor)).ok_or_else(|| {
         io::Error::other(format!(
-            "diagram claim drifted: missing anchor {anchor:?} ({meaning})"
+            "diagram claim drifted: missing anchor {anchor:?} ({meaning}); if the code \
+             legitimately changed, update the ordered claims in tools/doc-diagrams/src/lib.rs"
         ))
     })?;
     require_order(&source[anchor_pos..], before, after, meaning)
@@ -430,10 +478,16 @@ pub fn write_all(root: &Path, check: bool) -> io::Result<()> {
 
     if check {
         for (path, expected) in files {
-            let actual = fs::read_to_string(&path)?;
+            // Normalize line endings so an autocrlf checkout cannot fail the
+            // byte comparison forever (.gitattributes also pins these files
+            // to LF).
+            let actual = fs::read_to_string(&path)?.replace("\r\n", "\n");
             if actual != expected {
+                let (line, expected_line, actual_line) = first_divergence(&expected, &actual);
                 return Err(io::Error::other(format!(
-                    "{} is stale; run cargo run -p doc-diagrams",
+                    "{} is stale at line {line}: expected {expected_line:?}, found \
+                     {actual_line:?}; regenerate with `cargo run -p doc-diagrams` (generator \
+                     and claim tables: tools/doc-diagrams/src/lib.rs)",
                     path.display()
                 )));
             }
@@ -445,6 +499,27 @@ pub fn write_all(root: &Path, check: bool) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Locate the first line where two renderings differ, for actionable
+/// stale-diagram errors.
+fn first_divergence(expected: &str, actual: &str) -> (usize, String, String) {
+    let mut expected_lines = expected.lines();
+    let mut actual_lines = actual.lines();
+    let mut line = 0;
+    loop {
+        line += 1;
+        match (expected_lines.next(), actual_lines.next()) {
+            (Some(e), Some(a)) if e == a => continue,
+            (e, a) => {
+                return (
+                    line,
+                    e.unwrap_or("<end of file>").to_string(),
+                    a.unwrap_or("<end of file>").to_string(),
+                );
+            }
+        }
+    }
 }
 
 fn render_runtime() -> String {
@@ -653,7 +728,7 @@ fn render_request_flow_panel(svg: &mut String, offset: u32, backend: RequestBack
     svg.push_str(&format!(
         "<text x=\"730\" y=\"{}\" text-anchor=\"middle\" data-role=\"backend-panel\" font-family=\"sans-serif\" font-size=\"21\" font-weight=\"bold\" fill=\"#222\">{}</text>\n",
         y(115),
-        backend.panel_label()
+        escape(backend.panel_label())
     ));
 
     lane(svg, 70, y(160), 250, 590, "connection owner");
@@ -705,8 +780,10 @@ fn render_request_flow_panel(svg: &mut String, offset: u32, backend: RequestBack
     );
     stage(svg, 95, y(680), 200, 54, "7", "parse + send", "#FBB4AE");
 
-    let (backend_upper, backend_lower) = paired_edge_offsets(y(540), 24);
-    let (parse_upper, parse_lower) = paired_edge_offsets(y(707), 20);
+    // Connector pairs center on the midpoint of the stage edge they attach
+    // to: stage 5 spans y(510)..y(510)+74, stage 7 spans y(680)..y(680)+54.
+    let (backend_upper, backend_lower) = paired_edge_offsets(y(510) + 74 / 2, 24);
+    let (parse_upper, parse_lower) = paired_edge_offsets(y(680) + 54 / 2, 20);
 
     arrow(svg, 1100, y(217), 955, y(217), "accepted fd");
     arrow(svg, 655, y(230), 575, y(297), "generation-tagged ConnCtx");
@@ -967,23 +1044,25 @@ mod tests {
 
     #[test]
     fn paired_connectors_are_symmetric_around_edge_midpoint() {
-        assert_eq!(paired_edge_offsets(540, 24), (528, 552));
+        // Stage 5 spans y=510..584, so its edge midpoint is 547; stage 7
+        // spans y=680..734, midpoint 707.
+        assert_eq!(paired_edge_offsets(547, 24), (535, 559));
         assert_eq!(paired_edge_offsets(707, 20), (697, 717));
 
         let diagram = render_request_flow();
         for coordinate in [
-            "y2=\"528\"",
-            "y1=\"552\"",
+            "y2=\"535\"",
+            "y1=\"559\"",
             "y2=\"697\"",
             "y1=\"717\"",
-            "y2=\"1328\"",
-            "y1=\"1352\"",
+            "y2=\"1335\"",
+            "y1=\"1359\"",
             "y2=\"1497\"",
             "y1=\"1517\"",
         ] {
             assert!(diagram.contains(coordinate), "missing {coordinate}");
         }
-        for (label, y) in [("CQE", 575), ("readiness", 1375)] {
+        for (label, y) in [("CQE", 582), ("readiness", 1382)] {
             let line = diagram
                 .lines()
                 .find(|line| line.ends_with(&format!(">{label}</text>")))
@@ -1053,12 +1132,57 @@ mod tests {
             );
         }
 
-        let lane_bottom = 160 + 590;
-        let final_stage_bottom = 680 + 54;
-        assert!(
-            final_stage_bottom < lane_bottom,
-            "child stage must fit inside its lane"
-        );
+        // Derive containment from the rendered geometry rather than
+        // restating the renderer's constants: every stage rect must sit
+        // fully inside one of the lane rects.
+        let document = roxmltree::Document::parse(&request_flow).unwrap();
+        let rects: Vec<roxmltree::Node<'_, '_>> = document
+            .descendants()
+            .filter(|node| node.has_tag_name("rect") && node.attribute("width") != Some("100%"))
+            .collect();
+        let lanes: Vec<_> = rects
+            .iter()
+            .filter(|node| node.attribute("fill") == Some("#F7F7F7"))
+            .map(|node| rect_bounds(*node))
+            .collect();
+        let stages: Vec<_> = rects
+            .iter()
+            .filter(|node| {
+                node.attribute("rx").is_some()
+                    && matches!(node.attribute("fill"), Some("#CCEBC5" | "#FBB4AE"))
+            })
+            .map(|node| rect_bounds(*node))
+            .collect();
+        assert_eq!(lanes.len(), 8);
+        assert_eq!(stages.len(), 14);
+        for &(left, top, right, bottom) in &stages {
+            assert!(
+                lanes
+                    .iter()
+                    .any(|&(lane_left, lane_top, lane_right, lane_bottom)| {
+                        left >= lane_left
+                            && top >= lane_top
+                            && right <= lane_right
+                            && bottom <= lane_bottom
+                    }),
+                "stage ({left}, {top})..({right}, {bottom}) is not contained in any lane"
+            );
+        }
+    }
+
+    fn rect_bounds(node: roxmltree::Node<'_, '_>) -> (f64, f64, f64, f64) {
+        let read = |attribute: &str| {
+            node.attribute(attribute)
+                .expect("rect attribute")
+                .parse::<f64>()
+                .expect("numeric rect attribute")
+        };
+        (
+            read("x"),
+            read("y"),
+            read("x") + read("width"),
+            read("y") + read("height"),
+        )
     }
 
     #[test]

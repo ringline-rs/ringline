@@ -1,7 +1,7 @@
 # io_uring primer and code-derived Ringline diagrams
 
-- **Status:** open
-- **Span:** 2026-08-23 · branch `docs/io-uring-primer`
+- **Status:** shipped
+- **Span:** 2026-08-23 → 2026-08-24 · PR #319 (merge `0dfc715`)
 
 ## Goal
 
@@ -40,7 +40,7 @@ breaks or a committed SVG differs from generated output.
 
 ## Outcome
 
-The outcome remains open until the pull request lands. The branch contains:
+Shipped as PR #319 (merge `0dfc715`). The change contains:
 
 - `docs/io-uring-primer.md`;
 - `docs/architecture.md`;
@@ -96,8 +96,6 @@ backend counters are added.
 - The local image-view helper could not initialize its sandbox network
   namespace. XML validation, deterministic generation, viewport-bound checks,
   and independent review replace that unavailable preview step.
-- After merge, change this entry to shipped and record the pull request and
-  merge commit.
 - Repeat the local four-P-core benchmark on a fixed Ubuntu or unaffected
   upstream kernel before treating the diagnostic-patch numbers as publishable
   performance evidence. Preserve the failed syscall trace and reserved-field

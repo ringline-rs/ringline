@@ -10,7 +10,9 @@ ringline is a thread-per-core I/O framework. It provides an async/await API
 
 - An io_uring backend that exploits advanced kernel features: multishot
   recv, ring-provided buffers, SendMsgZc (zero-copy send), fixed file table
-- A Mio backend for non-Linux targets and Linux builds using `force-mio`
+- A Mio backend for macOS and other Unix targets, for Linux kernels older
+  than 6.0 (automatic build-time fallback), and for Linux builds using
+  `force-mio`
 - Thread-per-core with CPU pinning — no work-stealing, no task migration
 
 ## What ringline is NOT
@@ -129,12 +131,16 @@ handler instance. On the io_uring backend, each worker also owns:
 ## Platform Requirements
 
 - The io_uring backend requires **Linux 6.0+** on **x86_64** or **ARM64**.
-- Other supported Unix targets use Mio. Linux builds can select Mio with
-  `--features force-mio`.
+- Backend selection happens at build time in `ringline/build.rs`: a Linux
+  host whose kernel reports a version older than 6.0 silently gets the Mio
+  backend — no feature flag, no error. Verify which backend you built before
+  benchmarking.
+- macOS and other Mio-supported Unix targets always use the Mio backend.
+  Linux builds can force it with `--features force-mio`.
 
 ## MSRV
 
-Rust 1.85+ (edition 2024)
+Rust 1.88+ (edition 2024; let-chains in the core crate require 1.88)
 
 ## Examples
 

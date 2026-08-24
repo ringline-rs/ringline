@@ -26,15 +26,6 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  doc-diagrams:
-    name: Documentation diagrams
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo run --locked -p doc-diagrams -- --check
-
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -98,6 +89,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all
+      # The diagram freshness check shares this job: the claim tests already
+      # run under `cargo test --all`, so the only unique work is the stale-SVG
+      # comparison — not worth a dedicated runner.
+      - run: cargo run --locked -p doc-diagrams -- --check
 
   test-release:
     name: Test (release)
