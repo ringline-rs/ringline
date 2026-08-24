@@ -98,6 +98,32 @@ No runtime behavior changes are in scope.
   spatially distinct from lower-level content, rather than mixed into the same
   text rhythm merely because all strings technically fit.
 
+- **Friction** — Multiline labels were positioned one line at a time, so a
+  two-line label could be mathematically centered by its first baseline while
+  the visible block sat too high or low. The generator now measures the whole
+  line group, centers that group in the shape, and then places each baseline
+  within it. The skills should treat a multiline label as one layout object
+  before aligning its lines.
+
+- **Friction** — Sibling steps with different widths let a connector that was
+  correct for the narrow boxes penetrate the wider box. The generator now uses
+  one geometry for equivalent steps and tests connector endpoints against the
+  actual box borders. The skills should route against resolved shape bounds,
+  not against a nominal column coordinate.
+
+- **Friction** — Labels on two parallel arrows were both placed on the same
+  side of their lines. In a tight pair, that can put a label closer to the
+  neighboring arrow than to the arrow it describes. The generator now places
+  the upper label above the upper line and the lower label below the lower line.
+  The skills should choose label placement for the connector group: use outward
+  placement for a pair, then use collision-aware placement for larger groups.
+
+- **Friction** — The label `wake_recv + poll owner task` placed two meanings of
+  “poll” next to each other: Mio readiness polling and runtime task polling. The
+  public diagram now says `schedule owner task`; the Rust runtime detail remains
+  in prose. The skills should prefer mechanism-neutral lifecycle labels unless
+  an implementation detail distinguishes the paths being compared.
+
 - **Friction** — Combining materially different execution variants in one flow
   makes shared lifecycle stages look like shared backend mechanics. When two
   implementations use different operation vocabularies or event paths, the
@@ -110,6 +136,10 @@ No runtime behavior changes are in scope.
   three incorrect source markers during the first test run. The resulting
   generator now fails at the architecture boundary rather than producing a
   plausible stale chart.
+- **Confirmation** — Converting the user’s visual feedback into generator tests
+  made the fixes durable: multiline groups stay centered, equivalent boxes keep
+  one width, connector endpoints remain on borders, paired labels face outward,
+  and peer boxes remain inside their lanes.
 
 ### review-guide (beta)
 
