@@ -51,12 +51,17 @@ The outcome remains open until the pull request lands. The branch contains:
 No runtime behavior changes are in scope.
 
 The requested local io_uring-versus-Mio benchmark could not proceed on the
-2026-08-24 test host (Intel Core i5-13500H, Linux 6.8.0-138-generic). Ringline's
-`io_uring_setup` call succeeded with 256 SQ entries, and sparse buffer and file
-registration also succeeded. `IORING_REGISTER_PBUF_RING` then returned
-`EINVAL`, so the native Ringline server failed before binding. The forced-Mio
-binary built successfully, but running only that side would not produce a
-comparison. No performance numbers were recorded.
+2026-08-24 test host (Intel Core i5-13500H, Ubuntu 6.8.0-138.138-generic).
+Ringline's `io_uring_setup` call succeeded with 256 SQ entries, and sparse
+buffer and file registration also succeeded. `IORING_REGISTER_PBUF_RING` then
+returned `EINVAL`, so the native Ringline server failed before binding. The
+root cause is an inverted reserved-field check in Ubuntu's downstream
+`io_uring/kbuf.c`: it rejects a correctly zeroed `io_uring_buf_reg::resv` array.
+A syscall-only probe confirmed that both userspace-backed and kernel-allocated
+PBUF registration fail when `resv[0]` is zero and succeed when it is one. The
+nonzero value violates the ABI and is diagnostic evidence, not a workaround.
+The forced-Mio binary built successfully, but running only that side would not
+produce a comparison. No performance numbers were recorded.
 
 ## Lessons / open questions
 
@@ -70,11 +75,13 @@ comparison. No performance numbers were recorded.
   and independent review replace that unavailable preview step.
 - After merge, change this entry to shipped and record the pull request and
   merge commit.
-- Re-run the local four-P-core benchmark when the host accepts
-  `IORING_REGISTER_PBUF_RING`. Use logical CPUs `0,2,4,6` for the four physical
-  P cores and `8-15` for load generation; compare 1, 2, and 4 server workers at
-  1, 64, and 512 closed-loop connections, followed by fixed-rate 4-worker
-  trials. Preserve the failed syscall trace as the reason this run has no data.
+- Re-run the local four-P-core benchmark after installing an Ubuntu kernel that
+  fixes the inverted PBUF reserved-field check, or an unaffected upstream
+  kernel. Use logical CPUs `0,2,4,6` for the four physical P cores and `8-15`
+  for load generation; compare 1, 2, and 4 server workers at 1, 64, and 512
+  closed-loop connections, followed by fixed-rate 4-worker trials. Preserve the
+  failed syscall trace and reserved-field probe as the reason this run has no
+  data.
 
 ## Skill Feedback
 
