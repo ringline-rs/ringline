@@ -29,6 +29,8 @@ pub struct Ring {
     /// Reusable Entry128 conversion scratch for chain pushes — avoids a
     /// heap allocation per chained send.
     chain_scratch: Vec<squeue::Entry128>,
+    #[cfg(test)]
+    forced_push_failures: usize,
 }
 
 impl Ring {
@@ -60,6 +62,8 @@ impl Ring {
             ring,
             bgid: config.recv_buffer.bgid,
             chain_scratch: Vec::new(),
+            #[cfg(test)]
+            forced_push_failures: 0,
         })
     }
 
@@ -788,17 +792,33 @@ impl Ring {
     /// # Safety
     /// The SQE must reference valid memory for the lifetime of the operation.
     pub(crate) unsafe fn push_sqe128(&mut self, entry: squeue::Entry128) -> io::Result<()> {
+        #[cfg(test)]
+        if self.forced_push_failures > 0 {
+            self.forced_push_failures -= 1;
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "forced SQ push failure",
+            ));
+        }
         // Try to push; if SQ is full, submit first to make room.
         unsafe {
             if self.ring.submission().push(&entry).is_err() {
                 self.ring.submit()?;
                 if self.ring.submission().push(&entry).is_err() {
                     crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
-                    return Err(io::Error::other("SQ still full after submit"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "SQ still full after submit",
+                    ));
                 }
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_push_failures(&mut self, count: usize) {
+        self.forced_push_failures = count;
     }
 
     /// Push a chain of linked SQEs atomically.

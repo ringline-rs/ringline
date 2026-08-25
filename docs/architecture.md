@@ -147,10 +147,11 @@ work is still completing.
 ![Connection request and response flow](diagrams/request-flow.svg)
 
 This diagram is also generated and checked against code-level architecture
-constraints. It uses two vertically stacked panels rather than mixing backend
-terms: the io_uring lifecycle is on top and the Mio lifecycle is below. Each
-panel repeats the portable connection-task stages so its backend event path can
-be read independently.
+constraints. It uses three vertically stacked panels rather than mixing backend
+terms: the io_uring lifecycle is on top, the Mio lifecycle is below it, and a
+third panel shows the backend-independent `send_backpressured` admission path.
+Each backend panel repeats the portable connection-task stages so its event
+path can be read independently.
 
 Their shared text equivalent is: an accepted descriptor enters a worker's
 bounded channel; the worker allocates and initializes a generation-tagged slot,
@@ -190,6 +191,19 @@ logical send's completion. Neither form bypasses backend completion handling:
 the completion is required to release pool or slab resources and advance the
 queue. On io_uring, `send_parts` can retain guarded user memory for zero-copy
 sends; on Mio guards are consumed by copying.
+
+`send_backpressured` adds an admission stage upstream of that same queue,
+shown in the third panel. Constructing the future is inert; its first poll
+registers the polling task in a worker-local FIFO shared by every connection
+on the worker. The future parks until it is both the FIFO head and the send
+copy pool can admit the complete logical buffer (for TLS, a conservative
+ciphertext bound), then reserves every slot transactionally and enters the
+per-connection ordered send queue. Completions and failures are routed back
+by a logical-operation ID rather than a per-connection wake, so cancellation,
+moves between worker-local tasks, and slot reuse cannot misdeliver a result.
+Returned permits wake the FIFO head on completion, flush, and connection
+close. On Mio, a requested half-close is deferred until the send queue drains
+so the FIN cannot truncate an admitted send.
 
 ## TLS
 

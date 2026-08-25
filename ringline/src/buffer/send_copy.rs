@@ -15,6 +15,8 @@ pub struct SendCopyPool {
     // is marked, so the send waiter is woken once per logical send rather
     // than once per chunk. Independent single-slot sends are always final.
     slot_end_of_send: Vec<bool>,
+    /// Bounded logical-send identity, carried through partial/POLLOUT CQEs.
+    slot_bounded_send_id: Vec<Option<u64>>,
 }
 
 impl SendCopyPool {
@@ -33,7 +35,51 @@ impl SendCopyPool {
             slot_remaining: vec![0u32; n],
             in_use: vec![false; n],
             slot_end_of_send: vec![true; n],
+            slot_bounded_send_id: vec![None; n],
         }
+    }
+
+    /// Transactionally reserve and fill every slot needed for `data`.
+    ///
+    /// Returns `None` without reserving any slot when the whole logical send
+    /// does not fit. Callers may therefore report pressure without having
+    /// committed a prefix of the buffer.
+    pub fn copy_in_chunks(&mut self, data: &[u8]) -> Option<Vec<(u16, *const u8, u32)>> {
+        let slot_size = self.slot_size as usize;
+        let required = data.len().div_ceil(slot_size);
+        if required > self.free_list.len() {
+            crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
+            return None;
+        }
+
+        Some(
+            data.chunks(slot_size)
+                .map(|chunk| self.copy_in(chunk).expect("capacity was reserved"))
+                .collect(),
+        )
+    }
+
+    /// Reserve `required` empty slots as capacity permits.
+    ///
+    /// Returns `None` without changing the pool unless all requested slots
+    /// are available. Reserved slots must be released by the caller.
+    #[cfg(not(has_io_uring))]
+    pub fn reserve_slots(&mut self, required: usize) -> Option<Vec<u16>> {
+        if required > self.free_list.len() {
+            crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
+            return None;
+        }
+        let mut slots = Vec::with_capacity(required);
+        for _ in 0..required {
+            let slot = self.free_list.pop().expect("capacity was checked");
+            self.in_use[slot as usize] = true;
+            self.slot_offset[slot as usize] = 0;
+            self.slot_remaining[slot as usize] = 0;
+            self.slot_end_of_send[slot as usize] = true;
+            self.slot_bounded_send_id[slot as usize] = None;
+            slots.push(slot);
+        }
+        Some(slots)
     }
 
     /// Allocate a slot, copy `data` into it, and return (slot_index, ptr, len).
@@ -56,6 +102,7 @@ impl SendCopyPool {
         self.slot_remaining[idx as usize] = data.len() as u32;
         self.in_use[idx as usize] = true;
         self.slot_end_of_send[idx as usize] = true;
+        self.slot_bounded_send_id[idx as usize] = None;
         Some((idx, ptr, data.len() as u32))
     }
 
@@ -91,6 +138,7 @@ impl SendCopyPool {
         self.slot_remaining[idx as usize] = total_len as u32;
         self.in_use[idx as usize] = true;
         self.slot_end_of_send[idx as usize] = true;
+        self.slot_bounded_send_id[idx as usize] = None;
         Some((idx, out_ptr, total_len as u32))
     }
 
@@ -112,6 +160,7 @@ impl SendCopyPool {
         self.slot_remaining[idx as usize] = 0;
         self.in_use[idx as usize] = true;
         self.slot_end_of_send[idx as usize] = true;
+        self.slot_bounded_send_id[idx as usize] = None;
         let ptr = self.backing.as_mut_ptr().wrapping_add(offset);
         Some((idx, ptr, self.slot_size))
     }
@@ -134,6 +183,7 @@ impl SendCopyPool {
         self.in_use[idx as usize] = false;
         self.slot_offset[idx as usize] = 0;
         self.slot_remaining[idx as usize] = 0;
+        self.slot_bounded_send_id[idx as usize] = None;
         self.free_list.push(idx);
     }
 
@@ -194,15 +244,27 @@ impl SendCopyPool {
         self.slot_end_of_send[slot as usize]
     }
 
+    pub fn set_bounded_send_id(&mut self, slot: u16, id: Option<u64>) {
+        self.slot_bounded_send_id[slot as usize] = id;
+    }
+
+    pub fn bounded_send_id(&self, slot: u16) -> Option<u64> {
+        self.slot_bounded_send_id[slot as usize]
+    }
+
     /// Bytes per slot.
     pub fn slot_size(&self) -> u32 {
         self.slot_size
     }
 
     /// Number of free slots.
-    #[cfg(test)]
     pub fn free_count(&self) -> usize {
         self.free_list.len()
+    }
+
+    /// Total number of slots.
+    pub fn slot_count(&self) -> usize {
+        self.count as usize
     }
 }
 
@@ -243,6 +305,14 @@ mod tests {
         let _ = pool.copy_in(b"first").unwrap();
         assert_eq!(pool.free_count(), 0);
         assert!(pool.copy_in(b"second").is_none());
+    }
+
+    #[test]
+    fn chunk_reservation_is_transactional_under_pool_pressure() {
+        let mut pool = SendCopyPool::new(1, 4);
+
+        assert!(pool.copy_in_chunks(b"abcdefgh").is_none());
+        assert_eq!(pool.free_count(), 1);
     }
 
     #[test]
@@ -298,6 +368,19 @@ mod tests {
 
         pool.release(idx);
         assert_eq!(pool.free_count(), 4);
+    }
+
+    #[test]
+    fn bounded_send_identity_survives_partial_progress_and_clears_on_release() {
+        let mut pool = SendCopyPool::new(1, 16);
+        let (slot, _, _) = pool.copy_in(b"identity").unwrap();
+        pool.set_bounded_send_id(slot, Some(42));
+
+        assert!(pool.try_advance(slot, 3).is_some());
+        assert_eq!(pool.bounded_send_id(slot), Some(42));
+
+        pool.release(slot);
+        assert_eq!(pool.bounded_send_id(slot), None);
     }
 
     #[test]

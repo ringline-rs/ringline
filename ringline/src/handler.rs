@@ -17,7 +17,6 @@ pub(crate) struct ConnSendState {
     pub in_flight: bool,
     pub queue: VecDeque<BuiltSend>,
     /// Deferred shutdown_write — submitted after the send queue drains.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub shutdown_pending: bool,
     /// Set when the application's connection task has returned while
     /// there were still queued / in-flight sends. The runtime defers
@@ -63,6 +62,13 @@ impl ConnSendState {
             close_notify_deadline: None,
             acked_bytes: 0,
         }
+    }
+
+    #[cfg(has_io_uring)]
+    pub(crate) fn fail_terminal_send(&mut self) {
+        self.in_flight = false;
+        self.shutdown_pending = false;
+        self.close_pending = true;
     }
 }
 
@@ -217,12 +223,19 @@ impl<'a> DriverCtx<'a> {
 
     /// Regular (copying) send — copies data into library-owned pool before SQE submission.
     ///
-    /// Data larger than one send-pool slot is queued as multiple chunks. If
-    /// a chunk fails mid-loop (pool exhausted), the chunks queued before it
-    /// are already committed to the wire and `Err` is returned — retrying
-    /// the whole buffer would duplicate that prefix. Treat a mid-buffer
-    /// error as fatal for the connection (close it) rather than retrying.
+    /// Data larger than one send-pool slot is queued as multiple chunks. All
+    /// required slots are reserved before the first chunk is submitted, so
+    /// pool pressure returns `Err` without committing a response prefix.
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
+        self.send_with_id(conn, data, None)
+    }
+
+    fn send_with_id(
+        &mut self,
+        conn: ConnToken,
+        data: &[u8],
+        bounded_send_id: Option<u64>,
+    ) -> io::Result<()> {
         let conn_state = self
             .connections
             .get(conn.index)
@@ -236,9 +249,24 @@ impl<'a> DriverCtx<'a> {
 
         if !self.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.tls_table };
+            if let Some(capacity) = tls_table.ciphertext_capacity(conn.index, data.len()) {
+                let required = capacity.div_ceil(self.send_copy_pool.slot_size() as usize);
+                if self.send_copy_pool.free_count() < required {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "send copy pool exhausted",
+                    ));
+                }
+            }
             if tls_table.get_mut(conn.index).is_some() {
                 let sends =
                     crate::tls::encrypt_to_sends(tls_table, self.send_copy_pool, conn.index, data)?;
+                for send in &sends {
+                    if send.pool_slot != u16::MAX {
+                        self.send_copy_pool
+                            .set_bounded_send_id(send.pool_slot, bounded_send_id);
+                    }
+                }
                 // Route every ciphertext chunk through the per-connection
                 // send queue: io_uring doesn't order independent SQEs, and
                 // a partial-send resubmit would interleave chunks on the
@@ -247,23 +275,20 @@ impl<'a> DriverCtx<'a> {
             }
         }
 
-        let slot_size = self.send_copy_pool.slot_size() as usize;
-
-        // Chunk data that exceeds the send copy slot size. Each chunk gets its
-        // own pool slot and SQE; the per-connection send queue ensures they are
-        // transmitted in order. Only the final chunk is marked end-of-send, so
-        // the waiter is woken once for the whole logical send rather than once
-        // per chunk (which would report a short count and, for pipelined sends,
-        // wake the wrong future).
-        let mut chunks = data.chunks(slot_size).peekable();
-        while let Some(chunk) = chunks.next() {
-            let (slot, ptr, len) = self
-                .send_copy_pool
-                .copy_in(chunk)
-                .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
+        // Reserve every pool slot before submitting the first SQE. This is a
+        // logical-send transaction: pressure returns an error with no prefix
+        // queued to the socket, so callers never observe a truncated response.
+        let chunks = self
+            .send_copy_pool
+            .copy_in_chunks(data)
+            .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
+        let last = chunks.len().saturating_sub(1);
+        let mut sends = Vec::with_capacity(chunks.len());
+        for (chunk_index, (slot, ptr, len)) in chunks.into_iter().enumerate() {
             self.send_copy_pool
-                .set_end_of_send(slot, chunks.peek().is_none());
-
+                .set_end_of_send(slot, chunk_index == last);
+            self.send_copy_pool
+                .set_bounded_send_id(slot, bounded_send_id);
             let user_data = crate::completion::UserData::encode(
                 crate::completion::OpTag::Send,
                 conn.index,
@@ -273,18 +298,26 @@ impl<'a> DriverCtx<'a> {
                 .flags(crate::completion::STREAM_SEND_FLAGS)
                 .build()
                 .user_data(user_data.raw());
-
-            let built = BuiltSend {
+            sends.push(BuiltSend {
                 entry,
                 pool_slot: slot,
                 slab_idx: u16::MAX,
-                total_len: chunk.len() as u32,
-            };
-
-            self.submit_or_queue(conn.index, built)?;
+                total_len: len,
+            });
         }
 
-        Ok(())
+        self.queue_built_sends(conn.index, sends)
+    }
+
+    /// Bounded submission used by `ConnCtx::send_backpressured`. Capacity
+    /// admission is performed by the future before this transactional send.
+    pub(crate) fn send_backpressured(
+        &mut self,
+        conn: ConnToken,
+        data: &[u8],
+        id: u64,
+    ) -> io::Result<()> {
+        self.send_with_id(conn, data, Some(id))
     }
 
     /// Allocate a unique 32-bit disk-I/O completion key: monotonic sequence
@@ -1851,6 +1884,8 @@ pub struct DriverCtx<'a> {
     pub(crate) writable: &'a mut Vec<bool>,
     /// Per-connection send completion queue (byte counts for awaitable sends).
     pub(crate) send_completions: &'a mut Vec<std::collections::VecDeque<u32>>,
+    /// ID-keyed completions for bounded sends.
+    pub(crate) bounded_send_completions: &'a mut std::collections::VecDeque<(u64, io::Result<u32>)>,
     /// Per-connection connect timeout deadlines.
     pub(crate) connect_deadlines: &'a mut Vec<Option<std::time::Instant>>,
     pub(crate) sends_dirty: &'a mut Vec<u32>,
@@ -1924,7 +1959,9 @@ impl<'a> DriverCtx<'a> {
                 let ciphertext = crate::tls::encrypt_for_send_mio(tls_table, conn.index, data)?;
                 if !ciphertext.is_empty() {
                     let idx = conn.index as usize;
-                    self.pending_sends[idx].push_back((ciphertext, 0, None));
+                    self.pending_sends[idx].push_back(
+                        crate::backend::mio::driver::PendingSend::unbounded(ciphertext),
+                    );
                     self.mark_send_dirty(idx);
                 }
                 return Ok(());
@@ -1932,7 +1969,62 @@ impl<'a> DriverCtx<'a> {
         }
 
         let idx = conn.index as usize;
-        self.pending_sends[idx].push_back((data.to_vec(), 0, None));
+        self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::unbounded(
+            data.to_vec(),
+        ));
+        self.mark_send_dirty(idx);
+        Ok(())
+    }
+
+    /// Bounded submission used by `ConnCtx::send_backpressured`. The copied
+    /// bytes retain one configured send-pool permit per logical chunk until
+    /// their pending socket write completes.
+    pub(crate) fn send_backpressured(
+        &mut self,
+        conn: ConnToken,
+        data: &[u8],
+        id: u64,
+    ) -> io::Result<()> {
+        let conn_state = self
+            .connections
+            .get(conn.index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
+        if conn_state.generation != conn.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "stale connection",
+            ));
+        }
+
+        let slot_size = self.send_copy_pool.slot_size() as usize;
+        let (queued, slots) = if !self.tls_table.is_null() {
+            let tls_table = unsafe { &mut *self.tls_table };
+            if tls_table.has(conn.index) {
+                crate::tls::encrypt_for_send_mio_bounded(
+                    tls_table,
+                    self.send_copy_pool,
+                    conn.index,
+                    data,
+                )?
+            } else {
+                let required = data.len().div_ceil(slot_size);
+                let slots = self.send_copy_pool.reserve_slots(required).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "send copy pool exhausted")
+                })?;
+                (data.to_vec(), slots)
+            }
+        } else {
+            let required = data.len().div_ceil(slot_size);
+            let slots = self.send_copy_pool.reserve_slots(required).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "send copy pool exhausted")
+            })?;
+            (data.to_vec(), slots)
+        };
+
+        let idx = conn.index as usize;
+        self.pending_sends[idx].push_back(crate::backend::mio::driver::PendingSend::bounded(
+            queued, slots, id,
+        ));
         self.mark_send_dirty(idx);
         Ok(())
     }
@@ -1951,8 +2043,8 @@ impl<'a> DriverCtx<'a> {
     /// fully reached the socket, not at queue time.
     pub(crate) fn mark_last_send_awaited(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
-        if let Some((data, offset, notify)) = self.pending_sends[idx].back_mut() {
-            *notify = Some((data.len() - *offset) as u32);
+        if let Some(pending) = self.pending_sends[idx].back_mut() {
+            pending.notify_len = Some((pending.data.len() - pending.offset) as u32);
         } else {
             // The send was flushed... it can't have been (mio sends are
             // queued, never written inline) — but if the queue is somehow
@@ -2000,7 +2092,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Shut down the write half of a connection.
     ///
-    /// Flushes any buffered pending sends before issuing the TCP half-close.
+    /// Defers the TCP half-close until normal writable-event processing has
+    /// flushed every pending send.
     pub fn shutdown_write(&mut self, conn: ConnToken) {
         let idx = conn.index as usize;
         if self.connections.get(conn.index).is_none()
@@ -2008,14 +2101,23 @@ impl<'a> DriverCtx<'a> {
         {
             return;
         }
-        // Flush any pending send data before shutting down.
-        if let Some(ref mut stream) = self.tcp_streams[idx] {
-            use std::io::Write;
-            for (data, offset, _notify) in self.pending_sends[idx].drain(..) {
-                let _ = stream.write_all(&data[offset..]);
+
+        if self.pending_sends[idx].is_empty() {
+            self.send_queues[idx].shutdown_pending = false;
+            if let Some(stream) = self.tcp_streams[idx].as_mut() {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
-            let _ = stream.flush();
-            let _ = stream.shutdown(std::net::Shutdown::Write);
+            return;
+        }
+
+        self.send_queues[idx].shutdown_pending = true;
+        self.mark_send_dirty(idx);
+        if let Some(stream) = self.tcp_streams[idx].as_mut() {
+            let _ = self.poll.registry().reregister(
+                stream,
+                mio::Token(idx + 1),
+                mio::Interest::READABLE | mio::Interest::WRITABLE,
+            );
         }
     }
 
@@ -2055,7 +2157,11 @@ impl<'a> DriverCtx<'a> {
         let idx = conn_index as usize;
         self.tcp_streams[idx] = Some(mio_stream);
         self.writable[idx] = false;
-        self.pending_sends[idx].clear();
+        for pending in self.pending_sends[idx].drain(..) {
+            for slot in pending.pool_slots {
+                self.send_copy_pool.release(slot);
+            }
+        }
         if let Some(cs) = self.connections.get_mut(conn_index) {
             cs.peer_addr = Some(crate::connection::PeerAddr::Tcp(addr));
         }
@@ -3650,5 +3756,21 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         self.chain.total_bytes += built.total_len;
         self.chain.built.push(built);
         self.chain
+    }
+}
+
+#[cfg(all(test, has_io_uring))]
+mod send_queue_tests {
+    #[test]
+    fn terminal_queue_failure_marks_connection_for_close() {
+        let mut state = super::ConnSendState::new();
+        state.in_flight = true;
+        state.shutdown_pending = true;
+
+        state.fail_terminal_send();
+
+        assert!(!state.in_flight);
+        assert!(!state.shutdown_pending);
+        assert!(state.close_pending);
     }
 }

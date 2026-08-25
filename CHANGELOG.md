@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `ringline` (core): `ConnCtx::with_data_result` exposes terminal transport
+  receive errors without changing `with_data` EOF compatibility.
+- `ringline` (core): `ConnCtx::send_backpressured` provides FIFO, cancel-safe
+  copied-send admission bounded by the configured send-copy pool on both Mio
+  and io_uring backends.
+
+### Fixed
+
+- `ringline` (core): worker bootstrap failures retain their diagnostic message
+  through launch rollback and are returned from `launch()` as `Error::Io`.
+  Worker panics, including panics after startup, are likewise converted to
+  `Error::Io` results instead of propagating as thread-panic payloads from
+  `JoinHandle::join()`.
+- `ringline` (core): bounded logical sends retain exact identity and resource
+  ownership across partial writes, cancellation, half-close, and teardown. TLS
+  admission now accounts conservatively for ciphertext record expansion before
+  rustls consumes plaintext, so transient send-pool pressure parks safely on
+  both backends.
+- `ringline` (Mio): `shutdown_write` now defers the TCP FIN until normal
+  writable-event processing flushes every pending byte, preventing partial
+  nonblocking writes from truncating the logical send.
+- `ringline` (core): copied `send()` reserves every chunk transactionally, so
+  pool pressure no longer commits a prefix before returning an error.
+- `ringline` (io_uring): submission-queue saturation after an attempted flush is
+  reported as `WouldBlock` (previously `Other`).
+
 ## [0.5.5] - 2026-08-19
 
 Coordinated client release picking up parser fixes from the protocol crates.

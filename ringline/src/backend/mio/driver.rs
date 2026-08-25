@@ -18,13 +18,37 @@ use mio::Interest;
 
 /// mio token 0 is reserved for the wake pipe.
 pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
+/// Per-connection buffered send. Backpressured sends retain their copy-pool
+/// permits until the final byte reaches the socket.
+pub(crate) struct PendingSend {
+    pub(crate) data: Vec<u8>,
+    pub(crate) offset: usize,
+    pub(crate) notify_len: Option<u32>,
+    pub(crate) bounded_send_id: Option<u64>,
+    pub(crate) pool_slots: Vec<u16>,
+}
 
-/// Per-connection pending send: `(data, offset, notify_len)` for partial
-/// writes. `notify_len` is `Some(len)` for awaitable sends: the completion
-/// (wake_send) is delivered only when the entry has fully reached the
-/// socket — completing at queue time reported success for bytes that were
-/// never written and swallowed write errors entirely.
-pub(crate) type PendingSend = (Vec<u8>, usize, Option<u32>);
+impl PendingSend {
+    pub(crate) fn unbounded(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            offset: 0,
+            notify_len: None,
+            bounded_send_id: None,
+            pool_slots: Vec::new(),
+        }
+    }
+
+    pub(crate) fn bounded(data: Vec<u8>, pool_slots: Vec<u16>, bounded_send_id: u64) -> Self {
+        Self {
+            data,
+            offset: 0,
+            notify_len: None,
+            bounded_send_id: Some(bounded_send_id),
+            pool_slots,
+        }
+    }
+}
 
 /// Per-worker mio driver state.
 pub(crate) struct Driver {
@@ -57,7 +81,7 @@ pub(crate) struct Driver {
     // ── mio-specific state ───────────────────────────────────────────
     /// Per-connection mio TcpStream storage.
     pub(crate) tcp_streams: Vec<Option<mio::net::TcpStream>>,
-    /// Per-connection pending send buffers: `VecDeque<(data, offset)>`.
+    /// Per-connection pending send buffers, including optional pool permits.
     /// Populated by DriverCtx::send(), drained by the event loop on writable.
     pub(crate) pending_sends: Vec<VecDeque<PendingSend>>,
     /// Connection indices with non-empty `pending_sends`, so the per-loop
@@ -92,6 +116,8 @@ pub(crate) struct Driver {
     /// `DriverCtx::send_await()` pushes len here; the event loop drains
     /// these and calls `Executor::wake_send()` for each.
     pub(crate) send_completions: Vec<VecDeque<u32>>,
+    /// Exact logical-send completions for `send_backpressured` futures.
+    pub(crate) bounded_send_completions: VecDeque<(u64, io::Result<u32>)>,
     /// Bound UDP sockets (one per `config.udp_bind` address).
     pub(crate) udp_sockets: Vec<mio::net::UdpSocket>,
     /// Whether UDP GRO was requested; when set, the readable handler uses
@@ -240,6 +266,7 @@ impl Driver {
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
             send_completions: (0..max_conn).map(|_| VecDeque::new()).collect(),
+            bounded_send_completions: VecDeque::new(),
             udp_sockets,
             udp_gro: config.udp_gro,
             udp_token_base,
@@ -300,6 +327,7 @@ impl Driver {
             poll: &mut self.poll,
             writable: &mut self.writable,
             send_completions: &mut self.send_completions,
+            bounded_send_completions: &mut self.bounded_send_completions,
             connect_deadlines: &mut self.connect_deadlines,
             disk_io_pool: &self.disk_io_pool,
             disk_io_tx: &self.disk_io_tx,
@@ -374,7 +402,7 @@ impl Driver {
             .map(|c| c.established)
             .unwrap_or(false);
 
-        self.pending_sends[idx].clear();
+        self.clear_pending_sends(idx);
         self.writable[idx] = false;
         if self.connect_deadlines[idx].take().is_some() {
             self.connect_pending -= 1;
@@ -396,6 +424,22 @@ impl Driver {
         if was_established {
             crate::metrics::CONNECTIONS_ACTIVE.decrement();
         }
+    }
+
+    /// Drop queued sends and return any bounded-send permits.
+    pub(crate) fn clear_pending_sends(&mut self, idx: usize) {
+        for pending in self.pending_sends[idx].drain(..) {
+            for slot in pending.pool_slots {
+                self.send_copy_pool.release(slot);
+            }
+        }
+    }
+
+    pub(crate) fn pending_bounded_send_ids(&self, idx: usize) -> Vec<u64> {
+        self.pending_sends[idx]
+            .iter()
+            .filter_map(|pending| pending.bounded_send_id)
+            .collect()
     }
 
     /// Record `idx` in the dirty-sends list so the event loop's flush pass
@@ -438,11 +482,11 @@ impl Driver {
         while !self.pending_sends[idx].is_empty() {
             let mut iovecs: Vec<libc::iovec> =
                 Vec::with_capacity(self.pending_sends[idx].len().min(1024));
-            for (data, offset, _notify) in self.pending_sends[idx].iter() {
+            for pending in self.pending_sends[idx].iter() {
                 if iovecs.len() >= 1024 {
                     break;
                 }
-                let remaining = &data[*offset..];
+                let remaining = &pending.data[pending.offset..];
                 if !remaining.is_empty() {
                     iovecs.push(libc::iovec {
                         iov_base: remaining.as_ptr() as *mut libc::c_void,
@@ -452,7 +496,7 @@ impl Driver {
             }
 
             if iovecs.is_empty() {
-                self.pending_sends[idx].clear();
+                self.clear_pending_sends(idx);
                 break;
             }
 
@@ -481,20 +525,28 @@ impl Driver {
             let mut remaining = result as usize;
             total_written += result as u32;
             while remaining > 0 {
-                if let Some((data, offset, notify)) = self.pending_sends[idx].front_mut() {
-                    let avail = data.len() - *offset;
+                if let Some(pending) = self.pending_sends[idx].front_mut() {
+                    let avail = pending.data.len() - pending.offset;
                     if remaining >= avail {
                         remaining -= avail;
-                        if let Some(len) = notify.take() {
+                        if let Some(len) = pending.notify_len.take() {
                             self.send_completions[idx].push_back(len);
                             if !self.completions_dirty_flag[idx] {
                                 self.completions_dirty_flag[idx] = true;
                                 self.completions_dirty.push(idx as u32);
                             }
                         }
-                        self.pending_sends[idx].pop_front();
+                        if let Some(id) = pending.bounded_send_id.take() {
+                            self.bounded_send_completions
+                                .push_back((id, Ok(pending.data.len() as u32)));
+                        }
+                        if let Some(completed) = self.pending_sends[idx].pop_front() {
+                            for slot in completed.pool_slots {
+                                self.send_copy_pool.release(slot);
+                            }
+                        }
                     } else {
-                        *offset += remaining;
+                        pending.offset += remaining;
                         remaining = 0;
                     }
                 } else {
@@ -503,8 +555,13 @@ impl Driver {
             }
         }
 
-        // All sends flushed. Switch back to read-only interest.
+        // All sends flushed. A requested half-close must happen only after
+        // the final byte has reached the socket.
         if let Some(stream) = self.tcp_streams[idx].as_mut() {
+            if self.send_queues[idx].shutdown_pending {
+                self.send_queues[idx].shutdown_pending = false;
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
             let _ = self.poll.registry().reregister(
                 stream,
                 mio::Token(idx + 1),

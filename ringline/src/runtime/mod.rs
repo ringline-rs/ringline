@@ -28,9 +28,10 @@ pub(crate) mod stream;
 pub(crate) mod task;
 pub(crate) mod waker;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io as stdio;
+use std::rc::Rc;
 
 use self::task::{StandaloneTaskSlab, TaskSlab};
 use self::waker::drain_ready_queue;
@@ -409,6 +410,256 @@ impl TimerSlotPool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SendCapacityWaiter {
+    pub(crate) id: u64,
+    pub(crate) conn_index: u32,
+    pub(crate) generation: u32,
+}
+
+#[derive(Default)]
+struct SendCapacityQueue {
+    waiters: VecDeque<SendCapacityWaiter>,
+    operations: HashMap<u64, BoundedSendOperation>,
+    pending_wakes: VecDeque<u64>,
+    next_id: u64,
+}
+
+enum BoundedSendStatus {
+    Waiting,
+    Submitted,
+    Completed(stdio::Result<u32>),
+    Abandoned,
+}
+
+struct BoundedSendOperation {
+    conn_index: u32,
+    generation: u32,
+    task_id: u32,
+    status: BoundedSendStatus,
+}
+
+impl SendCapacityQueue {
+    fn register(
+        queue: &Rc<RefCell<Self>>,
+        conn_index: u32,
+        generation: u32,
+        task_id: u32,
+    ) -> SendCapacityRegistration {
+        let mut state = queue.borrow_mut();
+        let id = state.next_id;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .expect("bounded send operation ID space exhausted");
+        state.waiters.push_back(SendCapacityWaiter {
+            id,
+            conn_index,
+            generation,
+        });
+        state.operations.insert(
+            id,
+            BoundedSendOperation {
+                conn_index,
+                generation,
+                task_id,
+                status: BoundedSendStatus::Waiting,
+            },
+        );
+        SendCapacityRegistration {
+            id,
+            queue: Rc::clone(queue),
+            registered: true,
+        }
+    }
+
+    fn refresh_owner(&mut self, id: u64, task_id: u32) {
+        if let Some(operation) = self.operations.get_mut(&id) {
+            operation.task_id = task_id;
+        }
+    }
+
+    fn cancel(&mut self, id: u64) {
+        let was_head = self.waiters.front().is_some_and(|waiter| waiter.id == id);
+        if let Some(position) = self.waiters.iter().position(|waiter| waiter.id == id) {
+            self.waiters.remove(position);
+        }
+        if was_head && let Some(next) = self.waiters.front() {
+            self.pending_wakes.push_back(next.id);
+        }
+    }
+
+    fn finish_unsubmitted(&mut self, id: u64) {
+        self.cancel(id);
+        self.operations.remove(&id);
+    }
+
+    fn mark_submitted(&mut self, id: u64) {
+        self.cancel(id);
+        if let Some(operation) = self.operations.get_mut(&id) {
+            operation.status = BoundedSendStatus::Submitted;
+        }
+    }
+
+    fn abandon(&mut self, id: u64) {
+        let Some(operation) = self.operations.get_mut(&id) else {
+            return;
+        };
+        match operation.status {
+            BoundedSendStatus::Waiting => self.finish_unsubmitted(id),
+            BoundedSendStatus::Submitted => operation.status = BoundedSendStatus::Abandoned,
+            BoundedSendStatus::Completed(_) | BoundedSendStatus::Abandoned => {
+                self.operations.remove(&id);
+            }
+        }
+    }
+
+    fn complete(&mut self, id: u64, result: stdio::Result<u32>) {
+        let Some(operation) = self.operations.get_mut(&id) else {
+            return;
+        };
+        match operation.status {
+            BoundedSendStatus::Submitted => {
+                operation.status = BoundedSendStatus::Completed(result);
+                self.pending_wakes.push_back(id);
+            }
+            BoundedSendStatus::Abandoned => {
+                self.operations.remove(&id);
+            }
+            BoundedSendStatus::Waiting | BoundedSendStatus::Completed(_) => {}
+        }
+    }
+
+    fn take_result(&mut self, id: u64) -> Option<stdio::Result<u32>> {
+        let result = match self.operations.get_mut(&id)?.status {
+            BoundedSendStatus::Completed(ref mut result) => Some(std::mem::replace(
+                result,
+                Err(stdio::Error::other("bounded send result already consumed")),
+            )),
+            _ => None,
+        }?;
+        self.operations.remove(&id);
+        Some(result)
+    }
+
+    fn remove_connection(&mut self, conn_index: u32) {
+        let removed_head = self
+            .waiters
+            .front()
+            .is_some_and(|waiter| waiter.conn_index == conn_index);
+        self.waiters
+            .retain(|waiter| waiter.conn_index != conn_index);
+        let ids: Vec<u64> = self
+            .operations
+            .iter()
+            .filter(|(_, operation)| operation.conn_index == conn_index)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let Some(operation) = self.operations.get_mut(&id) else {
+                continue;
+            };
+            match operation.status {
+                BoundedSendStatus::Waiting | BoundedSendStatus::Submitted => {
+                    operation.status = BoundedSendStatus::Completed(Err(stdio::Error::new(
+                        stdio::ErrorKind::ConnectionAborted,
+                        "connection closed before bounded send completed",
+                    )));
+                    self.pending_wakes.push_back(id);
+                }
+                BoundedSendStatus::Abandoned => {
+                    self.operations.remove(&id);
+                }
+                BoundedSendStatus::Completed(_) => {}
+            }
+        }
+        if removed_head && let Some(next) = self.waiters.front() {
+            self.pending_wakes.push_back(next.id);
+        }
+    }
+
+    fn fail_waiting_for_connection(&mut self, conn_index: u32, generation: u32) {
+        let old_head = self.waiters.front().map(|waiter| waiter.id);
+        let ids: Vec<u64> = self
+            .operations
+            .iter()
+            .filter(|(_, operation)| {
+                operation.conn_index == conn_index
+                    && operation.generation == generation
+                    && matches!(operation.status, BoundedSendStatus::Waiting)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        self.waiters
+            .retain(|waiter| waiter.conn_index != conn_index || waiter.generation != generation);
+        for id in ids {
+            if let Some(operation) = self.operations.get_mut(&id) {
+                operation.status = BoundedSendStatus::Completed(Err(stdio::Error::new(
+                    stdio::ErrorKind::BrokenPipe,
+                    "connection write side shut down before bounded send admission",
+                )));
+                self.pending_wakes.push_back(id);
+            }
+        }
+        if old_head != self.waiters.front().map(|waiter| waiter.id)
+            && let Some(next) = self.waiters.front()
+        {
+            self.pending_wakes.push_back(next.id);
+        }
+    }
+
+    fn wake_head(&mut self) {
+        if let Some(waiter) = self.waiters.front() {
+            self.pending_wakes.push_back(waiter.id);
+        }
+    }
+}
+
+pub(crate) struct SendCapacityRegistration {
+    id: u64,
+    queue: Rc<RefCell<SendCapacityQueue>>,
+    registered: bool,
+}
+
+impl SendCapacityRegistration {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn refresh_owner(&mut self, task_id: u32) {
+        // Rc keeps this registration on one worker while local tasks may own it.
+        self.queue.borrow_mut().refresh_owner(self.id, task_id);
+    }
+
+    pub(crate) fn admit(&mut self) {
+        if self.registered {
+            self.queue.borrow_mut().mark_submitted(self.id);
+            self.registered = false;
+        }
+    }
+
+    pub(crate) fn take_result(&mut self) -> Option<stdio::Result<u32>> {
+        let result = self.queue.borrow_mut().take_result(self.id);
+        if result.is_some() {
+            self.id = u64::MAX;
+        }
+        result
+    }
+}
+
+impl Drop for SendCapacityRegistration {
+    fn drop(&mut self) {
+        if self.id == u64::MAX {
+            return;
+        }
+        if self.registered {
+            self.queue.borrow_mut().finish_unsubmitted(self.id);
+        } else {
+            self.queue.borrow_mut().abandon(self.id);
+        }
+    }
+}
+
 /// Per-worker async executor. Owns the task slab and coordinates
 /// CQE-driven wakeups with future polling.
 pub(crate) struct Executor {
@@ -430,8 +681,12 @@ pub(crate) struct Executor {
     waker_drain_scratch: VecDeque<u32>,
     /// Per-connection: task is awaiting recv data.
     pub(crate) recv_waiters: Vec<bool>,
+    /// Exact non-WouldBlock transport read errors for result-aware receivers.
+    pub(crate) recv_errors: Vec<Option<(u32, stdio::Error)>>,
     /// Per-connection: task is awaiting send completion.
     pub(crate) send_waiters: Vec<bool>,
+    /// Worker-local FIFO and cancellation ownership for bounded send admission.
+    send_capacity: Rc<RefCell<SendCapacityQueue>>,
     /// Per-connection: task is awaiting connect result.
     pub(crate) connect_waiters: Vec<bool>,
     /// Per-connection: CQE result storage for send/connect.
@@ -529,7 +784,13 @@ impl Executor {
             woken_while_polling: false,
             waker_drain_scratch: VecDeque::with_capacity(64),
             recv_waiters: vec![false; cap],
+            recv_errors: {
+                let mut errors = Vec::with_capacity(cap);
+                errors.resize_with(cap, || None);
+                errors
+            },
             send_waiters: vec![false; cap],
+            send_capacity: Rc::new(RefCell::new(SendCapacityQueue::default())),
             connect_waiters: vec![false; cap],
             io_results: {
                 let mut v = Vec::with_capacity(cap);
@@ -582,6 +843,22 @@ impl Executor {
         while let Some(id) = self.waker_drain_scratch.pop_front() {
             let _ = self.wake_task(id);
         }
+        self.drain_send_capacity_wakes();
+    }
+
+    fn drain_send_capacity_wakes(&mut self) {
+        // Resolve operation IDs only at drain time so an owner refresh also
+        // retargets a wake that was queued before the future moved locally.
+        let wakes: Vec<u32> = {
+            let mut state = self.send_capacity.borrow_mut();
+            let ids: Vec<u64> = state.pending_wakes.drain(..).collect();
+            ids.into_iter()
+                .filter_map(|id| state.operations.get(&id).map(|operation| operation.task_id))
+                .collect()
+        };
+        for task_id in wakes {
+            let _ = self.wake_task(task_id);
+        }
     }
 
     /// Reset all per-connection state for a connection that was closed.
@@ -593,6 +870,11 @@ impl Executor {
             self.recv_sinks[idx] = None;
         }
         self.task_slab.remove(conn_index);
+        self.send_capacity
+            .borrow_mut()
+            .remove_connection(conn_index);
+        self.send_capacity.borrow_mut().wake_head();
+        self.drain_send_capacity_wakes();
         if idx < self.recv_waiters.len() {
             // If a *standalone* task was awaiting recv/send/connect on this
             // connection, it isn't removed by `task_slab.remove`. Push it
@@ -647,6 +929,32 @@ impl Executor {
         false
     }
 
+    /// Preserve a transport receive failure for `with_data_result` and wake
+    /// the registered reader. Existing `with_data` callers continue to see EOF.
+    pub(crate) fn fail_recv(&mut self, conn_index: u32, generation: u32, error: stdio::Error) {
+        let idx = conn_index as usize;
+        if idx < self.recv_errors.len() {
+            self.recv_errors[idx] = Some((generation, error));
+        }
+        self.wake_recv(conn_index);
+    }
+
+    pub(crate) fn take_recv_error(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+    ) -> Option<stdio::Error> {
+        let slot = self.recv_errors.get_mut(conn_index as usize)?;
+        if slot
+            .as_ref()
+            .is_some_and(|(error_generation, _)| *error_generation == generation)
+        {
+            slot.take().map(|(_, error)| error)
+        } else {
+            None
+        }
+    }
+
     /// Wake a task that was waiting for recv data.
     ///
     /// Resolves through `owner_task` so that outbound connections correctly
@@ -658,6 +966,47 @@ impl Executor {
             let task_id = self.owner_task[idx].unwrap_or(conn_index);
             self.wake_task(task_id);
         }
+    }
+
+    /// Allocate and enqueue a FIFO copy-pool capacity waiter.
+    pub(crate) fn enqueue_send_capacity(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        task_id: u32,
+    ) -> SendCapacityRegistration {
+        SendCapacityQueue::register(&self.send_capacity, conn_index, generation, task_id)
+    }
+
+    /// Whether this waiter is first in the FIFO and may attempt reservation.
+    pub(crate) fn send_capacity_turn(&self, id: u64) -> bool {
+        self.send_capacity
+            .borrow()
+            .waiters
+            .front()
+            .is_some_and(|waiter| waiter.id == id)
+    }
+
+    /// Wake only the FIFO head when send capacity may have increased.
+    pub(crate) fn wake_send_capacity(&mut self) {
+        self.send_capacity.borrow_mut().wake_head();
+        self.drain_send_capacity_wakes();
+    }
+
+    pub(crate) fn complete_bounded_send(&mut self, id: u64, result: stdio::Result<u32>) {
+        self.send_capacity.borrow_mut().complete(id, result);
+        self.drain_send_capacity_wakes();
+    }
+
+    pub(crate) fn fail_bounded_capacity_for_connection(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+    ) {
+        self.send_capacity
+            .borrow_mut()
+            .fail_waiting_for_connection(conn_index, generation);
+        self.drain_send_capacity_wakes();
     }
 
     /// Wake a task that was waiting for send completion.
@@ -785,6 +1134,151 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_capacity_waiters_are_fifo_and_cancel_safe() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        for task_id in [1, 2] {
+            exec.task_slab
+                .spawn(task_id, Box::pin(std::future::pending::<()>()));
+            let future = exec.task_slab.take_ready(task_id).unwrap();
+            exec.task_slab.park(task_id, future);
+        }
+
+        let first = exec.enqueue_send_capacity(1, 7, 1);
+        let second = exec.enqueue_send_capacity(2, 9, 2);
+        assert!(exec.send_capacity_turn(first.id()));
+        assert!(!exec.send_capacity_turn(second.id()));
+        assert_eq!(
+            exec.send_capacity
+                .borrow()
+                .waiters
+                .front()
+                .unwrap()
+                .generation,
+            7
+        );
+
+        drop(first);
+        exec.collect_wakeups();
+        assert!(exec.send_capacity_turn(second.id()));
+        assert!(exec.task_slab.take_ready(2).is_some());
+    }
+
+    #[test]
+    fn queued_capacity_wake_follows_refreshed_task_owner() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.task_slab
+            .spawn(1, Box::pin(std::future::pending::<()>()));
+        let old_future = exec.task_slab.take_ready(1).unwrap();
+        exec.task_slab.park(1, old_future);
+
+        let new_index = exec
+            .standalone_slab
+            .spawn(Box::pin(std::future::pending::<()>()))
+            .expect("standalone slab has capacity");
+        let new_future = exec
+            .standalone_slab
+            .take_ready(new_index)
+            .expect("new task starts ready");
+        exec.standalone_slab.park(new_index, new_future);
+        let new_task = new_index | waker::STANDALONE_BIT;
+
+        let mut registration = exec.enqueue_send_capacity(1, 7, 1);
+        exec.send_capacity.borrow_mut().wake_head();
+        registration.refresh_owner(new_task);
+        exec.drain_send_capacity_wakes();
+
+        assert!(
+            exec.task_slab.take_ready(1).is_none(),
+            "a wake queued before the move targeted the stale task owner"
+        );
+        assert!(
+            exec.standalone_slab.take_ready(new_index).is_some(),
+            "the most recent polling task did not receive the capacity wake"
+        );
+    }
+
+    #[test]
+    fn queued_capacity_drop_without_driver_tls_unregisters_only_that_waiter() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        for task_id in [1, 3] {
+            exec.task_slab
+                .spawn(task_id, Box::pin(std::future::pending::<()>()));
+            let future = exec.task_slab.take_ready(task_id).unwrap();
+            exec.task_slab.park(task_id, future);
+        }
+
+        let first = exec.enqueue_send_capacity(1, 7, 1);
+        let canceled = exec.enqueue_send_capacity(2, 9, 2);
+        let canceled_id = canceled.id();
+        let third = exec.enqueue_send_capacity(3, 11, 3);
+        assert!(exec.send_capacity_turn(first.id()));
+        assert!(!exec.send_capacity_turn(canceled_id));
+        assert!(!exec.send_capacity_turn(third.id()));
+
+        // Unit tests run without CURRENT_DRIVER. The registration token owns
+        // enough worker-local state to unregister safely without that TLS.
+        drop(canceled);
+        assert_eq!(exec.send_capacity.borrow().waiters.len(), 2);
+        assert!(
+            !exec
+                .send_capacity
+                .borrow()
+                .operations
+                .contains_key(&canceled_id)
+        );
+        drop(first);
+        exec.collect_wakeups();
+        assert!(exec.send_capacity_turn(third.id()));
+        assert!(exec.task_slab.take_ready(3).is_some());
+    }
+
+    #[test]
+    fn connection_removal_retains_tagged_receive_error_for_stale_owner() {
+        let mut exec = Executor::new(4, 4, 4, 0, 0);
+        exec.fail_recv(1, 7, stdio::Error::from_raw_os_error(libc::ECONNRESET));
+        exec.remove_connection(1);
+        assert!(exec.take_recv_error(1, 8).is_none());
+        let error = exec
+            .take_recv_error(1, 7)
+            .expect("error was discarded or stolen by a reused generation");
+        assert_eq!(error.raw_os_error(), Some(libc::ECONNRESET));
+    }
+
+    #[test]
+    fn connection_removal_cancels_capacity_waiter_and_advances_fifo() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.task_slab
+            .spawn(2, Box::pin(std::future::pending::<()>()));
+        let future = exec.task_slab.take_ready(2).unwrap();
+        exec.task_slab.park(2, future);
+
+        let removed = exec.enqueue_send_capacity(1, 3, 1);
+        let survivor = exec.enqueue_send_capacity(2, 4, 2);
+        assert!(exec.send_capacity_turn(removed.id()));
+        exec.remove_connection(1);
+        assert!(exec.send_capacity_turn(survivor.id()));
+        assert!(exec.task_slab.take_ready(2).is_some());
+    }
+
+    #[test]
+    fn connection_removal_wakes_unrelated_fifo_head() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.task_slab
+            .spawn(2, Box::pin(std::future::pending::<()>()));
+        let future = exec.task_slab.take_ready(2).unwrap();
+        exec.task_slab.park(2, future);
+
+        let survivor = exec.enqueue_send_capacity(2, 4, 2);
+        assert!(exec.send_capacity_turn(survivor.id()));
+
+        // Connection 1 may own pool permits even though connection 2 owns
+        // the FIFO head. Closing 1 releases capacity and must wake 2.
+        exec.remove_connection(1);
+
+        assert!(exec.task_slab.take_ready(2).is_some());
+    }
 
     #[test]
     fn collect_wakeups_transitions_parked_to_ready() {

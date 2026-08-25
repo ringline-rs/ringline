@@ -114,6 +114,41 @@ const CLAIMS: &[Claim] = &[
         needle: "cargo:rustc-cfg=has_io_uring",
         meaning: "compile-time backend selection",
     },
+    Claim {
+        path: "ringline/src/runtime/io.rs",
+        needle: "pub fn send_backpressured",
+        meaning: "bounded send public API",
+    },
+    Claim {
+        path: "ringline/src/runtime/mod.rs",
+        needle: "pub(crate) fn enqueue_send_capacity",
+        meaning: "worker-local FIFO admission for bounded sends",
+    },
+    Claim {
+        path: "ringline/src/runtime/mod.rs",
+        needle: "pub(crate) fn complete_bounded_send",
+        meaning: "bounded-send completion routed by operation ID",
+    },
+    Claim {
+        path: "ringline/src/runtime/mod.rs",
+        needle: "pub(crate) fn wake_send_capacity",
+        meaning: "capacity release wakes the admission FIFO head",
+    },
+    Claim {
+        path: "ringline/src/buffer/send_copy.rs",
+        needle: "pub fn copy_in_chunks",
+        meaning: "all-or-nothing copy-pool reservation",
+    },
+    Claim {
+        path: "ringline/src/backend/mio/event_loop.rs",
+        needle: "complete_bounded_send",
+        meaning: "Mio delivers bounded completions by ID",
+    },
+    Claim {
+        path: "ringline/src/backend/uring/event_loop.rs",
+        needle: "complete_bounded_send",
+        meaning: "io_uring delivers bounded completions by ID",
+    },
 ];
 
 /// The kernel floor `ringline/build.rs` enforces for the io_uring backend.
@@ -300,6 +335,27 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
         "self.tcp_streams[idx].take()",
         "self.connections.release(conn_index)",
         "Mio closes the socket before recycling the connection slot",
+    )?;
+    require_order_after(
+        &mio_driver,
+        "fn flush_sends",
+        "self.send_queues[idx].shutdown_pending",
+        "stream.shutdown(std::net::Shutdown::Write)",
+        "Mio defers the half-close FIN until the send queue drains",
+    )?;
+    require_order_after(
+        &runtime,
+        "impl Drop for SendCapacityRegistration",
+        "finish_unsubmitted(self.id)",
+        "abandon(self.id)",
+        "dropping a bounded send unregisters before admission and abandons by ID after",
+    )?;
+    require_order_after(
+        &runtime,
+        "self.task_slab.remove(conn_index)",
+        ".remove_connection(conn_index)",
+        ".wake_head()",
+        "closing a connection releases its permits and wakes the admission FIFO head",
     )?;
 
     let manifest = fs::read_to_string(root.join("ringline/Cargo.toml"))?;
@@ -699,7 +755,7 @@ impl RequestBackend {
 }
 
 fn render_request_flow() -> String {
-    let mut svg = canvas(1460, 1620, "Ringline connection and request flow");
+    let mut svg = canvas(1460, 2440, "Ringline connection and request flow");
     text(
         &mut svg,
         50,
@@ -719,6 +775,7 @@ fn render_request_flow() -> String {
 
     render_request_flow_panel(&mut svg, 0, RequestBackend::IoUring);
     render_request_flow_panel(&mut svg, 800, RequestBackend::Mio);
+    render_bounded_send_panel(&mut svg, 1600);
     svg.push_str("</svg>\n");
     svg
 }
@@ -826,6 +883,140 @@ fn render_request_flow_panel(svg: &mut String, offset: u32, backend: RequestBack
         730,
         y(780),
         "return/panic → deferred close → slot generation increments",
+        15,
+        false,
+    );
+}
+
+/// Backend-independent admission path for `ConnCtx::send_backpressured`:
+/// a worker-local FIFO gates copy-pool reservation, and completions are
+/// routed back by logical-operation ID rather than per-connection wakes.
+fn render_bounded_send_panel(svg: &mut String, offset: u32) {
+    let y = |value: u32| value + offset;
+    svg.push_str(&format!(
+        "<text x=\"730\" y=\"{}\" text-anchor=\"middle\" data-role=\"admission-panel\" font-family=\"sans-serif\" font-size=\"21\" font-weight=\"bold\" fill=\"#222\">{}</text>\n",
+        y(115),
+        escape("send_backpressured admission (both backends)")
+    ));
+
+    lane(svg, 70, y(160), 250, 590, "connection owner");
+    lane(svg, 350, y(160), 250, 590, "portable runtime");
+    lane(svg, 630, y(160), 350, 590, "backend");
+    lane(svg, 1010, y(160), 380, 590, "kernel / peer");
+
+    stage(
+        svg,
+        95,
+        y(190),
+        200,
+        54,
+        "1",
+        "send_backpressured",
+        "#FBB4AE",
+    );
+    stage(
+        svg,
+        375,
+        y(270),
+        200,
+        54,
+        "2",
+        "first poll joins FIFO",
+        "#CCEBC5",
+    );
+    stage(
+        svg,
+        375,
+        y(350),
+        200,
+        54,
+        "3",
+        "park: head + capacity",
+        "#CCEBC5",
+    );
+    stage(
+        svg,
+        655,
+        y(430),
+        300,
+        54,
+        "4",
+        "reserve all slots + copy",
+        "#CCEBC5",
+    );
+    stage(
+        svg,
+        655,
+        y(510),
+        300,
+        74,
+        "5",
+        "ordered send queue\nsubmit / flush",
+        "#CCEBC5",
+    );
+    stage(
+        svg,
+        375,
+        y(600),
+        200,
+        54,
+        "6",
+        "completion by ID",
+        "#CCEBC5",
+    );
+    stage(
+        svg,
+        95,
+        y(680),
+        200,
+        54,
+        "7",
+        "resume: Ok(len) | Err",
+        "#FBB4AE",
+    );
+
+    // Same paired-connector rule as the backend panels: center on the
+    // midpoint of stage 5's edge (y(510), height 74).
+    let (backend_upper, backend_lower) = paired_edge_offsets(y(510) + 74 / 2, 24);
+
+    arrow(svg, 295, y(217), 375, y(297), "first poll");
+    arrow(svg, 475, y(324), 475, y(350), "FIFO order");
+    arrow(svg, 575, y(377), 655, y(457), "admitted");
+    arrow(svg, 805, y(484), 805, y(510), "in order");
+    arrow(
+        svg,
+        955,
+        backend_upper,
+        1090,
+        backend_upper,
+        "one send in flight",
+    );
+    arrow_with_label_offset(
+        svg,
+        1090,
+        backend_lower,
+        955,
+        backend_lower,
+        "CQE / writable",
+        -18.0,
+    );
+    arrow(svg, 655, backend_lower, 575, y(627), "routed by ID");
+    arrow(svg, 445, y(600), 445, y(404), "returned permits wake head");
+    arrow(svg, 375, y(627), 295, y(700), "ready task");
+    external_box(svg, 1090, y(507), 250, 80, "peer socket");
+    centered(
+        svg,
+        730,
+        y(780),
+        "drop before admission unregisters · drop after submission abandons the ID — a stale completion cannot resolve a newer send",
+        15,
+        false,
+    );
+    centered(
+        svg,
+        730,
+        y(805),
+        "Mio half-close: the FIN is deferred until the send queue drains",
         15,
         false,
     );
@@ -984,6 +1175,7 @@ mod tests {
         assert!(first.runtime.contains("ringline-worker-i"));
         assert!(first.request_flow.contains("submit_and_wait"));
         assert!(first.request_flow.contains("on_accept"));
+        assert!(first.request_flow.contains("send_backpressured"));
         assert_eq!(first.runtime.matches("<svg").count(), 1);
         assert_eq!(first.runtime.matches("</svg>").count(), 1);
         assert_eq!(first.request_flow.matches("<svg").count(), 1);
@@ -1059,6 +1251,8 @@ mod tests {
             "y1=\"1359\"",
             "y2=\"1497\"",
             "y1=\"1517\"",
+            "y2=\"2135\"",
+            "y1=\"2159\"",
         ] {
             assert!(diagram.contains(coordinate), "missing {coordinate}");
         }
@@ -1089,7 +1283,8 @@ mod tests {
             !diagram.contains("io_uring: submit_and_wait + CQE\nMio: poll + readiness"),
             "backend operations must not share a stage"
         );
-        assert_eq!(diagram.matches("data-role=\"lane-label\"").count(), 8);
+        assert_eq!(diagram.matches("data-role=\"admission-panel\"").count(), 1);
+        assert_eq!(diagram.matches("data-role=\"lane-label\"").count(), 12);
     }
 
     #[test]
@@ -1122,9 +1317,9 @@ mod tests {
         }
 
         let request_flow = render_request_flow();
-        assert_eq!(request_flow.matches("data-role=\"lane-label\"").count(), 8);
-        assert_eq!(request_flow.matches("height=\"590\"").count(), 8);
-        for y in [660, 1460] {
+        assert_eq!(request_flow.matches("data-role=\"lane-label\"").count(), 12);
+        assert_eq!(request_flow.matches("height=\"590\"").count(), 12);
+        for y in [660, 1460, 2107] {
             let peer = format!("x=\"1090\" y=\"{y}\" width=\"250\" height=\"80\"");
             assert!(
                 request_flow.contains(&peer),
@@ -1153,8 +1348,8 @@ mod tests {
             })
             .map(|node| rect_bounds(*node))
             .collect();
-        assert_eq!(lanes.len(), 8);
-        assert_eq!(stages.len(), 14);
+        assert_eq!(lanes.len(), 12);
+        assert_eq!(stages.len(), 21);
         for &(left, top, right, bottom) in &stages {
             assert!(
                 lanes
