@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   admission now accounts conservatively for ciphertext record expansion before
   rustls consumes plaintext, so transient send-pool pressure parks safely on
   both backends.
+- `ringline` (Mio): `shutdown_write` now defers the TCP FIN until normal
+  writable-event processing flushes every pending byte, preventing partial
+  nonblocking writes from truncating the logical send.
 - `ringline` (core): copied `send()` reserves every chunk transactionally, so
   pool pressure no longer commits a prefix before returning an error.
 - `ringline` (io_uring): submission-queue saturation after an attempted flush is

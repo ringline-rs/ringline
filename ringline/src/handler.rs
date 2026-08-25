@@ -17,7 +17,6 @@ pub(crate) struct ConnSendState {
     pub in_flight: bool,
     pub queue: VecDeque<BuiltSend>,
     /// Deferred shutdown_write — submitted after the send queue drains.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub shutdown_pending: bool,
     /// Set when the application's connection task has returned while
     /// there were still queued / in-flight sends. The runtime defers
@@ -2093,7 +2092,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Shut down the write half of a connection.
     ///
-    /// Flushes any buffered pending sends before issuing the TCP half-close.
+    /// Defers the TCP half-close until normal writable-event processing has
+    /// flushed every pending send.
     pub fn shutdown_write(&mut self, conn: ConnToken) {
         let idx = conn.index as usize;
         if self.connections.get(conn.index).is_none()
@@ -2101,23 +2101,23 @@ impl<'a> DriverCtx<'a> {
         {
             return;
         }
-        // Flush any pending send data before shutting down.
-        if let Some(ref mut stream) = self.tcp_streams[idx] {
-            use std::io::Write;
-            for mut pending in self.pending_sends[idx].drain(..) {
-                let logical_len = pending.data.len() as u32;
-                let result = stream
-                    .write_all(&pending.data[pending.offset..])
-                    .map(|()| logical_len);
-                if let Some(id) = pending.bounded_send_id.take() {
-                    self.bounded_send_completions.push_back((id, result));
-                }
-                for slot in pending.pool_slots {
-                    self.send_copy_pool.release(slot);
-                }
+
+        if self.pending_sends[idx].is_empty() {
+            self.send_queues[idx].shutdown_pending = false;
+            if let Some(stream) = self.tcp_streams[idx].as_mut() {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
-            let _ = stream.flush();
-            let _ = stream.shutdown(std::net::Shutdown::Write);
+            return;
+        }
+
+        self.send_queues[idx].shutdown_pending = true;
+        self.mark_send_dirty(idx);
+        if let Some(stream) = self.tcp_streams[idx].as_mut() {
+            let _ = self.poll.registry().reregister(
+                stream,
+                mio::Token(idx + 1),
+                mio::Interest::READABLE | mio::Interest::WRITABLE,
+            );
         }
     }
 

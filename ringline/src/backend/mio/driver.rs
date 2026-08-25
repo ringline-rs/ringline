@@ -555,8 +555,13 @@ impl Driver {
             }
         }
 
-        // All sends flushed. Switch back to read-only interest.
+        // All sends flushed. A requested half-close must happen only after
+        // the final byte has reached the socket.
         if let Some(stream) = self.tcp_streams[idx].as_mut() {
+            if self.send_queues[idx].shutdown_pending {
+                self.send_queues[idx].shutdown_pending = false;
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
             let _ = self.poll.registry().reregister(
                 stream,
                 mio::Token(idx + 1),

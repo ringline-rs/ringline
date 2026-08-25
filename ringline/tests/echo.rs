@@ -5753,6 +5753,12 @@ static BACKPRESSURE_SHUTDOWN_ARMED: AtomicU32 = AtomicU32::new(0);
 static BACKPRESSURE_HALF_CLOSE_STATE: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(not(has_io_uring))]
+static DEFERRED_HALF_CLOSE_STATE: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(not(has_io_uring))]
+const DEFERRED_HALF_CLOSE_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(not(has_io_uring))]
 struct BackpressureHalfCloseHandler;
 
 #[cfg(not(has_io_uring))]
@@ -5829,6 +5835,87 @@ fn mio_half_close_completes_submitted_send_and_cancels_capacity_waiter() {
         2,
         "half-close left a submitted or capacity-waiting bounded send stuck"
     );
+
+    shutdown.shutdown();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+#[cfg(not(has_io_uring))]
+struct DeferredHalfCloseHandler;
+
+#[cfg(not(has_io_uring))]
+impl AsyncEventHandler for DeferredHalfCloseHandler {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            if conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
+                .await
+                == 0
+            {
+                return;
+            }
+
+            let payload = vec![b'x'; DEFERRED_HALF_CLOSE_BYTES];
+            let mut send = Box::pin(conn.send_backpressured(&payload));
+            std::future::poll_fn(|cx| {
+                assert!(send.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            conn.shutdown_write();
+            DEFERRED_HALF_CLOSE_STATE.store(1, Ordering::Release);
+            let result = send.as_mut().await;
+            let correct = matches!(result, Ok(len) if len as usize == DEFERRED_HALF_CLOSE_BYTES);
+            DEFERRED_HALF_CLOSE_STATE.store(if correct { 2 } else { 3 }, Ordering::Release);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        DeferredHalfCloseHandler
+    }
+}
+
+#[test]
+#[cfg(not(has_io_uring))]
+fn mio_half_close_waits_for_partial_send_to_finish_before_fin() {
+    DEFERRED_HALF_CLOSE_STATE.store(0, Ordering::Release);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(1, DEFERRED_HALF_CLOSE_BYTES as u32)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<DeferredHalfCloseHandler>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(b"go").unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while DEFERRED_HALF_CLOSE_STATE.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_ne!(
+        DEFERRED_HALF_CLOSE_STATE.load(Ordering::Acquire),
+        0,
+        "handler did not reach half-close"
+    );
+
+    let mut received = Vec::new();
+    stream.read_to_end(&mut received).unwrap();
+    assert_eq!(received.len(), DEFERRED_HALF_CLOSE_BYTES);
+    assert!(received.iter().all(|byte| *byte == b'x'));
+    assert_eq!(DEFERRED_HALF_CLOSE_STATE.load(Ordering::Acquire), 2);
 
     shutdown.shutdown();
     for handle in handles {
