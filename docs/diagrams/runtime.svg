@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc">
+<title id="title">Ringline runtime topology</title>
+<desc id="desc">Generated from assertions against Ringline source code.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#4D4D4D"/></marker></defs>
+<rect width="100%" height="100%" fill="white"/>
+<text x="50" y="55" font-family="sans-serif" font-size="28" fill="#222">Runtime startup and connection ownership</text>
+<text x="50" y="84" font-family="sans-serif" font-size="16" fill="#222">Workers become ready before the listener exists.</text>
+<rect x="60" y="135" width="190" height="70" rx="12" fill="white" stroke="#4D4D4D" stroke-width="2.4" stroke-dasharray="8 5"/>
+<text x="155" y="176" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">caller / application</text>
+<rect x="310" y="125" width="220" height="90" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<text x="420" y="176" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">RinglineBuilder</text>
+<line x1="250" y1="170" x2="310" y2="170" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="280" y="157" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">launch</text>
+<rect x="610" y="105" width="250" height="70" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<text x="735" y="146" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">prepare N workers</text>
+<rect x="610" y="205" width="250" height="70" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<text x="735" y="246" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">bind + listen</text>
+<line x1="530" y1="170" x2="610" y2="140" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="564" y="143" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">spawn</text>
+<line x1="735" y1="175" x2="735" y2="205" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="753" y="195" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">all ready</text>
+<rect x="935" y="205" width="260" height="70" rx="12" fill="#F2F2F2" stroke="#4D4D4D" stroke-width="1.4"/>
+<text x="1065" y="246" text-anchor="middle" font-family="monospace" font-size="17" fill="#222">ringline-acceptor</text>
+<line x1="860" y1="240" x2="935" y2="240" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="898" y="227" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">listener fd</text>
+<rect x="935" y="105" width="260" height="60" rx="12" fill="white" stroke="#4D4D4D" stroke-width="2.4" stroke-dasharray="8 5"/>
+<text x="1065" y="141" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">network peers</text>
+<line x1="1065" y1="165" x2="1065" y2="205" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="1083" y="190" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">TCP bytes</text>
+<rect x="930" y="345" width="270" height="62" fill="#EDEDED" stroke="#4D4D4D" stroke-width="1.4"/>
+<line x1="975" y1="345" x2="975" y2="407" stroke="#9E9E9E"/>
+<line x1="1020" y1="345" x2="1020" y2="407" stroke="#9E9E9E"/>
+<line x1="1065" y1="345" x2="1065" y2="407" stroke="#9E9E9E"/>
+<line x1="1110" y1="345" x2="1110" y2="407" stroke="#9E9E9E"/>
+<line x1="1155" y1="345" x2="1155" y2="407" stroke="#9E9E9E"/>
+<text x="1065" y="382" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#222">bounded fd queue + wake</text>
+<line x1="1065" y1="275" x2="1065" y2="345" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="1083" y="315" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">try_send + wake</text>
+<rect x="540" y="470" width="660" height="190" rx="12" fill="#F2F2F2" stroke="#4D4D4D" stroke-width="1.4"/>
+<text x="870" y="452" text-anchor="middle" data-role="group-label" font-family="monospace" font-size="17" fill="#222">ringline-worker-i</text>
+<rect x="575" y="520" width="180" height="80" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<text x="665" y="566" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">backend Driver</text>
+<rect x="780" y="520" width="170" height="80" rx="12" fill="#CCEBC5" stroke="#4D4D4D" stroke-width="1.4"/>
+<text x="865" y="566" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">Executor</text>
+<rect x="975" y="520" width="190" height="80" rx="12" fill="#FBB4AE" stroke="#4D4D4D" stroke-width="1.4"/>
+<text x="1070" y="566" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">handler instance</text>
+<line x1="1065" y1="407" x2="1065" y2="470" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="1083" y="444" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">accepted fd</text>
+<line x1="755" y1="560" x2="780" y2="560" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="768" y="547" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">events</text>
+<line x1="950" y1="560" x2="975" y2="560" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="963" y="547" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">poll task</text>
+<rect x="60" y="470" width="390" height="190" rx="12" fill="#F2F2F2" stroke="#4D4D4D" stroke-width="1.4"/>
+<text x="255" y="452" text-anchor="middle" data-role="group-label" font-family="sans-serif" font-size="17" fill="#222">optional auxiliary pools</text>
+<text x="90" y="520" font-family="monospace" font-size="17" fill="#222">ringline-resolver-i</text>
+<text x="90" y="555" font-family="monospace" font-size="17" fill="#222">ringline-spawner-i</text>
+<text x="90" y="590" font-family="monospace" font-size="17" fill="#222">ringline-blocking-i</text>
+<text x="90" y="625" font-family="monospace" font-size="17" fill="#222">ringline-disk-io-i (Mio)</text>
+<line x1="450" y1="565" x2="540" y2="565" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
+<text x="495" y="552" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">response queue + wake</text>
+<text x="50" y="720" font-family="sans-serif" font-size="16" fill="#222">No shared Driver • no work stealing • no cross-worker task migration</text>
+</svg>

@@ -368,6 +368,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "doc-diagrams"
+version = "0.0.0"
+dependencies = [
+ "roxmltree",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1737,6 +1744,15 @@ dependencies = [
  "resp-proto",
  "ringline",
  "thiserror",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

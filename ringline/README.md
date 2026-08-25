@@ -1,21 +1,22 @@
 # ringline
 
-**io_uring-native async I/O runtime for Linux.**
+**Thread-per-core async I/O with an io_uring backend for Linux and a portable
+Mio backend.**
 
-ringline is a thread-per-core I/O framework built directly on io_uring.
-It provides an async/await API (`AsyncEventHandler`) on a single-threaded
-executor with no work-stealing.
+ringline is a thread-per-core I/O framework. It provides an async/await API
+(`AsyncEventHandler`) on a single-threaded executor with no work-stealing.
 
 ## What ringline is
 
-- An io_uring-native runtime that exploits advanced kernel features: multishot
+- An io_uring backend that exploits advanced kernel features: multishot
   recv, ring-provided buffers, SendMsgZc (zero-copy send), fixed file table
+- A Mio backend for macOS and other Unix targets, for Linux kernels older
+  than 6.0 (automatic build-time fallback), and for Linux builds using
+  `force-mio`
 - Thread-per-core with CPU pinning — no work-stealing, no task migration
-- Linux 6.0+ only — no epoll/kqueue/IOCP fallback, no portability tax
 
 ## What ringline is NOT
 
-- A cross-platform runtime (Linux only, io_uring required)
 - A Tokio replacement (different abstractions, not API-compatible)
 - A general-purpose task scheduler (all tasks are `!Send`, pinned to cores)
 
@@ -53,6 +54,15 @@ fn main() -> Result<(), ringline::Error> {
 
 ## Architecture
 
+For the code-derived runtime and request lifecycle diagrams, see
+[Architecture](https://github.com/ringline-rs/ringline/blob/main/docs/architecture.md).
+For the technology tradeoffs behind the Linux backend, see
+[Why consider io_uring?](https://github.com/ringline-rs/ringline/blob/main/docs/io-uring-primer.md);
+for the counted syscalls and copies per request on each backend, see
+[Syscalls and copies, counted](https://github.com/ringline-rs/ringline/blob/main/docs/syscalls-and-copies.md).
+
+The io_uring backend has this worker-local shape:
+
 ```
                       ┌─────────────────────────────┐
                       │        Acceptor Thread       │
@@ -73,12 +83,14 @@ fn main() -> Result<(), ringline::Error> {
    └─────────────┘       └─────────────┘       └─────────────┘
 ```
 
-Each worker thread owns:
+Each worker thread owns its backend driver, executor, connection table
+(with generation-based stale detection), and handler instance. On the
+io_uring backend, each worker also owns:
+
 - A dedicated **io_uring** instance (SQ + CQ)
 - A **ring-provided buffer pool** for recv (kernel selects buffers at completion time)
 - A **send copy pool** for small sends and a **send slab** for scatter-gather zero-copy sends
 - A **fixed file table** for O(1) fd lookups (no per-syscall fd table traversal)
-- A **connection table** with generation-based stale detection
 
 ## io_uring Features Used
 
@@ -109,12 +121,16 @@ Each worker thread owns:
 
 ## Platform Requirements
 
-- **Linux 6.0+** (io_uring with required features)
-- **x86_64** or **ARM64**
+- The io_uring backend requires **Linux 6.0+** on **x86_64** or **ARM64**.
+- Backend selection happens at build time in `build.rs`: a Linux host whose
+  kernel reports a version older than 6.0 silently gets the Mio backend — no
+  feature flag, no error. Verify which backend you built before benchmarking.
+- macOS and other Mio-supported Unix targets always use the Mio backend.
+  Linux builds can force it with `--features force-mio`.
 
 ## MSRV
 
-Rust 1.85+ (edition 2024)
+Rust 1.88+ (edition 2024; let-chains in the core crate require 1.88)
 
 ## Examples
 

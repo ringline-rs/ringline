@@ -1,0 +1,8 @@
+[package]
+name = "doc-diagrams"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+roxmltree = "0.21"

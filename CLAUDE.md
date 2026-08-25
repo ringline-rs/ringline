@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+The design stances behind the rules below are written up separately in
+[docs/principles/PRINCIPLES.md](docs/principles/PRINCIPLES.md). This file says
+what to do; that one says why, and is the place to argue with a decision rather
+than work around it.
+
 ## Build & Test Commands
 
 ```bash
@@ -145,7 +150,7 @@ These are the recurring failure modes in this codebase — the 2026-07 audit (~3
 
 ## Copy Semantics
 
-Ringline aims to minimize data copies on the hot path. Understanding where copies happen is critical for performance work.
+Ringline aims to minimize data copies on the hot path. Understanding where copies happen is critical for performance work. The user-facing home for this analysis (plus per-backend syscall counting and measured numbers) is [docs/syscalls-and-copies.md](docs/syscalls-and-copies.md) — keep the two in sync when the counted paths change.
 
 ### Core Runtime Copy Counts
 
