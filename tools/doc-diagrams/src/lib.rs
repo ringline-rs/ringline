@@ -244,12 +244,25 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
         "response.seq",
         "Mio drains disk I/O responses in the worker loop",
     )?;
+    // Both ring-entry branches must precede the drain, and both must carry
+    // GETEVENTS: `submit_and_wait(1)` when the loop blocks, and
+    // `submit_and_get_events()` when it declines to because a task is
+    // runnable. A plain `submit_and_wait(0)` here would set no GETEVENTS and,
+    // under DEFER_TASKRUN, strand task_work indefinitely.
     require_order_after(
         &uring_loop,
         "pub(crate) fn run",
-        "submit_and_wait(min_complete)",
+        "submit_and_wait(1)",
         "self.drain_completions()",
-        "io_uring waits for and then drains completions",
+        "io_uring blocks for completions, then drains them",
+    )?;
+    require_order_after(
+        &uring_loop,
+        "pub(crate) fn run",
+        "submit_and_get_events()",
+        "self.drain_completions()",
+        "io_uring reaps deferred completions without blocking when a task is \
+         runnable, then drains them",
     )?;
     require_order_after(
         &uring_loop,
