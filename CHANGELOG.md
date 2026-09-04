@@ -10,25 +10,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - `AsyncSendBuilder::submit_batch_await` is back (both backends), returning a
-  `SendFuture` alongside the submitted part count. 0.3.0 removed it as dead
-  code along with `build_await`; it was not dead, just used out of tree
-  (crucible's cache server), and there is no equivalent substitute. A caller
-  that wants completion-paced backpressure on a scatter-gather send has only
-  `send()`, which copies the value and so gives up the zero-copy guard path,
-  or `send_chain()`, which is io_uring-only and therefore breaks mio builds.
+  `SendFuture` alongside the submitted part count. 0.3.0 (#231) removed it as
+  dead code along with `build_await`; it was not dead, just used out of tree
+  (crucible's cache server), and nothing in the API replaces it. A caller that
+  wants to know when a scatter-gather send has completed -- to pace itself
+  against the wire rather than filling the per-connection send queue as fast
+  as it can build responses -- has only `send()`, which copies the payload and
+  so gives up the zero-copy guard path that motivates gather sends in the
+  first place, or `send_chain()`, which is `#[cfg(has_io_uring)]` and so
+  unavailable to anything that also builds on mio.
 
-  Yielding to the executor is not a substitute either, which is the reason
-  this comes back rather than staying removed: the ready-queue drain is
-  `while i < ready_queue.len()` and a self-wake re-queues the task inside the
-  same pass, so it is re-polled before the loop returns to `submit_and_wait`
-  / `drain_completions`. A yield therefore never lets a send CQE land or a
-  send-pool slot recycle -- it only reorders among already-ready tasks. Only
-  parking on the completion hands control back to the ring.
+  This also restores the `nowait`/await symmetry the rest of the send API has
+  (`send_nowait`/`send`, `send_chain_nowait`/`send_chain`); the gather path
+  was the one place a caller could submit but not await.
 
   A batch that is empty or carries no bytes is now rejected with
   `InvalidInput` rather than returning a future that no completion could ever
-  wake (the pre-0.3.0 version rejected only the empty-`Vec` case). `build_await`
-  stays removed -- it really was unused.
+  wake (the pre-0.3.0 version rejected only the empty-`Vec` case).
+  `build_await` stays removed -- it really was unused.
+
+### Fixed
+
+- Documentation, no behavior change: `poll_ready_tasks` in both event loops
+  claimed that entries appended to `ready_queue` mid-pass come from "wake_task()
+  called from within a polled future, which pushes directly to
+  executor.ready_queue". That is true only of the *internal* `wake_task` path.
+  A `std::task::Waker` -- what a future gets from its `Context`, and so what
+  any yield-style self-wake uses -- pushes onto the thread-local queue in
+  `runtime/waker.rs` instead, and only reaches `executor.ready_queue` via
+  `collect_wakeups()` after the pass has ended. The comment read as though a
+  self-woken task is re-polled within the same pass; it is not, and the
+  distinction matters to anyone reasoning about whether a yield lets the loop
+  reach the ring. New `tests/ready_queue_fairness.rs` pins the actual
+  behavior.
 
 ## [0.6.0] - 2026-09-03
 
