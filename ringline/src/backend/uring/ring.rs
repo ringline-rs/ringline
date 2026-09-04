@@ -29,6 +29,10 @@ pub struct Ring {
     /// Reusable Entry128 conversion scratch for chain pushes — avoids a
     /// heap allocation per chained send.
     chain_scratch: Vec<squeue::Entry128>,
+    /// Whether the ring was set up with `IORING_SETUP_DEFER_TASKRUN`. When
+    /// set, the kernel runs task_work — and so posts the CQEs it generates —
+    /// only on an `io_uring_enter` carrying `IORING_ENTER_GETEVENTS`.
+    defer_taskrun: bool,
 }
 
 impl Ring {
@@ -60,6 +64,7 @@ impl Ring {
             ring,
             bgid: config.recv_buffer.bgid,
             chain_scratch: Vec::new(),
+            defer_taskrun: !config.sqpoll,
         })
     }
 
@@ -650,6 +655,44 @@ impl Ring {
         }
     }
 
+    /// Submit pending SQEs and reap deferred completions **without blocking**.
+    ///
+    /// Use this instead of `submit_and_wait(0)` whenever the event loop
+    /// declines to block because a task is runnable.
+    ///
+    /// `submit_and_wait(0)` does not set `IORING_ENTER_GETEVENTS` (the
+    /// io-uring crate sets it only for `want > 0`), and under
+    /// `IORING_SETUP_DEFER_TASKRUN` the kernel runs task_work only when that
+    /// flag is present. A worker with a permanently runnable task therefore
+    /// never blocks, never sets GETEVENTS, and — if the runnable task also
+    /// queues no SQEs, so `flush()` takes its empty-SQ shortcut — never reaps
+    /// a single completion: no accepts, no recvs, no send completions, and so
+    /// no send-pool slots recycled, for as long as that task stays runnable.
+    ///
+    /// Costs the same one syscall as the `submit_and_wait(0)` it replaces.
+    /// Without DEFER_TASKRUN (SQPOLL rings, which cannot enable it) the kernel
+    /// posts completions eagerly, so this delegates.
+    pub fn submit_and_get_events(&self) -> io::Result<()> {
+        if !self.defer_taskrun {
+            return self.submit_and_wait(0);
+        }
+        loop {
+            // Safety: as in `flush()` — a shared view of the SQ head/tail
+            // atomics, read-only.
+            let n = unsafe { self.ring.submission_shared().len() } as u32;
+            match unsafe {
+                self.ring
+                    .submitter()
+                    .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+            } {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Submit a timeout SQE that fires after the given duration.
     /// Produces a CQE with the given user_data when it fires (-ETIME)
     /// or is cancelled (-ECANCELED).
@@ -700,9 +743,14 @@ impl Ring {
         let n = unsafe { self.ring.submission_shared().len() } as u32;
         if n == 0 {
             // Nothing to submit. Pending DEFER_TASKRUN task_work and CQEs are
-            // reaped by the next submit_and_wait(1) (always a GETEVENTS enter),
-            // so skipping the syscall here only defers completion reaping by at
-            // most one loop iteration — no correctness impact.
+            // reaped by the event loop's next ring entry, which always carries
+            // GETEVENTS — `submit_and_wait(1)` when it blocks, and
+            // `submit_and_get_events()` when it declines to because a task is
+            // runnable. Skipping the syscall here therefore defers completion
+            // reaping by at most one loop iteration. (That second case is why
+            // `submit_and_get_events` exists: a plain `submit_and_wait(0)` sets
+            // no GETEVENTS, and combined with this shortcut it would strand
+            // task_work indefinitely.)
             return Ok(());
         }
         unsafe {

@@ -2,17 +2,18 @@
 //! Regression test: one task that repeatedly wakes itself must not starve the
 //! rest of a worker.
 //!
-//! A task that self-wakes mid-poll has its slot read `Empty`, so the wake
-//! cannot transition it; the event loop re-queues it via `woken_while_polling`
-//! right after it parks. The ready-queue drain condition re-reads
-//! `ready_queue.len()`, so without a budget that re-queued task is polled
-//! again inside the same pass -- indefinitely, never returning to
-//! `submit_and_wait` / `drain_completions`. Nothing else on the worker runs:
-//! no new connection is accepted, no recv is processed, and no send completion
-//! is reaped (so send-pool slots never recycle).
+//! The io_uring event loop declines to block while a task is runnable
+//! (`min_complete = 0`), and `flush()` skips its syscall when the SQ is empty.
+//! Under `IORING_SETUP_DEFER_TASKRUN` the kernel runs task_work only on a
+//! GETEVENTS enter, which `submit_and_wait(0)` does not set -- so a task that
+//! stays runnable without queueing SQEs left neither path reaping, and the
+//! worker saw zero completions for as long as it ran: no accepts, no recv or
+//! send dispatch, no send-pool slots recycled.
 //!
 //! This test pins the fairness property: a second connection is serviced
-//! while a first connection's task is in an unbounded self-wake loop.
+//! while a first connection's task is in an unbounded self-wake loop. It
+//! failed on io_uring before `Ring::submit_and_get_events` and passes after;
+//! the mio backend was never affected.
 
 use ringline::ConfigBuilder;
 use std::future::Future;
@@ -160,8 +161,8 @@ fn self_waking_task_does_not_starve_the_worker() {
         ),
         Err(e) => panic!(
             "second connection was starved by a self-waking task ({e}) -- \
-             the ready-queue drain re-polls a self-woken task within the same \
-             pass, so the worker never returns to the event loop",
+             the worker is not reaping completions while a task stays \
+             runnable, so nothing is accepted or dispatched",
         ),
     }
 }

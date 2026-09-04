@@ -215,8 +215,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Commit buffer returns from the poll pass and revive
             // ENOBUFS-parked receivers before we block.
             self.flush_replenish_and_rearm();
-            let min_complete = u32::from(self.executor.ready_queue.is_empty());
-            self.driver.ring.submit_and_wait(min_complete)?;
+            // Declining to block still has to reap: under DEFER_TASKRUN the
+            // kernel runs task_work only on a GETEVENTS enter, and
+            // `submit_and_wait(0)` carries no such flag. Going through
+            // `submit_and_get_events` (same single syscall) keeps completions
+            // flowing while a task is runnable — otherwise a task that stays
+            // runnable without queueing SQEs (so `flush()` takes its empty-SQ
+            // shortcut) starves the whole worker of completions.
+            if self.executor.ready_queue.is_empty() {
+                self.driver.ring.submit_and_wait(1)?;
+            } else {
+                self.driver.ring.submit_and_get_events()?;
+            }
             let mut wait_ns: u64 = 0;
             if let Some(start) = wait_start {
                 wait_ns = start.elapsed().as_nanos() as u64;
