@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [ringline-memcache 0.7.1] - 2026-09-04
+
+Documentation-only patch release. No change to code, tests, or behavior.
+
 ## [0.6.1] - 2026-09-04
 
 Core-only patch release: **ringline 0.6.1**. No client crate changed since
