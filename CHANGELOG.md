@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-04
+
+Core-only patch release: **ringline 0.6.1**. No client crate changed since
+0.6.0, so they stay at their published versions (`ringline-redis` /
+`-memcache` 0.7.0; `-ping` / `-http` / `-grpc` / `-quic` / `-h2` / `-h3`
+0.6.0) and pick this up through their `ringline = "0.6"` requirement.
+
+Headline is the io_uring liveness fix below -- a worker reaped no completions
+at all while any task stayed runnable, which could hang a worker outright.
+`submit_batch_await` also returns.
+
+Also included, with no user-visible change: `tls.rs` is split into
+`tls/mod.rs` + `tls/buffered.rs` with a new crate-private `CiphertextBuf`
+(#338), groundwork for the unbuffered TLS send path designed in #339.
+
 ### Added
 
 - `AsyncSendBuilder::submit_batch_await` is back (both backends), returning a
