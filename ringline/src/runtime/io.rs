@@ -1822,6 +1822,73 @@ impl AsyncSendBuilder {
             Ok(consumed)
         })
     }
+
+    /// Like [`submit_batch`](Self::submit_batch), but returns a [`SendFuture`]
+    /// that resolves when the batch has been sent.
+    ///
+    /// Use this when the caller needs completion-paced backpressure rather
+    /// than fire-and-forget. Awaiting the future parks the task until the
+    /// kernel signals the send, which returns control to the event loop so
+    /// completions are reaped and send-pool slots recycled. Yielding to the
+    /// executor is *not* a substitute: a self-wake is re-polled within the
+    /// same ready-queue drain pass, before the loop revisits the ring.
+    ///
+    /// Batch limits and the all-or-nothing rejection behavior are identical
+    /// to [`submit_batch`](Self::submit_batch). A batch that is empty or
+    /// carries no bytes is rejected with `InvalidInput`: it would produce no
+    /// completion, so the returned future could never resolve.
+    pub fn submit_batch_await(
+        self,
+        parts: Vec<crate::handler::SendPart<'_>>,
+    ) -> io::Result<(usize, SendFuture)> {
+        use crate::handler::SendPart;
+        with_state(|driver, executor| {
+            if total_part_len(&parts) == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "empty send batch",
+                ));
+            }
+            let mut ctx = driver.make_ctx();
+            let mut builder = ctx.send_parts(self.token);
+            let mut consumed = 0usize;
+            for part in parts {
+                match part {
+                    SendPart::Copy(data) => {
+                        builder = builder.copy(data);
+                    }
+                    SendPart::Guard(guard) => {
+                        builder = builder.guard(guard);
+                    }
+                }
+                consumed += 1;
+            }
+            builder.submit()?;
+            let conn_index = self.token.index;
+            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.send_waiters[conn_index as usize] = true;
+            Ok((
+                consumed,
+                SendFuture {
+                    conn_index,
+                    generation: self.token.generation,
+                },
+            ))
+        })
+    }
+}
+
+/// Total byte length carried by a batch of send parts.
+#[cfg(has_io_uring)]
+fn total_part_len(parts: &[crate::handler::SendPart<'_>]) -> usize {
+    use crate::handler::SendPart;
+    parts
+        .iter()
+        .map(|part| match part {
+            SendPart::Copy(data) => data.len(),
+            SendPart::Guard(guard) => guard.as_ptr_len().1 as usize,
+        })
+        .sum()
 }
 
 // ── mio AsyncSendBuilder (copy-only fallback) ───────────────────────
@@ -1891,6 +1958,56 @@ impl AsyncSendBuilder {
                 ctx.send(self.token, &buf)?;
             }
             Ok(consumed)
+        })
+    }
+
+    /// Like [`submit_batch`](Self::submit_batch), but returns a [`SendFuture`]
+    /// that resolves when the batch has been written to the socket.
+    ///
+    /// A batch that is empty or carries no bytes is rejected with
+    /// `InvalidInput`: it would produce no completion, so the returned future
+    /// could never resolve.
+    pub fn submit_batch_await(
+        self,
+        parts: Vec<crate::handler::SendPart<'_>>,
+    ) -> io::Result<(usize, SendFuture)> {
+        use crate::handler::SendPart;
+        with_state(|driver, executor| {
+            let mut buf = Vec::new();
+            let mut consumed = 0usize;
+            for part in &parts {
+                match part {
+                    SendPart::Copy(data) => buf.extend_from_slice(data),
+                    SendPart::Guard(guard) => {
+                        let (ptr, len) = guard.as_ptr_len();
+                        let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                        buf.extend_from_slice(data);
+                    }
+                }
+                consumed += 1;
+            }
+            if buf.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "empty send batch",
+                ));
+            }
+            let mut ctx = driver.make_ctx();
+            ctx.send(self.token, &buf)?;
+            // The send is buffered — mark it awaitable so the event loop
+            // delivers wake_send when the bytes actually reach the socket,
+            // matching `ConnCtx::send`.
+            ctx.mark_last_send_awaited(self.token.index);
+            let conn_index = self.token.index;
+            executor.owner_task[conn_index as usize] = Some(CURRENT_TASK_ID.with(|c| c.get()));
+            executor.send_waiters[conn_index as usize] = true;
+            Ok((
+                consumed,
+                SendFuture {
+                    conn_index,
+                    generation: self.token.generation,
+                },
+            ))
         })
     }
 }

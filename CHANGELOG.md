@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `AsyncSendBuilder::submit_batch_await` is back (both backends), returning a
+  `SendFuture` alongside the submitted part count. 0.3.0 removed it as dead
+  code along with `build_await`; it was not dead, just used out of tree
+  (crucible's cache server), and there is no equivalent substitute. A caller
+  that wants completion-paced backpressure on a scatter-gather send has only
+  `send()`, which copies the value and so gives up the zero-copy guard path,
+  or `send_chain()`, which is io_uring-only and therefore breaks mio builds.
+
+  Yielding to the executor is not a substitute either, which is the reason
+  this comes back rather than staying removed: the ready-queue drain is
+  `while i < ready_queue.len()` and a self-wake re-queues the task inside the
+  same pass, so it is re-polled before the loop returns to `submit_and_wait`
+  / `drain_completions`. A yield therefore never lets a send CQE land or a
+  send-pool slot recycle -- it only reorders among already-ready tasks. Only
+  parking on the completion hands control back to the ring.
+
+  A batch that is empty or carries no bytes is now rejected with
+  `InvalidInput` rather than returning a future that no completion could ever
+  wake (the pre-0.3.0 version rejected only the empty-`Vec` case). `build_await`
+  stays removed -- it really was unused.
+
 ## [0.6.0] - 2026-09-03
 
 Coordinated breaking release carrying four batched API changes (see Changed)
