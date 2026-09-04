@@ -18,9 +18,10 @@ Headline is the io_uring liveness fix below -- a worker reaped no completions
 at all while any task stayed runnable, which could hang a worker outright.
 `submit_batch_await` also returns.
 
-Also included, with no user-visible change: `tls.rs` is split into
-`tls/mod.rs` + `tls/buffered.rs` with a new crate-private `CiphertextBuf`
-(#338), groundwork for the unbuffered TLS send path designed in #339.
+Also carries TLS groundwork for the unbuffered send path: the `tls.rs` split
+into `tls/mod.rs` + `tls/buffered.rs` with a crate-private `CiphertextBuf`
+(#338, no behavior change), the design in #339, and the allocation change
+under Changed below (#341).
 
 ### Added
 
@@ -43,6 +44,20 @@ Also included, with no user-visible change: `tls.rs` is split into
   `InvalidInput` rather than returning a future that no completion could ever
   wake (the pre-0.3.0 version rejected only the empty-`Vec` case).
   `build_await` stays removed -- it really was unused.
+
+### Changed
+
+- `CiphertextBuf` no longer zero-fills (#341). It allocated with
+  `vec![0u8; n]` and grew with `resize(n, 0)`, initializing memory the peer
+  had not sent -- a per-connection `memset` and real resident memory at high
+  connection counts, which also forfeits the property that large provided
+  buffers are RSS-free because untouched pages stay demand-paged. Now
+  `Vec::with_capacity` + `reserve_exact` for the allocation and
+  `extend_from_slice` for writes, holding `buf.len() == end` as a strict
+  invariant, with no `unsafe`. `capacity()` reports a tracked `reserved`
+  field rather than `Vec::capacity()`, so the cap assertion pins this type's
+  own arithmetic rather than allocator rounding. Crate-private type: no API
+  change, and TLS connections get cheaper to set up and smaller in RSS.
 
 ### Fixed
 
