@@ -475,8 +475,7 @@ impl ClientBuilder {
     /// Requests are framed with the binary header (`BinaryRequest`) and
     /// responses parsed from the 24-byte binary header. Response/request
     /// correlation stays FIFO (opaque is set to 0), matching the ASCII path.
-    /// Enables driving servers that only speak the binary protocol (e.g.
-    /// Datomic valcache).
+    /// Enables driving servers that only speak the binary protocol.
     ///
     /// The binary protocol implements the fire/recv pipelining API only, so
     /// this returns a [`BinaryClient`] rather than a [`Client`]: the ASCII
@@ -3274,8 +3273,8 @@ mod binary_tests {
     // ── Request framing ─────────────────────────────────────────────────
     //
     // These pin the on-wire bytes of the binary encoders. The client talks to
-    // real servers (valcache, memcached -B binary), so header field placement
-    // is a wire contract, not an implementation detail.
+    // real binary-protocol servers, so header field placement is a wire
+    // contract, not an implementation detail.
 
     /// Decode the fixed header fields of a request frame for assertions.
     fn hdr(buf: &[u8]) -> (u8, u8, usize, usize, usize) {

@@ -99,7 +99,7 @@ and memcache binary protocol support. Crate versions: **ringline 0.6.0**;
   `recv()`, timing, and callbacks stay protocol-agnostic. Request/response
   correlation is FIFO (opaque is always 0), matching the ASCII path, and the
   zero-copy guarded-SET path is supported. This makes binary-only servers
-  (e.g. Datomic valcache) reachable and benchmarkable.
+  reachable and benchmarkable.
 
   The binary protocol implements the fire/recv pipelining API only, and that
   boundary is enforced by the type system: `BinaryClient` exposes just that
