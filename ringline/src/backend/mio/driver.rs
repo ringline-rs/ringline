@@ -286,8 +286,6 @@ impl Driver {
             tcp_nodelay: self.tcp_nodelay,
             #[cfg(feature = "timestamps")]
             timestamps: false,
-            #[cfg(feature = "timestamps")]
-            recvmsg_msghdr: std::ptr::null(),
             send_queues: &mut self.send_queues,
             pending_sends: &mut self.pending_sends,
             sends_dirty: &mut self.sends_dirty,

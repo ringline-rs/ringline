@@ -786,8 +786,6 @@ impl Driver {
             send_zc_threshold: self.send_zc_threshold,
             #[cfg(feature = "timestamps")]
             timestamps: self.timestamps,
-            #[cfg(feature = "timestamps")]
-            recvmsg_msghdr: &*self.recvmsg_msghdr as *const libc::msghdr,
             connect_timespecs: &mut self.connect_timespecs,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
@@ -913,9 +911,13 @@ impl Driver {
                 .connections
                 .get(conn_index)
                 .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
+            let generation = self.connections.generation(conn_index);
             if !armed
                 && open
-                && self.ring.submit_multishot_recv(conn_index).is_ok()
+                && self
+                    .ring
+                    .submit_multishot_recv(conn_index, generation)
+                    .is_ok()
                 && let Some(cs) = self.connections.get_mut(conn_index)
             {
                 cs.recv_multishot_armed = true;
@@ -1180,12 +1182,22 @@ impl Driver {
             .get(conn_index)
             .is_some_and(|c| c.recv_multishot_armed);
         if recv_armed {
+            // Must reproduce the arm-time payload (the connection generation):
+            // `submit_async_cancel` matches the request by `user_data`.
             let recv_ud = crate::completion::UserData::encode(
                 crate::completion::OpTag::RecvMulti,
                 conn_index,
-                0,
+                self.connections.generation(conn_index),
             );
             let _ = self.ring.submit_async_cancel(recv_ud.raw(), conn_index);
+            // Cleared whether or not the cancel push landed. A failed push (SQ
+            // full) does leave a multishot armed in the kernel, but nothing
+            // retries the cancel (`drain_close_retries` re-drives only the
+            // `Close`), every remaining reader of this flag is gated on
+            // `Lifecycle::Open`, and `deactivate()` clears it again when the
+            // Close CQE releases the slot. The uncancelled multishot's late
+            // completions are rejected on the generation now carried in their
+            // payload — see `docs/recv-multi-identity-design.md`.
             if let Some(cs) = self.connections.get_mut(conn_index) {
                 cs.recv_multishot_armed = false;
             }

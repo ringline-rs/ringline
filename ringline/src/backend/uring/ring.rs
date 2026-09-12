@@ -209,13 +209,18 @@ impl Ring {
     /// Submit a multishot recvmsg with provided buffer ring for a connection.
     /// Used when SO_TIMESTAMPING is enabled to receive cmsg ancillary data
     /// (kernel timestamps) alongside TCP payload.
+    ///
+    /// `generation` is the connection's generation at arm time and is carried
+    /// whole in the payload — see `Ring::submit_multishot_recv` for why.
+    /// Any cancel targeting this request must encode the same payload.
     #[cfg(feature = "timestamps")]
     pub fn submit_multishot_recvmsg(
         &mut self,
         conn_index: u32,
+        generation: u32,
         msghdr: *const libc::msghdr,
     ) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::RecvMsgMultiTs, conn_index, 0);
+        let user_data = UserData::encode(OpTag::RecvMsgMultiTs, conn_index, generation);
         let entry = opcode::RecvMsgMulti::new(Fixed(conn_index), msghdr, self.bgid)
             .build()
             .user_data(user_data.raw());
@@ -248,8 +253,19 @@ impl Ring {
     }
 
     /// Submit a multishot recv with provided buffer ring for a connection.
-    pub fn submit_multishot_recv(&mut self, conn_index: u32) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::RecvMulti, conn_index, 0);
+    ///
+    /// `generation` is the connection's generation at arm time. It occupies the
+    /// whole 32-bit payload (an exact match, unlike the truncated send-family
+    /// generations), so `handle_recv_multi` can reject a completion that
+    /// outlived its connection slot: a multishot can survive the fixed-file
+    /// `Close` (its cancel is best-effort and is dropped when the SQ is full),
+    /// and without this the terminal `-ECONNRESET` would be misattributed to
+    /// whichever connection next occupies the index.
+    ///
+    /// Any cancel targeting this request must encode the same payload — a
+    /// cancel matches by `user_data`.
+    pub fn submit_multishot_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::RecvMulti, conn_index, generation);
         let entry = opcode::RecvMulti::new(Fixed(conn_index), self.bgid)
             .build()
             .user_data(user_data.raw());

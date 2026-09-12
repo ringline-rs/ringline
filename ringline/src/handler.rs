@@ -144,9 +144,6 @@ pub struct DriverCtx<'a> {
     /// Whether SO_TIMESTAMPING is enabled.
     #[cfg(feature = "timestamps")]
     pub(crate) timestamps: bool,
-    /// Pointer to the per-worker RecvMsgMulti msghdr template.
-    #[cfg(feature = "timestamps")]
-    pub(crate) recvmsg_msghdr: *const libc::msghdr,
     /// Pre-allocated timespec storage for connect timeouts (io_uring only).
     #[cfg(has_io_uring)]
     pub(crate) connect_timespecs: &'a mut Vec<io_uring::types::Timespec>,
@@ -923,7 +920,14 @@ impl<'a> DriverCtx<'a> {
 
         cs.recv_mode = crate::connection::RecvMode::Closed;
 
-        let target_ud = crate::completion::UserData::encode(target_tag, conn.index, 0);
+        // A cancel matches its target by `user_data`, so the payload must be
+        // exactly what the arm site submitted: the connection generation for
+        // the multishot recv families, zero for `Connect`.
+        let target_payload = match target_tag {
+            crate::completion::OpTag::Connect => 0,
+            _ => conn.generation,
+        };
+        let target_ud = crate::completion::UserData::encode(target_tag, conn.index, target_payload);
         self.ring.submit_async_cancel(target_ud.raw(), conn.index)?;
         Ok(())
     }
@@ -1872,8 +1876,6 @@ pub struct DriverCtx<'a> {
     pub(crate) tcp_nodelay: bool,
     #[cfg(feature = "timestamps")]
     pub(crate) timestamps: bool,
-    #[cfg(feature = "timestamps")]
-    pub(crate) recvmsg_msghdr: *const libc::msghdr,
     pub(crate) send_queues: &'a mut Vec<ConnSendState>,
     /// Per-connection pending send buffers (mio backend).
     /// DriverCtx::send() pushes data here; the event loop flushes on writable.
