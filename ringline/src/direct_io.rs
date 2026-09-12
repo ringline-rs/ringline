@@ -19,7 +19,7 @@
 //! # Kernel requirements
 //!
 //! - Linux 5.6+ for basic io_uring read/write
-//! - Linux 6.0+ already required by ringline for `SendMsgZc`
+//! - Linux 6.1+ already required by ringline for `SendMsgZc`
 
 /// Operation type for tracking what kind of I/O was submitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

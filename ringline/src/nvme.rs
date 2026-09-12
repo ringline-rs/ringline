@@ -8,7 +8,7 @@
 //! # Kernel requirements
 //!
 //! - Linux 5.19+ for `IORING_OP_URING_CMD`
-//! - Linux 6.0+ already required by ringline for `SendMsgZc`
+//! - Linux 6.1+ already required by ringline for `SendMsgZc`
 //! - NVMe device accessible via `/dev/ng*` (requires `CAP_SYS_ADMIN` or udev rules)
 
 /// NVMe I/O command opcodes (NVM command set).

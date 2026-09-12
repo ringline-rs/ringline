@@ -7,8 +7,10 @@ fn main() {
     }
 }
 
-/// Check that the running kernel is 6.0+ (required for SendMsgZc, multishot
-/// recv with provided buffers, and other io_uring features ringline depends on).
+/// Check that the running kernel is 6.1+. `Ring::setup` unconditionally sets
+/// `IORING_SETUP_DEFER_TASKRUN` (non-SQPOLL) and the send path uses
+/// `IORING_OP_SENDMSG_ZC`; both landed in 6.1. Multishot recv, provided
+/// buffers, and `SINGLE_ISSUER` are 6.0.
 ///
 /// When cross-compiling, `/proc/sys/kernel/osrelease` reflects the *host* kernel
 /// which may differ from the target. In that case we optimistically emit the cfg
@@ -30,5 +32,5 @@ fn kernel_version_sufficient() -> bool {
             digits.parse().ok()
         })
         .unwrap_or(0);
-    (major, minor) >= (6, 0)
+    (major, minor) >= (6, 1)
 }

@@ -11,7 +11,7 @@ ringline is a thread-per-core I/O framework. It provides an async/await API
 - An io_uring backend that exploits advanced kernel features: multishot
   recv, ring-provided buffers, SendMsgZc (zero-copy send), fixed file table
 - A Mio backend for macOS and other Unix targets, for Linux kernels older
-  than 6.0 (automatic build-time fallback), and for Linux builds using
+  than 6.1 (automatic build-time fallback), and for Linux builds using
   `force-mio`
 - Thread-per-core with CPU pinning — no work-stealing, no task migration
 
@@ -130,9 +130,10 @@ handler instance. On the io_uring backend, each worker also owns:
 
 ## Platform Requirements
 
-- The io_uring backend requires **Linux 6.0+** on **x86_64** or **ARM64**.
+- The io_uring backend requires **Linux 6.1+** on **x86_64** or **ARM64**
+  (`IORING_SETUP_DEFER_TASKRUN` and `IORING_OP_SENDMSG_ZC` are 6.1 features).
 - Backend selection happens at build time in `ringline/build.rs`: a Linux
-  host whose kernel reports a version older than 6.0 silently gets the Mio
+  host whose kernel reports a version older than 6.1 silently gets the Mio
   backend — no feature flag, no error. Verify which backend you built before
   benchmarking.
 - macOS and other Mio-supported Unix targets always use the Mio backend.
@@ -163,13 +164,12 @@ cargo run --example echo_tls_server
 
 ## Benchmarks
 
-Published benchmark numbers have been withdrawn pending re-measurement on a
-dedicated two-machine rig. The previous figures were collected in a
-single-host configuration that did not reflect real network behavior, so they
-are not currently published rather than risk misleading comparisons. The
-benchmark tooling lives in `ringline-bench` (distributed load generator) and
-`ringline-benchmarks` (single-machine matrix), with experiment specs under
-`experiments/`. New results will be added once validated end-to-end.
+Two-machine ringline-vs-tokio cache-server numbers, with methodology and
+caveats, are in [BENCHMARKS.md](BENCHMARKS.md). They were measured in June
+2026 on ringline 0.1.3 and have not yet been re-run on the current release.
+The benchmark tooling lives in `ringline-bench` (distributed load generator)
+and `ringline-benchmarks` (single-machine matrix), with experiment specs under
+`experiments/`.
 
 ## License
 

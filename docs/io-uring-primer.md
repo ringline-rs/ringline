@@ -362,7 +362,7 @@ The preceding considerations are language-independent. Ringline adds several
 implementation choices that are distinct from properties of the Linux API.
 
 Ringline selects one backend at compile time. For a Linux target without
-`force-mio`, the build enables `io_uring` when the host reports kernel 6.0
+`force-mio`, the build enables `io_uring` when the host reports kernel 6.1
 or newer. If the host kernel version is unavailable during cross-compilation,
 the build enables it optimistically. Non-Linux targets and `force-mio` builds
 use Mio. Mio is a separate readiness implementation, not an emulation of
@@ -370,8 +370,9 @@ io_uring completion semantics. If an io_uring build cannot create or prepare
 its rings at runtime, `RinglineBuilder::launch` returns an error; Ringline
 does not switch a running binary to Mio.
 
-The 6.0 requirement comes from the networking facilities Ringline uses,
-including `SendMsgZc`, multishot receive, and provided buffers. It is more
+The 6.1 requirement comes from the facilities Ringline uses: `SendMsgZc`
+and `IORING_SETUP_DEFER_TASKRUN` are 6.1; multishot receive, provided
+buffers, and `SINGLE_ISSUER` are 6.0. It is more
 useful to an operator than the historical 5.1 introduction point, but it is
 not a complete capability check: vendor kernels, container policy, seccomp,
 and the `kernel.io_uring_disabled` sysctl can still prevent startup.

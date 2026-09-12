@@ -40,11 +40,11 @@ cargo run --example echo_tls_server
 
 ## Platform & Backend Matrix
 
-Ringline has two backends selected at **compile time** by the `has_io_uring` cfg, which `build.rs` emits only when: target is Linux AND the `force-mio` feature is off AND the host kernel is ≥ 6.0. There is no runtime backend selection (it would fight the `CURRENT_DRIVER` raw-pointer thread-local design).
+Ringline has two backends selected at **compile time** by the `has_io_uring` cfg, which `build.rs` emits only when: target is Linux AND the `force-mio` feature is off AND the host kernel is ≥ 6.1. There is no runtime backend selection (it would fight the `CURRENT_DRIVER` raw-pointer thread-local design).
 
 The kernel check is a **build-host, compile-time** gate and is necessary but not sufficient. At **run time** the kernel must also permit io_uring: `kernel.io_uring_disabled` (6.6+) must be 0, or 1 with the process in `kernel.io_uring_group` (or holding `CAP_SYS_ADMIN`), and no seccomp profile may deny `io_uring_setup`. Otherwise every launch fails with `Error::RingSetup`, whose message names the cause. RHEL 10 / Rocky 10 ship `io_uring_disabled = 2` (refused for everyone, root included), so on that family only a `force-mio` build runs — verified on Rocky 10.2, kernel 6.12.0-211.el10 (#355).
 
-- **io_uring** (`ringline/src/backend/uring/`) — the production path. Linux 6.0+ (SendMsgZc, multishot recv with provided buffers).
+- **io_uring** (`ringline/src/backend/uring/`) — the production path. Linux 6.1+ (DEFER_TASKRUN and SendMsgZc are 6.1; multishot recv with provided buffers is 6.0).
 - **mio** (`ringline/src/backend/mio/`) — cross-platform fallback (macOS, containers without io_uring). Zero-copy sends degrade to copies (guards are consumed by copying), NVMe is unsupported, and fs/direct I/O run on a dedicated disk-I/O thread pool (`disk_io_pool.rs`) instead of the ring.
 
 Development reality on macOS:

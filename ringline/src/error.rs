@@ -38,9 +38,10 @@ pub enum Error {
     ///   profile (Docker/containerd default, gVisor, systemd
     ///   `SystemCallFilter=`). The message says which, based on the sysctl.
     /// - `ENOSYS`: kernel built without io_uring.
-    /// - `EINVAL`: kernel older than 6.0 rejecting a required setup flag.
+    /// - `EINVAL`: kernel older than 6.1 rejecting a required setup flag
+    ///   (`DEFER_TASKRUN` and `SendMsgZc` are 6.1 features).
     ///
-    /// The backend is chosen at build time by `build.rs` (Linux 6.0+ host
+    /// The backend is chosen at build time by `build.rs` (Linux 6.1+ host
     /// gets io_uring); the only opt-out is the `force-mio` cargo feature,
     /// e.g. `cargo build --features ringline/force-mio` from a dependent
     /// crate. There is no runtime fallback.
@@ -240,13 +241,13 @@ pub(crate) fn describe_ring_setup_failure(err: &io::Error, probe: &RingSetupProb
             }
         },
         Some(libc::ENOSYS) => {
-            msg.push_str("this kernel was built without io_uring. Use a kernel with CONFIG_IO_URING (6.0+), ");
+            msg.push_str("this kernel was built without io_uring. Use a kernel with CONFIG_IO_URING (6.1+), ");
         }
         Some(libc::EINVAL) => {
             msg.push_str(
                 "the kernel rejected a setup flag ringline requires \
-                 (IORING_SETUP_DEFER_TASKRUN / SINGLE_ISSUER / COOP_TASKRUN need \
-                 Linux 6.0+). Upgrade the kernel, ",
+                 (IORING_SETUP_DEFER_TASKRUN and IORING_OP_SENDMSG_ZC need \
+                 Linux 6.1+). Upgrade the kernel, ",
             );
         }
         _ => {
@@ -529,7 +530,7 @@ mod tests {
         let err = io::Error::from_raw_os_error(libc::EINVAL);
         let text = describe_ring_setup_failure(&err, &probe(None, None));
         assert!(text.contains("EINVAL"), "{text}");
-        assert!(text.contains("6.0"), "{text}");
+        assert!(text.contains("6.1"), "{text}");
         assert!(text.contains("force-mio"), "{text}");
     }
 

@@ -119,7 +119,7 @@ const CLAIMS: &[Claim] = &[
 /// The kernel floor `ringline/build.rs` enforces for the io_uring backend.
 /// Docs that advertise the floor are checked against this same constant so a
 /// bump in build.rs cannot leave stale version prose behind.
-const MIN_IOURING_KERNEL: (u32, u32) = (6, 0);
+const MIN_IOURING_KERNEL: (u32, u32) = (6, 1);
 
 /// Docs that state the io_uring kernel floor in prose.
 const KERNEL_FLOOR_DOCS: &[&str] = &[

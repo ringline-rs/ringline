@@ -25,7 +25,7 @@ edition = "2024"
 # in the core crate require 1.88; this records the real floor explicitly.
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/brayniac/ringline"
+repository = "https://github.com/ringline-rs/ringline"
 
 [workspace.dependencies]
 # Internal crates

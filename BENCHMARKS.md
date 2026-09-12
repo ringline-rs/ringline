@@ -4,6 +4,9 @@ Point-in-time performance numbers for the ringline **server**, alongside a
 tokio reference. Checked in so future changes have a baseline to beat (or to
 flag a regression against).
 
+**Run:** June 2026, ringline 0.1.3 (commit `c77cfba`), tokio reference in the
+same `bench-server` binary. Not yet re-run on the current release.
+
 These numbers are from a **clean two-machine run** — two separate EC2 instances,
 not the co-located/single-host configuration whose unreliable tail-latency
 numbers were withdrawn previously. The workload is a realistic cache server, not
@@ -78,7 +81,7 @@ load — see below), 128 connections:
 | | p99 latency | **260 µs** | 305 µs | **−15%** |
 | | ops / server-core-s | **214,000** | 176,000 | **+22%** |
 | **1 KiB** | throughput (ops/s) | **772,533** | 593,163 | **+30%** |
-| | p50 latency | **158 µs** | 209 µs | **−25%** |
+| | p50 latency | **158 µs** | 209 µs | **−24%** |
 | | p99 latency | **268 µs** | 328 µs | **−18%** |
 | | ops / server-core-s | **207,000** | 168,000 | **+23%** |
 | **4 KiB** | throughput (ops/s) | 451,155 | 451,145 | tie (bandwidth-bound) |
