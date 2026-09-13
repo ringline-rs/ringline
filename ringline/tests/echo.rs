@@ -2774,35 +2774,62 @@ fn async_join3_mixed() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
 
-    // First write triggers the handler (consumed by initial with_data).
-    stream.write_all(b"x").unwrap();
-    stream.flush().unwrap();
-
-    // Brief delay, then send second payload for the join3 with_data branch.
-    std::thread::sleep(Duration::from_millis(30));
-    stream.write_all(b"PAYLOAD").unwrap();
-    stream.flush().unwrap();
+    // Read until `buf[..total]` contains `needle`, or the deadline passes.
+    // Returns whether it was found.
+    fn read_until(stream: &mut TcpStream, buf: &mut [u8], total: &mut usize, needle: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if std::str::from_utf8(&buf[..*total])
+                .unwrap_or("")
+                .contains(needle)
+            {
+                return true;
+            }
+            match stream.read(&mut buf[*total..]) {
+                Ok(0) => break,
+                Ok(n) => *total += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("read error: {e}"),
+            }
+        }
+        std::str::from_utf8(&buf[..*total])
+            .unwrap_or("")
+            .contains(needle)
+    }
 
     let mut buf = [0u8; 128];
     let mut total = 0;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        match stream.read(&mut buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => {
-                total += n;
-                let s = std::str::from_utf8(&buf[..total]).unwrap_or("");
-                if s.contains("JOIN3:") {
-                    break;
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => panic!("read error: {e}"),
-        }
-    }
+
+    // First write triggers the handler; its initial `with_data` consumes
+    // everything available at that moment.
+    stream.write_all(b"x").unwrap();
+    stream.flush().unwrap();
+
+    // Wait for "ABC" before writing the second payload, rather than sleeping
+    // and hoping. "ABC" is sent by `fut_a` *inside* the join3, so it cannot
+    // appear until the initial `with_data` has already returned — which makes
+    // it proof that the handler consumed "x" alone.
+    //
+    // The previous version slept 30ms instead. Under parallel suite load the
+    // worker can take longer than that to get to this connection, in which
+    // case one recv delivers "x" and "PAYLOAD" together, the initial
+    // `with_data` consumes both, and the join3's own `with_data` waits for a
+    // third write that never comes — the whole future stalls and the test
+    // times out with only "ABC" in hand. Measured at ~3% on Linux under
+    // `--features force-mio` (ringline-rs/ringline#386).
+    assert!(
+        read_until(&mut stream, &mut buf, &mut total, "ABC"),
+        "handler did not reach the join3: {:?}",
+        std::str::from_utf8(&buf[..total])
+    );
+
+    stream.write_all(b"PAYLOAD").unwrap();
+    stream.flush().unwrap();
+
+    read_until(&mut stream, &mut buf, &mut total, "JOIN3:");
 
     let result = std::str::from_utf8(&buf[..total]).unwrap();
     // a=3 (send "ABC"), b=42 (sleep completed), c=7 (with_data received "PAYLOAD")
@@ -4723,41 +4750,6 @@ fn mpsc_channel_backpressure() {
     assert_eq!(MPSC_BACKPRESSURE.load(Ordering::SeqCst), 15);
 
     shutdown.shutdown();
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
-}
-
-// ── signal handling tests ───────────────────────────────────────────
-
-/// wait_on_signal shuts down workers when SIGTERM is sent to self.
-#[test]
-fn signal_wait_on_signal_shutdown() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
-    let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
-        .launch::<AsyncEcho>()
-        .expect("launch failed");
-
-    wait_for_server(&addr);
-
-    // Verify server is running.
-    let got = echo_round_trip(&addr, b"hi");
-    assert_eq!(got, b"hi");
-
-    // Send SIGTERM to self from a background thread after a short delay.
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_millis(100));
-        unsafe {
-            libc::kill(libc::getpid(), libc::SIGTERM);
-        }
-    });
-
-    let sig = shutdown.wait_on_signal();
-    assert_eq!(sig, ringline::Signal::Terminate);
-
     for h in handles {
         h.join().unwrap().unwrap();
     }

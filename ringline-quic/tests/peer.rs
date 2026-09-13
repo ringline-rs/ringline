@@ -163,7 +163,24 @@ fn read_until_fin(
     let mut acc = Vec::with_capacity(expected_len);
     let mut buf = vec![0u8; 16 * 1024];
     let mut fin = false;
-    for _ in 0..64 {
+    // Loop on *progress*, not on a fixed round count. The transport here is
+    // an in-memory function call, but `drain` reads `Instant::now()` and
+    // drives QUIC's timers from it, so wall-clock time leaks into an
+    // otherwise deterministic simulation: under parallel-suite load enough
+    // real time can pass between rounds to fire loss-detection or PTO
+    // timers, and the retransmission that follows costs rounds. A fixed
+    // budget of 64 then runs out before the FIN arrives and the test fails
+    // with "server should observe FIN" (ringline-rs/ringline#386).
+    //
+    // `stall_budget` is what bounds the loop now: rounds are cheap, and a
+    // round that moves nothing and reads nothing means the endpoints have
+    // genuinely gone quiet, which is the only condition under which giving
+    // up is correct.
+    let mut stall_budget = 64usize;
+    let mut rounds = 0usize;
+    while stall_budget > 0 && rounds < 10_000 {
+        rounds += 1;
+        let before = acc.len();
         // Process outstanding events from the rx side first so any
         // synthesised StreamReadable lands.
         while let Some(_ev) = rx_endpoint.poll_event() {}
@@ -190,6 +207,13 @@ fn read_until_fin(
         // Need more data — let the wire deliver it.
         rx_endpoint.flush(Instant::now());
         drain(tx_endpoint, rx_endpoint, tx_addr, rx_addr);
+        if acc.len() > before {
+            // Still arriving: this round earned its keep, so restore the
+            // budget rather than counting down toward an arbitrary cap.
+            stall_budget = 64;
+        } else {
+            stall_budget -= 1;
+        }
     }
     (acc, fin)
 }
