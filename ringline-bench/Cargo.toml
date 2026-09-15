@@ -25,6 +25,11 @@ path = "src/bin/client.rs"
 # `#[cfg(has_io_uring)]` calls here would not compile.
 [features]
 force-mio = ["ringline/force-mio"]
+# tokio-uring is Linux-only and pulls its own io_uring stack, so it is opt-in
+# rather than a default dependency of the harness. It exists to answer one
+# question: how much of ringline's lead is the I/O interface rather than the
+# scheduler shape.
+tokio-uring-arm = ["dep:tokio-uring"]
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
@@ -37,3 +42,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { version = "0.5", optional = true }

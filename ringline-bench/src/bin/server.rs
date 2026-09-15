@@ -9,6 +9,18 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TokioScheduler {
+    MultiThread,
+    PerCore,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TokioEcho {
+    Copy,
+    Splice,
+}
+
 /// Which ringline echo strategy `bench-server` drives.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum EchoMode {
@@ -23,6 +35,9 @@ enum EchoMode {
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Runtime {
     Ringline,
+    /// tokio on its own io_uring runtime (`tokio-uring`). Linux only, and only
+    /// when built with `--features tokio-uring-arm`.
+    TokioUring,
     Tokio,
 }
 
@@ -66,6 +81,21 @@ struct Args {
     ///   `with_data`/`with_bytes` observe nothing while it is on.
     #[arg(long, value_enum, default_value_t = EchoMode::Direct)]
     echo_mode: EchoMode,
+
+    /// (tokio only) Scheduler shape. `multi-thread` is tokio's default
+    /// work-stealing runtime; `per-core` gives each core its own
+    /// `current_thread` runtime and `SO_REUSEPORT` listener, matching
+    /// ringline's thread-per-core structure. Isolates scheduler shape from
+    /// I/O interface in the comparison.
+    #[arg(long, value_enum, default_value_t = TokioScheduler::MultiThread)]
+    tokio_scheduler: TokioScheduler,
+
+    /// (tokio only) How the bytes move. `copy` is the canonical echo loop
+    /// (read into a reused buffer, write back out); `splice` moves them
+    /// socket -> pipe -> socket without entering user memory, the counterpart
+    /// to ringline's recv-forward byte pipe. Linux only.
+    #[arg(long, value_enum, default_value_t = TokioEcho::Copy)]
+    tokio_echo: TokioEcho,
 
     /// (ringline only) Connections assigned to each worker before moving to the next.
     /// 1 = classic round-robin. Higher values pack connections onto fewer workers
@@ -153,6 +183,7 @@ fn main() {
     let runtime_name = match args.runtime {
         Runtime::Ringline => "ringline",
         Runtime::Tokio => "tokio",
+        Runtime::TokioUring => "tokio-uring",
     };
 
     eprintln!(
@@ -173,8 +204,39 @@ fn main() {
             args.conn_chunk_size,
             pin_to_core,
         ),
-        Runtime::Tokio => run_tokio(args.addr, workers, args.msg_size),
+        Runtime::Tokio => {
+            use ringline_bench::servers::tokio_arms;
+            tokio_arms::run(
+                args.addr,
+                workers,
+                args.msg_size,
+                match args.tokio_scheduler {
+                    TokioScheduler::MultiThread => tokio_arms::TokioScheduler::MultiThread,
+                    TokioScheduler::PerCore => tokio_arms::TokioScheduler::PerCore,
+                },
+                match args.tokio_echo {
+                    TokioEcho::Copy => tokio_arms::TokioEcho::Copy,
+                    TokioEcho::Splice => tokio_arms::TokioEcho::Splice,
+                },
+                pin_to_core,
+            )
+        }
+        Runtime::TokioUring => run_tokio_uring(args.addr, workers, args.msg_size, pin_to_core),
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "tokio-uring-arm"))]
+fn run_tokio_uring(addr: SocketAddr, workers: usize, msg_size: usize, pin_to_core: bool) {
+    ringline_bench::servers::tokio_uring_arm::run(addr, workers, msg_size, pin_to_core)
+}
+
+#[cfg(not(all(target_os = "linux", feature = "tokio-uring-arm")))]
+fn run_tokio_uring(_addr: SocketAddr, _workers: usize, _msg_size: usize, _pin_to_core: bool) {
+    eprintln!(
+        "bench-server: --runtime tokio-uring needs a Linux build with \
+         --features tokio-uring-arm"
+    );
+    std::process::exit(2);
 }
 
 #[allow(clippy::manual_async_fn)]
@@ -311,58 +373,4 @@ fn run_ringline(
     for h in handles {
         h.join().ok();
     }
-}
-
-fn run_tokio(addr: SocketAddr, workers: usize, msg_size: usize) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime");
-
-    rt.block_on(async move {
-        let socket = tokio::net::TcpSocket::new_v4().expect("failed to create socket");
-        socket.set_reuseaddr(true).expect("failed to set reuseaddr");
-        socket.bind(addr).expect("failed to bind");
-        let listener = socket.listen(1024).expect("failed to listen");
-
-        eprintln!("bench-server: ready");
-
-        loop {
-            let (mut stream, _) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(_) => continue,
-            };
-            stream.set_nodelay(true).ok();
-
-            tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                // Bulk byte echo, matching what the ringline side does: take
-                // whatever arrived and echo exactly that many bytes. Neither
-                // server frames.
-                //
-                // This used to be `read_exact(&mut buf[..msg_size])`, which
-                // forces **one read syscall per message** however much data is
-                // already available, while ringline's `with_data` hands the
-                // handler everything that arrived. That is not a tuning
-                // difference, it is a pathology, and it manufactured a ~9.6x
-                // ringline "win" in a previous campaign before it was caught.
-                //
-                // The read buffer deliberately matches ringline's per-buffer
-                // recv size (`recv_buffer(256, ...)` below), so neither side
-                // gets a structurally larger read quantum.
-                let read_buf = msg_size.next_power_of_two().max(4096);
-                let mut buf = vec![0u8; read_buf];
-                loop {
-                    let n = match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    if stream.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-    });
 }
