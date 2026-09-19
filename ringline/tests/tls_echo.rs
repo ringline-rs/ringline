@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ringline::{
     AsyncEventHandler, ConfigBuilder, ConnCtx, ParseResult, RinglineBuilder, TlsConfig, TlsInfo,
@@ -19,6 +19,49 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read until `buf` is full, **failing when progress stalls** rather than
+/// retrying forever.
+///
+/// `TcpStream::set_read_timeout` surfaces a timed-out read as
+/// `ErrorKind::WouldBlock`, which is indistinguishable from "no data yet". So
+/// a `WouldBlock` arm that retries unconditionally makes the read timeout
+/// **inert**: any stall becomes an unbounded hang instead of a failure. This
+/// file already learned that once — see the `big_send` reader, whose comment
+/// records a six-hour CI hang from the same shape — and this is that fix,
+/// factored out so the remaining readers cannot regress to it.
+///
+/// The budget is *time without progress*, not total time, so a large transfer
+/// on a slow link still succeeds while a genuine stall fails fast. Panics
+/// report how far the read got, which is the number that localises the stall.
+fn read_until_full_or_stalled(
+    stream: &mut impl Read,
+    buf: &mut [u8],
+    stall_budget: Duration,
+    what: &str,
+) -> usize {
+    let want = buf.len();
+    let mut total = 0;
+    let mut last_progress = Instant::now();
+    while total < want {
+        match stream.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                last_progress = Instant::now();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    last_progress.elapsed() < stall_budget,
+                    "{what}: no progress for {stall_budget:?} at {total}/{want} bytes"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("{what}: read error at {total}/{want} bytes: {e}"),
+        }
+    }
+    total
+}
 
 fn test_config_builder() -> ConfigBuilder {
     ConfigBuilder::new()
@@ -171,20 +214,12 @@ fn tls_echo_with_external_client() {
     stream.flush().unwrap();
 
     let mut large_buf = vec![0u8; large_msg.len()];
-    let mut total = 0;
-    while total < large_msg.len() {
-        match stream.read(&mut large_buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // rustls::Stream may return WouldBlock if the TLS record
-                // isn't fully available yet; retry after a short delay.
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Err(e) => panic!("TLS read error (large): {e}"),
-        }
-    }
+    let total = read_until_full_or_stalled(
+        &mut stream,
+        &mut large_buf,
+        Duration::from_secs(30),
+        "large TLS echo",
+    );
     assert_eq!(&large_buf[..total], &large_msg[..], "large echo mismatch");
 
     shutdown.shutdown();
@@ -278,18 +313,12 @@ fn tls_single_send_larger_than_rustls_buffer() {
 
     let expected = big_send_payload();
     let mut buf = vec![0u8; BIG_SEND_SIZE];
-    let mut total = 0;
-    while total < BIG_SEND_SIZE {
-        match stream.read(&mut buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            Err(e) => panic!("TLS read error: {e}"),
-        }
-    }
+    let total = read_until_full_or_stalled(
+        &mut stream,
+        &mut buf,
+        Duration::from_secs(30),
+        "single send larger than the rustls buffer",
+    );
     assert_eq!(total, BIG_SEND_SIZE, "short read");
     assert_eq!(buf, expected, "byte-exact mismatch — chunk reorder or loss");
 
@@ -765,18 +794,12 @@ fn tls_segmented_recv_reassembles_and_eofs() {
         stream.flush().unwrap();
 
         let mut buf = vec![0u8; SIZE];
-        let mut total = 0;
-        while total < SIZE {
-            match stream.read(&mut buf[total..]) {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(e) => panic!("TLS read error: {e}"),
-            }
-        }
+        let total = read_until_full_or_stalled(
+            &mut stream,
+            &mut buf,
+            Duration::from_secs(30),
+            "segmented TLS echo",
+        );
         assert_eq!(total, SIZE, "short read reassembling segmented echo");
         assert_eq!(buf, msg, "segmented TLS echo byte-exact mismatch");
     }

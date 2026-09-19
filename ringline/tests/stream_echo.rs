@@ -192,11 +192,24 @@ fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
 
     let mut buf = vec![0u8; msg.len()];
     let mut total = 0;
+    let mut last_progress = std::time::Instant::now();
     while total < msg.len() {
         match stream.read(&mut buf[total..]) {
             Ok(0) => break,
-            Ok(n) => total += n,
+            Ok(n) => {
+                total += n;
+                last_progress = std::time::Instant::now();
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // A timed-out read surfaces as WouldBlock, so retrying
+                // unconditionally makes the socket timeout inert and turns a
+                // stall into an unbounded hang. Bound it by time without
+                // progress, as tls_echo.rs does.
+                assert!(
+                    last_progress.elapsed() < Duration::from_secs(30),
+                    "no echo progress for 30s at {total}/{} bytes",
+                    msg.len()
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => panic!("read error: {e}"),
