@@ -1105,3 +1105,105 @@ fn tls_tick_close_sends_close_notify() {
         h.join().unwrap().unwrap();
     }
 }
+
+// ── Segmented recv must adopt bytes that arrived first (#423) ───────────────
+
+/// Installing a segmented reader *after* data has already arrived must still
+/// deliver that data.
+///
+/// `segments()` flips `recv_domain` to `Segmented`; anything received before
+/// that is already in the `RecvAccumulator`, which a segmented reader never
+/// looks at. Without adoption those bytes are invisible forever: the reader
+/// parks, the data sits in the accumulator, and the connection hangs with
+/// every health signal reading normal — ring full, multishot live, no errors.
+///
+/// The production symptom was intermittent (~30% of runs under
+/// `--test-threads=1`) because it depended on whether the handler's first poll
+/// beat the client's data. Sleeping before installing the reader makes the
+/// race deterministic: this test hangs 100% of the time without the fix.
+#[cfg(has_io_uring)]
+struct TlsLateSegmentReader;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsLateSegmentReader {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            // Let the handshake finish and the client's payload arrive and be
+            // decrypted into the accumulator *before* the reader exists.
+            ringline::sleep(Duration::from_millis(300)).await;
+
+            let mut reader = conn.segments();
+            loop {
+                match reader.next().await {
+                    Ok(Some(seg)) => {
+                        let _ = conn.send_nowait(&seg);
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsLateSegmentReader
+    }
+}
+
+#[cfg(has_io_uring)]
+#[test]
+fn tls_segments_installed_after_data_still_delivers_it() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (certs, key) = generate_self_signed();
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<TlsLateSegmentReader>()
+        .expect("launch failed");
+    wait_for_server(&addr);
+
+    let client_config = client_tls_config(&certs);
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Small enough to sit in the accumulator whole, so a failure is
+    // unambiguously "none of it arrived" rather than a partial stall.
+    let msg: Vec<u8> = (0..4096u32)
+        .map(|i| i.wrapping_mul(2654435761) as u8)
+        .collect();
+    {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        stream.write_all(&msg).unwrap();
+        stream.flush().unwrap();
+
+        let mut buf = vec![0u8; msg.len()];
+        let total = read_until_full_or_stalled(
+            &mut stream,
+            &mut buf,
+            Duration::from_secs(20),
+            "late-installed segment reader",
+        );
+        assert_eq!(
+            total,
+            msg.len(),
+            "bytes that arrived before segments() were stranded in the accumulator"
+        );
+        assert_eq!(buf, msg, "late-installed segmented echo mismatch");
+    }
+
+    let _ = tcp;
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}

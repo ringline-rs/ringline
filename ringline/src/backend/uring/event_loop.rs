@@ -7756,6 +7756,80 @@ mod tests {
         );
     }
 
+    /// A segmented reader must deliver bytes that are sitting in the
+    /// accumulator rather than parking forever (#423).
+    ///
+    /// The accumulator is invisible to a segmented reader, so this state used
+    /// to hang with every health signal normal. It is reachable from legal
+    /// compositions — `SegmentReader::drop` settles the hold into the
+    /// accumulator, and `with_segments` leaves its remainder there — so the
+    /// reader adopts rather than asserting.
+    ///
+    /// This covers `adopt_stranded_accumulator`, which the end-to-end test
+    /// cannot reach: there, entry-time adoption has already drained the
+    /// accumulator.
+    #[test]
+    fn segmented_reader_adopts_bytes_stranded_in_the_accumulator() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        // Order matters. `segments()` adopts at entry, so stranding the bytes
+        // first would leave the poll-entry path with nothing to do and test the
+        // wrong thing. Install the reader first, *then* strand — which is what
+        // a settle (`SegmentReader::drop`, `with_segments`) actually does.
+        let conn = ConnCtx::new(conn_index, generation);
+        let mut reader = with_driver_state(&mut el, || conn.segments());
+
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        assert!(
+            el.driver.accumulators.append(conn_index, b"stranded"),
+            "accumulator append"
+        );
+        assert!(
+            el.driver.segment_hold[conn_index as usize].is_empty(),
+            "hold must be empty so only the accumulator can satisfy this read"
+        );
+
+        use metriken::CounterGroupMetric;
+        let before = crate::metrics::POOL
+            .counter_value(crate::metrics::pool::SEGMENT_STRANDED_ADOPTED)
+            .unwrap_or(0);
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(reader.next());
+        let got = match with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        }) {
+            std::task::Poll::Ready(Ok(Some(seg))) => seg,
+            // `RecvSegment` has no `Debug`, so describe the outcome instead of
+            // formatting it.
+            std::task::Poll::Ready(Ok(None)) => {
+                panic!("reader reported EOF instead of adopting the stranded bytes")
+            }
+            std::task::Poll::Ready(Err(e)) => panic!("reader errored: {e}"),
+            std::task::Poll::Pending => {
+                panic!("reader parked on stranded bytes instead of adopting them")
+            }
+        };
+        with_driver_state(&mut el, || {
+            assert_eq!(&got[..], b"stranded", "the stranded bytes, in order");
+        });
+        drop(got);
+
+        assert!(
+            el.driver.accumulators.is_empty(conn_index),
+            "the accumulator must be drained by the adopt"
+        );
+        assert!(
+            crate::metrics::POOL
+                .counter_value(crate::metrics::pool::SEGMENT_STRANDED_ADOPTED)
+                .unwrap_or(0)
+                > before,
+            "the adopt must be counted — it is the only way this is visible in production"
+        );
+    }
+
     /// (c1) An owned held segment consumed via the reader returns the correct
     /// bytes, never enters the pin slot, and its drop replenishes nothing (no
     /// bid) — the ring stays balanced with no double-replenish.

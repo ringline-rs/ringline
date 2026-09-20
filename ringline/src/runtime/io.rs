@@ -851,6 +851,66 @@ impl ConnCtx {
         }
     }
 
+    /// Enter the segmented recv domain, **adopting bytes that already arrived**.
+    ///
+    /// Flipping `recv_domain` is not enough. Anything received before the
+    /// reader was installed is already in the `RecvAccumulator` (or pinned as
+    /// the zero-copy `pending_recv_bufs` slot), and a segmented reader only
+    /// ever looks at `segment_hold` — so without this those bytes are
+    /// invisible forever: the reader parks, the data sits in the accumulator,
+    /// and every health signal reads normal (ring full, multishot live, no
+    /// errors). That is #423.
+    ///
+    /// The race is easy to lose and hard to see. A handler installs its reader
+    /// on the task's first poll, which is strictly after `on_accept`; under TLS
+    /// the handshake round-trip all but guarantees application data is already
+    /// in flight by then. How much is stranded depends purely on timing, which
+    /// is why the symptom was an intermittent hang at a varying offset.
+    ///
+    /// This covers Modes B and C (`segments()`, `recv_owned_segment()`).
+    /// Ordering: accumulator bytes are the oldest and go to the front, the
+    /// pinned buffer is the newest and goes to the back. (On main, Mode A's
+    /// `arm_forward_source` adopts the same way; this line's `forward_to` does
+    /// not, and is not changed here.)
+    #[cfg(has_io_uring)]
+    fn enter_segmented_domain(&self) {
+        with_state(|driver, _executor| {
+            let idx = self.conn_index as usize;
+            // A stale handle must not touch the slot's new occupant. Without
+            // this, a recycled connection has its accumulator drained into a
+            // hold its own `with_data` reader never looks at — #423 inflicted
+            // on an innocent third party. The caller's own poll then resolves
+            // to EOF.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
+            // A running Mode A forward owns this connection's hold. Adopting
+            // the accumulator here would push post-`len` overshoot into the
+            // forward's next write and corrupt the relayed stream, so leave a
+            // forwarding connection strictly alone. (`forward_recv_active` is
+            // this line's "a `forward_to` is driving this connection" flag.)
+            if driver.forward_recv_active[idx] {
+                return;
+            }
+            driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
+            if !driver.accumulators.is_empty(self.conn_index) {
+                let buffered = driver.accumulators.take_frozen(self.conn_index);
+                driver.segment_hold[idx].push_front(crate::backend::HeldRecvBuf::Owned(buffered));
+            }
+            if let Some(pending) = driver.pending_recv_bufs[idx].take() {
+                // SAFETY: the slot owns an unreplenished provided buffer with
+                // `len` bytes received into it; taking the slot transfers that
+                // ownership here, and the bid goes back at the same moment the
+                // copy is made.
+                let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                driver.segment_hold[idx].push_back(crate::backend::HeldRecvBuf::Owned(
+                    Bytes::copy_from_slice(data),
+                ));
+                driver.pending_replenish.push(pending.bid);
+            }
+        });
+    }
+
     /// Borrow a segmented-recv reader (Mode B "Borrow", the sound lending-iterator
     /// face — see `docs/segmented-recv-design.md`).
     ///
@@ -868,10 +928,7 @@ impl ConnCtx {
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
     pub fn segments(&self) -> SegmentReader<'_> {
-        with_state(|driver, _executor| {
-            driver.recv_domain[self.conn_index as usize] =
-                crate::recv::domain::RecvDomain::Segmented;
-        });
+        self.enter_segmented_domain();
         SegmentReader {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -902,10 +959,7 @@ impl ConnCtx {
     /// io_uring only — segmented delivery is backed by the provided-buffer ring.
     #[cfg(has_io_uring)]
     pub fn recv_owned_segment(&self) -> RecvOwnedSegment {
-        with_state(|driver, _executor| {
-            driver.recv_domain[self.conn_index as usize] =
-                crate::recv::domain::RecvDomain::Segmented;
-        });
+        self.enter_segmented_domain();
         RecvOwnedSegment {
             conn_index: self.conn_index,
             generation: self.generation,
@@ -2463,9 +2517,42 @@ impl Drop for SegmentReader<'_> {
     }
 }
 
-/// Future returned by [`SegmentReader::next`]. Borrows the reader (`&mut`) for
-/// `'a`; the yielded [`RecvSegment`] shares that borrow, keeping the reader
-/// exclusively locked while the segment is alive.
+/// Deliver bytes a segmented reader would otherwise never see (#423).
+///
+/// A segmented reader consumes only `segment_hold`; the `RecvAccumulator` is
+/// invisible to it. Reaching a poll with a non-empty accumulator therefore
+/// means those bytes are stranded, and the connection hangs with every other
+/// signal healthy — provided ring full, multishot armed and live, no ENOBUFS,
+/// no errors. That combination is invisible to every other counter here, which
+/// is what made #423 cost months to find.
+///
+/// Called at the **top** of the poll, before the hold is examined, so adopted
+/// bytes are returned by that same poll. Adopting after the park decision
+/// instead would be useless: `Executor::wake_recv` is gated on the waiter flag
+/// the caller has not set yet, so the wake would be a silent no-op and the
+/// reader would still hang.
+///
+/// This is a recovery path, not an assertion. The accumulator can legitimately
+/// be non-empty here — `SegmentReader::drop` settles the hold into it, and
+/// `with_segments` leaves its un-consumed remainder there — and in every such
+/// case adopting is simply the correct answer. (`SegmentNext::poll` already
+/// treats a second concurrent reader as a recoverable misuse rather than a
+/// panic; asserting here would contradict that.)
+///
+/// `enter_segmented_domain` adopts on entry, so a non-zero
+/// `SEGMENT_STRANDED_ADOPTED` means bytes were stranded *after* entry and this
+/// path is the only reason the connection kept working.
+#[cfg(has_io_uring)]
+fn adopt_stranded_accumulator(driver: &mut Driver, conn: u32) {
+    if driver.accumulators.is_empty(conn) {
+        return;
+    }
+    let idx = conn as usize;
+    let buffered = driver.accumulators.take_frozen(conn);
+    driver.segment_hold[idx].push_front(crate::backend::HeldRecvBuf::Owned(buffered));
+    crate::metrics::POOL.increment(crate::metrics::pool::SEGMENT_STRANDED_ADOPTED);
+}
+
 #[cfg(has_io_uring)]
 pub struct SegmentNext<'a> {
     conn_index: u32,
@@ -2488,6 +2575,10 @@ impl<'a> Future for SegmentNext<'a> {
             if driver.connections.generation(conn) != self.generation {
                 return Poll::Ready(Ok(None));
             }
+
+            // Before anything else: bytes stranded in the accumulator are
+            // invisible to this reader. Adopt them so this poll can return them.
+            adopt_stranded_accumulator(driver, conn);
 
             // One live pinned segment per connection at a time. A *single* reader
             // is kept sound by `&mut self` (a live `RecvSegment` borrows the reader
@@ -2776,6 +2867,10 @@ impl Future for RecvOwnedSegment {
             if driver.connections.generation(conn) != self.generation {
                 return Poll::Ready(Ok(None));
             }
+
+            // Before anything else: bytes stranded in the accumulator are
+            // invisible to this reader. Adopt them so this poll can return them.
+            adopt_stranded_accumulator(driver, conn);
 
             // A held buffer is available: COPY it into an owned `Bytes` and
             // replenish the bid immediately. The copy is the release — this path
