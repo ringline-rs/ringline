@@ -6556,6 +6556,125 @@ mod tests {
         assert_eq!(el.driver.provided_bufs.free(), entries - 1);
     }
 
+    /// A stale handle must not put the slot's new occupant into the segmented
+    /// domain.
+    ///
+    /// This is the #429 headline: `with_segments` used to flip
+    /// `recv_domain[idx] = Segmented` eagerly at *call* time, with no
+    /// generation check at all. The victim's own `with_data` reader never
+    /// looks at `segment_hold`, so its bytes are stranded and it hangs with
+    /// every health signal normal — #423, inflicted on a third party. The flip
+    /// now happens on the first poll, behind the same gate every other
+    /// segmented entry uses.
+    #[test]
+    fn with_segments_does_not_flip_a_stale_slots_domain() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+
+        // Merely constructing the future must not touch the driver.
+        let waker = noop_waker();
+        let mut fut = std::pin::pin!(with_driver_state(&mut el, || {
+            stale.with_segments(|_chain| crate::SegConsumed(0))
+        }));
+        assert_eq!(
+            el.driver.recv_domain[conn_index as usize],
+            crate::recv::domain::RecvDomain::CopyOrConsume,
+            "constructing the future must not flip the domain"
+        );
+
+        // Nor must polling it.
+        let p = with_driver_state(&mut el, || {
+            let mut cx = std::task::Context::from_waker(&waker);
+            fut.as_mut().poll(&mut cx)
+        });
+        assert!(
+            matches!(p, std::task::Poll::Ready(Ok(0))),
+            "a stale with_segments resolves as EOF, got {p:?}"
+        );
+        assert_eq!(
+            el.driver.recv_domain[conn_index as usize],
+            crate::recv::domain::RecvDomain::CopyOrConsume,
+            "the live occupant must still be on the default read path"
+        );
+    }
+
+    /// A stale handle must not settle the slot's new occupant's hold.
+    ///
+    /// `end_segments` drains held segments into the accumulator and resets the
+    /// delivery domain. Run against a recycled slot it does that to whoever
+    /// owns it now — #423's shape, inflicted on a third party. See #429.
+    #[test]
+    fn end_segments_refuses_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+
+        // The live occupant is in the segmented domain.
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+
+        match with_driver_state(&mut el, || stale.end_segments()) {
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
+            Ok(()) => panic!("a stale handle must not end another connection's segmented domain"),
+        }
+        assert_eq!(
+            el.driver.recv_domain[conn_index as usize],
+            crate::recv::domain::RecvDomain::Segmented,
+            "the live occupant's delivery domain must be untouched"
+        );
+    }
+
+    /// A stale handle must not read — or consume — the new occupant's bytes.
+    ///
+    /// `try_with_data` both hands the caller the accumulator's contents and
+    /// advances it past what the closure consumed, so an ungated stale call
+    /// leaks one connection's data to another and eats it. See #429.
+    #[test]
+    fn try_with_data_refuses_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+
+        assert!(
+            el.driver
+                .accumulators
+                .append(conn_index, b"the new occupant's bytes"),
+            "append into the live occupant's accumulator"
+        );
+
+        let seen = with_driver_state(&mut el, || {
+            stale.try_with_data(|data| crate::ParseResult::Consumed(data.len()))
+        });
+        assert!(
+            seen.is_none(),
+            "a stale handle must not see another connection's data"
+        );
+        assert_eq!(
+            el.driver.accumulators.data(conn_index),
+            b"the new occupant's bytes",
+            "and must not consume it either"
+        );
+    }
+
+    /// A stale handle must not flip the new occupant into recv-forward mode:
+    /// it would start holding its recv buffers for a forward nobody will issue.
+    #[test]
+    fn enable_recv_forward_ignores_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+
+        with_driver_state(&mut el, || stale.enable_recv_forward());
+        assert!(
+            !el.driver.recv_forward[conn_index as usize],
+            "a stale handle must not enable recv-forward on the new occupant"
+        );
+    }
+
     /// (c1) An owned held segment consumed via the reader returns the correct
     /// bytes, never enters the pin slot, and its drop replenishes nothing (no
     /// bid) — the ring stays balanced with no double-replenish.

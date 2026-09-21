@@ -936,7 +936,15 @@ impl ConnCtx {
         // accumulator, reset the delivery domain to default" routine (named for
         // its first caller, the Mode A `forward_to` completion). Reused here for
         // the streaming-value read side, which needs the identical settle.
-        let ok = with_state(|driver, _executor| driver.settle_forward_end(self.conn_index));
+        let ok = with_state(|driver, _executor| {
+            // A stale handle must not settle the slot's new occupant: that
+            // drains someone else's hold into their accumulator and resets
+            // their delivery domain underneath them. See #429.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return Err(io::Error::from_raw_os_error(libc::EPIPE));
+            }
+            Ok(driver.settle_forward_end(self.conn_index))
+        })?;
         if ok {
             Ok(())
         } else {
@@ -997,14 +1005,20 @@ impl ConnCtx {
     where
         F: FnMut(&SegChain<'_>) -> SegConsumed,
     {
-        with_state(|driver, _executor| {
-            driver.recv_domain[self.conn_index as usize] =
-                crate::recv::domain::RecvDomain::Segmented;
-        });
+        // The domain flip happens on the first poll, not here.
+        //
+        // Flipping at call time skipped the generation check every other
+        // segmented entry performs, so a *stale* handle — one whose slot was
+        // closed and recycled — could put a different connection into the
+        // segmented domain. That connection's own `with_data` reader never
+        // looks at `segment_hold`, so its bytes are stranded and it hangs with
+        // every health signal normal: #423 inflicted on an innocent third
+        // party. See #429.
         WithSegmentsFuture {
             conn_index: self.conn_index,
             generation: self.generation,
             f: Some(f),
+            entered: false,
         }
     }
 
@@ -1119,6 +1133,12 @@ impl ConnCtx {
     /// returning `Some(result)`. Returns `None` if the accumulator is empty.
     pub fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(&self, f: F) -> Option<ParseResult> {
         with_state(|driver, _executor| {
+            // A stale handle must not read the slot's new occupant — this both
+            // hands the caller another connection's bytes and advances that
+            // connection's accumulator past them. See #429.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return None;
+            }
             let data = driver.accumulators.data(self.conn_index);
             if data.is_empty() {
                 return None;
@@ -1263,8 +1283,14 @@ impl ConnCtx {
     /// provided-buffer ring until their forward completes, so a slow peer
     /// naturally throttles recv (`ENOBUFS`) rather than growing memory.
     #[cfg(has_io_uring)]
+    /// A stale handle is a no-op: this returns `()` and so has no way to
+    /// report a refusal, and flipping the flag on a recycled slot would make a
+    /// *different* connection start holding its recv buffers. See #429.
     pub fn enable_recv_forward(&self) {
         with_state(|driver, _| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
             driver.recv_forward[self.conn_index as usize] = true;
         });
     }
@@ -3061,6 +3087,11 @@ pub struct WithSegmentsFuture<F> {
     /// See `WithDataFuture` for the role of `generation`.
     generation: u32,
     f: Option<F>,
+    /// Has this future put the connection into the segmented domain yet?
+    ///
+    /// The flip is deferred to the first poll so it happens behind the
+    /// generation and claim checks; see [`ConnCtx::with_segments`] and #429.
+    entered: bool,
 }
 
 #[cfg(has_io_uring)]
@@ -3077,6 +3108,17 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
             if driver.connections.generation(conn) != self.generation {
                 self.f.take();
                 return Poll::Ready(Ok(0));
+            }
+
+            if !self.entered {
+                // A live `SegmentReader` owns the hold; handing the same
+                // buffers to a second consumer would double-deliver them.
+                if driver.segment_reader_live[idx] {
+                    self.f.take();
+                    return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY)));
+                }
+                driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
+                self.entered = true;
             }
 
             // Flush a leftover single-buffer zero-copy recv (from a pre-`segments`
