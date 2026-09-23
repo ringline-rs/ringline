@@ -299,7 +299,12 @@ impl Ring {
     /// on the accepted fd to learn the peer.
     pub fn submit_accept_multi(&mut self, listener_index: u32, listen_fd: RawFd) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::AcceptMulti, listener_index, 0);
+        // The same flags `accept_nonblock` passes to `accept4` on the pool
+        // path. Multishot accept defaults to zero, so without this the merged
+        // path is the one place in the runtime that hands out an fd which
+        // survives `exec` and blocks on a direct read (#460).
         let entry = opcode::AcceptMulti::new(Fd(listen_fd))
+            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
             .build()
             .user_data(user_data.raw());
         unsafe {
