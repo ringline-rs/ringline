@@ -2086,6 +2086,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         } else {
             let raw_fd = result;
+            // Merged mode has no acceptor thread, so this is the only place the
+            // accepted socket's options get applied. Leaving it out is how
+            // `tcp_nodelay(true)` came to be silently ignored here, costing 29x
+            // under TLS when Nagle met the peer's delayed ACK (#460).
+            //
+            // TCP only: a merged listener is never a Unix socket
+            // (SO_REUSEPORT does not apply to one), so there is no is_unix case
+            // to consider as there is in the acceptor.
+            crate::acceptor::apply_accepted_sockopts(
+                raw_fd,
+                self.driver.tcp_nodelay,
+                #[cfg(feature = "timestamps")]
+                self.driver.timestamps,
+            );
             let peer = crate::backend::sockaddr::getpeername_peer_addr(raw_fd).unwrap_or(
                 crate::connection::PeerAddr::Tcp(std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
             );

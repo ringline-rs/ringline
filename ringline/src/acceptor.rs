@@ -40,6 +40,51 @@ pub struct AcceptorConfig {
     pub timestamps: bool,
 }
 
+/// Apply the per-connection socket options an accepted fd needs.
+///
+/// Shared by both accept paths. It used to live inline in the acceptor loop,
+/// which meant merged accept mode — which has no acceptor thread — applied
+/// none of them: `ConfigBuilder::tcp_nodelay(true)` was accepted, documented
+/// and ignored there. Nagle on a TLS handshake's small writes then met the
+/// client's 40 ms delayed ACK, and merged mode measured 29x slower than the
+/// pool with its workers idle (#460).
+///
+/// One function, called from both paths, so the two cannot drift again.
+pub(crate) fn apply_accepted_sockopts(
+    fd: RawFd,
+    nodelay: bool,
+    #[cfg(feature = "timestamps")] timestamps: bool,
+) {
+    if nodelay {
+        let optval: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    // Kernel-level RX timestamps (Linux only).
+    #[cfg(all(target_os = "linux", feature = "timestamps"))]
+    if timestamps {
+        let flags: libc::c_int =
+            (libc::SOF_TIMESTAMPING_SOFTWARE | libc::SOF_TIMESTAMPING_RX_SOFTWARE) as libc::c_int;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TIMESTAMPING,
+                &flags as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
 /// Run one listener's acceptor loop. Terminates when all channels disconnect.
 ///
 /// Accepts connections via blocking `accept4` and distributes raw fds
@@ -85,36 +130,13 @@ pub fn run_acceptor(config: AcceptorConfig) {
             }
         }
 
-        // Set TCP_NODELAY if configured (skip for Unix domain sockets).
-        if config.tcp_nodelay && addr_storage.ss_family != libc::AF_UNIX as libc::sa_family_t {
-            let optval: libc::c_int = 1;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_NODELAY,
-                    &optval as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-        }
-
-        // Set SO_TIMESTAMPING for kernel-level RX timestamps (Linux only).
-        #[cfg(all(target_os = "linux", feature = "timestamps"))]
-        if config.timestamps {
-            let flags: libc::c_int = (libc::SOF_TIMESTAMPING_SOFTWARE
-                | libc::SOF_TIMESTAMPING_RX_SOFTWARE)
-                as libc::c_int;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_TIMESTAMPING,
-                    &flags as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-        }
+        let is_unix = addr_storage.ss_family == libc::AF_UNIX as libc::sa_family_t;
+        apply_accepted_sockopts(
+            fd,
+            config.tcp_nodelay && !is_unix,
+            #[cfg(feature = "timestamps")]
+            config.timestamps,
+        );
 
         // Parse peer address from the sockaddr_storage filled by accept4.
         // A Unix accept has no `SocketAddr` — its peer is normally unnamed, so
@@ -229,5 +251,99 @@ fn accept_nonblock(
             }
         }
         fd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    /// The option is actually applied, not merely requested.
+    ///
+    /// This covers the helper, which is what both accept paths call. It does
+    /// not prove the merged path calls it — the accepted fd is closed right
+    /// after `register_files_update` hands it to io_uring's fixed-file table,
+    /// so no test can read the option back off a live accepted connection.
+    /// That half is covered by the connect-rate measurement on the rack
+    /// (#460), where the symptom is a 29x throughput difference.
+    #[test]
+    fn nodelay_is_set_when_asked() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let (accepted, _) = listener.accept().expect("accept");
+
+        // Start from the opposite state, so a no-op helper cannot pass.
+        let off: libc::c_int = 0;
+        unsafe {
+            libc::setsockopt(
+                accepted.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                &off as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        assert_eq!(read_nodelay(accepted.as_raw_fd()), 0, "precondition");
+
+        apply_accepted_sockopts(
+            accepted.as_raw_fd(),
+            true,
+            #[cfg(feature = "timestamps")]
+            false,
+        );
+        // Non-zero, not `== 1`: Linux reports 1, macOS reports the internal
+        // TF_NODELAY flag bits (4). The contract is on-versus-off.
+        assert_ne!(
+            read_nodelay(accepted.as_raw_fd()),
+            0,
+            "TCP_NODELAY should be on"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn nodelay_is_left_alone_when_not_asked() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let (accepted, _) = listener.accept().expect("accept");
+
+        let off: libc::c_int = 0;
+        unsafe {
+            libc::setsockopt(
+                accepted.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                &off as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        apply_accepted_sockopts(
+            accepted.as_raw_fd(),
+            false,
+            #[cfg(feature = "timestamps")]
+            false,
+        );
+        assert_eq!(read_nodelay(accepted.as_raw_fd()), 0);
+        drop(client);
+    }
+
+    /// Zero means off; any non-zero means on (the value differs by platform).
+    fn read_nodelay(fd: RawFd) -> libc::c_int {
+        let mut val: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                &mut val as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt failed");
+        val
     }
 }
