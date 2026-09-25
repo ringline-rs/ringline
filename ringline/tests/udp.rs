@@ -2084,8 +2084,29 @@ fn udp_gso_invalid_segment_size_returns_error() {
         let (n, _) = client.recv_from(&mut buf).unwrap();
         assert_eq!(n, 200);
     }
+    // Receiving the segments does not mean the handler has finished.
+    //
+    // The mio `send_to_gso` emits one `send_to` per segment, so all three
+    // datagrams are on the wire from inside that loop — before `send_to_gso`
+    // returns, and well before the `fetch_add` that follows it. A client that
+    // reads the counter the instant the last datagram lands is racing the
+    // handler's next statement, and loses whenever the handler thread is
+    // descheduled in that window. That is the flake behind the CI failure of
+    // 2026-09-24 (`Test (mio)`): reproduced here at 3/60, always with the
+    // datagrams arriving from the server's own address and the handler simply
+    // not there yet.
+    //
+    // So wait for the counter the same way the test waits for the handler to
+    // start, rather than assuming the send and the bookkeeping are atomic.
+    let sane_ok = SANE_OK.get().unwrap();
+    for _ in 0..400 {
+        if sane_ok.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(
-        SANE_OK.get().unwrap().load(Ordering::SeqCst),
+        sane_ok.load(Ordering::SeqCst),
         1,
         "follow-up send_to_gso must succeed after the invalid-arg errors"
     );
