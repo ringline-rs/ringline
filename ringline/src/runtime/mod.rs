@@ -421,7 +421,7 @@ pub(crate) struct Executor {
     /// Connection indices (and standalone task indices with STANDALONE_BIT) ready to poll.
     pub(crate) ready_queue: VecDeque<u32>,
     /// The task currently being polled (its future is checked out of the
-    /// slab, so its slot reads Empty). `wake_task` consults this to record
+    /// slab, so its slot reads `Polling`). `wake_task` consults this to record
     /// self-wakes instead of dropping them.
     pub(crate) currently_polling: Option<u32>,
     /// Set by `wake_task` when the currently-polling task wakes itself;
@@ -693,9 +693,10 @@ impl Executor {
     /// is now ready.
     pub(crate) fn wake_task(&mut self, task_id: u32) -> bool {
         // A task waking itself from inside its own poll: the future is
-        // checked out of the slab (slot reads Empty), so slab.wake() would
-        // silently drop the wake and the task would park forever. Record it;
-        // the poll loop re-queues the task after parking it.
+        // checked out of the slab (slot reads `Polling`), so slab.wake() has
+        // no parked future to transition and would silently drop the wake,
+        // leaving the task parked forever. Record it; the poll loop re-queues
+        // the task after parking it.
         if self.currently_polling == Some(task_id) {
             self.woken_while_polling = true;
             return true;

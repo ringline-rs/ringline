@@ -1423,7 +1423,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         }
                         Ok(std::task::Poll::Pending) => {
                             executor.standalone_slab.park(task_idx, fut);
-                            // Self-wake during poll (slot read Empty) —
+                            // Self-wake during poll (slot read `Polling`) —
                             // re-queue now that the task is parked.
                             if executor.woken_while_polling {
                                 let _ = executor.wake_task(raw_id);
@@ -1465,7 +1465,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         }
                         Ok(std::task::Poll::Pending) => {
                             executor.task_slab.park(conn_index, fut);
-                            // Self-wake during poll (slot read Empty) —
+                            // Self-wake during poll (slot read `Polling`) —
                             // re-queue now that the task is parked.
                             if executor.woken_while_polling {
                                 let _ = executor.wake_task(conn_index);

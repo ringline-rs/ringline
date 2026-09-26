@@ -11,6 +11,15 @@ pub struct TaskId(pub(crate) u32);
 enum TaskSlot {
     /// Slot is empty (no task).
     Empty,
+    /// The future is out of the slab, being polled. Distinct from `Empty`
+    /// because `StandaloneTaskSlab::remove` has to tell "this task just
+    /// finished, reclaim its index" from "there was never a task here, do
+    /// not push a duplicate onto the free list".
+    ///
+    /// `wake` cannot transition this state — there is no future here to mark
+    /// ready — which is why a task that wakes during its own poll is recorded
+    /// in `Executor::woken_while_polling` and re-queued after parking instead.
+    Polling,
     /// Task is parked (waiting for a wakeup).
     Parked(BoxFuture),
     /// Task is ready to be polled.
@@ -54,7 +63,7 @@ impl TaskSlab {
         if idx >= self.tasks.len() {
             return None;
         }
-        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty) {
+        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Polling) {
             TaskSlot::Ready(fut) => Some(fut),
             other => {
                 // Put it back — was not Ready.
@@ -87,6 +96,10 @@ impl TaskSlab {
                 // Already ready — put it back.
                 self.tasks[idx] = TaskSlot::Ready(fut);
                 false // already queued
+            }
+            TaskSlot::Polling => {
+                self.tasks[idx] = TaskSlot::Polling;
+                false
             }
             TaskSlot::Empty => false,
         }
@@ -142,7 +155,7 @@ impl StandaloneTaskSlab {
         if idx >= self.tasks.len() {
             return None;
         }
-        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty) {
+        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Polling) {
             TaskSlot::Ready(fut) => Some(fut),
             other => {
                 self.tasks[idx] = other;
@@ -171,6 +184,10 @@ impl StandaloneTaskSlab {
             }
             TaskSlot::Ready(fut) => {
                 self.tasks[idx] = TaskSlot::Ready(fut);
+                false
+            }
+            TaskSlot::Polling => {
+                self.tasks[idx] = TaskSlot::Polling;
                 false
             }
             TaskSlot::Empty => false,
@@ -222,6 +239,45 @@ mod tests {
         }
     }
 
+    /// A completed standalone task must give its slot back. The slab is the
+    /// only bound on how many standalone tasks can ever be spawned, so one
+    /// slot lost per completion means a runtime that stops accepting spawns
+    /// for good, `standalone_task_capacity` spawns after it starts. Measured
+    /// in a server that spawns one task per buffer flush: of 4,866 flushes,
+    /// the first 4,095 spawned and the remaining 771 could not, every one of
+    /// them falling back to running inline on the event loop.
+    #[test]
+    fn completed_standalone_task_frees_its_slot() {
+        let mut slab = StandaloneTaskSlab::new(1);
+        for round in 0..10 {
+            let idx = slab
+                .spawn(Box::pin(async {}))
+                .unwrap_or_else(|| panic!("slab full on round {round}"));
+            // What the event loop does: take the future out, poll it to
+            // completion, then remove it.
+            let fut = slab.take_ready(idx).expect("ready after spawn");
+            drop(fut);
+            slab.remove(idx);
+            assert!(!slab.has_task(idx));
+        }
+    }
+
+    /// `remove` stays idempotent: a second call must not hand the same index
+    /// out twice, or two spawns collide on one slot and one future is lost.
+    #[test]
+    fn removing_twice_does_not_double_free() {
+        let mut slab = StandaloneTaskSlab::new(2);
+        let a = slab.spawn(Box::pin(async {})).unwrap();
+        let fut = slab.take_ready(a).unwrap();
+        drop(fut);
+        slab.remove(a);
+        slab.remove(a);
+        let x = slab.spawn(Box::pin(async {})).unwrap();
+        let y = slab.spawn(Box::pin(async {})).unwrap();
+        assert_ne!(x, y, "two spawns landed on the same slot");
+        assert!(slab.spawn(Box::pin(async {})).is_none(), "capacity is 2");
+    }
+
     #[test]
     fn spawn_and_take_ready() {
         let mut slab = TaskSlab::new(4);
@@ -234,7 +290,13 @@ mod tests {
         let fut = slab.take_ready(0);
         assert!(fut.is_some());
 
-        // After taking, slot is Empty.
+        // The future is out being polled, so the slot is not Ready and cannot
+        // be taken again -- but it is still occupied, and only `remove` frees
+        // it. A slot that read Empty here is what leaked standalone task
+        // indices, because `remove` cannot distinguish Empty from finished.
+        assert!(slab.take_ready(0).is_none());
+        assert!(slab.has_task(0));
+        slab.remove(0);
         assert!(!slab.has_task(0));
     }
 
@@ -293,6 +355,10 @@ mod tests {
         assert!(slab.has_task(idx));
         let fut = slab.take_ready(idx);
         assert!(fut.is_some());
+        // Out for polling: still occupied, not takeable, freed by `remove`.
+        assert!(slab.take_ready(idx).is_none());
+        assert!(slab.has_task(idx));
+        slab.remove(idx);
         assert!(!slab.has_task(idx));
     }
 
