@@ -116,6 +116,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: every event-loop iteration scanned all `max_connections` park
+  drain slots, whether or not any connection was parking. The early return
+  tested `park_drain.is_empty()` on a vector sized to `max_connections`,
+  which is never empty. At the default of 16,000 this was 37% of a client
+  worker's cycles at 64 connections and 100K req/s, and doubled cycles per
+  request at pipeline depth 1. The loop now returns on a count of pending
+  drains and stops after the last one. Introduced in #483; not in a
+  release. (#514)
+
 - io_uring: a TLS `send`, `send_nowait` or `send_parts` that ran out of
   send pool partway through encryption corrupted the connection. Slots were
   taken as records were sealed, so when the pool ran dry the records already

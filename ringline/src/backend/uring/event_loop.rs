@@ -2114,16 +2114,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// install to the cancel is what made 9,427 of 9,427 abandonments
     /// (`docs/journal/2026-09-two-phase-park.md`).
     fn drive_park_drains(&mut self) {
-        if self.driver.park_drain.is_empty() {
+        // `park_drain` is dense, so the count is the only cheap way to know
+        // there is nothing to do; it also ends the scan at the last drain.
+        let mut remaining = self.driver.park_drain_live;
+        if remaining == 0 {
             return;
         }
         for conn_index in 0..self.driver.park_drain.len() as u32 {
+            if remaining == 0 {
+                break;
+            }
             let Some(drain) = self.driver.park_drain[conn_index as usize] else {
                 continue;
             };
+            remaining -= 1;
             // A recycled slot must not inherit someone else's drain.
             if self.driver.connections.generation(conn_index) != drain.generation {
-                self.driver.park_drain[conn_index as usize] = None;
+                self.driver.set_park_drain(conn_index, None);
                 metrics::PARK_DIAG.increment(metrics::park_diag::DRAIN_STALE);
                 continue;
             }
@@ -2140,7 +2147,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     // Backpressure: keep the drain and retry next tick.
                     continue;
                 }
-                self.driver.park_drain[conn_index as usize] = None;
+                self.driver.set_park_drain(conn_index, None);
                 self.driver.park_in_flight[conn_index as usize] =
                     Some(crate::backend::uring::driver::ParkInFlight {
                         target: drain.target,
@@ -2165,11 +2172,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.abandon_park_drain(conn_index);
                 }
                 Some(left) => {
-                    self.driver.park_drain[conn_index as usize] =
+                    self.driver.set_park_drain(
+                        conn_index,
                         Some(crate::backend::uring::driver::ParkDrain {
                             ticks_left: left,
                             ..drain
-                        });
+                        }),
+                    );
                 }
             }
         }
@@ -2280,13 +2289,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     return false;
                 }
                 metrics::PARK_DIAG.increment(metrics::park_diag::CANCEL_SUBMITTED);
-                self.driver.park_drain[conn_index as usize] =
+                self.driver.set_park_drain(
+                    conn_index,
                     Some(crate::backend::uring::driver::ParkDrain {
                         target,
                         generation,
                         ticks_left: PARK_DRAIN_TICKS,
                         started: std::time::Instant::now(),
-                    });
+                    }),
+                );
             }
             None => {
                 // Nothing armed to cancel, so nothing can arrive: install now.
@@ -2334,7 +2345,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             return;
         }
-        self.driver.park_drain[conn_index as usize] = None;
+        self.driver.set_park_drain(conn_index, None);
         self.rearm_multishot_if_idle(conn_index);
     }
 
@@ -2378,7 +2389,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Clear without re-arming: the slot belongs to a different
             // connection now, and that occupant armed its own recv at accept.
             // Re-arming here would submit against the new generation.
-            self.driver.park_drain[conn_index as usize] = None;
+            self.driver.set_park_drain(conn_index, None);
             return; // `fd` drops, closing this reference.
         }
         // Quiesce can have broken across the round trip. Record *which* gate
@@ -2498,7 +2509,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.park_offered[conn_index as usize] = false;
         // Cleared, never re-armed here: on the handover path the fd has left
         // this worker, and on the adopt path the caller arms recv itself.
-        self.driver.park_drain[conn_index as usize] = None;
+        self.driver.set_park_drain(conn_index, None);
         self.driver.park_carry.remove(&conn_index);
         match adopt {
             Some(state) => {
@@ -4172,7 +4183,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.park_offered[conn_index as usize] = false;
         // Cleared, never re-armed here: on the handover path the fd has left
         // this worker, and on the adopt path the caller arms recv itself.
-        self.driver.park_drain[conn_index as usize] = None;
+        self.driver.set_park_drain(conn_index, None);
         self.driver.park_carry.remove(&conn_index);
 
         // TLS client path
@@ -5985,13 +5996,15 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         // As begin_park leaves it: recv cancelled, draining, nothing armed.
-        el.driver.park_drain[conn_index as usize] =
+        el.driver.set_park_drain(
+            conn_index,
             Some(crate::backend::uring::driver::ParkDrain {
                 target: 1,
                 generation: el.driver.connections.generation(conn_index),
                 ticks_left: PARK_DRAIN_TICKS,
                 started: std::time::Instant::now(),
-            });
+            }),
+        );
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = false;
         }
@@ -6017,7 +6030,7 @@ mod tests {
     fn abandoning_without_a_draining_park_changes_nothing() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
-        el.driver.park_drain[conn_index as usize] = None;
+        el.driver.set_park_drain(conn_index, None);
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
             cs.recv_multishot_armed = false;
         }
@@ -6031,6 +6044,70 @@ mod tests {
                 .is_some_and(|c| !c.recv_multishot_armed),
             "no park was draining, so nothing was owed"
         );
+    }
+
+    fn test_drain(generation: u32) -> Option<crate::backend::uring::driver::ParkDrain> {
+        Some(crate::backend::uring::driver::ParkDrain {
+            target: 1,
+            generation,
+            ticks_left: PARK_DRAIN_TICKS,
+            started: std::time::Instant::now(),
+        })
+    }
+
+    fn live_drains(el: &AsyncEventLoop<NoopHandler>) -> usize {
+        el.driver.park_drain.iter().filter(|d| d.is_some()).count()
+    }
+
+    /// `park_drain_live` is what lets `drive_park_drains` skip its scan of
+    /// every slot (#514), so it has to equal the number of drains outstanding
+    /// through set, replace, clear and close.
+    #[test]
+    fn park_drain_live_counts_outstanding_drains() {
+        let mut el = make_test_loop();
+        assert_eq!(el.driver.park_drain_live, 0);
+        let a = accept_connection(&mut el);
+        let b = accept_connection(&mut el);
+        let gen_a = el.driver.connections.generation(a);
+        let gen_b = el.driver.connections.generation(b);
+
+        el.driver.set_park_drain(a, test_drain(gen_a));
+        el.driver.set_park_drain(a, test_drain(gen_a));
+        assert_eq!(
+            el.driver.park_drain_live, 1,
+            "replacing a drain is not a new one"
+        );
+        el.driver.set_park_drain(b, test_drain(gen_b));
+        assert_eq!(el.driver.park_drain_live, 2);
+
+        el.driver.set_park_drain(a, None);
+        el.driver.set_park_drain(a, None);
+        assert_eq!(el.driver.park_drain_live, 1, "clearing twice counts once");
+        assert_eq!(el.driver.park_drain_live, live_drains(&el));
+
+        el.driver.close_connection(b);
+        assert_eq!(el.driver.park_drain_live, live_drains(&el));
+    }
+
+    /// With nothing draining, the per-tick drive must leave every slot alone;
+    /// with a drain left by a recycled slot, it must find and clear it and
+    /// bring the count back to zero.
+    #[test]
+    fn drive_park_drains_follows_the_live_count() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+
+        el.drive_park_drains();
+        assert_eq!(el.driver.park_drain_live, 0);
+        assert_eq!(live_drains(&el), 0);
+
+        let stale = el.driver.connections.generation(conn_index).wrapping_add(1);
+        el.driver.set_park_drain(conn_index, test_drain(stale));
+        assert_eq!(el.driver.park_drain_live, 1);
+
+        el.drive_park_drains();
+        assert!(el.driver.park_drain[conn_index as usize].is_none());
+        assert_eq!(el.driver.park_drain_live, 0);
     }
 
     /// Pool mode is the default and has no imbalance to repair. Park must be
