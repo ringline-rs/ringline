@@ -206,6 +206,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection, like a write error. Series PR 4 of #318 (design:
   `docs/copied-send-reservation-design.md`).
 
+## [0.6.8] - 2026-09-29
+
+### Fixed
+
+- io_uring: a segmented reader (`segments()`, `recv_owned_segment()`)
+  installed after data had arrived never saw that data: the bytes sat in
+  the accumulator, which a segmented reader does not look at, and the
+  reader parked forever. Entering the segmented domain now adopts them,
+  and a stranded-bytes check at the top of each segmented poll recovers
+  any left behind later (counted by the `segment_stranded_adopted` pool
+  metric).
+  Under TLS the handshake makes this race easy to lose; it is the
+  intermittent `tls_echo` hang (#423, fixed by #425 on main).
+
+- io_uring: `forward_to` skipped bytes that were already buffered when the
+  forward started. The length a forward needs comes from a header read with
+  `with_data`, so the body bytes that arrived with the header sat in the
+  accumulator (or pinned as the zero-copy buffer), where a forward never
+  reads: later bytes were forwarded as the body and the skipped ones
+  surfaced after it, or the forward hung if nothing more arrived. Those
+  bytes now open the forward, and the pinned buffer's bid goes back to the
+  ring instead of leaking. Found on main in #415.
+- io_uring: `forward_to` on a stale handle switched the slot's new
+  connection into forwarding, stranding its bytes. It is now ignored.
+- io_uring: five ways a forwarding connection could stop receiving for
+  good, all fixed on main in #415: the throttle flag was cleared while its
+  cancel was still in flight, so nothing re-armed the recv; a cancel that
+  landed on a later multishot left the connection unarmed; an ECANCELED
+  carrying `IORING_CQE_F_MORE` left it marked armed; the fallback recv could
+  run on a segmented connection, and a late one appended to the accumulator
+  a forward never reads; and a connection parked on a dry ring was only
+  re-armed on a pass that had just returned buffers.
+
 ## [0.6.7] - 2026-09-29
 
 ### Fixed
