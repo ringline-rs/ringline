@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-09-29
+
 ### Fixed
 
 - io_uring: a send that could not be pushed because the submission queue
