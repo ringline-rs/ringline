@@ -116,6 +116,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a TLS `send`, `send_nowait` or `send_parts` that ran out of
+  send pool partway through encryption corrupted the connection. Slots were
+  taken as records were sealed, so when the pool ran dry the records already
+  sealed had spent their sequence numbers with no ciphertext on the wire:
+  the call returned `Err`, the connection stayed open, and every later
+  record failed `bad_record_mac` at the peer. These sends are now admitted
+  against the same ciphertext bound `send_backpressured` uses, before
+  anything is encrypted: `Err` while the pool is short (retryable, nothing
+  committed) and `InvalidInput` for a message the whole pool could never
+  hold, as on the plaintext path. With the unbuffered engine and a
+  `send_copy_slot_size` too small to hold one whole record, no bound
+  exists; such sends are still attempted, and a shortfall found
+  mid-encryption now closes the connection instead of leaving it open to
+  send records the peer will reject.
+
 - Copied sends can no longer transmit a prefix and then fail. Pool slots for
   a multi-chunk copy send are reserved up front, so the send is admitted
   whole or not at all, and a submission queue that is still full after a

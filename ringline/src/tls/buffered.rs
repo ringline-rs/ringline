@@ -827,6 +827,25 @@ pub(crate) mod test_support {
         (server, client)
     }
 
+    /// Decrypt `ciphertext` at `to` and return the plaintext, or the error
+    /// rustls reported (a sequence gap is `bad_record_mac`).
+    pub(crate) fn decrypt_at(to: &mut BufferedKind, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let mut cursor = Cursor::new(ciphertext);
+        while (cursor.position() as usize) < ciphertext.len() {
+            if to.read_tls(&mut cursor).map_err(|e| e.to_string())? == 0 {
+                break;
+            }
+            to.process_new_packets().map_err(|e| e.to_string())?;
+        }
+        let mut out = Vec::new();
+        match to.reader().read_to_end(&mut out) {
+            Ok(_) => Ok(out),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(out),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     pub(crate) fn wrap_server(server: BufferedKind) -> TlsConn {
         TlsConn {
             conn: TlsConnKind::Buffered(server),

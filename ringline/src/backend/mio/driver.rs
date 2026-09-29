@@ -1185,7 +1185,7 @@ pub(crate) mod tests {
     fn handshaked_tls_conn() -> crate::tls::TlsConn {
         #[cfg(feature = "tls-unbuffered")]
         {
-            crate::tls::unbuffered::tests::handshaked_server()
+            crate::tls::unbuffered::tests::handshaked_pair().0
         }
         #[cfg(not(feature = "tls-unbuffered"))]
         {

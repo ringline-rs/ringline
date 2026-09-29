@@ -1764,9 +1764,8 @@ impl ConnCtx {
     ///
     /// Same error contract as `send()`: pool admission errors
     /// only (`Other` when the pool cannot admit the whole buffer,
-    /// `InvalidInput` when it never could), nothing committed on a plaintext
-    /// `Err`, TLS pool exhaustion not retryable, submission-queue pressure
-    /// absorbed by the queue. With no future to resolve, persistent
+    /// `InvalidInput` when it never could), nothing committed on `Err`,
+    /// submission-queue pressure absorbed by the queue. With no future to resolve, persistent
     /// submission-queue starvation surfaces only as the connection closing.
     ///
     /// For backpressure-aware sending, use `send()` instead.
@@ -2301,13 +2300,14 @@ impl ConnCtx {
     ///
     /// Returns `Err` if the send copy pool cannot admit the whole buffer
     /// (`Other`, retryable once in-flight sends complete) or if the buffer
-    /// is wider than the entire pool (`InvalidInput`). On a plaintext
-    /// connection nothing was queued or transmitted on `Err`, so the same
-    /// buffer may be sent again later. On a TLS connection pool exhaustion
-    /// during encryption is not retryable: the record sequence has already
-    /// advanced, so close the connection instead (a pre-encryption admission
-    /// check is planned; see `docs/backpressured-sends-series-design.md`,
-    /// PR 8). Submission-queue pressure is not an error: the send is queued
+    /// is wider than the entire pool (`InvalidInput`). Nothing was queued or
+    /// transmitted on `Err`, so the same buffer may be sent again later. On a
+    /// TLS connection the pool is checked against the *ciphertext* bound
+    /// before anything is encrypted, which is what keeps that true there.
+    /// The one exception is the unbuffered TLS engine with a
+    /// `send_copy_slot_size` too small to hold one whole record, where no
+    /// bound exists: a shortfall found mid-encryption closes the connection
+    /// and returns `Err`. Submission-queue pressure is not an error: the send is queued
     /// and retried. Persistent submission-queue starvation is reported like
     /// a write error: the awaited `SendFuture` resolves `Err` and the
     /// connection is closed.

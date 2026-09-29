@@ -367,6 +367,85 @@ impl<'a> DriverCtx<'a> {
         tls_table.get_info(conn.index)
     }
 
+    /// Encrypt a plain (not bounded) TLS send into pool-backed sends, admitting
+    /// it against the ciphertext bound first.
+    ///
+    /// The admission is the point. `encrypt_to_sends` allocates as it seals
+    /// records, so running out of pool partway left the sealed records'
+    /// sequence numbers spent with no ciphertext on the wire, and every later
+    /// record failed `bad_record_mac` at the peer. Checking the bound
+    /// `send_backpressured` uses (`TlsTable::ciphertext_capacity`) before
+    /// rustls mutates turns that into the same refusal the plaintext path
+    /// gives: `Other` while the pool is short, `InvalidInput` when it never
+    /// could hold the message, nothing committed either way. A plain capacity
+    /// check is enough for the reason `send_bounded` gives: the worker is
+    /// single-threaded and nothing allocates between the check and the call.
+    ///
+    /// Where no bound is expressible (the unbuffered engine with a slot too
+    /// small for one whole record) the send is attempted without one, as
+    /// before — refusing would break deployments running such slots, and the
+    /// bounded path already refuses them itself. If encryption fails after
+    /// rustls has sealed anything, the connection is closed: by departure 1 a
+    /// record gap is fatal, and leaving the connection open only lets it emit
+    /// records the peer will reject.
+    ///
+    /// The caller has checked that `conn` is current and has TLS state.
+    fn encrypt_tls_send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<Vec<BuiltSend>> {
+        let slot_size = self.send_copy_pool.slot_size() as usize;
+        // SAFETY: same single-threaded borrow-splitting contract as every
+        // other `tls_table` use in this module; no other reference to the
+        // table is live across this function.
+        let tls_table = unsafe { &mut *self.tls_table };
+        let needed = tls_table
+            .ciphertext_capacity(conn.index, data.len())
+            .and_then(|bound| bound.slots(slot_size));
+        if let Some(needed) = needed {
+            let capacity = self.send_copy_pool.slot_count();
+            if needed > capacity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "a TLS send of {} bytes needs up to {needed} send-pool slots of \
+                         ciphertext but the pool has {capacity} (raise Config::send_pool)",
+                        data.len()
+                    ),
+                ));
+            }
+            if self.send_copy_pool.free_count() < needed {
+                crate::metrics::POOL.increment(crate::metrics::pool::SEND_EXHAUSTED);
+                return Err(io::Error::other("send copy pool exhausted"));
+            }
+        }
+        let free_before = self.send_copy_pool.free_count();
+        match crate::tls::encrypt_to_sends(
+            tls_table,
+            self.send_copy_pool,
+            conn.index,
+            conn.generation,
+            data,
+        ) {
+            Ok(sends) => {
+                // The same tripwire as `send_bounded`: a bound that was beaten
+                // is a bound that will one day close a connection it admitted.
+                if let Some(needed) = needed {
+                    debug_assert!(
+                        free_before.saturating_sub(self.send_copy_pool.free_count()) <= needed,
+                        "TLS ciphertext bound beaten: admitted against {needed} slots, \
+                         encryption took {}",
+                        free_before.saturating_sub(self.send_copy_pool.free_count()),
+                    );
+                }
+                Ok(sends)
+            }
+            Err(e) => {
+                // `encrypt_to_sends` released every slot it took, but any
+                // record it sealed first spent a sequence number.
+                self.close(conn);
+                Err(e)
+            }
+        }
+    }
+
     /// Regular (copying) send — copies data into library-owned pool before SQE submission.
     ///
     /// Data larger than one send-pool slot is split across slots and queued
@@ -375,10 +454,10 @@ impl<'a> DriverCtx<'a> {
     /// transmitted and the same buffer may be sent again later. A send wider
     /// than the whole pool is refused with `InvalidInput`. Submission-queue
     /// pressure is absorbed by the per-connection queue and is not an error
-    /// here. The TLS branch below is the exception: `encrypt_to_sends`
-    /// advances rustls before the pool refuses, so its `Err` is not
-    /// retryable (series PR 8). The user-facing contract lives on
-    /// `ConnCtx::send`.
+    /// here. The TLS branch admits against the ciphertext bound before
+    /// rustls mutates, so the same holds there (see `encrypt_tls_send`,
+    /// which also names the one case that stays fatal). The user-facing
+    /// contract lives on `ConnCtx::send`.
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
         let conn_state = self
             .connections
@@ -404,13 +483,7 @@ impl<'a> DriverCtx<'a> {
         if !self.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.tls_table };
             if tls_table.get_mut(conn.index).is_some() {
-                let sends = crate::tls::encrypt_to_sends(
-                    tls_table,
-                    self.send_copy_pool,
-                    conn.index,
-                    conn.generation,
-                    data,
-                )?;
+                let sends = self.encrypt_tls_send(conn, data)?;
                 // Route every ciphertext chunk through the per-connection
                 // send queue: io_uring doesn't order independent SQEs, and
                 // a partial-send resubmit would interleave chunks on the
@@ -3525,7 +3598,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         if !self.ctx.tls_table.is_null() {
             let tls_table = unsafe { &mut *self.ctx.tls_table };
             if tls_table.get_mut(self.conn.index).is_some() {
-                return self.submit_tls(tls_table);
+                return self.submit_tls();
             }
         }
 
@@ -3549,7 +3622,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     }
 
     /// TLS fallback: gather all data into a contiguous buffer, encrypt, copy-send.
-    fn submit_tls(mut self, tls_table: &mut crate::tls::TlsTable) -> io::Result<()> {
+    fn submit_tls(mut self) -> io::Result<()> {
         let mut plaintext = Vec::with_capacity(self.total_len as usize);
         for i in 0..self.part_count as usize {
             match self.parts[i] {
@@ -3572,13 +3645,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
         for g in self.guards.iter_mut() {
             *g = None;
         }
-        let sends = crate::tls::encrypt_to_sends(
-            tls_table,
-            self.ctx.send_copy_pool,
-            self.conn.index,
-            self.conn.generation,
-            &plaintext,
-        )?;
+        let sends = self.ctx.encrypt_tls_send(self.conn, &plaintext)?;
         self.ctx.queue_built_sends(self.conn.index, sends);
         Ok(())
     }

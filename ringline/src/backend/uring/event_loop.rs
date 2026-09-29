@@ -14351,22 +14351,271 @@ mod tests {
     /// deliberately does not create one (the table has no server config), so
     /// this is the only TLS a bounded-send test sees.
     fn install_handshaked_tls(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
+        let _peer = install_handshaked_tls_with_peer(el, conn_index);
+    }
+
+    /// The client end of a connection installed by
+    /// [`install_handshaked_tls_with_peer`], able to decrypt what the server
+    /// end sends.
+    struct TlsTestPeer {
+        #[cfg(feature = "tls-unbuffered")]
+        conn: crate::tls::TlsConn,
+        #[cfg(not(feature = "tls-unbuffered"))]
+        conn: crate::tls::buffered::BufferedKind,
+    }
+
+    impl TlsTestPeer {
+        /// The plaintext `ciphertext` carries, or the record layer's error. A
+        /// record sealed and then dropped leaves a sequence gap, which the
+        /// next record reports as `bad_record_mac`.
+        fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+            #[cfg(feature = "tls-unbuffered")]
+            return crate::tls::unbuffered::tests::decrypt_at(&mut self.conn, ciphertext);
+            #[cfg(not(feature = "tls-unbuffered"))]
+            return crate::tls::buffered::test_support::decrypt_at(&mut self.conn, ciphertext);
+        }
+    }
+
+    /// As [`install_handshaked_tls`], keeping the client end.
+    fn install_handshaked_tls_with_peer(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+    ) -> TlsTestPeer {
         let max = el.driver.connections.max_slots();
         let mut table = crate::tls::TlsTable::with_listener_configs(max, None, None, Vec::new());
         #[cfg(feature = "tls-unbuffered")]
-        table.insert_for_test(
-            conn_index,
-            crate::tls::unbuffered::tests::handshaked_server(),
-        );
+        let peer = {
+            let (server, client) = crate::tls::unbuffered::tests::handshaked_pair();
+            table.insert_for_test(conn_index, server);
+            TlsTestPeer { conn: client }
+        };
         #[cfg(not(feature = "tls-unbuffered"))]
-        {
-            let (server, _peer) = crate::tls::buffered::test_support::handshaked();
+        let peer = {
+            let (server, client) = crate::tls::buffered::test_support::handshaked();
             table.insert_for_test(
                 conn_index,
                 crate::tls::buffered::test_support::wrap_server(server),
             );
-        }
+            TlsTestPeer { conn: client }
+        };
         el.driver.tls_table = Some(table);
+        peer
+    }
+
+    /// Run `conn_index`'s queued sends through the real ring until it is idle,
+    /// then return everything that reached `peer`.
+    fn flush_sends_to_peer(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+        peer: &std::os::fd::OwnedFd,
+    ) -> Vec<u8> {
+        for _ in 0..64 {
+            if !el.driver.send_queues[conn_index as usize].in_flight {
+                break;
+            }
+            el.driver
+                .ring
+                .submit_and_wait(1)
+                .expect("submit_and_wait failed");
+            el.drain_completions();
+        }
+        assert!(
+            !el.driver.send_queues[conn_index as usize].in_flight,
+            "sends did not drain"
+        );
+        let mut wire = Vec::new();
+        let mut buf = [0u8; 65536];
+        while let Some(n) = try_recv(peer, &mut buf) {
+            if n == 0 {
+                break;
+            }
+            wire.extend_from_slice(&buf[..n]);
+        }
+        wire
+    }
+
+    /// Take free send-pool slots until only `leave` remain; hand them back
+    /// with [`release_slots`].
+    fn hold_all_but(el: &mut AsyncEventLoop<NoopHandler>, leave: usize) -> Vec<u16> {
+        let mut held = Vec::new();
+        while el.driver.send_copy_pool.free_count() > leave {
+            let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+            held.push(slot);
+        }
+        held
+    }
+
+    fn release_slots(el: &mut AsyncEventLoop<NoopHandler>, held: Vec<u16>) {
+        for slot in held {
+            el.driver.send_copy_pool.release(slot);
+        }
+    }
+
+    /// A plain TLS send that the pool cannot cover must be refused *before*
+    /// rustls seals a record. Encrypting first and running out partway left
+    /// the sealed records' sequence numbers spent with no ciphertext on the
+    /// wire, so every later record failed `bad_record_mac` at the peer —
+    /// and the connection was left open to send them.
+    ///
+    /// One free slot holds the first record of a two-record send, which is
+    /// exactly where the old path ran dry.
+    #[test]
+    fn plain_tls_send_refuses_before_encrypting_when_the_pool_is_short() {
+        let mut el = tls_bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (_ours, peer_fd) = attach_socketpair(&mut el, conn_index);
+        let mut peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+
+        let held = hold_all_but(&mut el, 1);
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, &[b'z'; 16448])
+                .expect_err("one free slot cannot cover a two-record send")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err}");
+        assert_eq!(el.driver.send_copy_pool.free_count(), 1);
+        assert!(
+            !el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .close_requested(),
+            "a pre-encryption refusal is backpressure, not a dead connection"
+        );
+
+        // The refusal spent no sequence number: once the pool frees up, the
+        // next record decrypts.
+        release_slots(&mut el, held);
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, b"hello").expect("the pool has room now");
+        }
+        let wire = flush_sends_to_peer(&mut el, conn_index, &peer_fd);
+        assert_eq!(peer.decrypt(&wire).as_deref(), Ok(&b"hello"[..]));
+    }
+
+    /// A plain TLS send wider than the whole pool can never be admitted. It
+    /// used to be discovered mid-encryption, after rustls had sealed records
+    /// for it; now it is refused up front with `InvalidInput`, like the
+    /// plaintext path, and the connection carries on.
+    #[test]
+    fn plain_tls_send_wider_than_the_pool_is_refused_up_front() {
+        let mut el = tls_bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (_ours, peer_fd) = attach_socketpair(&mut el, conn_index);
+        let mut peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+
+        // Nine records into an eight-slot pool.
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, &vec![b'z'; 9 * 16384])
+                .expect_err("nine records cannot fit eight slots")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(el.driver.send_copy_pool.free_count(), 8);
+
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, b"hello").expect("a small send still fits");
+        }
+        let wire = flush_sends_to_peer(&mut el, conn_index, &peer_fd);
+        assert_eq!(peer.decrypt(&wire).as_deref(), Ok(&b"hello"[..]));
+    }
+
+    /// `send_parts` on a TLS connection gathers and encrypts through the same
+    /// path, so it gets the same pre-encryption refusal.
+    #[test]
+    fn tls_send_parts_refuses_before_encrypting_when_the_pool_is_short() {
+        let mut el = tls_bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (_ours, peer_fd) = attach_socketpair(&mut el, conn_index);
+        let mut peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+
+        let held = hold_all_but(&mut el, 1);
+        let big = [b'z'; 16448];
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_parts(token)
+                .copy(&big[..8000])
+                .copy(&big[8000..])
+                .submit()
+                .expect_err("one free slot cannot cover a two-record send")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err}");
+        assert!(
+            !el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .close_requested()
+        );
+
+        release_slots(&mut el, held);
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, b"hello").expect("the pool has room now");
+        }
+        let wire = flush_sends_to_peer(&mut el, conn_index, &peer_fd);
+        assert_eq!(peer.decrypt(&wire).as_deref(), Ok(&b"hello"[..]));
+    }
+
+    /// Where no bound can be expressed — the unbuffered engine with a slot too
+    /// small to hold one whole record — a plain send is still attempted, as it
+    /// was (refusing would break deployments running such slots). If the pool
+    /// then runs dry mid-encryption the records already sealed have spent
+    /// their sequence numbers, so the connection is closed rather than left
+    /// open to emit records the peer will reject.
+    #[cfg(feature = "tls-unbuffered")]
+    #[test]
+    fn plain_tls_send_that_fails_mid_encryption_closes_the_connection() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 4096)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (_ours, _peer_fd) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        assert_eq!(
+            el.driver
+                .tls_table
+                .as_ref()
+                .unwrap()
+                .ciphertext_capacity(conn_index, 16384)
+                .unwrap()
+                .slots(4096),
+            None,
+            "the premise: this slot size has no expressible bound"
+        );
+
+        let held = hold_all_but(&mut el, 1);
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, &[b'z'; 16384])
+        };
+        assert!(result.is_err(), "one 4 KiB slot cannot hold 16 KiB");
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            conn.is_none() || conn.unwrap().close_requested(),
+            "records were sealed and dropped, so the connection must close"
+        );
+        // The close queues a close_notify, and it can only have got a slot if
+        // the failed encryption gave back the one it took.
+        assert_eq!(el.driver.send_copy_pool.free_count(), 0);
+        assert!(
+            el.driver.send_queues[conn_index as usize].in_flight,
+            "the close_notify is on its way, in the slot the encryption returned"
+        );
+        release_slots(&mut el, held);
     }
 
     /// Departure 1, end to end on the path the series was built for: a

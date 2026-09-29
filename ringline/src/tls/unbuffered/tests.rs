@@ -106,10 +106,11 @@ fn conn_pair_with_fragment(max_fragment_size: Option<usize>) -> (TlsConn, TlsCon
     )
 }
 
-/// An already-handshaked unbuffered **server** connection, for tests outside
-/// this module that need real records from the engine this build compiled in.
-/// The buffered twin is `tls::buffered::test_support::handshaked`.
-pub(crate) fn handshaked_server() -> TlsConn {
+/// An already-handshaked unbuffered `(server, client)` pair, for tests
+/// outside this module that need real records from the engine this build
+/// compiled in, and a peer able to decrypt them. The buffered twin is
+/// `tls::buffered::test_support::handshaked`.
+pub(crate) fn handshaked_pair() -> (TlsConn, TlsConn) {
     let (mut server, mut client) = conn_pair();
     let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
     handshake(&mut server, &mut client, &mut accs);
@@ -117,7 +118,19 @@ pub(crate) fn handshaked_server() -> TlsConn {
         !server.conn.is_handshaking(),
         "in-memory unbuffered handshake did not complete"
     );
-    server
+    (server, client)
+}
+
+/// Decrypt `ciphertext` at `to` and return the plaintext, or the error the
+/// record layer reported (a sequence gap is `bad_record_mac`).
+pub(crate) fn decrypt_at(to: &mut TlsConn, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    let mut accs = AccumulatorTable::new(2, 4 * 1024 * 1024);
+    let mut out = Vec::new();
+    let mut sink = PlaintextSink::Accumulator(&mut accs);
+    match feed(to, Some(&mut sink), &mut out, ciphertext, 0) {
+        DriveOutcome::Error(e) => Err(e.to_string()),
+        _ => Ok(accs.data(0).to_vec()),
+    }
 }
 
 /// PR 8's unbuffered slot bound is `slots = records`, which is only an upper
