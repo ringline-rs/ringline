@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   iteration; after two failed retries the waiter fails and the connection
   closes (#376, parking half).
 
+- io_uring: `ConnCtx::forward_held` pushed its recv-forward `sendmsg` straight
+  to the ring without looking at the connection's send state, so echoed bytes
+  could overtake a plain send that was queued, in flight or parked for retry,
+  or an active send chain. **Behaviour change:** it now returns `WouldBlock`
+  while any earlier send is outstanding, before allocating anything; the held
+  buffers stay in the hold and the next call forwards them. Await the earlier
+  send first. A handler that only forwards, awaiting each forward before the
+  next, is unaffected.
+
 - io_uring: plain sends and IO_LINK send chains could overtake each other on
   one connection, putting bytes on the wire out of order; parking widened the
   window. A plain send now queues behind an active chain. **Behaviour
