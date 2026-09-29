@@ -3203,10 +3203,10 @@ impl Driver {
                                 }
                             }
                         } else {
-                            // Only expect a ZC notification when result > 0.
-                            // On error/zero, no notification arrives — incrementing
-                            // would permanently leak the slab entry.
-                            if result > 0 {
+                            // A notification follows exactly when the main CQE
+                            // carries IORING_CQE_F_MORE, error and zero results
+                            // included (#487).
+                            if cqueue::more(flags) {
                                 self.send_slab.inc_pending_notifs(slab_idx);
                             }
                             self.send_slab.mark_awaiting_notifications(slab_idx);

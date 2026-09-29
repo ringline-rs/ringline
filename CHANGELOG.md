@@ -101,6 +101,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `SendMsgZc` send that completed with an error or a zero result released
+  its send-slab entry at once, but the kernel still posts a notification for
+  it: `IORING_CQE_F_MORE` is set on error (`io_sendrecv_fail`) and on a zero
+  result (`io_sendmsg_zc`). If the next send reused the entry first, the late
+  notification decremented the new send's count -- a "notification underflow"
+  panic in debug, and in release an entry that wraps or is released while the
+  kernel may still hold the new send's pages. Notifications are now expected
+  exactly when the main CQE carries `IORING_CQE_F_MORE` (#487).
+
 - Copied sends can no longer transmit a prefix and then fail. Pool slots for
   a multi-chunk copy send are reserved up front, so the send is admitted
   whole or not at all, and a submission queue that is still full after a
