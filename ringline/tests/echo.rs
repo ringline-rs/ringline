@@ -3667,6 +3667,197 @@ fn async_send_pool_exhaustion() {
     );
 }
 
+// ── Multi-slot send retry after pool pressure ──────────────────────
+
+const MULTI_SLOT_FILLER_LEN: usize = 1024;
+const MULTI_SLOT_FILLERS: usize = 3;
+const MULTI_SLOT_PAYLOAD_LEN: usize = 3000;
+const MULTI_SLOT_MAX_ATTEMPTS: u32 = 500;
+
+/// How many `send_nowait` attempts `RetryAfterPoolPressure` needed for its
+/// 3000-byte response, and the final outcome (`Err` if the fillers were
+/// refused or the retry budget ran out).
+static MULTI_SLOT_RETRY_ATTEMPTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+static MULTI_SLOT_RETRY_RESULT: std::sync::OnceLock<Result<(), String>> =
+    std::sync::OnceLock::new();
+
+/// With `send_pool(4, 1024)`: on the client's first byte, take three of the
+/// four slots with 1024-byte fillers, then send a 3000-byte response that
+/// needs three slots while only one is free. On io_uring the first attempt
+/// is refused; the handler sleeps a tick (the fillers' CQEs release their
+/// slots) and resends the same buffer. On mio sends are `Vec`-backed and
+/// the first attempt succeeds.
+struct RetryAfterPoolPressure;
+
+impl AsyncEventHandler for RetryAfterPoolPressure {
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+
+            let filler = [0xCDu8; MULTI_SLOT_FILLER_LEN];
+            for _ in 0..MULTI_SLOT_FILLERS {
+                if let Err(e) = conn.send_nowait(&filler) {
+                    MULTI_SLOT_RETRY_ATTEMPTS.set(0).ok();
+                    MULTI_SLOT_RETRY_RESULT
+                        .set(Err(format!("one-slot filler send refused: {e}")))
+                        .ok();
+                    return;
+                }
+            }
+
+            let payload = [0xABu8; MULTI_SLOT_PAYLOAD_LEN];
+            let mut attempts = 0u32;
+            let mut result: Result<(), String> = Err("retry budget exhausted".into());
+            while attempts < MULTI_SLOT_MAX_ATTEMPTS {
+                attempts += 1;
+                match conn.send_nowait(&payload) {
+                    Ok(()) => {
+                        result = Ok(());
+                        break;
+                    }
+                    Err(e) => {
+                        // The contract under test: on `Err` nothing was
+                        // queued, so waiting for in-flight sends to complete
+                        // and resending the *same* buffer is safe.
+                        result = Err(format!("attempt {attempts}: {e}"));
+                        ringline::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            }
+            MULTI_SLOT_RETRY_ATTEMPTS.set(attempts).ok();
+            MULTI_SLOT_RETRY_RESULT.set(result).ok();
+
+            // Keep the connection open until the client hangs up, so its
+            // "no extra bytes" read sees a timeout rather than a FIN.
+            loop {
+                let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        RetryAfterPoolPressure
+    }
+}
+
+/// A multi-slot copied send refused for pool pressure must have committed
+/// nothing, so resending the same buffer delivers it exactly once.
+///
+/// Why this could fail before the reservation (io_uring): the old
+/// `DriverCtx::send` copied chunk by chunk, so with one free slot the first
+/// attempt at the 3000-byte send queued its first 1024 bytes and then
+/// returned `Err` on the second chunk. The retry then delivered all 3000, so
+/// the client saw 3072 `0xCD` + 1024 `0xAB` + 3000 `0xAB`: the byte-pattern
+/// checks below would pass, and the exactly-once check (nothing after the
+/// expected total) would fail with 1024 surplus bytes. On mio the first
+/// attempt succeeds and the test pins the contract without exercising it.
+#[test]
+fn multi_slot_send_retry_after_pool_pressure_delivers_exactly_once() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = test_config_builder()
+        .send_pool(4, MULTI_SLOT_FILLER_LEN as u32)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind(addr.parse().unwrap())
+        .launch::<RetryAfterPoolPressure>()
+        .expect("launch failed");
+
+    let mut stream = connect_with_retry(&addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    stream.write_all(b"g").unwrap();
+    stream.flush().unwrap();
+
+    let expected = MULTI_SLOT_FILLERS * MULTI_SLOT_FILLER_LEN + MULTI_SLOT_PAYLOAD_LEN;
+    let mut received = Vec::with_capacity(expected + 4096);
+    let mut buf = [0u8; 4096];
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while received.len() < expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out with {} of {expected} bytes",
+            received.len()
+        );
+        match stream.read(&mut buf) {
+            Ok(0) => panic!("server closed after {} of {expected} bytes", received.len()),
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => panic!("read failed after {} bytes: {e}", received.len()),
+        }
+    }
+    // A single read can overshoot `expected` only if more than one copy of
+    // the response was sent.
+    assert_eq!(
+        received.len(),
+        expected,
+        "more than one copy of the response arrived"
+    );
+    let fillers_len = MULTI_SLOT_FILLERS * MULTI_SLOT_FILLER_LEN;
+    assert!(
+        received[..fillers_len].iter().all(|&b| b == 0xCD),
+        "filler bytes corrupted"
+    );
+    assert!(
+        received[fillers_len..].iter().all(|&b| b == 0xAB),
+        "response bytes corrupted"
+    );
+
+    // Exactly once: nothing else may follow the response.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    match stream.read(&mut buf) {
+        Ok(0) => {}
+        Ok(n) => {
+            panic!("{n} surplus bytes after the response: the refused send had committed a prefix")
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) => {}
+        Err(e) => panic!("unexpected read error after the response: {e}"),
+    }
+
+    let result = MULTI_SLOT_RETRY_RESULT
+        .get()
+        .expect("handler did not record a result");
+    assert_eq!(result, &Ok(()), "response send did not succeed");
+    let attempts = *MULTI_SLOT_RETRY_ATTEMPTS
+        .get()
+        .expect("handler did not record attempts");
+    assert!(attempts >= 1);
+    // On io_uring the pool really was three slots short at the first
+    // attempt, so the retry path must have been exercised; on mio the
+    // first attempt succeeds (Vec-backed sends, no pool admission).
+    #[cfg(has_io_uring)]
+    assert!(
+        attempts > 1,
+        "expected the first attempt to be refused for pool pressure, got {attempts} attempt(s)"
+    );
+
+    drop(stream);
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
 // ── Scatter-gather send_parts test ──────────────────────────────────
 
 #[cfg(has_io_uring)]
@@ -5260,4 +5451,17 @@ fn connection_task_panic_does_not_kill_worker() {
         // The worker should exit cleanly; the panic was caught.
         let _ = h.join();
     }
+}
+
+/// Connect to a test server that may not be listening yet (from main).
+fn connect_with_retry(addr: &str) -> TcpStream {
+    (0..200)
+        .find_map(|_| match TcpStream::connect(addr) {
+            Ok(stream) => Some(stream),
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(10));
+                None
+            }
+        })
+        .expect("server did not accept connection")
 }

@@ -4806,6 +4806,137 @@ mod tests {
 
     // ── ZC send path tests ─────────────────────────────────────────
 
+    /// A copied send wider than the free part of the pool must be refused
+    /// before anything is copied or queued. Before the up-front reservation,
+    /// the chunks that fit were queued (or pushed to the ring) and the caller
+    /// got `Err` for the tail, so a retry duplicated the prefix on the wire.
+    #[test]
+    fn send_wider_than_free_slots_commits_nothing() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(4, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+
+        // Hold three of the four slots so only one is free.
+        let (_f1, _, _) = el.driver.send_copy_pool.copy_in(b"a").unwrap();
+        let (_f2, _, _) = el.driver.send_copy_pool.copy_in(b"b").unwrap();
+        let (_f3, _, _) = el.driver.send_copy_pool.copy_in(b"c").unwrap();
+        assert_eq!(el.driver.send_copy_pool.free_count(), 1);
+
+        // 100 bytes over 64-byte slots needs 2 slots; only 1 is free.
+        let data = [0u8; 100];
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, &data)
+        };
+        let err = result.expect_err("send needing 2 slots with 1 free must fail");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+
+        // Nothing was taken from the pool and nothing was queued or pushed.
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            1,
+            "a refused send must not consume pool slots"
+        );
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.queue.is_empty(), "a refused send must queue nothing");
+        assert!(!state.in_flight, "a refused send must not push an SQE");
+    }
+
+    /// A send that needs more slots than the whole pool holds can never
+    /// succeed, so it is refused up front with `InvalidInput` instead of
+    /// committing the first `slot_count` chunks and failing on the rest.
+    #[test]
+    fn send_wider_than_the_pool_is_invalid_input() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(4, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        assert_eq!(el.driver.send_copy_pool.free_count(), 4);
+
+        // 300 bytes over 64-byte slots needs 5 slots; the pool has 4.
+        let data = [0u8; 300];
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, &data)
+        };
+        let err = result.expect_err("send wider than the pool must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            4,
+            "a refused send must not consume pool slots"
+        );
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.queue.is_empty(), "a refused send must queue nothing");
+        assert!(!state.in_flight, "a refused send must not push an SQE");
+    }
+
+    /// Guards the streaming rewrite: a multi-slot send that is admitted still
+    /// queues one entry per chunk, in order, with only the last chunk marked
+    /// end-of-send (so the waiter is woken once with the full count).
+    #[test]
+    fn multi_chunk_send_still_queues_all_chunks_in_order() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(6, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+
+        // Pool of 6, one slot held, a 4-slot send: the final free count then
+        // tells "reservation consumed" (1 free) from "reservation still
+        // outstanding" (0 free).
+        let (_held, _, _) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+        assert_eq!(el.driver.send_copy_pool.free_count(), 5);
+
+        // With a send already in flight, every chunk is queued rather than
+        // pushed to the ring, so the whole logical send is inspectable.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        // 200 bytes over 64-byte slots: 64 + 64 + 64 + 8 = 4 chunks.
+        let data = [0u8; 200];
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, &data)
+        };
+        result.expect("a send that fits the free pool must be admitted");
+
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert_eq!(state.queue.len(), 4, "one queued entry per chunk");
+        let end_flags: Vec<bool> = state
+            .queue
+            .iter()
+            .map(|b| el.driver.send_copy_pool.is_end_of_send(b.pool_slot))
+            .collect();
+        assert_eq!(
+            end_flags,
+            vec![false, false, false, true],
+            "only the final chunk is end-of-send"
+        );
+        let lens: Vec<u32> = state.queue.iter().map(|b| b.total_len).collect();
+        assert_eq!(lens, vec![64, 64, 64, 8], "chunks queued in order");
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            1,
+            "every reserved slot was filled and the reservation fully consumed"
+        );
+    }
+
     #[test]
     fn handle_send_msg_zc_notif_releases_slab() {
         let mut el = make_test_loop();

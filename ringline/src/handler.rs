@@ -228,11 +228,11 @@ impl<'a> DriverCtx<'a> {
 
     /// Regular (copying) send — copies data into library-owned pool before SQE submission.
     ///
-    /// Data larger than one send-pool slot is queued as multiple chunks. If
-    /// a chunk fails mid-loop (pool exhausted), the chunks queued before it
-    /// are already committed to the wire and `Err` is returned — retrying
-    /// the whole buffer would duplicate that prefix. Treat a mid-buffer
-    /// error as fatal for the connection (close it) rather than retrying.
+    /// Data larger than one send-pool slot is queued as multiple chunks. Every
+    /// slot the buffer needs is reserved before the first byte is copied, so
+    /// the send is admitted whole or not at all: on `Err` nothing was sent and
+    /// retrying the whole buffer is safe. A buffer needing more slots than the
+    /// pool holds is `InvalidInput`.
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
         let conn_state = self
             .connections
@@ -265,6 +265,29 @@ impl<'a> DriverCtx<'a> {
 
         let slot_size = self.send_copy_pool.slot_size() as usize;
 
+        // Reserve every slot the buffer needs before copying the first byte.
+        // Without this, pool exhaustion on chunk k left chunks 1..k-1 queued
+        // (or on the wire) behind an `Err`, and a retry duplicated the prefix.
+        // The reservation is a count, not popped slots, so a refusal has no
+        // side effects (see `SendCopyPool::reserve_slots`).
+        let needed = data.len().div_ceil(slot_size);
+        let mut reservation = match self.send_copy_pool.reserve_slots(needed) {
+            Ok(r) => r,
+            Err(crate::buffer::send_copy::ReserveError::Exhausted) => {
+                return Err(io::Error::other("send copy pool exhausted"));
+            }
+            Err(crate::buffer::send_copy::ReserveError::TooLarge { needed, capacity }) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "send of {} bytes needs {needed} send-pool slots but the pool has \
+                         {capacity} (raise Config::send_pool)",
+                        data.len()
+                    ),
+                ));
+            }
+        };
+
         // Chunk data that exceeds the send copy slot size. Each chunk gets its
         // own pool slot and SQE; the per-connection send queue ensures they are
         // transmitted in order. Only the final chunk is marked end-of-send, so
@@ -275,8 +298,7 @@ impl<'a> DriverCtx<'a> {
         while let Some(chunk) = chunks.next() {
             let (slot, ptr, len) = self
                 .send_copy_pool
-                .copy_in(chunk)
-                .ok_or_else(|| io::Error::other("send copy pool exhausted"))?;
+                .copy_in_reserved(&mut reservation, chunk);
             self.send_copy_pool
                 .set_end_of_send(slot, chunks.peek().is_none());
 
@@ -297,9 +319,19 @@ impl<'a> DriverCtx<'a> {
                 total_len: chunk.len() as u32,
             };
 
-            self.submit_or_queue(conn.index, built)?;
+            // Only the first chunk can fail here: it is pushed to the ring
+            // only when nothing is in flight, and once it is, every later
+            // chunk queues behind it (which cannot fail). A full SQ on that
+            // first push has therefore sent nothing, and the chunk's own slot
+            // is already released; hand back the rest of the reservation.
+            if let Err(e) = self.submit_or_queue(conn.index, built) {
+                self.send_copy_pool.release_reservation(reservation);
+                return Err(e);
+            }
         }
 
+        // Every promised slot was filled; this returns a zero remainder.
+        self.send_copy_pool.release_reservation(reservation);
         Ok(())
     }
 

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a copied send larger than one send-pool slot could transmit a
+  prefix and then fail. Each chunk took its slot inside the send loop, so
+  when the pool ran out at chunk k, chunks 1..k-1 were already queued or on
+  the wire and the caller got `Err`; a retry sent that prefix twice. Every
+  slot is now reserved before the first byte is copied, so the send is
+  admitted whole or not at all, and a send needing more slots than the pool
+  holds is `InvalidInput` (#376, the reservation half only; its SQ-pressure
+  parking is a separate change).
+
 - io_uring: a multishot recv completion carried no connection generation, so
   one for a closed connection could be attributed to the next connection to
   reuse its slot. A late error tore the new connection down for an error it
