@@ -206,6 +206,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection, like a write error. Series PR 4 of #318 (design:
   `docs/copied-send-reservation-design.md`).
 
+## [0.6.7] - 2026-09-29
+
+### Fixed
+
+- io_uring: a TLS `send`, `send_nowait` or `send_parts` that ran out of
+  send pool partway through encryption left the connection open and
+  corrupt. The records already sealed had spent their sequence numbers with
+  no ciphertext on the wire, so every later record failed `bad_record_mac`
+  at the peer. Such a send now closes the connection and returns `Err`, as
+  the docs already told callers to do. With no free slot at all, the send
+  is refused before encrypting and the connection is left alone; previously
+  the buffered engine took the plaintext, returned `Err`, and sent it later
+  anyway, so a retry duplicated it. (0.7 turns the partway case into a
+  retryable refusal too, by admitting TLS sends against a ciphertext bound;
+  that needs machinery this line does not have.)
+
 ## [0.6.6] - 2026-09-29
 
 ### Fixed
