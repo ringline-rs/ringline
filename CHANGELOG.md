@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-09-29
+
 ### Fixed
 
 - io_uring: a copied send larger than one send-pool slot could transmit a
