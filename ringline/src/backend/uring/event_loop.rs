@@ -2114,20 +2114,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// install to the cancel is what made 9,427 of 9,427 abandonments
     /// (`docs/journal/2026-09-two-phase-park.md`).
     fn drive_park_drains(&mut self) {
-        // `park_drain` is dense, so the count is the only cheap way to know
-        // there is nothing to do; it also ends the scan at the last drain.
-        let mut remaining = self.driver.park_drain_live;
-        if remaining == 0 {
+        if self.driver.park_drain_pending.is_empty() {
             return;
         }
-        for conn_index in 0..self.driver.park_drain.len() as u32 {
-            if remaining == 0 {
-                break;
-            }
+        // Visit the list, not `park_drain`: that is sized to `max_connections`
+        // and walking it every tick was most of an idle worker's cycles (#514).
+        let mut pending = std::mem::take(&mut self.driver.park_drain_pending);
+        for &conn_index in &pending {
             let Some(drain) = self.driver.park_drain[conn_index as usize] else {
                 continue;
             };
-            remaining -= 1;
             // A recycled slot must not inherit someone else's drain.
             if self.driver.connections.generation(conn_index) != drain.generation {
                 self.driver.set_park_drain(conn_index, None);
@@ -2182,6 +2178,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
         }
+        // Keep the drains still outstanding, in order, plus any started while
+        // this ran (they went onto the list we swapped in).
+        pending.retain(|&i| self.driver.park_drain[i as usize].is_some());
+        for i in std::mem::take(&mut self.driver.park_drain_pending) {
+            if !pending.contains(&i) {
+                pending.push(i);
+            }
+        }
+        self.driver.park_drain_pending = pending;
     }
 
     fn maybe_park_one(&mut self) {
@@ -6055,17 +6060,31 @@ mod tests {
         })
     }
 
-    fn live_drains(el: &AsyncEventLoop<NoopHandler>) -> usize {
-        el.driver.park_drain.iter().filter(|d| d.is_some()).count()
+    fn live_drains(el: &AsyncEventLoop<NoopHandler>) -> Vec<u32> {
+        (0..el.driver.park_drain.len() as u32)
+            .filter(|&i| el.driver.park_drain[i as usize].is_some())
+            .collect()
     }
 
-    /// `park_drain_live` is what lets `drive_park_drains` skip its scan of
-    /// every slot (#514), so it has to equal the number of drains outstanding
-    /// through set, replace, clear and close.
+    /// Every live drain is on the pending list exactly once.
+    fn assert_pending_covers_live(el: &AsyncEventLoop<NoopHandler>) {
+        let pending = &el.driver.park_drain_pending;
+        for i in live_drains(el) {
+            assert_eq!(
+                pending.iter().filter(|&&p| p == i).count(),
+                1,
+                "drain on connection {i} must be pending exactly once"
+            );
+        }
+    }
+
+    /// `park_drain_pending` is what `drive_park_drains` visits instead of
+    /// scanning every slot (#514), so every drain must be on it exactly once
+    /// through set, replace, clear, re-set and close.
     #[test]
-    fn park_drain_live_counts_outstanding_drains() {
+    fn park_drain_pending_tracks_outstanding_drains() {
         let mut el = make_test_loop();
-        assert_eq!(el.driver.park_drain_live, 0);
+        assert!(el.driver.park_drain_pending.is_empty());
         let a = accept_connection(&mut el);
         let b = accept_connection(&mut el);
         let gen_a = el.driver.connections.generation(a);
@@ -6073,41 +6092,42 @@ mod tests {
 
         el.driver.set_park_drain(a, test_drain(gen_a));
         el.driver.set_park_drain(a, test_drain(gen_a));
-        assert_eq!(
-            el.driver.park_drain_live, 1,
-            "replacing a drain is not a new one"
-        );
         el.driver.set_park_drain(b, test_drain(gen_b));
-        assert_eq!(el.driver.park_drain_live, 2);
+        assert_eq!(el.driver.park_drain_pending, vec![a, b]);
 
+        // Cleared then set again before a drive: still one entry.
         el.driver.set_park_drain(a, None);
-        el.driver.set_park_drain(a, None);
-        assert_eq!(el.driver.park_drain_live, 1, "clearing twice counts once");
-        assert_eq!(el.driver.park_drain_live, live_drains(&el));
+        el.driver.set_park_drain(a, test_drain(gen_a));
+        assert_eq!(el.driver.park_drain_pending, vec![a, b]);
+        assert_pending_covers_live(&el);
 
         el.driver.close_connection(b);
-        assert_eq!(el.driver.park_drain_live, live_drains(&el));
+        assert_pending_covers_live(&el);
     }
 
-    /// With nothing draining, the per-tick drive must leave every slot alone;
-    /// with a drain left by a recycled slot, it must find and clear it and
-    /// bring the count back to zero.
+    /// With nothing draining, the per-tick drive has nothing to visit; a
+    /// drain left by a recycled slot is found, cleared and dropped from the
+    /// list, and a cleared entry left on the list is dropped too.
     #[test]
-    fn drive_park_drains_follows_the_live_count() {
+    fn drive_park_drains_visits_only_the_pending_list() {
         let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
+        let a = accept_connection(&mut el);
+        let b = accept_connection(&mut el);
 
         el.drive_park_drains();
-        assert_eq!(el.driver.park_drain_live, 0);
-        assert_eq!(live_drains(&el), 0);
+        assert!(el.driver.park_drain_pending.is_empty());
+        assert!(live_drains(&el).is_empty());
 
-        let stale = el.driver.connections.generation(conn_index).wrapping_add(1);
-        el.driver.set_park_drain(conn_index, test_drain(stale));
-        assert_eq!(el.driver.park_drain_live, 1);
+        let stale = el.driver.connections.generation(a).wrapping_add(1);
+        el.driver.set_park_drain(a, test_drain(stale));
+        el.driver
+            .set_park_drain(b, test_drain(el.driver.connections.generation(b)));
+        el.driver.set_park_drain(b, None);
+        assert_eq!(el.driver.park_drain_pending, vec![a, b]);
 
         el.drive_park_drains();
-        assert!(el.driver.park_drain[conn_index as usize].is_none());
-        assert_eq!(el.driver.park_drain_live, 0);
+        assert!(el.driver.park_drain[a as usize].is_none());
+        assert!(el.driver.park_drain_pending.is_empty());
     }
 
     /// Pool mode is the default and has no imbalance to repair. Park must be

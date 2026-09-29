@@ -370,15 +370,19 @@ pub(crate) struct Driver {
     /// forever — the failure the unconditional re-arm was added to prevent.
     ///
     /// Written only through [`Driver::set_park_drain`], which keeps
-    /// `park_drain_live` in step.
+    /// `park_drain_pending` in step.
     pub(crate) park_drain: Vec<Option<ParkDrain>>,
-    /// Number of `Some` entries in `park_drain`.
+    /// Connection indices with a drain outstanding, visited by
+    /// `drive_park_drains` each tick instead of scanning `park_drain`.
     ///
-    /// `park_drain` is sized to `max_connections`, so `is_empty()` is never
-    /// true and cannot gate the per-tick drive. Without this count every tick
-    /// scanned every slot: 16,000 per worker at the default, measured at 37%
-    /// of a client worker's cycles with nothing parking (#514).
-    pub(crate) park_drain_live: usize,
+    /// `park_drain` is sized to `max_connections`, so walking it cost every
+    /// tick 16,000 slot checks per worker at the default with nothing parking,
+    /// measured at 37% of a client worker's cycles (#514). Same shape as the
+    /// retry lists: per-slot state plus a list of the slots with work.
+    ///
+    /// Holds no duplicates. May briefly hold an index whose drain was cleared
+    /// elsewhere; the next drive drops it.
+    pub(crate) park_drain_pending: Vec<u32>,
     /// State the handler deposited alongside the offer, carried to the
     /// adopting worker and handed to `on_adopt`.
     ///
@@ -1072,7 +1076,7 @@ impl Driver {
             adopt_pending: std::collections::HashMap::new(),
             park_offered: vec![false; config.max_connections as usize],
             park_drain: vec![None; config.max_connections as usize],
-            park_drain_live: 0,
+            park_drain_pending: Vec::new(),
             park_carry: std::collections::HashMap::new(),
             park_in_flight: vec![None; config.max_connections as usize],
             park_ready: Vec::new(),
@@ -1757,14 +1761,12 @@ impl Driver {
     }
 
     /// Set or clear `conn_index`'s park drain. Every write to `park_drain`
-    /// goes through here so `park_drain_live` stays equal to the number of
-    /// drains outstanding.
+    /// goes through here so every drain is on `park_drain_pending`. Clearing
+    /// leaves the index on the list for `drive_park_drains` to drop.
     pub(crate) fn set_park_drain(&mut self, conn_index: u32, drain: Option<ParkDrain>) {
         let slot = &mut self.park_drain[conn_index as usize];
-        match (slot.is_some(), drain.is_some()) {
-            (false, true) => self.park_drain_live += 1,
-            (true, false) => self.park_drain_live -= 1,
-            _ => {}
+        if slot.is_none() && drain.is_some() && !self.park_drain_pending.contains(&conn_index) {
+            self.park_drain_pending.push(conn_index);
         }
         *slot = drain;
     }
