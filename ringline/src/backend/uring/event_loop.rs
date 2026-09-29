@@ -7834,6 +7834,79 @@ mod tests {
 
     /// close_connection must defer the Close SQE while a send chain's SQEs
     /// are still in the kernel, and finalize once the chain drains.
+    /// A plain send issued while a chain is in flight must queue behind it.
+    /// io_uring does not order independent SQEs, so pushing it directly let
+    /// its bytes reach the peer interleaved with the chain's. Chain completion
+    /// already drains the send queue (`fire_chain_complete`); the send path
+    /// just never queued into it while only a chain was active.
+    #[test]
+    fn a_plain_send_queues_behind_an_active_chain() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+
+        el.driver.chain_table.start(conn_index, 1, 100);
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, b"after the chain")
+                .expect("a send behind a chain is accepted");
+        }
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].queue.len(),
+            1,
+            "a send issued while a chain is active must wait in the queue"
+        );
+
+        // The chain completes; its completion submits what queued behind it.
+        let event = el.driver.chain_table.on_operation_cqe(conn_index, 100);
+        assert!(matches!(event, ChainEvent::Complete { .. }));
+        el.fire_chain_complete(conn_index);
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.queue.is_empty(), "the queued send was not submitted");
+        assert!(state.in_flight, "the queued send is now in flight");
+
+        // And the next send waits behind it rather than pushing past it.
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, b"next").expect("accepted");
+        }
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].queue.len(),
+            1,
+            "a send issued after the chain completed overtook the queued one"
+        );
+    }
+
+    /// A chain issued while plain sends are queued or in flight would
+    /// overtake them, and the plain queue cannot hold a linked chain, so the
+    /// chain is refused with `WouldBlock` and releases what it built.
+    #[test]
+    fn a_chain_refuses_while_plain_sends_are_in_flight() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_chain(token).copy(b"chained").finish()
+        };
+        let err = result.expect_err("a chain behind in-flight plain sends must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            !el.driver.chain_table.is_active(conn_index),
+            "a refused chain must not start"
+        );
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before,
+            "a refused chain must release the slots it built"
+        );
+    }
+
     #[test]
     fn close_defers_while_chain_active() {
         let mut el = make_test_loop();

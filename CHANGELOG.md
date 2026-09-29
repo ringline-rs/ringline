@@ -101,6 +101,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: plain sends and IO_LINK send chains could overtake each other on
+  one connection, putting bytes on the wire out of order. io_uring does not
+  order independent SQEs, and neither path looked at the other: a plain send
+  issued while a chain was in flight was pushed straight to the ring, and a
+  chain issued while plain sends were queued, in flight or parked for retry
+  was pushed ahead of them. A plain send now queues behind an active chain
+  (chain completion already submitted the queue). **Behaviour change:** a
+  chain started while earlier sends are still in flight -- plain, or another
+  chain -- is refused with `WouldBlock` instead of reordering, and releases
+  what it built. Await the earlier send, then retry.
+
 - Copied sends can no longer transmit a prefix and then fail. Pool slots for
   a multi-chunk copy send are reserved up front, so the send is admitted
   whole or not at all, and a submission queue that is still full after a

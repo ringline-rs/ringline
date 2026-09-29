@@ -770,9 +770,18 @@ impl<'a> DriverCtx<'a> {
     /// two failed attempts, fails the send waiter and closes the connection.
     /// Nothing is dropped or released here (Domain Invariant 7).
     pub(crate) fn submit_or_queue(&mut self, conn_index: u32, built: BuiltSend) {
+        // An active IO_LINK chain counts as in flight: io_uring does not order
+        // independent SQEs, so pushing this send now could interleave its bytes
+        // with the chain's on the wire. Queue it and mark the queue as owning
+        // the send order (`in_flight`), as parking does; the invariant is that
+        // a non-empty queue implies `in_flight`, which `submit_next_queued`
+        // relies on. Chain completion submits the queue
+        // (`fire_chain_complete` -> `submit_next_queued`).
+        let chain_active = self.chain_table.is_active(conn_index);
         let state = &mut self.send_queues[conn_index as usize];
-        if state.in_flight {
+        if state.in_flight || chain_active {
             state.queue.push_back(built);
+            state.in_flight = true;
             return;
         }
         match unsafe { self.ring.push_sqe(&built.entry) } {
@@ -3940,6 +3949,20 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "connection closing",
+            ));
+        }
+
+        // Plain sends queued, in flight or parked, or another chain active:
+        // this chain would overtake them, since io_uring does not order
+        // independent SQEs, and the plain send queue cannot hold a linked
+        // chain. Refuse rather than reorder; finished stays false, so Drop
+        // releases what was built. Await the earlier send, then retry.
+        let state = &self.ctx.send_queues[conn_index as usize];
+        if state.in_flight || !state.queue.is_empty() || self.ctx.chain_table.is_active(conn_index)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "earlier sends are still in flight on this connection",
             ));
         }
 
