@@ -410,11 +410,17 @@ line are cut from it.
   1. Bump the changed crate(s) only.
   2. Update `Cargo.lock`.
   3. Move the branch's `Unreleased` to `[X.Y.Z]`.
-  4. Commit as `release: vX.Y.Z` on the maintenance branch.
-  5. Once CI is green, tag that commit by hand (`git tag -a vX.Y.Z -m "Release vX.Y.Z"`) and push the tag. `release.yml` publishes; `tag-release.yml` fires only on `main`, so nothing on a maintenance branch tags itself.
+  4. Land it through a PR into the maintenance branch titled
+     `release: vX.Y.Z`. The `release branches` ruleset requires PRs and
+     squash merges on `release/**`, as `main`'s does.
+  5. Once the merge commit's CI is green, tag it by hand
+     (`git tag -a vX.Y.Z -m "Release vX.Y.Z"`) and push the tag.
+     `release.yml` publishes; `tag-release.yml` fires only on `main`, so
+     nothing on a maintenance branch tags itself.
 - **Record it on `main` afterwards:** add the `[X.Y.Z]` section to `main`'s
   CHANGELOG as shipped, drop its entries from `main`'s `Unreleased`, and
   move `ringline` to the next patch version if `main` was on the one just
   published (as #490 did for 0.6.4).
-- **Never force-push a maintenance branch** once a release has been tagged
-  from it.
+- **Protection:** the `release branches` ruleset covers `release/**`. It
+  blocks deletion and force-pushes, and requires a PR with squash merge,
+  matching `main`'s ruleset.
