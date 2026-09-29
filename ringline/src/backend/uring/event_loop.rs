@@ -11930,6 +11930,90 @@ mod tests {
         );
     }
 
+    /// A recv-forward connection with `bids` held, ready for `forward_held`.
+    fn stage_recv_forward(el: &mut AsyncEventLoop<NoopHandler>, bids: &[u16], len: u32) -> u32 {
+        let conn_index = accept_connection(el);
+        el.driver.recv_forward[conn_index as usize] = true;
+        for &bid in bids {
+            let (ptr, _) = el.driver.provided_bufs.get_buffer(bid);
+            el.driver.recv_hold[conn_index as usize].push_back(crate::backend::PendingRecvBuf {
+                bid,
+                len,
+                ptr,
+            });
+        }
+        conn_index
+    }
+
+    fn forward_held_on(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+    ) -> io::Result<crate::runtime::io::SendFuture> {
+        let conn = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        with_driver_state(el, || conn.forward_held())
+    }
+
+    #[test]
+    fn forward_held_submits_on_an_idle_connection() {
+        let mut el = make_test_loop();
+        let conn_index = stage_recv_forward(&mut el, &[0, 1], 1024);
+
+        let _fut = forward_held_on(&mut el, conn_index).expect("an idle connection forwards");
+
+        assert!(el.driver.recv_hold[conn_index as usize].is_empty());
+        assert_eq!(el.driver.send_slab.recv_forward_bids(0), &[0, 1]);
+        assert!(el.driver.send_queues[conn_index as usize].in_flight);
+    }
+
+    /// A forward is its own SQE, and io_uring does not order independent
+    /// SQEs, so pushing it while earlier sends are in flight, queued, parked
+    /// or chained lets the echoed bytes overtake them. It is refused with
+    /// `WouldBlock` before anything is allocated, and the hold is untouched
+    /// so a later call forwards the same bytes.
+    #[test]
+    fn forward_held_refuses_while_earlier_sends_are_outstanding() {
+        type Setup = fn(&mut AsyncEventLoop<NoopHandler>, u32);
+        let cases: [(&str, Setup); 3] = [
+            ("in flight", |el, c| {
+                el.driver.send_queues[c as usize].in_flight = true;
+            }),
+            ("parked in the queue", |el, c| {
+                let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(b"first").unwrap();
+                let state = &mut el.driver.send_queues[c as usize];
+                state.queue.push_back(crate::handler::BuiltSend {
+                    entry: io_uring::opcode::Send::new(io_uring::types::Fixed(c), ptr, len).build(),
+                    pool_slot: slot,
+                    slab_idx: u16::MAX,
+                    total_len: len,
+                });
+                state.in_flight = true;
+                state.parked = true;
+            }),
+            ("behind an active chain", |el, c| {
+                el.driver.chain_table.start(c, 1, 5);
+            }),
+        ];
+        for (what, setup) in cases {
+            let mut el = make_test_loop();
+            let conn_index = stage_recv_forward(&mut el, &[0, 1], 1024);
+            setup(&mut el, conn_index);
+
+            let err = forward_held_on(&mut el, conn_index)
+                .err()
+                .unwrap_or_else(|| panic!("a forward {what} must be refused"));
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{what}");
+            assert_eq!(
+                el.driver.recv_hold[conn_index as usize].len(),
+                2,
+                "{what}: a refused forward must leave the hold in place"
+            );
+            assert!(
+                !el.driver.send_slab.in_use(0),
+                "{what}: a refused forward must not allocate a slab entry"
+            );
+        }
+    }
+
     #[test]
     fn dry_flush_submits_fallback_for_partial_message() {
         let mut el = make_test_loop();

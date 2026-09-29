@@ -2125,7 +2125,10 @@ impl ConnCtx {
     ///
     /// One forward is in flight per connection at a time (await the returned
     /// future before calling again); buffers received during the send accumulate
-    /// in the hold and are picked up by the next call.
+    /// in the hold and are picked up by the next call. The same holds for any
+    /// other send on the connection: while one is queued or in flight, or a
+    /// send chain is active, this returns `WouldBlock` rather than let the
+    /// forward overtake it, and the held buffers stay in the hold.
     #[cfg(has_io_uring)]
     pub fn forward_held(&self) -> io::Result<SendFuture> {
         with_state(|driver, executor| {
@@ -2150,6 +2153,22 @@ impl ConnCtx {
                     conn_index,
                     generation: self.generation,
                 });
+            }
+
+            // Earlier sends queued, in flight or parked, or a chain active: the
+            // forward is its own SQE and io_uring does not order independent
+            // SQEs, so pushing it now would let the echoed bytes overtake them.
+            // Refuse before allocating anything; the hold stays put and the
+            // next call forwards the same bytes. Await the earlier send first.
+            let state = &driver.send_queues[conn_index as usize];
+            if state.in_flight
+                || !state.queue.is_empty()
+                || driver.chain_table.is_active(conn_index)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "earlier sends are still in flight on this connection",
+                ));
             }
 
             // Gather iovecs over the held provided-buffer memory (PendingRecvBuf
