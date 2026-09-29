@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-09-29
+
 ### Fixed
 
 - io_uring: a TLS `send`, `send_nowait` or `send_parts` that ran out of
