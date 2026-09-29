@@ -7976,6 +7976,90 @@ mod tests {
         );
     }
 
+    /// Allocate a one-iovec ZC send entry for `conn_index`.
+    fn alloc_zc_entry(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) -> u16 {
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(
+                conn_index,
+                el.driver.connections.generation(conn_index),
+                &iovecs,
+                u16::MAX,
+                guards,
+                0,
+                100,
+            )
+            .unwrap();
+        slab_idx
+    }
+
+    const CQE_F_MORE: u32 = 1 << 1; // IORING_CQE_F_MORE
+    const CQE_F_NOTIF: u32 = 1 << 3; // IORING_CQE_F_NOTIF
+
+    /// The kernel posts a ZC notification whenever the main CQE carries
+    /// `IORING_CQE_F_MORE` -- including on error (`io_sendrecv_fail`) and on
+    /// a zero result (`io_sendmsg_zc` sets it unconditionally). The entry must
+    /// stay in use until that notification arrives.
+    #[test]
+    fn handle_send_msg_zc_error_with_f_more_waits_for_its_notification() {
+        for result in [-libc::ECONNRESET, 0] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            let slab_idx = alloc_zc_entry(&mut el, conn_index);
+            let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+
+            el.test_dispatch_cqe(ud.raw(), result, CQE_F_MORE);
+            assert!(
+                el.driver.send_slab.in_use(slab_idx),
+                "result {result} with F_MORE: entry released before its notification"
+            );
+
+            el.test_dispatch_cqe(ud.raw(), 0, CQE_F_NOTIF);
+            assert!(
+                !el.driver.send_slab.in_use(slab_idx),
+                "result {result}: entry not released after its notification"
+            );
+        }
+    }
+
+    /// The CI panic (ringline-rs/ringline#487): an entry released on an error
+    /// CQE that carried F_MORE is reused by the next send, and the first
+    /// send's late notification then decrements the new send's count --
+    /// "notification underflow" in debug, and in release an entry released
+    /// while the kernel may still hold the new send's pages.
+    #[test]
+    fn a_late_notification_never_reaches_a_reused_entry() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let first = alloc_zc_entry(&mut el, conn_index);
+        let first_ud = UserData::encode(OpTag::SendMsgZc, conn_index, first as u32);
+        el.test_dispatch_cqe(first_ud.raw(), -libc::ECONNRESET, CQE_F_MORE);
+
+        // The next send, before the first one's notification arrives.
+        let second = alloc_zc_entry(&mut el, conn_index);
+        let second_ud = UserData::encode(OpTag::SendMsgZc, conn_index, second as u32);
+
+        // The first send's notification, late.
+        el.test_dispatch_cqe(first_ud.raw(), 0, CQE_F_NOTIF);
+
+        // The second send is untouched: still in use, and its own main CQE
+        // and notification complete it normally.
+        assert!(
+            el.driver.send_slab.in_use(second),
+            "the second send's entry was released"
+        );
+        el.test_dispatch_cqe(second_ud.raw(), 100, CQE_F_MORE);
+        assert!(el.driver.send_slab.in_use(second));
+        el.test_dispatch_cqe(second_ud.raw(), 0, CQE_F_NOTIF);
+        assert!(!el.driver.send_slab.in_use(second));
+    }
+
     #[test]
     fn handle_send_msg_zc_result_zero_does_not_leak_slab() {
         let mut el = make_test_loop();
