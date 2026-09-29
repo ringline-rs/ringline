@@ -29,7 +29,7 @@ repository = "https://github.com/ringline-rs/ringline"
 
 [workspace.dependencies]
 # Internal crates
-ringline = { path = "ringline", version = "0.6" }
+ringline = { path = "ringline", version = "0.7.0-alpha.0" }
 ringline-quic = { path = "ringline-quic" }
 ringline-http = { path = "ringline-http" }
 ringline-h2 = { path = "ringline-h2" }

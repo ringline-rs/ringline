@@ -418,9 +418,13 @@ line are cut from it.
      `release.yml` publishes; `tag-release.yml` fires only on `main`, so
      nothing on a maintenance branch tags itself.
 - **Record it on `main` afterwards:** add the `[X.Y.Z]` section to `main`'s
-  CHANGELOG as shipped, drop its entries from `main`'s `Unreleased`, and
-  move `ringline` to the next patch version if `main` was on the one just
-  published (as #490 did for 0.6.4).
+  CHANGELOG as shipped, and drop its entries from `main`'s `Unreleased`.
+  `main`'s version is not touched.
+- **Versions:** `main` carries the next minor as a pre-release
+  (`0.7.0-alpha.N`), and the workspace `ringline` requirement matches it.
+  Released `X.Y.Z` versions of a maintained line exist only on
+  `release/X.Y.x`, so `main` never holds a version that is also published
+  from a maintenance branch.
 - **Protection:** the `release branches` ruleset covers `release/**`. It
   blocks deletion and force-pushes, and requires a PR with squash merge,
   matching `main`'s ruleset.
