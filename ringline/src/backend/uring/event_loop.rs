@@ -810,7 +810,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.recv_starved.swap_remove(i);
                 continue;
             }
-            if replenished {
+            // Re-arm whenever the ring can actually feed a multishot, not only
+            // on a pass that just returned bids. A connection parked while the
+            // ring was dry, whose bids came back in a pass that did not visit
+            // it — a fallback completion re-parks it *after* the flush — would
+            // otherwise sit parked against a full ring with nothing left to
+            // trigger another replenish: no further recv, so no further bid
+            // return, so no further pass with `replenished`. Forever.
+            if replenished || self.driver.provided_bufs.free() > 0 {
                 self.driver.recv_starved.swap_remove(i);
                 let generation = self.driver.connections.generation(conn_index);
                 if self
@@ -832,9 +839,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Whether a parked connection may take the fallback recv path:
-    /// plaintext accumulator route only (no TLS, recv sink, zero-copy
-    /// forward, or direct echo — those paths keep the park-until-replenish
-    /// behavior) with a partial message already accumulated. The caller
+    /// plaintext accumulator route only (no TLS, recv sink, segmented
+    /// delivery, zero-copy forward, or direct echo — those paths keep the
+    /// park-until-replenish behavior) with a partial message already
+    /// accumulated. The caller
     /// has already checked liveness and that no fallback is in flight.
     fn fallback_eligible(&mut self, conn_index: u32) -> bool {
         let ci = conn_index as usize;
@@ -848,8 +856,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .connections
             .get(conn_index)
             .is_some_and(|c| c.direct_echo);
+        // Segmented delivery (`forward_to`, `with_segments`) is defined over
+        // provided buffers: a segment is a held bid, and the hold is where a
+        // reader looks. The fallback reads into a pool slot and can only append
+        // to the accumulator, so on a segmented connection it does not merely
+        // bypass the reader — it reorders the stream, since bytes already held
+        // are earlier than the ones it appends. A forward source is the worst
+        // case: it never looks at the accumulator at all, so the fallback chain
+        // feeds bytes into a buffer nobody reads while the forward waits for a
+        // segment that cannot arrive, forever. It is reachable because a
+        // forward's own overshoot tail (bytes past `len`) lands in the
+        // accumulator, which is exactly the "half-delivered message" this path
+        // takes as its cue.
+        let is_segmented =
+            self.driver.recv_domain[ci] == crate::recv::domain::RecvDomain::Segmented;
         if is_tls
             || is_direct_echo
+            || is_segmented
             || self.driver.recv_forward[ci]
             || self.executor.recv_sinks[ci].is_some()
         {
@@ -942,7 +965,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             .expect("checked in_use above");
         let (ptr, _) = pool.current_ptr_remaining(slot);
         let data = unsafe { std::slice::from_raw_parts(ptr, bytes_received as usize) };
-        let appended = self.driver.accumulators.append(conn_index, data);
+        // `fallback_eligible` refuses a segmented connection, but the domain can
+        // flip *while a fallback is in flight* — a handler that parses a length
+        // header and then starts a forward does exactly that. These bytes are
+        // the newest on the stream, so they go to the back of the hold, where
+        // the segmented reader will find them; appending them to the
+        // accumulator would stand them in front of the held bytes and strand
+        // them besides, since a forward never reads the accumulator.
+        let appended = if self.driver.recv_domain[conn_index as usize]
+            == crate::recv::domain::RecvDomain::Segmented
+        {
+            self.driver.segment_hold[conn_index as usize].push_back(
+                crate::backend::HeldRecvBuf::Owned(bytes::Bytes::copy_from_slice(data)),
+            );
+            true
+        } else {
+            self.driver.accumulators.append(conn_index, data)
+        };
         self.driver
             .fallback_recv_pool
             .as_mut()
@@ -1100,12 +1139,34 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     metrics::POOL.increment(metrics::pool::RECV_PARKED);
                 }
             } else if errno == libc::ECANCELED {
-                // A cancel terminated the multishot. If this connection was
-                // throttled by the Mode A hold cap, this is the ECANCELED for that
-                // throttle-cancel — `recv_multishot_armed` was just cleared at the
-                // top of the handler, so try to re-arm now if the hold has already
-                // drained below the cap (otherwise a later write completion will).
+                // A cancel terminated the multishot. Whatever was armed is gone
+                // now, `IORING_CQE_F_MORE` or not: a cancel posts `-ECANCELED`
+                // only for a request it actually found live, and at most one
+                // multishot recv per (connection, generation) is ever live, so
+                // this CQE belongs to the current arming even when the flag
+                // says the request continues. Trusting the flag left the
+                // connection marked armed against a multishot the kernel had
+                // already killed — no data ever arrived again, and every
+                // re-arm path declined because it looked armed.
+                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.recv_multishot_armed = false;
+                }
+                // If this connection was throttled by the Mode A hold cap, this
+                // is the ECANCELED for that throttle-cancel: re-arm now if the
+                // hold has already drained below the cap (otherwise a later
+                // write completion will).
                 self.maybe_rearm_throttled_forward(conn_index);
+                // The cancel may also have landed on a *different* multishot
+                // than the one it was aimed at: it matches by user_data, and a
+                // throttled recv that terminated on its own (`!has_more`) is
+                // re-armed with that same user_data as soon as the forward
+                // settles — before the kernel gets to the queued cancel. The
+                // connection is no longer throttled by then, so neither this
+                // branch's re-arm nor the one at the end of the handler (which
+                // this `return` skips) would fire, and the connection sat open
+                // with no recv armed and its bytes piling up in the
+                // accumulator, forever.
+                self.rearm_multishot_if_idle(conn_index);
                 return;
             } else if !has_more {
                 self.executor.wake_recv(conn_index);
@@ -2431,6 +2492,48 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// waits for the old multishot to fully terminate (its ECANCELED clears
     /// `recv_multishot_armed` at the top of `handle_recv_multi`) so two multishots
     /// with the same `RecvMulti` user_data never overlap.
+    /// Re-arm a connection's multishot recv if it should be receiving and
+    /// nothing is armed.
+    ///
+    /// The backstop for a cancel that outlived its target. `submit_async_cancel`
+    /// matches a request by `user_data`, and a connection's multishot recv
+    /// re-uses one user_data for the life of the slot (generation included), so
+    /// a cancel queued against one arming can be applied by the kernel to the
+    /// next one. Whoever cancelled has by then moved on, so no other path
+    /// re-arms; without this the connection goes quiet for good.
+    ///
+    /// Deliberately does nothing for a connection that is closing or not in
+    /// multishot recv mode (`close_connection` sets `RecvMode::Closed`, and its
+    /// cancel is what releases the recv's reference on the fd so the Close
+    /// actually FINs), or that is throttled by the Mode A hold cap — that one
+    /// owns its own re-arm and must not have a second multishot armed under it.
+    fn rearm_multishot_if_idle(&mut self, conn_index: u32) {
+        if self.driver.forward_hold_throttled[conn_index as usize] {
+            return;
+        }
+        let should_arm = self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| !c.recv_multishot_armed && matches!(c.recv_mode, RecvMode::Multi));
+        if !should_arm {
+            return;
+        }
+        let generation = self.driver.connections.generation(conn_index);
+        if self
+            .driver
+            .ring
+            .submit_multishot_recv(conn_index, generation)
+            .is_err()
+        {
+            metrics::RING.increment(metrics::ring::RECV_ARM_FAILURES);
+            self.executor.wake_recv(conn_index);
+            self.driver.close_connection(conn_index);
+        } else if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = true;
+        }
+    }
+
     fn maybe_rearm_throttled_forward(&mut self, conn_index: u32) {
         let ci = conn_index as usize;
         if !self.driver.forward_hold_throttled[ci] {
@@ -8971,9 +9074,18 @@ mod tests {
             !el.driver.recv_fallback_inflight[conn_index as usize],
             "fallback submitted with nothing half-delivered"
         );
+        // Nothing is torn, so the connection does not degrade to a fallback —
+        // it goes back to an ordinary multishot, which this test's ring (never
+        // drained) can feed. The park is for a dry ring, and the wake
+        // condition is "the ring has buffers"; a replenish is just the usual
+        // way that becomes true.
         assert!(
-            el.driver.recv_starved.contains(&conn_index),
-            "connection should stay parked"
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "an untorn connection re-arms once the ring can feed it"
         );
     }
 
@@ -11406,5 +11518,394 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── #415 io_uring forward-path fixes, targeted for 0.6 ──────────────
+
+    /// A stale handle must not turn the slot's new occupant into a forwarder.
+    ///
+    /// `forward_to` flipped `recv_domain` to `Segmented`, set
+    /// `forward_recv_active` and (now) adopts buffered bytes, all without a
+    /// generation check. On a recycled slot that strands the new connection's
+    /// bytes in a hold its own `with_data` reader never looks at, the same
+    /// shape #437 closed for the other recv entry points.
+    #[test]
+    fn forward_to_ignores_a_stale_handle() {
+        use std::os::fd::AsFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        assert!(el.driver.accumulators.append(conn_index, b"theirs"));
+
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let _fut = with_driver_state(&mut el, || stale.forward_to(&sinkfd, 1024));
+
+        assert_eq!(
+            el.driver.recv_domain[conn_index as usize],
+            crate::recv::domain::RecvDomain::default(),
+            "a stale handle must not flip the new occupant's domain"
+        );
+        assert!(!el.driver.forward_recv_active[conn_index as usize]);
+        assert_eq!(
+            el.driver.accumulators.data(conn_index),
+            b"theirs",
+            "nor take its buffered bytes"
+        );
+        assert!(el.driver.segment_hold[conn_index as usize].is_empty());
+    }
+
+    /// A forward that ends while its throttle-cancel is still in flight must
+    /// still leave the connection reading.
+    ///
+    /// `settle_forward_end` used to clear `forward_hold_throttled` in that case
+    /// and re-arm nothing — it cannot re-arm while the old multishot is still
+    /// live, two with the same user_data must never overlap. But the ECANCELED
+    /// branch's re-arm is gated on exactly that flag, and nothing else re-arms a
+    /// connection that has stopped forwarding, so the connection stayed unarmed
+    /// and the handler's next `with_data` parked forever. Found by the
+    /// length-prefixed proxy test in `tests/echo.rs` at `forward_hold_cap(1)`,
+    /// where it reproduced about one run in three.
+    #[test]
+    fn settle_forward_end_with_cancel_in_flight_rearms_from_ecanceled() {
+        let cap = 1;
+        let mut el = make_test_loop_with_config(config_with_forward_cap(cap));
+        let conn_index = accept_connection(&mut el);
+        let ci = conn_index as usize;
+        el.driver.recv_domain[ci] = crate::recv::domain::RecvDomain::Segmented;
+        el.driver.forward_recv_active[ci] = true;
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+
+        // One segment reaches the cap, so the recv is cancelled.
+        deliver_segment(&mut el, conn_index, 0, b"x");
+        assert!(el.driver.forward_hold_throttled[ci], "throttled at the cap");
+
+        // The forward finishes first: the future drains the hold and settles,
+        // all before the cancel's ECANCELED comes back.
+        el.driver.segment_hold[ci].pop_front();
+        assert!(el.driver.settle_forward_end(conn_index));
+        assert!(
+            el.driver.forward_hold_throttled[ci],
+            "the flag has to survive settle, or the ECANCELED re-arm is skipped"
+        );
+
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
+        assert!(!el.driver.forward_hold_throttled[ci]);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "the connection must be reading again once the forward is over"
+        );
+    }
+
+    /// Arming a forward must also take the zero-copy pending recv buffer, not
+    /// just the accumulator.
+    ///
+    /// The plaintext read path holds the most recent provided buffer in place
+    /// instead of copying it, so buffered bytes can sit *behind* an empty
+    /// accumulator. A forward that only drained the accumulator left them
+    /// there for good — nothing on the forward path reads that slot — and the
+    /// bid stayed pinned, so the provided ring lost an entry too.
+    ///
+    /// This is the shape the proxy test hit ~3% of the time: the backend's
+    /// first echo chunk landed on the connection just before the return-leg
+    /// forward was armed, and the forward then waited forever for bytes it
+    /// already had.
+    #[test]
+    fn arming_a_forward_takes_the_pending_recv_buffer() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let free_before = el.driver.provided_bufs.free();
+
+        // A plaintext arrival with an empty accumulator is held in place
+        // (`deliver_segment` is just a recv CQE; the domain is still the
+        // default here, so it takes the plaintext route).
+        deliver_segment(&mut el, conn_index, 0, b"early bytes");
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
+            "the arrival should be held zero-copy, not copied"
+        );
+        assert!(el.driver.accumulators.is_empty(conn_index));
+
+        let conn = ConnCtx::new(conn_index, generation);
+        use std::os::fd::AsFd;
+        let (sink, _peer) = make_socketpair();
+        let sinkfd = crate::runtime::io::SinkFd::socket(sink.as_fd());
+        let _fut = with_driver_state(&mut el, || conn.forward_to(&sinkfd, 1024));
+
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_none(),
+            "the held buffer must be taken, not left where the forward cannot see it"
+        );
+        assert_eq!(
+            el.driver.segment_hold[conn_index as usize].len(),
+            1,
+            "its bytes belong in the hold"
+        );
+        let held = match &el.driver.segment_hold[conn_index as usize][0] {
+            crate::backend::HeldRecvBuf::Owned(b) => b.clone(),
+            crate::backend::HeldRecvBuf::Pinned { .. } => {
+                panic!("expected an owned copy of the taken buffer")
+            }
+        };
+        assert_eq!(&held[..], b"early bytes");
+
+        // And its bid goes back, or the ring bleeds an entry per forward.
+        let r: Vec<u16> = std::mem::take(&mut el.driver.pending_replenish);
+        el.driver.provided_bufs.replenish_batch(&r);
+        assert_eq!(el.driver.provided_bufs.free(), free_before);
+    }
+
+    /// An ECANCELED that still carries `IORING_CQE_F_MORE` must not leave the
+    /// connection believing it is armed.
+    ///
+    /// `-ECANCELED` is posted only for a request the cancel found live, and a
+    /// connection has at most one live multishot recv per generation — so the
+    /// CQE belongs to the current arming whatever the flag says. Trusting the
+    /// flag left `recv_multishot_armed` set against a multishot the kernel had
+    /// already killed, and every re-arm path then declined because the
+    /// connection looked armed. Observed as a forward parked at 4096 of 8192
+    /// bytes, flagged armed, with no data ever arriving.
+    #[test]
+    fn ecanceled_with_more_flag_still_rearms() {
+        const IORING_CQE_F_MORE: u32 = 1 << 1;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        let pushed_before = el.driver.ring.pushed_sqes();
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, IORING_CQE_F_MORE);
+
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "the connection must end up armed again — by a fresh multishot, not \
+             by a stale flag"
+        );
+        // The flag alone cannot tell the two apart: left stale, it still reads
+        // `true`. A fresh multishot is an SQE.
+        assert_eq!(
+            el.driver.ring.pushed_sqes(),
+            pushed_before + 1,
+            "the re-arm must submit a new multishot recv"
+        );
+    }
+
+    /// A cancel that the kernel applies to a *later* multishot must not leave
+    /// the connection unarmed.
+    ///
+    /// The throttle-cancel matches by `user_data`, which a connection's
+    /// multishot recv re-uses for the life of the slot. If the throttled recv
+    /// terminates on its own (`!has_more`) and the forward then settles and
+    /// re-arms, the queued cancel lands on the *new* multishot. By then the
+    /// connection is no longer throttled, so the throttle re-arm declines and
+    /// the ECANCELED branch used to return before the handler's ordinary
+    /// re-arm — leaving a healthy `Open`/`Multi` connection with nothing armed
+    /// and its bytes accumulating unread. Found by the proxy test in
+    /// `tests/echo.rs`, which hung on 22 of 25 runs at `forward_hold_cap(1)`;
+    /// a stuck-state dump showed exactly this shape.
+    #[test]
+    fn ecanceled_for_a_superseded_multishot_rearms_the_connection() {
+        let mut el = make_test_loop_with_config(config_with_forward_cap(1));
+        let conn_index = accept_connection(&mut el);
+        let ci = conn_index as usize;
+
+        // The state the race leaves behind: armed cleared by the ECANCELED that
+        // is about to arrive, no throttle (the forward already settled), the
+        // connection otherwise healthy and expected to be reading.
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+        assert!(!el.driver.forward_hold_throttled[ci]);
+
+        let recv_ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
+
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "an unthrottled Open/Multi connection must come back armed"
+        );
+        assert!(
+            matches!(
+                el.driver.connections.get(conn_index).unwrap().recv_mode,
+                crate::connection::RecvMode::Multi
+            ),
+            "and must not have been closed"
+        );
+    }
+
+    /// The same ECANCELED must NOT re-arm a connection that is closing — that
+    /// cancel is `close_connection` releasing the recv's reference on the fd so
+    /// the Close actually FINs, and re-arming would pin it again.
+    #[test]
+    fn ecanceled_during_close_does_not_rearm() {
+        let mut el = make_test_loop_with_config(config_with_forward_cap(1));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_multishot_armed = true;
+        el.driver.close_connection(conn_index);
+
+        let recv_ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+        el.test_dispatch_cqe(recv_ud.raw(), -libc::ECANCELED, 0);
+
+        assert!(
+            !el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_multishot_armed),
+            "a closing connection must stay unarmed"
+        );
+    }
+
+    /// A fallback already in flight when the domain flips must land in the
+    /// hold, not the accumulator.
+    ///
+    /// `fallback_eligible` refuses a segmented connection, but a handler that
+    /// reads a length header and *then* starts a forward flips the domain
+    /// underneath an outstanding fallback. Those bytes are the newest on the
+    /// stream; in the accumulator they would sit in front of the held bytes and
+    /// be stranded besides, because a forward never reads the accumulator.
+    #[test]
+    fn fallback_completing_after_the_domain_flips_lands_in_the_hold() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.accumulators.append(conn_index, b"header tail"));
+        el.flush_replenish_and_rearm();
+        assert!(
+            el.driver.recv_fallback_inflight[conn_index as usize],
+            "the fallback is submitted while the connection is still plain"
+        );
+
+        // The handler starts a forward: domain flips, the accumulator is
+        // drained into the hold (what `arm_forward_source` does).
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        el.driver.forward_recv_active[conn_index as usize] = true;
+        let buffered = el.driver.accumulators.take_frozen(conn_index);
+        el.driver.segment_hold[conn_index as usize]
+            .push_front(crate::backend::HeldRecvBuf::Owned(buffered));
+
+        let ud = UserData::encode(OpTag::RecvFallback, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 5, 0);
+
+        assert_eq!(
+            el.driver.accumulators.data(conn_index).len(),
+            0,
+            "nothing may be left where the forward cannot see it"
+        );
+        assert_eq!(
+            el.driver.segment_hold[conn_index as usize].len(),
+            2,
+            "the late bytes join the hold, behind what was already there"
+        );
+    }
+
+    /// A parked connection must come back when the ring has buffers, even if
+    /// this pass returned none.
+    ///
+    /// The re-arm used to be gated on a replenish happening in the same pass.
+    /// A connection re-parked *after* that pass — a fallback completion does
+    /// exactly this — then sat against a full ring with nothing left to
+    /// trigger another replenish: no recv armed, so no bid returned, so no
+    /// further pass with `replenished`.
+    #[test]
+    fn parked_connection_rearms_against_a_full_ring_without_a_replenish() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        assert!(el.driver.pending_replenish.is_empty(), "nothing to return");
+        assert!(el.driver.provided_bufs.free() > 0, "the ring has buffers");
+
+        el.flush_replenish_and_rearm();
+
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "a parked connection must re-arm while the ring can feed it"
+        );
+        assert!(!el.driver.recv_starved.contains(&conn_index));
+    }
+
+    /// A segmented connection must never take the fallback recv.
+    ///
+    /// The fallback reads into a pool slot and can only append to the
+    /// accumulator, while a segmented reader takes its bytes from the hold —
+    /// so the fallback both bypasses the reader and reorders the stream
+    /// (held bytes are earlier than anything it appends). For a `forward_to`
+    /// source it is fatal: the forward never reads the accumulator, so the
+    /// fallback chain feeds a buffer nobody reads while the forward waits for
+    /// a segment that cannot come. The proxy test in `tests/echo.rs` hung this
+    /// way on 29 of 30 runs; an in-memory trace ring showed an unbroken
+    /// `fb-submit`/`fb-done` loop with the accumulator climbing.
+    ///
+    /// The trigger is the forward's own doing: bytes past `len` are stashed in
+    /// the accumulator, which is exactly the half-delivered message this path
+    /// takes as its cue to degrade.
+    #[test]
+    fn segmented_connection_never_takes_the_fallback_recv() {
+        let mut el = make_test_loop();
+        let conn_index = park_connection(&mut el);
+        el.driver.recv_domain[conn_index as usize] = crate::recv::domain::RecvDomain::Segmented;
+        el.driver.forward_recv_active[conn_index as usize] = true;
+        // The overshoot tail a forward stashes when a held buffer runs past
+        // `len` — a non-empty accumulator is what makes fallback eligible.
+        assert!(el.driver.accumulators.append(conn_index, b"tail past len"));
+
+        el.flush_replenish_and_rearm();
+
+        assert!(
+            !el.driver.recv_fallback_inflight[conn_index as usize],
+            "a segmented connection must not take the fallback recv"
+        );
+        assert_eq!(el.driver.recv_fallback_count, 0);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_multishot_armed,
+            "it takes an ordinary multishot instead — segments need provided buffers"
+        );
     }
 }

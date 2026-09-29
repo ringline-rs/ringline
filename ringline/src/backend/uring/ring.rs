@@ -39,6 +39,10 @@ pub struct Ring {
     /// [`Ring::force_push_failures`].
     #[cfg(test)]
     forced_push_failures: usize,
+    /// Test-only: `push_sqe`/`push_sqe128` calls that reached the SQ. See
+    /// [`Ring::pushed_sqes`].
+    #[cfg(test)]
+    pushed_sqes: usize,
 }
 
 impl Ring {
@@ -79,6 +83,8 @@ impl Ring {
             defer_taskrun: !config.sqpoll,
             #[cfg(test)]
             forced_push_failures: 0,
+            #[cfg(test)]
+            pushed_sqes: 0,
         })
     }
 
@@ -929,7 +935,21 @@ impl Ring {
                 }
             }
         }
+        #[cfg(test)]
+        {
+            self.pushed_sqes += 1;
+        }
         Ok(())
+    }
+
+    /// Test-only: how many single SQEs have been pushed to the SQ.
+    ///
+    /// Lets a test tell "a fresh request was submitted" from "a flag says one
+    /// is live", which reading the flag alone cannot. `push_sqe_chain`'s
+    /// multi-entry path is not counted.
+    #[cfg(test)]
+    pub(crate) fn pushed_sqes(&self) -> usize {
+        self.pushed_sqes
     }
 
     /// Test-only: make the next `count` `push_sqe`/`push_sqe128` calls fail.

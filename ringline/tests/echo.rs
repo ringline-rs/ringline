@@ -5465,3 +5465,169 @@ fn connect_with_retry(addr: &str) -> TcpStream {
         })
         .expect("server did not accept connection")
 }
+
+// ── forward_to: a length-prefixed proxy (#415 on main, targeted for 0.6) ──
+
+/// Backend for the forward proxy: accepts one connection per request, reads it
+/// to EOF, and hands what it received back to the test.
+#[cfg(has_io_uring)]
+static FORWARD_BACKEND: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
+
+/// Reads a 4-byte big-endian length with `with_data`, then forwards exactly
+/// that many body bytes to a fresh backend socket with `forward_to`, and acks
+/// the client with one byte.
+///
+/// Reading the header is what puts body bytes in front of the forward: they
+/// arrive in the same segment and land in the accumulator (or stay pinned as
+/// the zero-copy buffer) while the header is parsed. A forward that only reads
+/// the hold skipped them, so later bytes went out as the body.
+#[cfg(has_io_uring)]
+struct LenPrefixedForward;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for LenPrefixedForward {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, conn: ConnCtx) -> impl Future<Output = ()> + 'static {
+        async move {
+            loop {
+                let mut hdr = [0u8; 4];
+                let n = conn
+                    .with_data(|data| {
+                        if data.len() < 4 {
+                            return ParseResult::NeedMore;
+                        }
+                        hdr.copy_from_slice(&data[..4]);
+                        ParseResult::Consumed(4)
+                    })
+                    .await;
+                if n == 0 {
+                    break;
+                }
+                let len = u32::from_be_bytes(hdr) as usize;
+                let backend =
+                    TcpStream::connect(FORWARD_BACKEND.get().expect("backend addr")).unwrap();
+                {
+                    use std::os::fd::AsFd;
+                    let sink = ringline::SinkFd::socket(backend.as_fd());
+                    match conn.forward_to(&sink, len).await {
+                        Ok(f) if f == len => {}
+                        other => {
+                            eprintln!("forward_to: {other:?}, wanted {len}");
+                            break;
+                        }
+                    }
+                }
+                // Closing the backend socket is its end-of-body.
+                drop(backend);
+                if conn.send_nowait(b"K").is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        LenPrefixedForward
+    }
+}
+
+/// One request through the proxy: send the header and body (together, or the
+/// header first), wait for the ack, and return what the backend received.
+#[cfg(has_io_uring)]
+fn forward_round_trip(
+    stream: &mut TcpStream,
+    bodies: &std::sync::mpsc::Receiver<Vec<u8>>,
+    body: &[u8],
+    split: bool,
+) -> Vec<u8> {
+    let hdr = (body.len() as u32).to_be_bytes();
+    if split {
+        stream.write_all(&hdr).unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        stream.write_all(body).unwrap();
+    } else {
+        let mut msg = hdr.to_vec();
+        msg.extend_from_slice(body);
+        stream.write_all(&msg).unwrap();
+    }
+    stream.flush().unwrap();
+    let mut ack = [0u8; 1];
+    stream
+        .read_exact(&mut ack)
+        .expect("the proxy must ack each forwarded body");
+    assert_eq!(&ack, b"K");
+    bodies
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the backend must receive the body")
+}
+
+/// `forward_to` must forward the bytes that follow the header, in order,
+/// however they arrive: in the header's own segment (where they are already
+/// buffered when the forward starts), or later.
+#[cfg(has_io_uring)]
+#[test]
+fn forward_to_proxies_the_body_that_follows_a_header() {
+    let backend = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    FORWARD_BACKEND
+        .set(backend.local_addr().unwrap())
+        .expect("set once");
+    let (tx, bodies) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for s in backend.incoming() {
+            let mut s = s.unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).unwrap();
+            if tx.send(got).is_err() {
+                break;
+            }
+        }
+    });
+
+    for cap in [None, Some(1)] {
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let mut builder = test_config_builder();
+        if let Some(cap) = cap {
+            builder = builder.forward_hold_cap(cap);
+        }
+        let config = builder.build().expect("valid config");
+        let (shutdown, handles) = RinglineBuilder::new(config)
+            .bind(addr.parse().unwrap())
+            .launch::<LenPrefixedForward>()
+            .expect("launch failed");
+        wait_for_server(&addr);
+
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // Sizes: inside one provided buffer with the header, and several
+        // buffers' worth.
+        for (i, size) in [3000usize, 20000].into_iter().enumerate() {
+            for split in [false, true] {
+                let body: Vec<u8> = (0..size)
+                    .map(|b| (b as u32).wrapping_mul(2654435761).wrapping_add(i as u32) as u8)
+                    .collect();
+                let got = forward_round_trip(&mut stream, &bodies, &body, split);
+                assert!(
+                    got == body,
+                    "cap={cap:?} size={size} split={split}: backend got {} bytes, {} \
+                     (first mismatch at {:?})",
+                    got.len(),
+                    if got.len() == body.len() {
+                        "same length"
+                    } else {
+                        "wrong length"
+                    },
+                    got.iter().zip(&body).position(|(a, b)| a != b),
+                );
+            }
+        }
+        drop(stream);
+        shutdown.shutdown();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+    }
+}

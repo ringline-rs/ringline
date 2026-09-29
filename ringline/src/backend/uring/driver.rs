@@ -909,24 +909,35 @@ impl Driver {
         // If the forward throttled its recv (hold reached `forward_hold_cap`), its
         // multishot was cancelled. Re-arm it so the connection's subsequent
         // `with_data`/`with_bytes` reads resume — the domain is now the default,
-        // so newly received bytes land in the accumulator. If the recv is still
-        // armed (its ECANCELED not yet observed, or it was never throttled),
-        // nothing to do. On a re-arm failure the connection is left unarmed; the
-        // caller's next read errors and closes it (standard recovery).
+        // so newly received bytes land in the accumulator. If the throttle-cancel
+        // is still in flight, the re-arm has to wait for its ECANCELED, so the
+        // throttle flag is left set and that branch does it. On a re-arm failure
+        // the connection is left unarmed; the caller's next read errors and
+        // closes it (standard recovery).
         self.forward_recv_active[conn_index as usize] = false;
         if self.forward_hold_throttled[conn_index as usize] {
-            self.forward_hold_throttled[conn_index as usize] = false;
             let armed = self
                 .connections
                 .get(conn_index)
                 .is_some_and(|c| c.recv_multishot_armed);
+            // Still armed means the throttle-cancel's ECANCELED has not been
+            // observed yet, so the re-arm cannot happen here — two multishots
+            // with the same user_data must never overlap. Leave the flag set
+            // and let `maybe_rearm_throttled_forward`, which the ECANCELED
+            // branch calls, do it: clearing the flag here instead left the
+            // connection unarmed for good, because that re-arm is gated on the
+            // flag and nothing re-arms a connection that is no longer
+            // forwarding. The next `with_data` then parked forever.
+            if armed {
+                return ok;
+            }
+            self.forward_hold_throttled[conn_index as usize] = false;
             let open = self
                 .connections
                 .get(conn_index)
                 .is_some_and(|c| matches!(c.recv_mode, RecvMode::Multi));
             let generation = self.connections.generation(conn_index);
-            if !armed
-                && open
+            if open
                 && self
                     .ring
                     .submit_multishot_recv(conn_index, generation)

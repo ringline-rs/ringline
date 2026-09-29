@@ -1120,13 +1120,48 @@ impl ConnCtx {
     #[cfg(has_io_uring)]
     pub fn forward_to<'a>(&self, sink: &'a SinkFd<'a>, len: usize) -> ForwardToFuture<'a> {
         with_state(|driver, _executor| {
-            driver.recv_domain[self.conn_index as usize] =
-                crate::recv::domain::RecvDomain::Segmented;
+            let idx = self.conn_index as usize;
+            // A stale handle must not touch the slot's new occupant: flipping it
+            // into the segmented domain and marking it a forwarder would strand
+            // its bytes where its own `with_data` reader never looks. The
+            // future's first poll sees the same mismatch and resolves.
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
+            driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
             // Mark this connection as a forwarder so the recv handler applies the
             // `forward_hold_cap` throttle (bounded hold + TCP-window backpressure)
             // — distinguishing it from a pure Mode B segment reader that also uses
             // the `Segmented` domain but is drained by a `SegmentReader`.
-            driver.forward_recv_active[self.conn_index as usize] = true;
+            driver.forward_recv_active[idx] = true;
+            // Bytes already buffered are the front of the forward. The length a
+            // forward needs comes from a header, and reading a header means
+            // `with_data`, so the body bytes that arrived with the header are
+            // sitting in the accumulator. A forward only reads the hold, so
+            // leaving them there skipped them: later bytes went out as the
+            // body, and the skipped ones surfaced after the forward settled.
+            if !driver.accumulators.is_empty(self.conn_index) {
+                let buffered = driver.accumulators.take_frozen(self.conn_index);
+                driver.segment_hold[idx].push_front(crate::backend::HeldRecvBuf::Owned(buffered));
+            }
+            // The plaintext path holds the most recent provided buffer in
+            // place rather than copying it (the zero-copy `with_data` read),
+            // so buffered bytes can be sitting *behind* an empty accumulator.
+            // They are the newest, hence the back of the hold. Missing them
+            // stranded the buffer for good: a forward never reads this slot,
+            // and the bid it pins is only replenished when the slot is
+            // cleared, so the ring lost an entry too.
+            if let Some(pending) = driver.pending_recv_bufs[idx].take() {
+                // SAFETY: the slot owns an unreplenished provided buffer with
+                // `len` bytes received into it; taking the slot transfers that
+                // ownership here, and the bid goes back at the same moment the
+                // copy is made.
+                let data = unsafe { std::slice::from_raw_parts(pending.ptr, pending.len as usize) };
+                driver.segment_hold[idx].push_back(crate::backend::HeldRecvBuf::Owned(
+                    bytes::Bytes::copy_from_slice(data),
+                ));
+                driver.pending_replenish.push(pending.bid);
+            }
         });
         ForwardToFuture {
             conn_index: self.conn_index,
