@@ -101,26 +101,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- io_uring: `ConnCtx::forward_held` pushed its recv-forward `sendmsg` straight
-  to the ring without looking at the connection's send state, so echoed bytes
-  could overtake a plain send that was queued, in flight or parked for retry,
-  or an active send chain. **Behaviour change:** it now returns `WouldBlock`
-  while any earlier send is outstanding, before allocating anything; the held
-  buffers stay in the hold and the next call forwards them. Await the earlier
-  send first. A handler that only forwards, awaiting each forward before the
-  next, is unaffected.
-
-- io_uring: plain sends and IO_LINK send chains could overtake each other on
-  one connection, putting bytes on the wire out of order. io_uring does not
-  order independent SQEs, and neither path looked at the other: a plain send
-  issued while a chain was in flight was pushed straight to the ring, and a
-  chain issued while plain sends were queued, in flight or parked for retry
-  was pushed ahead of them. A plain send now queues behind an active chain
-  (chain completion already submitted the queue). **Behaviour change:** a
-  chain started while earlier sends are still in flight -- plain, or another
-  chain -- is refused with `WouldBlock` instead of reordering, and releases
-  what it built. Await the earlier send, then retry.
-
 - Copied sends can no longer transmit a prefix and then fail. Pool slots for
   a multi-chunk copy send are reserved up front, so the send is admitted
   whole or not at all, and a submission queue that is still full after a
@@ -195,6 +175,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the awaiting `send`; persistent starvation fails the waiter and closes the
   connection, like a write error. Series PR 4 of #318 (design:
   `docs/copied-send-reservation-design.md`).
+
+## [0.6.6] - 2026-09-29
+
+### Fixed
+
+- io_uring: a send that could not be pushed because the submission queue
+  was still full after a submit was thrown away. On an idle connection it
+  was released and the caller got `Err` -- under TLS after rustls had
+  already advanced its record sequence, so every later record failed
+  `bad_record_mac` at the peer. From a queued tail it was worse: the head
+  was popped before pushing, and on failure the head *and every queued send
+  behind it* were released, `in_flight` cleared and nobody woken, so the
+  prefix was on the wire, the rest silently lost, and the waiting send
+  future hung. TLS handshake responses, alerts and `close_notify` ignored
+  the error. The built send is now kept at the queue head and retried next
+  iteration; after two failed retries the waiter fails and the connection
+  closes (#376, parking half).
+
+- io_uring: `ConnCtx::forward_held` pushed its recv-forward `sendmsg` straight
+  to the ring without looking at the connection's send state, so echoed bytes
+  could overtake a plain send that was queued, in flight or parked for retry,
+  or an active send chain. **Behaviour change:** it now returns `WouldBlock`
+  while any earlier send is outstanding, before allocating anything; the held
+  buffers stay in the hold and the next call forwards them. Await the earlier
+  send first. A handler that only forwards, awaiting each forward before the
+  next, is unaffected.
+
+- io_uring: plain sends and IO_LINK send chains could overtake each other on
+  one connection, putting bytes on the wire out of order; parking widened the
+  window. A plain send now queues behind an active chain. **Behaviour
+  change:** a chain started while earlier sends are still in flight -- plain,
+  or another chain -- is refused with `WouldBlock` instead of reordering, and
+  releases what it built (#494).
 
 ## [0.6.5] - 2026-09-29
 

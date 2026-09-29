@@ -412,7 +412,9 @@ line are cut from it.
   3. Move the branch's `Unreleased` to `[X.Y.Z]`.
   4. Land it through a PR into the maintenance branch titled
      `release: vX.Y.Z`. The `release branches` ruleset requires PRs and
-     squash merges on `release/**`, as `main`'s does.
+     squash merges on `release/**`, as `main`'s does. Name the PR's head
+     branch outside `release/` (e.g. `prep/vX.Y.Z`): anything under
+     `release/` falls under the ruleset and cannot be deleted afterwards.
   5. Once the merge commit's CI is green, tag it by hand
      (`git tag -a vX.Y.Z -m "Release vX.Y.Z"`) and push the tag.
      `release.yml` publishes; `tag-release.yml` fires only on `main`, so
