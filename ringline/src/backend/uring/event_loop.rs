@@ -5092,9 +5092,8 @@ mod tests {
             "slot reuse must bump the generation"
         );
 
-        // The new occupant has a task parked on recv and no recorded error.
+        // The new occupant has a task parked on recv.
         el.executor.recv_waiters[conn_index as usize] = true;
-        el.executor.recv_errors[conn_index as usize] = None;
 
         // The previous occupant's uncancelled multishot finally reports: a
         // terminal error completion (no `F_MORE`).
@@ -5106,17 +5105,12 @@ mod tests {
             .connections
             .get(conn_index)
             .expect("the new occupant must still hold the slot");
+        // On 0.6 the error path wakes the recv waiter and closes: close
+        // sets `recv_mode = Closed` (main tracks this as `close_requested`,
+        // `ReadHalf` and `recv_errors`).
         assert!(
-            !conn.close_requested(),
+            !matches!(conn.recv_mode, crate::connection::RecvMode::Closed),
             "stale completion closed the new occupant"
-        );
-        assert!(
-            matches!(conn.read, ReadHalf::Open),
-            "stale completion poisoned the new occupant's read half"
-        );
-        assert!(
-            el.executor.recv_errors[conn_index as usize].is_none(),
-            "stale completion recorded a recv error on the new occupant"
         );
         assert!(
             el.executor.recv_waiters[conn_index as usize],

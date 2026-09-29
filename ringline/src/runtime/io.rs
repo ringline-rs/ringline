@@ -3110,13 +3110,12 @@ impl<F: FnMut(&SegChain<'_>) -> SegConsumed + Unpin> Future for WithSegmentsFutu
                 return Poll::Ready(Ok(0));
             }
 
+            // Enter the segmented domain at first poll, behind the generation
+            // check above, not eagerly at call time: a stale handle must not
+            // flip another connection's delivery domain (#437). (main also
+            // refuses here while a `SegmentReader` is live; 0.6 has no such
+            // tracking, and never refused.)
             if !self.entered {
-                // A live `SegmentReader` owns the hold; handing the same
-                // buffers to a second consumer would double-deliver them.
-                if driver.segment_reader_live[idx] {
-                    self.f.take();
-                    return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY)));
-                }
                 driver.recv_domain[idx] = crate::recv::domain::RecvDomain::Segmented;
                 self.entered = true;
             }
