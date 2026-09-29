@@ -101,15 +101,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- A `SendMsgZc` send that completed with an error or a zero result released
-  its send-slab entry at once, but the kernel still posts a notification for
-  it: `IORING_CQE_F_MORE` is set on error (`io_sendrecv_fail`) and on a zero
-  result (`io_sendmsg_zc`). If the next send reused the entry first, the late
-  notification decremented the new send's count -- a "notification underflow"
-  panic in debug, and in release an entry that wraps or is released while the
-  kernel may still hold the new send's pages. Notifications are now expected
-  exactly when the main CQE carries `IORING_CQE_F_MORE` (#487).
-
 - Copied sends can no longer transmit a prefix and then fail. Pool slots for
   a multi-chunk copy send are reserved up front, so the send is admitted
   whole or not at all, and a submission queue that is still full after a
@@ -184,6 +175,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the awaiting `send`; persistent starvation fails the waiter and closes the
   connection, like a write error. Series PR 4 of #318 (design:
   `docs/copied-send-reservation-design.md`).
+
+## [0.6.4] - 2026-09-29
+
+A patch release from 0.6.3 carrying fixes from `main`. The breaking changes
+on `main` since 0.6.3 are not included; they are for 0.7.0.
+
+### Security
+
+- The `rustls` floor is raised to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3
+  handshake messages incorrectly accepted across encryption level
+  boundaries). Downstream resolvers respect the pin, so they cannot land on
+  a vulnerable 0.23.x through ringline (#399).
+
+### Fixed
+
+- A `SendMsgZc` send that completed with an error or a zero result released
+  its send-slab entry at once, but the kernel still posts a notification for
+  it: `IORING_CQE_F_MORE` is set on error (`io_sendrecv_fail`) and on a zero
+  result (`io_sendmsg_zc`). If the next send reused the entry first, the late
+  notification decremented the new send's count -- a "notification underflow"
+  panic in debug, and in release an entry that wraps or is released while the
+  kernel may still hold the new send's pages. Notifications are now expected
+  exactly when the main CQE carries `IORING_CQE_F_MORE` (#487, #488).
+
+- A standalone task that ran to completion leaked its task-slab slot, so
+  after `standalone_task_capacity` completions `spawn()` returned `None` for
+  the life of the worker, and callers fell back to running work inline on
+  the event loop. A slot now reads as polling, not empty, while its future
+  is out, so `remove()` frees a finished task's slot and stays idempotent
+  for one that never had a task (#478).
 
 ## [0.6.3] - 2026-09-09
 
