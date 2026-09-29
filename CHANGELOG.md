@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-09-29
+
 ### Fixed
+
+- io_uring: a segmented reader (`segments()`, `recv_owned_segment()`)
+  installed after data had arrived never saw that data: the bytes sat in
+  the accumulator, which a segmented reader does not look at, and the
+  reader parked forever. Entering the segmented domain now adopts them,
+  and a stranded-bytes check at the top of each segmented poll recovers
+  any left behind later (counted by the `segment_stranded_adopted` pool
+  metric).
+  Under TLS the handshake makes this race easy to lose; it is the
+  intermittent `tls_echo` hang (#423, fixed by #425 on main).
 
 - io_uring: `forward_to` skipped bytes that were already buffered when the
   forward started. The length a forward needs comes from a header read with
