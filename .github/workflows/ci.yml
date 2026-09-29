@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release/** are maintenance branches (e.g. release/0.6.x): patch releases
+    # are cut and tagged there by hand, so CI must run on them too.
+    branches: [main, 'release/**']
   pull_request:
-    branches: [main]
+    # Backports reach release/** through PRs, and need the same gate.
+    branches: [main, 'release/**']
   workflow_call:
   schedule:
     # Daily at 13:17 UTC so the RustSec advisory database catches

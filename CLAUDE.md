@@ -382,3 +382,39 @@ Use the shared `release` skill from the custom-skills MCP server (it discovers t
 **Per-crate releases** (`ringline-<crate>-vX.Y.Z` tags, used for a satellite crate on its own cadence) are not tagged by the shared workflow. Bump the crate, land the PR, then tag the merge commit by hand and push the tag to `ringline-rs/ringline`; `release.yml` publishes on the tag.
 
 Required secrets: `RELEASE_TOKEN` (PAT for tagging), `CARGO_REGISTRY_TOKEN` (crates.io).
+
+### Maintenance branches and backports
+
+`main` is development; the next release from it may be breaking. A released
+line that still needs fixes gets a **maintenance branch**, `release/<major>.<minor>.x`
+(e.g. `release/0.6.x`, cut from the `v0.6.3` tag), and patch releases for that
+line are cut from it.
+
+- **Fix `main` first, then backport.** Land the fix on `main`, then
+  `git cherry-pick -x <merge commit>` onto a branch off `release/X.Y.x` and open
+  a PR into `release/X.Y.x`. Fixes flow one way, from `main` to the maintenance
+  lines, never back. `-x` records the source commit.
+- **Adapt a conflict to the old line; don't pull in the new one.** A conflict
+  usually means `main` has moved on around the fix. Keep the old line's code
+  and apply only what the fix changes. Drop tests that exercise APIs the line
+  doesn't have, and keep the fix's own tests. Say what was adapted in the PR.
+- **Patch-sized only.** A fix that needs a series of `main`'s changes
+  underneath it (for example the bounded-send series behind #376) is not a
+  backport. Write a targeted fix for the old line, or leave it to the next
+  release.
+- **No breaking changes.** A maintenance line takes fixes and dependency floors
+  (security pins), never a `!:` change.
+- **CI runs on `release/**`** for pushes and PRs (`ci.yml`). Since io_uring code
+  can't be built on macOS, a backport's CI is its verification.
+- **Releasing a patch** (`vX.Y.Z` from `release/X.Y.x`):
+  1. Bump the changed crate(s) only.
+  2. Update `Cargo.lock`.
+  3. Move the branch's `Unreleased` to `[X.Y.Z]`.
+  4. Commit as `release: vX.Y.Z` on the maintenance branch.
+  5. Once CI is green, tag that commit by hand (`git tag -a vX.Y.Z -m "Release vX.Y.Z"`) and push the tag. `release.yml` publishes; `tag-release.yml` fires only on `main`, so nothing on a maintenance branch tags itself.
+- **Record it on `main` afterwards:** add the `[X.Y.Z]` section to `main`'s
+  CHANGELOG as shipped, drop its entries from `main`'s `Unreleased`, and
+  move `ringline` to the next patch version if `main` was on the one just
+  published (as #490 did for 0.6.4).
+- **Never force-push a maintenance branch** once a release has been tagged
+  from it.
