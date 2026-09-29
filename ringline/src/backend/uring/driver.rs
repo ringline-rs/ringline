@@ -421,6 +421,13 @@ pub(crate) struct Driver {
     pub(crate) pending_recv_forward_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
+    /// Connections whose queued head send could not be pushed (SQ still
+    /// full after submit): (conn_index, generation, attempts). Drained each
+    /// tick by `drain_send_retries`; the entry stays at the queue head with
+    /// `in_flight = true` meanwhile, so stream order and the close deferral
+    /// are preserved. Two failed attempts fail the send waiter and close the
+    /// connection, mirroring `pending_copy_retries`.
+    pub(crate) pending_send_retries: Vec<(u32, u32, u8)>,
     /// Connections whose close_pending was set from a DriverCtx callback;
     /// the event loop re-drives `try_finalize_close` for each.
     pub(crate) pending_finalize_closes: Vec<u32>,
@@ -433,6 +440,7 @@ pub(crate) struct Driver {
     pub(crate) send_pollout_retry_scratch: Vec<(u32, u32, u16, u8, bool)>,
     pub(crate) coalesced_retry_scratch: Vec<(u32, u32, u16, u8)>,
     pub(crate) recv_forward_retry_scratch: Vec<(u32, u32, u16, u8)>,
+    pub(crate) send_retry_scratch: Vec<(u32, u32, u8)>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
     /// NVMe device tracking table. `None` when NVMe is not configured.
@@ -686,12 +694,14 @@ impl Driver {
             pending_coalesced_retries: Vec::new(),
             pending_recv_forward_retries: Vec::new(),
             pending_close_retries: Vec::new(),
+            pending_send_retries: Vec::new(),
             pending_finalize_closes: Vec::new(),
             zc_retry_scratch: Vec::new(),
             copy_retry_scratch: Vec::new(),
             send_pollout_retry_scratch: Vec::new(),
             coalesced_retry_scratch: Vec::new(),
             recv_forward_retry_scratch: Vec::new(),
+            send_retry_scratch: Vec::new(),
             udp_sockets,
             nvme_devices: config
                 .nvme
@@ -802,6 +812,7 @@ impl Driver {
             fs_cmd_slab: &mut self.fs_cmd_slab,
             fs_fd_base: self.fs_fd_base,
             pending_finalize_closes: &mut self.pending_finalize_closes,
+            pending_send_retries: &mut self.pending_send_retries,
             close_notify_timeout: self.close_notify_timeout,
             next_disk_io_seq: &mut self.next_disk_io_seq,
         }
@@ -826,8 +837,10 @@ impl Driver {
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
+            &mut self.pending_replenish,
         );
         state.in_flight = false;
+        state.parked = false;
         state.close_pending = false;
         state.close_submitted = false;
         state.shutdown_pending = false;
@@ -1118,10 +1131,11 @@ impl Driver {
         // as parallel SQEs here would repeat "mistake (b)" above.
         if !state.queue.is_empty() {
             state.in_flight = true;
-            if !self.submit_next_queued(conn_index) {
-                // SQ was full — submit_next_queued released the queue and
-                // already fired try_finalize_close.
-            }
+            // A `false` here means the head was parked (SQ still full):
+            // it stays queued with `in_flight = true`, `drain_send_retries`
+            // re-pushes it, and `close_pending` keeps the Close deferred
+            // behind it until it drains or the retry cap fails the send.
+            self.submit_next_queued(conn_index);
         } else {
             self.try_finalize_close(conn_index);
         }
@@ -1238,9 +1252,11 @@ impl Driver {
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
+            &mut self.pending_replenish,
         );
         state.in_flight = false;
         state.shutdown_pending = false;
+        state.parked = false;
         self.chain_table.cancel(conn_index);
         self.try_finalize_close(conn_index);
     }
@@ -1284,10 +1300,28 @@ impl Driver {
         true
     }
 
-    /// Pop the next queued send for a connection and submit it to the ring.
-    /// Returns true if a send was submitted, false if the queue was empty
-    /// (in which case in_flight is set to false).
+    /// Submit the next queued send for a connection to the ring.
+    ///
+    /// Returns `true` if an SQE was pushed (the entries it covers are popped
+    /// only then). Returns `false` with an empty queue when the connection
+    /// went idle: `in_flight` is cleared and a deferred shutdown/close fires.
+    /// Returns `false` with a non-empty queue when the head could not be
+    /// pushed (SQ still full after submit): the entry is *parked* — it stays
+    /// at the queue head, `in_flight` stays `true`, and the connection is on
+    /// `pending_send_retries` for `drain_send_retries` to re-push next
+    /// iteration. Nothing is dropped or released on that path (Domain
+    /// Invariant 7); persistent starvation past the retry cap fails the
+    /// waiter and closes the connection there.
     pub(crate) fn submit_next_queued(&mut self, conn_index: u32) -> bool {
+        self.submit_next_queued_inner(conn_index, 0)
+    }
+
+    /// [`submit_next_queued`](Self::submit_next_queued) with the attempt
+    /// count to record if the push fails again. `drain_send_retries` passes
+    /// `attempts + 1` so a re-park carries the incremented count instead of
+    /// restarting at zero; every other caller goes through the public
+    /// wrapper with `0`.
+    pub(crate) fn submit_next_queued_inner(&mut self, conn_index: u32, attempts: u8) -> bool {
         use crate::buffer::send_slab::MAX_IOVECS;
 
         let ci = conn_index as usize;
@@ -1355,30 +1389,31 @@ impl Driver {
                 total,
                 end_of_send,
             ) {
-                for _ in 0..n {
-                    self.send_queues[ci].queue.pop_front();
-                }
                 match self
                     .ring
                     .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
                 {
-                    Ok(()) => return true,
-                    Err(_) => {
-                        // SQ full — release the coalesced slab entry + its pool
-                        // slots, drain the rest of the queue, clear in_flight.
-                        for &s in &pool_slots[..n] {
-                            self.send_copy_pool.release(s);
+                    Ok(()) => {
+                        // Pushed: the slab entry now owns the run's pool
+                        // slots (released by the coalesced completion).
+                        for _ in 0..n {
+                            self.send_queues[ci].queue.pop_front();
                         }
+                        self.send_queues[ci].parked = false;
+                        return true;
+                    }
+                    Err(_) => {
+                        // SQ still full after submit. `allocate_coalesced`
+                        // only *recorded* the pool slots in the slab entry;
+                        // the `BuiltSend`s still at the queue head own them.
+                        // Release just the slab entry and park: the run stays
+                        // queued in order, `in_flight` stays true, and
+                        // `drain_send_retries` re-pushes next iteration.
                         self.send_slab.release(slab_idx);
-                        let state = &mut self.send_queues[ci];
-                        Self::release_queued_sends(
-                            &mut state.queue,
-                            &mut self.send_slab,
-                            &mut self.send_copy_pool,
-                        );
-                        state.in_flight = false;
-                        state.shutdown_pending = false;
-                        self.try_finalize_close(conn_index);
+                        self.send_queues[ci].parked = true;
+                        let generation = self.connections.generation(conn_index);
+                        self.pending_send_retries
+                            .push((conn_index, generation, attempts));
                         return false;
                     }
                 }
@@ -1387,122 +1422,96 @@ impl Driver {
         }
 
         let state = &mut self.send_queues[ci];
-        match state.queue.pop_front() {
-            Some(built) => {
-                let pool_slot = built.pool_slot;
-                let slab_idx = built.slab_idx;
-                match unsafe { self.ring.push_sqe(built.entry) } {
-                    Ok(()) => true,
-                    Err(_) => {
-                        // SQ full — release this entry and drain remaining queue.
-                        Self::release_built_resources(
-                            &mut self.send_slab,
-                            &mut self.send_copy_pool,
-                            pool_slot,
-                            slab_idx,
-                        );
-                        Self::release_queued_sends(
-                            &mut state.queue,
-                            &mut self.send_slab,
-                            &mut self.send_copy_pool,
-                        );
-                        state.in_flight = false;
-                        state.shutdown_pending = false;
-                        // If a deferred close was pending, fire it now that
-                        // the queue is drained.
-                        self.try_finalize_close(conn_index);
-                        false
-                    }
+        if !state.queue.is_empty() {
+            // Peek, don't pop: on a push failure the entry must stay at the
+            // head so the retry re-pushes the same bytes in the same order.
+            let pushed = {
+                let front = &state.queue[0];
+                unsafe { self.ring.push_sqe(&front.entry) }
+            };
+            return match pushed {
+                Ok(()) => {
+                    state.queue.pop_front();
+                    state.parked = false;
+                    true
                 }
-            }
-            None => {
-                state.in_flight = false;
-                // Submit deferred shutdown_write now that the send queue is drained.
-                if state.shutdown_pending {
-                    state.shutdown_pending = false;
-                    let _ = self.ring.submit_shutdown(conn_index);
+                Err(_) => {
+                    // SQ still full after submit: park at the head. Nothing
+                    // is released and `in_flight` stays true; see
+                    // `drain_send_retries` for the retry and the cap.
+                    state.parked = true;
+                    let generation = self.connections.generation(conn_index);
+                    self.pending_send_retries
+                        .push((conn_index, generation, attempts));
+                    false
                 }
-                // Fire a deferred close now that nothing is in flight and the
-                // queue is empty. The ZC and recv-forward completion paths
-                // reach here without a note_send_finalized call, so without
-                // this a close_pending connection would leak its fd and slot.
-                self.try_finalize_close(conn_index);
-                false
-            }
+            };
         }
+
+        // Queue empty: the connection is idle.
+        state.in_flight = false;
+        state.parked = false;
+        // Submit deferred shutdown_write now that the send queue is drained.
+        if state.shutdown_pending {
+            state.shutdown_pending = false;
+            let _ = self.ring.submit_shutdown(conn_index);
+        }
+        // Fire a deferred close now that nothing is in flight and the
+        // queue is empty. The ZC and recv-forward completion paths
+        // reach here without a note_send_finalized call, so without
+        // this a close_pending connection would leak its fd and slot.
+        self.try_finalize_close(conn_index);
+        false
     }
 
-    /// Submit a built send SQE or queue it if a send is already in-flight.
+    /// Submit a built send SQE, or queue it if a send is already in flight.
     ///
     /// This is the Driver-level equivalent of `DriverCtx::submit_or_queue`,
-    /// used by zero-copy forward paths that bypass DriverCtx.
+    /// used by zero-copy forward paths that bypass DriverCtx, and carries the
+    /// same contract: infallible, the entry is committed to the connection's
+    /// stream on return. If the push fails (SQ still full after submit) the
+    /// entry is parked at the head of the (empty) queue with
+    /// `in_flight = true` and the connection is registered on
+    /// `pending_send_retries`; `drain_send_retries` re-pushes it. A parked
+    /// `SendRecvBuf` keeps its provided buffer exactly as a queued one does —
+    /// the bid is replenished by its completion, not by the caller.
     pub(crate) fn submit_or_queue_send(
         &mut self,
         conn_index: u32,
         built: crate::handler::BuiltSend,
-    ) -> io::Result<()> {
+    ) {
         let state = &mut self.send_queues[conn_index as usize];
         if state.in_flight {
             state.queue.push_back(built);
-            Ok(())
-        } else {
-            // Destructure instead of cloning the 64-byte SQE: the fields are
-            // only needed on the error branch.
-            let crate::handler::BuiltSend {
-                entry,
-                pool_slot,
-                slab_idx,
-                total_len: _,
-            } = built;
-            match unsafe { self.ring.push_sqe(entry) } {
-                Ok(()) => {
-                    state.in_flight = true;
-                    Ok(())
-                }
-                Err(e) => {
-                    // For SendRecvBuf, pool_slot and slab_idx are u16::MAX (no resources).
-                    // The caller is responsible for replenishing the recv buffer bid on error.
-                    if slab_idx != u16::MAX {
-                        let pool_slot = self.send_slab.release(slab_idx);
-                        if pool_slot != u16::MAX {
-                            self.send_copy_pool.release(pool_slot);
-                        }
-                    } else if pool_slot != u16::MAX {
-                        self.send_copy_pool.release(pool_slot);
-                    }
-                    Err(e)
-                }
+            return;
+        }
+        match unsafe { self.ring.push_sqe(&built.entry) } {
+            Ok(()) => state.in_flight = true,
+            Err(_) => {
+                // SQ still full after submit: park at the head and retry next
+                // iteration (see `drain_send_retries`). Nothing is dropped.
+                state.queue.push_back(built);
+                state.in_flight = true;
+                state.parked = true;
+                let generation = self.connections.generation(conn_index);
+                self.pending_send_retries.push((conn_index, generation, 0));
             }
         }
     }
 
     /// Queue a batch of built sends in order through the per-connection
-    /// send queue. If one fails to submit (SQ full on the first while
-    /// nothing is in flight — submit_or_queue_send releases that entry's
-    /// own resources), the remaining entries' pool slots are released here
-    /// so nothing leaks, and the error is returned.
+    /// send queue. Infallible: `submit_or_queue_send` parks under SQ
+    /// pressure rather than failing, so every entry is committed in order
+    /// and nothing needs releasing here. `sends` is drained, not consumed,
+    /// so the caller can keep the `Vec`'s allocation as scratch.
     pub(crate) fn queue_built_sends(
         &mut self,
         conn_index: u32,
         sends: &mut Vec<crate::handler::BuiltSend>,
-    ) -> io::Result<()> {
-        let mut it = sends.drain(..);
-        while let Some(built) = it.next() {
-            if let Err(e) = self.submit_or_queue_send(conn_index, built) {
-                for rest in it {
-                    if rest.slab_idx != u16::MAX {
-                        let pool_slot = self.send_slab.release(rest.slab_idx);
-                        if pool_slot != u16::MAX {
-                            self.send_copy_pool.release(pool_slot);
-                        }
-                    } else if rest.pool_slot != u16::MAX {
-                        self.send_copy_pool.release(rest.pool_slot);
-                    }
-                }
-                return Err(e);
-            }
+    ) {
+        for built in sends.drain(..) {
+            self.submit_or_queue_send(conn_index, built);
         }
-        Ok(())
     }
 
     /// Drain and release all queued sends for a connection.
@@ -1512,8 +1521,10 @@ impl Driver {
             &mut state.queue,
             &mut self.send_slab,
             &mut self.send_copy_pool,
+            &mut self.pending_replenish,
         );
         state.in_flight = false;
+        state.parked = false;
         // Abandon any partially-accumulated logical send so the next one
         // starts from zero.
         state.acked_bytes = 0;
@@ -1523,12 +1534,26 @@ impl Driver {
     }
 
     /// Release all entries from a send queue.
+    ///
+    /// A queued `SendRecvBuf` entry (recv-buffer forward / direct echo) owns
+    /// neither a pool slot nor a slab entry; it owns the provided recv buffer
+    /// whose bid is the SQE's payload. No CQE will ever replenish it, so the
+    /// bid is recovered from the entry's user_data here, exactly as the
+    /// completion handler would have done.
     pub(crate) fn release_queued_sends(
         queue: &mut VecDeque<BuiltSend>,
         send_slab: &mut InFlightSendSlab,
         send_copy_pool: &mut SendCopyPool,
+        pending_replenish: &mut Vec<u16>,
     ) {
         for built in queue.drain(..) {
+            if built.pool_slot == u16::MAX && built.slab_idx == u16::MAX {
+                let ud = crate::completion::UserData(built.entry.get_user_data());
+                if ud.tag() == Some(crate::completion::OpTag::SendRecvBuf) {
+                    pending_replenish.push(ud.payload() as u16);
+                }
+                continue;
+            }
             Self::release_built_resources(
                 send_slab,
                 send_copy_pool,

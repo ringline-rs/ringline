@@ -305,6 +305,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_coalesced_retries();
             self.drain_recv_forward_retries();
             self.drain_copy_retries();
+            self.drain_send_retries();
             self.drain_close_retries();
             self.drain_send_pollout_retries();
             self.driver.tick_count += 1;
@@ -1197,7 +1198,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // close below.
                 if !self.driver.tls_out_scratch.is_empty() {
                     let mut sends = std::mem::take(&mut self.driver.tls_out_scratch);
-                    let _ = self.driver.queue_built_sends(conn_index, &mut sends);
+                    self.driver.queue_built_sends(conn_index, &mut sends);
                     self.driver.tls_out_scratch = sends;
                 }
 
@@ -1379,10 +1380,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 };
                 self.driver.send_recv_buf_original_lens[conn_index as usize] = bytes_received;
                 self.driver.send_recv_buf_remaining[conn_index as usize] = bytes_received;
-                if self.driver.submit_or_queue_send(conn_index, built).is_err() {
-                    // SQ full — replenish and give up on this echo.
-                    self.driver.pending_replenish.push(bid);
-                }
+                // Infallible: under SQ pressure the echo is parked at the queue
+                // head and retried, holding its provided buffer exactly as a
+                // queued echo does; the bid is replenished by its completion.
+                self.driver.submit_or_queue_send(conn_index, built);
                 // Do NOT call wake_recv here. DirectEchoFuture only needs to
                 // be woken on connection close (handled by the result <= 0 path
                 // above), not on every incoming buffer.
@@ -2644,7 +2645,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .build()
                 .user_data(new_ud.raw());
 
-                if unsafe { self.driver.ring.push_sqe(entry) }.is_err() {
+                if unsafe { self.driver.ring.push_sqe(&entry) }.is_err() {
                     // SQ full — replenish and give up.
                     self.driver.pending_replenish.push(bid);
                     self.driver.submit_next_queued(conn_index);
@@ -2966,7 +2967,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             );
             if !self.driver.tls_out_scratch.is_empty() {
                 let mut sends = std::mem::take(&mut self.driver.tls_out_scratch);
-                let _ = self.driver.queue_built_sends(conn_index, &mut sends);
+                self.driver.queue_built_sends(conn_index, &mut sends);
                 self.driver.tls_out_scratch = sends;
             }
             if !flushed {
@@ -3986,6 +3987,60 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.copy_retry_scratch.clear();
     }
 
+    /// Re-push queued sends whose head could not be submitted (SQ full).
+    ///
+    /// The entry waited at its queue head with `in_flight = true`, so the
+    /// connection's stream order is intact and a requested close stays
+    /// deferred behind it. Two failed attempts convert persistent starvation
+    /// into a terminal connection error — release the queue, fail the send
+    /// waiter, wake the reader, close — mirroring `drain_copy_retries`, so a
+    /// connection is never left open with a parked send nobody will push.
+    fn drain_send_retries(&mut self) {
+        if self.driver.pending_send_retries.is_empty() {
+            return;
+        }
+        std::mem::swap(
+            &mut self.driver.pending_send_retries,
+            &mut self.driver.send_retry_scratch,
+        );
+        for idx in 0..self.driver.send_retry_scratch.len() {
+            let (conn_index, generation, attempts) = self.driver.send_retry_scratch[idx];
+            // Connection closed or reused, or its Close already submitted:
+            // the close path released the queue, so there is nothing to push.
+            if self.driver.connections.get(conn_index).is_none()
+                || self.driver.connections.generation(conn_index) != generation
+                || self.close_submitted(conn_index)
+            {
+                continue;
+            }
+            // Nothing parked any more — the queue was released, or another
+            // path (a completed send chain) already pushed the head: the
+            // entry is stale, and pushing now would put a second SQE on the
+            // stream alongside the one in flight.
+            let state = &self.driver.send_queues[conn_index as usize];
+            if !state.parked || state.queue.is_empty() {
+                continue;
+            }
+            if attempts >= 2 {
+                // Give up: release the parked entry and everything behind it,
+                // fail the waiter and close so the connection isn't left open
+                // with a hole in its byte stream.
+                self.driver.drain_conn_send_queue(conn_index);
+                let err = io::Error::other("max retries during send submit");
+                self.executor.wake_send(conn_index, Err(err));
+                self.executor.wake_recv(conn_index);
+                self.driver.close_connection(conn_index);
+                continue;
+            }
+            // Re-parks itself on `pending_send_retries` with `attempts + 1`
+            // if the push fails again; pops the head and returns true if it
+            // goes through.
+            self.driver
+                .submit_next_queued_inner(conn_index, attempts + 1);
+        }
+        self.driver.send_retry_scratch.clear();
+    }
+
     /// Retry Close submissions that failed (SQ was full). Entries are never
     /// dropped: the connection slot cannot be reused until the Close CQE
     /// runs handle_close, so giving up would leak the fd and the slot
@@ -4481,6 +4536,748 @@ mod tests {
         );
     }
 
+    /// A copied send wider than the free part of the pool must be refused
+    /// before anything is copied or queued. Before the up-front reservation,
+    /// the chunks that fit were queued (or pushed to the ring) and the caller
+    /// got `Err` for the tail, so a retry duplicated the prefix on the wire.
+    #[test]
+    fn send_wider_than_free_slots_commits_nothing() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(4, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+
+        // Hold three of the four slots so only one is free.
+        let (_f1, _, _) = el.driver.send_copy_pool.copy_in(b"a").unwrap();
+        let (_f2, _, _) = el.driver.send_copy_pool.copy_in(b"b").unwrap();
+        let (_f3, _, _) = el.driver.send_copy_pool.copy_in(b"c").unwrap();
+        assert_eq!(el.driver.send_copy_pool.free_count(), 1);
+
+        // 100 bytes over 64-byte slots needs 2 slots; only 1 is free.
+        let data = [0u8; 100];
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, &data)
+        };
+        let err = result.expect_err("send needing 2 slots with 1 free must fail");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+
+        // Nothing was taken from the pool and nothing was queued or pushed.
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            1,
+            "a refused send must not consume pool slots"
+        );
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.queue.is_empty(), "a refused send must queue nothing");
+        assert!(!state.in_flight, "a refused send must not push an SQE");
+    }
+
+    /// A send that needs more slots than the whole pool holds can never
+    /// succeed, so it is refused up front with `InvalidInput` instead of
+    /// committing the first `slot_count` chunks and failing on the rest.
+    #[test]
+    fn send_wider_than_the_pool_is_invalid_input() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(4, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        assert_eq!(el.driver.send_copy_pool.free_count(), 4);
+
+        // 300 bytes over 64-byte slots needs 5 slots; the pool has 4.
+        let data = [0u8; 300];
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, &data)
+        };
+        let err = result.expect_err("send wider than the pool must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            4,
+            "a refused send must not consume pool slots"
+        );
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.queue.is_empty(), "a refused send must queue nothing");
+        assert!(!state.in_flight, "a refused send must not push an SQE");
+    }
+
+    /// Guards the streaming rewrite: a multi-slot send that is admitted still
+    /// queues one entry per chunk, in order, with only the last chunk marked
+    /// end-of-send (so the waiter is woken once with the full count).
+    #[test]
+    fn multi_chunk_send_still_queues_all_chunks_in_order() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(6, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+
+        // Pool of 6, one slot held, a 4-slot send: the final free count then
+        // tells "reservation consumed" (1 free) from "reservation still
+        // outstanding" (0 free).
+        let (_held, _, _) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
+        assert_eq!(el.driver.send_copy_pool.free_count(), 5);
+
+        // With a send already in flight, every chunk is queued rather than
+        // pushed to the ring, so the whole logical send is inspectable.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        // 200 bytes over 64-byte slots: 64 + 64 + 64 + 8 = 4 chunks.
+        let data = [0u8; 200];
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, &data)
+        };
+        result.expect("a send that fits the free pool must be admitted");
+
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert_eq!(state.queue.len(), 4, "one queued entry per chunk");
+        let end_flags: Vec<bool> = state
+            .queue
+            .iter()
+            .map(|b| el.driver.send_copy_pool.is_end_of_send(b.pool_slot))
+            .collect();
+        assert_eq!(
+            end_flags,
+            vec![false, false, false, true],
+            "only the final chunk is end-of-send"
+        );
+        let lens: Vec<u32> = state.queue.iter().map(|b| b.total_len).collect();
+        assert_eq!(lens, vec![64, 64, 64, 8], "chunks queued in order");
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            1,
+            "every reserved slot was filled and the reservation fully consumed"
+        );
+    }
+
+    // ── SQ-pressure parking tests ──────────────────────────────────
+    //
+    // A built send whose SQE cannot be pushed (SQ still full after submit)
+    // is parked at its queue head with `in_flight = true` and re-pushed by
+    // `drain_send_retries`; it is never dropped. `Ring::force_push_failures`
+    // stands in for the full SQ.
+
+    /// Build a plain copied `Send` entry for `data` in a fresh pool slot, the
+    /// way `DriverCtx::send` does, so tests can hand entries to the queue.
+    fn built_copy_send(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+        data: &[u8],
+    ) -> crate::handler::BuiltSend {
+        let generation = el.driver.connections.generation(conn_index);
+        let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        let ud = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot, generation),
+        );
+        let entry = io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), ptr, len)
+            .flags(crate::completion::STREAM_SEND_FLAGS)
+            .build()
+            .user_data(ud.raw());
+        crate::handler::BuiltSend {
+            entry,
+            pool_slot: slot,
+            slab_idx: u16::MAX,
+            total_len: data.len() as u32,
+        }
+    }
+
+    /// Register one end of a socketpair as `conn_index`'s fixed file so a
+    /// real `Send` SQE on `Fixed(conn_index)` completes against it. Returns
+    /// both ends; the caller keeps them alive for the test's duration.
+    fn attach_socketpair(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+    ) -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use std::os::fd::AsRawFd;
+        let (ours, peer) = make_socketpair();
+        el.driver
+            .ring
+            .register_files_update(conn_index, &[ours.as_raw_fd()])
+            .expect("register_files_update failed");
+        (ours, peer)
+    }
+
+    /// Non-blocking read of up to `buf.len()` bytes from `fd`. Returns the
+    /// byte count, or `None` on `EAGAIN`/`EWOULDBLOCK`.
+    fn try_recv(fd: &std::os::fd::OwnedFd, buf: &mut [u8]) -> Option<usize> {
+        use std::os::fd::AsRawFd;
+        let n = unsafe {
+            libc::recv(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            assert!(
+                matches!(err.kind(), io::ErrorKind::WouldBlock),
+                "unexpected recv error: {err}"
+            );
+            return None;
+        }
+        Some(n as usize)
+    }
+
+    /// A push failure on an idle connection's first send parks the entry
+    /// (previously `DriverCtx::send` returned `Err`, and for TLS the
+    /// ciphertext — with rustls' sequence already advanced — was lost). The
+    /// next iteration's `drain_send_retries` pushes it and the bytes reach
+    /// the peer exactly once.
+    #[test]
+    fn first_push_failure_parks_and_completes_next_iteration() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
+
+        el.driver.ring.force_push_failures(1);
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, b"hello")
+        };
+        result.expect("SQ pressure must not surface as a send error");
+
+        // Parked: still queued, in_flight held, registered for retry with
+        // attempts 0, and the pool slot still owned by the queued entry.
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert_eq!(state.queue.len(), 1, "the entry must stay queued");
+            assert!(state.in_flight, "a parked send holds in_flight");
+        }
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 0)],
+            "the connection must be registered for one retry"
+        );
+        assert_eq!(el.driver.send_copy_pool.free_count(), 7);
+
+        // Next iteration: the retry pushes the parked entry.
+        el.drain_send_retries();
+        assert!(
+            el.driver.send_queues[conn_index as usize].queue.is_empty(),
+            "the retry must pop the entry once its SQE is pushed"
+        );
+        assert!(
+            el.driver.pending_send_retries.is_empty(),
+            "a successful retry must not re-register"
+        );
+        assert!(el.driver.send_queues[conn_index as usize].in_flight);
+
+        // Drive the send CQE through the real ring.
+        el.driver
+            .ring
+            .submit_and_wait(1)
+            .expect("submit_and_wait failed");
+        el.drain_completions();
+        assert!(
+            !el.driver.send_queues[conn_index as usize].in_flight,
+            "the send CQE must clear in_flight"
+        );
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            8,
+            "the send CQE must release the pool slot"
+        );
+
+        // The peer sees the bytes exactly once.
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            try_recv(&peer, &mut buf),
+            Some(5),
+            "peer must receive the send"
+        );
+        assert_eq!(&buf[..5], b"hello");
+        assert_eq!(
+            try_recv(&peer, &mut buf),
+            None,
+            "the parked send must not be delivered twice"
+        );
+    }
+
+    /// A push failure on the queued tail of a stream must leave the whole
+    /// queue intact and in order. Before parking, both failure arms released
+    /// the entry *and everything behind it*: the prefix was on the wire, the
+    /// tail vanished, and no waiter was ever woken.
+    #[test]
+    fn queued_tail_push_failure_parks_without_dropping_the_queue() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        // A send is in flight; behind it: one independent send (its own
+        // logical send, so end-of-send) and then the two chunks of a second
+        // logical send. The independent head keeps the coalescing run at
+        // one entry, so this exercises the single-entry push path.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let head = built_copy_send(&mut el, conn_index, b"X");
+        let chunk0 = built_copy_send(&mut el, conn_index, b"AA");
+        let chunk1 = built_copy_send(&mut el, conn_index, b"BBB");
+        el.driver
+            .send_copy_pool
+            .set_end_of_send(chunk0.pool_slot, false);
+        el.driver
+            .send_copy_pool
+            .set_end_of_send(chunk1.pool_slot, true);
+        let expected_slots = [head.pool_slot, chunk0.pool_slot, chunk1.pool_slot];
+        {
+            let q = &mut el.driver.send_queues[conn_index as usize].queue;
+            q.push_back(head);
+            q.push_back(chunk0);
+            q.push_back(chunk1);
+        }
+        assert_eq!(el.driver.send_copy_pool.free_count(), 5);
+
+        // The in-flight send completes and the CQE path tries to push the
+        // head; the SQ refuses.
+        el.driver.ring.force_push_failures(1);
+        assert!(
+            !el.driver.submit_next_queued(conn_index),
+            "a refused push must report false"
+        );
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            let slots: Vec<u16> = state.queue.iter().map(|b| b.pool_slot).collect();
+            assert_eq!(
+                slots,
+                expected_slots.to_vec(),
+                "queue must be intact and in order"
+            );
+            assert!(state.in_flight, "a parked send holds in_flight");
+        }
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            5,
+            "parking must not release any pool slot"
+        );
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 0)]
+        );
+
+        // The retry pushes the head; the two chunks behind it are untouched.
+        el.drain_send_retries();
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            let slots: Vec<u16> = state.queue.iter().map(|b| b.pool_slot).collect();
+            assert_eq!(
+                slots,
+                expected_slots[1..].to_vec(),
+                "only the head may be popped by the retry"
+            );
+            assert!(state.in_flight);
+        }
+        assert!(el.driver.pending_send_retries.is_empty());
+        assert_eq!(el.driver.send_copy_pool.free_count(), 5);
+    }
+
+    /// When the coalesced `sendmsg` for a run of chunks cannot be pushed,
+    /// only the slab entry is released. `allocate_coalesced` records the pool
+    /// slots in the entry but does not take ownership of them; the queued
+    /// `BuiltSend`s still do, and they stay queued.
+    #[test]
+    fn coalesced_push_failure_releases_only_the_slab_entry() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        // Three chunks of one logical send behind an in-flight send: a
+        // coalescable run of three.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let c0 = built_copy_send(&mut el, conn_index, b"aa");
+        let c1 = built_copy_send(&mut el, conn_index, b"bb");
+        let c2 = built_copy_send(&mut el, conn_index, b"cc");
+        el.driver
+            .send_copy_pool
+            .set_end_of_send(c0.pool_slot, false);
+        el.driver
+            .send_copy_pool
+            .set_end_of_send(c1.pool_slot, false);
+        el.driver.send_copy_pool.set_end_of_send(c2.pool_slot, true);
+        let expected_slots = [c0.pool_slot, c1.pool_slot, c2.pool_slot];
+        {
+            let q = &mut el.driver.send_queues[conn_index as usize].queue;
+            q.push_back(c0);
+            q.push_back(c1);
+            q.push_back(c2);
+        }
+        let slab_free = el.driver.send_slab.free_count();
+        assert_eq!(el.driver.send_copy_pool.free_count(), 5);
+
+        el.driver.ring.force_push_failures(1);
+        assert!(!el.driver.submit_next_queued(conn_index));
+
+        assert_eq!(
+            el.driver.send_slab.free_count(),
+            slab_free,
+            "the coalesced slab entry must be released on a refused push"
+        );
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            let slots: Vec<u16> = state.queue.iter().map(|b| b.pool_slot).collect();
+            assert_eq!(
+                slots,
+                expected_slots.to_vec(),
+                "the run must stay queued in order"
+            );
+            assert!(state.in_flight);
+        }
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            5,
+            "the queued entries still own their pool slots"
+        );
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 0)]
+        );
+
+        // The retry re-coalesces the run and pushes it: the queue drains
+        // into one slab entry.
+        el.drain_send_retries();
+        assert!(
+            el.driver.send_queues[conn_index as usize].queue.is_empty(),
+            "the retry must push the whole coalesced run"
+        );
+        assert_eq!(
+            el.driver.send_slab.free_count(),
+            slab_free - 1,
+            "the pushed run must hold one slab entry"
+        );
+        assert!(el.driver.pending_send_retries.is_empty());
+    }
+
+    /// Persistent SQ starvation is terminal for the connection, never a
+    /// silent drop: after two failed retries the parked queue is released,
+    /// the send waiter resolves `Err`, and the connection closes — the same
+    /// shape as `drain_copy_retries`' give-up.
+    #[test]
+    fn send_retry_cap_fails_the_waiter_and_closes() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        el.executor.send_waiters[conn_index as usize] = true;
+        el.executor.owner_task[conn_index as usize] = Some(conn_index);
+
+        // The initial push and both retries are refused.
+        el.driver.ring.force_push_failures(3);
+        let result = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, b"hello")
+        };
+        result.expect("SQ pressure must not surface as a send error");
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 0)]
+        );
+
+        // Retry 1 fails: re-parked with attempts 1.
+        el.drain_send_retries();
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 1)],
+            "a failed retry must re-park with the incremented attempt count"
+        );
+        assert_eq!(el.driver.send_queues[conn_index as usize].queue.len(), 1);
+        assert!(el.executor.io_results[conn_index as usize].is_none());
+
+        // Retry 2 fails: re-parked with attempts 2.
+        el.drain_send_retries();
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 2)]
+        );
+        assert_eq!(el.driver.send_queues[conn_index as usize].queue.len(), 1);
+        assert!(el.executor.io_results[conn_index as usize].is_none());
+
+        // Retry 3 hits the cap: give up.
+        el.drain_send_retries();
+        assert!(el.driver.pending_send_retries.is_empty());
+        match &el.executor.io_results[conn_index as usize] {
+            Some(crate::runtime::IoResult::Send(Err(_))) => {}
+            _ => panic!("expected the send waiter to be failed by the retry cap"),
+        }
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert!(state.queue.is_empty(), "give-up must release the queue");
+            assert!(!state.in_flight, "give-up must clear in_flight");
+        }
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            8,
+            "give-up must return the parked entry's pool slot"
+        );
+        let conn = el.driver.connections.get(conn_index);
+        assert!(
+            // 0.6: close_connection marks the slot with `recv_mode = Closed`
+            // (main tracks this as `close_requested`).
+            conn.is_none()
+                || matches!(conn.unwrap().recv_mode, crate::connection::RecvMode::Closed),
+            "give-up must close the connection"
+        );
+    }
+
+    /// A parked send satisfies `in_flight` for the close-deferral machinery:
+    /// a close requested while parked waits for the parked bytes to go out,
+    /// then finalizes on their CQE. Without this, the Close SQE would race
+    /// (or truncate) the parked send.
+    #[test]
+    fn parked_send_defers_a_requested_close() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
+
+        el.driver.ring.force_push_failures(1);
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send(token, b"hello").expect("send must park, not fail");
+        }
+        assert!(el.driver.send_queues[conn_index as usize].in_flight);
+
+        // Close while parked: deferred, not submitted.
+        el.driver.close_connection(conn_index);
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert!(state.close_pending, "close must defer behind a parked send");
+            assert!(
+                !state.close_submitted,
+                "Close must not be submitted while a send is parked"
+            );
+        }
+        // Re-driving the finalize (as the loop's end-of-iteration drain and
+        // `note_send_finalized` do) must still hold off.
+        el.driver.try_finalize_close(conn_index);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_submitted,
+            "try_finalize_close must wait for the parked send"
+        );
+
+        // The retry pushes the parked send; the close still waits for its CQE.
+        el.drain_send_retries();
+        assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_submitted,
+            "Close must wait for the pushed send's CQE"
+        );
+
+        // The send CQE drains the queue and finalizes the deferred close.
+        el.driver
+            .ring
+            .submit_and_wait(1)
+            .expect("submit_and_wait failed");
+        el.drain_completions();
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert!(!state.in_flight);
+            assert!(
+                !state.close_pending,
+                "the close must finalize after the CQE"
+            );
+            assert!(
+                state.close_submitted,
+                "the deferred Close must be submitted once the parked send drained"
+            );
+        }
+
+        // And the parked bytes did reach the peer before the close.
+        let mut buf = [0u8; 16];
+        assert_eq!(try_recv(&peer, &mut buf), Some(5));
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    /// `queue_built_sends` (the TLS ciphertext path) is infallible: a push
+    /// failure on the first entry parks it and queues the rest behind it in
+    /// order. Previously the first entry was released, the rest released
+    /// too, and three callers discarded the `Err` — a handshake reply or
+    /// close_notify vanished silently under SQ pressure.
+    /// A retry entry that outlives its park must not push a second SQE.
+    /// Park A with B queued behind it, let "another path" push A directly
+    /// (`submit_next_queued` clears `parked`), then run the drain: B must
+    /// stay queued because A is now in flight.
+    #[test]
+    fn stale_retry_entry_does_not_push_a_second_sqe() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        let a = built_copy_send(&mut el, conn_index, b"aaa");
+        let b = built_copy_send(&mut el, conn_index, b"bbb");
+        let slot_b = b.pool_slot;
+        el.driver.ring.force_push_failures(1);
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.queue_built_sends(conn_index, vec![a, b]);
+        }
+        assert!(el.driver.send_queues[conn_index as usize].parked);
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 0)]
+        );
+
+        // Another path pushes the head first.
+        assert!(el.driver.submit_next_queued(conn_index));
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert!(!state.parked, "a successful push clears parked");
+            assert_eq!(state.queue.len(), 1);
+            assert!(state.in_flight);
+        }
+
+        // The stale retry entry must be a no-op: B stays queued behind the
+        // in-flight A rather than becoming a parallel SQE on the stream.
+        el.drain_send_retries();
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert_eq!(state.queue.len(), 1, "stale retry pushed a second SQE");
+            assert_eq!(state.queue[0].pool_slot, slot_b);
+            assert!(state.in_flight);
+        }
+        assert!(el.driver.pending_send_retries.is_empty());
+    }
+
+    /// A queued recv-buffer forward owns a provided buffer, not a pool slot.
+    /// Releasing the queue (give-up, force-finalize, slot reuse) must hand
+    /// its bid back to the ring instead of leaking it.
+    #[test]
+    fn releasing_a_queued_recv_buf_forward_replenishes_its_bid() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let bid: u16 = 7;
+        let ud = UserData::encode(OpTag::SendRecvBuf, conn_index, bid as u32);
+        let entry =
+            io_uring::opcode::Send::new(io_uring::types::Fixed(conn_index), std::ptr::null(), 0)
+                .flags(crate::completion::STREAM_SEND_FLAGS)
+                .build()
+                .user_data(ud.raw());
+        el.driver.send_queues[conn_index as usize]
+            .queue
+            .push_back(crate::handler::BuiltSend {
+                entry,
+                pool_slot: u16::MAX,
+                slab_idx: u16::MAX,
+                total_len: 0,
+            });
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let before = el.driver.pending_replenish.len();
+
+        el.driver.drain_conn_send_queue(conn_index);
+
+        assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
+        assert_eq!(
+            &el.driver.pending_replenish[before..],
+            &[bid],
+            "the queued forward's bid must be replenished on release"
+        );
+    }
+
+    #[test]
+    fn queue_built_sends_parks_under_sq_pressure() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        let first = built_copy_send(&mut el, conn_index, b"one");
+        let second = built_copy_send(&mut el, conn_index, b"two");
+        let expected_slots = [first.pool_slot, second.pool_slot];
+        assert_eq!(el.driver.send_copy_pool.free_count(), 6);
+
+        el.driver.ring.force_push_failures(1);
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.queue_built_sends(conn_index, vec![first, second]);
+        }
+
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            let slots: Vec<u16> = state.queue.iter().map(|b| b.pool_slot).collect();
+            assert_eq!(
+                slots,
+                expected_slots.to_vec(),
+                "both entries must be queued in order"
+            );
+            assert!(state.in_flight, "the parked head holds in_flight");
+        }
+        assert_eq!(
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation, 0)]
+        );
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            6,
+            "parking must not touch the pool"
+        );
+
+        // The retry pushes the head (each entry is its own logical send, so
+        // the coalescing run stops at one); the second stays queued.
+        el.drain_send_retries();
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            let slots: Vec<u16> = state.queue.iter().map(|b| b.pool_slot).collect();
+            assert_eq!(slots, expected_slots[1..].to_vec());
+            assert!(state.in_flight);
+        }
+        assert!(el.driver.pending_send_retries.is_empty());
+    }
+
     #[test]
     fn handle_send_pipelined_independent_sends_wake_separately() {
         // Two independent conn.send() calls pipelined on one connection share
@@ -4805,137 +5602,6 @@ mod tests {
     }
 
     // ── ZC send path tests ─────────────────────────────────────────
-
-    /// A copied send wider than the free part of the pool must be refused
-    /// before anything is copied or queued. Before the up-front reservation,
-    /// the chunks that fit were queued (or pushed to the ring) and the caller
-    /// got `Err` for the tail, so a retry duplicated the prefix on the wire.
-    #[test]
-    fn send_wider_than_free_slots_commits_nothing() {
-        let mut el = make_test_loop_with_config(
-            test_config_builder()
-                .send_pool(4, 64)
-                .build()
-                .expect("valid config"),
-        );
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
-
-        // Hold three of the four slots so only one is free.
-        let (_f1, _, _) = el.driver.send_copy_pool.copy_in(b"a").unwrap();
-        let (_f2, _, _) = el.driver.send_copy_pool.copy_in(b"b").unwrap();
-        let (_f3, _, _) = el.driver.send_copy_pool.copy_in(b"c").unwrap();
-        assert_eq!(el.driver.send_copy_pool.free_count(), 1);
-
-        // 100 bytes over 64-byte slots needs 2 slots; only 1 is free.
-        let data = [0u8; 100];
-        let result = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send(token, &data)
-        };
-        let err = result.expect_err("send needing 2 slots with 1 free must fail");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-
-        // Nothing was taken from the pool and nothing was queued or pushed.
-        assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            1,
-            "a refused send must not consume pool slots"
-        );
-        let state = &el.driver.send_queues[conn_index as usize];
-        assert!(state.queue.is_empty(), "a refused send must queue nothing");
-        assert!(!state.in_flight, "a refused send must not push an SQE");
-    }
-
-    /// A send that needs more slots than the whole pool holds can never
-    /// succeed, so it is refused up front with `InvalidInput` instead of
-    /// committing the first `slot_count` chunks and failing on the rest.
-    #[test]
-    fn send_wider_than_the_pool_is_invalid_input() {
-        let mut el = make_test_loop_with_config(
-            test_config_builder()
-                .send_pool(4, 64)
-                .build()
-                .expect("valid config"),
-        );
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
-        assert_eq!(el.driver.send_copy_pool.free_count(), 4);
-
-        // 300 bytes over 64-byte slots needs 5 slots; the pool has 4.
-        let data = [0u8; 300];
-        let result = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send(token, &data)
-        };
-        let err = result.expect_err("send wider than the pool must fail");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-
-        assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            4,
-            "a refused send must not consume pool slots"
-        );
-        let state = &el.driver.send_queues[conn_index as usize];
-        assert!(state.queue.is_empty(), "a refused send must queue nothing");
-        assert!(!state.in_flight, "a refused send must not push an SQE");
-    }
-
-    /// Guards the streaming rewrite: a multi-slot send that is admitted still
-    /// queues one entry per chunk, in order, with only the last chunk marked
-    /// end-of-send (so the waiter is woken once with the full count).
-    #[test]
-    fn multi_chunk_send_still_queues_all_chunks_in_order() {
-        let mut el = make_test_loop_with_config(
-            test_config_builder()
-                .send_pool(6, 64)
-                .build()
-                .expect("valid config"),
-        );
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
-
-        // Pool of 6, one slot held, a 4-slot send: the final free count then
-        // tells "reservation consumed" (1 free) from "reservation still
-        // outstanding" (0 free).
-        let (_held, _, _) = el.driver.send_copy_pool.copy_in(b"x").unwrap();
-        assert_eq!(el.driver.send_copy_pool.free_count(), 5);
-
-        // With a send already in flight, every chunk is queued rather than
-        // pushed to the ring, so the whole logical send is inspectable.
-        el.driver.send_queues[conn_index as usize].in_flight = true;
-
-        // 200 bytes over 64-byte slots: 64 + 64 + 64 + 8 = 4 chunks.
-        let data = [0u8; 200];
-        let result = {
-            let mut ctx = el.driver.make_ctx();
-            ctx.send(token, &data)
-        };
-        result.expect("a send that fits the free pool must be admitted");
-
-        let state = &el.driver.send_queues[conn_index as usize];
-        assert_eq!(state.queue.len(), 4, "one queued entry per chunk");
-        let end_flags: Vec<bool> = state
-            .queue
-            .iter()
-            .map(|b| el.driver.send_copy_pool.is_end_of_send(b.pool_slot))
-            .collect();
-        assert_eq!(
-            end_flags,
-            vec![false, false, false, true],
-            "only the final chunk is end-of-send"
-        );
-        let lens: Vec<u32> = state.queue.iter().map(|b| b.total_len).collect();
-        assert_eq!(lens, vec![64, 64, 64, 8], "chunks queued in order");
-        assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            1,
-            "every reserved slot was filled and the reservation fully consumed"
-        );
-    }
 
     #[test]
     fn handle_send_msg_zc_notif_releases_slab() {

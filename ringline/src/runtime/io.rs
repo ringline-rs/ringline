@@ -1161,7 +1161,12 @@ impl ConnCtx {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the send copy pool is exhausted or the submission queue is full.
+    /// Same error contract as [`send()`](Self::send): pool admission errors
+    /// only (`Other` when the pool cannot admit the whole buffer,
+    /// `InvalidInput` when it never could), nothing committed on a plaintext
+    /// `Err`, TLS pool exhaustion not retryable, submission-queue pressure
+    /// absorbed by the queue. With no future to resolve, persistent
+    /// submission-queue starvation surfaces only as the connection closing.
     ///
     /// For backpressure-aware sending, use [`send()`](Self::send) instead.
     pub fn send_nowait(&self, data: &[u8]) -> io::Result<()> {
@@ -1228,12 +1233,12 @@ impl ConnCtx {
                             total_len: pending.len,
                         };
 
-                        let result = driver.submit_or_queue_send(conn_index, built);
-                        if result.is_err() {
-                            // Submit failed — replenish the recv buffer.
-                            driver.pending_replenish.push(pending.bid);
-                        }
-                        return result;
+                        // Infallible: under SQ pressure the entry is parked in
+                        // the connection's queue and keeps its bid exactly as
+                        // a queued entry does; `handle_send_recv_buf`
+                        // replenishes it on completion.
+                        driver.submit_or_queue_send(conn_index, built);
+                        return Ok(());
                     }
 
                     // Pointer mismatch �� put it back and fall through to copy path.
@@ -1461,7 +1466,18 @@ impl ConnCtx {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the send copy pool is exhausted or the submission queue is full.
+    /// Returns `Err` if the send copy pool cannot admit the whole buffer
+    /// (`Other`, retryable once in-flight sends complete) or if the buffer
+    /// is wider than the entire pool (`InvalidInput`). On a plaintext
+    /// connection nothing was queued or transmitted on `Err`, so the same
+    /// buffer may be sent again later. On a TLS connection pool exhaustion
+    /// during encryption is not retryable: the record sequence has already
+    /// advanced, so close the connection instead (a pre-encryption admission
+    /// check is planned; see `docs/backpressured-sends-series-design.md`,
+    /// PR 8). Submission-queue pressure is not an error: the send is queued
+    /// and retried. Persistent submission-queue starvation is reported like
+    /// a write error: the awaited `SendFuture` resolves `Err` and the
+    /// connection is closed.
     pub fn send(&self, data: &[u8]) -> io::Result<SendFuture> {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
@@ -3478,9 +3494,9 @@ impl Future for DirectEchoFuture {
                         total_len: pending.len,
                     };
                     driver.send_recv_buf_original_lens[self.conn_index as usize] = pending.len;
-                    if driver.submit_or_queue_send(self.conn_index, built).is_err() {
-                        driver.pending_replenish.push(pending.bid);
-                    }
+                    // Infallible: a parked entry keeps its bid like a queued
+                    // one; the completion replenishes it.
+                    driver.submit_or_queue_send(self.conn_index, built);
                 }
             }
 
