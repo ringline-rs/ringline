@@ -6,7 +6,8 @@ on:
     # v0.6.3); CI must run there too, since they are tagged by hand.
     branches: [main, 'release/**']
   pull_request:
-    branches: [main]
+    # Backports land on release/** through PRs, and need the same gate.
+    branches: [main, 'release/**']
   workflow_call:
   schedule:
     # Daily at 13:17 UTC so the RustSec advisory database catches

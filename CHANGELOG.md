@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- io_uring: a multishot recv completion carried no connection generation, so
+  one for a closed connection could be attributed to the next connection to
+  reuse its slot. A late error tore the new connection down for an error it
+  never saw; a late `result > 0` appended the dead connection's bytes to the
+  new one's data. This could happen when the multishot's cancel was dropped
+  on a full submission queue and the kernel posted its terminal completion
+  after the slot was reused. `RecvMulti`/`RecvMsgMultiTs` now carry the
+  generation, and a completion for another occupant is discarded, returning
+  its provided buffer (#382).
+
+- io_uring: four recv entry points acted on a stale `ConnCtx` -- one whose
+  slot had been closed and reused -- against whichever connection held the
+  slot now. `try_with_data` could hand the caller another connection's bytes
+  and advance that connection's buffer past them; it now returns `None`.
+  `with_segments` switched the other connection into segmented delivery and
+  stranded its reader; the switch now happens at first poll, behind the
+  generation check. `end_segments` now returns `EPIPE`, and
+  `enable_recv_forward` is a no-op on a stale handle (#437).
+
 ## [0.6.4] - 2026-09-29
 
 A patch release from 0.6.3 carrying fixes from `main`. The breaking changes
