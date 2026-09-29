@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- io_uring: a send that could not be pushed because the submission queue
+  was still full after a submit was thrown away. On an idle connection it
+  was released and the caller got `Err` -- under TLS after rustls had
+  already advanced its record sequence, so every later record failed
+  `bad_record_mac` at the peer. From a queued tail it was worse: the head
+  was popped before pushing, and on failure the head *and every queued send
+  behind it* were released, `in_flight` cleared and nobody woken, so the
+  prefix was on the wire, the rest silently lost, and the waiting send
+  future hung. TLS handshake responses, alerts and `close_notify` ignored
+  the error. The built send is now kept at the queue head and retried next
+  iteration; after two failed retries the waiter fails and the connection
+  closes (#376, parking half).
+
+- io_uring: plain sends and IO_LINK send chains could overtake each other on
+  one connection, putting bytes on the wire out of order; parking widened the
+  window. A plain send now queues behind an active chain. **Behaviour
+  change:** a chain started while earlier sends are still in flight -- plain,
+  or another chain -- is refused with `WouldBlock` instead of reordering, and
+  releases what it built (#494).
+
 ## [0.6.5] - 2026-09-29
 
 ### Fixed
