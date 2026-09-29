@@ -1074,4 +1074,4 @@ fn drain_pending_plaintext(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

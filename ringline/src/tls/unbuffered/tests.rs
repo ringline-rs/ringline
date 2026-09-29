@@ -86,6 +86,31 @@ fn conn_pair() -> (TlsConn, TlsConn) {
     )
 }
 
+/// An already-handshaked unbuffered `(server, client)` pair, for tests
+/// outside this module that need real records and a peer able to decrypt them.
+pub(crate) fn handshaked_pair() -> (TlsConn, TlsConn) {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+    handshake(&mut server, &mut client, &mut accs);
+    assert!(
+        !server.conn.is_handshaking(),
+        "in-memory unbuffered handshake did not complete"
+    );
+    (server, client)
+}
+
+/// Decrypt `ciphertext` at `to` and return the plaintext, or the error the
+/// record layer reported (a sequence gap is `bad_record_mac`).
+pub(crate) fn decrypt_at(to: &mut TlsConn, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    let mut accs = AccumulatorTable::new(2, 4 * 1024 * 1024);
+    let mut out = Vec::new();
+    let mut sink = PlaintextSink::Accumulator(&mut accs);
+    match feed(to, Some(&mut sink), &mut out, ciphertext, 0) {
+        DriveOutcome::Error(e) => Err(e.to_string()),
+        _ => Ok(accs.data(0).to_vec()),
+    }
+}
+
 /// Push `bytes` into `to`'s ciphertext buffer and drive it, collecting its
 /// own output. Returns (outcome, output ciphertext).
 fn pump(to: &mut TlsConn, bytes: &[u8], accs: &mut AccumulatorTable) -> (DriveOutcome, Vec<u8>) {

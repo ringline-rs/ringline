@@ -49,14 +49,14 @@ use crate::buffer::send_copy::SendCopyPool;
 mod backend_mio;
 #[cfg(has_io_uring)]
 mod backend_uring;
-mod buffered;
+pub(crate) mod buffered;
 // The incoming-ciphertext buffer belongs to the unbuffered engine and has no
 // other consumer, so it shares the engine's gate; without it every item in the
 // module is dead code in a default build.
 #[cfg(feature = "tls-unbuffered")]
 mod ciphertext;
 #[cfg(feature = "tls-unbuffered")]
-mod unbuffered;
+pub(crate) mod unbuffered;
 
 // Glob re-export keeps call sites at `crate::tls::*`. Both backends' shared
 // names now live in their dispatcher module; nothing is re-exported from
@@ -339,6 +339,12 @@ impl TlsTable {
     }
 
     /// Get a mutable reference to the TLS connection at the given index.
+    /// Install an already-built connection at `conn_index` (tests only).
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, conn_index: u32, conn: TlsConn) {
+        self.conns[conn_index as usize] = Some(conn);
+    }
+
     pub fn get_mut(&mut self, conn_index: u32) -> Option<&mut TlsConn> {
         self.conns[conn_index as usize].as_mut()
     }

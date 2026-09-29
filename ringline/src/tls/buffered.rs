@@ -730,7 +730,7 @@ pub(super) fn borrow_conn_and_buf(
 /// [`PlaintextSink::Segments`], asserting decrypted plaintext lands as owned
 /// segments and that the outstanding-plaintext bound kills an over-limit flood.
 #[cfg(all(test, has_io_uring))]
-mod segmented_tls_tests {
+pub(crate) mod segmented_tls_tests {
     use super::*;
     use crate::backend::HeldRecvBuf;
     use std::collections::VecDeque;
@@ -766,8 +766,27 @@ mod segmented_tls_tests {
         }
     }
 
+    /// Decrypt `ciphertext` at `to` and return the plaintext, or the error
+    /// rustls reported (a sequence gap is `bad_record_mac`).
+    pub(crate) fn decrypt_at(to: &mut BufferedKind, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let mut cursor = Cursor::new(ciphertext);
+        while (cursor.position() as usize) < ciphertext.len() {
+            if to.read_tls(&mut cursor).map_err(|e| e.to_string())? == 0 {
+                break;
+            }
+            to.process_new_packets().map_err(|e| e.to_string())?;
+        }
+        let mut out = Vec::new();
+        match to.reader().read_to_end(&mut out) {
+            Ok(_) => Ok(out),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(out),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// A completed in-memory TLS session: (server, client), both past handshake.
-    fn handshaked() -> (BufferedKind, BufferedKind) {
+    pub(crate) fn handshaked() -> (BufferedKind, BufferedKind) {
         let (certs, key) = test_certs();
         let server_config = Arc::new(
             rustls::ServerConfig::builder()
