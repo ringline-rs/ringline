@@ -3154,7 +3154,7 @@ impl Driver {
             }
 
             for i in 0..self.cqe_batch.len() {
-                let (user_data_raw, result, flags) = self.cqe_batch[i];
+                let (user_data_raw, _, flags) = self.cqe_batch[i];
                 let ud = UserData(user_data_raw);
                 let tag = match ud.tag() {
                     Some(t) => t,
