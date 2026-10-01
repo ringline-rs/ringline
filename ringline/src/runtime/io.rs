@@ -1716,8 +1716,8 @@ impl ConnCtx {
     /// target buffer instead of the per-connection accumulator.
     ///
     /// Does nothing if the handle is stale (its connection has been
-    /// released); [`recv_ready`](Self::recv_ready) then resolves immediately
-    /// and [`take_recv_sink`](Self::take_recv_sink) returns 0.
+    /// released); `recv_ready` then resolves immediately and
+    /// `take_recv_sink` returns 0.
     ///
     /// # Safety
     ///
