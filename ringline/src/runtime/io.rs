@@ -1177,6 +1177,10 @@ impl ConnCtx {
     /// Install a recv sink so that CQE data is written directly to the
     /// target buffer instead of the per-connection accumulator.
     ///
+    /// Does nothing if the handle is stale (its connection has been
+    /// released); [`recv_ready`](Self::recv_ready) then resolves immediately
+    /// and [`take_recv_sink`](Self::take_recv_sink) returns 0.
+    ///
     /// # Safety
     ///
     /// The caller must ensure that `target` points to writable memory of at
@@ -1185,10 +1189,6 @@ impl ConnCtx {
     /// is guaranteed because ringline is single-threaded: the task sets the sink,
     /// yields, and the CQE handler (same thread) writes to it before the task
     /// resumes and clears the sink.
-    ///
-    /// Does nothing if the handle is stale (its connection has been
-    /// released); `recv_ready` then resolves immediately and
-    /// `take_recv_sink` returns 0.
     pub unsafe fn set_recv_sink(&self, target: *mut u8, len: usize) {
         with_state(|driver, executor| {
             if driver.connections.generation(self.conn_index) != self.generation {

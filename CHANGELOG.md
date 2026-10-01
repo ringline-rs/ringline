@@ -11,12 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - io_uring and mio: `ConnCtx::close` on a stale handle, one whose slot had
   been reused by a new connection, closed that new connection. It now does
-  nothing on a stale handle, as `enable_recv_forward` already did. The same
-  check now guards
-  `set_recv_sink` (a stale handle installed its buffer as the new
-  connection's recv sink, so that connection's bytes were written into it),
-  `take_recv_sink` (a stale handle removed the new connection's sink) and
-  `recv_timestamp` (#535, #540).
+  nothing on a stale handle. The same check now guards `set_recv_sink` (a
+  stale handle installed its buffer as the new connection's recv sink, so
+  that connection's bytes were written into it) and `take_recv_sink` (a
+  stale handle removed the new connection's sink). On io_uring it also
+  guards `recv_timestamp`, which returned the new connection's timestamp.
+  Backport of #540 (#535).
 
 ## [0.6.9] - 2026-09-29
 

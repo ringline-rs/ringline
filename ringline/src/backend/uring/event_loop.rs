@@ -7992,9 +7992,6 @@ mod tests {
             "teardown must clear the old occupant's sink"
         );
 
-        // While the slot is free, closing the old handle does nothing.
-        with_driver_state(&mut el, || old.close());
-
         let new_index = accept_connection(&mut el);
         assert_eq!(new_index, conn_index, "the test needs the slot reused");
         let new_gen = el.driver.connections.generation(conn_index);
@@ -8008,9 +8005,19 @@ mod tests {
                 .is_some_and(|c| !matches!(c.recv_mode, crate::connection::RecvMode::Closed)),
             "the stale handle closed the new occupant"
         );
-        assert_eq!(with_driver_state(&mut el, || old.take_recv_sink()), 0);
-
         let current = ConnCtx::new(conn_index, new_gen);
+        let mut new_buf = [0u8; 64];
+        // SAFETY: `new_buf` outlives the sink, which is taken below.
+        with_driver_state(&mut el, || unsafe {
+            current.set_recv_sink(new_buf.as_mut_ptr(), new_buf.len())
+        });
+        assert_eq!(with_driver_state(&mut el, || old.take_recv_sink()), 0);
+        assert!(
+            el.executor.recv_sinks[conn_index as usize].is_some(),
+            "the stale handle took the new occupant's recv sink"
+        );
+        with_driver_state(&mut el, || current.take_recv_sink());
+
         with_driver_state(&mut el, || current.close());
         assert!(
             el.driver
