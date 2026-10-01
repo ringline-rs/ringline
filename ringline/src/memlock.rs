@@ -5,10 +5,19 @@
 //! the rings are charged too: the SQ/CQ ring region, the SQE array and each
 //! provided buffer ring are allocated with `io_create_region`
 //! (`io_uring/memmap.c`), which charges their pages. Before 6.14 they are not
-//! charged. Each ring is charged separately, against the `RLIMIT_MEMLOCK` of
-//! the process creating it, and the kernel adds the charge to everything the
-//! same user already has charged in any process. A process with
-//! `CAP_IPC_LOCK` is not charged.
+//! charged.
+//!
+//! Each ring's charge is added separately; rings do not share one. The kernel
+//! adds every charge to what the same user has charged in any process, and
+//! compares the total with the `RLIMIT_MEMLOCK` soft limit of the process
+//! making the charge. A process with `CAP_IPC_LOCK` in the initial user
+//! namespace is not charged; the capability inside a container's own user
+//! namespace does not exempt it.
+//!
+//! A zero-copy send from memory that is not a registered buffer is charged
+//! too, `len / page + 2` pages while the send is in flight
+//! (`IORING_OP_SENDMSG_ZC` from Linux 6.15). The preflight cannot count that,
+//! so the limit needs room above what it computes.
 
 /// A kernel's major and minor version, from `uname -r`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -86,14 +95,25 @@ pub(crate) fn provided_ring_bytes(entries: u16, page: u64) -> u64 {
     page_align(u64::from(entries) * 16, page)
 }
 
-/// Whether this process holds `CAP_IPC_LOCK` in its effective set, which
-/// exempts it from io_uring's memlock charge. `false` when it cannot be read.
+/// Whether this process holds `CAP_IPC_LOCK` in the initial user namespace,
+/// which exempts it from io_uring's memlock charge. `false` when either part
+/// cannot be read.
 #[cfg(has_io_uring)]
 pub(crate) fn has_cap_ipc_lock() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| cap_eff_has_ipc_lock(&status))
-        .unwrap_or(false)
+    let initial_ns =
+        std::fs::read_to_string("/proc/self/uid_map").is_ok_and(|map| is_initial_uid_map(&map));
+    initial_ns
+        && std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| cap_eff_has_ipc_lock(&status))
+            .unwrap_or(false)
+}
+
+/// Whether `/proc/self/uid_map` is the initial user namespace's identity
+/// map. io_uring honours `CAP_IPC_LOCK` only there
+/// (`ns_capable_noaudit(&init_user_ns, CAP_IPC_LOCK)`).
+pub(crate) fn is_initial_uid_map(map: &str) -> bool {
+    map.split_whitespace().eq(["0", "0", "4294967295"])
 }
 
 /// Read bit `CAP_IPC_LOCK` (14) of the `CapEff:` line of `/proc/self/status`.
@@ -157,6 +177,15 @@ mod tests {
         assert_eq!(provided_ring_bytes(16, PAGE), PAGE);
         assert_eq!(provided_ring_bytes(256, PAGE), PAGE);
         assert_eq!(provided_ring_bytes(512, PAGE), 2 * PAGE);
+    }
+
+    #[test]
+    fn only_the_identity_uid_map_is_the_initial_namespace() {
+        assert!(is_initial_uid_map("         0          0 4294967295\n"));
+        // Root inside `unshare -Ur`, rootless podman, docker --userns-remap.
+        assert!(!is_initial_uid_map("         0       1000          1\n"));
+        assert!(!is_initial_uid_map("0 100000 65536\n"));
+        assert!(!is_initial_uid_map(""));
     }
 
     #[test]

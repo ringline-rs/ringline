@@ -153,8 +153,8 @@ pub(crate) struct RingSetupProbe {
     pub(crate) kernel: Option<crate::memlock::KernelVersion>,
     /// The `RLIMIT_MEMLOCK` soft limit in bytes, the one the kernel checks.
     pub(crate) memlock_soft: Option<u64>,
-    /// Whether the process holds `CAP_IPC_LOCK`, which exempts it from the
-    /// memlock charge.
+    /// Whether the process holds `CAP_IPC_LOCK` in the initial user
+    /// namespace, which exempts it from the memlock charge.
     pub(crate) cap_ipc_lock: bool,
 }
 
@@ -292,16 +292,16 @@ fn memlock_cause(probe: &RingSetupProbe, what: &str) -> Option<String> {
         return None;
     }
     let soft = match probe.memlock_soft {
-        Some(soft) => format!("the soft limit here is {} KiB", kib_ceil(soft)),
-        None => "the soft limit could not be read".to_string(),
+        Some(soft) => format!("This process's soft limit is {} KiB", kib_ceil(soft)),
+        None => "This process's soft limit could not be read".to_string(),
     };
     let kernel = match probe.kernel {
         Some(k) => format!("Linux {k}"),
         None => "this kernel".to_string(),
     };
     Some(format!(
-        "{kernel} charges {what} to RLIMIT_MEMLOCK, added to what every process \
-         of this user has already charged, and {soft}. Raise it with \
+        "{kernel} charges {what} to RLIMIT_MEMLOCK. The charge is added to what \
+         every process of this user has already charged. {soft}. Raise it with \
          `ulimit -l` (or `LimitMEMLOCK=` in the systemd unit), or grant the \
          process CAP_IPC_LOCK",
     ))
@@ -395,7 +395,8 @@ pub(crate) fn describe_memlock_shortfall(
          hard limit is {} (soft {}). Raise it with `ulimit -l {}` before \
          starting (or `LimitMEMLOCK=` in the systemd unit), or grant the \
          process CAP_IPC_LOCK, which exempts it from the limit. The kernel \
-         adds this to what every other process of the same user has charged.",
+         adds this to everything else the same user has charged, in this \
+         process and in others.",
         kib_ceil(required),
         rlim_kib(limit.hard),
         rlim_kib(limit.soft),
@@ -440,14 +441,13 @@ pub(crate) fn describe_buffer_registration_failure(
     msg
 }
 
-/// What to check when registering a **provided buffer ring** fails with
-/// `ENOMEM`.
+/// What to check when registering a provided buffer ring fails with `ENOMEM`.
 ///
 /// On Linux 6.14+ the ring is charged to `RLIMIT_MEMLOCK`, so the limit is the
-/// usual cause and the hint names it. Before 6.14 it is not charged: the test
-/// suite registers these rings with the soft limit at 8 KiB on 6.12 (#426), so
-/// there the hint says `ulimit -l` will not help and points at the cgroup
-/// memory limit and the map-count ceiling instead.
+/// usual cause and the hint names it. Before 6.14 the ring is not charged:
+/// `memlock_rings` registers one under a one-page limit on those kernels
+/// (#426). There the hint says `ulimit -l` will not help and points at the
+/// cgroup memory limit and the map-count ceiling instead.
 #[cfg(any(has_io_uring, test))]
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) fn provided_ring_enomem_hint(probe: &RingSetupProbe) -> String {
@@ -461,15 +461,15 @@ pub(crate) fn provided_ring_enomem_hint(probe: &RingSetupProbe) -> String {
         ),
         None => {
             let why = if probe.cap_ipc_lock {
-                "this process holds CAP_IPC_LOCK, which exempts it"
+                "this process holds CAP_IPC_LOCK in the initial user namespace, \
+                 which exempts it"
             } else if probe.memlock_soft == Some(libc::RLIM_INFINITY) {
                 "the limit is unlimited"
             } else {
-                "kernels before 6.14 do not charge provided buffer rings to it \
-                 (the test suite registers them with the soft limit at 8 KiB on 6.12)"
+                "kernels before 6.14 do not charge provided buffer rings to it"
             };
             format!(
-                "ENOMEM here is NOT RLIMIT_MEMLOCK -- {why} -- so raising \
+                "ENOMEM here is not caused by RLIMIT_MEMLOCK -- {why} -- so raising \
                  `ulimit -l` will not help. Check {OTHER_CAUSES}"
             )
         }
@@ -803,21 +803,21 @@ mod provided_ring_hint_tests {
     }
 
     /// Before 6.14 provided buffer rings are not charged to `RLIMIT_MEMLOCK`
-    /// (#426: the suite registers them at an 8 KiB limit on 6.12), so there
+    /// (#426; `memlock_rings` checks this under a one-page limit), so there
     /// the hint must not send the reader to `ulimit -l`.
     #[test]
     fn before_6_14_does_not_send_the_reader_to_ulimit_l() {
         for p in [probe(12, 8 << 20, false), probe(17, 8 << 20, true)] {
             let h = provided_ring_enomem_hint(&p);
-            assert!(h.contains("NOT RLIMIT_MEMLOCK"), "{p:?}: {h}");
+            assert!(h.contains("not caused by RLIMIT_MEMLOCK"), "{p:?}: {h}");
             let i = h.find("ulimit -l").expect("names ulimit -l as a dead end");
             let around = &h[i.saturating_sub(40)..h.len().min(i + 40)];
             assert!(around.contains("will not help"), "{around}");
         }
     }
 
-    /// From 6.14 the ring is charged to `RLIMIT_MEMLOCK`, which on a GitHub
-    /// runner at 8 MiB failed every nextest run (#426), so the limit leads.
+    /// From 6.14 the ring is charged to `RLIMIT_MEMLOCK`, so the hint names
+    /// the limit first.
     #[test]
     fn from_6_14_names_memlock_first() {
         let h = provided_ring_enomem_hint(&probe(17, 8 << 20, false));

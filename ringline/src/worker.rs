@@ -1667,16 +1667,16 @@ fn ensure_nofile_limit(
 ///
 /// Every worker registers the configured regions as fixed buffers, and on
 /// Linux 6.14+ each worker's ring and provided buffer rings are charged too
-/// (see [`crate::memlock`]). Distros default the limit to 8 MiB or 64 MiB, and
-/// the kernel reports a shortfall as a bare `ENOMEM`. Like the nofile check,
+/// (see [`crate::memlock`]). The kernel's default limit is 8 MiB (64 KiB
+/// before Linux 5.16), and it reports a shortfall as a bare `ENOMEM`. Like the nofile check,
 /// this raises the soft limit when the hard limit allows and otherwise fails
 /// with the fix spelled out.
 ///
 /// The kernel compares the limit with everything the same user has charged in
 /// any process, which this cannot see, so passing here does not rule out an
-/// `ENOMEM` at setup; the setup error names the limit in that case. Regions
-/// registered later through `Runtime::register_region` are checked at that
-/// call instead.
+/// `ENOMEM` at setup; the setup error names the limit in that case. A region
+/// added later through `Runtime::register_region` is not counted here; if that
+/// call fails with `ENOMEM`, its error names the limit.
 #[cfg(has_io_uring)]
 fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::error::Error> {
     use crate::error::{MemlockLimit, MemlockPlan, describe_memlock_shortfall, memlock_plan};
@@ -1732,12 +1732,15 @@ fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::er
 fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: u64) -> u64 {
     use crate::memlock::{provided_ring_bytes, ring_bytes};
 
-    // Pinning is per page, and a region that does not start on a page
-    // boundary pins one more than its length suggests.
+    // The kernel pins every page the region touches. This assumes base pages:
+    // a region backed by huge pages is charged in whole huge pages.
     let regions: u64 = config
         .registered_regions
         .iter()
-        .map(|r| (r.len() as u64).div_ceil(page) * page + page)
+        .map(|r| {
+            let start = r.ptr() as u64;
+            ((start + r.len() as u64).div_ceil(page) - start / page) * page
+        })
         .sum();
     let rings = if charges_rings {
         let mut bytes = ring_bytes(config.sq_entries, page)
@@ -2274,15 +2277,34 @@ mod memlock_required_tests {
         assert_eq!(memlock_required(&with, 1, true, PAGE), 8 * PAGE);
     }
 
+    /// A region at `addr`, for counting only: `memlock_required` reads its
+    /// address and length and never touches the memory.
+    fn region(addr: u64, len: u64) -> MemoryRegion {
+        // SAFETY: the region is never registered or dereferenced.
+        unsafe { MemoryRegion::new(addr as *mut u8, len as usize) }
+    }
+
+    #[test]
+    fn a_region_costs_the_pages_it_touches() {
+        let aligned = builder().registered_regions(vec![region(16 * PAGE, 3 * PAGE)]);
+        assert_eq!(
+            memlock_required(&aligned.build().unwrap(), 1, false, PAGE),
+            3 * PAGE
+        );
+        let offset = builder().registered_regions(vec![region(16 * PAGE + 16, 3 * PAGE)]);
+        assert_eq!(
+            memlock_required(&offset.build().unwrap(), 1, false, PAGE),
+            4 * PAGE
+        );
+    }
+
     #[test]
     fn every_worker_registers_every_region() {
-        let mut backing = vec![0u8; 3 * PAGE as usize];
-        // SAFETY: `backing` outlives the config, which is never launched.
-        let region = unsafe { MemoryRegion::new(backing.as_mut_ptr(), backing.len()) };
-        let config = builder().registered_regions(vec![region]).build().unwrap();
-        // 3 pages, plus one for a start that is not page-aligned.
-        assert_eq!(memlock_required(&config, 1, false, PAGE), 4 * PAGE);
-        assert_eq!(memlock_required(&config, 3, false, PAGE), 12 * PAGE);
-        assert_eq!(memlock_required(&config, 3, true, PAGE), 3 * (4 + 6) * PAGE);
+        let config = builder()
+            .registered_regions(vec![region(16 * PAGE, 3 * PAGE)])
+            .build()
+            .unwrap();
+        assert_eq!(memlock_required(&config, 3, false, PAGE), 9 * PAGE);
+        assert_eq!(memlock_required(&config, 3, true, PAGE), 3 * (3 + 6) * PAGE);
     }
 }

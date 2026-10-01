@@ -7,8 +7,8 @@
 //! source. Here the kernel itself must refuse one page below each and accept
 //! each exactly.
 //!
-//! One test, sequential: the hard limit is lowered only at the end, because
-//! lowering it is irreversible for the process. The kernel compares the limit
+//! One test, sequential: the hard limit is lowered only for the last two
+//! steps, because lowering it is irreversible for the process. The kernel compares the limit
 //! with what every process of this user has charged, so this test must not
 //! share the machine with other io_uring tests; `.config/nextest.toml` runs it
 //! alone.
@@ -100,11 +100,12 @@ fn ring(sq_entries: u32) -> io::Result<IoUring<squeue::Entry128, cqueue::Entry32
         .build(sq_entries)
 }
 
-/// Register a provided buffer ring of `entries` on `ring`, from memory this
-/// function maps and leaks.
+/// Register a provided buffer ring of `entries` as group `bgid` on `ring`,
+/// from memory this function maps and leaks.
 fn register_pbuf(
     ring: &IoUring<squeue::Entry128, cqueue::Entry32>,
     entries: u16,
+    bgid: u16,
 ) -> io::Result<()> {
     let len = usize::from(entries) * 16;
     let addr = unsafe {
@@ -120,7 +121,7 @@ fn register_pbuf(
     assert_ne!(addr, libc::MAP_FAILED, "mmap");
     unsafe {
         ring.submitter()
-            .register_buf_ring_with_flags(addr as u64, entries, 0, 0)
+            .register_buf_ring_with_flags(addr as u64, entries, bgid, 0)
     }
 }
 
@@ -182,32 +183,43 @@ fn ring_memory_charged_to_memlock_matches_the_kernel() {
         return;
     }
 
+    // Each ENOMEM check runs while holding something that fit the limit
+    // exactly, so nothing else is charged to this user at that moment: a ring
+    // dropped earlier, here or in another process, could otherwise still be
+    // charged and make ENOMEM come early, which would hide an overcount.
     for (sq, bytes) in [(64, RING_64), (256, RING_256)] {
-        set_memlock(bytes - PAGE, hard);
-        expect_enomem(&format!("ring with {sq} SQ entries"), ring(sq));
+        let what = format!("ring with {sq} SQ entries");
         set_memlock(bytes, hard);
-        drop(within_limit(&format!("ring with {sq} SQ entries"), || {
-            ring(sq)
-        }));
+        let held = within_limit(&what, || ring(sq));
+        set_memlock(2 * bytes - PAGE, hard);
+        expect_enomem(&what, ring(sq));
+        drop(held);
     }
 
-    set_memlock(RING_64 + PBUF_512 - PAGE, hard);
-    let r = within_limit("ring with 64 SQ entries", || ring(64));
-    expect_enomem("provided buffer ring of 512", register_pbuf(&r, 512));
-    drop(r);
     set_memlock(RING_64 + PBUF_512, hard);
-    within_limit("ring and provided buffer ring of 512", || {
+    let held = within_limit("ring and provided buffer ring of 512", || {
         let r = ring(64)?;
-        register_pbuf(&r, 512)
+        register_pbuf(&r, 512, 0)?;
+        Ok(r)
     });
+    set_memlock(RING_64 + 2 * PBUF_512 - PAGE, hard);
+    expect_enomem(
+        "a second provided buffer ring of 512",
+        register_pbuf(&held, 512, 1),
+    );
+    drop(held);
 
     // A whole worker: its ring and its recv provided buffer ring, which is
     // what the preflight computes for `builder()`.
+    // Soft and hard both at the figure, so a preflight that overcounted by a
+    // page would have no room to raise into and would refuse.
     let worker = RING_64 + PBUF_16;
-    set_memlock(worker, hard);
+    set_memlock(worker, worker);
     within_limit("a one-worker launch", || {
         launch_and_stop().map_err(|e| match e {
-            Error::RingSetup(ref text) if text.contains("ENOMEM") => {
+            Error::RingSetup(ref text) | Error::BufferRegistration(ref text)
+                if text.contains("ENOMEM") =>
+            {
                 io::Error::from_raw_os_error(libc::ENOMEM)
             }
             other => io::Error::other(other.to_string()),
@@ -229,7 +241,7 @@ fn ring_memory_charged_to_memlock_matches_the_kernel() {
     );
     assert!(text.contains("io_uring rings"), "{text}");
     assert!(
-        text.contains("every other process of the same user"),
+        text.contains("everything else the same user has charged"),
         "{text}"
     );
 }
