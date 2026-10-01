@@ -935,20 +935,26 @@ fn bind_udp_with_reuseport(addr: SocketAddr, udp_gro: bool) -> io::Result<std::n
         }
     }
 
-    let optval: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        let err = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(err);
+    // SO_REUSEPORT lets every worker bind the same port. A zero port reaches
+    // a worker only when each worker should get its own port, and with the
+    // option set the free-port search can return a port another
+    // SO_REUSEPORT socket already holds, so it is left off then.
+    if addr.port() != 0 {
+        let optval: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
     }
 
     // Enable UDP GRO (opt-in → hard-fail, mirroring the io_uring backend).

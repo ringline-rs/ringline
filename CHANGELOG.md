@@ -44,11 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - An unconnected port-0 UDP bind on more than one worker now shares one
-  port across the workers (see Fixed). A multi-worker UDP client on such a
+  port across the workers. A multi-worker UDP client on such a
   bind receives each reply on whichever worker the kernel delivers it to, not
-  necessarily the worker that sent the request. A client that needs its
-  replies per worker uses `bind_udp_connected`, which keeps a port per
-  worker.
+  necessarily the worker that sent the request. A client with one peer per
+  bind can use `bind_udp_connected`, which gives each worker its own port
+  when the local port is zero. A client that talks to several peers from one
+  unconnected bind has no way to get a port per worker.
 
 - **Breaking:** `ShutdownHandle` is renamed `Runtime`, with no alias. It
   controls shutdown, listener addresses, deferred listeners, accept steering

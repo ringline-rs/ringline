@@ -237,10 +237,9 @@ impl Runtime {
     /// `RinglineBuilder::bind_udp` / `bind_udp_connected`, each in call order.
     ///
     /// A zero port reports the port the kernel chose, which every worker's
-    /// socket for that bind shares. The exception is a connected zero-port
-    /// bind on more than one worker: each worker's socket has its own port,
-    /// so that each receives the replies to what it sent, and the entry is
-    /// `None`.
+    /// socket for that bind shares. A connected zero-port bind on more than
+    /// one worker reports `None`. Each worker's socket has its own port and
+    /// receives the replies to what it sent.
     ///
     /// [`UdpCtx::index`]: crate::UdpCtx::index
     pub fn bound_udp_addrs(&self) -> Vec<Option<SocketAddr>> {
@@ -808,10 +807,10 @@ impl RinglineBuilder {
     ///
     /// Can be called multiple times to bind multiple UDP addresses.
     /// Each worker creates its own socket per address. With a zero port,
-    /// `launch` chooses one port and every worker binds it; the kernel then
-    /// delivers each datagram to one of the workers, so on more than one
-    /// worker a reply need not reach the worker that sent the request. Read
-    /// the port back with [`Runtime::bound_udp_addr`].
+    /// `launch` chooses one port and every worker binds it. The kernel
+    /// delivers each datagram to one worker, so with more than one worker a
+    /// reply can arrive at a worker other than the one that sent the request.
+    /// Read the port back with [`Runtime::bound_udp_addrs`].
     pub fn bind_udp(mut self, addr: SocketAddr) -> Self {
         self.config.udp_bind.push(addr);
         self.config.udp_connect_peers.push(None);
@@ -825,7 +824,7 @@ impl RinglineBuilder {
     /// per round trip on single-shot client workloads.
     ///
     /// With a zero local port and more than one worker, each worker's socket
-    /// gets its own port, so each receives the replies to what it sent, and
+    /// gets its own port and receives the replies to what it sent.
     /// [`Runtime::bound_udp_addrs`] reports `None` for this bind. On one
     /// worker the port is resolved and reported.
     pub fn bind_udp_connected(mut self, local: SocketAddr, peer: SocketAddr) -> Self {
@@ -1011,7 +1010,7 @@ impl RinglineBuilder {
         };
 
         // Each worker binds its own SO_REUSEPORT socket per UDP address, so an
-        // unresolved zero port gives each worker a different port. Resolve it
+        // unresolved zero port gives each worker its own ephemeral port. Resolve it
         // here for every bind that should share one port. The reserving
         // sockets stay bound until `launch` returns, after every worker has
         // bound the port.
@@ -1850,7 +1849,9 @@ fn resolve_zero_port_udp_binds(
 ///
 /// `SO_REUSEPORT` is set after the bind. Set before it, Linux's search for a
 /// free port can return a port another `SO_REUSEPORT` socket of the same user
-/// already holds, and the reservation would join that socket's group.
+/// already holds, and the reservation would share that socket's port. The
+/// worker sockets leave `SO_REUSEPORT` off for a zero port for the same
+/// reason.
 fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, SocketAddr)> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 

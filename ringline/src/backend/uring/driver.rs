@@ -2856,16 +2856,21 @@ impl Driver {
             return Err(crate::error::Error::Io(std::io::Error::last_os_error()));
         }
 
-        // Set SO_REUSEPORT for multi-worker binding.
-        let optval: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
+        // SO_REUSEPORT lets every worker bind the same port. A zero port
+        // reaches a worker only when each worker should get its own port, and
+        // with the option set Linux's free-port search can return a port
+        // another SO_REUSEPORT socket already holds, so it is left off then.
+        if bind_addr.port() != 0 {
+            let optval: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEPORT,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
         }
 
         // Enable UDP GRO. Opt-in, so a failure is hard rather than silent —

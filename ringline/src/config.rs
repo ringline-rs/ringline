@@ -1060,7 +1060,8 @@ impl ConfigBuilder {
 
     // ── UDP settings ─────────────────────────────────────────────────
 
-    /// Add a UDP bind address. Can be called multiple times.
+    /// Add a UDP bind address. Can be called multiple times. A zero port
+    /// behaves as in [`RinglineBuilder::bind_udp`](crate::RinglineBuilder::bind_udp).
     pub fn udp_bind(mut self, addr: SocketAddr) -> Self {
         self.config.udp_bind.push(addr);
         self.config.udp_connect_peers.push(None);
@@ -1071,7 +1072,8 @@ impl ConfigBuilder {
     /// kernel filters incoming datagrams to `peer` and the runtime can use
     /// the lighter `RecvUdp`/`SendUdp` opcodes instead of the
     /// `RecvMsgUdp`/`SendMsgUdp` pair. Saves ~4 microseconds per round trip
-    /// on single-shot client workloads.
+    /// on single-shot client workloads. A zero local port behaves as in
+    /// [`RinglineBuilder::bind_udp_connected`](crate::RinglineBuilder::bind_udp_connected).
     pub fn udp_bind_connected(mut self, local: SocketAddr, peer: SocketAddr) -> Self {
         self.config.udp_bind.push(local);
         self.config.udp_connect_peers.push(Some(peer));

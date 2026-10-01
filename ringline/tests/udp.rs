@@ -136,8 +136,8 @@ fn udp_basic_round_trip() {
 
 /// A port-0 UDP bind reports a nonzero port, and each worker binds its own
 /// `SO_REUSEPORT` socket to that port. The reserving socket is closed by the
-/// time `launch` returns, so the IPv4 UDP table lists exactly one socket per
-/// worker on the port.
+/// time `launch` returns, so on Linux the IPv4 UDP table lists exactly one
+/// socket per worker on the port.
 #[test]
 fn udp_port_zero_resolves_once_for_every_worker() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
