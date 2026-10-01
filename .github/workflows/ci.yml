@@ -111,7 +111,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all
+      - uses: taiki-e/install-action@cargo-nextest
+      - run: cargo nextest run --locked --workspace --profile ci
+      - run: cargo test --locked --workspace --doc
       # A run on 2026-09-22 aborted the release test binary with a bare ENOMEM
       # from `register_buf_ring`. The error text blames RLIMIT_MEMLOCK, but that
       # was measured and ruled out: on kernel 6.12 the whole uring test suite
@@ -169,7 +171,7 @@ jobs:
           echo "=== kernel ring buffer (OOM evidence) ==="
           (sudo dmesg | tail -40) 2>/dev/null || dmesg | tail -40 || true
       # The diagram freshness check shares this job: the claim tests already
-      # run under `cargo test --all`, so the only unique work is the stale-SVG
+      # run under `cargo nextest run`, so the only unique work is the stale-SVG
       # comparison — not worth a dedicated runner.
       - run: cargo run --locked -p doc-diagrams -- --check
 
@@ -180,7 +182,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all --release
+      - uses: taiki-e/install-action@cargo-nextest
+      - run: cargo nextest run --locked --workspace --profile ci --release
+      - run: cargo test --locked --workspace --doc --release
       # A run on 2026-09-22 aborted the release test binary with a bare ENOMEM
       # from `register_buf_ring`. The error text blames RLIMIT_MEMLOCK, but that
       # was measured and ruled out: on kernel 6.12 the whole uring test suite
@@ -245,7 +249,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all --features force-mio
+      - uses: taiki-e/install-action@cargo-nextest
+      - run: cargo nextest run --locked --workspace --profile ci --features force-mio
+      - run: cargo test --locked --workspace --doc --features force-mio
 
   test-tls-unbuffered:
     name: Test (tls-unbuffered)
@@ -254,7 +260,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all --features tls-unbuffered
+      - uses: taiki-e/install-action@cargo-nextest
+      - run: cargo nextest run --locked --workspace --profile ci --features tls-unbuffered
+      - run: cargo test --locked --workspace --doc --features tls-unbuffered
 
   test-macos:
     name: Test (macOS)
@@ -263,7 +271,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all
+      - uses: taiki-e/install-action@cargo-nextest
+      - run: cargo nextest run --locked --workspace --profile ci
+      - run: cargo test --locked --workspace --doc
 
   test-mio-release:
     name: Test (mio, release)
@@ -272,7 +282,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all --features force-mio --release
+      - uses: taiki-e/install-action@cargo-nextest
+      - run: cargo nextest run --locked --workspace --profile ci --features force-mio --release
+      - run: cargo test --locked --workspace --doc --features force-mio --release
 
   integration-clients:
     name: Integration (public servers)

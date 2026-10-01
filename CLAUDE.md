@@ -19,12 +19,14 @@ cargo fmt --all
 cargo clippy --all-targets -- -D warnings                      # io_uring backend (Linux) / mio (macOS)
 cargo clippy --all-targets --features force-mio -- -D warnings # mio backend explicitly
 
-# Test
-cargo test --all                     # all workspace crates
-cargo test --all --release           # release mode
-cargo test --all --features force-mio  # mio backend
-cargo test -p ringline -- <name>     # single test by name
-cargo test -p ringline-redis         # single crate
+# Test (CI runs cargo-nextest: one process per test; config in .config/nextest.toml)
+cargo nextest run --workspace                       # all workspace crates
+cargo nextest run --workspace --release             # release mode
+cargo nextest run --workspace --features force-mio  # mio backend
+cargo test --workspace --doc                        # doctests (nextest does not run them)
+cargo nextest run -p ringline <name>                # tests matching a name
+cargo nextest run -p ringline-redis                 # single crate
+cargo test --all                                    # also works; runs a binary's tests in one process
 
 # Docs
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
