@@ -1668,9 +1668,10 @@ fn ensure_nofile_limit(
 /// Every worker registers the configured regions as fixed buffers, and on
 /// Linux 6.14+ each worker's ring and provided buffer rings are charged too
 /// (see [`crate::memlock`]). The kernel's default limit is 8 MiB (64 KiB
-/// before Linux 5.16), and it reports a shortfall as a bare `ENOMEM`. Like the nofile check,
-/// this raises the soft limit when the hard limit allows and otherwise fails
-/// with the fix spelled out.
+/// before Linux 5.16), and it reports a shortfall as a bare `ENOMEM`. When
+/// the hard limit covers the need, this raises the soft limit to the hard
+/// limit, which leaves room for the charges it cannot count. Otherwise it
+/// fails with the fix spelled out.
 ///
 /// The kernel compares the limit with everything the same user has charged in
 /// any process, which this cannot see, so passing here does not rule out an

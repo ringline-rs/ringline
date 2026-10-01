@@ -230,7 +230,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   when a worker started: in `io_uring_setup` with a bare `ENOMEM` on 6.14+, or
   when registering its regions. The preflight now counts each worker's ring,
   provided buffer rings and regions, and skips a process with `CAP_IPC_LOCK`
-  in the initial user namespace. An `ENOMEM` from `io_uring_setup` or a
+  in the initial user namespace. When the soft limit is short and the hard
+  limit covers the need, it raises the soft limit to the hard limit rather
+  than to exactly the need, which left no room for anything else the user
+  charges. An `ENOMEM` from `io_uring_setup` or a
   provided buffer ring registration on 6.14+ now names the limit and the soft
   value, and says the kernel sums the charge over every process of the user
   (#426).

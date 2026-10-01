@@ -352,7 +352,9 @@ impl MemlockLimit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemlockPlan {
     Sufficient,
-    /// The soft limit is short but the hard limit allows raising it to this.
+    /// The soft limit is short and the hard limit covers the need: raise the
+    /// soft limit to this, the hard limit. The kernel compares the limit with
+    /// everything the user has charged, which `required` does not include.
     RaiseSoftTo(u64),
     HardTooLow,
 }
@@ -362,7 +364,7 @@ pub(crate) fn memlock_plan(required: u64, limit: &MemlockLimit) -> MemlockPlan {
     if required == 0 || limit.soft >= required {
         MemlockPlan::Sufficient
     } else if limit.hard == libc::RLIM_INFINITY || limit.hard >= required {
-        MemlockPlan::RaiseSoftTo(required)
+        MemlockPlan::RaiseSoftTo(limit.hard)
     } else {
         MemlockPlan::HardTooLow
     }
@@ -392,7 +394,7 @@ pub(crate) fn describe_memlock_shortfall(
 ) -> String {
     format!(
         "RLIMIT_MEMLOCK too low: {what} need {} KiB of pinned memory but the \
-         hard limit is {} (soft {}). Raise it with `ulimit -l {}` before \
+         hard limit is {} (soft {}). Raise it with `ulimit -l {}` or higher before \
          starting (or `LimitMEMLOCK=` in the systemd unit), or grant the \
          process CAP_IPC_LOCK, which exempts it from the limit. The kernel \
          adds this to everything else the same user has charged, in this \
@@ -706,7 +708,7 @@ mod tests {
     fn memlock_plan_raises_soft_when_hard_allows() {
         assert!(matches!(
             memlock_plan(32 * MIB, &limit(8 * MIB, 64 * MIB)),
-            MemlockPlan::RaiseSoftTo(v) if v == 32 * MIB
+            MemlockPlan::RaiseSoftTo(v) if v == 64 * MIB
         ));
     }
 
@@ -714,7 +716,7 @@ mod tests {
     fn memlock_plan_raises_soft_under_infinite_hard() {
         assert!(matches!(
             memlock_plan(32 * MIB, &limit(8 * MIB, libc::RLIM_INFINITY)),
-            MemlockPlan::RaiseSoftTo(v) if v == 32 * MIB
+            MemlockPlan::RaiseSoftTo(v) if v == libc::RLIM_INFINITY
         ));
     }
 
