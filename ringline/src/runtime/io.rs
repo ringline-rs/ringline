@@ -1723,8 +1723,14 @@ impl ConnCtx {
     /// is guaranteed because ringline is single-threaded: the task sets the sink,
     /// yields, and the CQE handler (same thread) writes to it before the task
     /// resumes and clears the sink.
+    ///
+    /// A stale handle does nothing: installing the sink on the slot's current
+    /// occupant would write that connection's bytes into `target`.
     pub unsafe fn set_recv_sink(&self, target: *mut u8, len: usize) {
-        with_state(|_driver, executor| {
+        with_state(|driver, executor| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return;
+            }
             executor.recv_sinks[self.conn_index as usize] = Some(crate::runtime::RecvSink {
                 ptr: target,
                 cap: len,
@@ -1734,14 +1740,17 @@ impl ConnCtx {
     }
 
     /// Remove the recv sink and return the number of bytes written to it.
-    /// Returns 0 if no sink was active.
+    /// Returns 0 if no sink was active, or if the handle is stale.
     pub(crate) fn take_recv_sink(&self) -> usize {
-        with_state(
-            |_driver, executor| match executor.recv_sinks[self.conn_index as usize].take() {
+        with_state(|driver, executor| {
+            if driver.connections.generation(self.conn_index) != self.generation {
+                return 0;
+            }
+            match executor.recv_sinks[self.conn_index as usize].take() {
                 Some(sink) => sink.pos,
                 None => 0,
-            },
-        )
+            }
+        })
     }
 
     /// Returns a future that becomes ready when any recv data is available
@@ -2525,7 +2534,8 @@ impl ConnCtx {
     // ── Timestamps ─────────────────────────────────────────────────
 
     /// Returns the most recent kernel RX software timestamp as nanoseconds
-    /// since epoch (`CLOCK_REALTIME`), or 0 if no timestamp has been received.
+    /// since epoch (`CLOCK_REALTIME`), or 0 if no timestamp has been received
+    /// or the handle is stale.
     ///
     /// Updated each time a `RecvMsgMulti` completion delivers an
     /// `SCM_TIMESTAMPING` cmsg. Only available when the `timestamps` feature
@@ -2536,6 +2546,7 @@ impl ConnCtx {
             driver
                 .connections
                 .get(self.conn_index)
+                .filter(|cs| cs.generation == self.generation)
                 .map(|cs| cs.recv_timestamp_ns)
                 .unwrap_or(0)
         })
@@ -2544,6 +2555,9 @@ impl ConnCtx {
     // ── Close / metadata ─────────────────────────────────────────────
 
     /// Close this connection.
+    ///
+    /// Does nothing on a stale handle, one whose slot now holds a different
+    /// connection. Closing by slot index alone would close that connection.
     pub fn close(&self) {
         let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
         if opt_non_null.is_none() {
@@ -2552,6 +2566,9 @@ impl ConnCtx {
         let mut non_null = opt_non_null.unwrap();
         let state = unsafe { non_null.as_mut() };
         let driver = unsafe { &mut *state.driver.as_mut() };
+        if driver.connections.generation(self.conn_index) != self.generation {
+            return;
+        }
         driver.close_connection(self.conn_index);
     }
 
