@@ -73,45 +73,6 @@ fn test_config_builder() -> ConfigBuilder {
         .send_pool(64, 16384)
 }
 
-fn free_port() -> u16 {
-    // Ports come from *below* the ephemeral range (Linux's `ip_local_port_range`
-    // starts at 32768, macOS at 49152). That is the whole fix for #431: the
-    // kernel never auto-assigns a port down here, so the probe-bind/drop/rebind
-    // window stops being a race. Nothing can take one of these out from under
-    // the caller except another process asking for it by number.
-    //
-    // The old version probed with `bind(":0")` and dropped the listener, which
-    // left the port in the ephemeral pool. Between the drop and the server's
-    // real bind, the kernel could hand it to anyone — surfacing either as an
-    // `AddrInUse` launch failure, or (worse, in
-    // `async_outbound_connect_refused`) as a connection *succeeding* to a port
-    // the test believed was dead.
-    //
-    // `cargo test` runs binaries concurrently, so the window is offset per
-    // process; `CLAIMED` keeps threads inside one binary from colliding.
-    use std::sync::Mutex;
-    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
-    const BASE: u16 = 20_000;
-    const SPAN: u16 = 10_000;
-
-    let stride = ((std::process::id() % 40) as u16).saturating_mul(250);
-    for step in 0..SPAN {
-        let port = BASE + (stride + step) % SPAN;
-        {
-            let mut guard = CLAIMED.lock().unwrap();
-            if !guard.get_or_insert_with(Default::default).insert(port) {
-                continue;
-            }
-        }
-        // Confirm nothing currently holds it. Unlike the old probe, dropping
-        // this listener does not return the port to a pool anyone draws from.
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port in the test range {BASE}..{}", BASE + SPAN);
-}
-
 fn wait_for_server(addr: &str) {
     for _ in 0..200 {
         if TcpStream::connect(addr).is_ok() {
@@ -192,21 +153,22 @@ fn a_plaintext_and_a_tls_listener_coexist_in_one_process() {
     let (certs, key) = generate_self_signed();
     let server_config = server_tls_config(certs.clone(), key);
 
-    let plain_port = free_port();
-    let tls_port = free_port();
-    let plain_addr = format!("127.0.0.1:{plain_port}");
-    let tls_addr = format!("127.0.0.1:{tls_port}");
-
     // No process-wide `.tls()`: the TLS listener carries its own config, and
     // the plaintext one must stay plaintext.
     let config = test_config_builder().build().expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(plain_addr.parse().unwrap())
-        .bind_tls(tls_addr.parse().unwrap(), TlsConfig::new(server_config))
+        .bind("127.0.0.1:0".parse().unwrap())
+        .bind_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            TlsConfig::new(server_config),
+        )
         .launch::<TlsEchoHandler>()
         .expect("launch failed");
 
     assert_eq!(shutdown.listener_count(), 2);
+    let bound = shutdown.bound_addrs();
+    let plain_addr = bound[0].expect("plaintext listener address").to_string();
+    let tls_addr = bound[1].expect("TLS listener address").to_string();
 
     wait_for_server(&plain_addr);
     wait_for_server(&tls_addr);
@@ -251,17 +213,15 @@ fn tls_echo_with_external_client() {
     let (certs, key) = generate_self_signed();
     let server_config = server_tls_config(certs.clone(), key);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsEchoHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -369,17 +329,15 @@ fn tls_single_send_larger_than_rustls_buffer() {
     let (certs, key) = generate_self_signed();
     let server_config = server_tls_config(certs.clone(), key);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsBigSendHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -419,9 +377,6 @@ fn tls_echo_large_multichunk() {
     let (certs, key) = generate_self_signed();
     let server_config = server_tls_config(certs.clone(), key);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     // The 1 MiB payload needs > 64 in-flight echo chunks at peak (the
     // synchronous client writes the whole payload before reading, so echo
     // sends queue until it turns around). The default 64×16 KiB test pool is
@@ -434,9 +389,10 @@ fn tls_echo_large_multichunk() {
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsEchoHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -567,9 +523,6 @@ fn tls_outbound_connect_and_echo() {
     let (certs, key) = generate_self_signed();
     let server_config = server_tls_config(certs.clone(), key);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     // Start TLS server.
     let srv_config = test_config_builder()
         .tls(TlsConfig::new(server_config))
@@ -577,9 +530,10 @@ fn tls_outbound_connect_and_echo() {
         .expect("valid config");
 
     let (s_shutdown, s_handles) = RinglineBuilder::new(srv_config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsEchoHandler>()
         .expect("server launch failed");
+    let addr = s_shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
     TLS_SERVER_ADDR.set(addr.parse().unwrap()).ok();
@@ -686,17 +640,15 @@ fn tls_info_accessors() {
     let (certs, key) = generate_self_signed();
     let server_config = server_tls_config(certs.clone(), key);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsInfoHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -843,17 +795,15 @@ fn tls_segmented_recv_reassembles_and_eofs() {
     let (certs, key) = generate_self_signed();
     let server_config = server_tls_config(certs.clone(), key);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsSegmentedHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -970,17 +920,15 @@ fn tls_server_close_sends_close_notify() {
     let (certs, key) = generate_self_signed();
     let server_config = server_tls_config(certs.clone(), key);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsCloseHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -1122,17 +1070,15 @@ fn tls_tick_close_sends_close_notify() {
     let (certs, key) = generate_self_signed();
     let server_config = server_tls_config(certs.clone(), key);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .tls(TlsConfig::new(server_config))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsTickCloseHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -1308,30 +1254,34 @@ impl AsyncEventHandler for PlainEcho {
 fn forward_to_conn_from_a_tls_source() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
-    let backend_port = free_port();
-    let backend_addr = format!("127.0.0.1:{backend_port}");
     let (backend_shutdown, backend_handles) =
         RinglineBuilder::new(test_config_builder().build().expect("valid config"))
-            .bind(backend_addr.parse().unwrap())
+            .bind("127.0.0.1:0".parse().unwrap())
             .launch::<PlainEcho>()
             .expect("backend launch failed");
+    let backend_addr = backend_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
     wait_for_server(&backend_addr);
     TLS_FORWARD_BACKEND
         .set(backend_addr.parse().unwrap())
         .expect("backend addr set once");
 
     let (certs, key) = generate_self_signed();
-    let proxy_port = free_port();
-    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let config = test_config_builder()
         .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
         .forward_hold_cap(1)
         .build()
         .expect("valid config");
     let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(config)
-        .bind(proxy_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsForwardProxy>()
         .expect("proxy launch failed");
+    let proxy_addr = proxy_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
     wait_for_server(&proxy_addr);
 
     let client_config = client_tls_config(&certs);
@@ -1440,29 +1390,33 @@ impl AsyncEventHandler for TlsSinkRefusedProxy {
 fn a_tls_connection_is_refused_as_a_forward_sink() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
-    let backend_port = free_port();
-    let backend_addr = format!("127.0.0.1:{backend_port}");
     let (backend_shutdown, backend_handles) =
         RinglineBuilder::new(test_config_builder().build().expect("valid config"))
-            .bind(backend_addr.parse().unwrap())
+            .bind("127.0.0.1:0".parse().unwrap())
             .launch::<PlainEcho>()
             .expect("backend launch failed");
+    let backend_addr = backend_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
     wait_for_server(&backend_addr);
     TLS_SINK_REFUSED_BACKEND
         .set(backend_addr.parse().unwrap())
         .expect("backend addr set once");
 
     let (certs, key) = generate_self_signed();
-    let proxy_port = free_port();
-    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let config = test_config_builder()
         .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
         .build()
         .expect("valid config");
     let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(config)
-        .bind(proxy_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsSinkRefusedProxy>()
         .expect("proxy launch failed");
+    let proxy_addr = proxy_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
     wait_for_server(&proxy_addr);
 
     let client_config = client_tls_config(&certs);
@@ -1563,16 +1517,15 @@ fn tls_segments_installed_after_data_still_delivers_it() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     let (certs, key) = generate_self_signed();
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let config = test_config_builder()
         .tls(TlsConfig::new(server_tls_config(certs.clone(), key)))
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TlsLateSegmentReader>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     let client_config = client_tls_config(&certs);

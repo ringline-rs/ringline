@@ -152,44 +152,45 @@ fn test_config() -> Config {
     test_config_builder().build().expect("valid config")
 }
 
-/// Find an available port by binding to :0.
-fn free_port() -> u16 {
-    // Ports come from *below* the ephemeral range (Linux's `ip_local_port_range`
-    // starts at 32768, macOS at 49152). That is the whole fix for #431: the
-    // kernel never auto-assigns a port down here, so the probe-bind/drop/rebind
-    // window stops being a race. Nothing can take one of these out from under
-    // the caller except another process asking for it by number.
-    //
-    // The old version probed with `bind(":0")` and dropped the listener, which
-    // left the port in the ephemeral pool. Between the drop and the server's
-    // real bind, the kernel could hand it to anyone — surfacing either as an
-    // `AddrInUse` launch failure, or (worse, in
-    // `async_outbound_connect_refused`) as a connection *succeeding* to a port
-    // the test believed was dead.
-    //
-    // `cargo test` runs binaries concurrently, so the window is offset per
-    // process; `CLAIMED` keeps threads inside one binary from colliding.
-    use std::sync::Mutex;
-    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
-    const BASE: u16 = 20_000;
-    const SPAN: u16 = 10_000;
+/// A TCP port that refuses connections: a socket bound to it that never
+/// listens, so a connect gets a reset. The socket holds the port until it is
+/// dropped, so no other process can take it in the meantime.
+fn refusing_port() -> (std::os::fd::OwnedFd, u16) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    let stride = ((std::process::id() % 40) as u16).saturating_mul(250);
-    for step in 0..SPAN {
-        let port = BASE + (stride + step) % SPAN;
-        {
-            let mut guard = CLAIMED.lock().unwrap();
-            if !guard.get_or_insert_with(Default::default).insert(port) {
-                continue;
-            }
-        }
-        // Confirm nothing currently holds it. Unlike the old probe, dropping
-        // this listener does not return the port to a pool anyone draws from.
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
+    // SAFETY: `raw` is a socket created above and owned by nothing else.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    sin.sin_family = libc::AF_INET as libc::sa_family_t;
+    sin.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    {
+        sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
     }
-    panic!("no free port in the test range {BASE}..{}", BASE + SPAN);
+    let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &sin as *const _ as *const libc::sockaddr,
+            len,
+        )
+    };
+    assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
+
+    let mut bound: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut blen = len;
+    let rc = unsafe {
+        libc::getsockname(
+            fd.as_raw_fd(),
+            &mut bound as *mut _ as *mut libc::sockaddr,
+            &mut blen,
+        )
+    };
+    assert_eq!(rc, 0, "getsockname: {}", io::Error::last_os_error());
+    (fd, u16::from_be(bound.sin_port))
 }
 
 fn wait_for_server(addr: &str) {
@@ -261,12 +262,11 @@ fn coalesced_sends_preserve_order() {
         .send_pool(512, 16384)
         .build()
         .expect("valid config");
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<BurstSender>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
@@ -313,12 +313,11 @@ fn recv_forward_echo_preserves_order_across_buffers() {
         .sq_entries(256)
         .build()
         .expect("valid config");
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<RecvForwardEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
@@ -385,13 +384,11 @@ fn runtime_reports_bound_addr() {
 
 #[test]
 fn echo_small_message() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -407,13 +404,11 @@ fn echo_small_message() {
 
 #[test]
 fn echo_large_message() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -430,13 +425,11 @@ fn echo_large_message() {
 
 #[test]
 fn echo_multiple_connections() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -461,13 +454,11 @@ fn echo_multiple_connections() {
 
 #[test]
 fn echo_sequential_sends() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -502,13 +493,11 @@ fn echo_sequential_sends() {
 
 #[test]
 fn async_echo_small_message() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -524,13 +513,11 @@ fn async_echo_small_message() {
 
 #[test]
 fn async_echo_large_message() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -546,13 +533,11 @@ fn async_echo_large_message() {
 
 #[test]
 fn async_echo_multiple_connections() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -577,13 +562,11 @@ fn async_echo_multiple_connections() {
 
 #[test]
 fn connection_close_on_client_disconnect() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -609,13 +592,11 @@ fn connection_close_on_client_disconnect() {
 
 #[test]
 fn graceful_shutdown() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -663,13 +644,11 @@ impl AsyncEventHandler for ShutdownWriteEcho {
 
 #[test]
 fn async_shutdown_write_triggers_eof() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ShutdownWriteEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -735,13 +714,11 @@ impl AsyncEventHandler for RequestShutdownHandler {
 
 #[test]
 fn async_request_shutdown_exits_cleanly() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<RequestShutdownHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -805,13 +782,11 @@ fn async_spawn_standalone_task() {
     // Reset counter.
     SPAWN_COUNTER.store(0, Ordering::SeqCst);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SpawnTestHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -884,13 +859,11 @@ impl AsyncEventHandler for SleepEchoHandler {
 
 #[test]
 fn async_sleep_completes() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SleepEchoHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -984,13 +957,11 @@ impl AsyncEventHandler for TimeoutTestHandler {
 
 #[test]
 fn async_timeout_ok() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TimeoutTestHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -1023,13 +994,11 @@ fn async_timeout_ok() {
 
 #[test]
 fn async_timeout_expires() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TimeoutTestHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -1142,13 +1111,15 @@ impl AsyncEventHandler for ForwarderHandler {
 #[test]
 fn async_outbound_connect_and_echo() {
     // 1. Start a backend echo server.
-    let backend_port = free_port();
-    let backend_addr = format!("127.0.0.1:{backend_port}");
 
     let (backend_shutdown, backend_handles) = RinglineBuilder::new(test_config())
-        .bind(backend_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend launch failed");
+    let backend_addr = backend_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
 
     wait_for_server(&backend_addr);
 
@@ -1157,13 +1128,14 @@ fn async_outbound_connect_and_echo() {
         .set(backend_addr.parse().unwrap())
         .ok();
 
-    let forwarder_port = free_port();
-    let forwarder_addr = format!("127.0.0.1:{forwarder_port}");
-
     let (fwd_shutdown, fwd_handles) = RinglineBuilder::new(test_config())
-        .bind(forwarder_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ForwarderHandler>()
         .expect("forwarder launch failed");
+    let forwarder_addr = fwd_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
 
     wait_for_server(&forwarder_addr);
 
@@ -1221,21 +1193,17 @@ impl AsyncEventHandler for ConnectRefusedHandler {
 
 #[test]
 fn async_outbound_connect_refused() {
-    // A port from the test allocator, never bound. `free_port` hands out ports
-    // from below the ephemeral range, so nothing will take this one behind our
-    // back — which is what used to make this test fail with `CONNECTED`
-    // instead of a refusal (#431).
-    let dead_port = free_port();
+    // A port held by a socket that never listens, so a connect is refused and
+    // nothing else can take the port while the test runs (#431).
+    let (_dead_guard, dead_port) = refusing_port();
 
     CONNECT_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ConnectRefusedHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -1369,13 +1337,15 @@ impl AsyncEventHandler for MultiOutboundHandler {
 #[test]
 fn async_multiple_outbound_from_one_task() {
     // Start backend echo server.
-    let backend_port = free_port();
-    let backend_addr = format!("127.0.0.1:{backend_port}");
 
     let (backend_shutdown, backend_handles) = RinglineBuilder::new(test_config())
-        .bind(backend_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend launch failed");
+    let backend_addr = backend_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
 
     wait_for_server(&backend_addr);
 
@@ -1384,13 +1354,12 @@ fn async_multiple_outbound_from_one_task() {
         .ok();
 
     // Start the multi-outbound server.
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<MultiOutboundHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -1511,20 +1480,18 @@ impl AsyncEventHandler for SelectTwoHandler {
 #[test]
 fn async_select_two_connections() {
     // Start two backend echo servers.
-    let backend1_port = free_port();
-    let backend1_addr = format!("127.0.0.1:{backend1_port}");
     let (b1_shutdown, b1_handles) = RinglineBuilder::new(test_config())
-        .bind(backend1_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend1 launch failed");
+    let backend1_addr = b1_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&backend1_addr);
 
-    let backend2_port = free_port();
-    let backend2_addr = format!("127.0.0.1:{backend2_port}");
     let (b2_shutdown, b2_handles) = RinglineBuilder::new(test_config())
-        .bind(backend2_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend2 launch failed");
+    let backend2_addr = b2_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&backend2_addr);
 
     SELECT_BACKEND1_ADDR
@@ -1534,12 +1501,11 @@ fn async_select_two_connections() {
         .set(backend2_addr.parse().unwrap())
         .ok();
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SelectTwoHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
@@ -1661,31 +1627,28 @@ impl AsyncEventHandler for SelectSecondWinsHandler {
 
 #[test]
 fn async_select_second_wins() {
-    let b1_port = free_port();
-    let b1_addr = format!("127.0.0.1:{b1_port}");
     let (b1_shutdown, b1_handles) = RinglineBuilder::new(test_config())
-        .bind(b1_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend1 launch failed");
+    let b1_addr = b1_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&b1_addr);
 
-    let b2_port = free_port();
-    let b2_addr = format!("127.0.0.1:{b2_port}");
     let (b2_shutdown, b2_handles) = RinglineBuilder::new(test_config())
-        .bind(b2_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend2 launch failed");
+    let b2_addr = b2_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&b2_addr);
 
     SELECT2_BACKEND1_ADDR.set(b1_addr.parse().unwrap()).ok();
     SELECT2_BACKEND2_ADDR.set(b2_addr.parse().unwrap()).ok();
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SelectSecondWinsHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
@@ -1777,18 +1740,16 @@ impl AsyncEventHandler for SelectSleepHandler {
 
 #[test]
 fn async_select_with_sleep() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     // Use a config with limited timer slots to make leaks detectable.
     let config = test_config_builder()
         .timer_slots(16)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SelectSleepHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -1897,22 +1858,20 @@ impl AsyncEventHandler for Select3Handler {
 
 #[test]
 fn async_select3_basic() {
-    let b_port = free_port();
-    let b_addr = format!("127.0.0.1:{b_port}");
     let (b_shutdown, b_handles) = RinglineBuilder::new(test_config())
-        .bind(b_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend launch failed");
+    let b_addr = b_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&b_addr);
 
     SELECT3_BACKEND_ADDR.set(b_addr.parse().unwrap()).ok();
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<Select3Handler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
@@ -2006,17 +1965,15 @@ impl AsyncEventHandler for TrySpawnHandler {
 
 #[test]
 fn async_spawn_exhaustion() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .standalone_task_capacity(1)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TrySpawnHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2100,17 +2057,15 @@ impl AsyncEventHandler for CancelTaskHandler {
 
 #[test]
 fn async_cancel_running_task() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .standalone_task_capacity(1)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<CancelTaskHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2184,13 +2139,11 @@ impl AsyncEventHandler for CancelCompletedHandler {
 
 #[test]
 fn async_cancel_completed_task() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<CancelCompletedHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2242,13 +2195,11 @@ fn multi_worker_config(threads: usize) -> Config {
 
 #[test]
 fn multi_worker_echo() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(multi_worker_config(2))
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2267,13 +2218,11 @@ fn multi_worker_echo() {
 
 #[test]
 fn multi_worker_async_echo() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(multi_worker_config(2))
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2292,13 +2241,11 @@ fn multi_worker_async_echo() {
 
 #[test]
 fn multi_worker_graceful_shutdown() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(multi_worker_config(4))
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2358,13 +2305,11 @@ impl AsyncEventHandler for SendAwaitHandler {
 
 #[test]
 fn async_send_await_basic() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SendAwaitHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2458,13 +2403,11 @@ impl AsyncEventHandler for SendChainAwaitHandler {
 #[test]
 #[cfg(has_io_uring)]
 fn async_send_chain_await_basic() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SendChainAwaitHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2555,17 +2498,15 @@ impl AsyncEventHandler for TrySleepHandler {
 
 #[test]
 fn async_try_sleep_exhaustion() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .timer_slots(2)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TrySleepHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2648,17 +2589,15 @@ impl AsyncEventHandler for TryTimeoutHandler {
 
 #[test]
 fn async_try_timeout_exhaustion() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .timer_slots(2)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TryTimeoutHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2747,13 +2686,11 @@ impl AsyncEventHandler for JoinHandler {
 
 #[test]
 fn async_join_basic() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<JoinHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -2840,9 +2777,6 @@ impl AsyncEventHandler for BackpressuredEchoHandler {
 /// passes.
 #[test]
 fn backpressured_send_waits_for_pool_capacity_without_duplication() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .workers(1)
         .send_pool(8, 4096)
@@ -2850,9 +2784,10 @@ fn backpressured_send_waits_for_pool_capacity_without_duplication() {
         .expect("valid config");
 
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<BackpressuredEchoHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     // `connect_retry`, not `wait_for_server` + `connect`: the discarded probe
     // would be accepted as connection 0, and this handler sends unprompted at a
     // peer that has already closed. See #518 and `connect_retry`'s comment.
@@ -2968,17 +2903,16 @@ impl AsyncEventHandler for OwnerMoveHandler {
 
 #[test]
 fn backpressured_send_refreshes_owner_after_first_poll_move() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let config = test_config_builder()
         .workers(1)
         .send_pool(1, 4096)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<OwnerMoveHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
@@ -3025,12 +2959,11 @@ impl AsyncEventHandler for FirstPollMoveHandler {
 
 #[test]
 fn backpressured_send_registers_the_first_polling_task_after_move() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<FirstPollMoveHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
@@ -3084,12 +3017,11 @@ impl AsyncEventHandler for CancelSubmittedHandler {
 
 #[test]
 fn canceled_submitted_backpressured_send_cannot_complete_the_next_send() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<CancelSubmittedHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
@@ -3165,17 +3097,16 @@ impl AsyncEventHandler for MioHalfCloseHandler {
 #[cfg(not(has_io_uring))]
 #[test]
 fn mio_half_close_resolves_every_bounded_send_without_hanging() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let config = test_config_builder()
         .workers(1)
         .send_pool(1, 4096)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<MioHalfCloseHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
@@ -3221,12 +3152,11 @@ impl AsyncEventHandler for LazyDropHandler {
 
 #[test]
 fn backpressured_send_construction_is_lazy_and_unpolled_drop_is_inert() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<LazyDropHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -3270,16 +3200,15 @@ impl AsyncEventHandler for OversizeHandler {
 
 #[test]
 fn backpressured_send_rejects_oversize_before_writing() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let config = test_config_builder()
         .send_pool(8, 4096)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<OversizeHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -3359,17 +3288,16 @@ const SHUTDOWN_PARKED: &[u8] = &[b'P'; 4096];
 
 #[test]
 fn shutdown_drops_parked_backpressured_send_without_hanging() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let config = test_config_builder()
         .workers(1)
         .send_pool(1, 4096)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ShutdownWhileParkedHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
@@ -3477,9 +3405,6 @@ impl AsyncEventHandler for ProbeWitnessHandler {
 /// hazard is the same either way.
 #[test]
 fn wait_for_server_probe_reaches_a_send_on_accept_handler() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .workers(1)
         .send_pool(8, 4096)
@@ -3487,9 +3412,10 @@ fn wait_for_server_probe_reaches_a_send_on_accept_handler() {
         .expect("valid config");
 
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ProbeWitnessHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     // The probe, and nothing else: no real client connects in this test.
     wait_for_server(&addr);
@@ -3686,9 +3612,6 @@ impl AsyncEventHandler for Repro518Handler {
 }
 
 fn repro518_round(sleep_ms: usize, pool_slots: usize, conns: usize) -> Repro518Report {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     R518_SEQ.store(0, Ordering::SeqCst);
     if let Ok(mut g) = R518_FATES.lock() {
         g.clear();
@@ -3701,9 +3624,10 @@ fn repro518_round(sleep_ms: usize, pool_slots: usize, conns: usize) -> Repro518R
         .expect("valid config");
 
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<Repro518Handler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     let mut streams = Vec::new();
     for _ in 0..conns {
@@ -3766,13 +3690,11 @@ fn repro518_round(sleep_ms: usize, pool_slots: usize, conns: usize) -> Repro518R
 
 #[test]
 fn async_join3_mixed() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<Join3Handler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -3888,13 +3810,11 @@ impl AsyncEventHandler for SleepUntilHandler {
 
 #[test]
 fn async_sleep_until_basic() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SleepUntilHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -3967,13 +3887,11 @@ impl AsyncEventHandler for TimeoutAtHandler {
 
 #[test]
 fn async_timeout_at_expires() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TimeoutAtHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -4050,17 +3968,13 @@ impl AsyncEventHandler for UdpEchoAsync {
 
 #[test]
 fn async_udp_echo() {
-    let udp_port = free_port();
-    let udp_addr: std::net::SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
-
-    let tcp_port = free_port();
-    let tcp_addr = format!("127.0.0.1:{tcp_port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(tcp_addr.parse().unwrap())
-        .bind_udp(udp_addr)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<UdpEchoAsync>()
         .expect("launch failed");
+    let tcp_addr = shutdown.bound_addr().expect("bound address").to_string();
+    let udp_addr = shutdown.bound_udp_addr().expect("bound UDP address");
 
     wait_for_server(&tcp_addr);
     std::thread::sleep(Duration::from_millis(50));
@@ -4159,12 +4073,11 @@ impl AsyncEventHandler for StandaloneConnectHandler {
 #[test]
 fn async_standalone_connect() {
     // Start backend echo server.
-    let backend_port = free_port();
-    let backend_addr = format!("127.0.0.1:{backend_port}");
     let (b_shutdown, b_handles) = RinglineBuilder::new(test_config())
-        .bind(backend_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend launch failed");
+    let backend_addr = b_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&backend_addr);
 
     STANDALONE_CONNECT_BACKEND
@@ -4172,12 +4085,11 @@ fn async_standalone_connect() {
         .ok();
 
     // Start the handler server.
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<StandaloneConnectHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     let mut stream = TcpStream::connect(&addr).unwrap();
@@ -4305,12 +4217,11 @@ impl AsyncEventHandler for GreetingClientHandler {
 
 #[test]
 fn async_server_speaks_first_greeting() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<GreetingServer>()
         .expect("server launch failed");
+    let addr = s_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     GREETING_ADDR.set(addr.parse().unwrap()).ok();
@@ -4396,12 +4307,11 @@ impl AsyncEventHandler for OnStartClientHandler {
 #[test]
 fn async_on_start_client_only() {
     // Start backend echo server.
-    let backend_port = free_port();
-    let backend_addr = format!("127.0.0.1:{backend_port}");
     let (b_shutdown, b_handles) = RinglineBuilder::new(test_config())
-        .bind(backend_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend launch failed");
+    let backend_addr = b_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&backend_addr);
 
     ON_START_BACKEND_ADDR
@@ -4468,20 +4378,17 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
 
 #[test]
 fn async_standalone_connect_refused() {
-    // A port from the test allocator, never bound — see #431 and the note on
-    // `free_port`. The old probe-then-drop left it in the ephemeral pool,
-    // where anything could take it and turn "refused" into "connected".
-    let dead_port = free_port();
+    // A port held by a socket that never listens, so a connect is refused and
+    // nothing else can take the port while the test runs (#431).
+    let (_dead_guard, dead_port) = refusing_port();
 
     STANDALONE_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<StandaloneConnectRefusedHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -4560,13 +4467,11 @@ impl AsyncEventHandler for PeerCloseHandler {
 
 #[test]
 fn async_peer_close_delivers_eof() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<PeerCloseHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     // Connect with std TCP, send data, read echo, then close.
@@ -4647,18 +4552,16 @@ impl AsyncEventHandler for PoolExhaustionHandler {
 #[cfg(has_io_uring)]
 #[test]
 fn async_send_pool_exhaustion() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         // Very small send pool to trigger exhaustion quickly.
         .send_pool(4, 16384)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<PoolExhaustionHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     // Connect and send a trigger message. Don't read — let the server's
@@ -4776,16 +4679,15 @@ impl AsyncEventHandler for RetryAfterPoolPressure {
 /// attempt succeeds and the test pins the contract without exercising it.
 #[test]
 fn multi_slot_send_retry_after_pool_pressure_delivers_exactly_once() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let config = test_config_builder()
         .send_pool(4, MULTI_SLOT_FILLER_LEN as u32)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<RetryAfterPoolPressure>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     let mut stream = connect_with_retry(&addr);
     stream
@@ -4919,13 +4821,11 @@ impl AsyncEventHandler for SendPartsHandler {
 #[cfg(has_io_uring)]
 #[test]
 fn async_send_parts_scatter_gather() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SendPartsHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     // Send trigger, then read the scatter-gather response.
@@ -5038,11 +4938,9 @@ impl AsyncEventHandler for OutboundEofClient {
 
 #[test]
 fn async_outbound_connect_receives_eof() {
-    let port = free_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     // Start a simple std TCP echo-once server in a thread.
-    let listener = std::net::TcpListener::bind(addr).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
     let server_thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
@@ -5084,17 +4982,16 @@ fn async_outbound_connect_receives_eof() {
 fn buffer_ring_exhaustion_recovers() {
     // Use a tiny buffer ring (4 buffers) to force ENOBUFS under
     // concurrent connection load, then verify all data echoes correctly.
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let config = test_config_builder()
         .recv_buffer(4, 4096)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     // Open 8 connections simultaneously and send data on all of them.
@@ -5259,13 +5156,12 @@ impl AsyncEventHandler for JoinHandleHandler {
 #[test]
 fn spawn_with_handle_awaits_result() {
     JOIN_RESULT.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<JoinHandleHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5312,13 +5208,12 @@ impl AsyncEventHandler for ImmediateJoinHandler {
 #[test]
 fn spawn_with_handle_immediate_completion() {
     IMMEDIATE_RESULT.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ImmediateJoinHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5368,13 +5263,12 @@ impl AsyncEventHandler for DetachHandler {
 #[test]
 fn spawn_with_handle_detach_on_drop() {
     DETACH_RAN.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<DetachHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5421,13 +5315,11 @@ impl AsyncEventHandler for AbortHandler {
 
 #[test]
 fn spawn_with_handle_abort() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AbortHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5473,13 +5365,12 @@ impl AsyncEventHandler for MultiJoinHandler {
 #[test]
 fn spawn_with_handle_multiple_join() {
     MULTI_SUM.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<MultiJoinHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5532,13 +5423,12 @@ impl AsyncEventHandler for OneshotHandler {
 #[test]
 fn oneshot_channel_async_wakeup() {
     ONESHOT_RESULT.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<OneshotHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5590,13 +5480,12 @@ impl AsyncEventHandler for OneshotClosedHandler {
 #[test]
 fn oneshot_channel_sender_dropped() {
     ONESHOT_CLOSED.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<OneshotClosedHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5658,13 +5547,12 @@ impl AsyncEventHandler for MpscHandler {
 #[test]
 fn mpsc_channel_multiple_senders() {
     MPSC_SUM.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<MpscHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5721,13 +5609,12 @@ impl AsyncEventHandler for MpscBackpressureHandler {
 #[test]
 fn mpsc_channel_backpressure() {
     MPSC_BACKPRESSURE.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<MpscBackpressureHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5785,13 +5672,12 @@ impl AsyncEventHandler for ResolveHandler {
 #[test]
 fn resolve_localhost() {
     RESOLVE_RESULT.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ResolveHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5859,13 +5745,12 @@ fn resolve_invalid_hostname() {
     }
 
     RESOLVE_ERR.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ResolveErrorHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5909,17 +5794,15 @@ impl AsyncEventHandler for ResolveDisabledHandler {
 
 #[test]
 fn resolve_disabled_returns_error() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .resolver_threads(0)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ResolveDisabledHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -5978,17 +5861,16 @@ fn an_excluded_worker_stops_receiving_connections() {
         }
     }
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let config = test_config_builder()
         .workers(WORKERS)
         .accept_mode(ringline::AcceptMode::Merged)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<Reporter>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     shutdown
@@ -6093,18 +5975,16 @@ fn merged_accept_mode_serves_connections_across_workers() {
     SAW_PEER.store(0, Ordering::SeqCst);
 
     const CONNS: usize = 16;
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .workers(4)
         .accept_mode(ringline::AcceptMode::Merged)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<MergedEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     // Reachability is the real assertion here: in merged mode nothing listens
     // until every worker has reported ready and launch has called listen(2).
@@ -6180,18 +6060,17 @@ fn mixed_tcp_and_unix_listeners_are_distinguishable() {
     TCP_LISTENER.store(u32::MAX, Ordering::SeqCst);
     UNIX_LISTENER.store(u32::MAX, Ordering::SeqCst);
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let sock_path =
         std::env::temp_dir().join(format!("ringline-mixed-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock_path);
 
     // TCP binds first, so it is listener 0 and the Unix socket is listener 1.
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .bind_unix(&sock_path)
         .launch::<ListenerReporter>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     assert_eq!(
         shutdown.listener_count(),
@@ -6239,8 +6118,8 @@ fn mixed_tcp_and_unix_listeners_are_distinguishable() {
     let addrs = shutdown.bound_addrs();
     assert_eq!(addrs.len(), 2);
     assert_eq!(
-        addrs[tcp_id as usize].map(|a| a.port()),
-        Some(port),
+        addrs[tcp_id as usize].map(|a| a.to_string()),
+        Some(addr.clone()),
         "the TCP listener's id should index its own bound address"
     );
     assert!(
@@ -6412,13 +6291,12 @@ fn peer_addr_tcp_regression() {
     }
 
     TCP_PEER.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<PeerAddrHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
     let _ = echo_round_trip(&addr, b"x");
@@ -6475,13 +6353,12 @@ impl AsyncEventHandler for CancellationHandler {
 #[test]
 fn cancellation_token_wakes_task() {
     CANCEL_RESULT.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<CancellationHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -6534,13 +6411,12 @@ impl AsyncEventHandler for SelectCancelHandler {
 #[test]
 fn cancellation_token_with_select() {
     SELECT_CANCEL.store(0, Ordering::SeqCst);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SelectCancelHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -6588,13 +6464,11 @@ impl AsyncEventHandler for ForwardEcho {
 
 #[test]
 fn forward_echo_small_message() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ForwardEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -6610,18 +6484,16 @@ fn forward_echo_small_message() {
 
 #[test]
 fn forward_echo_large_message() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let config = test_config_builder()
         .recv_buffer(64, 32768)
         .send_pool(64, 32768)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ForwardEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -6638,16 +6510,14 @@ fn forward_echo_large_message() {
 
 #[test]
 fn forward_echo_message_larger_than_buffer() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     // Buffer is 4KB but message is 8KB — forces the accumulator path, where
     // forward_recv_buf detaches the accumulator and sends it under a guard
     // rather than copying it into the send pool (#397).
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ForwardEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -6673,13 +6543,12 @@ fn forward_echo_chunked_message_then_more_traffic() {
     // The first message is written in chunks with gaps so it lands across
     // several recv completions (the accumulator path). The two that follow
     // then have to arrive intact on the same connection.
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ForwardEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -6723,13 +6592,11 @@ fn forward_echo_chunked_message_then_more_traffic() {
 
 #[test]
 fn forward_echo_multiple_connections() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ForwardEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -6774,13 +6641,11 @@ fn forward_echo_multiple_connections() {
 
 #[test]
 fn forward_echo_sequential_sends() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ForwardEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -6849,13 +6714,11 @@ impl AsyncEventHandler for PanickingThenEcho {
 
 #[test]
 fn connection_task_panic_does_not_kill_worker() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<PanickingThenEcho>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     wait_for_server(&addr);
 
@@ -6986,12 +6849,11 @@ fn with_data_result_returns_ok_zero_on_clean_close() {
         .unwrap_or_else(|e| e.into_inner());
     WITH_DATA_RESULT_OUTCOME.store(0, Ordering::Release);
     WITH_DATA_RESULT_ACCEPTED.store(0, Ordering::Release);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<WithDataResultHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     let mut stream = connect_with_retry(&addr);
     wait_for_with_data_result_accept(1);
@@ -7019,12 +6881,11 @@ fn with_data_result_surfaces_tcp_reset() {
         .unwrap_or_else(|e| e.into_inner());
     WITH_DATA_RESULT_OUTCOME.store(0, Ordering::Release);
     WITH_DATA_RESULT_ACCEPTED.store(0, Ordering::Release);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<WithDataResultHandler>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     let stream = connect_with_retry(&addr);
     wait_for_with_data_result_accept(1);
@@ -7151,12 +7012,11 @@ fn set_linger_zero(stream: &TcpStream) {
 /// connection must echo: a server that leaks the slot of a peer-closed
 /// connection refuses the third one.
 fn assert_sequential_connections<H: AsyncEventHandler>(count: usize, close: ClientClose) {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(two_slot_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<H>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     let mut echoed = 0;
     for i in 0..count {
@@ -7280,12 +7140,11 @@ impl AsyncEventHandler for RespondAfterEof {
 #[test]
 fn response_after_peer_fin_is_delivered() {
     RESPONSE_AFTER_EOF_SEND.store(0, Ordering::Release);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(large_send_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<RespondAfterEof>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     let mut stream = connect_with_retry(&addr);
     stream
@@ -7357,12 +7216,11 @@ impl AsyncEventHandler for RespondAfterEofCountingTicks {
 #[test]
 fn deferred_close_does_not_spin_on_half_closed_peer() {
     DRAIN_TICKS.store(0, Ordering::Relaxed);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(large_send_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<RespondAfterEofCountingTicks>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     let mut stream = connect_with_retry(&addr);
     stream
@@ -7462,12 +7320,11 @@ impl AsyncEventHandler for RespondThenHalfClose {
 #[test]
 fn half_close_waits_for_queued_sends_to_drain() {
     HALF_CLOSE_PROGRESS.store(0, Ordering::Release);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(large_send_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<RespondThenHalfClose>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
 
     let mut stream = connect_with_retry(&addr);
     stream
@@ -7637,12 +7494,14 @@ fn proxy_round_trip(stream: &mut TcpStream, payload: &[u8], split: bool, case: &
 /// path would go untested.
 #[test]
 fn forward_to_conn_proxies_both_directions() {
-    let backend_port = free_port();
-    let backend_addr = format!("127.0.0.1:{backend_port}");
     let (backend_shutdown, backend_handles) = RinglineBuilder::new(test_config())
-        .bind(backend_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend launch failed");
+    let backend_addr = backend_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
     wait_for_server(&backend_addr);
 
     PROXY_BACKEND_ADDR
@@ -7654,12 +7513,14 @@ fn forward_to_conn_proxies_both_directions() {
             .forward_hold_cap(hold_cap)
             .build()
             .expect("valid config");
-        let proxy_port = free_port();
-        let proxy_addr = format!("127.0.0.1:{proxy_port}");
         let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(config)
-            .bind(proxy_addr.parse().unwrap())
+            .bind("127.0.0.1:0".parse().unwrap())
             .launch::<ForwardToConnProxy>()
             .expect("proxy launch failed");
+        let proxy_addr = proxy_shutdown
+            .bound_addr()
+            .expect("bound address")
+            .to_string();
         wait_for_server(&proxy_addr);
 
         let mut stream = TcpStream::connect(&proxy_addr).unwrap();
@@ -7762,23 +7623,27 @@ impl AsyncEventHandler for DroppedForwardProxy {
 
 #[test]
 fn dropping_a_forward_to_conn_future_cancels_the_relay() {
-    let backend_port = free_port();
-    let backend_addr = format!("127.0.0.1:{backend_port}");
     let (backend_shutdown, backend_handles) = RinglineBuilder::new(test_config())
-        .bind(backend_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend launch failed");
+    let backend_addr = backend_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
     wait_for_server(&backend_addr);
     DROPPED_FORWARD_BACKEND
         .set(backend_addr.parse().unwrap())
         .expect("backend addr set once");
 
-    let proxy_port = free_port();
-    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(test_config())
-        .bind(proxy_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<DroppedForwardProxy>()
         .expect("proxy launch failed");
+    let proxy_addr = proxy_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
     wait_for_server(&proxy_addr);
 
     // Connect first and pause, so the handler has armed and dropped its
@@ -7913,12 +7778,11 @@ fn forward_to_file_writes_a_large_body_byte_exact() {
     let path = dir.join("sink.bin");
     FILE_SINK_PATH.set(path.clone()).expect("set once");
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<FileForwarder>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     let size = 1024 * 1024;
@@ -8024,12 +7888,11 @@ fn forward_to_file_stops_at_len_and_leaves_the_tail_readable() {
         }
     }
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<TailForwarder>()
         .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     // Forward 100_000 bytes, but send 64 more. With a 4 KiB ring the boundary
@@ -8128,23 +7991,27 @@ impl AsyncEventHandler for BusyForwardProxy {
 
 #[test]
 fn a_second_forward_on_one_connection_is_refused_with_ebusy() {
-    let backend_port = free_port();
-    let backend_addr = format!("127.0.0.1:{backend_port}");
     let (backend_shutdown, backend_handles) = RinglineBuilder::new(test_config())
-        .bind(backend_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncEcho>()
         .expect("backend launch failed");
+    let backend_addr = backend_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
     wait_for_server(&backend_addr);
     BUSY_FORWARD_BACKEND
         .set(backend_addr.parse().unwrap())
         .expect("backend addr set once");
 
-    let proxy_port = free_port();
-    let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let (proxy_shutdown, proxy_handles) = RinglineBuilder::new(test_config())
-        .bind(proxy_addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<BusyForwardProxy>()
         .expect("proxy launch failed");
+    let proxy_addr = proxy_shutdown
+        .bound_addr()
+        .expect("bound address")
+        .to_string();
     wait_for_server(&proxy_addr);
 
     let mut stream = TcpStream::connect(&proxy_addr).unwrap();
@@ -8176,12 +8043,6 @@ fn a_second_forward_on_one_connection_is_refused_with_ebusy() {
 /// so with the send issued while the read side is borrowed.
 #[test]
 fn split_halves_echo_round_trip() {
-    // Bind :0 and read the resolved port back, rather than going through
-    // `free_port()`. That helper probes with a throwaway listener and drops it
-    // before the server binds, so another process can take the port in the
-    // window between — which is exactly the `AddrInUse` launch failure this
-    // suite hits under parallel load. Letting the server own the bind closes
-    // the window instead of narrowing it.
     let (shutdown, handles) = RinglineBuilder::new(test_config())
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SplitEcho>()

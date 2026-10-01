@@ -136,10 +136,6 @@ impl AsyncEventHandler for ReleaseOnCue {
 
 #[test]
 fn a_gated_listener_refuses_until_the_handler_releases_it() {
-    // Port 0, resolved after launch. `free_port`-style probing binds a socket
-    // and drops it before the runtime binds, and another test binary can take
-    // the port in that window. Letting the kernel choose leaves no window: the
-    // runtime holds the port from `bind(2)` onward.
     let (shutdown, handles) = RinglineBuilder::new(test_config())
         .bind("127.0.0.1:0".parse().unwrap())
         .defer_listen()

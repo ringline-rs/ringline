@@ -61,53 +61,6 @@ fn test_config() -> Config {
     test_config_builder().build().expect("valid config")
 }
 
-fn free_port() -> u16 {
-    // Ports come from *below* the ephemeral range (Linux's `ip_local_port_range`
-    // starts at 32768, macOS at 49152). That is the whole fix for #431: the
-    // kernel never auto-assigns a port down here, so the probe-bind/drop/rebind
-    // window stops being a race. Nothing can take one of these out from under
-    // the caller except another process asking for it by number.
-    //
-    // The old version probed with `bind(":0")` and dropped the listener, which
-    // left the port in the ephemeral pool. Between the drop and the server's
-    // real bind, the kernel could hand it to anyone — surfacing either as an
-    // `AddrInUse` launch failure, or (worse, in
-    // `async_outbound_connect_refused`) as a connection *succeeding* to a port
-    // the test believed was dead.
-    //
-    // `cargo test` runs binaries concurrently, so the window is offset per
-    // process; `CLAIMED` keeps threads inside one binary from colliding.
-    use std::sync::Mutex;
-    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
-    const BASE: u16 = 20_000;
-    const SPAN: u16 = 10_000;
-
-    let stride = ((std::process::id() % 40) as u16).saturating_mul(250);
-    for step in 0..SPAN {
-        let port = BASE + (stride + step) % SPAN;
-        {
-            let mut guard = CLAIMED.lock().unwrap();
-            if !guard.get_or_insert_with(Default::default).insert(port) {
-                continue;
-            }
-        }
-        // Confirm nothing currently holds it. Unlike the old probe, dropping
-        // this listener does not return the port to a pool anyone draws from.
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port in the test range {BASE}..{}", BASE + SPAN);
-}
-
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn wait_for_tcp(addr: &str) {
     for _ in 0..200 {
         if TcpStream::connect(addr).is_ok() {
@@ -231,14 +184,11 @@ impl AsyncEventHandler for AsyncTcpEcho {
 /// (duration, received) tuple so callers can compare to the std::net
 /// baseline.
 fn tcp_echo_round_trip_ringline(payload: &[u8], chunk_size: usize) -> (Duration, Vec<u8>) {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let bind: SocketAddr = addr.parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(bind)
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncTcpEcho>()
         .expect("ringline launch");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_tcp(&addr);
 
     let result = run_tcp_echo_chunked(&addr, payload, chunk_size);
@@ -395,17 +345,16 @@ static UDP_HANDLER_STARTED: AtomicUsize = AtomicUsize::new(0);
 
 fn udp_request_reply_ringline(count: usize, payload_size: usize) -> Duration {
     UDP_HANDLER_STARTED.store(0, Ordering::SeqCst);
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let cfg = test_config_builder()
         .udp_send_slots(64)
         .udp_recv_queue_capacity(4096)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncUdpEcho>()
         .expect("ringline udp launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
 
     for _ in 0..400 {
         if UDP_HANDLER_STARTED.load(Ordering::SeqCst) > 0 {
@@ -492,14 +441,11 @@ fn udp_throughput_request_reply_vs_std_net() {
 /// the queue (the old behavior), the receiver gets fewer bytes than
 /// were sent.
 fn tcp_fire_and_forget_ringline(payload: &[u8]) -> Vec<u8> {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let bind: SocketAddr = addr.parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind(bind)
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<AsyncTcpEcho>()
         .expect("ringline launch");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
     wait_for_tcp(&addr);
 
     let mut client = TcpStream::connect(&addr).expect("connect");

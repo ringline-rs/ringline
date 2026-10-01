@@ -64,45 +64,6 @@ fn test_config_builder() -> ConfigBuilder {
         .send_pool(64, 16384)
 }
 
-fn free_port() -> u16 {
-    // Ports come from *below* the ephemeral range (Linux's `ip_local_port_range`
-    // starts at 32768, macOS at 49152). That is the whole fix for #431: the
-    // kernel never auto-assigns a port down here, so the probe-bind/drop/rebind
-    // window stops being a race. Nothing can take one of these out from under
-    // the caller except another process asking for it by number.
-    //
-    // The old version probed with `bind(":0")` and dropped the listener, which
-    // left the port in the ephemeral pool. Between the drop and the server's
-    // real bind, the kernel could hand it to anyone — surfacing either as an
-    // `AddrInUse` launch failure, or (worse, in
-    // `async_outbound_connect_refused`) as a connection *succeeding* to a port
-    // the test believed was dead.
-    //
-    // `cargo test` runs binaries concurrently, so the window is offset per
-    // process; `CLAIMED` keeps threads inside one binary from colliding.
-    use std::sync::Mutex;
-    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
-    const BASE: u16 = 20_000;
-    const SPAN: u16 = 10_000;
-
-    let stride = ((std::process::id() % 40) as u16).saturating_mul(250);
-    for step in 0..SPAN {
-        let port = BASE + (stride + step) % SPAN;
-        {
-            let mut guard = CLAIMED.lock().unwrap();
-            if !guard.get_or_insert_with(Default::default).insert(port) {
-                continue;
-            }
-        }
-        // Confirm nothing currently holds it. Unlike the old probe, dropping
-        // this listener does not return the port to a pool anyone draws from.
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port in the test range {BASE}..{}", BASE + SPAN);
-}
-
 fn wait_for_server(addr: SocketAddr) {
     for _ in 0..200 {
         if TcpStream::connect(addr).is_ok() {
@@ -476,18 +437,16 @@ fn grpc_unary_echo() {
     let server_tls = server_tls_config(certs.clone(), key);
     let client_tls = client_tls_config(&certs);
 
-    let port = free_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let config = test_config_builder()
         .tls(TlsConfig::new(server_tls))
         .build()
         .expect("valid config");
 
     let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind(addr)
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<GrpcEchoServer>()
         .expect("launch failed");
+    let addr: SocketAddr = shutdown.bound_addr().expect("bound address");
 
     wait_for_server(addr);
     std::thread::sleep(Duration::from_millis(50));

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Runtime::bound_udp_addr` / `bound_udp_addrs` report the address each UDP
+  bind is bound to, with a zero port resolved, as `bound_addr` /
+  `bound_addrs` already do for TCP listeners.
+
 - `RinglineBuilder::defer_listen` binds a listener without listening on it, and
   `begin_listening` / `begin_listening_all` start it from code on a worker;
   `ListenHandle` (from `Runtime::listen_handle`) does the same from any
@@ -207,6 +211,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of the series that lands #318.
 
 ### Fixed
+
+- A port-0 UDP bind (`bind_udp("…:0")`) with more than one worker bound each
+  worker's socket to a different ephemeral port, so the bind had no single
+  address. `launch` now resolves the port once and every worker binds it.
 
 - `ConnCtx::close` (and `Connection::close` / `SendHalf::close`, which call
   it) on a stale handle, one whose slot had been reused by a new connection,

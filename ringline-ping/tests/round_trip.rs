@@ -33,45 +33,6 @@ fn test_config() -> Config {
     test_config_builder().build().expect("valid config")
 }
 
-fn free_port() -> u16 {
-    // Ports come from *below* the ephemeral range (Linux's `ip_local_port_range`
-    // starts at 32768, macOS at 49152). That is the whole fix for #431: the
-    // kernel never auto-assigns a port down here, so the probe-bind/drop/rebind
-    // window stops being a race. Nothing can take one of these out from under
-    // the caller except another process asking for it by number.
-    //
-    // The old version probed with `bind(":0")` and dropped the listener, which
-    // left the port in the ephemeral pool. Between the drop and the server's
-    // real bind, the kernel could hand it to anyone — surfacing either as an
-    // `AddrInUse` launch failure, or (worse, in
-    // `async_outbound_connect_refused`) as a connection *succeeding* to a port
-    // the test believed was dead.
-    //
-    // `cargo test` runs binaries concurrently, so the window is offset per
-    // process; `CLAIMED` keeps threads inside one binary from colliding.
-    use std::sync::Mutex;
-    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
-    const BASE: u16 = 20_000;
-    const SPAN: u16 = 10_000;
-
-    let stride = ((std::process::id() % 40) as u16).saturating_mul(250);
-    for step in 0..SPAN {
-        let port = BASE + (stride + step) % SPAN;
-        {
-            let mut guard = CLAIMED.lock().unwrap();
-            if !guard.get_or_insert_with(Default::default).insert(port) {
-                continue;
-            }
-        }
-        // Confirm nothing currently holds it. Unlike the old probe, dropping
-        // this listener does not return the port to a pool anyone draws from.
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port in the test range {BASE}..{}", BASE + SPAN);
-}
-
 fn wait_for_server(addr: &str) {
     for _ in 0..200 {
         if std::net::TcpStream::connect(addr).is_ok() {
@@ -168,12 +129,11 @@ fn ping_round_trip() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     // Start ping server.
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<PingServer>()
         .expect("server launch failed");
+    let addr = s_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     PING_SERVER_ADDR.set(addr.parse().unwrap()).ok();
@@ -259,12 +219,11 @@ fn ping_pool() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
     // Start ping server.
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<PingServer>()
         .expect("server launch failed");
+    let addr = s_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     POOL_SERVER_ADDR.set(addr.parse().unwrap()).ok();
@@ -364,12 +323,11 @@ impl AsyncEventHandler for BadPingClientHandler {
 fn parse_error_returns_error_not_hang() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<BadPingServer>()
         .expect("server launch failed");
+    let addr = s_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     BAD_SERVER_ADDR.set(addr.parse().unwrap()).ok();
@@ -521,12 +479,11 @@ impl AsyncEventHandler for PoolSemanticsHandler {
 fn pool_checkout_semantics() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let (s_shutdown, s_handles) = RinglineBuilder::new(test_config())
-        .bind(addr.parse().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
         .launch::<PingServer>()
         .expect("server launch failed");
+    let addr = s_shutdown.bound_addr().expect("bound address").to_string();
     wait_for_server(&addr);
 
     SEMANTICS_SERVER_ADDR.set(addr.parse().unwrap()).ok();

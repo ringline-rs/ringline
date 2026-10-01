@@ -55,8 +55,6 @@ fn overflow_closes_connection_instead_of_hanging() {
         .recv_accumulator_max(CAP)
         .build()
         .expect("valid config");
-    // Bind :0 and read the kernel-assigned port back — the drop-and-rebind
-    // free_port pattern races across parallel test binaries (AddrInUse).
     let (shutdown, handles) = RinglineBuilder::new(config)
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<NeverSatisfied>()

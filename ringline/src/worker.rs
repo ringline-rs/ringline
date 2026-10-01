@@ -184,6 +184,9 @@ pub struct Runtime {
     /// inside `accept4`; it does not wake one parked in
     /// `ListenGates::wait_open`.
     listen_gates: Arc<crate::listen_gate::ListenGates>,
+    /// The address each `bind_udp` / `bind_udp_connected` socket is bound to,
+    /// in call order, with a zero port resolved to the one the workers share.
+    udp_addrs: Vec<SocketAddr>,
 }
 
 impl Runtime {
@@ -215,6 +218,23 @@ impl Runtime {
     /// [`ListenerId`](crate::ListenerId).
     pub fn bound_addrs(&self) -> Vec<Option<SocketAddr>> {
         self.listeners.iter().map(|l| l.bound_addr).collect()
+    }
+
+    /// The address of the first UDP socket, if any. A port-0 bind reports the
+    /// port the kernel chose; every worker's socket for that bind shares it.
+    ///
+    /// With more than one UDP bind, use [`bound_udp_addrs`].
+    ///
+    /// [`bound_udp_addrs`]: Runtime::bound_udp_addrs
+    pub fn bound_udp_addr(&self) -> Option<SocketAddr> {
+        self.udp_addrs.first().copied()
+    }
+
+    /// Every UDP socket's address, in `bind_udp` / `bind_udp_connected` call
+    /// order (after any `ConfigBuilder::udp_bind` addresses). A port-0 bind
+    /// reports the port the kernel chose.
+    pub fn bound_udp_addrs(&self) -> Vec<SocketAddr> {
+        self.udp_addrs.clone()
     }
 
     /// A handle for opening deferred listeners from any thread.
@@ -965,6 +985,12 @@ impl RinglineBuilder {
         self.config.validate()?;
         self.validate_listeners()?;
 
+        // Each worker binds its own SO_REUSEPORT socket for every UDP address,
+        // so a zero port would scatter them across ephemeral ports. Resolve it
+        // once here; the reserving sockets hold the port until `launch`
+        // returns, by which point every worker has bound it.
+        let _udp_reservations = resolve_zero_port_udp_binds(&mut self.config.udp_bind)?;
+
         let num_threads = if self.config.worker.threads == 0 {
             crate::topology::physical_core_count()
         } else {
@@ -1579,6 +1605,7 @@ impl RinglineBuilder {
             listeners,
             region_registrar,
             listen_gates,
+            udp_addrs: self.config.udp_bind.clone(),
         };
 
         Ok((runtime, handles))
@@ -1761,6 +1788,80 @@ fn bind_reuseport_socket(addr: SocketAddr) -> Result<RawFd, crate::error::Error>
         return Err(crate::error::Error::Io(err));
     }
     Ok(fd)
+}
+
+/// Bind a `SO_REUSEPORT` UDP socket to each zero-port address in `udp_bind`
+/// and write the chosen port back into the address, so every worker's socket
+/// joins that port. The returned sockets hold the port while the workers bind
+/// it.
+fn resolve_zero_port_udp_binds(
+    udp_bind: &mut [SocketAddr],
+) -> Result<Vec<std::os::fd::OwnedFd>, crate::error::Error> {
+    let mut held = Vec::new();
+    for addr in udp_bind.iter_mut().filter(|a| a.port() == 0) {
+        let (fd, resolved) = reserve_udp_port(*addr).map_err(crate::error::Error::Io)?;
+        *addr = resolved;
+        held.push(fd);
+    }
+    Ok(held)
+}
+
+/// A `SO_REUSEPORT` UDP socket bound to `addr`, and the address it bound.
+fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, SocketAddr)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    #[cfg(target_os = "linux")]
+    let sock_type = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let sock_type = libc::SOCK_DGRAM;
+    let raw = unsafe { libc::socket(domain, sock_type, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a socket this function just created and owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+        if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    let optval: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &optval as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = crate::backend::socket_addr_to_sockaddr(addr, &mut storage);
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &storage as *const _ as *const libc::sockaddr,
+            len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let resolved = getsockname_v4_v6(fd.as_raw_fd())
+        .ok_or_else(|| io::Error::other("getsockname on a bound UDP socket returned no address"))?;
+    Ok((fd, resolved))
 }
 
 /// Create a bound TCP listener, without SO_REUSEPORT and without listening.

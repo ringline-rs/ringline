@@ -38,58 +38,6 @@ fn base_config() -> Config {
     base_config_builder().build().expect("valid config")
 }
 
-/// Reserve a port from *below* the ephemeral range.
-///
-/// Same fix as `free_port` in `echo.rs` (#431): binding `:0` and dropping the
-/// socket returns the port to the pool the kernel auto-assigns from, so
-/// anything can take it between the probe and the real bind. Ports down here
-/// are only ever taken by number.
-fn reserve_test_port(kind: PortKind) -> u16 {
-    use std::sync::Mutex;
-    static CLAIMED: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
-    const BASE: u16 = 20_000;
-    const SPAN: u16 = 10_000;
-
-    let stride = ((std::process::id() % 40) as u16).saturating_mul(250);
-    for step in 0..SPAN {
-        let port = BASE + (stride + step) % SPAN;
-        {
-            let mut guard = CLAIMED.lock().unwrap();
-            if !guard.get_or_insert_with(Default::default).insert(port) {
-                continue;
-            }
-        }
-        let free = match kind {
-            PortKind::Udp => std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok(),
-            PortKind::UdpV6 => std::net::UdpSocket::bind(("::1", port)).is_ok(),
-            PortKind::Tcp => std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
-        };
-        if free {
-            return port;
-        }
-    }
-    panic!("no free port in the test range {BASE}..{}", BASE + SPAN);
-}
-
-#[derive(Clone, Copy)]
-enum PortKind {
-    Tcp,
-    Udp,
-    UdpV6,
-}
-
-fn free_udp_port() -> u16 {
-    reserve_test_port(PortKind::Udp)
-}
-
-fn free_udp_port_v6() -> u16 {
-    reserve_test_port(PortKind::UdpV6)
-}
-
-fn free_port() -> u16 {
-    reserve_test_port(PortKind::Tcp)
-}
-
 fn await_handler_started(flag: &AtomicUsize) {
     for _ in 0..400 {
         if flag.load(Ordering::SeqCst) > 0 {
@@ -159,13 +107,11 @@ fn udp_basic_round_trip() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_echo_started();
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<UdpEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
 
     await_handler_started(ECHO_STARTED.get().unwrap());
 
@@ -188,18 +134,93 @@ fn udp_basic_round_trip() {
     }
 }
 
+/// A port-0 UDP bind resolves to one port shared by every worker, and
+/// `bound_udp_addr` reports it.
+///
+/// Each worker binds its own `SO_REUSEPORT` socket. If the zero port reached
+/// the workers unresolved, each would bind a different ephemeral port, and a
+/// datagram to any one of them would still be echoed, so the round trip alone
+/// cannot tell. The socket count on the reported port can.
+#[test]
+fn udp_port_zero_resolves_once_for_every_worker() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_echo_started();
+
+    const WORKERS: usize = 3;
+    let (runtime, handles) = RinglineBuilder::new(
+        base_config_builder()
+            .workers(WORKERS)
+            .build()
+            .expect("valid config"),
+    )
+    .bind_udp("127.0.0.1:0".parse().unwrap())
+    .launch::<UdpEcho>()
+    .expect("launch");
+
+    let addr = runtime
+        .bound_udp_addr()
+        .expect("a UDP bind reports its address");
+    assert_ne!(addr.port(), 0, "the zero port must be resolved");
+    assert_eq!(runtime.bound_udp_addrs(), vec![addr]);
+
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/net/udp lists local addresses as hex `ip:port`.
+        let table = std::fs::read_to_string("/proc/net/udp").unwrap();
+        let port_hex = format!(":{:04X} ", addr.port());
+        let sockets = table
+            .lines()
+            .skip(1)
+            .filter(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .is_some_and(|local| format!("{local} ").ends_with(&port_hex))
+            })
+            .count();
+        assert_eq!(
+            sockets, WORKERS,
+            "every worker must bind the reported port, and nothing else may hold it"
+        );
+    }
+
+    // The kernel picks a worker per datagram, so every handler must be up.
+    let started = ECHO_STARTED.get().unwrap();
+    for _ in 0..400 {
+        if started.load(Ordering::SeqCst) >= WORKERS {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        started.load(Ordering::SeqCst) >= WORKERS,
+        "handlers did not start"
+    );
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client.send_to(b"zero port", addr).unwrap();
+    let mut buf = [0u8; 64];
+    let (n, src) = client.recv_from(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"zero port");
+    assert_eq!(src, addr);
+
+    runtime.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
 #[test]
 fn udp_echo_many_datagrams_in_sequence() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_echo_started();
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<UdpEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(ECHO_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -232,13 +253,11 @@ fn udp_echo_distinguishes_peers() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_echo_started();
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<UdpEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(ECHO_STARTED.get().unwrap());
 
     // Three clients, each gets its own message echoed to its own port.
@@ -275,9 +294,6 @@ fn udp_echo_burst_unique_payloads() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_echo_started();
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let cfg = base_config_builder()
         // Make sure send slot ring is comfortably larger than the burst so the
         // server doesn't have to wait on send_ready for the common case.
@@ -285,9 +301,10 @@ fn udp_echo_burst_unique_payloads() {
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<UdpEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(ECHO_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -342,18 +359,16 @@ fn udp_large_datagram_within_mtu() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_echo_started();
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     // Bump the recv buffer to comfortably cover ~1400 bytes + header.
     let cfg = base_config_builder()
         .udp_recv_buffer(128, 4096)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<UdpEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(ECHO_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -382,21 +397,14 @@ fn udp_multiple_bound_sockets() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_echo_started();
 
-    let p1 = free_udp_port();
-    let p2 = loop {
-        let p = free_udp_port();
-        if p != p1 {
-            break p;
-        }
-    };
-    let a1: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
-    let a2: SocketAddr = format!("127.0.0.1:{p2}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(a1)
-        .bind_udp(a2)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<UdpEcho>()
         .expect("launch");
+    let bound = shutdown.bound_udp_addrs();
+    let (a1, a2) = (bound[0], bound[1]);
+    assert_ne!(a1.port(), a2.port(), "two binds must get two ports");
 
     // Wait for both UDP handlers to start.
     let started = ECHO_STARTED.get_or_init(Default::default);
@@ -444,13 +452,11 @@ fn udp_ipv6_round_trip() {
     };
     drop(probe);
 
-    let port = free_udp_port_v6();
-    let addr: SocketAddr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port);
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0))
         .launch::<UdpEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(ECHO_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("[::1]:0").unwrap();
@@ -464,7 +470,7 @@ fn udp_ipv6_round_trip() {
     let mut buf = [0u8; 64];
     let (n, src) = client.recv_from(&mut buf).unwrap();
     assert_eq!(&buf[..n], payload);
-    assert_eq!(src.port(), port, "echo source port mismatch");
+    assert_eq!(src.port(), addr.port(), "echo source port mismatch");
     assert!(src.is_ipv6(), "echo source not IPv6: {src}");
 
     shutdown.shutdown();
@@ -568,17 +574,15 @@ fn udp_send_ready_unblocks_after_exhaustion() {
         .unwrap()
         .take();
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let cfg = base_config_builder()
         .udp_send_slots(4)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<SendStress>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(SEND_STRESS_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -712,18 +716,16 @@ fn udp_oversized_send_does_not_corrupt_state() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let cfg = base_config_builder()
         .send_pool(64, 4096)
         .udp_recv_buffer(128, 4096)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<OversizedSend>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(OVER_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -807,9 +809,6 @@ fn udp_truncated_datagram_recoverable() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     // Tight recv buffer: 256 bytes total → ~70 bytes for payload after the
     // io_uring header + sockaddr.
     let cfg = base_config_builder()
@@ -817,9 +816,10 @@ fn udp_truncated_datagram_recoverable() {
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<CountingEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(COUNT_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -918,18 +918,16 @@ fn udp_reuseport_balances_across_workers() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let workers = 4;
     let cfg = base_config_builder()
         .workers(workers)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<ReuseportEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
 
     let started = REUSE_STARTED.get().unwrap();
     for _ in 0..400 {
@@ -994,13 +992,11 @@ fn udp_echo_zero_byte_datagram() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_echo_started();
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<UdpEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(ECHO_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1069,16 +1065,13 @@ fn udp_and_tcp_coexist() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let tcp_port = free_port();
-    let udp_port = free_udp_port();
-    let tcp_addr: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
-    let udp_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind(tcp_addr)
-        .bind_udp(udp_addr)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<TcpUdpHandler>()
         .expect("launch");
+    let tcp_addr: SocketAddr = shutdown.bound_addr().expect("bound address");
+    let udp_addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
 
     // Wait for both TCP listener and UDP handler.
     await_handler_started(TCP_UDP_STARTED.get().unwrap());
@@ -1158,13 +1151,11 @@ fn udp_handler_exit_does_not_crash_worker() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<ExitingUdpHandler>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(EXITING_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1199,17 +1190,15 @@ fn udp_recv_queue_capacity_drops_excess_datagrams() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let cfg = base_config_builder()
         .udp_recv_queue_capacity(8)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<ExitingUdpHandler>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(EXITING_STARTED.get().unwrap());
 
     // Snapshot the dropped counter before the burst.
@@ -1288,21 +1277,13 @@ fn udp_handler_panic_keeps_worker_alive() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let p1 = free_udp_port();
-    let p2 = loop {
-        let p = free_udp_port();
-        if p != p1 {
-            break p;
-        }
-    };
-    let panicking_addr: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
-    let echo_addr: SocketAddr = format!("127.0.0.1:{p2}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(panicking_addr) // index 0 — the panicking one
-        .bind_udp(echo_addr) // index 1 — normal echo
+        .bind_udp("127.0.0.1:0".parse().unwrap()) // index 0 — the panicking one
+        .bind_udp("127.0.0.1:0".parse().unwrap()) // index 1 — normal echo
         .launch::<PanickingUdpHandler>()
         .expect("launch");
+    let bound = shutdown.bound_udp_addrs();
+    let (panicking_addr, echo_addr) = (bound[0], bound[1]);
 
     let started = PANIC_STARTED.get().unwrap();
     for _ in 0..400 {
@@ -1388,13 +1369,11 @@ fn udp_shutdown_with_inflight_sends_completes() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<InFlightSendHandler>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(INFLIGHT_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1488,17 +1467,15 @@ fn udp_concurrent_inflight_sends_recycle_slots() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let cfg = base_config_builder()
         .udp_send_slots(8)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<ConcurrentSenders>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(CONC_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1557,9 +1534,6 @@ fn udp_max_size_loopback_datagram() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_echo_started();
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     // The recv buffer is capped at 65535 by config validation; that
     // leaves ~65535 - 16 (recvmsg_out) - 128 (sockaddr_storage) =
     // 65391 bytes for payload. Pick a size well under that but
@@ -1572,9 +1546,10 @@ fn udp_max_size_loopback_datagram() {
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<UdpEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(ECHO_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1661,9 +1636,6 @@ fn udp_recv_ring_exhaustion_under_burst() {
         .get_or_init(Default::default)
         .store(false, Ordering::SeqCst);
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let cfg = base_config_builder()
         .udp_recv_buffer(4, 256)
         .build()
@@ -1673,9 +1645,10 @@ fn udp_recv_ring_exhaustion_under_burst() {
         .unwrap_or(0);
 
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<BlockedThenEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(BLOCKED_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1795,13 +1768,11 @@ fn udp_send_to_unreachable_peer_does_not_kill_worker() {
         .get_or_init(Default::default)
         .store(0, Ordering::SeqCst);
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<UnreachableProbe>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(UNREACH_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1863,10 +1834,8 @@ fn udp_repeated_launch_does_not_leak_fds() {
     // pool, blocking pool, etc.) settle in. Compare counts after that.
     for _ in 0..2 {
         reset_echo_started();
-        let port = free_udp_port();
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let (shutdown, handles) = RinglineBuilder::new(base_config())
-            .bind_udp(addr)
+            .bind_udp("127.0.0.1:0".parse().unwrap())
             .launch::<UdpEcho>()
             .expect("launch");
         await_handler_started(ECHO_STARTED.get().unwrap());
@@ -1882,10 +1851,8 @@ fn udp_repeated_launch_does_not_leak_fds() {
 
     for _ in 0..6 {
         reset_echo_started();
-        let port = free_udp_port();
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let (shutdown, handles) = RinglineBuilder::new(base_config())
-            .bind_udp(addr)
+            .bind_udp("127.0.0.1:0".parse().unwrap())
             .launch::<UdpEcho>()
             .expect("launch");
         await_handler_started(ECHO_STARTED.get().unwrap());
@@ -1990,17 +1957,15 @@ fn udp_gso_segments_one_send_into_many_datagrams() {
     GSO_SEG_SIZE.store(segment_size as u64, Ordering::SeqCst);
     GSO_SEG_COUNT.store(segments as u64, Ordering::SeqCst);
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let cfg = base_config_builder()
         .send_pool(64, 16384)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(cfg)
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<GsoSendHandler>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(GSO_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2063,9 +2028,6 @@ fn udp_gso_invalid_segment_size_returns_error() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_echo_started();
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     // Use the standard echo handler — the test focuses on the API
     // contract for invalid arguments.
     struct GsoArgCheck {
@@ -2106,9 +2068,10 @@ fn udp_gso_invalid_segment_size_returns_error() {
         .store(0, Ordering::SeqCst);
 
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<GsoArgCheck>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(ECHO_STARTED.get().unwrap());
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2309,13 +2272,11 @@ fn udp_recv_batch_timed_captures_arrival_before_callback() {
         d.lock().unwrap().clear();
     }
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<TimedBatchEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(&started);
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2383,13 +2344,11 @@ fn udp_recv_batch_drains_a_full_batch_in_one_call() {
         d.lock().unwrap().clear();
     }
 
-    let port = free_udp_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
     let (shutdown, handles) = RinglineBuilder::new(base_config())
-        .bind_udp(addr)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
         .launch::<BatchEcho>()
         .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
     await_handler_started(&started);
 
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();

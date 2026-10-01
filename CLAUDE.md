@@ -36,6 +36,14 @@ cargo run --release --example echo_bench
 cargo run --example echo_tls_server
 ```
 
+Tests that open a socket bind port 0 and read the address back:
+`Runtime::bound_addr` / `bound_addrs` for TCP listeners, `bound_udp_addr` /
+`bound_udp_addrs` for UDP, `local_addr()` for a test's own `std` socket. Do not
+choose a port and bind it later. Ringline binds with `SO_REUSEPORT`, so two test
+processes given the same port both bind it and the kernel splits traffic between
+their servers. A test that needs a port with nothing listening holds it with a
+bound socket that never listens (`refusing_port` in `tests/echo.rs`).
+
 `cargo build` succeeding is NOT sufficient verification — clippy `-D warnings` and fmt failures are CI failures. CI runs every cargo invocation with `--locked`; `Cargo.lock` is committed, so any dependency or version change must update the lockfile in the same commit or CI goes red. A daily `cargo audit --deny warnings` cron catches new advisories — security version pins live as comments in the workspace `Cargo.toml`.
 
 ## Platform & Backend Matrix
