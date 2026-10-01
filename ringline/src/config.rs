@@ -251,6 +251,11 @@ pub struct Config {
     /// socket. Until then a worker must not arm an accept: accept on a
     /// bound-but-unlistening socket fails with `EINVAL`.
     pub(crate) merged_accept_live: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Every worker's wake handle. Set by `launch()`; the worker's `Config`
+    /// holds every wake fd open until the worker exits, and the mio backend
+    /// passes it to the per-worker disk-I/O pool, whose threads can outlive
+    /// the worker.
+    pub(crate) wake_keep_alive: Option<crate::wakeup::WakeKeepAlive>,
     /// This worker's index, so it can find its own slot in `worker_loads` and
     /// avoid handing a connection back to itself.
     pub(crate) worker_index: usize,
@@ -264,7 +269,7 @@ pub struct Config {
     /// attractive handoff target — the two mechanisms would fight.
     pub(crate) worker_accepting: Option<std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>>,
     /// Every worker's accept channel and wake handle, so a worker that accepts
-    /// while over its share can hand the raw fd to a less-loaded peer. Empty
+    /// while over its share can hand the connection to a less-loaded peer. Empty
     /// in pool mode, where the acceptor thread owns these.
     pub(crate) peer_accept: Vec<(
         crossbeam_channel::Sender<crate::acceptor::AcceptedConn>,
@@ -447,6 +452,7 @@ impl Default for Config {
             accept_mode: AcceptMode::Pool,
             merged_accept_fds: Vec::new(),
             merged_accept_live: None,
+            wake_keep_alive: None,
             worker_index: 0,
             worker_loads: None,
             worker_accepting: None,

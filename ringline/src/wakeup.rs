@@ -14,9 +14,9 @@ use std::sync::Arc;
 ///
 /// Cheap to copy; does not own the fd. The fd is owned by the
 /// [`Arc<WakeFdInner>`] held inside [`WakeHandle`]. A `WakeFd` must not be
-/// used after the last `WakeHandle` clone drops. The runtime's own clones live
-/// in [`crate::Runtime`], so dropping it before the workers join leaves their
-/// `WakeFd` copies dangling.
+/// used after the last `WakeHandle` clone drops, so every thread `launch()`
+/// starts that carries one also holds owning handles (a [`WakeKeepAlive`], or
+/// the acceptor's per-worker `WakeHandle`s) for as long as it runs.
 #[derive(Clone, Copy)]
 pub(crate) struct WakeFd {
     fd: RawFd,
@@ -45,14 +45,24 @@ impl WakeFd {
 }
 
 /// Owns the wake fd; closes it on drop.
+///
+/// On mio it also owns the pipe's read end, which the worker polls but does
+/// not close. A write to a pipe whose read end has closed raises SIGPIPE, which
+/// kills a process whose SIGPIPE disposition is `SIG_DFL`. With both ends owned
+/// here, a write after the worker has exited goes into the pipe buffer, or
+/// fails with `EAGAIN` once the buffer is full.
 struct WakeFdInner {
     fd: RawFd,
+    #[cfg(not(has_io_uring))]
+    read_fd: RawFd,
 }
 
 impl Drop for WakeFdInner {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.fd);
+            #[cfg(not(has_io_uring))]
+            libc::close(self.read_fd);
         }
     }
 }
@@ -76,8 +86,8 @@ pub struct WakeHandle {
 impl WakeHandle {
     /// Wake the associated worker.
     ///
-    /// Non-blocking, never errors — a failed write means the worker is
-    /// already gone, which is fine.
+    /// Non-blocking and never reports an error. If the pipe or eventfd is full
+    /// the write fails with `EAGAIN`, and a wake is already pending.
     pub fn wake(&self) {
         wake_fd(self.inner.fd);
     }
@@ -110,8 +120,8 @@ fn wake_fd(fd: RawFd) {
 /// Create a per-worker wake fd.
 ///
 /// With io_uring: creates an `eventfd(2)`.
-/// Without io_uring: creates a `pipe(2)` and returns `(read_fd, WakeHandle)`
-/// where `WakeHandle` wraps the write end.
+/// Without io_uring: creates a `pipe(2)` and returns `(read_fd, WakeHandle)`;
+/// `WakeHandle` writes to the write end and owns both ends.
 #[cfg(has_io_uring)]
 pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
@@ -126,33 +136,53 @@ pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     ))
 }
 
+/// Owning clones of every worker's wake handle, held by each pool and worker
+/// thread.
+///
+/// A thread holding one keeps every worker's wake fd open, so the [`WakeFd`]s
+/// it carries stay valid for as long as it runs, including after the
+/// `Runtime` has dropped. Cloned when a thread starts, never per request.
+pub(crate) type WakeKeepAlive = Arc<[WakeHandle]>;
+
 /// Create a per-worker wake fd pair (pipe).
 ///
-/// Returns `(read_fd, WakeHandle)` where `read_fd` is registered with the
-/// poller and `WakeHandle` wraps the write end for cross-thread waking.
+/// Returns `(read_fd, WakeHandle)`. `read_fd` is registered with the poller
+/// and is not owned by the caller; `WakeHandle` writes to the write end and
+/// owns both ends.
 #[cfg(not(has_io_uring))]
 pub(crate) fn create_wake_fd() -> io::Result<(RawFd, WakeHandle)> {
     let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+    // Both ends non-blocking and close-on-exec. On Linux `pipe2` sets the
+    // flags atomically, so a child spawned on another thread cannot inherit
+    // the pipe; elsewhere they are set after `pipe`.
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for fd in &fds {
+            unsafe {
+                let flags = libc::fcntl(*fd, libc::F_GETFL);
+                libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                let fd_flags = libc::fcntl(*fd, libc::F_GETFD);
+                libc::fcntl(*fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
+            }
+        }
     }
     let read_fd = fds[0];
     let write_fd = fds[1];
 
-    // Set both ends non-blocking and close-on-exec.
-    for fd in &fds {
-        unsafe {
-            let flags = libc::fcntl(*fd, libc::F_GETFL);
-            libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            let fd_flags = libc::fcntl(*fd, libc::F_GETFD);
-            libc::fcntl(*fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
-        }
-    }
-
     Ok((
         read_fd,
         WakeHandle {
-            inner: Arc::new(WakeFdInner { fd: write_fd }),
+            inner: Arc::new(WakeFdInner {
+                fd: write_fd,
+                read_fd,
+            }),
         },
     ))
 }

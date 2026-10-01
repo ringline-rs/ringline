@@ -2,8 +2,6 @@ use std::any::Any;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
-#[cfg(not(has_io_uring))]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -96,58 +94,6 @@ fn rollback_workers(
         }
     }
     first_error
-}
-
-/// Carries the worker wake read descriptor into its worker thread.
-///
-/// Mio has a distinct pipe read end, which this type owns until the driver is
-/// constructed. On io_uring, [`crate::wakeup::WakeHandle`] owns the shared
-/// eventfd and this type only carries its descriptor number.
-struct WorkerReadFd {
-    #[cfg(has_io_uring)]
-    fd: RawFd,
-    #[cfg(not(has_io_uring))]
-    fd: Option<OwnedFd>,
-}
-
-impl WorkerReadFd {
-    fn new(fd: RawFd) -> Self {
-        #[cfg(has_io_uring)]
-        {
-            Self { fd }
-        }
-        #[cfg(not(has_io_uring))]
-        Self {
-            // SAFETY: create_wake_fd returns a fresh pipe read descriptor and
-            // transfers its ownership to this constructor on the mio backend.
-            fd: Some(unsafe { OwnedFd::from_raw_fd(fd) }),
-        }
-    }
-
-    fn as_raw_fd(&self) -> RawFd {
-        #[cfg(has_io_uring)]
-        {
-            self.fd
-        }
-        #[cfg(not(has_io_uring))]
-        {
-            self.fd
-                .as_ref()
-                .expect("worker read fd must not be transferred twice")
-                .as_raw_fd()
-        }
-    }
-
-    fn transfer_to_driver(&mut self) {
-        #[cfg(not(has_io_uring))]
-        {
-            let owned = self
-                .fd
-                .take()
-                .expect("worker read fd must not be transferred twice");
-            let _ = owned.into_raw_fd();
-        }
-    }
 }
 
 /// Returned by `launch()` with the workers' join handles. Controls shutdown,
@@ -473,9 +419,9 @@ impl Drop for Runtime {
         //   * The listen-fd close is gated by an `AtomicBool::swap`, so
         //     a double-close is impossible whether `Drop` runs before
         //     or after an explicit `shutdown()`.
-        //   * `WakeHandle::wake` is documented as a no-op write into
-        //     an fd nobody is reading once workers have joined; the
-        //     write either delivers a real wake or returns harmlessly.
+        //   * `WakeHandle::wake` after the workers have joined writes
+        //     into a wake fd that is still open but unread; it never
+        //     errors.
         // Calling it unconditionally here makes the RAII idiom work
         // while leaving the explicit `.shutdown()` path unchanged.
         self.shutdown();
@@ -874,7 +820,7 @@ impl RinglineBuilder {
             |worker_id,
              config,
              accept_rx,
-             mut eventfd,
+             eventfd,
              shutdown_flag,
              resolve_rx,
              resolve_tx,
@@ -897,7 +843,7 @@ impl RinglineBuilder {
                     &config,
                     handler,
                     accept_rx,
-                    eventfd.0.as_raw_fd(),
+                    eventfd.0,
                     shutdown_flag,
                     resolve_rx,
                     resolve_tx,
@@ -917,7 +863,7 @@ impl RinglineBuilder {
                         &config,
                         handler,
                         accept_rx,
-                        eventfd.0.as_raw_fd(),
+                        eventfd.0,
                         eventfd.1,
                         shutdown_flag,
                         resolve_rx,
@@ -949,7 +895,6 @@ impl RinglineBuilder {
                 // preparation through `run()`: the io_uring eventfd-read SQE
                 // points into its inline driver storage, so moving the value
                 // after `prepare_run()` would invalidate that pointer.
-                eventfd.0.transfer_to_driver();
                 if let Err(e) = event_loop.prepare_run() {
                     let _ = startup_tx.send(Err(e));
                     return Err(startup_failure_placeholder());
@@ -975,7 +920,7 @@ impl RinglineBuilder {
                 usize,
                 Config,
                 Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
-                (WorkerReadFd, crate::wakeup::WakeFd),
+                (RawFd, crate::wakeup::WakeFd),
                 Arc<AtomicBool>,
                 Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
                 Option<crossbeam_channel::Sender<crate::resolver::ResolveResponse>>,
@@ -1029,8 +974,8 @@ impl RinglineBuilder {
         // Create per-worker channels and wake fds. `worker_wake_handles`
         // (Arc-based) is what `Runtime` keeps and what
         // `worker_wake_handle()` hands out to users; `worker_wake_fds`
-        // (Copy) is what the acceptor and internal request structs use on
-        // hot paths.
+        // (Copy) is what internal request structs and peer handoff use on hot
+        // paths; the acceptor takes owning `WakeHandle`s.
         let mut worker_txs = Vec::with_capacity(num_threads);
         let mut worker_rxs = Vec::with_capacity(num_threads);
         let mut worker_eventfds = Vec::with_capacity(num_threads);
@@ -1040,9 +985,9 @@ impl RinglineBuilder {
         for _ in 0..num_threads {
             // Bounded so a slow worker applies backpressure on the acceptor
             // rather than queuing fds indefinitely. On full, the acceptor
-            // tries the next worker; if every worker is full, the incoming
-            // fd is closed so the kernel can signal connection-refused to
-            // the peer instead of letting the listen queue overflow.
+            // tries the next worker; if every worker is full, the connection
+            // is dropped, which closes it, so the peer sees EOF instead of
+            // the listen queue overflowing.
             let (tx, rx) = crossbeam_channel::bounded::<crate::acceptor::AcceptedConn>(
                 self.config.accept_queue_capacity,
             );
@@ -1050,10 +995,19 @@ impl RinglineBuilder {
                 crate::wakeup::create_wake_fd().map_err(crate::error::Error::Io)?;
             worker_txs.push(tx);
             worker_rxs.push(rx);
-            worker_eventfds.push(WorkerReadFd::new(read_fd));
+            // Not owning: `wake_handle` owns the read side (the eventfd on
+            // io_uring, the pipe's read end on mio) and closes it.
+            worker_eventfds.push(read_fd);
             worker_wake_fds.push(wake_handle.as_wake_fd());
             worker_wake_handles.push(wake_handle);
         }
+        // The pool threads and the workers each hold a clone of this for as
+        // long as they run; each acceptor holds its own `WakeHandle` clones.
+        // The `WakeFd`s those threads carry do not own the fds. This keeps the
+        // fds open after `Runtime` drops, until the last such thread exits, so
+        // a late wake cannot write into a reused fd number.
+        let wake_keep_alive: crate::wakeup::WakeKeepAlive =
+            worker_wake_handles.iter().cloned().collect();
 
         // Park channels (tier 3, #443): a sibling of the accept channels so
         // the mio backend, which has neither merged accept nor park, is not
@@ -1088,6 +1042,7 @@ impl RinglineBuilder {
         let (resolver_pool, resolve_rxs) = if self.config.resolver_threads > 0 {
             let pool = Arc::new(crate::resolver::ResolverPool::start(
                 self.config.resolver_threads,
+                wake_keep_alive.clone(),
             ));
             let mut rxs = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
@@ -1103,6 +1058,7 @@ impl RinglineBuilder {
         let (spawner_pool, spawn_rxs) = if self.config.spawner_threads > 0 {
             let pool = Arc::new(crate::spawner::SpawnerPool::start(
                 self.config.spawner_threads,
+                wake_keep_alive.clone(),
             ));
             let mut rxs = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
@@ -1124,6 +1080,7 @@ impl RinglineBuilder {
         let (blocking_pool, blocking_rxs) = if self.config.blocking_threads > 0 {
             let pool = Arc::new(crate::blocking::BlockingPool::start(
                 self.config.blocking_threads,
+                wake_keep_alive.clone(),
             ));
             let mut rxs = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
@@ -1267,6 +1224,11 @@ impl RinglineBuilder {
                 .map(|(idx, fds, _)| (*idx, fds[worker_id]))
                 .collect();
             config.merged_accept_live = merged_live.clone();
+            // The worker's hold on every wake fd: `config` lives in the worker
+            // thread until it exits. Its event loop reads its own wake fd by
+            // number (the eventfd on io_uring, the pipe's read end on mio), and
+            // in merged accept mode (io_uring) it wakes peers.
+            config.wake_keep_alive = Some(wake_keep_alive.clone());
             config.worker_index = worker_id;
             config.worker_loads = worker_loads.clone();
             config.worker_accepting = Some(worker_accepting.clone());
@@ -1556,7 +1518,7 @@ impl RinglineBuilder {
                     listen_fd,
                     listener: crate::ListenerId::from_index(idx as u32),
                     worker_channels: worker_txs.clone(),
-                    worker_wake_handles: worker_wake_fds.clone(),
+                    worker_wake_handles: worker_wake_handles.clone(),
                     shutdown_flag: shutdown_flag.clone(),
                     listen_gates: listen_gates.clone(),
                     // A Unix listener has no TCP_NODELAY to set. This used to be
@@ -2087,9 +2049,8 @@ mod startup_gate_tests {
                             .recv_timeout(Duration::from_millis(250))
                             .ok();
                         observed_tx.send(accepted.is_some()).unwrap();
-                        if let Some(accepted) = accepted {
-                            unsafe { libc::close(accepted.fd) };
-                        }
+                        // Dropping `accepted` closes the connection.
+                        drop(accepted);
                         let _ = startup_tx.send(Err(crate::error::Error::Io(io::Error::other(
                             "injected worker startup failure",
                         ))));

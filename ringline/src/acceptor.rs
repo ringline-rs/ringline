@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -7,11 +7,10 @@ use crossbeam_channel::Sender;
 
 /// One accepted connection on its way to a worker.
 ///
-/// A struct rather than a tuple: this grew from `(RawFd, SocketAddr)` to carry
-/// a real `PeerAddr` (#445) and now a `ListenerId`, and positional fields stop
-/// paying their way at three.
+/// Owns the socket. A worker drains its channel when it exits, so a connection
+/// still queued for it is closed then.
 pub struct AcceptedConn {
-    pub fd: RawFd,
+    pub fd: OwnedFd,
     pub listener: crate::ListenerId,
     pub peer: crate::connection::PeerAddr,
 }
@@ -23,10 +22,12 @@ pub struct AcceptorConfig {
     /// Which listener this acceptor serves. Travels with every accepted fd so
     /// the handler can tell connections from different listeners apart.
     pub listener: crate::ListenerId,
-    /// Per-worker channels to send accepted (fd, peer_addr) pairs.
+    /// Per-worker channels that carry each `AcceptedConn`.
     pub worker_channels: Vec<Sender<AcceptedConn>>,
-    /// Per-worker wake handles to wake the event loop after sending a connection.
-    pub worker_wake_handles: Vec<crate::wakeup::WakeFd>,
+    /// Per-worker wake handles to wake the event loop after sending a
+    /// connection. Owning, so a worker's wake fd stays open while this
+    /// acceptor can still write to it.
+    pub worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
     /// Shared flag set by `Runtime::shutdown` to signal the acceptor to stop.
     #[allow(dead_code)] // stored for future use; acceptor currently uses channel disconnect
     pub shutdown_flag: Arc<AtomicBool>,
@@ -91,8 +92,8 @@ pub(crate) fn apply_accepted_sockopts(
 
 /// Run one listener's acceptor loop. Terminates when all channels disconnect.
 ///
-/// Accepts connections via blocking `accept4` and distributes raw fds
-/// to workers round-robin, waking each worker via eventfd. One of these runs
+/// Accepts connections via blocking `accept4` and distributes them to
+/// workers round-robin, waking each worker via eventfd. One of these runs
 /// per listener; they share the worker channels, so accepts from different
 /// listeners interleave and each carries its own `ListenerId`.
 pub fn run_acceptor(config: AcceptorConfig) {
@@ -169,11 +170,16 @@ pub fn run_acceptor(config: AcceptorConfig) {
         // Pick a target worker based on chunk assignment, then fall back to
         // adjacent workers if that worker's channel is full or it has exited.
         // `try_send` lets us distinguish a full queue (skip) from a
-        // disconnected channel (mark dead). Closing the fd when all workers
-        // are full or dead lets the kernel deliver a clean connection-refused
-        // to the peer instead of growing an unbounded backlog in the channel.
+        // disconnected channel (mark dead). Dropping the connection when every
+        // live worker is full or dead closes it, so the peer sees EOF straight
+        // away instead of the channel growing without bound.
         let primary = (conn_count / chunk_size) % num_workers;
-        let mut sent = false;
+        // SAFETY: `accept4` returned a fresh descriptor that nothing else owns.
+        let mut pending = Some(AcceptedConn {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            listener: config.listener,
+            peer: peer_addr,
+        });
         for i in 0..num_workers {
             let worker_idx = (primary + i) % num_workers;
 
@@ -181,46 +187,36 @@ pub fn run_acceptor(config: AcceptorConfig) {
                 continue;
             }
 
-            let accepted = AcceptedConn {
-                fd,
-                listener: config.listener,
-                peer: peer_addr.clone(),
-            };
+            let accepted = pending.take().expect("connection not yet sent");
             match config.worker_channels[worker_idx].try_send(accepted) {
                 Ok(()) => {
                     config.worker_wake_handles[worker_idx].wake();
                     conn_count = conn_count.wrapping_add(1);
-                    sent = true;
                     break;
                 }
-                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                Err(crossbeam_channel::TrySendError::Full(accepted)) => {
                     // Worker is backlogged — try the next one.
+                    pending = Some(accepted);
                     continue;
                 }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    // Worker has exited — mark dead.
+                Err(crossbeam_channel::TrySendError::Disconnected(accepted)) => {
+                    // Worker has exited — mark dead. With none left, dropping
+                    // the connection closes it.
                     alive[worker_idx] = false;
                     alive_count -= 1;
                     if alive_count == 0 {
-                        unsafe {
-                            libc::close(fd);
-                        }
                         return;
                     }
+                    pending = Some(accepted);
                     continue;
                 }
             }
         }
 
-        if !sent {
-            // Every live worker is backlogged. Drop the connection rather
-            // than block the acceptor, and keep accepting — the backlog is
-            // transient. (The all-workers-dead case returns above.)
-            unsafe {
-                libc::close(fd);
-            }
-            continue;
-        }
+        // Every live worker is backlogged. Dropping the connection closes it
+        // rather than blocking the acceptor; keep accepting, since the backlog
+        // is transient. (The all-workers-dead case returns above.)
+        drop(pending);
     }
 }
 

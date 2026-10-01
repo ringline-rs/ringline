@@ -230,6 +230,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Connected binds (`bind_udp_connected`) with a zero port keep one port per
   worker.
 
+- Connections accepted but still queued for a worker when the runtime shut
+  down were never closed: the accept channel carried the socket as a raw fd,
+  so the queued connections leaked when the worker exited without draining
+  it. On mio every connection queued at shutdown leaked; on io_uring only
+  those queued after the worker's last drain. Each queued connection now
+  owns its socket, and a worker closes the connections still queued for it
+  when it exits, including one that exits while the runtime keeps running
+  (#545).
+
 - `ConnCtx::close` (and `Connection::close` / `SendHalf::close`, which call
   it) on a stale handle, one whose slot had been reused by a new connection,
   closed that new connection. It now does nothing on a stale handle, as
@@ -238,6 +247,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection's recv sink, so that connection's bytes were written into it),
   `take_recv_sink` (a stale handle removed the new connection's sink) and
   `recv_timestamp` (#535).
+
+- A background thread that woke a worker after the `Runtime` had dropped
+  wrote into whatever file then held the wake fd's number. Dropping the
+  `Runtime` closed every worker's wake fd, but blocking-pool, resolver and
+  spawner threads, mio's disk-I/O threads, the acceptor and the workers
+  themselves carried the fd number without owning it. A `spawn_blocking` task
+  still running at shutdown therefore wrote its wake (8 bytes on io_uring, 1
+  on mio) into an unrelated fd once it finished. Each of those threads now
+  holds the wake fds open while it runs, so they close when the last of those
+  threads exits, or the last `WakeHandle` from `worker_wake_handle()` drops,
+  rather than when the `Runtime` drops. Pool threads are detached, so the wake
+  fds can still be open just after `launch()` returns an error or the worker
+  handles have joined; they close once those threads see shutdown. A pool
+  operation that never returns, such as a `spawn_blocking` task, keeps them
+  open. References are taken when threads start, never per request.
+
+- On mio, a wake that reached a worker after it had exited raised SIGPIPE.
+  That kills a process whose SIGPIPE disposition is the default; Rust programs
+  ignore SIGPIPE unless they reset it. Calling `shutdown()`, joining the
+  workers and then dropping the `Runtime` was enough, because the worker
+  closed its wake pipe's read end on exit. The `WakeHandle` now owns both ends
+  of the pipe.
 
 - Docs: `send_backpressured`'s documented error set omitted
   `io::ErrorKind::NotConnected`, which is what a waiter actually gets when the

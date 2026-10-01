@@ -2635,11 +2635,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let Some((tx, wake)) = self.driver.peer_accept.get(target) else {
             return Err((raw_fd, peer_addr));
         };
-        match tx.try_send(crate::acceptor::AcceptedConn {
-            fd: raw_fd,
+        // SAFETY: the caller owns `raw_fd` and gives it up here; a failed send
+        // returns it below.
+        let conn = crate::acceptor::AcceptedConn {
+            fd: unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw_fd) },
             listener,
-            peer: peer_addr.clone(),
-        }) {
+            peer: peer_addr,
+        };
+        match tx.try_send(conn) {
             Ok(()) => {
                 // Claim the slot on the target's behalf straight away. The
                 // target only republishes once it drains, and a burst of
@@ -2654,7 +2657,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Ok(())
             }
             // Full or gone: keep it here rather than drop it.
-            Err(_) => Err((raw_fd, peer_addr)),
+            Err(
+                crossbeam_channel::TrySendError::Full(conn)
+                | crossbeam_channel::TrySendError::Disconnected(conn),
+            ) => Err((std::os::fd::IntoRawFd::into_raw_fd(conn.fd), conn.peer)),
         }
     }
 
@@ -2762,13 +2768,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     None => None,
                 };
                 let Some(crate::acceptor::AcceptedConn {
-                    fd: raw_fd,
+                    fd,
                     listener,
                     peer: peer_addr,
                 }) = item
                 else {
                     break;
                 };
+                let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
                 self.install_accepted(raw_fd, listener, peer_addr);
             }
         }

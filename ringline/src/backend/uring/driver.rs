@@ -3200,8 +3200,16 @@ impl Driver {
         }
     }
 
-    /// Shutdown: close all connections, drain remaining CQEs, close eventfd.
+    /// Shutdown: close all connections and drain remaining CQEs. The eventfd
+    /// is closed by `WakeHandle`, not here.
     pub(crate) fn run_shutdown(&mut self) {
+        // Close connections still queued for this worker. Dropping the
+        // receiver alone leaves them in the channel until every sender (the
+        // acceptor threads, or in merged mode the other workers) has exited.
+        if let Some(rx) = self.accept_rx.take() {
+            rx.try_iter().for_each(drop);
+        }
+
         // 1. Close all active connections and drain their send queues.
         let max = self.connections.max_slots();
         for i in 0..max {

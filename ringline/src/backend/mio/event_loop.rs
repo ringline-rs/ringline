@@ -56,6 +56,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             let pool = Arc::new(crate::disk_io_pool::DiskIoPool::start(
                 config.disk_io_threads,
+                // `None` only in unit tests, which hold their own `WakeHandle`.
+                config
+                    .wake_keep_alive
+                    .clone()
+                    .unwrap_or_else(|| Arc::from(Vec::new())),
             ));
             let (tx, rx) = crossbeam_channel::unbounded::<crate::disk_io_pool::DiskIoResponse>();
             (Some(rx), Some(tx), Some(pool))
@@ -362,13 +367,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 None => None,
             };
             let Some(crate::acceptor::AcceptedConn {
-                fd: raw_fd,
+                fd,
                 listener,
                 peer: peer_addr,
             }) = item
             else {
                 break;
             };
+            let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
 
             let conn_index = match self.driver.connections.allocate() {
                 Some(idx) => idx,
@@ -1909,7 +1915,8 @@ mod tests {
         let (server_fd, _peer, peer_addr) = accepted_socket();
         accept_tx
             .send(crate::acceptor::AcceptedConn {
-                fd: server_fd,
+                // SAFETY: `accepted_socket` gave up ownership of `server_fd`.
+                fd: unsafe { std::os::fd::FromRawFd::from_raw_fd(server_fd) },
                 listener: crate::ListenerId::from_index(0),
                 peer: crate::connection::PeerAddr::Tcp(peer_addr),
             })
