@@ -152,9 +152,10 @@ fn test_config() -> Config {
     test_config_builder().build().expect("valid config")
 }
 
-/// A TCP port that refuses connections: a socket bound to it that never
-/// listens, so a connect gets a reset. The socket holds the port until it is
-/// dropped, so no other process can take it in the meantime.
+/// A loopback TCP port that refuses connections, and the socket that holds it.
+/// The socket is bound and never listens, so a connect to the port fails with
+/// `ConnectionRefused`. No other socket can bind the port until the returned
+/// fd is dropped.
 fn refusing_port() -> (std::os::fd::OwnedFd, u16) {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -1194,7 +1195,7 @@ impl AsyncEventHandler for ConnectRefusedHandler {
 #[test]
 fn async_outbound_connect_refused() {
     // A port held by a socket that never listens, so a connect is refused and
-    // nothing else can take the port while the test runs (#431).
+    // nothing else can take the port while the test runs.
     let (_dead_guard, dead_port) = refusing_port();
 
     CONNECT_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
@@ -4379,7 +4380,7 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
 #[test]
 fn async_standalone_connect_refused() {
     // A port held by a socket that never listens, so a connect is refused and
-    // nothing else can take the port while the test runs (#431).
+    // nothing else can take the port while the test runs.
     let (_dead_guard, dead_port) = refusing_port();
 
     STANDALONE_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);

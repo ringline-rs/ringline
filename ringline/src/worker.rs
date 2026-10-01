@@ -184,9 +184,11 @@ pub struct Runtime {
     /// inside `accept4`; it does not wake one parked in
     /// `ListenGates::wait_open`.
     listen_gates: Arc<crate::listen_gate::ListenGates>,
-    /// The address each `bind_udp` / `bind_udp_connected` socket is bound to,
-    /// in call order, with a zero port resolved to the one the workers share.
-    udp_addrs: Vec<SocketAddr>,
+    /// The address of each UDP bind, in `Config::udp_bind` order: `Some` with a
+    /// zero port replaced by the port the kernel chose, `None` for a connected
+    /// zero-port bind on more than one worker, whose workers each have their
+    /// own port.
+    udp_addrs: Vec<Option<SocketAddr>>,
 }
 
 impl Runtime {
@@ -220,20 +222,28 @@ impl Runtime {
         self.listeners.iter().map(|l| l.bound_addr).collect()
     }
 
-    /// The address of the first UDP socket, if any. A port-0 bind reports the
-    /// port the kernel chose; every worker's socket for that bind shares it.
+    /// The address of the first UDP bind. `None` if there is no UDP bind, or
+    /// if the first one has no single address (see [`bound_udp_addrs`]).
     ///
     /// With more than one UDP bind, use [`bound_udp_addrs`].
     ///
     /// [`bound_udp_addrs`]: Runtime::bound_udp_addrs
     pub fn bound_udp_addr(&self) -> Option<SocketAddr> {
-        self.udp_addrs.first().copied()
+        self.udp_addrs.first().copied().flatten()
     }
 
-    /// Every UDP socket's address, in `bind_udp` / `bind_udp_connected` call
-    /// order (after any `ConfigBuilder::udp_bind` addresses). A port-0 bind
-    /// reports the port the kernel chose.
-    pub fn bound_udp_addrs(&self) -> Vec<SocketAddr> {
+    /// Every UDP bind's address, in the order [`UdpCtx::index`] uses:
+    /// `ConfigBuilder::udp_bind` / `udp_bind_connected` addresses first, then
+    /// `RinglineBuilder::bind_udp` / `bind_udp_connected`, each in call order.
+    ///
+    /// A zero port reports the port the kernel chose, which every worker's
+    /// socket for that bind shares. The exception is a connected zero-port
+    /// bind on more than one worker: each worker's socket has its own port,
+    /// so that each receives the replies to what it sent, and the entry is
+    /// `None`.
+    ///
+    /// [`UdpCtx::index`]: crate::UdpCtx::index
+    pub fn bound_udp_addrs(&self) -> Vec<Option<SocketAddr>> {
         self.udp_addrs.clone()
     }
 
@@ -797,7 +807,11 @@ impl RinglineBuilder {
     /// Bind a UDP socket on each worker (with `SO_REUSEPORT`).
     ///
     /// Can be called multiple times to bind multiple UDP addresses.
-    /// Each worker creates its own socket per address.
+    /// Each worker creates its own socket per address. With a zero port,
+    /// `launch` chooses one port and every worker binds it; the kernel then
+    /// delivers each datagram to one of the workers, so on more than one
+    /// worker a reply need not reach the worker that sent the request. Read
+    /// the port back with [`Runtime::bound_udp_addr`].
     pub fn bind_udp(mut self, addr: SocketAddr) -> Self {
         self.config.udp_bind.push(addr);
         self.config.udp_connect_peers.push(None);
@@ -809,6 +823,11 @@ impl RinglineBuilder {
     /// to `peer` and the runtime uses the lighter `RecvUdp`/`SendUdp`
     /// opcodes instead of `RecvMsgUdp`/`SendMsgUdp`. Saves ~4 microseconds
     /// per round trip on single-shot client workloads.
+    ///
+    /// With a zero local port and more than one worker, each worker's socket
+    /// gets its own port, so each receives the replies to what it sent, and
+    /// [`Runtime::bound_udp_addrs`] reports `None` for this bind. On one
+    /// worker the port is resolved and reported.
     pub fn bind_udp_connected(mut self, local: SocketAddr, peer: SocketAddr) -> Self {
         self.config.udp_bind.push(local);
         self.config.udp_connect_peers.push(Some(peer));
@@ -985,17 +1004,22 @@ impl RinglineBuilder {
         self.config.validate()?;
         self.validate_listeners()?;
 
-        // Each worker binds its own SO_REUSEPORT socket for every UDP address,
-        // so a zero port would scatter them across ephemeral ports. Resolve it
-        // once here; the reserving sockets hold the port until `launch`
-        // returns, by which point every worker has bound it.
-        let _udp_reservations = resolve_zero_port_udp_binds(&mut self.config.udp_bind)?;
-
         let num_threads = if self.config.worker.threads == 0 {
             crate::topology::physical_core_count()
         } else {
             self.config.worker.threads
         };
+
+        // Each worker binds its own SO_REUSEPORT socket per UDP address, so an
+        // unresolved zero port gives each worker a different port. Resolve it
+        // here for every bind that should share one port. The reserving
+        // sockets stay bound until `launch` returns, after every worker has
+        // bound the port.
+        let (_udp_reservations, udp_addrs) = resolve_zero_port_udp_binds(
+            &mut self.config.udp_bind,
+            &self.config.udp_connect_peers,
+            num_threads,
+        )?;
 
         ensure_nofile_limit(self.config.max_connections, num_threads)?;
         #[cfg(has_io_uring)]
@@ -1605,7 +1629,7 @@ impl RinglineBuilder {
             listeners,
             region_registrar,
             listen_gates,
-            udp_addrs: self.config.udp_bind.clone(),
+            udp_addrs,
         };
 
         Ok((runtime, handles))
@@ -1790,23 +1814,43 @@ fn bind_reuseport_socket(addr: SocketAddr) -> Result<RawFd, crate::error::Error>
     Ok(fd)
 }
 
-/// Bind a `SO_REUSEPORT` UDP socket to each zero-port address in `udp_bind`
-/// and write the chosen port back into the address, so every worker's socket
-/// joins that port. The returned sockets hold the port while the workers bind
-/// it.
+/// Resolve the zero ports in `udp_bind` that every worker should share, and
+/// return the sockets reserving them with each bind's reported address.
+///
+/// A zero port is resolved, and the chosen port written back into the
+/// address, for an unconnected bind and for any bind on a single worker. A
+/// connected zero-port bind on more than one worker is left at port 0, so
+/// each worker's socket gets its own port, and reports `None`. The returned
+/// sockets keep their ports bound until they are dropped.
 fn resolve_zero_port_udp_binds(
     udp_bind: &mut [SocketAddr],
-) -> Result<Vec<std::os::fd::OwnedFd>, crate::error::Error> {
+    connect_peers: &[Option<SocketAddr>],
+    workers: usize,
+) -> Result<(Vec<std::os::fd::OwnedFd>, Vec<Option<SocketAddr>>), crate::error::Error> {
     let mut held = Vec::new();
-    for addr in udp_bind.iter_mut().filter(|a| a.port() == 0) {
-        let (fd, resolved) = reserve_udp_port(*addr).map_err(crate::error::Error::Io)?;
-        *addr = resolved;
-        held.push(fd);
+    let mut reported = Vec::with_capacity(udp_bind.len());
+    for (i, addr) in udp_bind.iter_mut().enumerate() {
+        let connected = connect_peers.get(i).is_some_and(Option::is_some);
+        if addr.port() != 0 {
+            reported.push(Some(*addr));
+        } else if connected && workers > 1 {
+            reported.push(None);
+        } else {
+            let (fd, resolved) = reserve_udp_port(*addr).map_err(crate::error::Error::Io)?;
+            *addr = resolved;
+            held.push(fd);
+            reported.push(Some(resolved));
+        }
     }
-    Ok(held)
+    Ok((held, reported))
 }
 
-/// A `SO_REUSEPORT` UDP socket bound to `addr`, and the address it bound.
+/// A UDP socket bound to an unused port at `addr`, with `SO_REUSEPORT` set so
+/// the workers' sockets can join it, and the address it bound.
+///
+/// `SO_REUSEPORT` is set after the bind. Set before it, Linux's search for a
+/// free port can return a port another `SO_REUSEPORT` socket of the same user
+/// already holds, and the reservation would join that socket's group.
 fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, SocketAddr)> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -1833,6 +1877,19 @@ fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, Socke
         }
     }
 
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = crate::backend::socket_addr_to_sockaddr(addr, &mut storage);
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &storage as *const _ as *const libc::sockaddr,
+            len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
     let optval: libc::c_int = 1;
     let rc = unsafe {
         libc::setsockopt(
@@ -1841,19 +1898,6 @@ fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, Socke
             libc::SO_REUSEPORT,
             &optval as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let len = crate::backend::socket_addr_to_sockaddr(addr, &mut storage);
-    let rc = unsafe {
-        libc::bind(
-            fd.as_raw_fd(),
-            &storage as *const _ as *const libc::sockaddr,
-            len,
         )
     };
     if rc < 0 {
