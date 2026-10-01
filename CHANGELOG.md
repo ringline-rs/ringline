@@ -222,6 +222,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- On Linux 6.14 and later, io_uring charges each ring and each provided buffer
+  ring to `RLIMIT_MEMLOCK`, in addition to registered buffers. The kernel adds
+  the charge to what every process of the same user has charged. The launch
+  preflight counted only `registered_regions`, and only once rather than once
+  per worker, so a config the limit could not hold passed it and failed in
+  `io_uring_setup` with a bare `ENOMEM`. The preflight now counts each
+  worker's ring, provided buffer rings and regions, skips a process with
+  `CAP_IPC_LOCK`, and names the rings in its error. An `ENOMEM` from
+  `io_uring_setup` or a provided buffer ring registration on 6.14+ now names
+  the limit, the soft value and the per-user sum; before 6.14 the provided
+  buffer ring hint still says the limit is not the cause (#426).
+
 - A port-0 unconnected UDP bind (`bind_udp("…:0")`) with more than one
   worker bound each worker's socket to a different ephemeral port, so the
   bind had no single address. `launch` now resolves the port once and every

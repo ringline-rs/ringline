@@ -128,7 +128,7 @@ Ringline is a thread-per-core async I/O runtime. No work-stealing, no cross-thre
 ### Startup Flow
 
 `RinglineBuilder::new(config).bind(addr).launch::<Handler>()` →
-1. Validates config, ensures RLIMIT_NOFILE is sufficient (and, on io_uring, that RLIMIT_MEMLOCK covers `registered_regions` — fixed buffers are pinned against it unless the process has `CAP_IPC_LOCK`); soft limits are raised when the hard limit allows, otherwise `Error::ResourceLimit` names the `ulimit` to run
+1. Validates config, ensures RLIMIT_NOFILE is sufficient (and, on io_uring, that RLIMIT_MEMLOCK covers what each worker charges to it: its `registered_regions`, plus on Linux 6.14+ its ring and provided buffer rings — see `ringline/src/memlock.rs`; a process with `CAP_IPC_LOCK` is not charged); soft limits are raised when the hard limit allows, otherwise `Error::ResourceLimit` names the `ulimit` to run
 2. Spawns an **acceptor thread** (if `.bind()` was called) that runs `accept4()` and round-robins fds to workers via crossbeam channels
 3. Spawns **N worker threads**, each pinned to a CPU core (SMT-aware: one worker per physical core), each owning its own `Driver` + `Executor` + ring/poll instance
 

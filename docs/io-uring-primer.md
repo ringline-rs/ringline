@@ -244,10 +244,14 @@ io_uring adds roughly 0.6 MiB of visible control storage, while extended
 send buffers, allocator overhead, kernel ring accounting, and socket buffers;
 the last category can dominate and exists with either backend.
 
-Registered memory can remain pinned. Kernels before Linux 5.12 charge fixed
-registered buffers against `RLIMIT_MEMLOCK`; Linux 5.12 and later with native
-io_uring workers use cgroup memory accounting instead
-([`io_uring_registered_buffers(7)`]).
+Registered memory can remain pinned. io_uring charges fixed registered buffers
+against `RLIMIT_MEMLOCK` on every kernel ringline supports, and from Linux 6.14
+it also charges each ring and each provided buffer ring. The charge goes to the
+user, not the process: the kernel adds it to what every process of that user
+has charged and compares the total with the creating process's limit, and a
+process with `CAP_IPC_LOCK` is not charged (`io_uring/rsrc.c` and
+`io_uring/memmap.c`; `ringline/tests/memlock_rings.rs` checks the ring sizes
+against a running kernel).
 Queue depth and outstanding-operation limits therefore require an explicit
 memory budget. A thread-per-connection design can additionally consume large
 virtual and resident stack space, but epoll/Mio does not require that design

@@ -967,7 +967,7 @@ impl RinglineBuilder {
 
         ensure_nofile_limit(self.config.max_connections, num_threads)?;
         #[cfg(has_io_uring)]
-        ensure_memlock_limit(&self.config)?;
+        ensure_memlock_limit(&self.config, num_threads)?;
 
         crate::metrics::init_metadata();
 
@@ -1662,30 +1662,35 @@ fn ensure_nofile_limit(
     }
 }
 
-/// Make sure `RLIMIT_MEMLOCK` covers the fixed buffers `Driver::new` will
-/// register, before any worker thread exists.
+/// Make sure `RLIMIT_MEMLOCK` covers what the workers' rings will charge to it,
+/// before any worker thread exists.
 ///
-/// io_uring charges registered buffers against the memlock limit unless the
-/// process holds `CAP_IPC_LOCK`; distros default it to 8 MiB or 64 MiB, and
-/// the kernel reports the shortfall as a bare `ENOMEM`. Like the nofile
-/// check, this raises the soft limit when the hard limit allows and otherwise
-/// fails with the fix spelled out. Regions registered later through
-/// `Runtime::register_region` are checked at that call instead.
+/// Every worker registers the configured regions as fixed buffers, and on
+/// Linux 6.14+ each worker's ring and provided buffer rings are charged too
+/// (see [`crate::memlock`]). Distros default the limit to 8 MiB or 64 MiB, and
+/// the kernel reports a shortfall as a bare `ENOMEM`. Like the nofile check,
+/// this raises the soft limit when the hard limit allows and otherwise fails
+/// with the fix spelled out.
+///
+/// The kernel compares the limit with everything the same user has charged in
+/// any process, which this cannot see, so passing here does not rule out an
+/// `ENOMEM` at setup; the setup error names the limit in that case. Regions
+/// registered later through `Runtime::register_region` are checked at that
+/// call instead.
 #[cfg(has_io_uring)]
-fn ensure_memlock_limit(config: &Config) -> Result<(), crate::error::Error> {
+fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::error::Error> {
     use crate::error::{MemlockLimit, MemlockPlan, describe_memlock_shortfall, memlock_plan};
+    use crate::memlock::{KernelVersion, charges_rings, has_cap_ipc_lock};
 
-    if config.registered_regions.is_empty() {
+    if has_cap_ipc_lock() {
         return Ok(());
     }
-    // Pinning is per page, and a region that does not start on a page
-    // boundary pins one more than its length suggests.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
-    let required: u64 = config
-        .registered_regions
-        .iter()
-        .map(|r| (r.len() as u64).div_ceil(page) * page + page)
-        .sum();
+    let kernel = KernelVersion::current();
+    let required = memlock_required(config, workers, charges_rings(kernel), page);
+    if required == 0 {
+        return Ok(());
+    }
     let limit = MemlockLimit::read().map_err(crate::error::Error::Io)?;
     match memlock_plan(required, &limit) {
         MemlockPlan::Sufficient => Ok(()),
@@ -1699,14 +1704,52 @@ fn ensure_memlock_limit(config: &Config) -> Result<(), crate::error::Error> {
             }
             Ok(())
         }
-        MemlockPlan::HardTooLow => Err(crate::error::Error::ResourceLimit(
-            describe_memlock_shortfall(
-                required,
-                &limit,
-                &format!("{} registered region(s)", config.registered_regions.len()),
-            ),
-        )),
+        MemlockPlan::HardTooLow => {
+            let mut what = format!("{workers} worker(s)");
+            if charges_rings(kernel) {
+                what.push_str(&match kernel {
+                    Some(k) => format!(", whose io_uring rings Linux {k} charges to the limit,"),
+                    None => ", whose io_uring rings this kernel may charge to the limit,".into(),
+                });
+            }
+            if !config.registered_regions.is_empty() {
+                what.push_str(&format!(
+                    " each registering {} region(s)",
+                    config.registered_regions.len()
+                ));
+            }
+            Err(crate::error::Error::ResourceLimit(
+                describe_memlock_shortfall(required, &limit, &what),
+            ))
+        }
     }
+}
+
+/// The bytes `workers` workers charge to `RLIMIT_MEMLOCK` when they start:
+/// each worker's registered regions, plus its ring and provided buffer rings
+/// when the kernel charges those (`charges_rings`).
+#[cfg(any(has_io_uring, test))]
+fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: u64) -> u64 {
+    use crate::memlock::{provided_ring_bytes, ring_bytes};
+
+    // Pinning is per page, and a region that does not start on a page
+    // boundary pins one more than its length suggests.
+    let regions: u64 = config
+        .registered_regions
+        .iter()
+        .map(|r| (r.len() as u64).div_ceil(page) * page + page)
+        .sum();
+    let rings = if charges_rings {
+        let mut bytes = ring_bytes(config.sq_entries, page)
+            + provided_ring_bytes(config.recv_buffer.ring_size, page);
+        if !config.udp_bind.is_empty() {
+            bytes += provided_ring_bytes(config.udp_recv_buffer.ring_size, page);
+        }
+        bytes
+    } else {
+        0
+    };
+    (regions + rings) * workers as u64
 }
 
 /// Pin the current thread to a specific CPU core.
@@ -2196,5 +2239,50 @@ mod startup_gate_tests {
         assert_eq!(super::panic_payload(&*st), "static");
         let other: Box<dyn std::any::Any + Send> = Box::new(42u32);
         assert_eq!(super::panic_payload(&*other), "non-string panic payload");
+    }
+}
+
+#[cfg(test)]
+mod memlock_required_tests {
+    use super::memlock_required;
+    use crate::buffer::fixed::MemoryRegion;
+    use crate::config::ConfigBuilder;
+
+    const PAGE: u64 = 4096;
+
+    fn builder() -> ConfigBuilder {
+        ConfigBuilder::new().sq_entries(64).recv_buffer(16, 1024)
+    }
+
+    #[test]
+    fn rings_count_per_worker_only_when_the_kernel_charges_them() {
+        let config = builder().build().unwrap();
+        // ring 5 pages + recv provided ring 1 page.
+        assert_eq!(memlock_required(&config, 1, true, PAGE), 6 * PAGE);
+        assert_eq!(memlock_required(&config, 4, true, PAGE), 24 * PAGE);
+        assert_eq!(memlock_required(&config, 4, false, PAGE), 0);
+    }
+
+    #[test]
+    fn the_udp_provided_ring_counts_only_with_a_udp_bind() {
+        let without = builder().udp_recv_buffer(512, 2048).build().unwrap();
+        assert_eq!(memlock_required(&without, 1, true, PAGE), 6 * PAGE);
+        let mut with = without.clone();
+        with.udp_bind.push("127.0.0.1:0".parse().unwrap());
+        with.udp_connect_peers.push(None);
+        // + 512 entries * 16 bytes = 2 pages.
+        assert_eq!(memlock_required(&with, 1, true, PAGE), 8 * PAGE);
+    }
+
+    #[test]
+    fn every_worker_registers_every_region() {
+        let mut backing = vec![0u8; 3 * PAGE as usize];
+        // SAFETY: `backing` outlives the config, which is never launched.
+        let region = unsafe { MemoryRegion::new(backing.as_mut_ptr(), backing.len()) };
+        let config = builder().registered_regions(vec![region]).build().unwrap();
+        // 3 pages, plus one for a start that is not page-aligned.
+        assert_eq!(memlock_required(&config, 1, false, PAGE), 4 * PAGE);
+        assert_eq!(memlock_required(&config, 3, false, PAGE), 12 * PAGE);
+        assert_eq!(memlock_required(&config, 3, true, PAGE), 3 * (4 + 6) * PAGE);
     }
 }

@@ -251,7 +251,9 @@ impl Ring {
                          ring size that is not a power of two. {}",
                         provided.bgid(),
                         provided.ring_entries(),
-                        crate::error::provided_ring_enomem_hint()
+                        crate::error::provided_ring_enomem_hint(
+                            &crate::error::RingSetupProbe::read()
+                        )
                     ))
                 })?;
         }
