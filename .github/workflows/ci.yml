@@ -112,15 +112,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-nextest
-      - run: cargo nextest run --locked --workspace --profile ci
-      - run: cargo test --locked --workspace --doc
-      # A run on 2026-09-22 aborted the release test binary with a bare ENOMEM
-      # from `register_buf_ring`. The error text blames RLIMIT_MEMLOCK, but that
-      # was measured and ruled out: on kernel 6.12 the whole uring test suite
-      # passes with the soft limit at 8 KiB, so the ring is not charged there.
-      # What is left is genuine kernel memory pressure, which nothing recorded.
-      # Capture it on failure so the next occurrence is diagnosable instead of
-      # being re-argued from the same empty log.
+      # io_uring charges ring memory to the user's RLIMIT_MEMLOCK on these
+      # runners (kernel 6.17), summed over every process the user runs. nextest
+      # runs tests as separate processes, so at the runner's 8 MiB limit
+      # io_uring_setup failed with ENOMEM in 10/10 release runs, and in 0/10 at
+      # 64 MiB (#426). Raised in the same shell as the tests, because each step
+      # starts a new one.
+      - run: |
+          sudo prlimit --pid $$ --memlock=67108864:67108864
+          cargo nextest run --locked --workspace --profile ci
+          cargo test --locked --workspace --doc
+      # Resource state for an io_uring ENOMEM. On kernel 6.12 the uring suite
+      # passes with RLIMIT_MEMLOCK at 8 KiB, so rings are not charged there; on
+      # the 6.17 runners they are (#426), which is why the step above raises it.
+      # Capture the rest in case another source turns up.
       - name: Resource state (on failure)
         if: failure()
         run: |
@@ -183,15 +188,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-nextest
-      - run: cargo nextest run --locked --workspace --profile ci --release
-      - run: cargo test --locked --workspace --doc --release
-      # A run on 2026-09-22 aborted the release test binary with a bare ENOMEM
-      # from `register_buf_ring`. The error text blames RLIMIT_MEMLOCK, but that
-      # was measured and ruled out: on kernel 6.12 the whole uring test suite
-      # passes with the soft limit at 8 KiB, so the ring is not charged there.
-      # What is left is genuine kernel memory pressure, which nothing recorded.
-      # Capture it on failure so the next occurrence is diagnosable instead of
-      # being re-argued from the same empty log.
+      # io_uring charges ring memory to the user's RLIMIT_MEMLOCK on these
+      # runners (kernel 6.17), summed over every process the user runs. nextest
+      # runs tests as separate processes, so at the runner's 8 MiB limit
+      # io_uring_setup failed with ENOMEM in 10/10 release runs, and in 0/10 at
+      # 64 MiB (#426). Raised in the same shell as the tests, because each step
+      # starts a new one.
+      - run: |
+          sudo prlimit --pid $$ --memlock=67108864:67108864
+          cargo nextest run --locked --workspace --profile ci --release
+          cargo test --locked --workspace --doc --release
+      # Resource state for an io_uring ENOMEM. On kernel 6.12 the uring suite
+      # passes with RLIMIT_MEMLOCK at 8 KiB, so rings are not charged there; on
+      # the 6.17 runners they are (#426), which is why the step above raises it.
+      # Capture the rest in case another source turns up.
       - name: Resource state (on failure)
         if: failure()
         run: |
@@ -261,8 +271,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-nextest
-      - run: cargo nextest run --locked --workspace --profile ci --features tls-unbuffered
-      - run: cargo test --locked --workspace --doc --features tls-unbuffered
+      # io_uring charges ring memory to the user's RLIMIT_MEMLOCK on these
+      # runners (kernel 6.17), summed over every process the user runs. nextest
+      # runs tests as separate processes, so at the runner's 8 MiB limit
+      # io_uring_setup failed with ENOMEM in 10/10 release runs, and in 0/10 at
+      # 64 MiB (#426). Raised in the same shell as the tests, because each step
+      # starts a new one.
+      - run: |
+          sudo prlimit --pid $$ --memlock=67108864:67108864
+          cargo nextest run --locked --workspace --profile ci --features tls-unbuffered
+          cargo test --locked --workspace --doc --features tls-unbuffered
 
   test-macos:
     name: Test (macOS)
