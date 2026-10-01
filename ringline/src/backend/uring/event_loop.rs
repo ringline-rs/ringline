@@ -7933,6 +7933,165 @@ mod tests {
         );
     }
 
+    /// A stale handle must not close the slot's new occupant (#535).
+    ///
+    /// A `ConnCtx` can outlive its connection, and the slot can be reused by
+    /// then; closing by slot index alone would close the new occupant.
+    #[test]
+    fn close_ignores_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+
+        with_driver_state(&mut el, || stale.close());
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| !matches!(c.recv_mode, crate::connection::RecvMode::Closed)),
+            "a stale handle must not close the new occupant"
+        );
+
+        // The control: the current handle still closes it.
+        let current = ConnCtx::new(conn_index, generation);
+        with_driver_state(&mut el, || current.close());
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_none_or(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed)),
+            "the current handle must still close its own connection"
+        );
+    }
+
+    /// A handle made stale by real teardown (close, the Close CQE, release)
+    /// and the slot's re-accept must not close the new occupant or take its
+    /// recv sink. Teardown clears the old occupant's sink before the slot is
+    /// released.
+    #[test]
+    fn close_ignores_a_handle_made_stale_by_teardown() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let old_gen = el.driver.connections.generation(conn_index);
+        let old = ConnCtx::new(conn_index, old_gen);
+        let mut buf = [0u8; 64];
+
+        // SAFETY: `buf` outlives the sink, which teardown removes below.
+        with_driver_state(&mut el, || unsafe {
+            old.set_recv_sink(buf.as_mut_ptr(), buf.len())
+        });
+        assert!(el.executor.recv_sinks[conn_index as usize].is_some());
+
+        el.driver.close_connection(conn_index);
+        let ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert!(el.driver.connections.get(conn_index).is_none());
+        assert!(
+            el.executor.recv_sinks[conn_index as usize].is_none(),
+            "teardown must clear the old occupant's sink"
+        );
+
+        // While the slot is free, closing the old handle does nothing.
+        with_driver_state(&mut el, || old.close());
+
+        let new_index = accept_connection(&mut el);
+        assert_eq!(new_index, conn_index, "the test needs the slot reused");
+        let new_gen = el.driver.connections.generation(conn_index);
+        assert_ne!(new_gen, old_gen, "release must change the generation");
+
+        with_driver_state(&mut el, || old.close());
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| !matches!(c.recv_mode, crate::connection::RecvMode::Closed)),
+            "the stale handle closed the new occupant"
+        );
+        assert_eq!(with_driver_state(&mut el, || old.take_recv_sink()), 0);
+
+        let current = ConnCtx::new(conn_index, new_gen);
+        with_driver_state(&mut el, || current.close());
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_none_or(|c| matches!(c.recv_mode, crate::connection::RecvMode::Closed))
+        );
+    }
+
+    /// A stale handle must not install a recv sink on the slot's new occupant:
+    /// that connection's bytes would be written into the stale caller's
+    /// buffer instead of reaching its own reader.
+    #[test]
+    fn set_recv_sink_ignores_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        let mut buf = [0u8; 64];
+
+        // SAFETY: no CQE is delivered before the test returns, so nothing
+        // writes through the sink even if one is installed.
+        with_driver_state(&mut el, || unsafe {
+            stale.set_recv_sink(buf.as_mut_ptr(), buf.len())
+        });
+        assert!(
+            el.executor.recv_sinks[conn_index as usize].is_none(),
+            "a stale handle must not install a recv sink on the new occupant"
+        );
+    }
+
+    /// A stale handle must not take the slot's new occupant's recv sink.
+    #[test]
+    fn take_recv_sink_ignores_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let current = ConnCtx::new(conn_index, generation);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        let mut buf = [0u8; 64];
+
+        // SAFETY: `buf` outlives the sink, which is removed below.
+        with_driver_state(&mut el, || unsafe {
+            current.set_recv_sink(buf.as_mut_ptr(), buf.len())
+        });
+        assert!(el.executor.recv_sinks[conn_index as usize].is_some());
+
+        let taken = with_driver_state(&mut el, || stale.take_recv_sink());
+        assert_eq!(taken, 0);
+        assert!(
+            el.executor.recv_sinks[conn_index as usize].is_some(),
+            "a stale handle must not take the new occupant's recv sink"
+        );
+
+        with_driver_state(&mut el, || current.take_recv_sink());
+        assert!(el.executor.recv_sinks[conn_index as usize].is_none());
+    }
+
+    /// A stale handle reads 0, not the new occupant's timestamp.
+    #[cfg(feature = "timestamps")]
+    #[test]
+    fn recv_timestamp_ignores_a_stale_handle() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .recv_timestamp_ns = 42;
+        let current = ConnCtx::new(conn_index, generation);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+
+        assert_eq!(with_driver_state(&mut el, || current.recv_timestamp()), 42);
+        assert_eq!(
+            with_driver_state(&mut el, || stale.recv_timestamp()),
+            0,
+            "a stale handle must not read the new occupant's timestamp"
+        );
+    }
+
     /// A stale handle must not flip the new occupant into recv-forward mode:
     /// it would start holding its recv buffers for a forward nobody will issue.
     #[test]
