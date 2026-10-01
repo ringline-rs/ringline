@@ -19,7 +19,8 @@ use ringline::ConfigBuilder;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ringline::{
     AsyncEventHandler, Config, Connection, GuardBox, ParseResult, RegionId, RinglineBuilder,
@@ -64,6 +65,50 @@ impl SendGuard for VecGuard {
     }
 }
 
+// ── Server-side trace, for a client timeout (#513) ──────────────────
+
+/// What each handler did, keyed by the client's ephemeral port.
+///
+/// #513 failed once with the client reading 0 of 144 bytes in 5 s, and the
+/// client side alone cannot say why: the server may never have seen the
+/// trigger, or it submitted the send and the bytes never reached the wire.
+/// The handlers record each step here and the client prints its own
+/// connection's steps when it gives up, so the next occurrence says which.
+///
+/// Keyed by port because the tests in this binary run in parallel, each with
+/// its own server; a single global would interleave them.
+static TRACE: Mutex<Vec<(u16, Instant, String)>> = Mutex::new(Vec::new());
+
+fn trace(conn: &Connection, event: impl Into<String>) {
+    let port = match conn.peer_addr() {
+        Some(ringline::PeerAddr::Tcp(a)) => a.port(),
+        _ => 0,
+    };
+    let event = event.into();
+    TRACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((port, Instant::now(), event));
+}
+
+/// The server-side steps for the client on `port`, timed from `t0`.
+fn trace_for(port: u16, t0: Instant) -> String {
+    let trace = TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    let steps: Vec<String> = trace
+        .iter()
+        .filter(|(p, _, _)| *p == port)
+        .map(|(_, at, ev)| {
+            let ms = at.saturating_duration_since(t0).as_secs_f64() * 1000.0;
+            format!("  +{ms:.1}ms {ev}")
+        })
+        .collect();
+    if steps.is_empty() {
+        "  (none: the handler never saw this connection)".to_string()
+    } else {
+        steps.join("\n")
+    }
+}
+
 // ── Handler ─────────────────────────────────────────────────────────
 
 /// On the first recv (trigger), sends copy(PREFIX) + guard(value of VLEN
@@ -75,9 +120,11 @@ struct GuardPartsSender<const VLEN: usize>;
 impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            trace(&conn, "accepted");
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
                 .await;
+            trace(&conn, format!("trigger with_data -> {n} bytes"));
             if n == 0 {
                 return;
             }
@@ -86,14 +133,17 @@ impl<const VLEN: usize> AsyncEventHandler for GuardPartsSender<VLEN> {
             let result = conn
                 .send_parts()
                 .build(|b| b.copy(PREFIX).guard(guard).copy(SUFFIX).submit());
+            trace(&conn, format!("send_parts -> {result:?}"));
             if let Err(e) = result {
-                let _ = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                let r = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                trace(&conn, format!("ERR send_nowait -> {r:?}"));
             }
 
             // Keep the connection open until the client finishes reading.
             loop {
                 let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
                 if n == 0 {
+                    trace(&conn, "client closed");
                     break;
                 }
             }
@@ -115,9 +165,11 @@ struct ChainGuardPartsSender<const VLEN: usize>;
 impl<const VLEN: usize> AsyncEventHandler for ChainGuardPartsSender<VLEN> {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            trace(&conn, "accepted");
             let n = conn
                 .with_data(|data| ParseResult::Consumed(data.len()))
                 .await;
+            trace(&conn, format!("trigger with_data -> {n} bytes"));
             if n == 0 {
                 return;
             }
@@ -137,13 +189,16 @@ impl<const VLEN: usize> AsyncEventHandler for ChainGuardPartsSender<VLEN> {
                     .add()
                     .finish()
             });
+            trace(&conn, format!("send_chain_nowait -> {result:?}"));
             if let Err(e) = result {
-                let _ = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                let r = conn.send_nowait(format!("ERR:{e}").as_bytes());
+                trace(&conn, format!("ERR send_nowait -> {r:?}"));
             }
 
             loop {
                 let n = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
                 if n == 0 {
+                    trace(&conn, "client closed");
                     break;
                 }
             }
@@ -206,7 +261,9 @@ fn run_case_with<H: AsyncEventHandler + 'static, const VLEN: usize>(config: Conf
     let addr = bound.to_string();
     wait_for_server(&addr);
 
+    let t0 = Instant::now();
     let mut stream = TcpStream::connect(&addr).unwrap();
+    let port = stream.local_addr().unwrap().port();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -222,13 +279,19 @@ fn run_case_with<H: AsyncEventHandler + 'static, const VLEN: usize>(config: Conf
             Ok(0) => break,
             Ok(n) => total += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                panic!("read timed out after 5s with {total}/{want} bytes")
-            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => panic!(
+                "read timed out after 5s with {total}/{want} bytes; server side (client port {port}):\n{}",
+                trace_for(port, t0)
+            ),
             Err(e) => panic!("read error: {e}"),
         }
     }
-    assert_eq!(total, want, "received {total} bytes");
+    assert_eq!(
+        total,
+        want,
+        "received {total} bytes; server side (client port {port}):\n{}",
+        trace_for(port, t0)
+    );
     assert!(
         !buf.starts_with(b"ERR:"),
         "server-side send_parts failed: {}",
