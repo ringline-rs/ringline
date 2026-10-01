@@ -152,46 +152,20 @@ fn test_config() -> Config {
     test_config_builder().build().expect("valid config")
 }
 
-/// A loopback TCP port that refuses connections, and the socket that holds it.
-/// The socket is bound and never listens, so a connect to the port fails with
-/// `ConnectionRefused`. No other socket can bind the port until the returned
-/// fd is dropped.
-fn refusing_port() -> (std::os::fd::OwnedFd, u16) {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
-    // SAFETY: `raw` is a socket created above and owned by nothing else.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-
-    let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    sin.sin_family = libc::AF_INET as libc::sa_family_t;
-    sin.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    {
-        sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-    }
-    let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::bind(
-            fd.as_raw_fd(),
-            &sin as *const _ as *const libc::sockaddr,
-            len,
-        )
-    };
-    assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
-
-    let mut bound: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut blen = len;
-    let rc = unsafe {
-        libc::getsockname(
-            fd.as_raw_fd(),
-            &mut bound as *mut _ as *mut libc::sockaddr,
-            &mut blen,
-        )
-    };
-    assert_eq!(rc, 0, "getsockname: {}", io::Error::last_os_error());
-    (fd, u16::from_be(bound.sin_port))
+/// A loopback TCP port that refuses connections, and the sockets that hold
+/// it. The port is the local port of the client end of an established
+/// loopback connection. Nothing listens on it, so a connect to it fails with
+/// `ConnectionRefused` on Linux and macOS, and the port stays in use until
+/// the returned streams are dropped, so a port-0 bind is never given it.
+///
+/// A bound socket that never listens does not work here: macOS drops a SYN
+/// to it instead of refusing, so the connect times out.
+fn refusing_port() -> ((TcpStream, TcpStream), u16) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let port = client.local_addr().unwrap().port();
+    ((client, server), port)
 }
 
 fn wait_for_server(addr: &str) {
