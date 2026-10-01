@@ -208,13 +208,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- `ConnCtx::close` on a stale handle, one whose slot had been reused by a
-  new connection, closed that new connection: it passed the slot index
-  without comparing the generation. It now does nothing on a stale handle,
-  like the other connection accessors. The same check now guards
-  `set_recv_sink` and `take_recv_sink` (a stale handle installed or removed
-  the new connection's recv sink, so that connection's bytes could be
-  written into the stale caller's buffer) and `recv_timestamp` (#535).
+- `ConnCtx::close` (and `Connection::close` / `SendHalf::close`, which call
+  it) on a stale handle, one whose slot had been reused by a new connection,
+  closed that new connection. It now does nothing on a stale handle, as
+  `enable_recv_forward` and `offer_for_park` already did. The same check now
+  guards `set_recv_sink` (a stale handle installed its buffer as the new
+  connection's recv sink, so that connection's bytes were written into it),
+  `take_recv_sink` (a stale handle removed the new connection's sink) and
+  `recv_timestamp` (#535).
 
 - Docs: `send_backpressured`'s documented error set omitted
   `io::ErrorKind::NotConnected`, which is what a waiter actually gets when the

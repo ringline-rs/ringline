@@ -168,11 +168,10 @@ impl Drop for PooledClient {
         // close the socket, so any path that does not return the client to a
         // slot must close it or the socket and driver slot leak.
         //
-        // `is_alive()` gates each close below. It is false once the handle's
-        // generation no longer matches the driver's connection slot, and
-        // `ConnCtx::close` does not check the generation, so closing a stale
-        // handle would close whichever connection now holds that slot. It is
-        // also false outside the executor, where `close` does nothing.
+        // `is_alive()` gates each close below. It is false once the connection
+        // is closing or its slot has been released, and outside the executor;
+        // `close` does nothing in each of those cases, so the gate only skips
+        // a redundant call.
 
         let alive = client.is_alive();
 
@@ -387,10 +386,7 @@ impl Pool {
     /// is to close every connection.
     pub fn close_all(&self) {
         for slot in self.shared.slots.borrow_mut().iter_mut() {
-            // `is_alive()` for the reason given in `PooledClient::drop`: a
-            // slot whose connection the runtime already closed holds a stale
-            // handle, and `ConnCtx::close` would close the slot's new
-            // occupant.
+            // `is_alive()` for the reason given in `PooledClient::drop`.
             if let Slot::Connected(conn) = slot
                 && conn.is_alive()
             {

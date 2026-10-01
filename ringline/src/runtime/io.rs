@@ -1724,8 +1724,9 @@ impl ConnCtx {
     /// yields, and the CQE handler (same thread) writes to it before the task
     /// resumes and clears the sink.
     ///
-    /// A stale handle does nothing: installing the sink on the slot's current
-    /// occupant would write that connection's bytes into `target`.
+    /// Does nothing if the handle is stale (its connection has been
+    /// released); `recv_ready` then resolves immediately and
+    /// `take_recv_sink` returns 0.
     pub unsafe fn set_recv_sink(&self, target: *mut u8, len: usize) {
         with_state(|driver, executor| {
             if driver.connections.generation(self.conn_index) != self.generation {
@@ -2556,8 +2557,9 @@ impl ConnCtx {
 
     /// Close this connection.
     ///
-    /// Does nothing on a stale handle, one whose slot now holds a different
-    /// connection. Closing by slot index alone would close that connection.
+    /// Does nothing if the connection has already been released (its slot may
+    /// now hold another connection), or when called outside the worker's
+    /// executor.
     pub fn close(&self) {
         let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
         if opt_non_null.is_none() {
