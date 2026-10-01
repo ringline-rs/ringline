@@ -317,6 +317,11 @@ pub struct Config {
     /// Saves ~4 microseconds per round trip on single-shot client workloads.
     /// Must have the same length as `udp_bind` (enforced at validation).
     pub(crate) udp_connect_peers: Vec<Option<SocketAddr>>,
+    /// Sockets `launch` bound for zero-port UDP binds, parallel to
+    /// `udp_bind` once `launch` has run (empty before). The first worker to
+    /// set up a bind's socket takes the reserved socket as its own, and the
+    /// other workers bind its port.
+    pub(crate) udp_reserved: std::sync::Arc<[std::sync::Mutex<Option<std::os::fd::OwnedFd>>]>,
     /// Number of concurrent in-flight UDP sends per socket. Each slot owns a
     /// pre-allocated `sockaddr_storage` + `iovec` + `msghdr` triple used to
     /// submit a `sendmsg` SQE; the slot is returned to the freelist on CQE.
@@ -456,6 +461,7 @@ impl Default for Config {
             timer_slots: 256,
             udp_bind: Vec::new(),
             udp_connect_peers: Vec::new(),
+            udp_reserved: std::sync::Arc::from(Vec::new()),
             udp_send_slots: 64,
             udp_recv_queue_capacity: 1024,
             udp_gro: false,
@@ -472,6 +478,16 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Take the socket `launch` reserved for UDP bind `index`, if there is
+    /// one and no worker has taken it yet.
+    pub(crate) fn take_udp_reserved(&self, index: usize) -> Option<std::os::fd::OwnedFd> {
+        self.udp_reserved
+            .get(index)?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
     /// The zero-copy guard send threshold in bytes. See
     /// [`ConfigBuilder::send_zc_threshold`].
     pub fn send_zc_threshold(&self) -> u32 {

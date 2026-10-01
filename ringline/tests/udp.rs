@@ -135,8 +135,8 @@ fn udp_basic_round_trip() {
 }
 
 /// A port-0 UDP bind reports a nonzero port, and each worker binds its own
-/// `SO_REUSEPORT` socket to that port. The reserving socket is closed by the
-/// time `launch` returns, so on Linux the IPv4 UDP table lists exactly one
+/// `SO_REUSEPORT` socket to that port. One worker's socket is the one `launch`
+/// reserved the port with, so on Linux the IPv4 UDP table lists exactly one
 /// socket per worker on the port.
 #[test]
 fn udp_port_zero_resolves_once_for_every_worker() {
@@ -208,17 +208,18 @@ fn udp_port_zero_resolves_once_for_every_worker() {
     }
 }
 
-const CLIENT_WORKERS: usize = 3;
+const CLIENT_MAX_WORKERS: usize = 3;
 const CLIENT_REQUESTS: usize = 10;
-static CLIENT_SERVER: OnceLock<SocketAddr> = OnceLock::new();
-static CLIENT_REPLIES: [AtomicUsize; CLIENT_WORKERS] = [
+static CLIENT_SERVER: Mutex<Option<SocketAddr>> = Mutex::new(None);
+static CLIENT_REPLIES: [AtomicUsize; CLIENT_MAX_WORKERS] = [
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
 ];
 
 /// Sends `CLIENT_REQUESTS` datagrams to `CLIENT_SERVER` from its UDP socket
-/// and counts the replies it receives, per worker.
+/// as soon as the socket is up, and counts the replies it receives, per
+/// worker.
 struct UdpClient {
     worker: usize,
 }
@@ -233,7 +234,10 @@ impl AsyncEventHandler for UdpClient {
     fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let worker = self.worker;
         Some(Box::pin(async move {
-            let server = *CLIENT_SERVER.get().expect("server address");
+            let server = CLIENT_SERVER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("server address");
             for _ in 0..CLIENT_REQUESTS {
                 let _ = udp.send_to(server, b"q");
                 ringline::sleep(Duration::from_millis(2)).await;
@@ -246,22 +250,21 @@ impl AsyncEventHandler for UdpClient {
     }
 }
 
-/// A connected zero-port bind on more than one worker gives each worker its
-/// own port, so each worker receives the replies to what it sent, and
-/// `bound_udp_addrs` has no single address to report.
-///
-/// Sharing one port here would deliver every reply to a single worker's
-/// socket.
-#[test]
-fn udp_connected_port_zero_keeps_a_port_per_worker() {
-    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// Launch `workers` [`UdpClient`]s against a std echo server, with the UDP
+/// bind `bind` adds, and return what `bound_udp_addrs` reports and the
+/// replies each worker received. Waits up to 5 s for every worker to receive
+/// `CLIENT_REQUESTS` replies. The caller holds `UDP_SLOT_LOCK`.
+fn run_udp_client(
+    workers: usize,
+    bind: impl FnOnce(RinglineBuilder, SocketAddr) -> RinglineBuilder,
+) -> (Vec<Option<SocketAddr>>, Vec<usize>) {
     for r in &CLIENT_REPLIES {
         r.store(0, Ordering::SeqCst);
     }
 
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     let server_addr = server.local_addr().unwrap();
-    CLIENT_SERVER.set(server_addr).expect("set once");
+    *CLIENT_SERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(server_addr);
     server
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -272,41 +275,80 @@ fn udp_connected_port_zero_keeps_a_port_per_worker() {
         }
     });
 
-    let (runtime, handles) = RinglineBuilder::new(
+    let builder = RinglineBuilder::new(
         base_config_builder()
-            .workers(CLIENT_WORKERS)
+            .workers(workers)
             .build()
             .expect("valid config"),
-    )
-    .bind_udp_connected("127.0.0.1:0".parse().unwrap(), server_addr)
-    .launch::<UdpClient>()
-    .expect("launch");
-
-    assert_eq!(runtime.bound_udp_addrs(), vec![None]);
-    assert_eq!(runtime.bound_udp_addr(), None);
+    );
+    let (runtime, handles) = bind(builder, server_addr)
+        .launch::<UdpClient>()
+        .expect("launch");
+    let bound = runtime.bound_udp_addrs();
 
     let replies = || -> Vec<usize> {
-        CLIENT_REPLIES
+        CLIENT_REPLIES[..workers]
             .iter()
             .map(|r| r.load(Ordering::SeqCst))
             .collect()
     };
     for _ in 0..500 {
-        if replies() == vec![CLIENT_REQUESTS; CLIENT_WORKERS] {
+        if replies() == vec![CLIENT_REQUESTS; workers] {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(
-        replies(),
-        vec![CLIENT_REQUESTS; CLIENT_WORKERS],
-        "each worker must receive exactly the replies to its own requests"
-    );
+    let got = replies();
 
     runtime.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();
     }
+    (bound, got)
+}
+
+/// A connected zero-port bind on more than one worker gives each worker its
+/// own port, so each worker receives the replies to what it sent, and
+/// `bound_udp_addrs` has no single address to report.
+///
+/// Sharing one port here would deliver every reply to a single worker's
+/// socket.
+#[test]
+fn udp_connected_port_zero_keeps_a_port_per_worker() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (bound, replies) = run_udp_client(CLIENT_MAX_WORKERS, |b, server| {
+        b.bind_udp_connected("127.0.0.1:0".parse().unwrap(), server)
+    });
+    assert_eq!(bound, vec![None]);
+    assert_eq!(
+        replies,
+        vec![CLIENT_REQUESTS; CLIENT_MAX_WORKERS],
+        "each worker must receive exactly the replies to its own requests"
+    );
+}
+
+/// A connected zero-port bind reports `None` on one worker too, so what it
+/// reports does not depend on the worker count.
+#[test]
+fn udp_connected_port_zero_reports_none_on_one_worker() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (bound, replies) = run_udp_client(1, |b, server| {
+        b.bind_udp_connected("127.0.0.1:0".parse().unwrap(), server)
+    });
+    assert_eq!(bound, vec![None]);
+    assert_eq!(replies, vec![CLIENT_REQUESTS]);
+}
+
+/// A one-worker client on an unconnected port-0 bind that sends as soon as
+/// its socket is up receives every reply. The socket `launch` reserves the
+/// port with is the worker's own socket, so no reply can land on a socket
+/// that nothing reads.
+#[test]
+fn udp_port_zero_client_receives_every_reply() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (bound, replies) = run_udp_client(1, |b, _| b.bind_udp("127.0.0.1:0".parse().unwrap()));
+    assert!(bound[0].is_some_and(|a| a.port() != 0), "{bound:?}");
+    assert_eq!(replies, vec![CLIENT_REQUESTS]);
 }
 
 #[test]

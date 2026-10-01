@@ -12,8 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `Runtime::bound_udp_addr` / `bound_udp_addrs` report the address each UDP
   bind is bound to, with a zero port resolved, as `bound_addr` /
   `bound_addrs` already do for TCP listeners. `bound_udp_addrs` returns
-  `Vec<Option<SocketAddr>>`: a connected zero-port bind on more than one
-  worker has no single address and reports `None`.
+  `Vec<Option<SocketAddr>>`: a connected zero-port bind gives each worker its
+  own port and reports `None`.
 
 - `RinglineBuilder::defer_listen` binds a listener without listening on it, and
   `begin_listening` / `begin_listening_all` start it from code on a worker;
@@ -225,8 +225,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A port-0 unconnected UDP bind (`bind_udp("…:0")`) with more than one
   worker bound each worker's socket to a different ephemeral port, so the
   bind had no single address. `launch` now resolves the port once and every
-  worker binds it. Connected binds (`bind_udp_connected`) with a zero port
-  keep one port per worker.
+  worker binds it. The socket `launch` binds to choose the port becomes one
+  worker's socket, so no datagram can arrive on a socket nothing reads.
+  Connected binds (`bind_udp_connected`) with a zero port keep one port per
+  worker.
 
 - `ConnCtx::close` (and `Connection::close` / `SendHalf::close`, which call
   it) on a stale handle, one whose slot had been reused by a new connection,

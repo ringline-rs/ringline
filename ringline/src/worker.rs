@@ -186,8 +186,7 @@ pub struct Runtime {
     listen_gates: Arc<crate::listen_gate::ListenGates>,
     /// The address of each UDP bind, in `Config::udp_bind` order: `Some` with a
     /// zero port replaced by the port the kernel chose, `None` for a connected
-    /// zero-port bind on more than one worker, whose workers each have their
-    /// own port.
+    /// zero-port bind, whose workers each have their own port.
     udp_addrs: Vec<Option<SocketAddr>>,
 }
 
@@ -237,9 +236,9 @@ impl Runtime {
     /// `RinglineBuilder::bind_udp` / `bind_udp_connected`, each in call order.
     ///
     /// A zero port reports the port the kernel chose, which every worker's
-    /// socket for that bind shares. A connected zero-port bind on more than
-    /// one worker reports `None`. Each worker's socket has its own port and
-    /// receives the replies to what it sent.
+    /// socket for that bind shares. A connected zero-port bind reports
+    /// `None`. Each worker's socket has its own port and receives the replies
+    /// to what it sent.
     ///
     /// [`UdpCtx::index`]: crate::UdpCtx::index
     pub fn bound_udp_addrs(&self) -> Vec<Option<SocketAddr>> {
@@ -823,10 +822,9 @@ impl RinglineBuilder {
     /// opcodes instead of `RecvMsgUdp`/`SendMsgUdp`. Saves ~4 microseconds
     /// per round trip on single-shot client workloads.
     ///
-    /// With a zero local port and more than one worker, each worker's socket
-    /// gets its own port and receives the replies to what it sent.
-    /// [`Runtime::bound_udp_addrs`] reports `None` for this bind. On one
-    /// worker the port is resolved and reported.
+    /// With a zero local port, each worker's socket gets its own port and
+    /// receives the replies to what it sent. [`Runtime::bound_udp_addrs`]
+    /// reports `None` for this bind.
     pub fn bind_udp_connected(mut self, local: SocketAddr, peer: SocketAddr) -> Self {
         self.config.udp_bind.push(local);
         self.config.udp_connect_peers.push(Some(peer));
@@ -1009,16 +1007,18 @@ impl RinglineBuilder {
             self.config.worker.threads
         };
 
-        // Each worker binds its own SO_REUSEPORT socket per UDP address, so an
-        // unresolved zero port gives each worker its own ephemeral port. Resolve it
-        // here for every bind that should share one port. The reserving
-        // sockets stay bound until `launch` returns, after every worker has
-        // bound the port.
-        let (_udp_reservations, udp_addrs) = resolve_zero_port_udp_binds(
-            &mut self.config.udp_bind,
-            &self.config.udp_connect_peers,
-            num_threads,
-        )?;
+        // Each worker binds its own socket per UDP address, so an unresolved
+        // zero port gives each worker its own ephemeral port. Resolve it here
+        // for every bind that should share one port. The first worker to set
+        // up the bind takes the reserving socket as its own, so every socket
+        // on the port is read by a worker.
+        let (udp_reserved, udp_addrs) =
+            resolve_zero_port_udp_binds(&mut self.config.udp_bind, &self.config.udp_connect_peers)?;
+        self.config.udp_reserved = udp_reserved
+            .into_iter()
+            .map(std::sync::Mutex::new)
+            .collect::<Vec<_>>()
+            .into();
 
         ensure_nofile_limit(self.config.max_connections, num_threads)?;
         #[cfg(has_io_uring)]
@@ -1813,31 +1813,35 @@ fn bind_reuseport_socket(addr: SocketAddr) -> Result<RawFd, crate::error::Error>
     Ok(fd)
 }
 
+/// The sockets `launch` binds for zero-port UDP binds, parallel to
+/// `Config::udp_bind`.
+type ReservedUdpSockets = Vec<Option<std::os::fd::OwnedFd>>;
+
 /// Resolve the zero ports in `udp_bind` that every worker should share, and
-/// return the sockets reserving them with each bind's reported address.
+/// return the sockets reserving them, parallel to `udp_bind`, with each
+/// bind's reported address.
 ///
-/// A zero port is resolved, and the chosen port written back into the
-/// address, for an unconnected bind and for any bind on a single worker. A
-/// connected zero-port bind on more than one worker is left at port 0, so
-/// each worker's socket gets its own port, and reports `None`. The returned
-/// sockets keep their ports bound until they are dropped.
+/// A zero port on an unconnected bind is resolved, and the chosen port
+/// written back into the address. A connected zero-port bind is left at
+/// port 0, so each worker's socket gets its own port, and reports `None`.
 fn resolve_zero_port_udp_binds(
     udp_bind: &mut [SocketAddr],
     connect_peers: &[Option<SocketAddr>],
-    workers: usize,
-) -> Result<(Vec<std::os::fd::OwnedFd>, Vec<Option<SocketAddr>>), crate::error::Error> {
-    let mut held = Vec::new();
+) -> Result<(ReservedUdpSockets, Vec<Option<SocketAddr>>), crate::error::Error> {
+    let mut held = Vec::with_capacity(udp_bind.len());
     let mut reported = Vec::with_capacity(udp_bind.len());
     for (i, addr) in udp_bind.iter_mut().enumerate() {
         let connected = connect_peers.get(i).is_some_and(Option::is_some);
         if addr.port() != 0 {
+            held.push(None);
             reported.push(Some(*addr));
-        } else if connected && workers > 1 {
+        } else if connected {
+            held.push(None);
             reported.push(None);
         } else {
             let (fd, resolved) = reserve_udp_port(*addr).map_err(crate::error::Error::Io)?;
             *addr = resolved;
-            held.push(fd);
+            held.push(Some(fd));
             reported.push(Some(resolved));
         }
     }
@@ -1845,7 +1849,8 @@ fn resolve_zero_port_udp_binds(
 }
 
 /// A UDP socket bound to an unused port at `addr`, with `SO_REUSEPORT` set so
-/// the workers' sockets can join it, and the address it bound.
+/// the other workers' sockets can join it, and the address it bound. One
+/// worker takes it as its own socket for the bind.
 ///
 /// `SO_REUSEPORT` is set after the bind. Set before it, Linux's search for a
 /// free port can return a port another `SO_REUSEPORT` socket of the same user
