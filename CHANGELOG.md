@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: `ConnCtx::forward_recv_buf` took the slot's pending recv buffer
+  before checking the handle's generation, so a stale handle (its
+  connection closed and the slot reused), called with the new connection's
+  bytes, sent the new connection's pending recv buffer to it. It now
+  returns `NotConnected` first, as the copy path's send does. Once the
+  connection's Close is submitted, the zero-copy branch is skipped, so the
+  copy path's refusal applies and the pending buffer stays in place.
+  Backport of #570 (#544).
+
 - io_uring and mio: `ConnCtx::close` on a stale handle, one whose slot had
   been reused by a new connection, closed that new connection. It now does
   nothing on a stale handle. The same check now guards `set_recv_sink` (a

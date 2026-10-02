@@ -1287,13 +1287,32 @@ impl ConnCtx {
     ///
     /// Only works for plaintext connections; TLS connections always copy.
     /// On the mio backend, this always uses the copy path.
+    ///
+    /// # Errors
+    ///
+    /// `NotConnected` if this handle is stale: its connection closed and the
+    /// slot now holds another. Otherwise the errors of
+    /// [`send_nowait`](Self::send_nowait). Nothing is sent on `Err`.
     pub fn forward_recv_buf(&self, data: &[u8]) -> io::Result<()> {
         with_state(|driver, _| {
             #[cfg_attr(not(has_io_uring), allow(unused_variables))]
             let conn_index = self.conn_index;
 
+            // Before the zero-copy branch: it takes the slot's pending recv
+            // buffer, which belongs to whichever connection holds the slot
+            // now. The same refusal as the copy path's `send` (#544).
+            if driver.connections.generation(conn_index) != self.generation {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "stale connection",
+                ));
+            }
+
+            // Once the Close is submitted, the copy path's `send` refuses
+            // without committing anything; the zero-copy branch would queue a
+            // send that is never driven.
             #[cfg(has_io_uring)]
-            {
+            if !driver.send_queues[conn_index as usize].close_submitted {
                 // Check for pending recv buffer.
                 if let Some(pending) = driver.pending_recv_bufs[conn_index as usize].take() {
                     // Verify the data pointer matches the pending buffer (sanity check).

@@ -7965,6 +7965,98 @@ mod tests {
         );
     }
 
+    /// Point the slot's pending recv buffer at `bytes`.
+    fn set_pending_recv_buf(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32, bytes: &[u8]) {
+        el.driver.pending_recv_bufs[conn_index as usize] =
+            Some(crate::backend::uring::driver::PendingRecvBuf {
+                bid: 0,
+                len: bytes.len() as u32,
+                ptr: bytes.as_ptr(),
+            });
+    }
+
+    /// Whether anything is queued or in flight on the connection's send queue.
+    fn send_queued(el: &AsyncEventLoop<NoopHandler>, conn_index: u32) -> bool {
+        let q = &el.driver.send_queues[conn_index as usize];
+        q.in_flight || !q.queue.is_empty()
+    }
+
+    /// A stale handle's `forward_recv_buf` must not send the slot's new
+    /// occupant's pending recv buffer (#544).
+    #[test]
+    fn forward_recv_buf_refuses_a_stale_handle_on_the_pending_buffer() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
+        let bytes = [7u8; 32];
+        set_pending_recv_buf(&mut el, conn_index, &bytes);
+
+        let err = with_driver_state(&mut el, || stale.forward_recv_buf(&bytes))
+            .expect_err("a stale handle must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
+            "a stale handle took the new occupant's pending recv buffer"
+        );
+        assert!(
+            !send_queued(&el, conn_index),
+            "a stale handle queued a send on the new occupant"
+        );
+        el.driver.pending_recv_bufs[conn_index as usize] = None;
+    }
+
+    /// A handle made stale by real teardown and the slot's re-accept must not
+    /// send the new occupant's pending recv buffer (#544).
+    #[test]
+    fn forward_recv_buf_refuses_a_handle_made_stale_by_teardown() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let old = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+
+        el.driver.close_connection(conn_index);
+        let ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        let new_index = accept_connection(&mut el);
+        assert_eq!(new_index, conn_index, "the test needs the slot reused");
+        // A real accept resets the slot's send state; this helper does not,
+        // and the previous occupant's committed Close would otherwise refuse
+        // the forward before the generation check is reached.
+        el.driver.reset_send_state(conn_index);
+
+        let bytes = [9u8; 32];
+        set_pending_recv_buf(&mut el, conn_index, &bytes);
+        let err = with_driver_state(&mut el, || old.forward_recv_buf(&bytes))
+            .expect_err("a stale handle must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
+            "the stale handle took the new occupant's pending recv buffer"
+        );
+        assert!(!send_queued(&el, conn_index));
+        el.driver.pending_recv_bufs[conn_index as usize] = None;
+    }
+
+    /// Once the connection's Close is submitted, `forward_recv_buf` on the
+    /// current handle is refused and leaves the pending recv buffer in place.
+    #[test]
+    fn forward_recv_buf_on_a_closing_connection_commits_nothing() {
+        let mut el = make_test_loop_with_config(config_with_reserve(16));
+        let conn_index = accept_connection(&mut el);
+        let current = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        el.driver.send_queues[conn_index as usize].close_submitted = true;
+
+        let bytes = [7u8; 32];
+        set_pending_recv_buf(&mut el, conn_index, &bytes);
+        assert!(with_driver_state(&mut el, || current.forward_recv_buf(&bytes)).is_err());
+        assert!(
+            el.driver.pending_recv_bufs[conn_index as usize].is_some(),
+            "a refused forward took the pending recv buffer"
+        );
+        el.driver.pending_recv_bufs[conn_index as usize] = None;
+        el.driver.send_queues[conn_index as usize].close_submitted = false;
+    }
+
     /// A handle made stale by real teardown (close, the Close CQE, release)
     /// and the slot's re-accept must not close the new occupant or take its
     /// recv sink. Teardown clears the old occupant's sink before the slot is
