@@ -11,7 +11,26 @@ use crate::buffer::fixed::FixedBufferRegistry;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
 use crate::error::{Error, MemlockLimit, describe_buffer_registration_failure, errno_name};
+use crate::memlock::KernelVersion;
 use crate::nvme::{NVME_URING_CMD_IO, NvmeUringCmd};
+
+/// The first kernel that releases a socket removed from the fixed-file table
+/// once that socket's own requests have completed. Earlier kernels release
+/// removed files in order, so any earlier request on a registered file or
+/// buffer, on any connection, holds the socket open (#581).
+const FIXED_FILES_RELEASED_PER_FILE_SINCE: KernelVersion = KernelVersion {
+    major: 6,
+    minor: 13,
+};
+
+/// Whether a connection's `Close` needs a `shutdown` linked ahead of it to
+/// send the FIN promptly: before Linux 6.13, or on a kernel whose version is
+/// unknown. From 6.13 the `Close` sends the FIN once the connection's own
+/// recv is cancelled, and skipping the shutdown keeps closes off the io-wq
+/// pool that blocking file I/O also uses (#586).
+pub(crate) fn close_needs_shutdown(kernel: Option<KernelVersion>) -> bool {
+    kernel.is_none_or(|k| k < FIXED_FILES_RELEASED_PER_FILE_SINCE)
+}
 
 /// Wrapper around IoUring providing high-level SQE submission helpers.
 ///
@@ -42,6 +61,9 @@ pub struct Ring {
     /// This opcode is the only way to get one back, so it decides whether
     /// park is available at all. See [`Ring::supports_park`].
     fixed_fd_install: bool,
+    /// Whether a connection's `Close` needs a `shutdown` linked ahead of it
+    /// to send the FIN promptly. See [`close_needs_shutdown`].
+    close_needs_shutdown: bool,
     /// Test-only: number of upcoming `push_sqe`/`push_sqe128` calls that
     /// fail as if the SQ were still full after a submit. See
     /// [`Ring::force_push_failures`].
@@ -124,6 +146,7 @@ impl Ring {
             chain_scratch: Vec::new(),
             defer_taskrun: !config.sqpoll,
             fixed_fd_install,
+            close_needs_shutdown: close_needs_shutdown(KernelVersion::current()),
             #[cfg(test)]
             forced_push_failures: 0,
         })
@@ -143,6 +166,12 @@ impl Ring {
     #[allow(dead_code)] // first caller lands with the handover (#443 step 5c)
     pub(crate) fn supports_park(&self) -> bool {
         self.fixed_fd_install
+    }
+
+    /// Whether a connection's `Close` needs a `shutdown` linked ahead of it on
+    /// the running kernel. See [`close_needs_shutdown`].
+    pub(crate) fn close_needs_shutdown(&self) -> bool {
+        self.close_needs_shutdown
     }
 
     /// Re-probe an arbitrary opcode. Exists so tests can establish that the
@@ -677,7 +706,9 @@ impl Ring {
         // Before Linux 6.13, a socket removed from the fixed-file table stays
         // open until earlier requests that use a registered file or buffer
         // complete. Those include other connections' requests, such as a
-        // multishot recv. `shutdown` queues a FIN behind any unsent data,
+        // multishot recv. The caller asks for the shutdown only on such a
+        // kernel (`close_needs_shutdown`). `shutdown` queues a FIN behind any
+        // unsent data,
         // whether or not the socket has been released. Hard-linked, so the
         // Close runs after the shutdown even when the shutdown fails.
         // `push_sqe_pair` pushes both together, so a submit cannot separate
@@ -1508,6 +1539,28 @@ mod tests {
     fn a_cap_above_the_kernel_limit_leaves_it() {
         let ring = ring_with(Some(100_000));
         assert_eq!(ring.iowq_max_workers().expect("query")[0], kernel_default());
+    }
+
+    /// The shutdown goes ahead of a close before 6.13 and on an unknown
+    /// kernel, and not from 6.13 (#586).
+    #[test]
+    fn a_close_needs_a_shutdown_before_6_13() {
+        let k = |major, minor| Some(KernelVersion { major, minor });
+        assert!(close_needs_shutdown(k(6, 1)));
+        assert!(close_needs_shutdown(k(6, 12)));
+        assert!(!close_needs_shutdown(k(6, 13)));
+        assert!(!close_needs_shutdown(k(7, 1)));
+        assert!(close_needs_shutdown(None));
+    }
+
+    /// The ring decides from the running kernel.
+    #[test]
+    fn the_ring_decides_the_shutdown_from_the_running_kernel() {
+        let ring = ring_with(None);
+        assert_eq!(
+            ring.close_needs_shutdown(),
+            close_needs_shutdown(KernelVersion::current())
+        );
     }
 
     /// A cap of 0 registers nothing.

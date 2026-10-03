@@ -269,6 +269,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- On Linux 6.13 and later, an io_uring connection close no longer sends a
+  `shutdown` ahead of its `Close`. From 6.13 the kernel releases a socket
+  removed from the fixed-file table once that socket's own requests
+  complete, so the `Close` sends the FIN by itself. Skipping the shutdown
+  keeps closes out of the bounded io-wq pool, where they waited behind
+  blocking file I/O such as `fs::fsync`. Older kernels, and kernels whose
+  version cannot be read, still send it (#586).
+
 - A `spawn_blocking` handle or `resolve` future dropped before its result
   arrived left its pending entry in the worker until the worker exited, and
   a closure's result delivered into that entry was held until then too.

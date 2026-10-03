@@ -2166,12 +2166,15 @@ impl Driver {
     }
 
     /// Whether closing this connection's slot shuts its socket down first:
+    /// on a kernel that needs it (before Linux 6.13, see
+    /// [`close_needs_shutdown`](super::ring::close_needs_shutdown)), for
     /// every close except one whose socket was handed to another worker.
     pub(crate) fn close_shuts_down(&self, conn_index: u32) -> bool {
-        !self
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| c.socket_handed_off)
+        self.ring.close_needs_shutdown()
+            && !self
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.socket_handed_off)
     }
 
     /// Submit the deferred `Close` SQE once every pending send, forward

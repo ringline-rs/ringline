@@ -941,11 +941,11 @@ impl ConfigBuilder {
     /// is left as it is.
     ///
     /// The kernel runs work it cannot complete inline on io-wq threads. In
-    /// the bounded pool that is the `shutdown` sent ahead of every
-    /// connection close (#581), and regular-file I/O that would block, such
-    /// as `fs::fsync`. Past the cap, work waits for a free thread. A cap at
+    /// the bounded pool that is regular-file I/O that would block, such as
+    /// `fs::fsync`, and, before Linux 6.13, the `shutdown` sent ahead of
+    /// every connection close (#581). Past the cap, work waits for a free thread. A cap at
     /// or below a worker's concurrent blocking file I/O therefore delays its
-    /// connection closes: with 32 `fsync` loops on one worker, a cap of 16
+    /// connection closes on those kernels: with 32 `fsync` loops on one worker, a cap of 16
     /// raised the median wait for a closed connection's EOF from 0.2 ms to
     /// 12 ms (#584). io_uring backend only; the mio backend ignores it.
     pub fn iowq_max_workers(mut self, n: u32) -> Self {
