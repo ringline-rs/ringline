@@ -1083,7 +1083,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let alive = self.driver.connections.get(conn_index).is_some_and(|c| {
                 matches!(c.lifecycle, Lifecycle::Open) && matches!(c.recv_arm, RecvArm::Multi)
             });
-            if !alive {
+            // `abandon_park_drain` and `handle_park_install` re-arm a
+            // connection whose park ends on this worker.
+            if !alive || self.driver.park_pending(conn_index) {
                 self.driver.recv_starved.swap_remove(i);
                 continue;
             }
@@ -1914,8 +1916,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
+        // A receive that ends with data (`F_MORE` clear, for example on a
+        // full completion queue) is re-armed here, or by
+        // `rearm_throttled_recvs` once a throttled connection drains below
+        // its cap. Neither runs while a park of the connection is pending.
         if !has_more
             && !self.driver.forward_hold_throttled[conn_index as usize]
+            && !self.driver.park_pending(conn_index)
             && let Some(conn) = self.driver.connections.get(conn_index)
             && matches!(conn.lifecycle, Lifecycle::Open)
             && matches!(conn.recv_arm, RecvArm::Multi)
@@ -2276,8 +2283,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             // Still parkable *and* offered again: the handler is back at a
             // quiescent point with fresh state deposited, which is exactly the
-            // condition the install needs.
-            if self.driver.park_blocker(conn_index).is_none() {
+            // condition the install needs. The install goes out only with no
+            // receive armed, so it also waits for this park's cancel to end
+            // the receive.
+            let armed = self
+                .driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_multishot_armed);
+            if !armed && self.driver.park_blocker(conn_index).is_none() {
                 if self
                     .driver
                     .ring
@@ -2512,12 +2526,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         };
 
-        // A failed install, or an `ECANCELED` from the linked recv-cancel
-        // failing (the recv self-terminated first). Neither is an error —
-        // park is best-effort and policy can try again later.
+        // A failed install. Not an error: park is best-effort and policy can
+        // try again later.
         if result < 0 {
             metrics::PARK_ABANDONED.increment(metrics::park_abandon::INSTALL_FAILED);
-            self.abandon_park_drain(conn_index);
+            // Re-arm the receive, unless the slot now holds another
+            // connection: that connection's own re-arm paths own its receive,
+            // and an arm here could overlap one of them (the starved pass arms
+            // without checking `recv_multishot_armed`).
+            if self.driver.connections.generation(conn_index) == ud.payload() {
+                self.rearm_multishot_if_idle(conn_index);
+            }
             return;
         }
         // SAFETY: a non-negative `FixedFdInstall` result is a fresh fd owned
@@ -2547,7 +2566,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // a matter of inference rather than measurement.
         if let Some(blocker) = self.driver.park_blocker(conn_index) {
             metrics::PARK_ABANDONED.increment(blocker.abandon_metric());
-            self.abandon_park_drain(conn_index);
+            self.rearm_multishot_if_idle(conn_index);
             return; // `fd` drops.
         }
 
@@ -3881,6 +3900,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn maybe_rearm_throttled_forward(&mut self, conn_index: u32) {
         let ci = conn_index as usize;
         if !self.driver.forward_hold_throttled[ci] {
+            return;
+        }
+        // Keep the connection throttled while a park is pending. If the park
+        // ends on this worker, `rearm_throttled_recvs` re-arms it on a later
+        // pass.
+        if self.driver.park_pending(conn_index) {
             return;
         }
         // Wait for the cancelled multishot to terminate before arming a fresh one.
@@ -6358,6 +6383,276 @@ mod tests {
                 .is_some_and(|c| c.recv_multishot_armed),
             "the connection must have a recv armed again"
         );
+    }
+
+    /// A receive that ends with data while a park drains (for example on a
+    /// full completion queue) is not re-armed: the drain installs only with
+    /// no receive armed, and a receive armed here would read bytes on this
+    /// worker after the install moved the socket.
+    #[test]
+    fn an_arm_ending_with_data_during_a_park_drain_is_not_rearmed() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.set_park_drain(
+            conn_index,
+            Some(crate::backend::uring::driver::ParkDrain {
+                target: 1,
+                generation: el.driver.connections.generation(conn_index),
+                ticks_left: PARK_DRAIN_TICKS,
+                started: std::time::Instant::now(),
+            }),
+        );
+        // IORING_CQE_F_BUFFER with bid 0, and no IORING_CQE_F_MORE.
+        let flags = 1u32;
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.test_dispatch_cqe(ud.raw(), 5, flags);
+        assert!(
+            !el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_multishot_armed),
+            "a receive was armed while the park drains"
+        );
+        el.abandon_park_drain(conn_index);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| c.recv_multishot_armed),
+            "abandoning the park must re-arm"
+        );
+    }
+
+    fn park_drain_for(
+        el: &AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+    ) -> crate::backend::uring::driver::ParkDrain {
+        crate::backend::uring::driver::ParkDrain {
+            target: 1,
+            generation: el.driver.connections.generation(conn_index),
+            ticks_left: PARK_DRAIN_TICKS,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn recv_armed(el: &AsyncEventLoop<NoopHandler>, conn_index: u32) -> bool {
+        el.driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.recv_multishot_armed)
+    }
+
+    /// A connection throttled by a receive that ended with data during a park
+    /// drain is not re-armed when its hold drains, and the install goes out
+    /// with no receive armed.
+    #[test]
+    fn a_throttled_rearm_waits_for_a_pending_park() {
+        let mut el = make_test_loop_with_config(config_with_forward_cap(1));
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_forward[conn_index as usize] = true;
+        el.driver
+            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        // IORING_CQE_F_BUFFER with bid 0, and no IORING_CQE_F_MORE.
+        el.test_dispatch_cqe(ud.raw(), 5, 1);
+        assert!(el.driver.forward_hold_throttled[conn_index as usize]);
+        for held in el.driver.recv_hold[conn_index as usize].drain(..) {
+            el.driver.pending_replenish.push(held.bid);
+        }
+        el.rearm_throttled_recvs();
+        assert!(!recv_armed(&el, conn_index), "re-armed during the drain");
+        el.driver.park_offered[conn_index as usize] = true;
+        el.drive_park_drains();
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_some(),
+            "the install did not go out"
+        );
+        el.rearm_throttled_recvs();
+        assert!(
+            !recv_armed(&el, conn_index),
+            "re-armed with the install in flight"
+        );
+    }
+
+    /// An install that fails after the drain gives the connection its
+    /// receive back.
+    #[test]
+    fn a_failed_install_rearms_the_receive() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver
+            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = false;
+        }
+        el.driver.park_offered[conn_index as usize] = true;
+        el.drive_park_drains();
+        assert!(el.driver.park_in_flight[conn_index as usize].is_some());
+        let ud = crate::completion::UserData::encode(
+            crate::completion::OpTag::ParkInstall,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.handle_park_install(ud, -libc::EBADF);
+        assert!(recv_armed(&el, conn_index), "no receive after the failure");
+    }
+
+    /// An arm that ends with `ENOBUFS` during a park drain leaves the
+    /// starved list without a re-arm.
+    #[test]
+    fn a_starved_connection_is_not_rearmed_during_a_park_drain() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver
+            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.test_dispatch_cqe(ud.raw(), -libc::ENOBUFS, 0);
+        assert!(el.driver.recv_starved.contains(&conn_index));
+        el.flush_replenish_and_rearm();
+        assert!(!recv_armed(&el, conn_index), "re-armed during the drain");
+        assert!(!el.driver.recv_starved.contains(&conn_index));
+    }
+
+    /// A park install still in flight for a slot's previous occupant does
+    /// not hold back the new occupant's re-arm, and its stale completion
+    /// leaves the new occupant's receive armed.
+    #[test]
+    fn a_stale_install_does_not_block_the_next_occupants_rearm() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = generation.wrapping_sub(1);
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation: stale,
+            });
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+        // IORING_CQE_F_BUFFER with bid 0, and no IORING_CQE_F_MORE.
+        el.test_dispatch_cqe(ud.raw(), 5, 1);
+        assert!(
+            recv_armed(&el, conn_index),
+            "re-arm held back by a stale park"
+        );
+        let probe = FdProbe::new();
+        el.handle_park_install(park_install_ud(conn_index, stale), probe.installed);
+        assert!(recv_armed(&el, conn_index));
+    }
+
+    /// A failed install for a slot's previous occupant does not arm the new
+    /// occupant's receive: a starved connection is re-armed by the starved
+    /// pass, and a second arm under the same user_data would overlap it.
+    #[test]
+    fn a_stale_failed_install_does_not_rearm_the_next_occupant() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = generation.wrapping_sub(1);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = false;
+        }
+        el.driver.recv_starved.push(conn_index);
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation: stale,
+            });
+        el.handle_park_install(park_install_ud(conn_index, stale), -libc::EBADF);
+        assert!(
+            !recv_armed(&el, conn_index),
+            "armed the new occupant while it is on the starved list"
+        );
+    }
+
+    /// An install that finds the connection no longer parkable closes the
+    /// installed fd and gives the connection its receive back.
+    #[test]
+    fn a_blocked_install_rearms_the_receive() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = false;
+        }
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation,
+            });
+        // Not offered: `park_blocker` refuses.
+        el.driver.park_offered[conn_index as usize] = false;
+        let probe = FdProbe::new();
+        el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
+        assert!(probe.was_closed(), "the installed fd was kept");
+        assert!(
+            recv_armed(&el, conn_index),
+            "no receive after the blocked install"
+        );
+    }
+
+    /// The install waits for the park's own cancel to end the receive.
+    #[test]
+    fn the_install_waits_for_the_receive_to_end() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        // As `begin_park` leaves it: the cancel queued, the receive still
+        // armed until its `ECANCELED` arrives.
+        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
+            cs.recv_multishot_armed = true;
+        }
+        el.driver
+            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
+        el.driver.park_offered[conn_index as usize] = true;
+        el.drive_park_drains();
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_none(),
+            "installed with a receive armed"
+        );
+        let ud = UserData::encode(
+            OpTag::RecvMulti,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+        el.drive_park_drains();
+        assert!(el.driver.park_in_flight[conn_index as usize].is_some());
+    }
+
+    /// A forward that ends during a park drain does not re-arm the receive;
+    /// the failed install does.
+    #[test]
+    fn a_forward_end_waits_for_a_pending_park() {
+        let mut el = make_test_loop_with_config(config_with_forward_cap(1));
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_forward[conn_index as usize] = true;
+        el.driver
+            .set_park_drain(conn_index, Some(park_drain_for(&el, conn_index)));
+        let generation = el.driver.connections.generation(conn_index);
+        let ud = UserData::encode(OpTag::RecvMulti, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 5, 1);
+        assert!(el.driver.forward_hold_throttled[conn_index as usize]);
+        for held in el.driver.recv_hold[conn_index as usize].drain(..) {
+            el.driver.pending_replenish.push(held.bid);
+        }
+        let _ = el.driver.settle_forward_end(conn_index);
+        assert!(!recv_armed(&el, conn_index), "re-armed during the drain");
+        el.driver.park_offered[conn_index as usize] = true;
+        el.drive_park_drains();
+        assert!(el.driver.park_in_flight[conn_index as usize].is_some());
+        el.handle_park_install(park_install_ud(conn_index, generation), -libc::EBADF);
+        assert!(recv_armed(&el, conn_index), "no receive after the failure");
     }
 
     /// Abandoning when no park is draining is a no-op, so a stray install CQE

@@ -368,6 +368,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a park (connection rebalancing, #443) sends its fd install only
+  while the connection has no receive armed. Four paths could re-arm a
+  receive during the drain: the end-of-completion re-arm after a receive
+  ended with data (on a full completion queue), the throttle and
+  end-of-forward re-arms once a held backlog drained, and the starved pass
+  once buffers returned after an `ENOBUFS` end. The install then went out
+  with the receive live, so this worker could read bytes after the socket
+  moved. An install that fails, or that finds the connection no longer
+  parkable, now re-arms the receive; before, the connection could stay
+  open with none armed.
+
 - On io_uring, one segment reader or `forward_to` source whose consumer
   stops draining what it holds, or with `recv_incremental` one recv-forward
   or direct-echo connection, no longer grows memory without limit or stalls

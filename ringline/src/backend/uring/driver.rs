@@ -1646,6 +1646,7 @@ impl Driver {
             });
             let generation = self.connections.generation(conn_index);
             if open
+                && !self.park_pending(conn_index)
                 && self
                     .ring
                     .submit_multishot_recv(conn_index, generation)
@@ -2029,6 +2030,22 @@ impl Driver {
         if let Some(taken) = self.send_half_taken.get_mut(idx) {
             *taken = false;
         }
+    }
+
+    /// Whether a park of the connection is draining (`park_drain`) or its
+    /// install is in flight (`park_in_flight`, for the connection's current
+    /// generation). While draining, a cancel for its receive has been
+    /// submitted; while the install is in flight, no receive is armed. The
+    /// end-of-completion, throttled, end-of-forward and starved-pass
+    /// re-arms skip it while this holds.
+    pub(crate) fn park_pending(&self, conn_index: u32) -> bool {
+        let ci = conn_index as usize;
+        let generation = self.connections.generation(conn_index);
+        self.park_drain.get(ci).is_some_and(|d| d.is_some())
+            || self
+                .park_in_flight
+                .get(ci)
+                .is_some_and(|p| p.is_some_and(|p| p.generation == generation))
     }
 
     /// Set or clear `conn_index`'s park drain. Every write to `park_drain`
