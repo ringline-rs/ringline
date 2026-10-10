@@ -21,7 +21,7 @@ pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(3);
 pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(6);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
-pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(8);
+pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(9);
 
 #[metric(
     name = "ringline/recv_ring",
@@ -380,6 +380,15 @@ pub mod pool {
     /// adopting. The adoption keeps a live system correct; the count is how
     /// you find out it happened.
     pub const SEGMENT_STRANDED_ADOPTED: usize = 7;
+    /// A zero-copy send (`SendMsgZc`) returned `-ENOMEM`, and the rest of
+    /// that send went out as plain `send`s. On Linux the usual cause is
+    /// that the pages the send would pin do not fit under
+    /// `RLIMIT_MEMLOCK`, which charges them from Linux 6.15; from 6.14 the
+    /// rings are charged to the same limit. A process with `CAP_IPC_LOCK` in
+    /// the initial user namespace is not charged.
+    /// Sustained counts mean zero-copy sends are paying a failed submission
+    /// and a copy: raise the memlock limit, or raise `send_zc_threshold`.
+    pub const SEND_ZC_ENOMEM: usize = 8;
 }
 
 /// Counter slot indices for UDP metrics.
@@ -578,6 +587,7 @@ pub fn init_metadata() {
         "op".into(),
         "segment_stranded_adopted".into(),
     );
+    POOL.insert_metadata(pool::SEND_ZC_ENOMEM, "op".into(), "send_zc_enomem".into());
 
     UDP.insert_metadata(
         udp::DATAGRAMS_RECEIVED,
@@ -640,6 +650,7 @@ mod tests {
             pool::RECV_FALLBACK,
             pool::FORWARD_THROTTLED,
             pool::SEGMENT_STRANDED_ADOPTED,
+            pool::SEND_ZC_ENOMEM,
         ] {
             assert!(POOL.increment(idx), "POOL[{idx}] out of bounds");
         }

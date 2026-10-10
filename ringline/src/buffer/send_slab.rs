@@ -67,6 +67,9 @@ struct InFlightSendEntry {
     /// stream: a send error closes the connection (as `handle_tls_send`
     /// does), where a plaintext run's error only drains the queue.
     close_on_error: bool,
+    /// A `SendMsgZc` of this entry returned `-ENOMEM`: the rest of the entry
+    /// is sent with plain `send`s, which pin no pages.
+    plain_send: bool,
     pending_notifs: u8,
     awaiting_notifications: bool,
     in_use: bool,
@@ -98,6 +101,7 @@ impl InFlightSendSlab {
                 sends: SendRun::EMPTY,
                 sent: 0,
                 close_on_error: false,
+                plain_send: false,
                 pending_notifs: 0,
                 awaiting_notifications: false,
                 in_use: false,
@@ -146,6 +150,7 @@ impl InFlightSendSlab {
         entry.sends.clear();
         entry.sent = 0;
         entry.close_on_error = false;
+        entry.plain_send = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -198,6 +203,7 @@ impl InFlightSendSlab {
         }
         entry.sent = 0;
         entry.close_on_error = close_on_error;
+        entry.plain_send = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -253,6 +259,7 @@ impl InFlightSendSlab {
         entry.sends.clear();
         entry.sent = 0;
         entry.close_on_error = false;
+        entry.plain_send = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -329,6 +336,17 @@ impl InFlightSendSlab {
                     iov.iov_len.min(u32::MAX as usize) as u32,
                 )
             })
+    }
+
+    /// Send the rest of entry `idx` with plain `send`s instead of `SendMsgZc`.
+    pub fn set_plain_send(&mut self, idx: u16) {
+        self.entries[idx as usize].plain_send = true;
+    }
+
+    /// Whether the rest of entry `idx` is sent with plain `send`s
+    /// ([`set_plain_send`](Self::set_plain_send)).
+    pub fn plain_send(&self, idx: u16) -> bool {
+        self.entries[idx as usize].plain_send
     }
 
     /// Get the msghdr pointer for a slab entry (for resubmission retries).
@@ -474,6 +492,42 @@ mod tests {
     use crate::guard::SendGuard;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A recycled entry is sent zero-copy again: every allocate clears the
+    /// `plain_send` an earlier occupant's `-ENOMEM` set.
+    #[test]
+    fn every_allocate_clears_plain_send() {
+        let iov = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 4,
+        }];
+        let mut slab = InFlightSendSlab::new(1);
+        let mark_and_release = |slab: &mut InFlightSendSlab, idx: u16| {
+            slab.set_plain_send(idx);
+            slab.release(idx);
+        };
+
+        let (idx, _) = slab
+            .allocate(0, 0, &iov, u16::MAX, [const { None }; MAX_GUARDS], 0, 4)
+            .unwrap();
+        assert!(!slab.plain_send(idx));
+        mark_and_release(&mut slab, idx);
+
+        let (idx, _) = slab
+            .allocate(0, 0, &iov, u16::MAX, [const { None }; MAX_GUARDS], 0, 4)
+            .unwrap();
+        assert!(!slab.plain_send(idx), "allocate");
+        mark_and_release(&mut slab, idx);
+
+        let (idx, _) = slab
+            .allocate_coalesced(0, 0, &iov, &[0], 4, [], false)
+            .unwrap();
+        assert!(!slab.plain_send(idx), "allocate_coalesced");
+        mark_and_release(&mut slab, idx);
+
+        let (idx, _) = slab.allocate_recv_forward(0, 0, &iov, &[0], 4).unwrap();
+        assert!(!slab.plain_send(idx), "allocate_recv_forward");
+    }
 
     struct TestGuard {
         ptr: *const u8,

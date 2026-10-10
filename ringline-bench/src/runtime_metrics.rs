@@ -98,6 +98,7 @@ pub fn print_summary() {
         "forward_throttled",
         "recv_arm_failures",
         "send_eagain",
+        "send_zc_enomem",
         "send_exhausted",
         "fallback_received",
     ];

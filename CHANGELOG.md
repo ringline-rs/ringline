@@ -368,6 +368,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a zero-copy send (`SendMsgZc`) that returned `-ENOMEM`, because
+  the pages it pins did not fit under `RLIMIT_MEMLOCK`, was dropped together
+  with every send queued behind it, after `send_parts` had returned `Ok`.
+  The connection stayed open, so later bytes arrived with a gap. The send
+  now goes out as plain `send`s from the guard's memory, and the new
+  `ringline/pool` counter `send_zc_enomem` counts each fallback. From Linux
+  6.15 a zero-copy send is charged `len / page_size + 2` pages while in flight,
+  and from 6.14 the rings are charged to the same limit, so at the common
+  8 MiB limit a guard smaller than 8 MiB can reach it. A `send_chain` with a
+  guard part still fails on `-ENOMEM`, as on any send error (#642).
+
 - On io_uring, one segment reader or `forward_to` source whose consumer
   stops draining what it holds, or with `recv_incremental` one recv-forward
   or direct-echo connection, no longer grows memory without limit or stalls

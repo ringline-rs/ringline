@@ -3487,12 +3487,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Submit a plain `send` of the first non-empty unsent iovec of slab entry
-    /// `slab_idx`, tagged `tag`, after its `sendmsg` returned `-EAGAIN`. A
-    /// `send` waits until the socket has room, where a `POLLOUT` poll
-    /// completes at once once the peer has half-closed (#603). The tag's
-    /// handler takes the result as a partial write of the entry.
+    /// `slab_idx`, tagged `tag`, after its `sendmsg` returned `-EAGAIN` or
+    /// its `SendMsgZc` returned `-ENOMEM`, or to continue an entry marked
+    /// `plain_send`. A `send` waits until the socket has room, where a
+    /// `POLLOUT` poll completes at once once the peer has half-closed (#603).
+    /// The tag's handler takes the result as a partial write of the entry.
     fn submit_slab_drain(&mut self, tag: OpTag, conn_index: u32, slab_idx: u16) -> io::Result<()> {
-        // An entry that got `-EAGAIN` has bytes left to send.
+        // An entry drained here has bytes left to send.
         let (ptr, len) = self
             .driver
             .send_slab
@@ -4204,15 +4205,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // `send`, which waits until there is room; its completion
         // (`SendMsgZcDrain`, no notification) comes back here as a partial
         // write and the rest is resubmitted zero-copy (#603).
-        if (result == -libc::EAGAIN || result == -libc::EWOULDBLOCK)
+        //
+        // ENOMEM from a `SendMsgZc` (not from its drain): the pages the send
+        // would pin do not fit under `RLIMIT_MEMLOCK`. Nothing was sent. The
+        // entry's bytes stay valid until it is released, so send them with
+        // plain `send`s, which pin nothing, through the same drain; the rest
+        // of the entry is sent the same way rather than retried zero-copy
+        // (#642).
+        let enomem = result == -libc::ENOMEM && ud.tag() == Some(OpTag::SendMsgZc);
+        if (result == -libc::EAGAIN || result == -libc::EWOULDBLOCK || enomem)
             && !self.close_submitted(conn_index)
         {
-            metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
+            if enomem {
+                metrics::POOL.increment(metrics::pool::SEND_ZC_ENOMEM);
+                self.driver.send_slab.set_plain_send(slab_idx);
+            } else {
+                metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
+            }
             if self
                 .submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
                 .is_err()
             {
-                // SQ full: resubmit the sendmsg next tick, as for a partial.
+                // SQ full: retry next tick (`drain_zc_retries`), as for a partial.
                 let generation = self.driver.connections.generation(conn_index);
                 self.driver
                     .pending_zc_retries
@@ -4239,13 +4253,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     return;
                 }
-                // Partial send — resubmit the remainder.
-                if self
-                    .driver
-                    .ring
-                    .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
-                    .is_ok()
-                {
+                // Partial send — resubmit the remainder, with a plain `send`
+                // if a `SendMsgZc` of this entry got ENOMEM.
+                let resubmitted = if self.driver.send_slab.plain_send(slab_idx) {
+                    self.submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
+                } else {
+                    self.driver
+                        .ring
+                        .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
+                };
+                if resubmitted.is_ok() {
                     return;
                 }
                 // Resubmission failed (SQ full) — queue for retry on the
@@ -5336,12 +5353,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue;
             }
             let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-            if self
-                .driver
-                .ring
-                .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
-                .is_err()
-            {
+            let submitted = if self.driver.send_slab.plain_send(slab_idx) {
+                self.submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
+            } else {
+                self.driver
+                    .ring
+                    .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
+            };
+            if submitted.is_err() {
                 self.driver.pending_zc_retries.push((
                     conn_index,
                     generation,
@@ -14616,6 +14635,115 @@ mod tests {
         assert!(
             !el.driver.send_slab.in_use(0),
             "released after the notification"
+        );
+    }
+
+    /// A zero-copy send that gets `-ENOMEM` (its pages do not fit under
+    /// `RLIMIT_MEMLOCK`) sends the whole entry with plain `send`s, one iovec
+    /// at a time, including a resubmission that waited on a full SQ, and
+    /// keeps the entry until the notification lands (#642).
+    #[test]
+    fn zc_enomem_sends_the_rest_of_the_entry_plain() {
+        const F_MORE: u32 = 2; // IORING_CQE_F_MORE
+        const F_NOTIF: u32 = 8; // IORING_CQE_F_NOTIF
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let data = Box::new([7u8; 300]);
+        let iovecs: Vec<libc::iovec> = (0..3)
+            .map(|i| libc::iovec {
+                iov_base: data[i * 100..].as_ptr() as *mut _,
+                iov_len: 100,
+            })
+            .collect();
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, generation, &iovecs, u16::MAX, guards, 0, 300)
+            .unwrap();
+        assert_eq!(slab_idx, 0);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        let zc = UserData::encode(OpTag::SendMsgZc, conn_index, 0);
+        let drain = UserData::encode(OpTag::SendMsgZcDrain, conn_index, 0);
+        el.test_dispatch_cqe(zc.raw(), -libc::ENOMEM, F_MORE);
+        assert_eagain_drains(&el, OpTag::SendMsgZcDrain, conn_index);
+        assert_eq!(
+            el.driver.send_slab.first_unsent(0),
+            Some((data.as_ptr(), 100))
+        );
+
+        // The first iovec is sent: the second goes out plain too.
+        el.test_dispatch_cqe(drain.raw(), 100, 0);
+        assert_eagain_drains(&el, OpTag::SendMsgZcDrain, conn_index);
+
+        // A short write of the second; its resubmission is a plain send. A
+        // retry parked by a full SQ, injected here, is a plain send as well.
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(drain.raw(), 50, 0);
+        el.driver.ring.last_pushed = None;
+        el.driver
+            .pending_zc_retries
+            .push((conn_index, generation, slab_idx, 0));
+        el.drain_zc_retries();
+        assert_eagain_drains(&el, OpTag::SendMsgZcDrain, conn_index);
+        assert_eq!(
+            el.driver.send_slab.first_unsent(0),
+            Some((data[150..].as_ptr(), 50))
+        );
+
+        el.test_dispatch_cqe(drain.raw(), 50, 0);
+        el.test_dispatch_cqe(drain.raw(), 100, 0);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].in_flight,
+            "the send is complete"
+        );
+        assert!(
+            el.driver.send_slab.in_use(0),
+            "the entry must wait for the ENOMEM's notification"
+        );
+        el.test_dispatch_cqe(zc.raw(), 0, F_NOTIF);
+        assert!(
+            !el.driver.send_slab.in_use(0),
+            "released after the notification"
+        );
+    }
+
+    /// `-ENOMEM` from the plain drain is a send error: only a `SendMsgZc`'s
+    /// `-ENOMEM` means its pages did not fit under `RLIMIT_MEMLOCK`.
+    #[test]
+    fn a_drain_enomem_fails_the_send() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let data = Box::new([7u8; 100]);
+        let iovecs = [libc::iovec {
+            iov_base: data.as_ptr() as *mut _,
+            iov_len: 100,
+        }];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, generation, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+
+        let zc = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(zc.raw(), -libc::ENOMEM, 0);
+        assert_eagain_drains(&el, OpTag::SendMsgZcDrain, conn_index);
+
+        el.driver.ring.last_pushed = None;
+        let drain = UserData::encode(OpTag::SendMsgZcDrain, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(drain.raw(), -libc::ENOMEM, 0);
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "a failed drain is not resubmitted"
+        );
+        assert!(
+            !el.driver.send_slab.in_use(slab_idx),
+            "the entry is released"
         );
     }
 

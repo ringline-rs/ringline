@@ -117,6 +117,21 @@ Plain `Send` paths (single-buffer copy sends, TLS) keep their `POLLOUT`
 fallback (`SendPollOut`): a `send` with `MSG_WAITALL` does not return
 `-EAGAIN` in this state, so the fallback is not reached.
 
+### `-ENOMEM` from a zero-copy send
+
+From Linux 6.15, a `SendMsgZc` from memory that is not a registered buffer
+charges `len / page_size + 2` pages to the user's `RLIMIT_MEMLOCK` while it
+is in flight. From 6.14 the same limit also holds every io_uring ring
+(`ringline/src/memlock.rs`). When the pages do not fit, the operation fails
+with `-ENOMEM` and sends nothing. The handler sends that entry through the
+same drain as `-EAGAIN`, and marks the entry so that the rest of it,
+including a resubmission that waited on a full SQ, also goes out as plain
+`send`s rather than as further `SendMsgZc`s. Each send therefore takes at
+most one `-ENOMEM`, counted by the `ringline/pool` counter `send_zc_enomem`.
+A process with `CAP_IPC_LOCK` in the initial user namespace is not charged
+and does not reach this path. Inside a `send_chain`, `-ENOMEM` fails the
+chain (#642).
+
 ### At worker shutdown
 
 `run_shutdown` closes every connection with the `CancelAll` lead, on every
