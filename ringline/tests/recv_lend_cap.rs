@@ -95,8 +95,9 @@ fn kernel_at_least(major: u32, minor: u32) -> bool {
 }
 
 /// Echo `total` bytes through a 16 × 1 KiB incremental ring, whose lend cap
-/// is 8 buffers, with handler `H`, and check the bytes and that the cap
-/// refused lends (so owned copies carried part of the stream).
+/// is 8 buffers, with handler `H` and unlimited multishot arms, and check
+/// the bytes and that the cap refused lends (so owned copies carried part
+/// of the stream).
 fn echo_over_the_lend_cap<H: AsyncEventHandler>(total: usize) {
     use ringline::metrics::{RECV_RING, recv_ring};
     let refused = || RECV_RING.value(recv_ring::LEND_REFUSED).unwrap_or(0);
@@ -108,6 +109,9 @@ fn echo_over_the_lend_cap<H: AsyncEventHandler>(total: usize) {
         .max_connections(64)
         .send_pool(128, 16384)
         .recv_incremental(true)
+        // A limited arm holds one connection under the lend cap, so the
+        // cap would refuse nothing (`tests/recv_limit.rs`).
+        .recv_multishot_limit(false)
         .recv_buffer(16, 1024)
         .build()
         .expect("config");

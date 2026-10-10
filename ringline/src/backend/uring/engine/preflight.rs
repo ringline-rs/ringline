@@ -1,13 +1,15 @@
-//! Behaviour preflight for incremental provided-buffer rings (#622).
+//! Behaviour preflights for the receive ring: incremental provided-buffer
+//! rings (#622), and multishot receives with a total byte limit.
 //!
 //! The 6.12.y incremental-buffer fixes ran through at least 6.12.81, so no
 //! kernel version marks a kernel that behaves as the receive driver relies
-//! on. Before a worker registers its TCP ring as incremental, it checks
-//! that behaviour on the running kernel with a one-entry ring and an
-//! `AF_UNIX` stream socketpair, which needs no network configuration
-//! (`docs/recv-incremental-ring-design.md`, "Selecting the ring kind"). It
-//! runs on the worker's ring before anything else is armed, since it reaps
-//! every completion the ring holds.
+//! on (`docs/recv-incremental-ring-design.md`, "Selecting the ring kind").
+//! The byte limit first shipped in Linux 6.17. Before a worker registers its
+//! TCP ring as incremental, and again before it arms limited receives, it
+//! checks the behaviour on the running kernel with a one-entry incremental
+//! ring and an `AF_UNIX` stream socketpair, which needs no network
+//! configuration. Each runs on the worker's ring before anything else is
+//! armed, since it reaps every completion the ring holds.
 
 use std::io::Write;
 use std::net::Shutdown;
@@ -33,16 +35,27 @@ const CANCEL_USER_DATA: u64 = u64::MAX - 2;
 /// How long the preflight waits for one completion.
 const WAIT: Duration = Duration::from_secs(1);
 
-/// What the preflight found.
+/// The byte limit the limit preflight arms with.
+const LIMIT: u32 = 24;
+
+/// What a preflight found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IncPreflight {
+pub(crate) enum Preflight {
     /// The kernel behaves as the receive driver relies on.
     Passed,
-    /// The kernel refuses incremental rings.
+    /// The kernel refuses the feature.
     Unsupported,
     /// The step that did not behave as relied on: a
     /// `metrics::recv_preflight` slot.
     Failed(usize),
+}
+
+/// The `metrics::recv_preflight` slots a preflight reports a setup failure,
+/// an I/O error or a timeout in.
+struct Slots {
+    socketpair: usize,
+    io_error: usize,
+    timeout: usize,
 }
 
 /// Check the incremental-ring behaviour the receive driver relies on.
@@ -52,23 +65,61 @@ pub(crate) enum IncPreflight {
 /// preflight could not cancel within 1 s; each fails the worker's startup.
 /// A socketpair or I/O failure is reported as a failed step, which selects
 /// plain rings.
-pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, Error> {
+pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<Preflight, Error> {
     if !engine.incremental_buffers().map_err(|e| {
         Error::BufferRegistration(format!(
             "incremental provided buffer ring probe (bgid {BGID}): {e}"
         ))
     })? {
-        return Ok(IncPreflight::Unsupported);
+        return Ok(Preflight::Unsupported);
     }
+    let slots = Slots {
+        socketpair: step::SOCKETPAIR,
+        io_error: step::IO_ERROR,
+        timeout: step::TIMEOUT,
+    };
+    preflight(engine, "incremental-ring", slots, run)
+}
+
+/// Check that a multishot receive with a total byte limit (`sqe->optlen`)
+/// ends once it has received at least the limit, on an incremental ring.
+/// Run only on a worker whose TCP ring is incremental.
+///
+/// `Unsupported` is the kernel failing the limited arm with `EINVAL`
+/// (before Linux 6.17). `Err` is as for `inc_preflight`.
+pub(crate) fn limit_preflight<E: Engine>(engine: &mut E) -> Result<Preflight, Error> {
+    let slots = Slots {
+        socketpair: step::LIMIT_SOCKETPAIR,
+        io_error: step::LIMIT_IO_ERROR,
+        timeout: step::LIMIT_TIMEOUT,
+    };
+    preflight(engine, "receive-limit", slots, run_limit)
+}
+
+/// Register a one-entry incremental ring, run `body` on a socketpair, then
+/// cancel whatever receive is still armed and unregister the ring.
+fn preflight<E: Engine>(
+    engine: &mut E,
+    name: &str,
+    slots: Slots,
+    body: fn(
+        &mut E,
+        &mut ProvidedBufRing,
+        &mut UnixStream,
+        &UnixStream,
+        &mut Reaped,
+        &mut bool,
+    ) -> std::io::Result<Preflight>,
+) -> Result<Preflight, Error> {
     let Ok((mut client, server)) = UnixStream::pair() else {
-        return Ok(IncPreflight::Failed(step::SOCKETPAIR));
+        return Ok(Preflight::Failed(slots.socketpair));
     };
     let mut ring = ProvidedBufRing::new(BGID, 1, SIZE).map_err(Error::Io)?;
     ring.set_incremental();
     engine.register_buf_ring(&ring, RingKind::Incremental)?;
     let mut armed = false;
     let mut reaped = Reaped::default();
-    let result = match run(
+    let result = match body(
         engine,
         &mut ring,
         &mut client,
@@ -77,10 +128,8 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
         &mut armed,
     ) {
         Ok(found) => Ok(found),
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            Ok(IncPreflight::Failed(step::TIMEOUT))
-        }
-        Err(_) => Ok(IncPreflight::Failed(step::IO_ERROR)),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(Preflight::Failed(slots.timeout)),
+        Err(_) => Ok(Preflight::Failed(slots.io_error)),
     };
     // A completion that ends the arm may already be reaped and unconsumed.
     armed &= reaped.0.iter().all(|&(_, flags)| cqueue::more(flags));
@@ -93,9 +142,9 @@ pub(crate) fn inc_preflight<E: Engine>(engine: &mut E) -> Result<IncPreflight, E
     }
     if !disarmed {
         // Its last completion would otherwise reach the event loop.
-        return Err(Error::RingSetup(
-            "the incremental-ring preflight could not cancel its receive within 1 s".into(),
-        ));
+        return Err(Error::RingSetup(format!(
+            "the {name} preflight could not cancel its receive within 1 s"
+        )));
     }
     result
 }
@@ -127,8 +176,8 @@ fn run<E: Engine>(
     server: &UnixStream,
     reaped: &mut Reaped,
     armed: &mut bool,
-) -> std::io::Result<IncPreflight> {
-    use IncPreflight::Failed;
+) -> std::io::Result<Preflight> {
+    use Preflight::Failed;
     let base = ring.data_ptr(0, 0) as u64;
 
     // Write, reap, write, reap: the completions append at increasing
@@ -197,7 +246,54 @@ fn run<E: Engine>(
         return Ok(Failed(step::EOF));
     }
     ring.release_batch(&[0]);
-    Ok(IncPreflight::Passed)
+    Ok(Preflight::Passed)
+}
+
+/// Arm with a limit of `LIMIT` bytes, then write below it and past it: the
+/// first completion keeps the arm, and the one that reaches the limit ends
+/// it with `F_MORE` clear. That completion may take all of the second write
+/// or stop at the limit.
+fn run_limit<E: Engine>(
+    e: &mut E,
+    ring: &mut ProvidedBufRing,
+    client: &mut UnixStream,
+    server: &UnixStream,
+    reaped: &mut Reaped,
+    armed: &mut bool,
+) -> std::io::Result<Preflight> {
+    use Preflight::Failed;
+    const FIRST: u32 = 10;
+    const SECOND: u32 = 20;
+    const _: () = assert!(FIRST < LIMIT && FIRST + SECOND >= LIMIT && FIRST + SECOND <= SIZE);
+    arm_with(e, server, LIMIT)?;
+    *armed = true;
+    if injected(step::LIMIT_BELOW) {
+        return Ok(Failed(step::LIMIT_BELOW));
+    }
+    client.write_all(&[b'a'; FIRST as usize])?;
+    let first = wait(e, reaped, armed)?;
+    if first.0 == -libc::EINVAL && !cqueue::more(first.1) {
+        return Ok(Preflight::Unsupported);
+    }
+    if !delivered(first, FIRST as i32, true, true) {
+        return Ok(Failed(step::LIMIT_BELOW));
+    }
+    ring.complete(0, FIRST, true);
+    if injected(step::LIMIT_END) {
+        return Ok(Failed(step::LIMIT_END));
+    }
+    client.write_all(&[b'b'; SECOND as usize])?;
+    let (res, flags) = wait(e, reaped, armed)?;
+    let ended = (LIMIT - FIRST..=SECOND).contains(&u32::try_from(res).unwrap_or(0))
+        && cqueue::buffer_select(flags) == Some(0)
+        && cqueue::buf_more(flags)
+        && !cqueue::more(flags);
+    if !ended {
+        return Ok(Failed(step::LIMIT_END));
+    }
+    ring.complete(0, res as u32, true);
+    ring.release_batch(&[0]);
+    Ok(Preflight::Passed)
 }
 
 /// Cancel a live preflight receive and reap its last completion and the
@@ -237,10 +333,16 @@ fn delivered((res, flags): (i32, u32), len: i32, buf_more: bool, more: bool) -> 
 }
 
 fn arm<E: Engine>(e: &mut E, server: &UnixStream) -> std::io::Result<()> {
+    arm_with(e, server, 0)
+}
+
+/// Arm the preflight receive with a total byte limit (0 for none).
+fn arm_with<E: Engine>(e: &mut E, server: &UnixStream, limit: u32) -> std::io::Result<()> {
     let sqe = Sqe::new(
         Op::RecvMulti {
             fd: Fd::Raw(server.as_raw_fd()),
             buf_group: BGID,
+            limit,
         },
         USER_DATA,
     );
@@ -319,7 +421,7 @@ mod tests {
             FAIL_AT.with(|f| f.set(Some(at)));
             let found = inc_preflight(&mut e);
             FAIL_AT.with(|f| f.set(None));
-            assert_eq!(found.expect("preflight"), IncPreflight::Failed(at));
+            assert_eq!(found.expect("preflight"), Preflight::Failed(at));
             e.submit_and_get_events().expect("enter");
             let mut left = Vec::new();
             e.reap(&mut left);
@@ -341,14 +443,73 @@ mod tests {
         let found = inc_preflight(&mut e).expect("preflight");
         eprintln!("preflight: {found:?} in {:?}", start.elapsed());
         let expected = if inc {
-            IncPreflight::Passed
+            Preflight::Passed
         } else {
-            IncPreflight::Unsupported
+            Preflight::Unsupported
         };
         assert_eq!(found, expected);
         e.submit_and_get_events().expect("enter");
         let mut left = Vec::new();
         e.reap(&mut left);
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// Whether the running kernel is 6.17 or later, where multishot
+    /// receives take a total byte limit.
+    fn has_recv_limit() -> bool {
+        use crate::memlock::KernelVersion;
+        KernelVersion::current()
+            >= Some(KernelVersion {
+                major: 6,
+                minor: 17,
+            })
+    }
+
+    /// The limit preflight passes from Linux 6.17, reports `Unsupported`
+    /// before it, and leaves no completion behind.
+    #[test]
+    fn the_limit_preflight_matches_the_kernel() {
+        let mut e = engine();
+        if !e.incremental_buffers().expect("probe") {
+            return;
+        }
+        let found = limit_preflight(&mut e).expect("preflight");
+        let expected = if has_recv_limit() {
+            Preflight::Passed
+        } else {
+            Preflight::Unsupported
+        };
+        assert_eq!(found, expected);
+        e.submit_and_get_events().expect("enter");
+        let mut left = Vec::new();
+        e.reap(&mut left);
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A limit preflight that fails with its receive armed cancels it, as
+    /// `a_failed_step_leaves_nothing_behind` checks for the ring preflight.
+    #[test]
+    fn a_failed_limit_step_leaves_nothing_behind() {
+        if !has_recv_limit() {
+            return;
+        }
+        for at in [step::LIMIT_BELOW, step::LIMIT_END] {
+            let mut e = engine();
+            if !e.incremental_buffers().expect("probe") {
+                return;
+            }
+            FAIL_AT.with(|f| f.set(Some(at)));
+            let found = limit_preflight(&mut e);
+            FAIL_AT.with(|f| f.set(None));
+            assert_eq!(found.expect("preflight"), Preflight::Failed(at));
+            e.submit_and_get_events().expect("enter");
+            let mut left = Vec::new();
+            e.reap(&mut left);
+            assert!(left.is_empty(), "step {at}: {left:?}");
+            let again = ProvidedBufRing::new(BGID, 1, SIZE).expect("ring");
+            e.register_buf_ring(&again, RingKind::Incremental)
+                .unwrap_or_else(|err| panic!("step {at}: group still registered: {err}"));
+            e.unregister_buf_ring(BGID).expect("unregister");
+        }
     }
 }

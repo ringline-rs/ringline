@@ -28,6 +28,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   an owned heap buffer above the cap. With `prefault_buffers(true)` the plain
   geometry makes 256 MiB per worker resident.
 
+- io_uring: on an incremental TCP receive ring, each connection's multishot
+  receive is armed with a total byte limit (`sqe->optlen`, Linux 6.17+):
+  the room left under the connection's hold cap, in buffers, and at most a
+  quarter of the ring. The kernel ends the arm at the limit, at most one
+  buffer over, and the runtime re-arms it while the connection is under
+  its cap. The limit bounds the bytes an arm takes, including those that
+  arrive while a throttle's cancel is in flight. Each worker
+  first checks the behaviour on a one-entry ring and a socketpair, and arms
+  without a limit if the check fails or the ring is plain. A byte limit
+  does not bound the buffers an arm takes on a plain ring, where each
+  completion takes a whole buffer (measured: 32 buffers for a 128-byte
+  limit with 4-byte writes). `ConfigBuilder::recv_multishot_limit(false)`
+  turns it off; default on. `ringline/recv_ring` counts the workers that
+  selected limited arms (`limited`) and the arms the kernel ended with data
+  (`limit_reached`: the limit, or a full completion queue), and
+  `ringline/recv_preflight_failed` the step a failed check stopped at
+  (`limit_*`).
+
 - Three connection counters (`ringline/connections`, `op` label) count three
   ways an accepted connection can be closed before it reaches a handler:
   `accept_table_full` (the worker's connection table was full),
@@ -367,6 +385,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   removed in the next breaking release (#579).
 
 ### Fixed
+
+- io_uring: a park (connection rebalancing, #443) sends its fd install only
+  while the connection has no receive armed. Four paths could re-arm a
+  receive during the drain: the end-of-completion re-arm after an arm
+  ended with data (on a full completion queue, or a limited arm reaching
+  its limit), the throttle and end-of-forward re-arms once a held
+  backlog drained, and the starved pass once buffers returned after an
+  `ENOBUFS` end. The install then went out with the receive live, so this
+  worker could read bytes after the socket moved. An install that fails,
+  or that finds the connection no longer parkable, now re-arms the
+  receive; before, the connection stayed open with none armed.
 
 - On io_uring, one segment reader or `forward_to` source whose consumer
   stops draining what it holds, or with `recv_incremental` one recv-forward

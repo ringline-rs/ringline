@@ -881,6 +881,25 @@ impl Engine for UringEngine {
     }
 }
 
+/// Byte offset of `optlen` in the 64-byte `struct io_uring_sqe`: the union
+/// after `buf_index` (u16 at 40) and `personality` (u16 at 42).
+const SQE_OPTLEN_OFFSET: usize = 44;
+
+/// Set an entry's `optlen`, which `io_uring::opcode::RecvMulti` (io-uring
+/// 0.7) has no builder method for.
+fn set_optlen(e: &mut Entry, optlen: u32) {
+    const _: () = assert!(std::mem::size_of::<Entry>() == 64);
+    // Safety: `Entry` is a `#[repr(C)]` wrapper of the 64-byte
+    // `io_uring_sqe`, and bytes 44..48 are its `optlen` union member.
+    unsafe {
+        (e as *mut Entry)
+            .cast::<u8>()
+            .add(SQE_OPTLEN_OFFSET)
+            .cast::<u32>()
+            .write_unaligned(optlen);
+    }
+}
+
 impl Sqe {
     /// The 128-byte entry the ring's submission queue holds.
     pub(crate) fn encode(&self) -> Entry128 {
@@ -921,9 +940,17 @@ impl Sqe {
             };
         }
         let e = match self.op {
-            Op::RecvMulti { fd, buf_group } => {
-                on!(fd, |t| opcode::RecvMulti::new(t, buf_group).build())
-            }
+            Op::RecvMulti {
+                fd,
+                buf_group,
+                limit,
+            } => on!(fd, |t| {
+                let mut e = opcode::RecvMulti::new(t, buf_group).build();
+                if limit != 0 {
+                    set_optlen(&mut e, limit);
+                }
+                e
+            }),
             Op::RecvMsgMulti { fd, msg, buf_group } => {
                 on!(fd, |t| opcode::RecvMsgMulti::new(t, msg, buf_group).build())
             }
@@ -1077,6 +1104,7 @@ mod encode_tests {
                     Op::RecvMulti {
                         fd: Fd::Fixed(9),
                         buf_group: 3,
+                        limit: 0,
                     },
                     ud,
                 ),
@@ -1348,6 +1376,26 @@ mod encode_tests {
         for (i, (sqe, want)) in cases.iter().enumerate() {
             assert_eq!(bytes(&sqe.encode()), bytes(want), "case {i}: {:?}", sqe.op);
         }
+    }
+
+    /// A limited multishot recv differs from the builder's only in bytes
+    /// 44..48, which hold the limit.
+    #[test]
+    fn a_recv_limit_is_the_sqe_optlen() {
+        let op = |limit| Op::RecvMulti {
+            fd: Fd::Fixed(9),
+            buf_group: 3,
+            limit,
+        };
+        let plain = bytes(&Sqe::new(op(0), 1).encode());
+        let limited = bytes(&Sqe::new(op(0x0102_0304), 1).encode());
+        for (i, (a, b)) in plain.iter().zip(&limited).enumerate() {
+            if !(44..48).contains(&i) {
+                assert_eq!(a, b, "byte {i}");
+            }
+        }
+        assert_eq!(limited[44..48], 0x0102_0304u32.to_ne_bytes());
+        assert_eq!(plain[44..48], [0; 4]);
     }
 
     /// `MAX_FILE_INDEX` is the largest slot the crate's `DestinationSlot`

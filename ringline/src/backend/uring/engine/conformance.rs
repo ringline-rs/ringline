@@ -63,6 +63,7 @@ fn arm(engine: &mut ActiveEngine, server: &TcpStream, group: u16, user_data: u64
         Op::RecvMulti {
             fd: Fd::Raw(server.as_raw_fd()),
             buf_group: group,
+            limit: 0,
         },
         user_data,
     );

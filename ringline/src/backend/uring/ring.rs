@@ -291,12 +291,21 @@ impl Ring {
     ///
     /// Any cancel targeting this request must encode the same payload — a
     /// cancel matches by `user_data`.
-    pub fn submit_multishot_recv(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+    ///
+    /// `limit` is the arm's total byte limit (`Op::RecvMulti`), 0 for none;
+    /// `Driver::recv_arm_limit` chooses it.
+    pub fn submit_multishot_recv(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        limit: u32,
+    ) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::RecvMulti, conn_index, generation);
         let entry = Sqe::new(
             Op::RecvMulti {
                 fd: sqe::Fd::Fixed(conn_index),
                 buf_group: self.bgid,
+                limit,
             },
             user_data.raw(),
         );
@@ -884,6 +893,7 @@ impl Ring {
             Op::RecvMulti {
                 fd: sqe::Fd::Fixed(fd_index),
                 buf_group: bgid,
+                limit: 0,
             },
             user_data.raw(),
         );

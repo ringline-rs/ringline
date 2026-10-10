@@ -31,7 +31,7 @@ pub static RECV_RING: ShardedCounterGroup = ShardedCounterGroup::new(recv_ring::
 
 #[metric(
     name = "ringline/recv_preflight_failed",
-    description = "Incremental-ring preflights that failed, by step"
+    description = "Receive-ring preflights that failed, by step"
 )]
 pub static RECV_PREFLIGHT_FAILED: ShardedCounterGroup =
     ShardedCounterGroup::new(recv_preflight::COUNT);
@@ -291,13 +291,22 @@ pub mod recv_ring {
     /// (`recv_incremental` only). A per-completion event, unlike the
     /// per-worker kind counts.
     pub const LEND_REFUSED: usize = 2;
-    pub const COUNT: usize = 3;
+    /// Workers that arm limited multishot receives
+    /// (`ConfigBuilder::recv_multishot_limit`).
+    pub const LIMITED: usize = 3;
+    /// Multishot receive arms on such a worker that the kernel ended with
+    /// data (a positive result without `F_MORE`): the arm reached its byte
+    /// limit, or the kernel ended it because the completion queue was full.
+    /// A per-completion event.
+    pub const LIMIT_REACHED: usize = 4;
+    pub const COUNT: usize = 5;
 }
 
-/// Slot indices for `RECV_PREFLIGHT_FAILED`: the step of the
-/// incremental-ring preflight that did not behave as the receive path
-/// relies on (`backend/uring/engine/preflight.rs`). A failed preflight
-/// selects a plain ring.
+/// Slot indices for `RECV_PREFLIGHT_FAILED`: the step of a receive-ring
+/// preflight that did not behave as the receive path relies on
+/// (`backend/uring/engine/preflight.rs`). A failed incremental-ring
+/// preflight (slots 0 to 7) selects a plain ring; a failed limit preflight
+/// (slots 8 to 12) selects unlimited multishot arms.
 pub mod recv_preflight {
     /// The socketpair could not be created.
     pub const SOCKETPAIR: usize = 0;
@@ -315,7 +324,18 @@ pub mod recv_preflight {
     pub const REPOST: usize = 6;
     /// The half-close completion or the ring entry it leaves.
     pub const EOF: usize = 7;
-    pub const COUNT: usize = 8;
+    /// Limit preflight: the socketpair could not be created.
+    pub const LIMIT_SOCKETPAIR: usize = 8;
+    /// Limit preflight: a write, read or ring operation failed.
+    pub const LIMIT_IO_ERROR: usize = 9;
+    /// Limit preflight: a step's completion did not arrive within 1 s.
+    pub const LIMIT_TIMEOUT: usize = 10;
+    /// Limit preflight: the completion below the limit.
+    pub const LIMIT_BELOW: usize = 11;
+    /// Limit preflight: the completion that reaches the limit, which must
+    /// end the arm.
+    pub const LIMIT_END: usize = 12;
+    pub const COUNT: usize = 13;
 }
 
 /// Slot indices for per-`OpTag` completion counters: the slot *is* the
@@ -401,6 +421,12 @@ pub fn init_metadata() {
     RECV_RING.insert_metadata(recv_ring::INCREMENTAL, "op".into(), "incremental".into());
     RECV_RING.insert_metadata(recv_ring::PLAIN, "op".into(), "plain".into());
     RECV_RING.insert_metadata(recv_ring::LEND_REFUSED, "op".into(), "lend_refused".into());
+    RECV_RING.insert_metadata(recv_ring::LIMITED, "op".into(), "limited".into());
+    RECV_RING.insert_metadata(
+        recv_ring::LIMIT_REACHED,
+        "op".into(),
+        "limit_reached".into(),
+    );
     for (step, name) in [
         (recv_preflight::SOCKETPAIR, "socketpair"),
         (recv_preflight::IO_ERROR, "io_error"),
@@ -410,6 +436,11 @@ pub fn init_metadata() {
         (recv_preflight::EXHAUSTION, "exhaustion"),
         (recv_preflight::REPOST, "repost"),
         (recv_preflight::EOF, "eof"),
+        (recv_preflight::LIMIT_SOCKETPAIR, "limit_socketpair"),
+        (recv_preflight::LIMIT_IO_ERROR, "limit_io_error"),
+        (recv_preflight::LIMIT_TIMEOUT, "limit_timeout"),
+        (recv_preflight::LIMIT_BELOW, "limit_below"),
+        (recv_preflight::LIMIT_END, "limit_end"),
     ] {
         RECV_PREFLIGHT_FAILED.insert_metadata(step, "op".into(), name.into());
     }
@@ -655,6 +686,8 @@ mod tests {
             recv_ring::INCREMENTAL,
             recv_ring::PLAIN,
             recv_ring::LEND_REFUSED,
+            recv_ring::LIMITED,
+            recv_ring::LIMIT_REACHED,
         ] {
             assert!(RECV_RING.increment(idx), "RECV_RING[{idx}] out of bounds");
         }
@@ -679,6 +712,11 @@ mod tests {
         assert_eq!(op(recv_ring::INCREMENTAL).as_deref(), Some("incremental"));
         assert_eq!(op(recv_ring::PLAIN).as_deref(), Some("plain"));
         assert_eq!(op(recv_ring::LEND_REFUSED).as_deref(), Some("lend_refused"));
+        assert_eq!(op(recv_ring::LIMITED).as_deref(), Some("limited"));
+        assert_eq!(
+            op(recv_ring::LIMIT_REACHED).as_deref(),
+            Some("limit_reached")
+        );
         for idx in 0..recv_ring::COUNT {
             assert!(
                 RECV_RING

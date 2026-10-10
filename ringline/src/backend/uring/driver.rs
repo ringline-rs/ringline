@@ -122,6 +122,106 @@ impl Driver {
 }
 
 impl Driver {
+    /// `forward_hold_cap`, but at most a quarter of the TCP ring's buffers.
+    pub(crate) fn quarter_ring_cap(&self) -> usize {
+        let quarter = (self.provided_bufs.ring_entries() as usize / 4).max(1);
+        self.forward_hold_cap.min(quarter)
+    }
+
+    /// How many more received entries a connection may hold before its
+    /// receive is throttled: the smaller of the room left in its segment hold
+    /// and in its recv-forward or direct-echo hold. 0 is `at_hold_cap`.
+    ///
+    /// The segment hold may reach `forward_hold_cap`. Without a lend cap each
+    /// segment entry can pin a ring buffer, so there it is held to a quarter
+    /// of the ring, and one connection cannot empty it; with one
+    /// (`recv_incremental`) the lend cap bounds the buffers lends pin on the
+    /// worker, and the rest are heap copies.
+    ///
+    /// The recv-forward or direct-echo hold is always held to a quarter of the
+    /// ring: its copies come from `own_recv_copy`, at most one ring's worth
+    /// per worker, and past that its entries pin ring buffers.
+    ///
+    /// The entries held by the connection's direct-echo and `forward_held`
+    /// sends, and by its `forward_recv_buf` sends of lent receive buffers
+    /// (`SendRecvBuf`), are counted in `send_held_recv` and added to the
+    /// `recv_hold` count, and the ring buffers a `forward_to` write pins are
+    /// added to the `segment_hold` count. Both stay held until the send
+    /// completes or fails (#638).
+    pub(crate) fn hold_room(&self, conn_index: u32) -> usize {
+        let ci = conn_index as usize;
+        let segment_cap = if self.lend_cap.is_some() {
+            self.forward_hold_cap
+        } else {
+            self.quarter_ring_cap()
+        };
+        let writing = self.forward_write[ci].as_ref().map_or(0, |w| w.pinned());
+        let sending = self.send_held_recv[ci] as usize;
+        let segment = segment_cap.saturating_sub(self.segment_hold[ci].len() + writing);
+        let recv = self
+            .quarter_ring_cap()
+            .saturating_sub(self.recv_hold[ci].len() + sending);
+        segment.min(recv)
+    }
+
+    /// Whether a park of the connection is draining (`park_drain`) or its
+    /// install is in flight (`park_in_flight`, for the connection's current
+    /// generation). While draining, a cancel for its receive has been
+    /// submitted; while the install is in flight, no receive is armed. The
+    /// end-of-completion, throttled, end-of-forward and starved-pass
+    /// re-arms skip it while this holds.
+    pub(crate) fn park_pending(&self, conn_index: u32) -> bool {
+        let ci = conn_index as usize;
+        let generation = self.connections.generation(conn_index);
+        self.park_drain.get(ci).is_some_and(|d| d.is_some())
+            || self
+                .park_in_flight
+                .get(ci)
+                .is_some_and(|p| p.is_some_and(|p| p.generation == generation))
+    }
+
+    /// Whether a connection holds as much received data as it may before its
+    /// receive is throttled (`hold_room` is 0).
+    pub(crate) fn at_hold_cap(&self, conn_index: u32) -> bool {
+        self.hold_room(conn_index) == 0
+    }
+
+    /// The byte limit for a connection's next multishot recv arm: 0 (none)
+    /// unless the worker selected limited arms (`recv_limit`), and otherwise
+    /// `hold_room` buffers' worth, at least one.
+    ///
+    /// The limit bounds the bytes an arm takes: the kernel ends the arm at
+    /// most one buffer past it. Limits are used only on an incremental ring,
+    /// where completions pack into buffers. While one connection's
+    /// completions are the only ones taking from the ring, its arm pins at
+    /// most `max(hold_room, 1) + 2` buffers. When other connections'
+    /// completions interleave, each of its completions can sit in a
+    /// different buffer. The buffers it pins are then bounded by the entry
+    /// cap (`throttle_if_held`) and the worker-wide lend cap (`may_lend`).
+    /// On a plain ring every completion takes a whole buffer, so a byte limit
+    /// does not bound buffers even for one connection.
+    pub(crate) fn recv_arm_limit(&self, conn_index: u32) -> u32 {
+        if !self.recv_limit {
+            return 0;
+        }
+        let room = self.hold_room(conn_index).max(1) as u64;
+        let size = u64::from(self.provided_bufs.buffer_size());
+        u32::try_from(room * size).unwrap_or(u32::MAX)
+    }
+
+    /// Arm a connection's multishot recv with `recv_arm_limit`.
+    pub(crate) fn arm_multishot_recv(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+    ) -> std::io::Result<()> {
+        let limit = self.recv_arm_limit(conn_index);
+        self.ring
+            .submit_multishot_recv(conn_index, generation, limit)
+    }
+}
+
+impl Driver {
     /// Record that `n` received buffers of `conn_index` were released by the
     /// send that held them (`send_held_recv`).
     pub(crate) fn release_send_held(&mut self, conn_index: u32, n: u32) {
@@ -226,11 +326,34 @@ fn select_incremental(config: &Config, ring: &mut Ring) -> Result<bool, crate::e
     if config.timestamps {
         return Ok(false);
     }
-    use crate::backend::uring::engine::preflight::{IncPreflight, inc_preflight};
+    use crate::backend::uring::engine::preflight::{Preflight, inc_preflight};
     Ok(match inc_preflight(&mut ring.engine)? {
-        IncPreflight::Passed => true,
-        IncPreflight::Unsupported => false,
-        IncPreflight::Failed(step) => {
+        Preflight::Passed => true,
+        Preflight::Unsupported => false,
+        Preflight::Failed(step) => {
+            metrics::RECV_PREFLIGHT_FAILED.increment(step);
+            false
+        }
+    })
+}
+
+/// Whether the worker arms its TCP multishot receives with a byte limit
+/// (`Driver::recv_arm_limit`): only on an incremental ring, with
+/// `recv_multishot_limit` on, and the kernel passing the limit preflight. A
+/// failed preflight is counted by step and selects unlimited arms.
+fn select_recv_limit(
+    config: &Config,
+    incremental: bool,
+    ring: &mut Ring,
+) -> Result<bool, crate::error::Error> {
+    if !incremental || !config.recv_multishot_limit {
+        return Ok(false);
+    }
+    use crate::backend::uring::engine::preflight::{Preflight, limit_preflight};
+    Ok(match limit_preflight(&mut ring.engine)? {
+        Preflight::Passed => true,
+        Preflight::Unsupported => false,
+        Preflight::Failed(step) => {
             metrics::RECV_PREFLIGHT_FAILED.increment(step);
             false
         }
@@ -792,6 +915,9 @@ pub(crate) struct Driver {
     /// while `held()` is at or below it; above it, each lend path copies
     /// instead. `None` leaves lends uncapped, as without `recv_incremental`.
     pub(crate) lend_cap: Option<u32>,
+    /// Whether multishot receives are armed with a byte limit
+    /// (`recv_arm_limit`, `select_recv_limit`).
+    pub(crate) recv_limit: bool,
     /// Owned copies standing in `recv_hold` entries (recv-forward, direct
     /// echo) for completions the lend cap refused. An entry's bid is
     /// `ring_entries() + index`, above every provided-ring bid, so the
@@ -1114,6 +1240,7 @@ impl Driver {
         // Before anything else is armed: the preflight reaps every
         // completion the ring holds.
         let incremental = select_incremental(config, &mut ring)?;
+        let recv_limit = select_recv_limit(config, incremental, &mut ring)?;
         let (recv_ring_size, recv_buffer_size) = config.tcp_recv_geometry(incremental);
         let mut provided_bufs =
             ProvidedBufRing::new(config.recv_buffer.bgid, recv_ring_size, recv_buffer_size)?;
@@ -1169,6 +1296,9 @@ impl Driver {
         } else {
             metrics::recv_ring::PLAIN
         });
+        if recv_limit {
+            metrics::RECV_RING.increment(metrics::recv_ring::LIMITED);
+        }
         if let Some(ref udp_bufs) = udp_provided_bufs {
             ring.register_buf_ring(udp_bufs, RingKind::Plain)?;
         }
@@ -1369,6 +1499,7 @@ impl Driver {
                 recv_buffer_size.saturating_mul(4).max(1 << 20)
             },
             lend_cap: config.recv_incremental.then_some(recv_ring_size as u32 / 2),
+            recv_limit,
             owned_recv: Vec::new(),
             owned_recv_free: Vec::new(),
             recv_fallback_count: 0,
@@ -1646,10 +1777,8 @@ impl Driver {
             });
             let generation = self.connections.generation(conn_index);
             if open
-                && self
-                    .ring
-                    .submit_multishot_recv(conn_index, generation)
-                    .is_ok()
+                && !self.park_pending(conn_index)
+                && self.arm_multishot_recv(conn_index, generation).is_ok()
                 && let Some(cs) = self.connections.get_mut(conn_index)
             {
                 cs.recv_multishot_armed = true;

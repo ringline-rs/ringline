@@ -185,6 +185,9 @@ pub struct Config {
     /// Try an incremental TCP receive ring. See
     /// `ConfigBuilder::recv_incremental`.
     pub(crate) recv_incremental: bool,
+    /// Arm multishot receives with a byte limit on an incremental ring. See
+    /// `ConfigBuilder::recv_multishot_limit`.
+    pub(crate) recv_multishot_limit: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its
     /// queue fast enough, the acceptor will skip past it (and possibly
     /// close the incoming fd if every worker is full) rather than
@@ -466,6 +469,7 @@ impl Default for Config {
             // over-provisions today and never touches what it asked for.
             prefault_buffers: false,
             recv_incremental: false,
+            recv_multishot_limit: true,
             accept_queue_capacity: 1024,
             conn_chunk_size: 1,
             send_copy_count: 1024,
@@ -1047,6 +1051,29 @@ impl ConfigBuilder {
     /// `recv_buffer` sets (256 × 16 KiB by default).
     pub fn recv_incremental(mut self, enabled: bool) -> Self {
         self.config.recv_incremental = enabled;
+        self
+    }
+
+    /// Arm each connection's multishot receive with a total byte limit when
+    /// the TCP ring is incremental (see
+    /// [`recv_incremental`](Self::recv_incremental)).
+    ///
+    /// The limit is the room left under the connection's hold cap (see
+    /// [`forward_hold_cap`](Self::forward_hold_cap)) in buffers, and at
+    /// most a quarter of the ring. The kernel ends the arm once it has
+    /// received that many bytes, at most one buffer over, and the runtime
+    /// re-arms it while the connection is under its cap. A connection at its
+    /// cap is also stopped by cancelling its receive, as without a limit;
+    /// the limit bounds the bytes that arrive before the cancel runs.
+    ///
+    /// Each worker first checks, on a one-entry ring, that the running
+    /// kernel ends a limited arm at its limit (Linux 6.17 and later); if the
+    /// check fails, or the ring is plain, receives are armed without a
+    /// limit. A plain ring takes a whole buffer for every completion, so a
+    /// byte limit does not bound the buffers an arm takes there. The mio
+    /// backend ignores this setting. **Default: true.**
+    pub fn recv_multishot_limit(mut self, enabled: bool) -> Self {
+        self.config.recv_multishot_limit = enabled;
         self
     }
 

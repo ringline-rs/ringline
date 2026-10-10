@@ -37,9 +37,14 @@ pub(crate) enum Link {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Op {
     /// Multishot recv selecting from provided-buffer group `buf_group`.
+    /// A nonzero `limit` ends the arm once it has received that many bytes
+    /// (`sqe->optlen`, Linux 6.17+; older kernels fail the arm with
+    /// `EINVAL`). The last completion before the end has `F_MORE` clear and
+    /// may overshoot the limit by up to one buffer. 0 is no limit.
     RecvMulti {
         fd: Fd,
         buf_group: u16,
+        limit: u32,
     },
     /// Multishot recvmsg selecting from `buf_group`, laid out by `msg`.
     RecvMsgMulti {
