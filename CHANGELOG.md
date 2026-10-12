@@ -885,6 +885,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection, like a write error. Series PR 4 of #318 (design:
   `docs/copied-send-reservation-design.md`).
 
+### Security
+
+- The `quinn-proto` floor is raised to 0.11.19 for RUSTSEC-2026-0338,
+  RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341, RUSTSEC-2026-0342,
+  RUSTSEC-2026-0343, GHSA-53rm-773f-4q8c and GHSA-wppq-2f6r-wfvm. Downstream
+  resolvers respect the pin, so they cannot land on a vulnerable 0.11.x
+  through ringline-quic or ringline-h3.
+
 ## [0.6.10] - 2026-10-11
 
 ### Changed
