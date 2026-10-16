@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ringline-redis`: `ClientBuilder::get_command` and
+  `ClientBuilder::set_command` set the command names a `Client` sends in
+  place of `GET` and `SET`. They apply to `fire_get`, the `fire_set*`
+  methods (zero-copy guard path included), the async `get` and `set*`
+  methods, `Pipeline::get` and `Pipeline::set`, `set_stream` and, on
+  io_uring, `get_stream`. Only the name changes: the TTL and condition forms
+  send the same `EX`, `PX` or `NX` arguments under the configured name.
+  Replies are parsed and counted as GET and SET replies. A client built
+  without them sends the same bytes as before: resp-proto's encoders on the
+  copy paths, and a hand-written prefix that produces the same bytes on the
+  guard and streaming paths. `Pool`, `ShardedClient` and `ClusterClient`
+  always send `GET` and `SET`.
 - `Connection::recv_arrival` and `RecvHalf::recv_arrival` return a
   `RecvArrival`: when the first and the last byte consumed by the
   connection's most recent reader call arrived. The reader calls are

@@ -114,6 +114,30 @@
 //! - Timing is zero-overhead when no callbacks/metrics are configured
 //! - Distinct from [`Client::pipeline()`] which uses Redis's native PIPELINE protocol
 //!
+//! # Custom GET and SET command names
+//!
+//! [`ClientBuilder::get_command`] and [`ClientBuilder::set_command`] make a
+//! client send another command name in place of `GET` or `SET`, for a server
+//! that serves the same request and reply shapes under a different command.
+//! Every GET and SET the client sends uses the configured name, including the
+//! fire/recv, zero-copy guard, [`Pipeline`] and streaming paths, and replies
+//! are counted as GETs and SETs in [`CommandResult`] and [`ClientMetrics`]. A
+//! client built without them sends `GET` and `SET`.
+//!
+//! ```no_run
+//! # use ringline::Connection;
+//! # use ringline_redis::Client;
+//! # async fn example(conn: Connection) -> Result<(), ringline_redis::Error> {
+//! let mut client = Client::builder(conn)
+//!     .get_command("MY.GET")
+//!     .set_command("MY.SET")
+//!     .build();
+//! client.set("k", "v").await?; // sends `MY.SET k v`
+//! let _ = client.get("k").await?; // sends `MY.GET k`
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Copy Semantics
 //!
 //! | Path | Copies | Mechanism |
@@ -456,6 +480,8 @@ pub struct ClientBuilder {
     max_batch_size: usize,
     max_in_flight: usize,
     zc_threshold: u32,
+    get_command: Option<Box<[u8]>>,
+    set_command: Option<Box<[u8]>>,
     #[cfg(feature = "metrics")]
     with_metrics: bool,
 }
@@ -468,9 +494,59 @@ impl ClientBuilder {
             max_batch_size: 1,
             max_in_flight: usize::MAX,
             zc_threshold: DEFAULT_ZC_THRESHOLD,
+            get_command: None,
+            set_command: None,
             #[cfg(feature = "metrics")]
             with_metrics: false,
         }
+    }
+
+    /// Send `name` in place of `GET` as the command name of every GET this
+    /// client sends: [`fire_get`](Client::fire_get), [`get`](Client::get),
+    /// [`Pipeline::get`] and, on io_uring, `get_stream`. The arguments are
+    /// unchanged (`name key`), and the reply is parsed as a GET reply: a bulk
+    /// string is a hit, a nil is a miss.
+    ///
+    /// Defaults to `GET`. Other commands, `MGET` included, are not affected.
+    /// [`Pool`], [`ShardedClient`] and [`ClusterClient`] build their own
+    /// clients and always send `GET`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is empty.
+    pub fn get_command(mut self, name: impl Into<Vec<u8>>) -> Self {
+        let name = name.into();
+        assert!(!name.is_empty(), "get_command name must not be empty");
+        self.get_command = Some(name.into_boxed_slice());
+        self
+    }
+
+    /// Send `name` in place of `SET` as the command name of every SET this
+    /// client sends: the `fire_set*` methods, the async `set*` methods,
+    /// [`Pipeline::set`] and [`set_stream`](Client::set_stream), on both the
+    /// copy and the zero-copy guard paths.
+    ///
+    /// Only the command name changes. The TTL and condition forms
+    /// ([`fire_set_ex`](Client::fire_set_ex),
+    /// [`fire_set_ex_with_guard`](Client::fire_set_ex_with_guard),
+    /// [`set_ex`](Client::set_ex), [`set_px`](Client::set_px),
+    /// [`set_nx`](Client::set_nx) and
+    /// [`set_ex_with_guard`](Client::set_ex_with_guard)) are allowed and send
+    /// `name key value` followed by the `EX`, `PX` or `NX` arguments that
+    /// `SET` would get. A command that does not accept them answers with an
+    /// error reply, which these methods return as [`Error::Redis`].
+    ///
+    /// Defaults to `SET`. [`Pool`], [`ShardedClient`] and [`ClusterClient`]
+    /// build their own clients and always send `SET`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is empty.
+    pub fn set_command(mut self, name: impl Into<Vec<u8>>) -> Self {
+        let name = name.into();
+        assert!(!name.is_empty(), "set_command name must not be empty");
+        self.set_command = Some(name.into_boxed_slice());
+        self
     }
 
     /// Set the zero-copy guard threshold (in bytes). Guard values passed to
@@ -561,10 +637,20 @@ impl ClientBuilder {
             max_batch_size,
             max_in_flight,
             zc_threshold,
+            get_command,
+            set_command,
             #[cfg(feature = "metrics")]
             with_metrics,
         } = self;
         let (tx, rx) = halves.unwrap_or_else(|| conn.split());
+        let command_names = if get_command.is_none() && set_command.is_none() {
+            None
+        } else {
+            Some(Box::new(CommandNames {
+                get: get_command.unwrap_or_else(|| Box::from(&b"GET"[..])),
+                set: set_command.unwrap_or_else(|| Box::from(&b"SET"[..])),
+            }))
+        };
         Client {
             tx,
             rx,
@@ -578,6 +664,7 @@ impl ClientBuilder {
             zc_threshold,
             buffered_ops: 0,
             encode_buf: Vec::new(),
+            command_names,
             #[cfg(feature = "metrics")]
             metrics: if with_metrics {
                 Some(ClientMetrics::new())
@@ -627,6 +714,10 @@ pub struct Client {
     /// its capacity across requests so steady-state encoding is
     /// allocation-free.
     encode_buf: Vec<u8>,
+    /// Command names sent in place of `GET` and `SET`. `None` (the default)
+    /// sends `GET` and `SET`: resp-proto's encoders on the copy paths, and
+    /// `append_set_prefix` on the guard and streaming paths.
+    command_names: Option<Box<CommandNames>>,
     #[cfg(feature = "metrics")]
     metrics: Option<ClientMetrics>,
 }
@@ -732,6 +823,7 @@ impl Client {
             zc_threshold: DEFAULT_ZC_THRESHOLD,
             buffered_ops: 0,
             encode_buf: Vec::new(),
+            command_names: None,
             #[cfg(feature = "metrics")]
             metrics: None,
         }
@@ -931,17 +1023,17 @@ impl Client {
     /// Fire a GET request without waiting for the response.
     pub fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), Error> {
         self.pre_flush_if_needed(false)?;
-        let req = Request::get(key);
+        let names = self.command_names.as_deref();
         let tx_bytes;
         if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
             // Direct send — skip write_buf round-trip.
             self.encode_buf.clear();
-            Self::encode_request_into(&req, &mut self.encode_buf);
+            encode_get_into(names, key, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
             self.tx.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
-            Self::encode_request_into(&req, &mut self.write_buf);
+            encode_get_into(names, key, &mut self.write_buf);
             tx_bytes = (self.write_buf.len() - before) as u32;
             self.buffered_ops += 1;
         }
@@ -967,17 +1059,18 @@ impl Client {
     /// Fire a SET request (with copy) without waiting for the response.
     pub fn fire_set(&mut self, key: &[u8], value: &[u8], user_data: u64) -> Result<(), Error> {
         self.pre_flush_if_needed(false)?;
-        let set_req = Request::set(key, value);
+        let names = self.command_names.as_deref();
+        let opt = SetOpt::Plain;
         let tx_bytes;
         if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
             // Direct send — skip write_buf round-trip.
             self.encode_buf.clear();
-            Self::encode_set_request_into(&set_req, &mut self.encode_buf);
+            encode_set_into(names, key, value, opt, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
             self.tx.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
-            Self::encode_set_request_into(&set_req, &mut self.write_buf);
+            encode_set_into(names, key, value, opt, &mut self.write_buf);
             tx_bytes = (self.write_buf.len() - before) as u32;
             self.buffered_ops += 1;
         }
@@ -1027,10 +1120,12 @@ impl Client {
         // Append prefix, record guard insertion point, append suffix —
         // directly into write_buf, no intermediate allocation.
         let before = self.write_buf.len();
-        append_set_guard_prefix(&mut self.write_buf, key, value_len as usize);
+        let set_name = self.command_names.as_deref().map(|n| &*n.set);
+        let opt = SetOpt::Plain;
+        append_set_prefix(&mut self.write_buf, set_name, key, value_len as usize, opt);
         self.write_guards
             .push((self.write_buf.len(), GuardBox::new(guard)));
-        self.write_buf.extend_from_slice(b"\r\n");
+        append_set_suffix(&mut self.write_buf, opt);
         let tx_bytes = (self.write_buf.len() - before + value_len as usize) as u32;
         self.buffered_ops += 1;
         let start = self.timing_start_buffered();
@@ -1053,17 +1148,18 @@ impl Client {
         user_data: u64,
     ) -> Result<(), Error> {
         self.pre_flush_if_needed(false)?;
-        let set_req = Request::set(key, value).ex(ttl_secs);
+        let names = self.command_names.as_deref();
+        let opt = SetOpt::Ex(ttl_secs);
         let tx_bytes;
         if self.max_batch_size == 1 && self.write_guards.is_empty() && self.write_buf.is_empty() {
             // Direct send — skip write_buf round-trip.
             self.encode_buf.clear();
-            Self::encode_set_request_into(&set_req, &mut self.encode_buf);
+            encode_set_into(names, key, value, opt, &mut self.encode_buf);
             tx_bytes = self.encode_buf.len() as u32;
             self.tx.send_nowait(&self.encode_buf)?;
         } else {
             let before = self.write_buf.len();
-            Self::encode_set_request_into(&set_req, &mut self.write_buf);
+            encode_set_into(names, key, value, opt, &mut self.write_buf);
             tx_bytes = (self.write_buf.len() - before) as u32;
             self.buffered_ops += 1;
         }
@@ -1114,10 +1210,12 @@ impl Client {
         // Append prefix, record guard insertion point, append suffix —
         // directly into write_buf, no intermediate allocations.
         let before = self.write_buf.len();
-        append_set_guard_prefix_ex(&mut self.write_buf, key, value_len as usize);
+        let set_name = self.command_names.as_deref().map(|n| &*n.set);
+        let opt = SetOpt::Ex(ttl_secs);
+        append_set_prefix(&mut self.write_buf, set_name, key, value_len as usize, opt);
         self.write_guards
             .push((self.write_buf.len(), GuardBox::new(guard)));
-        append_set_guard_suffix_ex(&mut self.write_buf, ttl_secs);
+        append_set_suffix(&mut self.write_buf, opt);
         let tx_bytes = (self.write_buf.len() - before + value_len as usize) as u32;
         self.buffered_ops += 1;
         let start = self.timing_start_buffered();
@@ -1782,17 +1880,32 @@ impl Client {
 
     /// Send a SET command via scatter-gather (prefix + value + suffix as
     /// separate iovecs) and read the response.
-    async fn execute_set(
-        &mut self,
-        set_req: &resp_proto::SetRequest<'_>,
-        value: &[u8],
-    ) -> Reply<Value> {
-        let (prefix, suffix) = set_req.encode_parts();
-        if let Err(e) = self
-            .tx
-            .send_parts()
-            .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())
-        {
+    async fn execute_set(&mut self, key: &[u8], value: &[u8], opt: SetOpt) -> Reply<Value> {
+        let sent = match self.command_names.as_deref() {
+            None => {
+                let (prefix, suffix) = opt.apply(Request::set(key, value)).encode_parts();
+                self.tx
+                    .send_parts()
+                    .build(|b| b.copy(&prefix).copy(value).copy(&suffix).submit())
+            }
+            Some(names) => {
+                self.encode_buf.clear();
+                append_set_prefix(
+                    &mut self.encode_buf,
+                    Some(&names.set),
+                    key,
+                    value.len(),
+                    opt,
+                );
+                let split = self.encode_buf.len();
+                append_set_suffix(&mut self.encode_buf, opt);
+                let (prefix, suffix) = self.encode_buf.split_at(split);
+                self.tx
+                    .send_parts()
+                    .build(|b| b.copy(prefix).copy(value).copy(suffix).submit())
+            }
+        };
+        if let Err(e) = sent {
             return (Err(e.into()), 0, None);
         }
         map_reply(self.read_reply().await, redis_error)
@@ -1916,7 +2029,7 @@ impl Client {
     pub async fn get(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>, Error> {
         let key = key.as_ref();
         self.encode_buf.clear();
-        Self::encode_request_into(&Request::get(key), &mut self.encode_buf);
+        encode_get_into(self.command_names.as_deref(), key, &mut self.encode_buf);
         if !self.is_instrumented() {
             return self.execute_bulk_encoded().await.0;
         }
@@ -1951,17 +2064,17 @@ impl Client {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let set_req = Request::set(key, value);
+        let opt = SetOpt::Plain;
         if !self.is_instrumented() {
-            let resp = self.execute_set(&set_req, value).await.0?;
+            let resp = self.execute_set(key, value, opt).await.0?;
             return match resp {
                 Value::SimpleString(_) | Value::Null => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
             };
         }
-        let tx_bytes = set_req.encoded_len() as u32;
+        let tx_bytes = set_encoded_len(self.command_names.as_deref(), key, value, opt) as u32;
         let start = Instant::now();
-        let (result, rx_bytes, arrival) = self.execute_set(&set_req, value).await;
+        let (result, rx_bytes, arrival) = self.execute_set(key, value, opt).await;
         let latency_ns = elapsed_ns(start);
         let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
         let success = result.is_ok();
@@ -1992,17 +2105,17 @@ impl Client {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let set_req = Request::set(key, value).ex(ttl_secs);
+        let opt = SetOpt::Ex(ttl_secs);
         if !self.is_instrumented() {
-            let resp = self.execute_set(&set_req, value).await.0?;
+            let resp = self.execute_set(key, value, opt).await.0?;
             return match resp {
                 Value::SimpleString(_) => Ok(()),
                 _ => Err(Error::UnexpectedResponse),
             };
         }
-        let tx_bytes = set_req.encoded_len() as u32;
+        let tx_bytes = set_encoded_len(self.command_names.as_deref(), key, value, opt) as u32;
         let start = Instant::now();
-        let (result, rx_bytes, arrival) = self.execute_set(&set_req, value).await;
+        let (result, rx_bytes, arrival) = self.execute_set(key, value, opt).await;
         let latency_ns = elapsed_ns(start);
         let (ttfb_ns, ttlb_ns) = ArrivalSpan::from_arrival(arrival.as_ref()).ns(Some(start));
         let success = result.is_ok();
@@ -2033,10 +2146,7 @@ impl Client {
     ) -> Result<(), Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let resp = self
-            .execute_set(&Request::set(key, value).px(ttl_ms), value)
-            .await
-            .0?;
+        let resp = self.execute_set(key, value, SetOpt::Px(ttl_ms)).await.0?;
         match resp {
             Value::SimpleString(_) => Ok(()),
             _ => Err(Error::UnexpectedResponse),
@@ -2051,10 +2161,7 @@ impl Client {
     ) -> Result<bool, Error> {
         let key = key.as_ref();
         let value = value.as_ref();
-        let resp = self
-            .execute_set(&Request::set(key, value).nx(), value)
-            .await
-            .0?;
+        let resp = self.execute_set(key, value, SetOpt::Nx).await.0?;
         match resp {
             Value::SimpleString(_) => Ok(true),
             Value::Null => Ok(false),
@@ -2819,7 +2926,7 @@ impl Client {
     /// pipeline responses are positional, and a command issued on the side
     /// would consume one of them and desync the batch.
     pub fn pipeline(&mut self) -> Pipeline<'_> {
-        Pipeline::new(&mut self.tx, &mut self.rx)
+        Pipeline::new(&mut self.tx, &mut self.rx, self.command_names.as_deref())
     }
 
     // ── Zero-copy SET ───────────────────────────────────────────────────
@@ -2834,7 +2941,9 @@ impl Client {
         if !self.is_instrumented() {
             let (_, value_len) = guard.as_ptr_len();
             self.encode_buf.clear();
-            append_set_guard_prefix(&mut self.encode_buf, key, value_len as usize);
+            let set_name = self.command_names.as_deref().map(|n| &*n.set);
+            let opt = SetOpt::Plain;
+            append_set_prefix(&mut self.encode_buf, set_name, key, value_len as usize, opt);
             let prefix: &[u8] = &self.encode_buf;
             self.tx.send_parts().build(move |b| {
                 b.copy(prefix)
@@ -2853,7 +2962,9 @@ impl Client {
         }
         let (_, value_len) = guard.as_ptr_len();
         self.encode_buf.clear();
-        append_set_guard_prefix(&mut self.encode_buf, key, value_len as usize);
+        let set_name = self.command_names.as_deref().map(|n| &*n.set);
+        let opt = SetOpt::Plain;
+        append_set_prefix(&mut self.encode_buf, set_name, key, value_len as usize, opt);
         let tx_bytes = (self.encode_buf.len() + value_len as usize + 2) as u32;
         let start = Instant::now();
         let prefix: &[u8] = &self.encode_buf;
@@ -2898,9 +3009,11 @@ impl Client {
         if !self.is_instrumented() {
             let (_, value_len) = guard.as_ptr_len();
             self.encode_buf.clear();
-            append_set_guard_prefix_ex(&mut self.encode_buf, key, value_len as usize);
+            let set_name = self.command_names.as_deref().map(|n| &*n.set);
+            let opt = SetOpt::Ex(ttl_secs);
+            append_set_prefix(&mut self.encode_buf, set_name, key, value_len as usize, opt);
             let split = self.encode_buf.len();
-            append_set_guard_suffix_ex(&mut self.encode_buf, ttl_secs);
+            append_set_suffix(&mut self.encode_buf, opt);
             let (prefix, suffix) = self.encode_buf.split_at(split);
             self.tx.send_parts().build(move |b| {
                 b.copy(prefix)
@@ -2919,9 +3032,11 @@ impl Client {
         }
         let (_, value_len) = guard.as_ptr_len();
         self.encode_buf.clear();
-        append_set_guard_prefix_ex(&mut self.encode_buf, key, value_len as usize);
+        let set_name = self.command_names.as_deref().map(|n| &*n.set);
+        let opt = SetOpt::Ex(ttl_secs);
+        append_set_prefix(&mut self.encode_buf, set_name, key, value_len as usize, opt);
         let split = self.encode_buf.len();
-        append_set_guard_suffix_ex(&mut self.encode_buf, ttl_secs);
+        append_set_suffix(&mut self.encode_buf, opt);
         let tx_bytes = (self.encode_buf.len() + value_len as usize) as u32;
         let start = Instant::now();
         let (prefix, suffix) = self.encode_buf.split_at(split);
@@ -2999,7 +3114,8 @@ impl<I: Iterator<Item = Bytes>> SegmentSource for I {
 impl Client {
     /// Streaming SET (single-connection [`Client`] only).
     ///
-    /// Sends the RESP `SET` command with the value bulk header declaring `len`
+    /// Sends the RESP `SET` command (or the name set by
+    /// [`ClientBuilder::set_command`]) with the value bulk header declaring `len`
     /// (`*3\r\n$3\r\nSET\r\n$<klen>\r\n<key>\r\n$<len>\r\n`), then streams exactly
     /// `len` value bytes pulled from `src`, then the trailing `\r\n`, and reads
     /// the `+OK` reply. The value is never gathered into one contiguous buffer on
@@ -3055,9 +3171,11 @@ impl Client {
         mut src: impl SegmentSource,
     ) -> Result<Value, Error> {
         // Command framing with the value bulk header declaring `len`:
-        // `*3\r\n$3\r\nSET\r\n$<klen>\r\n<key>\r\n$<len>\r\n`.
+        // `*3\r\n$3\r\nSET\r\n$<klen>\r\n<key>\r\n$<len>\r\n`, with the
+        // configured SET name in place of `SET`.
         self.encode_buf.clear();
-        append_set_guard_prefix(&mut self.encode_buf, key, len);
+        let set_name = self.command_names.as_deref().map(|n| &*n.set);
+        append_set_prefix(&mut self.encode_buf, set_name, key, len, SetOpt::Plain);
         self.tx.send_nowait(&self.encode_buf)?;
 
         // Stream the value body, enforcing the length contract.
@@ -3144,7 +3262,7 @@ impl Client {
         // synchronously (before we await), so the reply can't be processed under
         // the default path first.
         self.encode_buf.clear();
-        Self::encode_request_into(&Request::get(key), &mut self.encode_buf);
+        encode_get_into(self.command_names.as_deref(), key, &mut self.encode_buf);
         self.tx.send_nowait(&self.encode_buf)?;
 
         // Read the tiny `$<len>\r\n` (or `$-1\r\n`) bulk-string header. It always
@@ -3521,38 +3639,151 @@ fn append_bulk_len(buf: &mut Vec<u8>, n: usize) {
     buf.extend_from_slice(b"\r\n");
 }
 
-/// Append the RESP SET prefix for guard-based sends to `buf`:
-/// `*3\r\n$3\r\nSET\r\n${keylen}\r\n{key}\r\n${valuelen}\r\n`.
-/// The caller must append value bytes (via guard) + `\r\n` suffix.
-fn append_set_guard_prefix(buf: &mut Vec<u8>, key: &[u8], value_len: usize) {
-    buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n");
-    append_bulk_len(buf, key.len());
-    buf.extend_from_slice(key);
+/// Command names a [`Client`] sends in place of `GET` and `SET`, set by
+/// [`ClientBuilder::get_command`] and [`ClientBuilder::set_command`].
+struct CommandNames {
+    get: Box<[u8]>,
+    set: Box<[u8]>,
+}
+
+/// The options of a SET request, for the encoders below that write the
+/// command name themselves.
+#[derive(Clone, Copy, Debug)]
+enum SetOpt {
+    Plain,
+    Ex(u64),
+    Px(u64),
+    Nx,
+}
+
+impl SetOpt {
+    /// The same options on a resp-proto `SetRequest`.
+    fn apply(self, req: resp_proto::SetRequest<'_>) -> resp_proto::SetRequest<'_> {
+        match self {
+            SetOpt::Plain => req,
+            SetOpt::Ex(secs) => req.ex(secs),
+            SetOpt::Px(ms) => req.px(ms),
+            SetOpt::Nx => req.nx(),
+        }
+    }
+
+    /// Number of arguments after `name key value`.
+    fn extra_args(self) -> usize {
+        match self {
+            SetOpt::Plain => 0,
+            SetOpt::Ex(_) | SetOpt::Px(_) => 2,
+            SetOpt::Nx => 1,
+        }
+    }
+}
+
+/// Length of a RESP bulk string of `n` bytes: `${n}\r\n`, the data, `\r\n`.
+fn bulk_encoded_len(n: usize) -> usize {
+    1 + itoa::Buffer::new().format(n).len() + 2 + n + 2
+}
+
+/// Append `bytes` as a RESP bulk string.
+fn append_bulk(buf: &mut Vec<u8>, bytes: &[u8]) {
+    append_bulk_len(buf, bytes.len());
+    buf.extend_from_slice(bytes);
     buf.extend_from_slice(b"\r\n");
+}
+
+/// Append a GET of `key`: resp-proto's `Request::get` when `names` is
+/// `None`, otherwise `*2\r\n${n}\r\n{get name}\r\n${keylen}\r\n{key}\r\n`.
+fn encode_get_into(names: Option<&CommandNames>, key: &[u8], buf: &mut Vec<u8>) {
+    match names {
+        None => Client::encode_request_into(&Request::get(key), buf),
+        Some(names) => {
+            buf.extend_from_slice(b"*2\r\n");
+            append_bulk(buf, &names.get);
+            append_bulk(buf, key);
+        }
+    }
+}
+
+/// Append a SET of `key` to `value` with `opt`: resp-proto's `SetRequest`
+/// when `names` is `None`, otherwise the same arguments under the configured
+/// SET name.
+fn encode_set_into(
+    names: Option<&CommandNames>,
+    key: &[u8],
+    value: &[u8],
+    opt: SetOpt,
+    buf: &mut Vec<u8>,
+) {
+    match names {
+        None => Client::encode_set_request_into(&opt.apply(Request::set(key, value)), buf),
+        Some(names) => {
+            append_set_prefix(buf, Some(&names.set), key, value.len(), opt);
+            buf.extend_from_slice(value);
+            append_set_suffix(buf, opt);
+        }
+    }
+}
+
+/// Encoded length of the SET that [`encode_set_into`] writes.
+fn set_encoded_len(names: Option<&CommandNames>, key: &[u8], value: &[u8], opt: SetOpt) -> usize {
+    match names {
+        None => opt.apply(Request::set(key, value)).encoded_len(),
+        Some(names) => {
+            let opts = match opt {
+                SetOpt::Plain => 0,
+                SetOpt::Ex(n) | SetOpt::Px(n) => {
+                    bulk_encoded_len(2) + bulk_encoded_len(itoa::Buffer::new().format(n).len())
+                }
+                SetOpt::Nx => bulk_encoded_len(2),
+            };
+            // `*{argc}\r\n`, with argc a single digit (3 to 5).
+            4 + bulk_encoded_len(names.set.len())
+                + bulk_encoded_len(key.len())
+                + bulk_encoded_len(value.len())
+                + opts
+        }
+    }
+}
+
+/// Append the RESP SET prefix, up to and including the value's length
+/// header: `*{argc}\r\n$3\r\nSET\r\n${keylen}\r\n{key}\r\n${valuelen}\r\n`,
+/// where `argc` is 3 plus `opt`'s arguments and `name`, when given, replaces
+/// `SET`. The caller appends the value bytes (copied or via guard), then
+/// [`append_set_suffix`] with the same `opt`.
+fn append_set_prefix(
+    buf: &mut Vec<u8>,
+    name: Option<&[u8]>,
+    key: &[u8],
+    value_len: usize,
+    opt: SetOpt,
+) {
+    // argc is 3, 4 or 5: one digit.
+    buf.push(b'*');
+    buf.push(b'0' + (3 + opt.extra_args()) as u8);
+    buf.extend_from_slice(b"\r\n");
+    match name {
+        None => buf.extend_from_slice(b"$3\r\nSET\r\n"),
+        Some(name) => append_bulk(buf, name),
+    }
+    append_bulk(buf, key);
     append_bulk_len(buf, value_len);
 }
 
-/// Append the RESP SET EX prefix for guard-based sends to `buf`:
-/// `*5\r\n$3\r\nSET\r\n${keylen}\r\n{key}\r\n${valuelen}\r\n`.
-/// The caller must append value bytes (via guard) followed by the
-/// [`append_set_guard_suffix_ex`] suffix.
-fn append_set_guard_prefix_ex(buf: &mut Vec<u8>, key: &[u8], value_len: usize) {
-    buf.extend_from_slice(b"*5\r\n$3\r\nSET\r\n");
-    append_bulk_len(buf, key.len());
-    buf.extend_from_slice(key);
+/// Append the RESP SET suffix: the `\r\n` that ends the value, then `opt`'s
+/// arguments (`$2\r\nEX\r\n${ttllen}\r\n{ttl}\r\n`, the same with `PX`, or
+/// `$2\r\nNX\r\n`).
+fn append_set_suffix(buf: &mut Vec<u8>, opt: SetOpt) {
     buf.extend_from_slice(b"\r\n");
-    append_bulk_len(buf, value_len);
-}
-
-/// Append the RESP SET EX suffix for guard-based sends to `buf`:
-/// `\r\n$2\r\nEX\r\n${ttllen}\r\n{ttl}\r\n`.
-fn append_set_guard_suffix_ex(buf: &mut Vec<u8>, ttl_secs: u64) {
-    let mut itoa_buf = itoa::Buffer::new();
-    let ttl_str = itoa_buf.format(ttl_secs);
-    buf.extend_from_slice(b"\r\n$2\r\nEX\r\n");
-    append_bulk_len(buf, ttl_str.len());
-    buf.extend_from_slice(ttl_str.as_bytes());
-    buf.extend_from_slice(b"\r\n");
+    match opt {
+        SetOpt::Plain => {}
+        SetOpt::Ex(n) => {
+            append_bulk(buf, b"EX");
+            append_bulk(buf, itoa::Buffer::new().format(n).as_bytes());
+        }
+        SetOpt::Px(n) => {
+            append_bulk(buf, b"PX");
+            append_bulk(buf, itoa::Buffer::new().format(n).as_bytes());
+        }
+        SetOpt::Nx => append_bulk(buf, b"NX"),
+    }
 }
 
 // ── Pipeline ────────────────────────────────────────────────────────────
@@ -3580,15 +3811,17 @@ fn append_set_guard_suffix_ex(buf: &mut Vec<u8>, ttl_secs: u64) {
 pub struct Pipeline<'a> {
     tx: &'a mut SendHalf,
     rx: &'a mut RecvHalf,
+    names: Option<&'a CommandNames>,
     buf: Vec<u8>,
     count: usize,
 }
 
 impl<'a> Pipeline<'a> {
-    fn new(tx: &'a mut SendHalf, rx: &'a mut RecvHalf) -> Self {
+    fn new(tx: &'a mut SendHalf, rx: &'a mut RecvHalf, names: Option<&'a CommandNames>) -> Self {
         Self {
             tx,
             rx,
+            names,
             buf: Vec::new(),
             count: 0,
         }
@@ -3601,16 +3834,18 @@ impl<'a> Pipeline<'a> {
         self
     }
 
-    /// Add a SET command to the pipeline.
+    /// Add a SET command to the pipeline, under the client's
+    /// [`set_command`](ClientBuilder::set_command) name.
     pub fn set(mut self, key: &[u8], value: &[u8]) -> Self {
-        Client::encode_set_request_into(&Request::set(key, value), &mut self.buf);
+        encode_set_into(self.names, key, value, SetOpt::Plain, &mut self.buf);
         self.count += 1;
         self
     }
 
-    /// Add a GET command to the pipeline.
+    /// Add a GET command to the pipeline, under the client's
+    /// [`get_command`](ClientBuilder::get_command) name.
     pub fn get(mut self, key: &[u8]) -> Self {
-        Client::encode_request_into(&Request::get(key), &mut self.buf);
+        encode_get_into(self.names, key, &mut self.buf);
         self.count += 1;
         self
     }
@@ -3816,7 +4051,7 @@ mod encode_tests {
     #[test]
     fn golden_set_guard_prefix() {
         let mut prefix = Vec::new();
-        append_set_guard_prefix(&mut prefix, KEY, 1024);
+        append_set_prefix(&mut prefix, None, KEY, 1024, SetOpt::Plain);
         assert_eq!(
             prefix,
             &b"*3\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$1024\r\n"[..]
@@ -3826,9 +4061,9 @@ mod encode_tests {
     #[test]
     fn golden_set_guard_prefix_ex() {
         let mut prefix = Vec::new();
-        append_set_guard_prefix_ex(&mut prefix, KEY, 1024);
+        append_set_prefix(&mut prefix, None, KEY, 1024, SetOpt::Ex(7200));
         let mut suffix = Vec::new();
-        append_set_guard_suffix_ex(&mut suffix, 7200);
+        append_set_suffix(&mut suffix, SetOpt::Ex(7200));
         assert_eq!(
             prefix,
             &b"*5\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$1024\r\n"[..]
@@ -3865,7 +4100,7 @@ mod encode_tests {
         let full_wire: &[u8] = b"*3\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$5\r\nhello\r\n";
 
         let mut prefix = Vec::new();
-        append_set_guard_prefix(&mut prefix, KEY, VALUE_LEN);
+        append_set_prefix(&mut prefix, None, KEY, VALUE_LEN, SetOpt::Plain);
 
         // The caller sends: prefix || value_bytes || "\r\n".
         // So full wire length == prefix.len() + value_len + 2.
@@ -3891,9 +4126,9 @@ mod encode_tests {
             b"*5\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$5\r\nhello\r\n$2\r\nEX\r\n$4\r\n7200\r\n";
 
         let mut prefix = Vec::new();
-        append_set_guard_prefix_ex(&mut prefix, KEY, VALUE_LEN);
+        append_set_prefix(&mut prefix, None, KEY, VALUE_LEN, SetOpt::Ex(7200));
         let mut suffix = Vec::new();
-        append_set_guard_suffix_ex(&mut suffix, TTL);
+        append_set_suffix(&mut suffix, SetOpt::Ex(TTL));
 
         // The suffix starts with "\r\n" which closes the value bulk string —
         // no separate "\r\n" is needed between value and suffix.
@@ -4208,5 +4443,197 @@ mod get_header_poison_contract_tests {
             parse_get_header(b"$abc\r\n"),
             Err(Error::UnexpectedResponse)
         ));
+    }
+}
+
+#[cfg(test)]
+mod command_name_tests {
+    use super::*;
+    use ringline::{RegionId, SendGuard};
+
+    const KEY: &[u8] = b"user:123456789";
+
+    fn names(get: &[u8], set: &[u8]) -> CommandNames {
+        CommandNames {
+            get: get.into(),
+            set: set.into(),
+        }
+    }
+
+    const OPTS: [SetOpt; 4] = [SetOpt::Plain, SetOpt::Ex(7200), SetOpt::Px(250), SetOpt::Nx];
+
+    #[test]
+    fn named_encoders_match_resp_proto_under_the_default_names() {
+        // With the names spelled `GET` and `SET`, the hand-written encoders
+        // must produce resp-proto's bytes for every option.
+        let default_named = names(b"GET", b"SET");
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        encode_get_into(None, KEY, &mut a);
+        encode_get_into(Some(&default_named), KEY, &mut b);
+        assert_eq!(a, b);
+        for opt in OPTS {
+            a.clear();
+            b.clear();
+            encode_set_into(None, KEY, b"value", opt, &mut a);
+            encode_set_into(Some(&default_named), KEY, b"value", opt, &mut b);
+            assert_eq!(a, b, "{opt:?}");
+            assert_eq!(
+                set_encoded_len(None, KEY, b"value", opt),
+                a.len(),
+                "{opt:?}"
+            );
+            assert_eq!(
+                set_encoded_len(Some(&default_named), KEY, b"value", opt),
+                b.len(),
+                "{opt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn golden_named_get() {
+        let mut buf = Vec::new();
+        encode_get_into(Some(&names(b"X.GET", b"X.SET")), KEY, &mut buf);
+        assert_eq!(buf, &b"*2\r\n$5\r\nX.GET\r\n$14\r\nuser:123456789\r\n"[..]);
+    }
+
+    #[test]
+    fn golden_named_set_forms() {
+        let n = names(b"X.GET", b"X.SET");
+        let cases: [(SetOpt, &[u8]); 4] = [
+            (
+                SetOpt::Plain,
+                b"*3\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n",
+            ),
+            (
+                SetOpt::Ex(7200),
+                b"*5\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n$2\r\nEX\r\n$4\r\n7200\r\n",
+            ),
+            (
+                SetOpt::Px(250),
+                b"*5\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n$2\r\nPX\r\n$3\r\n250\r\n",
+            ),
+            (
+                SetOpt::Nx,
+                b"*4\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n$2\r\nNX\r\n",
+            ),
+        ];
+        for (opt, want) in cases {
+            let mut buf = Vec::new();
+            encode_set_into(Some(&n), KEY, b"v", opt, &mut buf);
+            assert_eq!(buf, want, "{opt:?}");
+            assert_eq!(
+                set_encoded_len(Some(&n), KEY, b"v", opt),
+                want.len(),
+                "{opt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn golden_named_set_guard_prefix() {
+        let mut prefix = Vec::new();
+        append_set_prefix(&mut prefix, Some(b"X.SET"), KEY, 1024, SetOpt::Plain);
+        assert_eq!(
+            prefix,
+            &b"*3\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$1024\r\n"[..]
+        );
+    }
+
+    struct VecGuard(Vec<u8>);
+
+    impl SendGuard for VecGuard {
+        fn as_ptr_len(&self) -> (*const u8, u32) {
+            (self.0.as_ptr(), self.0.len() as u32)
+        }
+        fn region(&self) -> RegionId {
+            RegionId::UNREGISTERED
+        }
+    }
+
+    /// A buffered (`max_batch_size` 8) client on a dangling connection; only
+    /// the paths that stop at `write_buf` are safe on it.
+    fn buffered(builder: impl FnOnce(ClientBuilder) -> ClientBuilder) -> Client {
+        let conn = ringline::Connection::for_test(0, 0);
+        builder(Client::builder(conn).max_batch_size(8)).build_for_test()
+    }
+
+    #[test]
+    fn fire_paths_write_the_configured_names() {
+        let mut client = buffered(|b| b.get_command("X.GET").set_command(b"X.SET".to_vec()));
+        client.fire_get(KEY, 1).unwrap();
+        client.fire_set(KEY, b"v", 2).unwrap();
+        client.fire_set_ex(KEY, b"v", 7200, 3).unwrap();
+        // 8 KiB is above the default zc_threshold: guard path.
+        client
+            .fire_set_with_guard(KEY, VecGuard(vec![0u8; 8192]), 4)
+            .unwrap();
+        client
+            .fire_set_ex_with_guard(KEY, VecGuard(vec![0u8; 8192]), 7200, 5)
+            .unwrap();
+        assert_eq!(client.write_guards.len(), 2);
+        let want: &[u8] = b"*2\r\n$5\r\nX.GET\r\n$14\r\nuser:123456789\r\n\
+            *3\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n\
+            *5\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n$2\r\nEX\r\n$4\r\n7200\r\n\
+            *3\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$8192\r\n\
+            \r\n\
+            *5\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$8192\r\n\
+            \r\n$2\r\nEX\r\n$4\r\n7200\r\n";
+        assert_eq!(client.write_buf, want);
+        // tx_bytes counts the guard values too.
+        let tx: Vec<u32> = client.pending.iter().map(|p| p.tx_bytes).collect();
+        assert_eq!(tx[0] as usize, 36);
+        assert_eq!(tx[3] as usize, 43 + 8192 + 2);
+    }
+
+    #[test]
+    fn default_client_writes_get_and_set() {
+        let mut client = buffered(|b| b);
+        assert!(client.command_names.is_none());
+        client.fire_get(KEY, 1).unwrap();
+        client.fire_set(KEY, b"v", 2).unwrap();
+        client
+            .fire_set_with_guard(KEY, VecGuard(vec![0u8; 8192]), 3)
+            .unwrap();
+        let want: &[u8] = b"*2\r\n$3\r\nGET\r\n$14\r\nuser:123456789\r\n\
+            *3\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n\
+            *3\r\n$3\r\nSET\r\n$14\r\nuser:123456789\r\n$8192\r\n\
+            \r\n";
+        assert_eq!(client.write_buf, want);
+    }
+
+    #[test]
+    fn one_name_leaves_the_other_at_its_default() {
+        let mut client = buffered(|b| b.set_command("X.SET"));
+        client.fire_get(KEY, 1).unwrap();
+        client.fire_set(KEY, b"v", 2).unwrap();
+        let want: &[u8] = b"*2\r\n$3\r\nGET\r\n$14\r\nuser:123456789\r\n\
+            *3\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n";
+        assert_eq!(client.write_buf, want);
+    }
+
+    #[test]
+    fn pipeline_writes_the_configured_names() {
+        let mut client = buffered(|b| b.get_command("X.GET").set_command("X.SET"));
+        let p = client.pipeline().get(KEY).set(KEY, b"v").del(KEY);
+        let want: &[u8] = b"*2\r\n$5\r\nX.GET\r\n$14\r\nuser:123456789\r\n\
+            *3\r\n$5\r\nX.SET\r\n$14\r\nuser:123456789\r\n$1\r\nv\r\n\
+            *2\r\n$3\r\nDEL\r\n$14\r\nuser:123456789\r\n";
+        assert_eq!(p.buf, want);
+    }
+
+    #[test]
+    #[should_panic(expected = "get_command name must not be empty")]
+    fn empty_get_name_panics() {
+        let conn = ringline::Connection::for_test(0, 0);
+        let _ = Client::builder(conn).get_command("");
+    }
+
+    #[test]
+    #[should_panic(expected = "set_command name must not be empty")]
+    fn empty_set_name_panics() {
+        let conn = ringline::Connection::for_test(0, 0);
+        let _ = Client::builder(conn).set_command(Vec::new());
     }
 }
