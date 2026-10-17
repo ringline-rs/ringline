@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `ringline-memcache`: a client built with `with_metrics()` and no
+  `on_result` callback records the latency of `fire_*`/`recv` operations.
+  Without the `timestamps` feature it read the clock only when a callback
+  was set, so those operations recorded `latency_ns = 0` in `ClientMetrics`
+  and `CompletedOp`. Such a client now reads the clock when an operation is
+  sent (once per batch when batching) and again when its response is
+  parsed, as the sequential API already did. Backport of #667 (#668).
+
+## [ringline-redis 0.7.1] - 2026-10-17
+
+Patch release of `ringline-redis` only, for ringline 0.6.
+
 ### Added
 
 - `ringline-redis`: `ClientBuilder::get_command` and
@@ -20,18 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   without them sends the same bytes as before: resp-proto's encoders on the
   copy paths, and a hand-written prefix that produces the same bytes on the
   guard and streaming paths. `Pool`, `ShardedClient` and `ClusterClient`
-  always send `GET` and `SET`. Backport of the main-branch change.
+  always send `GET` and `SET`.
 
 ### Fixed
 
-- `ringline-redis` and `ringline-memcache`: a client built with
-  `with_metrics()` and no `on_result` callback records the latency of
-  `fire_*`/`recv` operations. Without the `timestamps` feature it read the
-  clock only when a callback was set, so those operations recorded
-  `latency_ns = 0` in `ClientMetrics`, `CompletedOp` and redis `RespMeta`.
-  Such a client now reads the clock when an operation is sent (once per
-  batch when batching) and again when its response is parsed, as the
-  sequential API already did. Backport of #667 (#668).
+- `ringline-redis`: a client built with `with_metrics()` and no
+  `on_result` callback records the latency of `fire_*`/`recv` operations.
+  Without the `timestamps` feature it read the clock only when a callback
+  was set, so those operations recorded `latency_ns = 0` in `ClientMetrics`,
+  `CompletedOp` and `RespMeta`. Such a client now reads the clock when an
+  operation is sent (once per batch when batching) and again when its
+  response is parsed, as the sequential API already did. Backport of #667
+  (#668).
 
 ## [0.6.11] - 2026-10-14
 
