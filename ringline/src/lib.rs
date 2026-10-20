@@ -359,6 +359,8 @@ pub use runtime::io::connect;
 pub use runtime::io::connect_unix;
 /// Copy a receive view shorter than a threshold.
 pub use runtime::io::copy_small_view;
+/// Submit an fsync of a Direct I/O file and return a future for the result.
+pub use runtime::io::direct_io_fsync;
 /// Submit a Direct I/O read and return a future for the result.
 pub use runtime::io::direct_io_read;
 /// Submit a Direct I/O write and return a future for the result.
@@ -371,6 +373,8 @@ pub use runtime::io::nvme_read;
 pub use runtime::io::nvme_write;
 /// Open a Direct I/O file from any async task.
 pub use runtime::io::open_direct_io_file;
+/// Open a Direct I/O file from any async task, with open options.
+pub use runtime::io::open_direct_io_file_with;
 /// Open an NVMe device from any async task.
 pub use runtime::io::open_nvme_device;
 /// The calling worker's receive view threshold.
@@ -478,6 +482,8 @@ pub use direct_io::DirectIoConfig;
 pub use direct_io::DirectIoFile;
 /// Direct I/O operation type.
 pub use direct_io::DirectIoOp;
+/// Options for opening a direct I/O file.
+pub use direct_io::DirectIoOpenOptions;
 /// Runtime errors.
 pub use error::Error;
 /// Zero-copy send guard trait.

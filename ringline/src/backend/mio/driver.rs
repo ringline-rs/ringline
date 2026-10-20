@@ -2049,4 +2049,46 @@ pub(crate) mod tests {
             "unexpected message: {err}"
         );
     }
+
+    /// `dsync(true)` reaches the `open(2)` the mio backend makes, and the
+    /// default does not add `O_DSYNC`.
+    #[test]
+    fn open_direct_io_file_with_dsync_sets_o_dsync_on_the_fd() {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .direct_io(crate::direct_io::DirectIoConfig {
+                max_files: 2,
+                max_commands_in_flight: 4,
+            })
+            .build()
+            .expect("valid test config");
+        let (mut driver, _wake) = test_driver(&config);
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(".ringline_mio_dsync_flag");
+        std::fs::write(&path, [0u8; 4096]).unwrap();
+        let p = path.to_str().unwrap();
+        let (plain, synced) = {
+            let mut ctx = driver.make_ctx();
+            let plain = ctx.open_direct_io_file(p).expect("open plain");
+            let synced = ctx
+                .open_direct_io_file_with(
+                    p,
+                    crate::direct_io::DirectIoOpenOptions::new().dsync(true),
+                )
+                .expect("open dsync");
+            (plain, synced)
+        };
+        let fl = |index: u16| {
+            let fd = driver.direct_io_fds[index as usize].as_ref().unwrap();
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }
+        };
+        let (plain_fl, synced_fl) = (fl(plain.index), fl(synced.index));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(plain_fl & libc::O_DSYNC, 0);
+        assert_eq!(synced_fl & libc::O_DSYNC, libc::O_DSYNC);
+    }
 }

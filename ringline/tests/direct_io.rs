@@ -277,3 +277,118 @@ fn direct_io_multiple_files() {
     assert!(MULTI_FILE_DONE.load(Ordering::Acquire));
     assert!(MULTI_FILE_OK.load(Ordering::Acquire));
 }
+
+// ── O_DSYNC open, write, fsync future, read back ────────────────────
+
+static DSYNC_OUTCOME: std::sync::Mutex<Option<Result<(), String>>> = std::sync::Mutex::new(None);
+
+/// One block, aligned for `O_DIRECT`, freed on drop.
+struct Block(*mut u8);
+
+impl Block {
+    const LEN: usize = 4096;
+
+    fn filled(byte: u8) -> Self {
+        let layout = std::alloc::Layout::from_size_align(Self::LEN, Self::LEN).unwrap();
+        // SAFETY: the layout has a non-zero size.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        assert!(!ptr.is_null());
+        // SAFETY: `ptr` is valid for `LEN` bytes.
+        unsafe { std::ptr::write_bytes(ptr, byte, Self::LEN) };
+        Block(ptr)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `self.0` is valid for `LEN` bytes for the life of `self`.
+        unsafe { std::slice::from_raw_parts(self.0, Self::LEN) }
+    }
+}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::from_size_align(Self::LEN, Self::LEN).unwrap();
+        // SAFETY: allocated in `filled` with this layout.
+        unsafe { std::alloc::dealloc(self.0, layout) };
+    }
+}
+
+async fn dsync_write_fsync_read(path: &str) -> Result<(), String> {
+    let options = ringline::DirectIoOpenOptions::new().dsync(true);
+    let file = ringline::open_direct_io_file_with(path, options).map_err(|e| e.to_string())?;
+    let out = Block::filled(0xa5);
+    // SAFETY: `out` is aligned, `LEN` bytes, and outlives the await.
+    let n = unsafe { ringline::direct_io_write(file, 0, out.0, Block::LEN as u32) }
+        .map_err(|e| e.to_string())?
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    if n as usize != Block::LEN {
+        return Err(format!("wrote {n} bytes"));
+    }
+    let synced = ringline::direct_io_fsync(file)
+        .map_err(|e| e.to_string())?
+        .await
+        .map_err(|e| format!("fsync: {e}"))?;
+    if synced != 0 {
+        return Err(format!("fsync resolved to {synced}"));
+    }
+    let back = Block::filled(0);
+    // SAFETY: as for the write.
+    let n = unsafe { ringline::direct_io_read(file, 0, back.0, Block::LEN as u32) }
+        .map_err(|e| e.to_string())?
+        .await
+        .map_err(|e| format!("read: {e}"))?;
+    if n as usize != Block::LEN || back.bytes() != out.bytes() {
+        return Err(format!("read {n} bytes that differ from the write"));
+    }
+    Ok(())
+}
+
+struct DsyncHandler;
+
+impl AsyncEventHandler for DsyncHandler {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let path = temp_file_path(".krio_direct_io_dsync");
+            let outcome = dsync_write_fsync_read(path.to_str().unwrap()).await;
+            *DSYNC_OUTCOME.lock().unwrap() = Some(outcome);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        DsyncHandler
+    }
+}
+
+/// A file opened with `dsync` takes writes and reads like any other, and the
+/// fsync future resolves to `Ok(0)`.
+#[test]
+fn a_dsync_file_round_trips_and_its_fsync_future_resolves() {
+    if ringline::backend() == ringline::Backend::IoUring && !io_uring_supported() {
+        eprintln!("SKIP: io_uring not supported on this kernel");
+        return;
+    }
+    if !o_direct_supported() {
+        eprintln!("SKIP: O_DIRECT not supported on this filesystem");
+        return;
+    }
+    let path = temp_file_path(".krio_direct_io_dsync");
+    std::fs::write(&path, [0u8; Block::LEN]).unwrap();
+
+    let (shutdown, handles) = RinglineBuilder::new(direct_io_test_config())
+        .launch::<DsyncHandler>()
+        .expect("launch failed");
+    common::join_workers(&shutdown, handles);
+    let _ = std::fs::remove_file(&path);
+
+    DSYNC_OUTCOME
+        .lock()
+        .unwrap()
+        .take()
+        .expect("on_start did not finish")
+        .unwrap();
+}

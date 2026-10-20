@@ -7280,6 +7280,22 @@ pub fn open_direct_io_file(path: &str) -> io::Result<crate::direct_io::DirectIoF
     })
 }
 
+/// Open a Direct I/O file from any async task with `options` added to the
+/// flags [`open_direct_io_file()`] uses.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor.
+pub fn open_direct_io_file_with(
+    path: &str,
+    options: crate::direct_io::DirectIoOpenOptions,
+) -> io::Result<crate::direct_io::DirectIoFile> {
+    with_state(|driver, _| {
+        let mut ctx = driver.make_ctx();
+        ctx.open_direct_io_file_with(path, options)
+    })
+}
+
 /// Open an NVMe device from any async task.
 ///
 /// Returns an [`NvmeDevice`](crate::nvme::NvmeDevice) handle
@@ -7383,6 +7399,33 @@ pub unsafe fn direct_io_write(
         // caller guarantees the buffer invariants.
         #[allow(unused_unsafe)]
         let seq = unsafe { ctx.direct_io_write(file, offset, buf, len)? };
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor.wait_disk_io(seq, task_id);
+        Ok(DiskIoFuture::new(seq))
+    })
+}
+
+/// Submit an fsync of a Direct I/O file and return a future for the result.
+///
+/// The future resolves to `Ok(0)` once every write to `file` that completed
+/// before the call is on stable storage. On a Linux block device this sends
+/// the device a cache flush, which persists everything in its volatile write
+/// cache and not only this file's writes; the kernel skips the flush when the
+/// device reports a write-through cache. To make individual writes durable
+/// without flushing the whole cache, open the file with
+/// [`DirectIoOpenOptions::dsync`](crate::direct_io::DirectIoOpenOptions::dsync).
+///
+/// On io_uring the kernel runs an fsync on an io-wq worker thread.
+/// On mio it is `fsync(2)` on the disk I/O pool; on macOS that call does not
+/// flush the drive's own cache.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor.
+pub fn direct_io_fsync(file: crate::direct_io::DirectIoFile) -> io::Result<DiskIoFuture> {
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        let seq = ctx.direct_io_fsync(file)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.wait_disk_io(seq, task_id);
         Ok(DiskIoFuture::new(seq))

@@ -1848,6 +1848,16 @@ impl<'a> DriverCtx<'a> {
         &mut self,
         path: &str,
     ) -> io::Result<crate::direct_io::DirectIoFile> {
+        self.open_direct_io_file_with(path, crate::direct_io::DirectIoOpenOptions::new())
+    }
+
+    /// Open a file for direct I/O with `options` added to the flags
+    /// [`open_direct_io_file`](Self::open_direct_io_file) uses.
+    pub fn open_direct_io_file_with(
+        &mut self,
+        path: &str,
+        options: crate::direct_io::DirectIoOpenOptions,
+    ) -> io::Result<crate::direct_io::DirectIoFile> {
         let files = self
             .direct_io_files
             .as_mut()
@@ -1863,7 +1873,7 @@ impl<'a> DriverCtx<'a> {
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr(),
-                libc::O_RDWR | libc::O_DIRECT | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_DIRECT | libc::O_CLOEXEC | options.extra_flags(),
             )
         };
         if fd < 0 {
@@ -3351,6 +3361,16 @@ impl<'a> DriverCtx<'a> {
         &mut self,
         path: &str,
     ) -> io::Result<crate::direct_io::DirectIoFile> {
+        self.open_direct_io_file_with(path, crate::direct_io::DirectIoOpenOptions::new())
+    }
+
+    /// Open a file for direct I/O with `options` added to the flags
+    /// [`open_direct_io_file`](Self::open_direct_io_file) uses.
+    pub fn open_direct_io_file_with(
+        &mut self,
+        path: &str,
+        options: crate::direct_io::DirectIoOpenOptions,
+    ) -> io::Result<crate::direct_io::DirectIoFile> {
         let files = self
             .direct_io_files
             .as_mut()
@@ -3368,7 +3388,12 @@ impl<'a> DriverCtx<'a> {
         #[cfg(not(target_os = "linux"))]
         let flags = libc::O_RDWR;
 
-        let fd = unsafe { libc::open(c_path.as_ptr(), flags | libc::O_CLOEXEC) };
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                flags | libc::O_CLOEXEC | options.extra_flags(),
+            )
+        };
         if fd < 0 {
             files.release(index);
             return Err(io::Error::last_os_error());

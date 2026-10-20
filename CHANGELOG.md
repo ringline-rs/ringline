@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `direct_io_fsync` returns a future for an fsync of a direct I/O file. The
+  fsync that `DriverCtx::direct_io_fsync` submits has no future, so a task
+  could not wait for it.
+- `DirectIoOpenOptions`, with `dsync`, and `open_direct_io_file_with` on
+  `DriverCtx` and as a task function. A file opened with `dsync(true)` has
+  `O_DSYNC`, so each write completes only once its data is on stable storage
+  (on Linux).
+  On a Linux block device under io_uring, the kernel sends each write with FUA
+  when the device supports it, and does not flush the device's whole cache.
+  On a Linux block device, the mio backend's `pwrite(2)` is followed by a
+  cache flush on every write.
 - `ringline-redis`, `ringline-memcache`: `Client::recv_ready` (and
   `BinaryClient::recv_ready`) sends buffered `fire_*` requests and returns a
   future that resolves when bytes of the next reply have arrived or the

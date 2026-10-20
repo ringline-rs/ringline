@@ -29,6 +29,49 @@ pub enum DirectIoOp {
     Fsync,
 }
 
+/// Options for opening a direct I/O file, passed to
+/// [`crate::DriverCtx::open_direct_io_file_with`] and
+/// [`crate::open_direct_io_file_with`].
+///
+/// The default opens the file as
+/// [`crate::DriverCtx::open_direct_io_file`] does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectIoOpenOptions {
+    dsync: bool,
+}
+
+impl DirectIoOpenOptions {
+    /// Options that open the file as [`crate::DriverCtx::open_direct_io_file`]
+    /// does.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Open with `O_DSYNC`, so a write completes only once the kernel has sent
+    /// its data to the device (on Linux, to stable storage).
+    ///
+    /// On a Linux block device, io_uring sends each write with the FUA bit
+    /// set; when the device does not support FUA, the kernel follows the write
+    /// with a cache flush. The mio backend writes with `pwrite(2)`, and for
+    /// that call the kernel also flushes the device's cache after every write.
+    /// The kernel sends no FUA and no flush when the device reports a
+    /// write-through cache (`/sys/block/<dev>/queue/write_cache`). On a file in
+    /// a filesystem, each write also commits the metadata needed to read it
+    /// back. On macOS the write reaches the drive but the drive's own cache is
+    /// not flushed, as with `fsync(2)`.
+    #[must_use]
+    pub fn dsync(mut self, dsync: bool) -> Self {
+        self.dsync = dsync;
+        self
+    }
+
+    /// The `open(2)` flags these options add to `O_RDWR`, `O_CLOEXEC` and the
+    /// backend's direct I/O flag.
+    pub(crate) fn extra_flags(&self) -> libc::c_int {
+        if self.dsync { libc::O_DSYNC } else { 0 }
+    }
+}
+
 /// Opaque handle to an opened direct I/O file.
 ///
 /// Returned by [`crate::DriverCtx::open_direct_io_file`] and used to identify the
@@ -225,6 +268,22 @@ impl Default for DirectIoConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsync_adds_o_dsync_and_the_default_adds_nothing() {
+        assert_eq!(DirectIoOpenOptions::new().extra_flags(), 0);
+        assert_eq!(
+            DirectIoOpenOptions::new().dsync(true).extra_flags(),
+            libc::O_DSYNC
+        );
+        assert_eq!(
+            DirectIoOpenOptions::new()
+                .dsync(true)
+                .dsync(false)
+                .extra_flags(),
+            0
+        );
+    }
 
     #[test]
     fn file_table_alloc_release() {
