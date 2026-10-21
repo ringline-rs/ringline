@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sent (once per batch when batching) and again when its response is
   parsed, as the sequential API already did. Backport of #667 (#668).
 
+## [0.6.12] - 2026-10-21
+
+`ringline` 0.6.12 and `ringline-quic` 0.6.2 carry the `rustls-webpki` floor
+below.
+
 ### Security
 
 - `ringline` and `ringline-quic` require `rustls-webpki` 0.103.16 or later
