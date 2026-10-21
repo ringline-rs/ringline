@@ -408,7 +408,7 @@ These reflect deliberate owner decisions — follow them for any public-surface 
 
 ## Release Process
 
-Use the shared `release` skill from the custom-skills MCP server (it discovers this repo's mechanism from the files below; there is no in-repo release skill). `/pr` creates feature-branch PRs. Releases are **coordinated across all publishable crates**:
+Use the shared `release` skill from the custom-skills plugin (`/cs:release`; it discovers this repo's mechanism from the files below; there is no in-repo release skill). `/cs:pr` opens feature-branch PRs. Releases are **coordinated across all publishable crates**:
 
 1. Bump all package versions, the workspace `ringline` dependency requirement, AND the inter-crate exact-version requirements (http→h2, grpc→h2, h3→quic) — a stale `version = "0.x.0"` req excludes the new major and breaks publishing mid-sequence. Under 0.x a breaking release is `minor`, not `major`. The three `publish = false` crates (`ringline-bench`, `ringline-benchmarks`, `tools/doc-diagrams`) keep their own versions.
 2. Update the committed `Cargo.lock` (CI is `--locked`).
@@ -458,9 +458,14 @@ line are cut from it.
      nothing on a maintenance branch tags itself.
 - **Record it on `main` afterwards:** add the `[X.Y.Z]` section to `main`'s
   CHANGELOG as shipped, and drop its entries from `main`'s `Unreleased`.
-  `main`'s version is not touched.
+  `main`'s version does not take `X.Y.Z`; the PR bumps `-alpha.N` like any
+  other.
 - **Versions:** `main` carries the next minor as a pre-release
   (`0.7.0-alpha.N`), and the workspace `ringline` requirement matches it.
+  While `main`'s version carries `-alpha.N`, every PR to `main` other than a
+  release PR, docs-only and dependency-only ones included, bumps `N` by one
+  from the remote `main`'s value, in `ringline/Cargo.toml`, the workspace
+  requirement and `Cargo.lock`.
   Released `X.Y.Z` versions of a maintained line exist only on
   `release/X.Y.x`, so `main` never holds a version that is also published
   from a maintenance branch.
