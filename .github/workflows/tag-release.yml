@@ -19,12 +19,13 @@ jobs:
       version-manifest: ringline/Cargo.toml
       # Forks run this on their own `main` too; only the upstream repo tags.
       only-repository: ringline-rs/ringline
-      # After tagging, open a PR bumping only the core crate to the next bare
-      # patch version. Scoped to `ringline` because the satellite crates
-      # (redis, memcache, the unpublished tools) version on their own cadence
-      # and an unscoped bump would drag them to the core version; bare rather
-      # than `-alpha.0` because the workspace's `ringline = "0.6"` path
-      # requirement does not accept a prerelease.
+      # After tagging, open a PR bumping only the core crate, and the
+      # workspace's `ringline` requirement, to the next minor's first
+      # prerelease (v0.7.0 -> 0.8.0-alpha.0): main carries the next minor, and
+      # patch releases come from `release/X.Y.x`. Scoped to `ringline` because
+      # the satellite crates (redis, memcache, the unpublished tools) version
+      # on their own cadence and an unscoped bump would drag them to the core
+      # version.
       dev-bump: pr
       dev-bump-package: ringline
-      dev-bump-style: patch
+      dev-bump-style: minor-alpha
