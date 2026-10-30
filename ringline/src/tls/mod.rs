@@ -631,7 +631,7 @@ impl TlsTable {
     /// **The `+ 1` is a whole record of slack and is not optional.** rustls
     /// drains whatever is already sitting in `sendable_tls` — a TLS 1.3
     /// `key_update`, an alert — into the *front* of the same destination
-    /// buffer (0.23.41 `CommonState::write_fragments`, and
+    /// buffer (ringline-tls 0.1.1 `CommonState::write_fragments`, and
     /// `check_required_size` sizes `required_size` to include it). Its size is
     /// not a function of `plaintext_len`, and the unbuffered engine exposes no
     /// byte count for it at all: `tls_bytes_to_write` is buffered-only. So the

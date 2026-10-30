@@ -223,8 +223,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `ringline-tls` 0.1.1. On the unbuffered engine (the default), with the
+  ring or aws-lc-rs provider, a TLS 1.3 application-data send costs 1 copy
+  instead of 2: rustls seals the record in the send-pool slot (io_uring) or
+  the queued buffer (mio). On receive, rustls lends each decrypted record
+  from ringline's ciphertext buffer instead of copying it out. The buffered
+  engine and TLS 1.2 are unchanged.
 - **Breaking:** TLS and QUIC use ringline's forks of rustls and quinn-proto:
-  `ringline-tls` 0.1 (ringline-rs/rustls, rustls 0.23.46 renamed) and
+  `ringline-tls` 0.1 (ringline-rs/rustls, a fork of rustls 0.23.46) and
   `ringline-quic-proto` 0.1 (ringline-rs/quinn, quinn-proto 0.11.19 on
   ringline-tls). See `docs/rustls-quinn-forks-design.md`.
   - The builders, `TlsInfo`, `QuicConfig::builder()` and the ringline-quic
