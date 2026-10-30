@@ -349,9 +349,8 @@ pub fn flush_tls_output(
 ///
 /// `WriteTraffic::encrypt` encrypts into the slot. With the ring or aws-lc-rs
 /// provider, a TLS 1.3 record is copied once, into the slot, and sealed there
-/// (`MessageEncrypter::encrypt_into`). A
-/// TLS 1.2 record is sealed in a per-record buffer and then copied into the
-/// slot.
+/// (`MessageEncrypter::encrypt_into`). A TLS 1.2 record is sealed in a
+/// per-record buffer and then copied into the slot.
 ///
 /// On any failure every slot allocated by this call is released before
 /// returning, so a rejected send leaks nothing and nothing reaches the send

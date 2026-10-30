@@ -7,7 +7,7 @@
 //! `MessageEncrypter::encrypt_into`, which copies the plaintext into it and
 //! seals it there. TLS 1.2 records go through a per-record `PrefixedPayload`
 //! and are copied into the destination, 2 copies. The buffered engine pays 2
-//! copies on both versions. On receive,
+//! copies on both versions. On receive, on TLS 1.2 and 1.3,
 //! `ReadTraffic::next_record` lends each record from the
 //! [`super::ciphertext::CiphertextBuf`] it was decrypted in, and [`drive`]
 //! copies it into the recv accumulator (or, with no accumulator, a pending
@@ -664,9 +664,9 @@ pub(crate) const MIN_ENCRYPT_DST: usize = 64;
 /// records. Returns `(plaintext_consumed, ciphertext_written)`.
 ///
 /// With the ring or aws-lc-rs provider, a TLS 1.3 record is sealed in `dst`:
-/// the plaintext is copied once, into
-/// `dst`, and encrypted there (`MessageEncrypter::encrypt_into`). A TLS 1.2
-/// record is sealed in a per-record buffer and then copied into `dst`.
+/// the plaintext is copied once, into `dst`, and encrypted there
+/// (`MessageEncrypter::encrypt_into`). A TLS 1.2 record is sealed in a
+/// per-record buffer and then copied into `dst`.
 ///
 /// `encrypt` is all-or-nothing on its output: too small a buffer writes
 /// nothing and reports `required_size` for the payload it was handed. The
