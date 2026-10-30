@@ -1,14 +1,15 @@
 # Forking rustls and quinn-proto
 
-Status: steps 1 to 6 are done. ringline-tls 0.1.0 and ringline-quic-proto
-0.1.0 are published from ringline-rs/rustls and ringline-rs/quinn, and
-ringline, ringline-tls-config and ringline-quic use them (2026-10-29).
-ringline-tls 0.1.1 carries rustls patches 1 and 2, and ringline requires it
-(2026-10-30). Patch 1 was measured on the two-host rig: server user CPU per
-operation fell 10% at 64 KiB values, 2% at 4 KiB, and did not change at
-64 B. Patch 2 was measured in rustls-bench only: unbuffered receive
-throughput rose 11% at 4 KiB records and above, and did not change at 64 B.
-Step 7 is not started.
+Status: steps 1 to 5 are done, and step 6 is built. ringline-tls 0.1.0 and
+ringline-quic-proto 0.1.0 are published from ringline-rs/rustls and
+ringline-rs/quinn, and ringline, ringline-tls-config and ringline-quic use
+them (2026-10-29). ringline-tls 0.1.1 carries rustls patches 1 and 2, and
+ringline requires it (2026-10-30). Patch 1 was measured on the two-host rig,
+one run per size: server user CPU per operation fell 10% at 64 KiB values,
+2% at 4 KiB, and did not change at 64 B. Patch 2 was measured only in
+rustls-bench, on one pinned core: unbuffered receive throughput rose 11% at
+4 KiB and 16 KiB records, and did not change at 64 B. Its server CPU per
+operation measurement has not been run. Step 7 is not started.
 
 Apart from this status, "Security process" and the passages marked "Not
 built" or "Built", this document is the proposal as written on 2026-10-27.

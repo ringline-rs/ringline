@@ -19,7 +19,8 @@ records where *measuring* it did.
 > **This design's goal — "remove one of the two copies TLS pays on every send"
 > — cannot be met by switching to rustls' unbuffered API, and the shipped
 > feature does not meet it.** Application-data sends cost 2 copies on both
-> engines. Everything below that reasons from a 2 → 1 copy reduction is wrong,
+> engines (with upstream rustls; see the 2026-10-30 update at the end of this
+> block). Everything below that reasons from a 2 → 1 copy reduction is wrong,
 > including *Goal*, the copy table in *Design target*, *Motivation*, the
 > copy-count line in *Testing*, and the framing in *Why this is the stepping
 > stone to kTLS*. The rest of the document — `CiphertextBuf`, the state

@@ -195,9 +195,9 @@ fully zero-copy.
 | `send_parts()` with `.copy()` parts | 1 | All copy parts gathered into one pool slot. |
 | `send_parts()` with `.guard()` parts | 0 | `SendMsgZc` iovecs point at the caller's memory; the `SendGuard` is held in `InFlightSendSlab` until the kernel's notification CQE confirms the DMA. Routed through the copy path below `send_zc_threshold` (default 4096 — measured crossover is 1–4 KiB). |
 | Mixed `.copy()` + `.guard()` | 1 (copy parts only) | Copy parts → pool slot; guard parts zero-copy via iovec. |
-| Any send under TLS (buffered engine, `tls-buffered`) | 2 | Encryption must read plaintext and write ciphertext, so guard zero-copy is impossible — but rustls encrypts *directly into the pool slot* (an `io::Write` adapter over the slot in `tls/buffered.rs`), so TLS caps at one extra copy, and records are serialized through the per-connection send queue for ordering. |
-| Application-data send under TLS (unbuffered engine, the default; both backends) | 1 (TLS 1.3), 2 (TLS 1.2) | With ringline-tls 0.1.1 and the ring or aws-lc-rs provider, `WriteTraffic::encrypt` → `write_fragments` → `MessageEncrypter::encrypt_into` copies a TLS 1.3 record's plaintext into the pool slot (io_uring) or the queued `Vec` (mio) and seals it there. A TLS 1.2 record, or one from another provider, is sealed in a per-record buffer and then copied into the destination. See the correction below. |
-| TLS handshake output under the unbuffered engine, io_uring only | 2 | `EncodeTlsData::encode` needs one contiguous output buffer that can exceed a `send_copy_slot_size` slot, and takes no `io::Write`. Handshake ciphertext goes rustls → a scratch `Vec` → pool slot — one copy *more* than the buffered engine's direct `PoolWriter`. Handshake-only: application data does not go through that scratch `Vec`; it costs what the row above says. On mio there is no pool-slot step, so handshake output stays 1 copy on both engines. |
+| Any send under TLS (buffered engine, `tls-buffered`) | 2; 3 through `send_parts`/`send_chain` | Encryption must read plaintext and write ciphertext, so guard zero-copy is impossible. rustls seals each record in a per-record `PrefixedPayload`, and `write_tls` copies it into pool slots through `PoolWriter`, an `io::Write` adapter over the slot in `tls/buffered.rs` (no scratch `Vec`). `send_parts` and `send_chain` first gather their parts, guard parts included, into a `Vec` (`SendBuilder::submit_tls` and `finish_tls` on io_uring, `AsyncSendBuilder::build` on mio), one more copy. Records are serialized through the per-connection send queue for ordering. |
+| Application-data send under TLS (unbuffered engine, the default; both backends) | 1 (TLS 1.3, ring or aws-lc-rs), 2 otherwise; `send_parts`/`send_chain` +1 | With ringline-tls 0.1.1 and the ring or aws-lc-rs provider, `WriteTraffic::encrypt` → `write_fragments` → `MessageEncrypter::encrypt_into` copies a TLS 1.3 record's plaintext into the pool slot (io_uring) or the queued `Vec` (mio) and seals it there. A TLS 1.2 record, or one from another provider, is sealed in a per-record buffer and then copied into the destination. `send_parts` and `send_chain` first gather their parts, guard parts included, into a `Vec` (`SendBuilder::submit_tls` and `finish_tls` on io_uring, `AsyncSendBuilder::build` on mio), one more copy. See the correction below. |
+| TLS handshake output under the unbuffered engine, io_uring only | 2 | `EncodeTlsData::encode` needs one contiguous output buffer that can exceed a `send_copy_slot_size` slot, and takes no `io::Write`. Handshake ciphertext goes rustls → a scratch `Vec` → pool slot — one copy more than the buffered engine's direct `PoolWriter`. Handshake-only: application data does not go through that scratch `Vec`; it costs what the row above says. On mio there is no pool-slot step, so handshake output stays 1 copy on both engines. |
 | Any send on the mio backend | 1 | Zero-copy degrades: guards are consumed by copying. NVMe is unsupported and fs/direct I/O move to a thread pool. |
 
 > **Correction (2026-09-04).** The `tls-unbuffered` feature was merged (#350)
@@ -246,7 +246,7 @@ fully zero-copy.
 > `dangerous_into_kernel_connection` is public only on the unbuffered
 > connection types.
 >
-> Reaching the originally-claimed 1 copy required **rustls** to encrypt in
+> Reaching the originally-claimed 1 copy required rustls to encrypt in
 > place into `outgoing_tls`, which upstream's `write_fragments` does not do.
 > ringline-tls 0.1.1, ringline's fork of rustls, does it for TLS 1.3 with the
 > ring and aws-lc-rs providers (`MessageEncrypter::encrypt_into`), so the
@@ -255,7 +255,7 @@ fully zero-copy.
 > [`rustls-quinn-forks-design.md`](rustls-quinn-forks-design.md) and
 > [`journal/2026-09-unbuffered-tls.md`](journal/2026-09-unbuffered-tls.md).
 
-With `tls-buffered`, TLS *receive* costs 3 copies on either backend:
+With `tls-buffered`, TLS receive costs 3 copies on either backend:
 ciphertext into rustls' deframer buffer, decrypted plaintext into a per-record
 `Vec` (`CommonState::take_received_plaintext` → `Payload::into_vec`, one heap
 allocation per record), and that `Vec` into the accumulator. The unbuffered
@@ -264,7 +264,9 @@ engine with ringline-tls 0.1.1 makes no copy inside rustls:
 on unbuffered connections only. A TLS receive then costs 1 copy on io_uring,
 where the receive writes the ciphertext into `CiphertextBuf`, and 2 on mio,
 where `append` copies it there (from the code; ringline-tls's copy-count test
-measures the 0 inside rustls). `note_copied` counts only ringline's own copy.
+measures 0.00 bytes copied per plaintext byte inside rustls for TLS 1.3 with
+the ring provider; TLS 1.2 and aws-lc-rs are from the code). `note_copied`
+counts only ringline's own copy.
 
 ### Protocol clients
 

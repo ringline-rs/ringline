@@ -230,8 +230,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   buffer (mio). `send_parts` and `send_chain` gather their parts first and
   cost 2 instead of 3. On receive, rustls lends each decrypted record from
   ringline's ciphertext buffer instead of copying it out, on either TLS
-  version and with any provider. The buffered engine is unchanged; on TLS 1.2
-  `send` still costs 2 copies and `send_parts` and `send_chain` 3.
+  version and with any provider. On the unbuffered engine, TLS 1.2 (or
+  another provider) still costs 2 copies through `send` and 3 through
+  `send_parts` and `send_chain`. The buffered engine is unchanged.
 - **Breaking:** TLS and QUIC use ringline's forks of rustls and quinn-proto:
   `ringline-tls` 0.1 (ringline-rs/rustls, a fork of rustls 0.23.46) and
   `ringline-quic-proto` 0.1 (ringline-rs/quinn, quinn-proto 0.11.19 on
