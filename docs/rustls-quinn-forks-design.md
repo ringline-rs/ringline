@@ -7,9 +7,11 @@ them (2026-10-29). ringline-tls 0.1.1 carries rustls patches 1 and 2, and
 ringline requires it (2026-10-30). Patch 1 was measured on the two-host rig,
 one run per size: server user CPU per operation fell 10% at 64 KiB values,
 2% at 4 KiB, and did not change at 64 B. Patch 2 was measured only in
-rustls-bench, on one pinned core: unbuffered receive throughput rose 11% at
-4 KiB and 16 KiB records, and did not change at 64 B. Its server CPU per
-operation measurement has not been run. Step 7 is not started.
+rustls-bench, on one pinned core (`rustls-bench --api unbuffered bulk
+TLS13_AES_256_GCM_SHA384 <size>`, 11-15 interleaved pairs per size):
+unbuffered receive throughput rose 11-12% at 4 KiB and 16 KiB records, and
+did not change at 64 B. Its server CPU per operation measurement has not
+been run. Step 7 is not started.
 
 Apart from this status, "Security process" and the passages marked "Not
 built" or "Built", this document is the proposal as written on 2026-10-27.
