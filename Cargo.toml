@@ -92,7 +92,9 @@ ringline-quic-proto = { version = "0.1.0", default-features = false, features = 
 # the requirement to it (admin/ringline-raise in ringline-rs/rustls). A move
 # to a new minor version, or a raise on a maintenance branch, is done by
 # hand.
-ringline-tls = { version = "0.1.0", default-features = false }
+# Raised by ringline-rs/rustls's release workflow (admin/ringline-raise):
+# 0.1.1 is rustls 0.23.46.
+ringline-tls = { version = "0.1.1", default-features = false }
 # Upstream quinn-proto and rustls are used only by tests and the unpublished
 # benchmark crates: the tests check ringline against them, and
 # ringline-bench's connect-bench client, ringline-benchmarks' tokio
