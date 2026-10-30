@@ -1,14 +1,19 @@
 # Forking rustls and quinn-proto
 
-Status: steps 1 to 5 are done (2026-10-29): ringline-tls 0.1.0 and
-ringline-quic-proto 0.1.0 are published from ringline-rs/rustls and
-ringline-rs/quinn, and ringline, ringline-tls-config and ringline-quic use
-them. Steps 6 and 7 (the copy-removing patches) are not started.
+Status: steps 1 to 6 are done. ringline-tls 0.1.0 and ringline-quic-proto
+0.1.0 are published from ringline-rs/rustls and ringline-rs/quinn, and
+ringline, ringline-tls-config and ringline-quic use them (2026-10-29).
+ringline-tls 0.1.1 carries rustls patches 1 and 2, and ringline requires it
+(2026-10-30). Patch 1 was measured on the two-host rig: server user CPU per
+operation fell 10% at 64 KiB values, 2% at 4 KiB, and did not change at
+64 B. Patch 2 was measured in rustls-bench only: unbuffered receive
+throughput rose 11% at 4 KiB records and above, and did not change at 64 B.
+Step 7 is not started.
 
 Apart from this status, "Security process" and the passages marked "Not
 built" or "Built", this document is the proposal as written on 2026-10-27.
 Its "today" and its line references are to the tree at that time. What was
-built differs from it in three ways:
+built differs from it in four ways:
 
 - The pull request in ringline that raises the fork's requirement is opened
   by each fork's release workflow (`ringline-release.yml`,
@@ -21,6 +26,12 @@ built differs from it in three ways:
   an issue.
 - The update workflow does not run the fork's tests. They run as the pull
   request's checks.
+- Patch 2 reports the lent record's bytes in `AppDataRecord::discard`, which
+  the caller adds to `UnbufferedStatus::discard`. A record that is not read
+  is lent again from the next `process_tls_records` call; the fork checks
+  that its header and tag are unchanged and returns an error if not. A
+  caller that does not add the record's discard gets `Error::DecryptError`
+  from the next call.
 
 The owner decided on 2026-10-26 that ringline maintains its own copies of
 rustls and quinn-proto, so that it can change the TLS record layer and the

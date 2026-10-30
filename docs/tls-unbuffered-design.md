@@ -95,6 +95,13 @@ records where *measuring* it did.
 > reachable from ringline. See
 > [`journal/2026-09-unbuffered-tls.md`](journal/2026-09-unbuffered-tls.md) for
 > the GO/NO-GO verdict.
+>
+> **Update (2026-10-30).** ringline-tls 0.1.1, ringline's fork of rustls, makes
+> `write_fragments` encrypt TLS 1.3 records in place in `outgoing_tls` with the
+> ring and aws-lc-rs providers (`MessageEncrypter::encrypt_into`). On this
+> engine a TLS 1.3 application-data send now costs 1 copy; TLS 1.2 sends and
+> the buffered engine still cost 2. See
+> [`rustls-quinn-forks-design.md`](rustls-quinn-forks-design.md).
 
 ## Goal
 
