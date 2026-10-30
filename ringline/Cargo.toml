@@ -22,8 +22,9 @@ testing = []
 # `writer()`/`write_tls()`) for the TLS record layer. Without it the
 # unbuffered API (`UnbufferedConnectionCommon`) is used: rustls'
 # `dangerous_into_kernel_connection`, the path to kTLS, exists only there.
-# Application-data sends cost 2 copies on both engines (see
-# docs/tls-unbuffered-design.md).
+# Application-data sends cost 2 copies on the buffered engine. On the
+# unbuffered engine a TLS 1.3 record costs 1 and a TLS 1.2 record 2 (see
+# ringline/src/tls/unbuffered/mod.rs).
 tls-buffered = []
 # The unbuffered engine is the default; this feature has no effect and is
 # kept so existing `features = ["tls-unbuffered"]` builds still resolve.

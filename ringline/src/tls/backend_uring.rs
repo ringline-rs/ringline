@@ -21,14 +21,15 @@
 //! 16384-byte `send_copy_slot_size` — so the engine writes it to a `Vec` and
 //! [`ciphertext_to_sends`] chunks it across slots. Application data does not
 //! come through that scratch: `WriteTraffic::encrypt` writes into the slot
-//! directly. (That is not a copy saving over the buffered engine — see the
-//! `unbuffered` module docs.)
+//! directly. On TLS 1.3 that is one copy of the plaintext, against two on the
+//! buffered engine; TLS 1.2 costs two on both (see the `unbuffered` module
+//! docs).
 //!
 //! **Never drive the state machine to "flush" leftovers after encrypting or
 //! queueing an alert.** rustls' `write_fragments` drains `sendable_tls` into
 //! the *front* of the destination buffer ahead of the fragments it is about to
 //! encrypt, and `check_required_size` reserves that space (verified against
-//! rustls 0.23.41's `CommonState`). Anything already queued — a TLS 1.3
+//! ringline-tls 0.1.1's `CommonState`). Anything already queued — a TLS 1.3
 //! `key_update`, most notably — therefore rides out inside the destination,
 //! correctly ordered. Driving afterwards and queueing that output as a separate
 //! send puts it *after* those records on the wire, and the peer fails with
@@ -346,9 +347,10 @@ pub fn flush_tls_output(
 /// Encrypt application data into pool-backed sends for the per-connection send
 /// queue.
 ///
-/// This is where the copy is removed: `WriteTraffic::encrypt` reads the
-/// plaintext out of caller memory and writes the ciphertext straight into the
-/// slot, with no bounce through rustls' `sendable_plaintext`.
+/// `WriteTraffic::encrypt` encrypts into the slot. A TLS 1.3 record is copied
+/// once, into the slot, and sealed there (`MessageEncrypter::encrypt_into`). A
+/// TLS 1.2 record is sealed in a per-record buffer and then copied into the
+/// slot.
 ///
 /// On any failure every slot allocated by this call is released before
 /// returning, so a rejected send leaks nothing and nothing reaches the send

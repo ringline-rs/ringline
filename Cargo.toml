@@ -73,7 +73,7 @@ thiserror = "2"
 # resolve higher.
 ringline-quic-proto = { version = "0.1.0", default-features = false, features = ["rustls-ring"] }
 # ringline-tls (ringline-rs/rustls) is rustls 0.23 renamed; ringline and
-# ringline-tls-config depend on it. 0.1.0 is rustls 0.23.46 with
+# ringline-tls-config depend on it. It is rustls 0.23.46 with
 # rustls-webpki >= 0.103.16, past:
 #   RUSTSEC-2026-0346    Debug impls for client session values expose TLS secrets
 #   RUSTSEC-2026-0347    buffered application data sent to the outer server

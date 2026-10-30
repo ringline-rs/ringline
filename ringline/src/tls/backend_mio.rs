@@ -15,7 +15,7 @@
 //! queueing an alert.** rustls' `write_fragments` drains `sendable_tls` into
 //! the *front* of the destination buffer ahead of the fragments it is about to
 //! encrypt, and `check_required_size` reserves that space (verified against
-//! rustls 0.23.41's `CommonState`). Anything already queued — a TLS 1.3
+//! ringline-tls 0.1.1's `CommonState`). Anything already queued — a TLS 1.3
 //! `key_update`, most notably — therefore rides out inside the destination,
 //! correctly ordered. Driving afterwards and queueing that output as a
 //! separate send puts it *after* those records on the wire, and the peer fails
