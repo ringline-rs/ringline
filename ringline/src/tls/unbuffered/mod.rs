@@ -1,11 +1,13 @@
 //! Unbuffered TLS record layer, built on rustls' `UnbufferedConnectionCommon`.
 //!
 //! Encrypts via `WriteTraffic::encrypt` rather than
-//! `writer()`/`write_tls()`. With ringline-tls's ring or aws-lc-rs provider,
-//! a TLS 1.3 application-data record costs one copy:
-//! `CommonState::write_fragments` hands the destination to
-//! `MessageEncrypter::encrypt_into`, which copies the plaintext into it and
-//! seals it there. TLS 1.2 records go through a per-record `PrefixedPayload`
+//! `writer()`/`write_tls()`. With ringline-tls's ring provider, a TLS 1.3
+//! application-data record costs one copy: `CommonState::write_fragments`
+//! hands the destination to `MessageEncrypter::encrypt_into`, which copies the
+//! plaintext into it and seals it there. With aws-lc-rs on an AES-GCM suite
+//! outside FIPS mode, `encrypt_into` seals from the plaintext into the
+//! destination (`seal_out_of_place_scatter`) and copies nothing; aws-lc-rs
+//! ChaCha20-Poly1305, or aws-lc-rs in FIPS mode, copies once. TLS 1.2 records go through a per-record `PrefixedPayload`
 //! and are copied into the destination, 2 copies. The buffered engine pays 2
 //! copies on both versions. On receive, on TLS 1.2 and 1.3,
 //! `ReadTraffic::next_record` lends each record from the
@@ -664,10 +666,11 @@ pub(crate) const MIN_ENCRYPT_DST: usize = 64;
 /// Encrypt as much of `plaintext` as fits in `dst`, in one or more TLS
 /// records. Returns `(plaintext_consumed, ciphertext_written)`.
 ///
-/// With the ring or aws-lc-rs provider, a TLS 1.3 record is sealed in `dst`:
-/// the plaintext is copied once, into `dst`, and encrypted there
-/// (`MessageEncrypter::encrypt_into`). A TLS 1.2 record is sealed in a
-/// per-record buffer and then copied into `dst`.
+/// With the ring provider, a TLS 1.3 record is sealed in `dst`: the plaintext
+/// is copied once, into `dst`, and encrypted there
+/// (`MessageEncrypter::encrypt_into`). With aws-lc-rs on AES-GCM outside FIPS
+/// mode it is sealed from `plaintext` into `dst`, with no copy. A TLS 1.2
+/// record is sealed in a per-record buffer and then copied into `dst`.
 ///
 /// `encrypt` is all-or-nothing on its output: too small a buffer writes
 /// nothing and reports `required_size` for the payload it was handed. The

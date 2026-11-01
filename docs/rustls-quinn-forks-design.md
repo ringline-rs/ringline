@@ -1,8 +1,9 @@
 # Forking rustls and quinn-proto
 
-Status: steps 1 to 6 are done. ringline-tls 0.1.0 and ringline-quic-proto
-0.1.0 are published from ringline-rs/rustls and ringline-rs/quinn, and
-ringline, ringline-tls-config and ringline-quic use them (2026-10-29).
+Status: steps 1 to 6 are done, and the send half of patch 3 (step 7) is
+built. ringline-tls 0.1.0 and ringline-quic-proto 0.1.0 are published from
+ringline-rs/rustls and ringline-rs/quinn, and ringline, ringline-tls-config
+and ringline-quic use them (2026-10-29).
 ringline-tls 0.1.1 carries rustls patches 1 and 2, and ringline requires it
 (2026-10-30). Each patch was measured on the two-host rig against the build
 without it (patch 2 against patch 1 alone), one run per value size. Each run
@@ -29,7 +30,25 @@ except patch 1's at 64 KiB.
   2 raised unbuffered receive throughput 11-12% at 4 KiB and 16 KiB records
   and did not change it at 64 B.
 
-Step 7 is not started.
+ringline-tls 0.1.2 carries the send half of patch 3, and ringline requires
+it (2026-11-01). With aws-lc-rs, the TLS 1.3 AES-GCM encrypter seals a
+single-slice payload with `seal_out_of_place_scatter` from the caller's
+memory into the destination; aws-lc-rs in FIPS mode keeps the copy, because
+whether the FIPS security policy covers the out-of-place seal has not been
+checked. Decision 3 is unchanged: ringline's builders use ring, so the
+out-of-place seal applies only to a configuration built on the aws-lc-rs
+provider, with ringline-tls's `aws_lc_rs` feature, and passed through the
+escape hatches. On the rig, against ringline-tls 0.1.1 with aws-lc-rs, at a
+fixed request rate (56,000 requests/s at 64 KiB values, 3,600/s at 1 MiB)
+with four measurements of each build, it lowered server user CPU per
+operation 14.2% at 64 KiB and 16.2% at 1 MiB, and user plus system plus
+softirq 4.6% and 8.0%; at both sizes every measurement of 0.1.2 was below
+every measurement of 0.1.1 in both statistics. In a closed-loop run it did
+not change user CPU at 64 B. The receive half (`open_separate_gather` into
+the accumulator) is not built: on 2026-11-01 the owner agreed with the
+recommendation that its risks, plaintext written before the tag check and
+the inner content type arriving with the plaintext, outweigh the copy it
+would remove.
 
 Apart from this status, "Security process" and the passages marked "Not
 built" or "Built", this document is the proposal as written on 2026-10-27.

@@ -103,6 +103,8 @@ records where *measuring* it did.
 > engine a TLS 1.3 application-data send now costs 1 copy; TLS 1.2 sends and
 > the buffered engine still cost 2. See
 > [`rustls-quinn-forks-design.md`](rustls-quinn-forks-design.md).
+> ringline-tls 0.1.2 seals aws-lc-rs AES-GCM records from the caller's slice
+> outside FIPS mode, so that case costs no copy (2026-11-01).
 
 ## Goal
 

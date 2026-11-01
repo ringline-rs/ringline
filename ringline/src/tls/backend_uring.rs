@@ -23,9 +23,10 @@
 //! `Config::validate` refuses a `send_copy_slot_size` smaller than one
 //! worst-case record for the configured fragment size. Application data does
 //! not come through that scratch: `WriteTraffic::encrypt` writes into the slot
-//! directly. With the ring or aws-lc-rs provider, on TLS 1.3 that is one copy
-//! of the plaintext, against two on the buffered engine; TLS 1.2 costs two on
-//! both (see the `unbuffered` module docs).
+//! directly. With the ring provider, on TLS 1.3 that is one copy of the
+//! plaintext, against two on the buffered engine; with aws-lc-rs on AES-GCM
+//! outside FIPS mode it is none. TLS 1.2 costs two on both engines (see the
+//! `unbuffered` module docs).
 //!
 //! **Never drive the state machine to "flush" leftovers after encrypting or
 //! queueing an alert.** rustls' `write_fragments` drains `sendable_tls` into
@@ -349,10 +350,11 @@ pub fn flush_tls_output(
 /// Encrypt application data into pool-backed sends for the per-connection send
 /// queue.
 ///
-/// `WriteTraffic::encrypt` encrypts into the slot. With the ring or aws-lc-rs
-/// provider, a TLS 1.3 record is copied once, into the slot, and sealed there
-/// (`MessageEncrypter::encrypt_into`). A TLS 1.2 record is sealed in a
-/// per-record buffer and then copied into the slot.
+/// `WriteTraffic::encrypt` encrypts into the slot. With the ring provider, a
+/// TLS 1.3 record is copied once, into the slot, and sealed there
+/// (`MessageEncrypter::encrypt_into`). With aws-lc-rs on AES-GCM outside FIPS
+/// mode it is sealed from the plaintext into the slot, with no copy. A TLS 1.2
+/// record is sealed in a per-record buffer and then copied into the slot.
 ///
 /// On any failure every slot allocated by this call is released before
 /// returning, so a rejected send leaks nothing and nothing reaches the send
