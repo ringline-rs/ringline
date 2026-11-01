@@ -1850,9 +1850,9 @@ dependencies = [
 
 [[package]]
 name = "ringline-tls"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab7065ec8d039be0715dd23910845cef64d0231dbbc68045a80e0a29e95984d4"
+checksum = "2d4ee6564b812bee7374cdeaa60d019b6aee3709c2e3396452d8c3c09687a720"
 dependencies = [
  "once_cell",
  "ring",
