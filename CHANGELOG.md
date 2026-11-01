@@ -223,6 +223,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- When a `with_data` parser stops at an incomplete message, or `with_data`
+  parks with nothing buffered, an accumulator that grows through `append`
+  (every connection on mio, TLS connections on io_uring) moves the buffered
+  start of the message, at most a quarter of the capacity it has grown to,
+  to the front of its allocation. Before, a message that started near the
+  end of the allocation was moved once most of it had arrived. Over TLS,
+  bytes moved per plaintext byte fall from 0.75 to about 0.01 on both
+  backends for 64 KiB messages answered one at a time, and from 1.0 to
+  0.25-0.5 for pipelined 64 KiB frames on io_uring. In unit tests with
+  pipelined commands, in steady state, they fall from 0.87 to 0.13 for
+  64 KiB commands in 16 KiB appends, from 0.75 to 0.25 in 32 KiB appends,
+  and from 0.98 to 0.04 for 256 KiB. Commands the size of an append (4-64 KiB
+  tested) move 0.04-0.07 more per value byte. On mio, pipelined frames gain
+  in some runs and not others. `with_bytes` readers are unchanged.
 - ringline requires `ringline-tls` 0.1.2. On the unbuffered engine (the
   default), a TLS 1.3 send through `send`, `send_nowait` or
   `send_backpressured` costs 1 copy instead of 2 with the ring provider, and

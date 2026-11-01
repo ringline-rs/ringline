@@ -2553,6 +2553,9 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
             }
 
             // No data available — register as recv waiter and park.
+            driver
+                .accumulators
+                .compact_at_message_start(self.conn_index);
             park_recv(driver, executor, self.conn_index, None);
             return Poll::Pending;
         }
@@ -2587,6 +2590,9 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
         if let ParseResult::NeedAtLeast(additional) = result {
             driver.accumulators.reserve(self.conn_index, additional);
         }
+        driver
+            .accumulators
+            .compact_at_message_start(self.conn_index);
 
         // NeedMore or Consumed(0) on non-empty data: incomplete parse.
         // Check if the connection is closed (EOF with leftover partial data).
