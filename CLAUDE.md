@@ -263,7 +263,7 @@ The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parse
 | `send_parts()` with `.guard()` only | Guard memory used in-place via `SendMsgZc` iovec | 0 |
 | `send_parts()` mixed `.copy()` + `.guard()` | Copy parts → pool; guard parts zero-copy via iovec | 1 (copy parts only) |
 | Any send with TLS (buffered engine, `tls-buffered`) | rustls seals each record in a per-record `PrefixedPayload`; `write_tls` copies it into pool slots through `PoolWriter` (an `io::Write` adapter, no scratch `Vec`) on io_uring, or into the queued `Vec` on mio (`encrypt_for_send_mio_buffered`). `send_parts` and `send_chain` first gather their parts, guard parts included, into a `Vec` (`SendBuilder::submit_tls` for `send_parts` and `SendChainBuilder::copy` / `ChainPartsBuilder::add` for `send_chain` on io_uring; `AsyncSendBuilder` on mio), one more copy | 2; 3 through `send_parts`/`send_chain` |
-| Application-data send with TLS (unbuffered engine, default) | With ringline-tls 0.1.1 and the ring or aws-lc-rs provider, a TLS 1.3 record is copied once: `WriteTraffic::encrypt` → `write_fragments` → `MessageEncrypter::encrypt_into` copies the plaintext into the pool slot (io_uring) or the queued buffer (mio) and seals it there. A TLS 1.2 record, or one from another provider, is sealed in a per-record `PrefixedPayload` and then copied into the destination. `send_parts` and `send_chain` first gather their parts, guard parts included, into a `Vec` (`SendBuilder::submit_tls` for `send_parts` and `SendChainBuilder::copy` / `ChainPartsBuilder::add` for `send_chain` on io_uring; `AsyncSendBuilder` on mio), one more copy | 1 (TLS 1.3, ring or aws-lc-rs), 2 otherwise; `send_parts`/`send_chain` +1 |
+| Application-data send with TLS (unbuffered engine, default) | With ringline-tls and the ring provider, a TLS 1.3 record is copied once: `WriteTraffic::encrypt` → `write_fragments` → `MessageEncrypter::encrypt_into` copies the plaintext into the pool slot (io_uring) or the queued buffer (mio) and seals it there. With the aws-lc-rs provider on an AES-GCM suite, outside FIPS mode, `encrypt_into` seals from the caller's slice into the destination (`seal_out_of_place_scatter`) and copies none of the plaintext (AWS-LC still copies its 288-byte key context per record); aws-lc-rs ChaCha20-Poly1305, or aws-lc-rs in FIPS mode, copies once as ring does. ringline's builders use ring; aws-lc-rs needs a config passed to `TlsConfig::from_rustls`. A TLS 1.2 record, or one from another provider, is sealed in a per-record `PrefixedPayload` and then copied into the destination. `send_parts` and `send_chain` first gather their parts, guard parts included, into a `Vec` (`SendBuilder::submit_tls` for `send_parts` and `SendChainBuilder::copy` / `ChainPartsBuilder::add` for `send_chain` on io_uring; `AsyncSendBuilder` on mio), one more copy | 0 (TLS 1.3, aws-lc-rs AES-GCM outside FIPS mode), 1 (other TLS 1.3 with ring or aws-lc-rs), 2 otherwise; `send_parts`/`send_chain` +1 |
 
 The `tls-unbuffered` feature was merged (#350) claiming it took application-data
 sends from 2 copies to 1. **With upstream rustls that claim was false.**
@@ -278,10 +278,11 @@ the destination either: `WriteTraffic::encrypt` → `write_plaintext` →
 then `copy_from_slice`s the record into `outgoing_tls`. Two passes over the
 plaintext on both engines. An allocation counter inside the measured call agrees:
 263,976 bytes/op buffered vs 264,000 unbuffered at a 256 KiB payload.
-ringline-tls 0.1.1, ringline's fork of rustls, has `write_fragments` hand the
+ringline-tls, ringline's fork of rustls, has `write_fragments` hand the
 destination to `MessageEncrypter::encrypt_into`, which removes the per-record
 buffer for TLS 1.3 with the ring and aws-lc-rs providers: that path costs 1
-copy (the send table row above; `docs/rustls-quinn-forks-design.md`).
+copy, and none with aws-lc-rs on an AES-GCM suite outside FIPS mode (the send
+table row above; `docs/rustls-quinn-forks-design.md`).
 
 What the feature *does* deliver, measured in isolation on hv01 (Linux 6.12,
 rustc 1.98.1, io_uring): a small (~1–2%) send-side bookkeeping win at ≥64 KiB, a 4–8%
@@ -327,12 +328,14 @@ Minimal — `with_data()` recv (pattern-match `PONG\r\n`, no value extraction), 
 
 2. **Send buffer ownership**: Ringline must own all memory referenced by SQEs (the submission must outlive the syscall). `SendCopyPool` provides pre-allocated slots for this. `SendGuard` is the escape hatch for zero-copy — it pins user memory and holds it alive until the kernel confirms completion.
 
-3. **TLS send copies**: encryption must read plaintext and write ciphertext, so `SendGuard` zero-copy is impossible under TLS. Application data through `send` costs 2 copies on the buffered engine and for TLS 1.2; on the unbuffered engine a TLS 1.3 record costs 1 with the ring or aws-lc-rs provider. `send_parts` and `send_chain` add one gather copy (see the send table). Records are serialized through the per-connection send queue for ordering.
+3. **TLS send copies**: encryption must read plaintext and write ciphertext, so `SendGuard` zero-copy is impossible under TLS. Application data through `send` costs 2 copies on the buffered engine and for TLS 1.2; on the unbuffered engine a TLS 1.3 record costs 1 with the ring provider, and with aws-lc-rs on ChaCha20-Poly1305 or in FIPS mode; none with aws-lc-rs on AES-GCM outside FIPS mode. `send_parts` and `send_chain` add one gather copy (see the send table). Records are serialized through the per-connection send queue for ordering.
 
    The unbuffered engine (the default; the `tls-buffered` feature selects the
    buffered one) uses rustls' unbuffered API for the record layer. With
-   ringline-tls 0.1.1 it seals TLS 1.3 records in the destination (1 copy with
-   the ring or aws-lc-rs provider) and receives records lent from its
+   ringline-tls it seals TLS 1.3 records in the destination (1 copy with the
+   ring provider, and with aws-lc-rs on ChaCha20-Poly1305 or in FIPS mode;
+   none with aws-lc-rs on AES-GCM outside FIPS mode, which seals from the
+   caller's slice) and receives records lent from its
    ciphertext buffer; TLS 1.2 sends still cost 2 copies. Recv costs 1 copy on
    io_uring and 2 on mio with this engine, and 3 with the buffered one.
    Handshake ciphertext on io_uring pays one copy more than the buffered
