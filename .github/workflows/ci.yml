@@ -288,6 +288,9 @@ jobs:
       - uses: taiki-e/install-action@cargo-nextest
       - run: cargo nextest run --locked --workspace --profile ci --features force-mio
       - run: cargo test --locked --workspace --doc --features force-mio
+      # No other step runs tests with the optional compression codecs; MSRV and
+      # Doc only build them (--all-features).
+      - run: cargo nextest run --locked -p ringline-http -p ringline-grpc --profile ci --features ringline-http/compression,ringline-grpc/compression,ringline-http/force-mio
 
   test-tls-buffered:
     name: Test (tls-buffered)

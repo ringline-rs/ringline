@@ -94,7 +94,7 @@ fn decompress_gzip(data: &[u8], max_size: usize) -> Result<Vec<u8>, HttpError> {
     let decoder = flate2::read::GzDecoder::new(data);
     // `.take(n)` caps total bytes the decoder can produce. We then check
     // whether the source is exhausted; if not, the limit was hit.
-    let mut limited = decoder.take(max_size as u64 + 1);
+    let mut limited = decoder.take((max_size as u64).saturating_add(1));
     let mut buf = Vec::new();
     limited
         .read_to_end(&mut buf)
@@ -125,7 +125,7 @@ fn compress_gzip(data: &[u8]) -> Result<Vec<u8>, HttpError> {
 fn decompress_zstd(data: &[u8], max_size: usize) -> Result<Vec<u8>, HttpError> {
     use std::io::Read;
     let decoder = zstd::Decoder::new(data).map_err(|e| HttpError::Decompress(e.to_string()))?;
-    let mut limited = decoder.take(max_size as u64 + 1);
+    let mut limited = decoder.take((max_size as u64).saturating_add(1));
     let mut buf = Vec::new();
     limited
         .read_to_end(&mut buf)
@@ -149,7 +149,7 @@ fn compress_zstd(data: &[u8]) -> Result<Vec<u8>, HttpError> {
 fn decompress_brotli(data: &[u8], max_size: usize) -> Result<Vec<u8>, HttpError> {
     use std::io::Read;
     let decoder = brotli::Decompressor::new(data, 4096);
-    let mut limited = decoder.take(max_size as u64 + 1);
+    let mut limited = decoder.take((max_size as u64).saturating_add(1));
     let mut buf = Vec::new();
     limited
         .read_to_end(&mut buf)
@@ -235,6 +235,19 @@ mod tests {
         assert!(compressed.len() < 50_000, "should compress significantly");
         let result = super::decompress("gzip", &compressed, 1024);
         assert!(matches!(result, Err(crate::HttpError::MaxSizeExceeded(_))));
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn uncapped_max_size_decompresses_instead_of_wrapping() {
+        // `max_size = usize::MAX` is the uncapped setting
+        // (`set_max_decompressed_size(usize::MAX)`). The decoder limit,
+        // `max_size + 1`, must saturate rather than wrap to `take(0)`, which
+        // decodes every body as empty.
+        let original = b"payload that must survive an uncapped decompress".to_vec();
+        let compressed = super::compress("gzip", &original).unwrap();
+        let result = super::decompress("gzip", &compressed, usize::MAX).unwrap();
+        assert_eq!(result, original);
     }
 
     #[cfg(feature = "gzip")]
