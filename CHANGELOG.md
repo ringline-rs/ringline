@@ -769,6 +769,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `ringline-http`: with the decompressed-size cap turned off
+  (`set_max_decompressed_size(usize::MAX)` on `H1Conn` or `H2AsyncConn`), a
+  gzip, zstd or brotli response body decoded as empty in release builds and
+  panicked in debug builds on 64-bit targets: the decoder's limit,
+  `max_size as u64 + 1`, overflowed. The limit now saturates, as in `ringline-grpc`. CI also runs the
+  `ringline-http` and `ringline-grpc` tests with the `compression` feature.
 - mio, unbuffered TLS engine (the default): a send reserves its buffer once,
   for its ciphertext plus 128 bytes, and the queued send keeps that buffer.
   Each record used to be encrypted into a 32 KiB destination, so every send's
