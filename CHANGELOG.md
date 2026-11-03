@@ -1286,6 +1286,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection, like a write error. Series PR 4 of #318 (design:
   `docs/copied-send-reservation-design.md`).
 
+### Security
+
+- `ringline-http` and `ringline-grpc` require `zstd` 0.13.4 or later (with
+  the `zstd` or `compression` feature) for RUSTSEC-2026-0391 (data from an
+  abandoned stream leaks into the next stream on a reused context). 0.13.4
+  requires `zstd-safe` 7.4.0, which is past RUSTSEC-2026-0395 to
+  RUSTSEC-2026-0406 (use-after-free, double free, heap buffer overflow,
+  out-of-bounds reads and uninitialized memory in `zstd-safe`). The two
+  crates also require `zstd-sys` 2.1.2 for RUSTSEC-2026-0410 (WebAssembly
+  targets): `zstd-safe` 7.4.0 accepts 2.0.17, so they depend on `zstd-sys`
+  directly to carry the floor to downstream resolvers. `zstd` 0.13.4,
+  `zstd-safe` 7.4.0 and `zstd-sys` 2.1.2 are licensed BSD-3-Clause; the
+  releases they replace were MIT or MIT/Apache-2.0.
+
 ## [0.6.12] - 2026-10-21
 
 `ringline` 0.6.12 and `ringline-quic` 0.6.2 carry the `rustls-webpki` floor

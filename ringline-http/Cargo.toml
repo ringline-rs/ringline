@@ -10,7 +10,7 @@ repository.workspace = true
 
 [features]
 gzip = ["dep:flate2"]
-zstd = ["dep:zstd"]
+zstd = ["dep:zstd", "dep:zstd-sys"]
 brotli = ["dep:brotli"]
 compression = ["gzip", "zstd", "brotli"]
 # Exposes doc(hidden) entry points into the crate-private HTTP/1.1 parsers
@@ -23,7 +23,14 @@ force-mio = ["ringline/force-mio"]
 [dependencies]
 bytes = { workspace = true }
 flate2 = { version = "1", optional = true }
-zstd = { version = "0.13", optional = true, default-features = false }
+# 0.13.4 is past RUSTSEC-2026-0391 and requires zstd-safe 7.4.0, which is
+# past RUSTSEC-2026-0395 to RUSTSEC-2026-0406.
+zstd = { version = "0.13.4", optional = true, default-features = false }
+# Not used directly. zstd-safe 7.4.0 accepts zstd-sys 2.0.17; this carries
+# the 2.1.2 floor (RUSTSEC-2026-0410) to downstream resolvers.
+# default-features = false so it adds no features to the zstd-sys that
+# zstd-safe builds.
+zstd-sys = { version = "2.1.2", optional = true, default-features = false }
 brotli = { version = "7", optional = true }
 ringline = { workspace = true }
 ringline-h2 = { path = "../ringline-h2", version = "0.6.0" }
