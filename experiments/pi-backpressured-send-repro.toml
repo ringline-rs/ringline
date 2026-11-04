@@ -9,7 +9,7 @@
 # reorderings no amount of x86 confinement will produce.
 #
 # WHY A GUEST AND NOT THE BARE PI. Both, eventually, but the guest first: the
-# `debian-13-ci` image carries a Rust toolchain and an sccache pointed at delta,
+# `debian-13-6.12` image carries a Rust toolchain and an sccache pointed at delta,
 # where the bare host has no cargo on PATH at all (probe: `cargo: ABSENT`, though
 # ~/.cargo/bin exists). A cold build of the test binaries on four Cortex-A72
 # cores would cost most of an hour and occupy a Pi for it.
@@ -54,7 +54,7 @@ tags = ["pi4b"]
 [[jobs.steps]]
 type = "anvil-vm"
 shape = "a72.c"
-image = "debian-13-ci"
+image = "debian-13-6.12"
 memory_gib = 4
 gpu = false
 # Four Cortex-A72 cores build this, with sccache against delta. Generous.

@@ -51,7 +51,7 @@ rep = ["1", "2"]
 [params]
 # Update to the artifact id of a fresh `ringline cqe-by-tag build`.
 bins_artifact = "01a0ea53-0361-7393-2d9a-47a6e26eee1b"
-image         = "spool/images/debian-13-base-20260912.1@golden"
+image         = "debian-13-6.12"
 server_ip     = "172.31.0.1"
 client_ip     = "172.31.0.2"
 port          = "7878"

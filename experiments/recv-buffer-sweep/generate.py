@@ -174,7 +174,7 @@ name = "ringline recv-buffer sweep phase-{phase}w{workers} chunk-{idx}"
 
 [params]
 bins_artifact = "{bins_artifact}"
-image         = "spool/images/debian-13-base-20260912.1@golden"
+image         = "debian-13-6.12"
 proxy_ip      = "172.31.0.1"
 load_ip       = "172.31.0.2"
 port          = "7878"

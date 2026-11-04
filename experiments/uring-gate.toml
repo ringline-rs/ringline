@@ -37,7 +37,7 @@ tags = ["validation"]
 [[jobs.steps]]
 type = "anvil-vm"
 shape = "z4.c"
-image = "debian-13-ci"
+image = "debian-13-6.12"
 slots = 1
 # 4 GiB, because that is what the validation host can actually back: anvil backs
 # every guest with 1G hugepages, and `delta` has 4096 MiB of those free. Asking
