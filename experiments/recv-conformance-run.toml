@@ -20,7 +20,7 @@ tags = ["z2.baremetal"]
 type = "anvil-vm"
 mode = "start"
 shape = "z2.c"
-image = "spool/images/debian-12-base-20261008.1@golden"
+image = "spool/images/debian-12-6.1-20261008.1@golden"
 gpu = false
 boot_timeout = 600
 
@@ -78,7 +78,7 @@ upload = true
 type = "anvil-vm"
 mode = "start"
 shape = "z2.c"
-image = "spool/images/ubuntu-24.04-base-20261008.1@golden"
+image = "spool/images/ubuntu-24.04-6.8-20261008.1@golden"
 gpu = false
 boot_timeout = 600
 
@@ -119,7 +119,7 @@ upload = true
 type = "anvil-vm"
 mode = "start"
 shape = "z2.c"
-image = "spool/images/debian-13-base-20260912.1@golden"
+image = "spool/images/debian-13-6.12-20260912.1@golden"
 gpu = false
 boot_timeout = 600
 
@@ -160,7 +160,7 @@ upload = true
 type = "anvil-vm"
 mode = "start"
 shape = "z2.c"
-image = "spool/images/debian-13-ci-bpo-20261001.1@golden"
+image = "spool/images/debian-13-7.1-20261001.1@golden"
 gpu = false
 boot_timeout = 600
 

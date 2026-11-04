@@ -34,7 +34,7 @@ rep  = ["1", "2", "3"]
 [params]
 # Update to the artifact id of a fresh `ringline park rig build` before each run.
 bins_artifact = "01a0d726-860e-733a-8fe4-5b8c13937217"
-image         = "spool/images/debian-13-base-20260912.1@golden"
+image         = "spool/images/debian-13-6.12-20260912.1@golden"
 server_ip     = "172.31.0.1"
 client_ip     = "172.31.0.2"
 port          = "7878"

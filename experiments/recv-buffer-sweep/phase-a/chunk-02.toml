@@ -5,7 +5,7 @@ name = "ringline recv-buffer sweep phase-aw2 chunk-2"
 
 [params]
 bins_artifact = "01a0b0ac-b17c-73a2-6ea5-44592cdc2caa"
-image         = "spool/images/debian-13-base-20260912.1@golden"
+image         = "spool/images/debian-13-6.12-20260912.1@golden"
 proxy_ip      = "172.31.0.1"
 load_ip       = "172.31.0.2"
 port          = "7878"

@@ -62,7 +62,7 @@ rep = ["1"]
 [params]
 # Update to the artifact id of a fresh `ringline min-complete build`.
 bins_artifact = "01a0eb8b-8db4-7362-8c1a-65c630f602da"
-image         = "spool/images/debian-13-base-20260912.1@golden"
+image         = "spool/images/debian-13-6.12-20260912.1@golden"
 server_ip     = "172.31.0.1"
 client_ip     = "172.31.0.2"
 port          = "7878"
