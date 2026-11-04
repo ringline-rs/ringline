@@ -76,7 +76,7 @@ tags = ["pi4b"]
 [[jobs.steps]]
 type = "anvil-vm"
 shape = "a72.c"
-image = "debian-13-ci"
+image = "debian-13-6.12"
 memory_gib = 4
 gpu = false
 payload_timeout = 7200

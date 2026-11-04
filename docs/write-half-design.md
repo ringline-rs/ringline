@@ -91,7 +91,7 @@ through `activate`/`deactivate`.
 mio locally (fmt, clippy on default and `force-mio`, `cargo test --all` on
 both). io_uring: `cargo clippy --all-targets -- -D warnings` and `cargo test
 -p ringline` in an anvil VM on the validation host (`validation` tag,
-`z4.c`, `debian-13-ci`, build under `$HOME`) before the PR, then Linux CI.
+`z4.c`, `debian-13-6.12`, build under `$HOME`) before the PR, then Linux CI.
 
 ## Docs
 
