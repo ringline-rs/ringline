@@ -88,6 +88,13 @@ struct Args {
     /// chunk_size * threads. (ringline client only)
     #[arg(long, default_value_t = 1)]
     conn_chunk_size: usize,
+
+    /// Connect with TLS (offers 1.3 and 1.2; bench-server negotiates 1.3) on
+    /// the ring provider, accepting any server certificate
+    /// (`bench-server --tls` generates a self-signed one). (ringline client
+    /// only)
+    #[arg(long, default_value_t = false)]
+    tls: bool,
 }
 
 #[derive(Serialize)]
@@ -114,6 +121,12 @@ struct ClientReport {
     p9999_ns: u64,
     max_ns: u64,
     sample_count: u64,
+    /// Whether `--tls` was set.
+    tls: bool,
+    /// Connections whose task did not start or that failed to connect,
+    /// including a failed TLS handshake. Any makes the client exit with
+    /// status 1, as does a run that completed no operations.
+    connect_failures: u64,
 }
 
 fn main() {
@@ -130,6 +143,10 @@ fn main() {
         Runtime::Tokio => "tokio",
     };
 
+    if args.tls && args.runtime != Runtime::Ringline {
+        eprintln!("error: --tls requires --runtime ringline");
+        std::process::exit(2);
+    }
     if args.open && args.rate == 0 {
         eprintln!("error: --open requires --rate > 0");
         std::process::exit(2);
@@ -171,6 +188,7 @@ fn main() {
         threads,
         open,
         args.conn_chunk_size,
+        args.tls,
     );
 
     let report = ClientReport {
@@ -191,6 +209,8 @@ fn main() {
         p9999_ns: result.latency.p9999_ns,
         max_ns: result.latency.max_ns,
         sample_count: result.latency.count,
+        tls: args.tls,
+        connect_failures: result.connect_failures,
     };
 
     // JSON to stdout for machine consumption.
@@ -206,4 +226,16 @@ fn main() {
         report.p999_ns as f64 / 1000.0,
         report.sample_count,
     );
+
+    if report.connect_failures > 0 {
+        eprintln!(
+            "bench-client: {} of {} connections did not start or failed to connect",
+            report.connect_failures, report.clients
+        );
+        std::process::exit(1);
+    }
+    if report.total_ops == 0 {
+        eprintln!("bench-client: no operations completed");
+        std::process::exit(1);
+    }
 }

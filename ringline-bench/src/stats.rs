@@ -77,6 +77,10 @@ pub struct BenchResult {
     pub total_ops: u64,
     pub latency: LatencyStats,
     pub cpu_ns: u64,
+    /// Connections whose task did not start or that failed to connect
+    /// (including a failed TLS handshake). Counted by the ringline client; 0
+    /// from the tokio client.
+    pub connect_failures: u64,
 }
 
 /// Read process CPU time (user + system) from /proc/self/stat.
