@@ -268,6 +268,9 @@ mod ringline_client {
     };
 
     use super::OpenLoop;
+    // ringline's fork of rustls, which `TlsClientConfig::from_rustls` takes;
+    // this crate's own `rustls` dependency is upstream rustls.
+    use ringline::tls_config::rustls;
 
     /// Shared state passed into ringline worker tasks.
     pub struct ClientState {
@@ -299,6 +302,12 @@ mod ringline_client {
         /// CO-corrected response time (recv - scheduled).
         pub svc: Arc<Mutex<Vec<Vec<u64>>>>,
         pub lag: Arc<Mutex<Vec<Vec<u64>>>>,
+        /// Connect with TLS, accepting any server certificate (bench-server
+        /// generates a self-signed one at startup).
+        pub tls: bool,
+        /// Connections whose task did not start or that failed to connect,
+        /// including a failed TLS handshake.
+        pub connect_failures: Arc<AtomicU64>,
     }
 
     struct ClientHandler {
@@ -338,19 +347,17 @@ mod ringline_client {
                             break;
                         }
                         let s = state.clone();
-                        match s.open {
-                            Some(ol) => {
-                                spawn(async move {
-                                    run_ringline_open_client(s, ol).await;
-                                })
-                                .ok();
-                            }
-                            None => {
-                                spawn(async move {
-                                    run_ringline_client(s).await;
-                                })
-                                .ok();
-                            }
+                        let spawned = match s.open {
+                            Some(ol) => spawn(async move {
+                                run_ringline_open_client(s, ol).await;
+                            }),
+                            None => spawn(async move {
+                                run_ringline_client(s).await;
+                            }),
+                        };
+                        if spawned.is_err() {
+                            eprintln!("  ringline client task for connection {idx} not spawned");
+                            state.connect_failures.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     chunk_start += num_workers * chunk;
@@ -371,13 +378,77 @@ mod ringline_client {
 
     static GLOBAL_STATE: Mutex<Option<Arc<ClientState>>> = Mutex::new(None);
 
+    /// Connect to the target, with TLS when `state.tls` is set.
+    async fn connect_to(state: &ClientState) -> std::io::Result<Connection> {
+        let f = connect(state.target);
+        if state.tls {
+            f.tls("localhost").await
+        } else {
+            f.await
+        }
+    }
+
+    /// Accepts any certificate. Only used against bench-server's self-signed
+    /// certificate.
+    #[derive(Debug)]
+    struct NoVerify;
+
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// A client TLS config that accepts any server certificate, on the ring
+    /// provider.
+    fn no_verify_tls_config() -> ringline::TlsClientConfig {
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS versions")
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+        .with_no_client_auth();
+        ringline::TlsClientConfig::from_rustls(std::sync::Arc::new(config))
+    }
+
     async fn run_ringline_client(state: Arc<ClientState>) {
         let msg_size = state.msg_size;
 
-        let conn = match connect(state.target).await {
+        let conn = match connect_to(&state).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("  ringline client connect failed: {e}");
+                state.connect_failures.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
@@ -454,10 +525,11 @@ mod ringline_client {
     /// wake targets the owning task), and a separate spawned task is the
     /// *sender* (fire-and-forget `send_nowait`, never awaits recv).
     async fn run_ringline_open_client(state: Arc<ClientState>, ol: OpenLoop) {
-        let conn = match ringline::connect(state.target).await {
+        let conn = match connect_to(&state).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("  ringline client connect failed: {e}");
+                state.connect_failures.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
@@ -584,6 +656,21 @@ mod ringline_client {
             // Read before `state` is moved into GLOBAL_STATE below.
             let clients = state.num_clients;
             let inflight = state.open.as_ref().map_or(1, |o| o.max_inflight.max(1));
+            // Closed loop sends `depth` messages in one `send_nowait`.
+            let send_len = if state.open.is_some() {
+                msg_size
+            } else {
+                msg_size.saturating_mul(state.depth.max(1))
+            };
+            let tls = state.tls;
+            // The most connections one worker owns: `on_start` hands
+            // workers chunks of `conn_chunk_size` in turn, so none gets more
+            // than ceil(clients / (workers x chunk)) chunks.
+            let chunk = state.conn_chunk_size.max(1);
+            let per_worker = clients
+                .div_ceil(workers.max(1).saturating_mul(chunk))
+                .saturating_mul(chunk)
+                .min(clients);
 
             *GLOBAL_STATE.lock().unwrap() = Some(state);
 
@@ -596,10 +683,25 @@ mod ringline_client {
             // actually requested.
             let max_conns = (clients as u32).next_power_of_two().max(4096);
 
-            // One slot per in-flight message per connection, doubled for
-            // headroom, floored at the old value so small runs are unchanged.
-            let want_slots = clients
+            // Without TLS a slot is the message size rounded up to a power
+            // of two, and a send takes one slot per message in it. With TLS
+            // the slot holds one whole record (16448 is ringline's default
+            // `send_copy_slot_size`; the unbuffered engine needs 16413 for a
+            // 16 KiB fragment). On io_uring a TLS send takes one slot per
+            // 16 KiB of plaintext, and admission needs one slot more. mio's
+            // `send_nowait` does not use the pool.
+            let (slot, per_msg) = if tls {
+                (16448u32, send_len.div_ceil(16384) + 1)
+            } else {
+                let slot = msg_size.next_power_of_two().max(256);
+                (slot as u32, send_len.div_ceil(slot))
+            };
+            // Each worker has its own pool: the slots of each in-flight send
+            // on the worker's connections, doubled for headroom, floored at
+            // the old value so small runs are unchanged.
+            let want_slots = per_worker
                 .saturating_mul(inflight)
+                .saturating_mul(per_msg)
                 .saturating_mul(2)
                 .max(32768);
             // `send_copy_count` is a u16, so the pool cannot exceed 65535 slots
@@ -607,23 +709,27 @@ mod ringline_client {
             // a clamped pool is exactly the condition that produced the
             // collapse above, and it must not look like a server result.
             let slots = want_slots.min(u16::MAX as usize);
-            if slots < want_slots {
+            if cfg!(has_io_uring) && slots < want_slots {
                 eprintln!(
-                    "bench-client: WARNING send-copy pool clamped to {slots} slots \
-                     (wanted {want_slots} for {clients} conns x {inflight} in-flight). \
-                     Only {:.1} slots/conn — the client may bound this measurement.",
-                    slots as f64 / clients as f64
+                    "bench-client: WARNING send-copy pool clamped to {slots} slots per worker \
+                     (wanted {want_slots}: {per_worker} conns x {inflight} in-flight x \
+                     {per_msg} slots/send x 2) — the client may bound this measurement."
                 );
             }
 
-            let config = ConfigBuilder::new()
+            let mut builder = ConfigBuilder::new()
                 .workers(workers)
                 .pin_to_core(false)
                 .sq_entries(4096)
                 .max_connections(max_conns)
-                .send_pool(slots as u16, msg_size.next_power_of_two().max(256) as u32)
-                .build()
-                .expect("valid config");
+                .send_pool(slots as u16, slot)
+                // One task per connection plus `on_start`'s; at the default
+                // of 256, `spawn` fails for every connection past it.
+                .standalone_task_capacity((per_worker + 1).max(256) as u32);
+            if tls {
+                builder = builder.tls_client(no_verify_tls_config());
+            }
+            let config = builder.build().expect("valid config");
 
             // Client-only mode: no bind address.
             let (shutdown, handles) = RinglineBuilder::new(config).launch::<ClientHandler>()?;
@@ -657,6 +763,8 @@ fn wait_for_server(addr: &str) {
 /// `open` selects open-loop (rate-controlled) mode; `None` is the closed-loop
 /// request/response loop. `conn_chunk_size` controls how many connections are
 /// assigned to each ringline worker before moving to the next (1 = round-robin).
+/// `tls` connects with TLS and accepts any server certificate; ringline client
+/// only (panics with the tokio client).
 #[allow(clippy::too_many_arguments)]
 pub fn run_bench(
     addr: &str,
@@ -669,7 +777,12 @@ pub fn run_bench(
     workers: usize,
     open: Option<OpenLoop>,
     conn_chunk_size: usize,
+    tls: bool,
 ) -> BenchResult {
+    assert!(
+        ringline_client || !tls,
+        "TLS is implemented for the ringline client only"
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let ops = Arc::new(AtomicU64::new(0));
 
@@ -688,6 +801,7 @@ pub fn run_bench(
             workers,
             open,
             conn_chunk_size,
+            tls,
         )
     } else {
         run_bench_tokio(
@@ -802,6 +916,7 @@ fn run_bench_tokio(
         total_ops,
         latency: merged.finalize(),
         cpu_ns: cpu_after.saturating_sub(cpu_before),
+        connect_failures: 0,
     }
 }
 
@@ -838,11 +953,13 @@ fn run_bench_ringline(
     workers: usize,
     open: Option<OpenLoop>,
     conn_chunk_size: usize,
+    tls: bool,
 ) -> BenchResult {
     let histograms = Arc::new(Mutex::new(Vec::new()));
     let svc = Arc::new(Mutex::new(Vec::new()));
     let lag = Arc::new(Mutex::new(Vec::new()));
     let measure = Arc::new(AtomicBool::new(false));
+    let connect_failures = Arc::new(AtomicU64::new(0));
 
     let state = Arc::new(ringline_client::ClientState {
         target: addr.parse().expect("invalid addr for ringline client"),
@@ -858,6 +975,8 @@ fn run_bench_ringline(
         open,
         svc: svc.clone(),
         lag: lag.clone(),
+        tls,
+        connect_failures: connect_failures.clone(),
     });
 
     let client_rt = match ringline_client::RinglineClientRuntime::start(state, workers.max(1)) {
@@ -869,6 +988,7 @@ fn run_bench_ringline(
                 total_ops: 0,
                 latency: LatencyHistogram::new().finalize(),
                 cpu_ns: 0,
+                connect_failures: connect_failures.load(Ordering::Relaxed),
             };
         }
     };
@@ -921,5 +1041,6 @@ fn run_bench_ringline(
         total_ops,
         latency: merged.finalize(),
         cpu_ns: cpu_after.saturating_sub(cpu_before),
+        connect_failures: connect_failures.load(Ordering::Relaxed),
     }
 }
