@@ -73,8 +73,9 @@ and acceptor are absent, and workers begin through `on_start`.
 The acceptor assigns connections in configurable chunks. Its primary worker is
 `(connection_count / conn_chunk_size) % worker_count`; if that worker's bounded
 queue is full or disconnected, it tries adjacent workers. It never blocks on a
-full channel. If every live worker is full, it closes the newly accepted
-descriptor so accepted descriptors cannot accumulate without bound.
+full channel in that pass. If every live worker is full, it holds the
+connection and blocks until a queue has room, so further connections stay in the
+kernel's listen queue.
 
 A task waker encodes a connection index, or a standalone task index with
 `STANDALONE_BIT`, in its low 32 bits, and its worker's id in the high 32. Woken

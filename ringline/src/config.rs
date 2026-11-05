@@ -80,7 +80,7 @@ pub struct Config {
     pub(crate) max_registered_regions: u16,
     /// Worker/thread configuration.
     pub(crate) worker: WorkerConfig,
-    /// TCP listen backlog.
+    /// TCP listen backlog. The kernel caps it at `net.core.somaxconn`.
     pub(crate) backlog: i32,
     /// Maximum number of direct file descriptors (connections).
     pub(crate) max_connections: u32,
@@ -116,9 +116,8 @@ pub struct Config {
     /// first use. See `ConfigBuilder::prefault_buffers`.
     pub(crate) prefault_buffers: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its
-    /// queue fast enough, the acceptor will skip past it (and possibly
-    /// close the incoming fd if every worker is full) rather than
-    /// accumulating fds without backpressure. Default: 1024.
+    /// queue fast enough, the acceptor skips past it, and if every worker is
+    /// full it stops accepting until one has room. Default: 1024.
     pub(crate) accept_queue_capacity: usize,
     /// Number of connections assigned to each worker before moving to the
     /// next one. `1` (the default) gives classic round-robin. Higher values
@@ -368,7 +367,7 @@ impl Default for Config {
             registered_regions: Vec::new(),
             max_registered_regions: 64,
             worker: WorkerConfig::default(),
-            backlog: 1024,
+            backlog: 65535,
             max_connections: 16000,
             recv_accumulator_capacity: 4096,
             recv_accumulator_max: 1024 * 1024 * 1024,
@@ -735,7 +734,11 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the TCP listen backlog.
+    /// Set the TCP listen backlog. Default: 65535.
+    ///
+    /// The kernel caps the value at `net.core.somaxconn`, so the default leaves
+    /// that sysctl as the bound. A connection the backlog has no room for is
+    /// retried by the peer's TCP, which adds a second or more to its connect.
     pub fn backlog(mut self, n: i32) -> Self {
         self.config.backlog = n;
         self
@@ -749,6 +752,10 @@ impl ConfigBuilder {
     }
 
     /// Set the bound on the per-worker accept channel. Default: 1024.
+    ///
+    /// When every worker's channel is full, the acceptor stops accepting until
+    /// one has room, and connections wait in the listen queue
+    /// ([`backlog`](Self::backlog)).
     pub fn accept_queue_capacity(mut self, n: usize) -> Self {
         self.config.accept_queue_capacity = n;
         self

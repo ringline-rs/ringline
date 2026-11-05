@@ -200,13 +200,13 @@ fn failure_report(
     use ringline::metrics::{CONNECTIONS, RING, conn, ring};
     let counters = format!(
         "process counters: accepted {}, closed {}, dropped at accept (table full {}, \
-         register failed {}, acceptor backlog {}); io_uring: SQE submit \
+         register failed {}), accept queue full {}; io_uring: SQE submit \
          failures {}, recv arm failures {}, close submit failures {}",
         CONNECTIONS.value(conn::ACCEPTED).unwrap_or(0),
         CONNECTIONS.value(conn::CLOSED).unwrap_or(0),
         CONNECTIONS.value(conn::ACCEPT_TABLE_FULL).unwrap_or(0),
         CONNECTIONS.value(conn::ACCEPT_REGISTER_FAILED).unwrap_or(0),
-        CONNECTIONS.value(conn::ACCEPT_BACKLOG_DROPPED).unwrap_or(0),
+        CONNECTIONS.value(conn::ACCEPT_QUEUE_FULL).unwrap_or(0),
         RING.value(ring::SQE_SUBMIT_FAILURES).unwrap_or(0),
         RING.value(ring::RECV_ARM_FAILURES).unwrap_or(0),
         RING.value(ring::CLOSE_SUBMIT_FAILURES).unwrap_or(0),

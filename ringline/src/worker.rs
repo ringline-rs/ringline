@@ -376,8 +376,9 @@ impl Runtime {
     ///
     /// On Linux the listeners stop accepting at once. A listener's sockets
     /// close, and its port is free, once the threads accepting on it have
-    /// exited: its acceptor thread, which exits at once, or in merged accept
-    /// mode the workers. This `Runtime` does not hold them open. On macOS a
+    /// exited: its acceptor thread, which exits at once, or within 100 ms if it
+    /// is holding a connection no worker has room for, or in merged accept mode
+    /// the workers. This `Runtime` does not hold them open. On macOS a
     /// blocked acceptor thread exits only when a peer connects, and the
     /// listener keeps its port until then (#560).
     pub fn shutdown(&self) {
@@ -1085,9 +1086,9 @@ impl RinglineBuilder {
         for _ in 0..num_threads {
             // Bounded so a slow worker applies backpressure on the acceptor
             // rather than queuing fds indefinitely. On full, the acceptor
-            // tries the next worker; if every worker is full, the connection
-            // is dropped, which closes it, so the peer sees EOF instead of
-            // the listen queue overflowing.
+            // tries the next worker; if every worker is full, it stops
+            // accepting until one has room, which leaves connections in the
+            // kernel's listen queue.
             let (tx, rx) = crossbeam_channel::bounded::<crate::acceptor::AcceptedConn>(
                 self.config.accept_queue_capacity,
             );

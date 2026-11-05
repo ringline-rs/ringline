@@ -129,13 +129,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `ringline-redis`, `ringline-memcache`, `ringline-ping`:
   `CommandResult::ttlb_ns`, the time from the operation's start to the
   arrival of the response's last byte.
-- Three connection counters (`ringline/connections`, `op` label) count three
-  ways an accepted connection can be closed before it reaches a handler:
-  `accept_table_full` (the worker's connection table was full),
-  `accept_register_failed` (the worker could not register the socket), and
-  `accept_backlog_dropped` (the acceptor thread found every worker's accept
-  queue full). On Linux, a client that has already sent data sees these
-  closes as a connection reset (#598).
+- Two connection counters (`ringline/connections`, `op` label) count two ways
+  an accepted connection can be closed before it reaches a handler:
+  `accept_table_full` (the worker's connection table was full) and
+  `accept_register_failed` (the worker could not register the socket). On
+  Linux, a client that has already sent data sees these closes as a connection
+  reset (#598). A third, `accept_queue_full`, counts the times the acceptor
+  thread found every worker's accept queue full and waited for room (#658).
 
 - `ConfigBuilder::iowq_max_workers` caps the threads in each worker's
   bounded io-wq pool. The kernel sizes that pool at
@@ -837,6 +837,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The acceptor thread no longer closes a connection when every worker's accept
+  queue is full. It holds the connection until a queue has room, so later
+  connections wait in the kernel's listen queue. A burst of 10,000 connections
+  against one worker had lost 1,955 of them this way, each seeing a successful
+  connect and then EOF or a reset. `ConfigBuilder::backlog` now defaults to
+  65535 instead of 1024, which leaves `net.core.somaxconn` as the bound (#658).
 - io_uring: a UDP socket with no reader no longer stops the worker's other UDP
   sockets receiving, and no longer pins the worker at 100% CPU. 128 datagrams
   at an unread socket emptied the default ring, which all the worker's sockets
