@@ -242,8 +242,8 @@ the borrows do not overlap there.
 `Drop` for `SendHalf` and `RecvHalf` only clears the claim flag, so dropping an
 outbound `Connection`, or a client built on one, leaves the socket open and the
 slot occupied. An accepted connection is closed when its task ends. An outbound
-one is not. Removing `ConnCtx` and `DriverCtx` removes the only ways to close a dropped
-outbound connection. One downstream load generator keeps a `ConnCtx` in a guard to close
+one is not. Removing `ConnCtx` and `DriverCtx` removes the only ways to close a
+dropped outbound connection. One downstream load generator keeps a `ConnCtx` in a guard to close
 the connection on every exit from its reconnect loop.
 
 The removal does not force a runtime change. That crate can wrap the client in a
@@ -273,10 +273,11 @@ to a spawned task.
   `poll_ready_tasks` on io_uring, which today calls `drop(fut)` and then
   `close_connection`. It calls `close_connection` first, because a half owned by
   a top-level `Select` is dropped after `catch_unwind` returns, when `panicking()`
-  is false. Spawned tasks do not get this: the standalone arm has no connection
-  index, and `spawn_with_handle` catches the panic inside the task. A last half
-  owned by a top-level `Select` in a spawned task therefore closes gracefully, and
-  the peer receives close_notify. Mio has one close path, and `finish_close`
+  is false. Spawned tasks and outbound connections do not get this: the standalone
+  arm has no connection index, `spawn_with_handle` catches the panic inside the
+  task, and the connection arm closes only the task's own index. A last half of
+  either kind owned by a top-level `Select` therefore closes gracefully, and the
+  peer receives close_notify. Mio has one close path, and `finish_close`
   attempts the alert there, as it does today.
 - Park sets `socket_handed_off`, closes, and only then drops the task, so the drop
   finds the connection closing, or the generation changed, and does nothing. Mio
@@ -338,6 +339,6 @@ Each step is one PR, and all are breaking.
 adds a dated note to `connection-handle-ownership-design.md` pointing here.
 
 No step adds work per send or receive. Step 3 removes one `make_ctx` per loop
-iteration on io_uring and two on mio. Step 6 adds a flag check to each half drop, and two
-`Orphan` pushes to each teardown that drops a parked task, on both backends. These are per connection, so
+iteration on io_uring and two on mio. Step 6 adds a flag check to each half drop, and two `Orphan`
+pushes to each teardown that drops a parked task, on both backends. These are per connection, so
 step 6 is measured with a connection-churn run.
