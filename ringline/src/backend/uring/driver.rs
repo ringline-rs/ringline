@@ -113,10 +113,21 @@ pub(crate) enum DirectRecvBuf {
 }
 
 impl Driver {
+    /// Whether a connection that forwards its receive buffers should stop
+    /// receiving: it holds `forward_hold_cap` send slab entries, and the slab
+    /// is over half used. A connection alone on the worker can queue as much as
+    /// half the slab, because a peer that writes a large batch before reading
+    /// is not stuck, and holding it would stall both sides for good.
+    pub(crate) fn forward_recv_over_cap(&self, conn_index: u32) -> bool {
+        let generation = self.connections.generation(conn_index);
+        self.send_slab.over_half_used()
+            && self.send_slab.held_by(conn_index, generation) >= self.forward_hold_cap
+    }
+
     /// Arm a direct receive on `conn_index` if it is a direct connection (a
     /// plaintext TCP or Unix connection) or a TLS connection, open, and has
-    /// none in flight, and no park of it is pending. Called by a
-    /// receive future that parks, after its parser has seen every buffered
+    /// none in flight, no park of it is pending, and `forward_recv_over_cap` does
+    /// not hold it. Called by a receive future that parks, after its parser has seen every buffered
     /// byte: the receive detaches the accumulator's buffer, so arming earlier
     /// would hide buffered bytes from the parser until more arrive. A TLS
     /// connection's receive writes up to `recv_direct_region` bytes of
@@ -155,6 +166,17 @@ impl Driver {
         // that worker. The reader stays parked, and an abandoned park wakes
         // it (`rearm_direct_after_park`).
         if self.park_pending(conn_index) {
+            return false;
+        }
+        // A peer that does not read keeps these slab entries. Receiving no more
+        // closes its window, and `resume_forward_recvs` arms the receive when
+        // that changes.
+        let ci = conn_index as usize;
+        if self.forwards_recv_buf[ci] && self.forward_recv_over_cap(conn_index) {
+            if !self.forward_recv_held[ci] {
+                self.forward_recv_held[ci] = true;
+                self.forward_recv_held_conns.push(conn_index);
+            }
             return false;
         }
         let generation = cs.generation;
@@ -377,6 +399,19 @@ pub(crate) struct Driver {
     /// reports consuming, because the forward already removed those bytes
     /// (see `ConnCtx::forward_recv_buf`).
     pub(crate) forward_zc_consumed: Vec<u32>,
+    /// Send slab entries a connection that forwards its receive buffers may
+    /// hold before it stops receiving, once the slab is over half used. See
+    /// `ConfigBuilder::forward_hold_cap`.
+    pub(crate) forward_hold_cap: usize,
+    /// Per-connection: a `forward_recv_buf` of the whole accumulator has
+    /// queued a send.
+    pub(crate) forwards_recv_buf: Vec<bool>,
+    /// Per-connection: a parked read found `forward_recv_over_cap` true and
+    /// armed no receive, so the peer's window closes.
+    pub(crate) forward_recv_held: Vec<bool>,
+    /// The connections with `forward_recv_held` set, rechecked each loop
+    /// iteration.
+    pub(crate) forward_recv_held_conns: Vec<u32>,
     /// Per-connection receive arrival log (`recv::arrival`).
     pub(crate) arrival: Vec<crate::recv::arrival::ArrivalLog>,
     /// The current completion batch, whose time the arrival logs record. A
@@ -979,6 +1014,10 @@ impl Driver {
             send_slab,
             accumulators,
             forward_zc_consumed: vec![0; config.max_connections as usize],
+            forward_hold_cap: config.forward_hold_cap,
+            forwards_recv_buf: vec![false; config.max_connections as usize],
+            forward_recv_held: vec![false; config.max_connections as usize],
+            forward_recv_held_conns: Vec::new(),
             arrival: (0..config.max_connections)
                 .map(|_| crate::recv::arrival::ArrivalLog::default())
                 .collect(),
@@ -1185,6 +1224,8 @@ impl Driver {
     /// reset the next occupant's first send parks behind a completion that
     /// will never come.
     pub(crate) fn reset_send_state(&mut self, conn_index: u32) {
+        self.forwards_recv_buf[conn_index as usize] = false;
+        self.forward_recv_held[conn_index as usize] = false;
         let state = &mut self.send_queues[conn_index as usize];
         // Queued-but-unsubmitted sends from the previous occupant hold
         // pool/slab resources; no SQE was submitted for them, so no CQE

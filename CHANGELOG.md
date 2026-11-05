@@ -844,6 +844,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `forward_recv_buf` on a plaintext connection is throttled on io_uring. A
+  connection holding `forward_hold_cap` send slab entries while the worker's slab
+  is over half used stops receiving until that changes, so a peer that does not
+  read is stopped by its own TCP window. Before, such peers could take the
+  worker's 512 slab entries, after which every guarded send on the worker failed
+  with `send slab exhausted`. A peer that writes more before reading than half
+  the slab can queue, or more than the cap while other connections keep the slab
+  over half used, now stalls until it reads or that changes. Five stuck peers on
+  a worker can still fill the slab at the default cap, and further peers are then
+  not held (#733).
 - macOS: an acceptor thread exits at shutdown within about 100 ms. It used to
   stay blocked in `accept` until a peer connected, and its listener kept the
   port until then (#560).

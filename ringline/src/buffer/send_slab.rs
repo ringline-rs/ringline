@@ -18,6 +18,11 @@ pub(crate) const MAX_GUARDS: usize = 8;
 pub struct InFlightSendSlab {
     entries: Vec<InFlightSendEntry>,
     free_list: Vec<u16>,
+    /// Entries in use by each connection, by connection index, as the
+    /// generation the count belongs to and the count. Entries of an earlier
+    /// occupant of the slot, which can wait for notifications after it closes,
+    /// do not count against the next. Grows to the highest index seen.
+    held: Vec<(u32, u16)>,
 }
 
 struct InFlightSendEntry {
@@ -96,7 +101,11 @@ impl InFlightSendSlab {
             });
         }
         let free_list: Vec<u16> = (0..capacity).rev().collect();
-        InFlightSendSlab { entries, free_list }
+        InFlightSendSlab {
+            entries,
+            free_list,
+            held: Vec::new(),
+        }
     }
 
     /// Allocate a slot, store iovecs/guards, and return (slab_index, msghdr_ptr).
@@ -148,7 +157,9 @@ impl InFlightSendSlab {
         entry.msghdr.msg_iov = entry.iovecs.as_mut_ptr();
         entry.msghdr.msg_iovlen = entry.iov_count as _;
 
-        Some((idx, &entry.msghdr as *const libc::msghdr))
+        let msghdr = &entry.msghdr as *const libc::msghdr;
+        self.count_held(conn_index, generation);
+        Some((idx, msghdr))
     }
 
     /// Allocate a slot for a coalesced (non-ZC) send: one `sendmsg` whose iovecs
@@ -200,7 +211,9 @@ impl InFlightSendSlab {
         entry.msghdr.msg_iov = entry.iovecs.as_mut_ptr();
         entry.msghdr.msg_iovlen = entry.iov_count as _;
 
-        Some((idx, &entry.msghdr as *const libc::msghdr))
+        let msghdr = &entry.msghdr as *const libc::msghdr;
+        self.count_held(conn_index, generation);
+        Some((idx, msghdr))
     }
 
     /// The coalesced (non-ZC) pool slots backing this entry, to be released into
@@ -319,6 +332,11 @@ impl InFlightSendSlab {
         debug_assert!(entry.in_use);
 
         let pool_slot = entry.pool_slot;
+        if let Some((generation, held)) = self.held.get_mut(entry.conn_index as usize)
+            && *generation == entry.generation
+        {
+            *held = held.saturating_sub(1);
+        }
 
         // Drop all guards
         for g in entry.guards.iter_mut() {
@@ -340,6 +358,33 @@ impl InFlightSendSlab {
 
         self.free_list.push(idx);
         pool_slot
+    }
+
+    /// Entries the connection holds, including those that wait for a
+    /// zero-copy notification.
+    pub fn held_by(&self, conn_index: u32, generation: u32) -> usize {
+        match self.held.get(conn_index as usize) {
+            Some(&(counted, held)) if counted == generation => held as usize,
+            _ => 0,
+        }
+    }
+
+    fn count_held(&mut self, conn_index: u32, generation: u32) {
+        let index = conn_index as usize;
+        if index >= self.held.len() {
+            self.held.resize(index + 1, (0, 0));
+        }
+        let (counted, held) = &mut self.held[index];
+        if *counted != generation {
+            *counted = generation;
+            *held = 0;
+        }
+        *held += 1;
+    }
+
+    /// Whether more than half the entries are in use.
+    pub fn over_half_used(&self) -> bool {
+        self.free_list.len() * 2 < self.entries.len()
     }
 
     /// Whether a send error on this coalesced entry closes its connection:
@@ -419,6 +464,73 @@ impl InFlightSendSlab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slots_next_occupant_does_not_inherit_its_entries() {
+        let mut slab = InFlightSendSlab::new(4);
+        let iov = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }];
+        let held = |slab: &mut InFlightSendSlab, generation| {
+            slab.allocate(
+                0,
+                generation,
+                &iov,
+                u16::MAX,
+                [const { None }; MAX_GUARDS],
+                0,
+                4,
+            )
+            .expect("a free entry")
+            .0
+        };
+        let old = held(&mut slab, 1);
+        assert_eq!(slab.held_by(0, 1), 1);
+        assert_eq!(slab.held_by(0, 2), 0);
+
+        // The old occupant's entry is released after the next one starts.
+        let new = held(&mut slab, 2);
+        assert_eq!(slab.held_by(0, 2), 1);
+        slab.release(old);
+        assert_eq!(slab.held_by(0, 2), 1);
+        slab.release(new);
+        assert_eq!(slab.held_by(0, 2), 0);
+    }
+
+    #[test]
+    fn over_half_used_on_an_odd_size() {
+        let iov = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }];
+        for (size, first_true) in [(1, 1), (3, 2), (5, 3)] {
+            let mut slab = InFlightSendSlab::new(size);
+            for used in 1..=size {
+                slab.allocate(0, 0, &iov, u16::MAX, [const { None }; MAX_GUARDS], 0, 4)
+                    .expect("a free entry");
+                assert_eq!(
+                    slab.over_half_used(),
+                    used >= first_true,
+                    "{used} of {size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn over_half_used_is_past_the_midpoint() {
+        let mut slab = InFlightSendSlab::new(4);
+        let iov = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }];
+        for used in 1..=3 {
+            slab.allocate(0, 0, &iov, u16::MAX, [const { None }; MAX_GUARDS], 0, 4)
+                .expect("a free entry");
+            assert_eq!(slab.over_half_used(), used == 3);
+        }
+    }
     use crate::buffer::fixed::RegionId;
     use crate::guard::SendGuard;
     use std::sync::Arc;
