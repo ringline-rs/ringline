@@ -121,7 +121,6 @@ impl ProvidedBufRing {
     }
 
     /// Buffers currently available in the ring for the kernel to select.
-    #[cfg(test)]
     pub fn free(&self) -> u32 {
         self.ring_entries().saturating_sub(self.outstanding)
     }

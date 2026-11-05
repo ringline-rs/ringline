@@ -358,12 +358,16 @@ pub(crate) struct Driver {
     pub(crate) ring: Ring,
     pub(crate) connections: ConnectionTable,
     pub(crate) fixed_buffers: FixedBufferRegistry,
-    /// Provided buffer ring backing UDP multishot recvmsg. `None` when no UDP
-    /// sockets are configured.
-    pub(crate) udp_provided_bufs: Option<ProvidedBufRing>,
-    /// Buffer IDs from `udp_provided_bufs` that have been consumed and need
-    /// to be handed back to the kernel. Drained each tick.
-    pub(crate) udp_pending_replenish: Vec<u16>,
+    /// Provided buffer rings backing UDP multishot recvmsg, one per socket and
+    /// indexed like `udp_sockets`. A socket that runs out of buffers stops
+    /// reading, and the others are unaffected.
+    pub(crate) udp_provided_bufs: Vec<ProvidedBufRing>,
+    /// `(udp_index, bid)` of buffers that have been consumed and need to be
+    /// handed back to the kernel. Drained each loop pass.
+    pub(crate) udp_pending_replenish: Vec<(u32, u16)>,
+    /// Sockets to re-arm: their multishot ended with `ENOBUFS` and waits for a
+    /// buffer, or an earlier re-arm could not be submitted.
+    pub(crate) udp_awaiting_buffers: Vec<u32>,
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_slab: InFlightSendSlab,
     pub(crate) accumulators: AccumulatorTable,
@@ -854,15 +858,15 @@ impl Driver {
             FixedBufferRegistry::new(&config.registered_regions, config.max_registered_regions);
 
         let udp_count = config.udp_bind.len() as u32;
-        let udp_provided_bufs = if udp_count > 0 {
-            Some(ProvidedBufRing::new(
-                config.udp_recv_buffer.bgid,
-                config.udp_recv_buffer.ring_size,
-                config.udp_recv_buffer.buffer_size,
-            )?)
-        } else {
-            None
-        };
+        let udp_provided_bufs = (0..udp_count)
+            .map(|i| {
+                ProvidedBufRing::new(
+                    config.udp_recv_buffer.bgid + i as u16,
+                    config.udp_recv_buffer.ring_size,
+                    config.udp_recv_buffer.buffer_size,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let nvme_max = config
             .nvme
             .as_ref()
@@ -880,7 +884,7 @@ impl Driver {
         ring.register_files_sparse(
             config.max_connections + udp_count + nvme_max + direct_io_max + fs_max,
         )?;
-        if let Some(ref udp_bufs) = udp_provided_bufs {
+        for udp_bufs in &udp_provided_bufs {
             ring.register_buf_ring(udp_bufs)?;
         }
 
@@ -970,6 +974,7 @@ impl Driver {
             fixed_buffers,
             udp_provided_bufs,
             udp_pending_replenish: Vec::new(),
+            udp_awaiting_buffers: Vec::new(),
             send_copy_pool,
             send_slab,
             accumulators,
@@ -1096,12 +1101,12 @@ impl Driver {
 
         // Arm multishot recv for each UDP socket against the UDP buffer
         // group. One SQE per socket stays live in the kernel and fans out a
-        // CQE per datagram until the buffer ring is exhausted. Connected
+        // CQE per datagram until the socket's buffer ring is exhausted. Connected
         // sockets use the lighter `RecvUdp` opcode (no recvmsg metadata);
         // unconnected sockets use `RecvMsgUdp` so the kernel returns the
         // peer address in each CQE buffer.
-        let udp_bgid = config.udp_recv_buffer.bgid;
         for udp_idx in 0..driver.udp_sockets.len() {
+            let udp_bgid = driver.udp_provided_bufs[udp_idx].bgid();
             let fd_index = driver.udp_sockets[udp_idx].fd_index;
             let result = if driver.udp_sockets[udp_idx].connected_peer.is_some() {
                 let ud = UserData::encode(OpTag::RecvUdp, udp_idx as u32, 0);
@@ -2295,14 +2300,55 @@ impl Driver {
         }
     }
 
-    /// Re-arm the UDP multishot recvmsg for a socket. The completion handlers
-    /// call it at once when the kernel ends the multishot, including on
-    /// `ENOBUFS`.
-    pub(crate) fn rearm_udp_recvmsg(&mut self, udp_index: u32, bgid: u16) {
+    /// Handle the end of a socket's UDP multishot. `ENOBUFS` waits for a buffer,
+    /// because a re-arm on an empty ring returns `ENOBUFS` at once. `ECANCELED`
+    /// is a quiet teardown during shutdown.
+    pub(crate) fn on_udp_recv_ended(&mut self, udp_index: u32, errno: i32) {
+        match errno {
+            libc::ECANCELED => {}
+            libc::ENOBUFS => {
+                crate::metrics::POOL.increment(crate::metrics::pool::BUFFER_RING_EMPTY);
+                self.udp_awaiting_buffers.push(udp_index);
+            }
+            _ => self.rearm_udp_recvmsg(udp_index),
+        }
+    }
+
+    /// Return consumed buffers to their rings, and re-arm the sockets that were
+    /// waiting for one.
+    pub(crate) fn return_udp_buffers(&mut self) {
+        for (udp_index, bid) in self.udp_pending_replenish.drain(..) {
+            self.udp_provided_bufs[udp_index as usize].replenish_batch(&[bid]);
+        }
+        let mut awaiting = std::mem::take(&mut self.udp_awaiting_buffers);
+        awaiting.retain(|&udp_index| {
+            let free = self.udp_provided_bufs[udp_index as usize].free() > 0;
+            if free {
+                self.rearm_udp_recvmsg(udp_index);
+            }
+            !free
+        });
+        awaiting.append(&mut self.udp_awaiting_buffers);
+        self.udp_awaiting_buffers = awaiting;
+    }
+
+    /// Whether a socket is left to re-arm with a buffer free for it: its re-arm
+    /// failed in `return_udp_buffers`, and the worker should retry, not block.
+    pub(crate) fn udp_rearm_due(&self) -> bool {
+        self.udp_awaiting_buffers
+            .iter()
+            .any(|&udp_index| self.udp_provided_bufs[udp_index as usize].free() > 0)
+    }
+
+    /// Re-arm the UDP multishot recvmsg for a socket. A submission that fails
+    /// stays in `udp_awaiting_buffers`, for `return_udp_buffers` to retry once
+    /// the ring has a free buffer.
+    pub(crate) fn rearm_udp_recvmsg(&mut self, udp_index: u32) {
         let idx = udp_index as usize;
         if idx >= self.udp_sockets.len() {
             return;
         }
+        let bgid = self.udp_provided_bufs[idx].bgid();
         // Reset msg_namelen in case the kernel cleared it during teardown.
         self.udp_sockets[idx].recv_msghdr.msg_namelen =
             std::mem::size_of::<libc::sockaddr_storage>() as u32;
@@ -2318,6 +2364,7 @@ impl Driver {
         };
         if result.is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+            self.udp_awaiting_buffers.push(udp_index);
         }
     }
 
@@ -2536,14 +2583,14 @@ impl Driver {
             }
         }
 
-        // 4. Unregister the UDP provided buffer ring before Driver is dropped
+        // 4. Unregister the UDP provided buffer rings before Driver is dropped
         // (which munmaps the ring memory). Unregistering releases the
         // kernel's pin on the ring pages; the error and panic exits skip it,
         // which is safe for the reason given at `UringEngine::register_buf_ring`.
-        if let Some(ref udp_bufs) = self.udp_provided_bufs
-            && self.ring.unregister_buf_ring(udp_bufs.bgid()).is_err()
-        {
-            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+        for udp_bufs in &self.udp_provided_bufs {
+            if self.ring.unregister_buf_ring(udp_bufs.bgid()).is_err() {
+                crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+            }
         }
 
         // The eventfd is owned by `WakeHandle` (`WakeFdInner` closes it when
@@ -2767,7 +2814,7 @@ mod field_order_tests {
             .find("pub(crate) ring: Ring,")
             .expect("Driver::ring field signature not found — was it renamed?");
         let provided_pos = src
-            .find("pub(crate) udp_provided_bufs: Option<ProvidedBufRing>,")
+            .find("pub(crate) udp_provided_bufs: Vec<ProvidedBufRing>,")
             .expect("Driver::udp_provided_bufs field signature not found");
         let send_slab_pos = src
             .find("pub(crate) send_slab: InFlightSendSlab,")

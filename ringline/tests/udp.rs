@@ -11,11 +11,13 @@ use ringline::ConfigBuilder;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use ringline::{AsyncEventHandler, Config, Connection, ParseResult, RinglineBuilder, UdpSendError};
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -1771,9 +1773,9 @@ fn udp_max_size_loopback_datagram() {
 
 /// Handler that *blocks* on an atomic flag before calling `recv_from`,
 /// then drains and echoes everything in a tight loop. With a tiny
-/// `udp_recv_buffer.ring_size`, we can deterministically force the
-/// kernel's multishot recvmsg to hit `ENOBUFS` while the handler is
-/// blocked — then unblock and verify the worker recovers and processes
+/// `udp_recv_buffer.ring_size`, a burst makes the kernel's multishot
+/// recvmsg hit `ENOBUFS` while the handler is blocked — then unblock and
+/// verify the worker recovers and processes
 /// the surviving datagrams. Using a flag (not a sleep-per-recv) makes
 /// the test robust to debug-vs-release-mode timing.
 struct BlockedThenEcho {
@@ -1803,10 +1805,8 @@ impl AsyncEventHandler for BlockedThenEcho {
         Some(Box::pin(async move {
             started.fetch_add(1, Ordering::SeqCst);
             // Yield the executor until the test signals us to start
-            // draining. While we're here, the kernel piles up datagrams
-            // in our io_uring buffer ring (and beyond, in the socket's
-            // kernel queue) — and once the buffer ring is empty, the
-            // multishot recvmsg returns ENOBUFS and is torn down.
+            // draining. While we're here, datagrams take the 4-slot ring, and
+            // later ones wait in the kernel receive buffer.
             while !unblock.load(Ordering::SeqCst) {
                 let _ = ringline::sleep(Duration::from_millis(2)).await;
             }
@@ -1854,9 +1854,8 @@ fn udp_recv_ring_exhaustion_under_burst() {
         .set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
 
-    // While the handler is blocked, fire a flood. The kernel will fill
-    // our 4-slot buffer ring and then return ENOBUFS for everything
-    // else, tearing down the multishot.
+    // While the handler is blocked, fire a flood. It empties the 4-slot
+    // ring, which ends the multishot with ENOBUFS.
     for i in 0..200u32 {
         let payload = format!("burst-{i:04}");
         let _ = client.send_to(payload.as_bytes(), addr);
@@ -1864,9 +1863,8 @@ fn udp_recv_ring_exhaustion_under_burst() {
     // Give the kernel a moment to deliver as many as it can.
     std::thread::sleep(Duration::from_millis(100));
 
-    // Now release the handler. It should recover (the multishot will
-    // be re-armed once buffers replenish) and echo whatever is still
-    // in the kernel queue.
+    // Now release the handler. It should recover and echo whatever is
+    // still queued.
     BLOCKED_UNBLOCK.get().unwrap().store(true, Ordering::SeqCst);
 
     let mut received = 0;
@@ -1887,22 +1885,11 @@ fn udp_recv_ring_exhaustion_under_burst() {
     let buf_empty_after = ringline::metrics::POOL
         .value(ringline::metrics::pool::BUFFER_RING_EMPTY)
         .unwrap_or(0);
-    let _ = buf_empty_before;
-    let _ = buf_empty_after;
+    assert!(
+        buf_empty_after > buf_empty_before,
+        "the flood should have emptied the ring"
+    );
 
-    // The core property under test is that the worker survives the
-    // burst and resumes processing once the consumer unblocks.
-    //
-    // We deliberately do NOT assert `BUFFER_RING_EMPTY` ticked: the
-    // event loop replenishes recv buffers immediately after each CQE
-    // batch, so the kernel only catches an empty ring during a
-    // narrow scheduling window. Whether that window opens depends on
-    // kernel version, build profile, and machine load — assertions
-    // about it are flaky in CI even with a 4-slot ring and a fully
-    // blocked consumer. The metric is still useful for operators
-    // (it points at undersized rings under sustained burst), but the
-    // test that pins it down would have to inject failure into the
-    // replenisher to be deterministic.
     assert!(
         received >= 1,
         "expected the worker to recover after the burst and \
@@ -2842,6 +2829,279 @@ fn a_half_moved_after_an_abandoned_receive_still_receives() {
     let mut buf = [0u8; 16];
     let (n, _) = client.recv_from(&mut buf).expect("echo");
     assert_eq!(&buf[..n], b"moved");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+// ── One provided ring per socket ───────────────────────────────────────
+
+/// Handler that leaves its first two UDP sockets unread and echoes on the third.
+struct UnreadThenEcho {
+    bound: Arc<AtomicUsize>,
+    echo: UdpEcho,
+}
+
+static UNREAD_BOUND: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+
+impl AsyncEventHandler for UnreadThenEcho {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(id: usize) -> Self {
+        UnreadThenEcho {
+            bound: UNREAD_BOUND.get_or_init(Default::default).clone(),
+            echo: UdpEcho::create_for_worker(id),
+        }
+    }
+    fn on_udp_bind(
+        &self,
+        udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        if self.bound.fetch_add(1, Ordering::SeqCst) < 2 {
+            return None;
+        }
+        self.echo.on_udp_bind(udp)
+    }
+}
+
+#[test]
+fn undrained_udp_sockets_leave_their_sibling_receiving() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_echo_started();
+    UNREAD_BOUND
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+
+    let (shutdown, handles) = RinglineBuilder::new(base_config())
+        .bind_udp("127.0.0.1:0".parse().unwrap())
+        .bind_udp("127.0.0.1:0".parse().unwrap())
+        .bind_udp("127.0.0.1:0".parse().unwrap())
+        .launch::<UnreadThenEcho>()
+        .expect("launch");
+    let bound = shutdown.bound_udp_addrs();
+    await_handler_started(ECHO_STARTED.get().unwrap());
+
+    // Each flood is larger than the default ring of 128 buffers.
+    let flooder = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for addr in &bound[..2] {
+        for _ in 0..200 {
+            flooder.send_to(b"x", addr.unwrap()).unwrap();
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    for _ in 0..4 {
+        client.send_to(b"ping", bound[2].unwrap()).unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = client
+            .recv_from(&mut buf)
+            .expect("the read socket should still receive");
+        assert_eq!(&buf[..n], b"ping");
+    }
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// Handler that catches a panic from the receive callback of the method
+/// `PANIC_MODE` selects, and reads again, counting each panic.
+struct PanicInCallback {
+    panics: Arc<AtomicUsize>,
+}
+
+static CALLBACK_PANICS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+static PANIC_MODE: AtomicUsize = AtomicUsize::new(0);
+
+impl AsyncEventHandler for PanicInCallback {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        PanicInCallback {
+            panics: CALLBACK_PANICS.get_or_init(Default::default).clone(),
+        }
+    }
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let panics = self.panics.clone();
+        Some(Box::pin(async move {
+            loop {
+                let mode = PANIC_MODE.load(Ordering::SeqCst);
+                let result = match mode {
+                    0 => {
+                        let read = udp.with_datagram(|_, _| -> () { panic!("callback") });
+                        AssertUnwindSafe(read).catch_unwind().await
+                    }
+                    1 => {
+                        let read = udp.recv_batch(8, |_, _| panic!("callback"));
+                        AssertUnwindSafe(read).catch_unwind().await.map(drop)
+                    }
+                    _ => {
+                        let read = udp.recv_batch_timed(8, |_, _, _| panic!("callback"));
+                        AssertUnwindSafe(read).catch_unwind().await.map(drop)
+                    }
+                };
+                assert!(result.is_err(), "the callback should have panicked");
+                panics.fetch_add(1, Ordering::SeqCst);
+            }
+        }))
+    }
+}
+
+/// A callback that panics returns its datagram's buffer: more panics than the
+/// ring has buffers would otherwise leave the socket unable to receive.
+#[test]
+fn a_panicking_udp_callback_returns_its_buffer() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let panics = CALLBACK_PANICS.get_or_init(Default::default);
+    for mode in 0..3 {
+        PANIC_MODE.store(mode, Ordering::SeqCst);
+        panics.store(0, Ordering::SeqCst);
+        let cfg = base_config_builder()
+            .udp_recv_buffer(4, 256)
+            .build()
+            .expect("valid config");
+        let (shutdown, handles) = RinglineBuilder::new(cfg)
+            .bind_udp("127.0.0.1:0".parse().unwrap())
+            .launch::<PanicInCallback>()
+            .expect("launch");
+        let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for sent in 1..=8 {
+            client.send_to(b"x", addr).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while panics.load(Ordering::SeqCst) < sent {
+                assert!(
+                    Instant::now() < deadline,
+                    "mode {mode}: datagram {sent} was never read"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        shutdown.shutdown();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+    }
+}
+
+/// Handler that reads nothing until `LAG_RELEASE` is set, then records payloads.
+#[cfg(has_io_uring)]
+struct LaggingReader {
+    started: Arc<AtomicUsize>,
+}
+
+#[cfg(has_io_uring)]
+static LAG_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+#[cfg(has_io_uring)]
+static LAG_RELEASE: AtomicBool = AtomicBool::new(false);
+#[cfg(has_io_uring)]
+static LAG_RECEIVED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for LaggingReader {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        LaggingReader {
+            started: LAG_STARTED.get_or_init(Default::default).clone(),
+        }
+    }
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        Some(Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            while !LAG_RELEASE.load(Ordering::SeqCst) {
+                ringline::sleep(Duration::from_millis(2)).await;
+            }
+            loop {
+                let (data, _) = udp.recv_from().await;
+                LAG_RECEIVED.lock().unwrap().push(data);
+            }
+        }))
+    }
+}
+
+/// A socket out of buffers stops reading and does not spin. Datagrams past the
+/// ring wait in the kernel receive buffer, and a late reader gets all of them.
+/// The socket is not the first, so that a buffer drawn from another socket's
+/// ring shows up as a wrong payload.
+#[cfg(has_io_uring)]
+#[test]
+fn a_socket_out_of_buffers_waits_for_its_reader() {
+    const BURST: usize = 200;
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    LAG_STARTED
+        .get_or_init(Default::default)
+        .store(0, Ordering::SeqCst);
+    LAG_RELEASE.store(false, Ordering::SeqCst);
+    LAG_RECEIVED.lock().unwrap().clear();
+
+    // No tick, so that nothing but the re-arm wakes the worker after the last
+    // buffer returns.
+    let cfg = base_config_builder()
+        .tick_timeout_us(0)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(cfg)
+        .bind_udp("127.0.0.1:0".parse().unwrap())
+        .bind_udp("127.0.0.1:0".parse().unwrap())
+        .launch::<LaggingReader>()
+        .expect("launch");
+    let addr = shutdown.bound_udp_addrs()[1].expect("bound UDP address");
+    let started = LAG_STARTED.get().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while started.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < deadline, "UDP handlers did not start");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let ring_empty = || {
+        ringline::metrics::POOL
+            .value(ringline::metrics::pool::BUFFER_RING_EMPTY)
+            .unwrap_or(0)
+    };
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let sent: Vec<Vec<u8>> = (0..BURST).map(|i| format!("{i:04}").into_bytes()).collect();
+    for payload in &sent {
+        client.send_to(payload, addr).unwrap();
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let ring_empty_before = ring_empty();
+    assert!(ring_empty_before > 0, "the burst should exhaust the ring");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        ring_empty(),
+        ring_empty_before,
+        "the worker should not re-arm until a buffer returns"
+    );
+
+    LAG_RELEASE.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while LAG_RECEIVED.lock().unwrap().len() < BURST && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(*LAG_RECEIVED.lock().unwrap(), sent);
 
     shutdown.shutdown();
     for h in handles {

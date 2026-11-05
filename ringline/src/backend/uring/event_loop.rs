@@ -184,12 +184,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         )?;
         // On io_uring the recv queue holds kernel ring buffer bids
         // (`PendingUdpBuf::Kernel`), so each queued datagram pins one
-        // provided buffer until the task consumes it. Capacity beyond the
-        // ring size is physically unusable: the ring starves (ENOBUFS)
-        // before the queue ever fills, and the drop accounting never
-        // fires. Clamp so overflow is an observable drop instead of a
-        // silent stall. (The mio backend copies into owned buffers and
-        // keeps the full configured depth.)
+        // buffer of its socket's provided ring until the task consumes it.
+        // Capacity beyond the ring size is unusable: the ring runs out first.
+        // (The mio backend copies into owned buffers and keeps the full
+        // configured depth.)
         let udp_queue_capacity = config
             .udp_recv_queue_capacity
             .min(config.udp_recv_buffer.ring_size as usize);
@@ -376,6 +374,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // next completion; the wait below submits any timer cancels.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
             self.executor.collect_wakeups();
+            // Tasks have read what they will read in this pass. The wait below
+            // submits any re-arm, so a socket that ran out of buffers receives
+            // again without another completion to wake the worker.
+            self.driver.return_udp_buffers();
             // A task polled in the second pass may have consumed the bytes
             // ahead of a hangup; peek before blocking rather than at the next
             // completion.
@@ -447,15 +449,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 self.driver.run_shutdown();
                 return Ok(());
-            }
-
-            // Return the UDP buffers consumed since the last pass to the UDP
-            // provided buffer ring, when one is configured.
-            if !self.driver.udp_pending_replenish.is_empty()
-                && let Some(ref mut udp_bufs) = self.driver.udp_provided_bufs
-            {
-                udp_bufs.replenish_batch(&self.driver.udp_pending_replenish);
-                self.driver.udp_pending_replenish.clear();
             }
 
             // Drain pending region-registry updates dispatched from
@@ -947,7 +940,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Whether the run loop may block in `submit_and_wait(1)`. It may not while a
     /// task is runnable, while a close released by the orphan drain awaits the
-    /// end-of-iteration drain, or once shutdown is pending.
+    /// end-of-iteration drain, while a UDP re-arm is due, or once shutdown is
+    /// pending.
     ///
     /// Pending closes: `release_orphans` at the top of the iteration can push to
     /// `pending_finalize_closes`, and only the drain at the end of the iteration
@@ -960,11 +954,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// after `flush()`, and the eventfd read is not re-armed once
     /// `shutdown_flag` is set. With no tick timeout, a blocking wait would
     /// never return in either case.
+    ///
+    /// UDP re-arms: `return_udp_buffers` retries a re-arm that could not be
+    /// submitted, and with no tick timeout a blocking wait could outlast every
+    /// other completion.
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
         self.executor.ready_queue.is_empty()
             && self.driver.pending_finalize_closes.is_empty()
+            && !self.driver.udp_rearm_due()
             && !shutting_down
     }
 
@@ -3720,37 +3719,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let has_more = cqueue::more(flags);
 
         if idx >= self.driver.udp_sockets.len() {
-            // Stale socket. If a buffer was attached, hand it back so it
-            // doesn't leak out of the ring.
-            if result > 0
-                && let Some(bid) = cqueue::buffer_select(flags)
-            {
-                // Count the handout so the replenish's occupancy decrement is
-                // balanced. `replenish_batch` only decrements when the ring is
-                // Some, so guard the increment the same way.
-                if let Some(r) = self.driver.udp_provided_bufs.as_mut() {
-                    r.on_handout();
-                }
-                self.driver.udp_pending_replenish.push(bid);
-            }
             return;
         }
 
-        // udp_sockets is non-empty → udp_provided_bufs is Some.
-        let udp_bgid = match self.driver.udp_provided_bufs.as_ref() {
-            Some(r) => r.bgid(),
-            None => return,
-        };
-
         if result <= 0 {
             let errno = -result;
-            // If the multishot was torn down, rearm so the socket stays
-            // live. ECANCELED is a quiet teardown during shutdown; skip.
-            if !has_more && errno != libc::ECANCELED {
-                if errno == libc::ENOBUFS {
-                    metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
-                }
-                self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
+            if !has_more {
+                self.driver.on_udp_recv_ended(udp_index, errno);
             }
             return;
         }
@@ -3759,31 +3734,31 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             Some(b) => b,
             None => {
                 if !has_more {
-                    self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
+                    self.driver.rearm_udp_recvmsg(udp_index);
                 }
                 return;
             }
         };
         // The bid is checked out of the UDP ring; account it against occupancy so
         // `free()` and the double-replenish tripwire stay accurate. It is
-        // replenished exactly once — immediately below on a parse/drop, or when
+        // replenished exactly once — queued below on a parse/drop, or when
         // the consumer reads the queued datagram.
-        self.driver.udp_provided_bufs.as_mut().unwrap().on_handout();
+        self.driver.udp_provided_bufs[idx].on_handout();
 
         // SAFETY: The buffer pointer belongs to the UDP provided buffer ring
         // and remains valid until we replenish the bid below.
         let buf_len = result as u32;
         let buf = {
-            let udp_bufs = self.driver.udp_provided_bufs.as_ref().unwrap();
+            let udp_bufs = &self.driver.udp_provided_bufs[idx];
             let (buf_ptr, _) = udp_bufs.get_buffer(bid);
             unsafe { std::slice::from_raw_parts(buf_ptr, buf_len as usize) }
         };
 
         // Parse the recvmsg header out of the kernel buffer. If parsing fails
         // (or the datagram is truncated, or the queue is full) the bid is
-        // returned to the ring immediately. Otherwise the bid travels with the
-        // queue entry and is replenished when the consumer reads it — that's
-        // what makes the recv path zero-copy.
+        // queued for return at once. Otherwise the bid travels with the queue
+        // entry and is replenished when the consumer reads it — that's what
+        // makes the recv path zero-copy.
         let parse_result = crate::backend::uring::abi::RecvMsgOut::parse(
             buf,
             &self.driver.udp_sockets[idx].recv_msghdr,
@@ -3847,11 +3822,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if !handed_to_queue {
-            self.driver.udp_pending_replenish.push(bid);
+            self.driver.udp_pending_replenish.push((udp_index, bid));
         }
 
         if !has_more {
-            self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
+            self.driver.rearm_udp_recvmsg(udp_index);
         }
     }
 
@@ -3903,24 +3878,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let has_more = cqueue::more(flags);
 
         if idx >= self.driver.udp_sockets.len() {
-            if result > 0
-                && let Some(bid) = cqueue::buffer_select(flags)
-            {
-                // Count the handout so the replenish's occupancy decrement is
-                // balanced. `replenish_batch` only decrements when the ring is
-                // Some, so guard the increment the same way.
-                if let Some(r) = self.driver.udp_provided_bufs.as_mut() {
-                    r.on_handout();
-                }
-                self.driver.udp_pending_replenish.push(bid);
-            }
             return;
         }
-
-        let udp_bgid = match self.driver.udp_provided_bufs.as_ref() {
-            Some(r) => r.bgid(),
-            None => return,
-        };
 
         if result <= 0 {
             // Defensive: a zero-length datagram (or an error CQE on some
@@ -3929,18 +3888,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // until ENOBUFS (a remote peer sending empty datagrams could
             // drain the ring entirely).
             if let Some(bid) = cqueue::buffer_select(flags) {
-                // The ring is Some here (guarded by the `udp_bgid` match above).
                 // Count the handout so the replenish's occupancy decrement is
                 // balanced.
-                self.driver.udp_provided_bufs.as_mut().unwrap().on_handout();
-                self.driver.udp_pending_replenish.push(bid);
+                self.driver.udp_provided_bufs[idx].on_handout();
+                self.driver.udp_pending_replenish.push((udp_index, bid));
             }
-            let errno = -result;
-            if !has_more && errno != libc::ECANCELED {
-                if errno == libc::ENOBUFS {
-                    metrics::POOL.increment(metrics::pool::BUFFER_RING_EMPTY);
-                }
-                self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
+            if !has_more {
+                self.driver.on_udp_recv_ended(udp_index, -result);
             }
             return;
         }
@@ -3949,20 +3903,20 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             Some(b) => b,
             None => {
                 if !has_more {
-                    self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
+                    self.driver.rearm_udp_recvmsg(udp_index);
                 }
                 return;
             }
         };
         // The bid is checked out of the UDP ring; account it against occupancy so
         // `free()` and the double-replenish tripwire stay accurate. It is
-        // replenished exactly once — immediately below on a parse/drop, or when
+        // replenished exactly once — queued below on a parse/drop, or when
         // the consumer reads the queued datagram.
-        self.driver.udp_provided_bufs.as_mut().unwrap().on_handout();
+        self.driver.udp_provided_bufs[idx].on_handout();
 
         let payload_len = result as u32;
         let buf_ptr = {
-            let udp_bufs = self.driver.udp_provided_bufs.as_ref().unwrap();
+            let udp_bufs = &self.driver.udp_provided_bufs[idx];
             let (p, _) = udp_bufs.get_buffer(bid);
             p
         };
@@ -3995,11 +3949,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if !handed_to_queue {
-            self.driver.udp_pending_replenish.push(bid);
+            self.driver.udp_pending_replenish.push((udp_index, bid));
         }
 
         if !has_more {
-            self.driver.rearm_udp_recvmsg(udp_index, udp_bgid);
+            self.driver.rearm_udp_recvmsg(udp_index);
         }
     }
 
@@ -5311,6 +5265,43 @@ mod tests {
             el.driver.park_blocker(conn_index),
             Some(crate::backend::uring::driver::ParkBlocker::Closing)
         );
+    }
+
+    /// A UDP re-arm that cannot be submitted stays listed, keeps the worker
+    /// from blocking while the socket has a free buffer, and is retried.
+    #[test]
+    fn a_failed_udp_rearm_is_retried() {
+        let mut cfg = test_config();
+        cfg.udp_bind = vec!["127.0.0.1:0".parse().unwrap()];
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        el.driver.ring.flush().unwrap();
+        assert!(el.may_block());
+
+        el.driver.on_udp_recv_ended(0, libc::ENOBUFS);
+        el.driver.ring.force_push_failures(1);
+        el.driver.return_udp_buffers();
+        assert_eq!(el.driver.udp_awaiting_buffers, vec![0]);
+        assert!(el.driver.udp_rearm_due());
+        assert!(!el.may_block());
+
+        el.driver.return_udp_buffers();
+        assert!(el.driver.udp_awaiting_buffers.is_empty());
+        assert!(el.may_block());
+
+        // A failure with no buffer free waits for one, and the worker may block.
+        for _ in 0..el.driver.udp_provided_bufs[0].ring_entries() {
+            el.driver.udp_provided_bufs[0].on_handout();
+        }
+        el.driver.ring.force_push_failures(1);
+        el.driver.rearm_udp_recvmsg(0);
+        assert_eq!(el.driver.udp_awaiting_buffers, vec![0]);
+        assert!(!el.driver.udp_rearm_due());
+        assert!(el.may_block());
+
+        el.driver.udp_pending_replenish.push((0, 0));
+        el.driver.return_udp_buffers();
+        assert!(el.driver.udp_awaiting_buffers.is_empty());
     }
 
     /// A hangup poll that cannot be submitted puts the connection on the

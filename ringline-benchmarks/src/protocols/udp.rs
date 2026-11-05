@@ -460,11 +460,9 @@ fn run_bench_ringline(
         .workers(1)
         .pin_to_core(false)
         .sq_entries((num_clients * 4).next_power_of_two().max(256) as u32)
+        // Each client socket has a ring of its own and one reply outstanding.
         // Each buffer holds the recvmsg header (~160 bytes) plus the payload.
-        .udp_recv_buffer(
-            (num_clients * 2).next_power_of_two().max(64) as u16,
-            (msg_size + 4096).min(65535) as u32,
-        )
+        .udp_recv_buffer(8, (msg_size + 4096).min(65535) as u32)
         .udp_send_slots((num_clients * 2).next_power_of_two().max(64) as u16)
         .udp_recv_queue_capacity(4096)
         // Send copy pool slot must fit the largest datagram a client transmits.

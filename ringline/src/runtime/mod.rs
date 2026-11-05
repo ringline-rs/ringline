@@ -582,7 +582,8 @@ pub(crate) struct Executor {
     /// Hard cap on each `udp_recv_queues[i]`. Datagrams arriving when the
     /// queue is full are dropped (`udp::DATAGRAMS_DROPPED` is incremented).
     /// This prevents unbounded memory growth when the consumer future
-    /// stalls or has exited.
+    /// stalls or has exited. On io_uring a cap equal to the ring size is never
+    /// reached, because the ring runs out first and the socket stops reading.
     pub(crate) udp_recv_queue_capacity: usize,
     /// Per-UDP-socket: task ID waiting for recv_from (None = no waiter).
     pub(crate) udp_recv_waiters: Vec<Option<u32>>,
