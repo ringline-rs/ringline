@@ -682,9 +682,9 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// let (ca, cb) = (a?, b?);
 /// ```
 ///
-/// [`join`](crate::join) and [`join3`](crate::join3) take two and three
-/// futures. For more, spawn each connect with
-/// [`spawn_with_handle`](crate::spawn_with_handle) and await the handles.
+/// [`join_all`](crate::join_all) takes any number. Each connect takes a send
+/// pool slot for a TLS handshake or a first request, all at once:
+/// [`join_all_limited`](crate::join_all_limited) bounds that.
 ///
 /// # Panics
 ///

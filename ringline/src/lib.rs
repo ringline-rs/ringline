@@ -392,8 +392,14 @@ pub use runtime::io::yield_now;
 pub use runtime::join::Join;
 /// Future returned by [`join3()`].
 pub use runtime::join::Join3;
+/// Future returned by [`join_all()`].
+pub use runtime::join::JoinAll;
 /// Poll two futures concurrently, returning both outputs when complete.
 pub use runtime::join::join;
+/// Poll any number of futures concurrently, returning every output in order.
+pub use runtime::join::join_all;
+/// [`join_all`] with at most a given number of futures running at a time.
+pub use runtime::join::join_all_limited;
 /// Poll three futures concurrently, returning all outputs when complete.
 pub use runtime::join::join3;
 /// Result of [`select()`] — which branch completed.

@@ -36,6 +36,10 @@ use crate::{
 };
 use memcache_proto::Request as McRequest;
 
+/// Connects `connect_all` runs at a time. Each takes a send pool slot for a TLS
+/// handshake or AUTH, before any completes.
+const CONNECT_CONCURRENCY: usize = 16;
+
 /// Configuration for a ketama-sharded client. Build it with
 /// [`new`](Self::new) and the builder methods.
 pub struct ShardedConfig {
@@ -150,16 +154,33 @@ impl ShardedClient {
         }
     }
 
-    /// Eagerly connect all connections on all shards.
+    /// Eagerly connect all connections on all shards, up to
+    /// `CONNECT_CONCURRENCY` (16) at a time, so a TLS client needs that many
+    /// free send pool slots.
+    ///
+    /// A failed connect does not end the call: every connect runs to its end,
+    /// those that connected are kept, and the first error, by shard and slot
+    /// order, is returned. If the call is cancelled, no slot is filled.
     pub async fn connect_all(&mut self) -> Result<(), Error> {
         let opts = self.connect_opts();
+        let connects: Vec<_> = self
+            .shards
+            .iter()
+            .flat_map(|shard| shard.conns.iter().map(|_| do_connect(shard.addr, &opts)))
+            .collect();
+        let mut clients = ringline::join_all_limited(connects, CONNECT_CONCURRENCY)
+            .await
+            .into_iter();
+        let mut result = Ok(());
         for shard in &mut self.shards {
             for slot in &mut shard.conns {
-                let client = do_connect(shard.addr, &opts).await?;
-                *slot = ShardConn::Connected(Box::new(client));
+                match clients.next().expect("one client per slot") {
+                    Ok(client) => *slot = ShardConn::Connected(Box::new(client)),
+                    Err(error) => result = result.and(Err(error)),
+                }
             }
         }
-        Ok(())
+        result
     }
 
     /// Close all connections on all shards.

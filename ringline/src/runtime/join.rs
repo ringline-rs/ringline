@@ -60,6 +60,89 @@ impl<F: Future> Future for MaybeDone<F> {
     }
 }
 
+/// Future that polls any number of sub-futures. See [`join_all`].
+#[must_use = "futures do nothing unless awaited"]
+pub struct JoinAll<F: Future> {
+    children: Pin<Box<[MaybeDone<F>]>>,
+    /// The most children left pending by one poll.
+    limit: usize,
+}
+
+impl<F: Future> Future for JoinAll<F> {
+    type Output = Vec<F::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let limit = self.limit;
+        // Safety: the children are in a boxed slice and are never moved out of
+        // it, so each stays pinned.
+        let children = unsafe { self.children.as_mut().get_unchecked_mut() };
+        let mut pending = 0;
+        for child in children.iter_mut() {
+            if pending == limit {
+                return Poll::Pending;
+            }
+            // Safety: as above.
+            if unsafe { Pin::new_unchecked(child) }.poll(cx).is_pending() {
+                pending += 1;
+            }
+        }
+        if pending > 0 {
+            return Poll::Pending;
+        }
+        Poll::Ready(
+            children
+                .iter_mut()
+                .map(|child| {
+                    // Safety: as above.
+                    unsafe { Pin::new_unchecked(child) }
+                        .take_output()
+                        .expect("JoinAll polled after Ready")
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Poll any number of futures concurrently, returning their outputs in order
+/// when all have completed.
+///
+/// Each wake of the task polls every child that is not done, so N children cost
+/// N polls per wake. Use it for a bounded fan-out, not for a set that lives as
+/// long as the task. To start only some at a time, for example because each
+/// takes a send pool slot, use [`join_all_limited`].
+pub fn join_all<I>(futures: I) -> JoinAll<<I::Item as IntoFuture>::IntoFuture>
+where
+    I: IntoIterator,
+    I::Item: IntoFuture,
+{
+    join_all_limited(futures, usize::MAX)
+}
+
+/// [`join_all`], with at most `limit` futures started and not finished at a
+/// time. The first `limit` start at once, and each later one starts when an
+/// earlier one finishes.
+///
+/// # Panics
+///
+/// Panics if `limit` is 0.
+pub fn join_all_limited<I>(futures: I, limit: usize) -> JoinAll<<I::Item as IntoFuture>::IntoFuture>
+where
+    I: IntoIterator,
+    I::Item: IntoFuture,
+{
+    assert!(limit > 0, "join_all_limited limit must be > 0");
+    let children: Box<[_]> = futures
+        .into_iter()
+        .map(|future| MaybeDone::Pending {
+            future: future.into_future(),
+        })
+        .collect();
+    JoinAll {
+        children: children.into(),
+        limit,
+    }
+}
+
 pin_project_lite::pin_project! {
     /// Future that polls two sub-futures and returns both outputs when complete.
     pub struct Join<A: Future, B: Future> {
