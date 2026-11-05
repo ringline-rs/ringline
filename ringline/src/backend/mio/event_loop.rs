@@ -225,7 +225,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let mut event_list: Vec<(mio::Token, bool, bool, bool)> =
                 Vec::with_capacity(self.driver.events.iter().count());
             for event in self.driver.events.iter() {
-                let is_err = event.is_error() || event.is_read_closed() || event.is_write_closed();
+                let is_err = event.is_error()
+                    || event.is_read_closed()
+                    || event.is_write_closed()
+                    || event.is_priority();
                 event_list.push((
                     event.token(),
                     event.is_readable(),
@@ -270,12 +273,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                                 self.handle_writable(conn_index);
                             }
                             if readable {
-                                self.handle_readable(conn_index, &mut recv_buf);
+                                self.handle_readable(conn_index, &mut recv_buf, !is_err);
                             }
                             continue;
                         }
                         if readable {
-                            self.handle_readable(conn_index, &mut recv_buf);
+                            self.handle_readable(conn_index, &mut recv_buf, !is_err);
                         }
                         if writable {
                             self.handle_writable(conn_index);
@@ -476,7 +479,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .register(
                     &mut mio_stream,
                     mio_token,
-                    mio::Interest::READABLE | mio::Interest::WRITABLE,
+                    crate::backend::mio::driver::STREAM_INTEREST,
                 )
                 .is_err()
             {
@@ -719,7 +722,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 self.executor.wake_recv(source);
             }
-            self.handle_readable(source, recv_buf);
+            self.handle_readable(source, recv_buf, false);
         }
         progressed
     }
@@ -736,7 +739,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Handle a connection becoming readable: read data into accumulator.
-    fn handle_readable(&mut self, conn_index: u32, recv_buf: &mut [u8]) {
+    ///
+    /// The reads run on until `WouldBlock` or `0`, except that with
+    /// `stop_at_short_read`, on a TCP connection on Linux, a read that leaves
+    /// `recv_buf` unfilled ends them, which saves the read that would return
+    /// `EAGAIN`. A caller passes it only for a readiness event that does not
+    /// report the read side closed or urgent data. On a registration that is
+    /// edge-triggered, a FIN or urgent mark that arrives later raises its own
+    /// event, and one already here is on this event: a read stops short at an
+    /// urgent mark with bytes behind it, and has to run on to `0` to see a FIN.
+    ///
+    /// A Unix stream read also stops short with bytes behind it, at a message
+    /// carrying fds, and raises no event for them, so it reads to `WouldBlock`.
+    /// So does any other platform: kqueue has no urgent data event, and mio's
+    /// poll selector re-arms only on `WouldBlock`.
+    fn handle_readable(&mut self, conn_index: u32, recv_buf: &mut [u8], stop_at_short_read: bool) {
         let idx = conn_index as usize;
 
         // Check the connection is still active.
@@ -928,6 +945,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Plaintext path.
+        let stop_at_short_read =
+            stop_at_short_read
+                && cfg!(any(target_os = "linux", target_os = "android"))
+                && !self.driver.connections.get(conn_index).is_some_and(|c| {
+                    matches!(c.peer_addr, Some(crate::connection::PeerAddr::Unix(_)))
+                });
         loop {
             let stream = match self.driver.tcp_streams[idx].as_mut() {
                 Some(s) => s,
@@ -964,19 +987,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             self.driver.mark_forward_resume(conn_index);
                             break;
                         }
-                        continue;
-                    }
-                    let appended = self.driver.accumulators.append(conn_index, &recv_buf[..n]);
-                    if !appended {
-                        // Streamed past recv_accumulator_max. The bytes were
-                        // already read off the socket, so the stream cannot
-                        // continue coherently — close rather than OOM,
-                        // matching the uring and mio-TLS overflow paths.
+                    } else {
+                        let appended = self.driver.accumulators.append(conn_index, &recv_buf[..n]);
+                        if !appended {
+                            // Streamed past recv_accumulator_max. The bytes were
+                            // already read off the socket, so the stream cannot
+                            // continue coherently — close rather than OOM,
+                            // matching the uring and mio-TLS overflow paths.
+                            self.executor.wake_recv(conn_index);
+                            self.driver.close_connection(conn_index);
+                            break;
+                        }
                         self.executor.wake_recv(conn_index);
-                        self.driver.close_connection(conn_index);
+                    }
+                    if stop_at_short_read && n < recv_buf.len() {
                         break;
                     }
-                    self.executor.wake_recv(conn_index);
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     break;
@@ -1051,7 +1077,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let _ = self.driver.poll.registry().reregister(
                         stream,
                         mio::Token(idx + 1),
-                        mio::Interest::READABLE | mio::Interest::WRITABLE,
+                        crate::backend::mio::driver::STREAM_INTEREST,
                     );
                 }
 
@@ -2434,7 +2460,7 @@ mod tests {
         wait_for_bytes(el, conn_index, data.len());
         el.driver.recv_batch.begin_at(time);
         let mut buf = vec![0u8; 4096];
-        el.handle_readable(conn_index, &mut buf);
+        el.handle_readable(conn_index, &mut buf, false);
     }
 
     /// Read one `\n`-terminated line with `with_data` and return the

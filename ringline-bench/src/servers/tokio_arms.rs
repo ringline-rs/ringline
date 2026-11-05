@@ -4,8 +4,8 @@
 //! work-stealing runtime running the canonical tokio echo loop (one reused
 //! buffer, `read` into it, `write_all` out of it). Measured against ringline it
 //! trails by ~50% at 64 connections, and the gap is *latency*, not syscalls —
-//! tokio issues ~2.1 syscalls per operation against ringline's mio backend at
-//! ~3.0, and still loses. Two structural differences could account for that,
+//! tokio issues ~2.1 syscalls per operation, as ringline's mio backend does at
+//! ~2.06. Two structural differences could account for that,
 //! and the default arm confounds them:
 //!
 //! - **scheduler shape.** ringline is thread-per-core with no work stealing and

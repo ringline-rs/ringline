@@ -174,8 +174,9 @@ or registers itself as the connection's receive waiter and parks. A backend
 event makes bytes available and calls `Executor::wake_recv`; the executor wakes
 the recorded owner task and polls the same future again. In the top panel, SQEs
 produce CQEs. In the bottom panel, `mio::Poll` produces a readability event;
-the event loop immediately drains `read` until it returns `WouldBlock`
-(`EAGAIN`), then wakes the task that was waiting for receive data. In both
+the event loop immediately drains `read`, until a read comes back short on
+Linux TCP and until `WouldBlock` otherwise, then wakes the task that was waiting
+for receive data. In both
 panels, the subsequent poll is a poll of the owner task's Rust future, not
 another operating-system readiness poll. The handler parses a request and
 submits a response through the per-connection send queue. A send completion

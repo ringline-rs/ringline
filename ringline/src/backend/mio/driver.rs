@@ -17,6 +17,17 @@ use crate::runtime::send_completion::SendId;
 
 use mio::Interest;
 
+/// What a connection's stream is registered for. `PRIORITY` reports a TCP urgent
+/// mark, which ends a read early (`handle_readable`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) const STREAM_INTEREST: mio::Interest = mio::Interest::READABLE
+    .add(mio::Interest::WRITABLE)
+    .add(mio::Interest::PRIORITY);
+/// What a connection's stream is registered for.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) const STREAM_INTEREST: mio::Interest =
+    mio::Interest::READABLE.add(mio::Interest::WRITABLE);
+
 /// mio token 0 is reserved for the wake pipe.
 pub(crate) const WAKE_TOKEN: mio::Token = mio::Token(0);
 
