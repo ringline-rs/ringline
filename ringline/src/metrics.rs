@@ -95,9 +95,12 @@ pub mod conn {
     /// or the mio poll). A connection adopted from another worker is not
     /// counted here.
     pub const ACCEPT_REGISTER_FAILED: usize = 6;
-    /// Accepted connections the acceptor thread closed because every live
-    /// worker's accept queue was full (`ConfigBuilder::accept_queue_capacity`).
-    pub const ACCEPT_BACKLOG_DROPPED: usize = 7;
+    /// The acceptor thread found every live worker's accept queue full
+    /// (`ConfigBuilder::accept_queue_capacity`) and held a connection until
+    /// one had room. Counted when the wait starts and once per 100 ms of it, so
+    /// a wait that does not end counts 10 per second. While it waits,
+    /// connections stay in the kernel's listen queue.
+    pub const ACCEPT_QUEUE_FULL: usize = 7;
 }
 
 /// Completions processed, split by `OpTag`.
@@ -415,9 +418,9 @@ pub fn init_metadata() {
         "accept_register_failed".into(),
     );
     CONNECTIONS.insert_metadata(
-        conn::ACCEPT_BACKLOG_DROPPED,
+        conn::ACCEPT_QUEUE_FULL,
         "op".into(),
-        "accept_backlog_dropped".into(),
+        "accept_queue_full".into(),
     );
 
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_100, "op".into(), "lt_100us".into());
@@ -567,7 +570,7 @@ mod tests {
             conn::ADOPTED,
             conn::ACCEPT_TABLE_FULL,
             conn::ACCEPT_REGISTER_FAILED,
-            conn::ACCEPT_BACKLOG_DROPPED,
+            conn::ACCEPT_QUEUE_FULL,
         ] {
             assert!(
                 CONNECTIONS.increment(idx),

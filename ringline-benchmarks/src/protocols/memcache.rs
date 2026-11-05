@@ -99,7 +99,7 @@ fn start_memcache_server(
             let socket = tokio::net::TcpSocket::new_v4().expect("failed to create socket");
             socket.set_reuseaddr(true).ok();
             socket.bind(addr).expect("failed to bind");
-            let listener = socket.listen(1024).expect("failed to listen");
+            let listener = socket.listen(65535).expect("failed to listen");
 
             tokio::pin!(shutdown_rx);
             loop {

@@ -37,7 +37,12 @@ const CLAIMS: &[Claim] = &[
     Claim {
         path: "ringline/src/acceptor.rs",
         needle: "try_send(accepted)",
-        meaning: "acceptor never blocks on a full worker queue",
+        meaning: "acceptor tries every worker without blocking before it waits for room",
+    },
+    Claim {
+        path: "ringline/src/acceptor.rs",
+        needle: "select.select_timeout(SHUTDOWN_CHECK_INTERVAL)",
+        meaning: "with every worker full, the acceptor blocks until one has room",
     },
     Claim {
         path: "ringline/src/acceptor.rs",
@@ -629,7 +634,7 @@ fn render_runtime() -> String {
     arrow(&mut svg, 1065, 165, 1065, 205, "TCP bytes");
 
     queue(&mut svg, 930, 345, 270, 62, "bounded fd queue + wake");
-    arrow(&mut svg, 1065, 275, 1065, 345, "try_send + wake");
+    arrow(&mut svg, 1065, 275, 1065, 345, "send + wake");
 
     group_box(
         &mut svg,

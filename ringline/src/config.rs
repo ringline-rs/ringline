@@ -80,7 +80,8 @@ pub struct Config {
     pub(crate) max_registered_regions: u16,
     /// Worker/thread configuration.
     pub(crate) worker: WorkerConfig,
-    /// TCP listen backlog.
+    /// Listen backlog. The kernel caps it at `net.core.somaxconn`
+    /// (`kern.ipc.somaxconn` on macOS).
     pub(crate) backlog: i32,
     /// Maximum number of direct file descriptors (connections).
     pub(crate) max_connections: u32,
@@ -116,9 +117,8 @@ pub struct Config {
     /// first use. See `ConfigBuilder::prefault_buffers`.
     pub(crate) prefault_buffers: bool,
     /// Bound on the per-worker accept channel. If a worker can't drain its
-    /// queue fast enough, the acceptor will skip past it (and possibly
-    /// close the incoming fd if every worker is full) rather than
-    /// accumulating fds without backpressure. Default: 1024.
+    /// queue fast enough, the acceptor skips past it, and if every worker is
+    /// full it stops accepting until one has room. Default: 1024.
     pub(crate) accept_queue_capacity: usize,
     /// Number of connections assigned to each worker before moving to the
     /// next one. `1` (the default) gives classic round-robin. Higher values
@@ -368,7 +368,7 @@ impl Default for Config {
             registered_regions: Vec::new(),
             max_registered_regions: 64,
             worker: WorkerConfig::default(),
-            backlog: 1024,
+            backlog: 65535,
             max_connections: 16000,
             recv_accumulator_capacity: 4096,
             recv_accumulator_max: 1024 * 1024 * 1024,
@@ -509,9 +509,10 @@ impl Config {
                 "max_connections must be > 0 and < 2^24".into(),
             ));
         }
-        // A zero-capacity crossbeam channel is a rendezvous channel: try_send
-        // only succeeds while a receiver is blocked in recv(), and workers
-        // only ever try_recv — so every accept would fail.
+        // A zero-capacity crossbeam channel has no buffer, so a send completes
+        // only when a receiver takes it. Workers poll with try_recv and are
+        // woken after a send completes, so an idle worker would not take a
+        // held connection.
         if self.accept_queue_capacity == 0 {
             return Err(crate::error::Error::RingSetup(
                 "accept_queue_capacity must be > 0".into(),
@@ -735,7 +736,16 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the TCP listen backlog.
+    /// Set the TCP listen backlog. Default: 65535.
+    ///
+    /// The kernel uses the smaller of this value and `net.core.somaxconn`
+    /// (`kern.ipc.somaxconn` on macOS). A TCP connection the backlog has no room
+    /// for is retried by the peer's TCP, which adds a second or more to its
+    /// connect. On a Unix listener a non-blocking connect fails with `EAGAIN`
+    /// instead.
+    ///
+    /// A connection in the listen queue has completed its connect, and gets no
+    /// reply until a worker takes it. The runtime does not time it out.
     pub fn backlog(mut self, n: i32) -> Self {
         self.config.backlog = n;
         self
@@ -749,6 +759,10 @@ impl ConfigBuilder {
     }
 
     /// Set the bound on the per-worker accept channel. Default: 1024.
+    ///
+    /// When every worker's channel is full, the acceptor stops accepting until
+    /// one has room, and connections wait in the listen queue
+    /// ([`backlog`](Self::backlog)).
     pub fn accept_queue_capacity(mut self, n: usize) -> Self {
         self.config.accept_queue_capacity = n;
         self
@@ -1233,8 +1247,7 @@ mod tests {
 
     #[test]
     fn validate_accept_queue_capacity_zero_rejected() {
-        // bounded(0) is a rendezvous channel; workers only try_recv, so
-        // every accept would fail with the queue reported as full.
+        // bounded(0) is a rendezvous channel, and workers only try_recv.
         assert!(
             config_with(|c| c.accept_queue_capacity = 0)
                 .validate()

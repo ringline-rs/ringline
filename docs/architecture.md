@@ -72,9 +72,9 @@ and acceptor are absent, and workers begin through `on_start`.
 
 The acceptor assigns connections in configurable chunks. Its primary worker is
 `(connection_count / conn_chunk_size) % worker_count`; if that worker's bounded
-queue is full or disconnected, it tries adjacent workers. It never blocks on a
-full channel. If every live worker is full, it closes the newly accepted
-descriptor so accepted descriptors cannot accumulate without bound.
+queue is full or disconnected, it tries adjacent workers without blocking. If
+every live worker is full, it holds the connection and blocks until a queue has
+room, so further connections stay in the kernel's listen queue.
 
 A task waker encodes a connection index, or a standalone task index with
 `STANDALONE_BIT`, in its low 32 bits, and its worker's id in the high 32. Woken
@@ -280,7 +280,8 @@ their own backing without touching a reused connection.
 `Runtime::shutdown` sets a shared atomic flag, releases the listen gates, sets
 `SO_REUSEADDR` and calls `shutdown(SHUT_RD)` on each listener socket, and wakes
 every worker. On Linux `SHUT_RD` wakes an acceptor blocked in `accept4` and
-takes the socket out of the listening state. Each listener's sockets are owned
+takes the socket out of the listening state. An acceptor holding a connection
+sees the flag within about 100 ms. Each listener's sockets are owned
 by a shared `ListenerSockets`. Every thread that passes their fd numbers to a
 syscall holds it, and the sockets close when the last holder drops it: after
 shutdown, when the acceptor thread or, in merged accept mode, the workers

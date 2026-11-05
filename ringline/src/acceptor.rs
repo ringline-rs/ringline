@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::Sender;
 
@@ -31,7 +31,6 @@ pub struct AcceptorConfig {
     /// acceptor can still write to it.
     pub worker_wake_handles: Vec<crate::wakeup::WakeHandle>,
     /// Shared flag set by `Runtime::shutdown` to signal the acceptor to stop.
-    #[allow(dead_code)] // stored for future use; acceptor currently uses channel disconnect
     pub shutdown_flag: Arc<AtomicBool>,
     /// The runtime's listen gates. This acceptor waits on its gate before
     /// accepting. `ListenGates::open` calls `listen(2)`; until it runs, the
@@ -95,7 +94,6 @@ pub fn run_acceptor(config: AcceptorConfig) {
     let mut conn_count = 0usize; // successfully dispatched connections
     let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut alive = vec![true; num_workers];
-    let mut alive_count = num_workers;
 
     loop {
         let mut addr_len: libc::socklen_t =
@@ -143,10 +141,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
         // Pick a target worker based on chunk assignment, then fall back to
         // adjacent workers if that worker's channel is full or it has exited.
         // `try_send` lets us distinguish a full queue (skip) from a
-        // disconnected channel (mark dead). Dropping the connection when every
-        // live worker is full or dead closes it, so the peer sees the close
-        // straight away (a reset, if it had already sent data) instead of the
-        // channel growing without bound.
+        // disconnected channel (mark dead).
         let primary = (conn_count / chunk_size) % num_workers;
         // SAFETY: `accept4` returned a fresh descriptor that nothing else owns.
         let mut pending = Some(AcceptedConn {
@@ -177,8 +172,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
                     // Worker has exited — mark dead. With none left, dropping
                     // the connection closes it.
                     alive[worker_idx] = false;
-                    alive_count -= 1;
-                    if alive_count == 0 {
+                    if !alive.contains(&true) {
                         return;
                     }
                     pending = Some(accepted);
@@ -187,13 +181,59 @@ pub fn run_acceptor(config: AcceptorConfig) {
             }
         }
 
-        // Every live worker is backlogged. Dropping the connection closes it
-        // rather than blocking the acceptor; keep accepting, since the backlog
-        // is transient. (The all-workers-dead case returns above.)
-        if pending.is_some() {
-            crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPT_BACKLOG_DROPPED);
+        // Every live worker is backlogged. Hold this connection until one has
+        // room: not calling `accept4` leaves the rest in the kernel's listen
+        // queue, whose overflow the peer's TCP retries.
+        if let Some(accepted) = pending {
+            crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPT_QUEUE_FULL);
+            if !send_when_room(&config, &mut alive, accepted) {
+                return;
+            }
+            conn_count = conn_count.wrapping_add(1);
         }
-        drop(pending);
+    }
+}
+
+/// How often an acceptor waiting for queue room checks for shutdown and counts
+/// the wait.
+const SHUTDOWN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Block until a live worker's queue takes `accepted`. Returns false, closing
+/// the connection, when the runtime is shutting down or every worker has
+/// exited.
+fn send_when_room(config: &AcceptorConfig, alive: &mut [bool], accepted: AcceptedConn) -> bool {
+    let mut accepted = accepted;
+    loop {
+        let mut select = crossbeam_channel::Select::new();
+        let mut live = Vec::with_capacity(alive.len());
+        for (worker_idx, tx) in config.worker_channels.iter().enumerate() {
+            if alive[worker_idx] {
+                select.send(tx);
+                live.push(worker_idx);
+            }
+        }
+        if live.is_empty() {
+            return false;
+        }
+        let Ok(operation) = select.select_timeout(SHUTDOWN_CHECK_INTERVAL) else {
+            if config.shutdown_flag.load(Ordering::Acquire) {
+                return false;
+            }
+            crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPT_QUEUE_FULL);
+            continue;
+        };
+        let worker_idx = live[operation.index()];
+        match operation.send(&config.worker_channels[worker_idx], accepted) {
+            Ok(()) => {
+                config.worker_wake_handles[worker_idx].wake();
+                return true;
+            }
+            // That worker has exited.
+            Err(crossbeam_channel::SendError(returned)) => {
+                alive[worker_idx] = false;
+                accepted = returned;
+            }
+        }
     }
 }
 
@@ -300,15 +340,18 @@ mod tests {
         handle.join().expect("acceptor panicked");
     }
 
-    /// A connection the acceptor cannot hand to any worker, because every
-    /// worker's accept queue is full, is closed and counted (#598).
-    ///
-    /// Linux only: the test joins the acceptor after shutting its sockets
-    /// down, and other platforms keep it blocked until a peer connects (#560).
+    /// The listener, gates and acceptor config for one worker, whose queue
+    /// holds one connection and is already full.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_connection_every_worker_is_too_busy_for_is_dropped_and_counted() {
-        use std::io::{Read, Write};
+    fn acceptor_with_a_full_queue(
+        wake: crate::wakeup::WakeHandle,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<crate::listener_sockets::ListenerSockets>,
+        Arc<crate::listen_gate::ListenGates>,
+        crossbeam_channel::Receiver<AcceptedConn>,
+        AcceptorConfig,
+    ) {
         use std::sync::atomic::AtomicBool;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -318,8 +361,7 @@ mod tests {
         gates.register(0, Arc::clone(&sockets)).expect("register");
         gates.open(0).expect("open");
 
-        // The only worker's queue is already full.
-        let (tx, _rx) = crossbeam_channel::bounded::<AcceptedConn>(1);
+        let (tx, rx) = crossbeam_channel::bounded::<AcceptedConn>(1);
         let filler = std::net::UdpSocket::bind("127.0.0.1:0").expect("filler socket");
         tx.send(AcceptedConn {
             fd: filler.into(),
@@ -331,45 +373,139 @@ mod tests {
             sockets: Arc::clone(&sockets),
             listener: crate::ListenerId::from_index(0),
             worker_channels: vec![tx],
-            worker_wake_handles: Vec::new(),
+            worker_wake_handles: vec![wake],
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
         };
-        let before = crate::metrics::CONNECTIONS
-            .value(crate::metrics::conn::ACCEPT_BACKLOG_DROPPED)
-            .unwrap_or(0);
+        (addr, sockets, gates, rx, config)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn queue_full_count() -> u64 {
+        crate::metrics::CONNECTIONS
+            .value(crate::metrics::conn::ACCEPT_QUEUE_FULL)
+            .unwrap_or(0)
+    }
+
+    /// A connection no worker has room for is held until one does, rather than
+    /// closed (#658), and the worker is woken for it.
+    ///
+    /// Linux only: the test joins the acceptor after shutting its sockets
+    /// down, and other platforms keep it blocked until a peer connects (#560).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_connection_every_worker_is_too_busy_for_waits_for_room() {
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        let (read_fd, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
+        let (addr, sockets, gates, rx, config) = acceptor_with_a_full_queue(wake);
+        let before = queue_full_count();
         let handle = std::thread::spawn(move || run_acceptor(config));
 
         let mut client = std::net::TcpStream::connect(addr).expect("connect");
-        let _ = client.write_all(b"go");
+        client.write_all(b"go").expect("write");
         client
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("read timeout");
         let mut b = [0u8; 1];
         let read = client.read(&mut b);
-        // A close, not data: EOF, or a reset since the client sent bytes.
         assert!(
-            !matches!(read, Ok(n) if n > 0),
-            "the dropped connection was served: {read:?}"
+            matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the connection was closed while the queue was full: {read:?}"
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut after = before;
-        while after <= before && std::time::Instant::now() < deadline {
-            after = crate::metrics::CONNECTIONS
-                .value(crate::metrics::conn::ACCEPT_BACKLOG_DROPPED)
-                .unwrap_or(0);
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(queue_full_count() > before, "the wait was not counted");
+
+        // Room appears: the held connection takes it, and the worker is woken.
+        drop(rx.recv().expect("the filler"));
+        let accepted = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the held connection reached the queue");
+        // The fd is non-blocking and the `WakeHandle` owns it. The wake
+        // follows the send, so it may land just after the receive above.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut counter = [0u8; 8];
+        while unsafe { libc::read(read_fd, counter.as_mut_ptr().cast(), counter.len()) } <= 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker was not woken"
+            );
+            std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(
-            after > before,
-            "the drop was not counted ({before} -> {after})"
-        );
+        let mut served = std::net::TcpStream::from(accepted.fd);
+        let mut request = [0u8; 2];
+        served.read_exact(&mut request).expect("read the request");
+        assert_eq!(&request, b"go");
 
         gates.shutdown();
         sockets.shut_down();
         handle.join().expect("acceptor panicked");
+    }
+
+    /// An acceptor holding a connection does not wait for the workers to exit
+    /// at shutdown, as a blocked `accept4` does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_ends_an_acceptor_waiting_for_room() {
+        use std::time::Duration;
+
+        let (_read_fd, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
+        let (addr, sockets, gates, _rx, config) = acceptor_with_a_full_queue(wake);
+        let flag = Arc::clone(&config.shutdown_flag);
+        let before = queue_full_count();
+        let handle = std::thread::spawn(move || run_acceptor(config));
+
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while queue_full_count() == before && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!handle.is_finished(), "the acceptor exited before shutdown");
+
+        flag.store(true, Ordering::Release);
+        gates.shutdown();
+        sockets.shut_down();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "shutdown did not end the acceptor");
+        handle.join().expect("acceptor panicked");
+        drop(client);
+    }
+
+    /// The last worker exiting ends an acceptor holding a connection.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_last_worker_exiting_ends_an_acceptor_waiting_for_room() {
+        use std::time::Duration;
+
+        let (_read_fd, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
+        let (addr, sockets, gates, rx, config) = acceptor_with_a_full_queue(wake);
+        let before = queue_full_count();
+        let handle = std::thread::spawn(move || run_acceptor(config));
+
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while queue_full_count() == before && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        drop(rx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handle.is_finished(),
+            "the worker's exit did not end the acceptor"
+        );
+        handle.join().expect("acceptor panicked");
+        gates.shutdown();
+        sockets.shut_down();
+        drop(client);
     }
 
     /// `Runtime::shutdown` wakes an acceptor blocked in `accept4` by shutting
