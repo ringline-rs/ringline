@@ -80,7 +80,8 @@ pub struct Config {
     pub(crate) max_registered_regions: u16,
     /// Worker/thread configuration.
     pub(crate) worker: WorkerConfig,
-    /// TCP listen backlog. The kernel caps it at `net.core.somaxconn`.
+    /// Listen backlog. The kernel caps it at `net.core.somaxconn`
+    /// (`kern.ipc.somaxconn` on macOS).
     pub(crate) backlog: i32,
     /// Maximum number of direct file descriptors (connections).
     pub(crate) max_connections: u32,
@@ -508,9 +509,9 @@ impl Config {
                 "max_connections must be > 0 and < 2^24".into(),
             ));
         }
-        // A zero-capacity crossbeam channel is a rendezvous channel: try_send
+        // A zero-capacity crossbeam channel is a rendezvous channel: a send
         // only succeeds while a receiver is blocked in recv(), and workers
-        // only ever try_recv — so every accept would fail.
+        // only ever try_recv, and are woken after a send completes.
         if self.accept_queue_capacity == 0 {
             return Err(crate::error::Error::RingSetup(
                 "accept_queue_capacity must be > 0".into(),
@@ -736,9 +737,14 @@ impl ConfigBuilder {
 
     /// Set the TCP listen backlog. Default: 65535.
     ///
-    /// The kernel caps the value at `net.core.somaxconn`, so the default leaves
-    /// that sysctl as the bound. A connection the backlog has no room for is
-    /// retried by the peer's TCP, which adds a second or more to its connect.
+    /// The kernel uses the smaller of this value and `net.core.somaxconn`
+    /// (`kern.ipc.somaxconn` on macOS). A TCP connection the backlog has no room
+    /// for is retried by the peer's TCP, which adds a second or more to its
+    /// connect. On a Unix listener a non-blocking connect fails with `EAGAIN`
+    /// instead.
+    ///
+    /// A connection in the listen queue has completed its connect, and gets no
+    /// reply until a worker takes it. The runtime does not time it out.
     pub fn backlog(mut self, n: i32) -> Self {
         self.config.backlog = n;
         self
@@ -1240,8 +1246,7 @@ mod tests {
 
     #[test]
     fn validate_accept_queue_capacity_zero_rejected() {
-        // bounded(0) is a rendezvous channel; workers only try_recv, so
-        // every accept would fail with the queue reported as full.
+        // bounded(0) is a rendezvous channel, and workers only try_recv.
         assert!(
             config_with(|c| c.accept_queue_capacity = 0)
                 .validate()

@@ -178,7 +178,7 @@ pub(crate) fn reuseport_std_listener(addr: SocketAddr) -> std::io::Result<std::n
         {
             return Err(err());
         }
-        if libc::listen(fd, 1024) != 0 {
+        if libc::listen(fd, 65535) != 0 {
             return Err(err());
         }
         Ok(listener)
@@ -192,7 +192,7 @@ fn bind_listener(addr: SocketAddr, reuseport: bool) -> std::io::Result<tokio::ne
         socket.set_reuseport(true)?;
     }
     socket.bind(addr)?;
-    socket.listen(1024)
+    socket.listen(65535)
 }
 
 async fn accept_loop(listener: tokio::net::TcpListener, msg_size: usize, echo: TokioEcho) {

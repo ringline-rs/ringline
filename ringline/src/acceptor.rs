@@ -94,7 +94,6 @@ pub fn run_acceptor(config: AcceptorConfig) {
     let mut conn_count = 0usize; // successfully dispatched connections
     let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut alive = vec![true; num_workers];
-    let mut alive_count = num_workers;
 
     loop {
         let mut addr_len: libc::socklen_t =
@@ -173,8 +172,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
                     // Worker has exited — mark dead. With none left, dropping
                     // the connection closes it.
                     alive[worker_idx] = false;
-                    alive_count -= 1;
-                    if alive_count == 0 {
+                    if !alive.contains(&true) {
                         return;
                     }
                     pending = Some(accepted);
@@ -196,7 +194,8 @@ pub fn run_acceptor(config: AcceptorConfig) {
     }
 }
 
-/// How often an acceptor waiting for queue room checks for shutdown.
+/// How often an acceptor waiting for queue room checks for shutdown and counts
+/// the wait.
 const SHUTDOWN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Block until a live worker's queue takes `accepted`. Returns false, closing
@@ -220,6 +219,7 @@ fn send_when_room(config: &AcceptorConfig, alive: &mut [bool], accepted: Accepte
             if config.shutdown_flag.load(Ordering::Acquire) {
                 return false;
             }
+            crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPT_QUEUE_FULL);
             continue;
         };
         let worker_idx = live[operation.index()];
@@ -382,6 +382,7 @@ mod tests {
         (addr, sockets, gates, rx, config)
     }
 
+    #[cfg(target_os = "linux")]
     fn queue_full_count() -> u64 {
         crate::metrics::CONNECTIONS
             .value(crate::metrics::conn::ACCEPT_QUEUE_FULL)

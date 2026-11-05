@@ -95,10 +95,11 @@ pub mod conn {
     /// or the mio poll). A connection adopted from another worker is not
     /// counted here.
     pub const ACCEPT_REGISTER_FAILED: usize = 6;
-    /// Times the acceptor thread held a connection until a worker had room,
-    /// because every live worker's accept queue was full
-    /// (`ConfigBuilder::accept_queue_capacity`). While it waits, connections
-    /// stay in the kernel's listen queue.
+    /// The acceptor thread found every live worker's accept queue full
+    /// (`ConfigBuilder::accept_queue_capacity`) and held a connection until
+    /// one had room. Counted when the wait starts and once per 100 ms of it, so
+    /// a steady rate means the workers are not taking connections. While it
+    /// waits, connections stay in the kernel's listen queue.
     pub const ACCEPT_QUEUE_FULL: usize = 7;
 }
 
