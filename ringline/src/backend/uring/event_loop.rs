@@ -3680,19 +3680,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             None => return,
         };
 
-        if chain.first_error.is_none() {
-            self.driver.submit_next_queued(conn_index);
-        } else {
+        let failure = chain.failure();
+        let failed = failure.is_some();
+        if failed {
             self.driver.drain_conn_send_queue(conn_index);
+        } else {
+            self.driver.submit_next_queued(conn_index);
         }
 
         // `send_chain` attached an id; `send_chain_nowait` did not.
         if let Some(id) = chain.send_id {
-            let result = match chain.first_error {
-                Some(errno) => Err(io::Error::from_raw_os_error(-errno)),
+            let result = match failure {
+                Some(error) => Err(error),
                 None => Ok(chain.bytes_sent),
             };
             self.settle_send(id, result);
+        }
+
+        // The bytes of the chain and the queue behind it are gone, and a dropped
+        // `send_chain` future or a nowait chain reports that to nobody. Later
+        // sends must not reach the peer after that gap.
+        if failed {
+            self.driver.close_connection(conn_index);
         }
 
         // A close_connection that arrived while the chain was active deferred

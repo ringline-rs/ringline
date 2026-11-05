@@ -74,6 +74,7 @@ pub(crate) enum Op {
     SendMsgZc {
         fd: Fd,
         msg: *const libc::msghdr,
+        flags: u32,
     },
     Read {
         fd: Fd,
@@ -193,6 +194,21 @@ impl Sqe {
             Op::SendMsgZc {
                 fd: Fd::Fixed(index),
                 msg,
+                flags: 0,
+            },
+            user_data,
+        )
+    }
+
+    /// A zero-copy `sendmsg` in a linked chain. The kernel retries a short send
+    /// and fails the link if it cannot finish, because the next SQE of the
+    /// chain would otherwise follow a gap.
+    pub(crate) fn chain_send_msg_zc(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
+        Sqe::new(
+            Op::SendMsgZc {
+                fd: Fd::Fixed(index),
+                msg,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
             },
             user_data,
         )

@@ -868,7 +868,9 @@ impl Sqe {
             Op::SendMsg { fd, msg, flags } => {
                 on!(fd, |t| opcode::SendMsg::new(t, msg).flags(flags).build())
             }
-            Op::SendMsgZc { fd, msg } => on!(fd, |t| opcode::SendMsgZc::new(t, msg).build()),
+            Op::SendMsgZc { fd, msg, flags } => {
+                on!(fd, |t| opcode::SendMsgZc::new(t, msg).flags(flags).build())
+            }
             Op::Read {
                 fd,
                 buf,
@@ -1077,6 +1079,12 @@ mod encode_tests {
             (
                 Sqe::send_msg_zc(9, msg, ud),
                 e(opcode::SendMsgZc::new(fx, msg).build()),
+            ),
+            (
+                Sqe::chain_send_msg_zc(9, msg, ud),
+                e(opcode::SendMsgZc::new(fx, msg)
+                    .flags(crate::completion::STREAM_SEND_FLAGS as u32)
+                    .build()),
             ),
             (
                 Sqe::new(

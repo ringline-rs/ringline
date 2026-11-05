@@ -362,6 +362,7 @@ impl Ring {
         let user_data = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
         let entry = Sqe::new(
             Op::SendMsgZc {
+                flags: 0,
                 fd: sqe::Fd::Fixed(conn_index),
                 msg,
             },

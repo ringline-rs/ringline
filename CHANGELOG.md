@@ -861,6 +861,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   over half used, now stalls until it reads or that changes. Five stuck peers on
   a worker can still fill the slab at the default cap, and further peers are then
   not held (#733).
+- A chain that fails now closes the connection. Later sends used to reach the
+  peer after the bytes the chain and the send queue lost, and a
+  `send_chain_nowait` or a dropped `send_chain` future reported nothing. A
+  zero-copy part that hits `ENOMEM` on Linux 6.15+ causes this, because a chain
+  has no plain-send fallback (#734).
+- A zero-copy part of a chain no longer stops short. A part larger than the
+  socket's send buffer used to send what fit and report success, and the next
+  part followed the gap: 2,392,576 bytes of a 3 MiB part arrived on loopback.
+  The kernel now retries it, and a chain that still sends fewer bytes than it
+  holds fails (#734).
 - macOS: an acceptor thread exits at shutdown within about 100 ms. It used to
   stay blocked in `accept` until a peer connected, and its listener kept the
   port until then (#560).

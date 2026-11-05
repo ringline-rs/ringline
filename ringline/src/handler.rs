@@ -1019,6 +1019,7 @@ impl<'a> DriverCtx<'a> {
             built: Vec::new(),
             tls_plaintext: tls.then(Vec::new),
             tls_parts: 0,
+            total_len: 0,
             error: None,
             finished: false,
             send_id: None,
@@ -4106,6 +4107,8 @@ pub struct SendChainBuilder<'b, 'a> {
     tls_plaintext: Option<Vec<u8>>,
     /// Parts added to `tls_plaintext`, counted against `max_chain_length`.
     tls_parts: usize,
+    /// Bytes in the chain's linked SQEs.
+    total_len: u32,
     error: Option<io::Error>,
     finished: bool,
     /// Carried by `finish` into the chain's `ChainState`; on a TLS connection,
@@ -4159,6 +4162,7 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             pool_slot: slot,
             slab_idx: u16::MAX,
         });
+        self.total_len += len;
         self
     }
 
@@ -4262,6 +4266,9 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             }
             self.ctx.chain_table.start(conn_index, count as u16);
         }
+        self.ctx
+            .chain_table
+            .set_expected_bytes(conn_index, self.total_len);
         if let Some(id) = self.send_id {
             self.ctx.chain_table.set_send_id(conn_index, id);
         }
@@ -4637,7 +4644,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                                     conn_index,
                                     slab_idx as u32,
                                 );
-                                let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(
+                                let entry = crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
                                     conn_index,
                                     msg_ptr,
                                     user_data.raw(),
@@ -4708,7 +4715,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                             conn_index,
                             slab_idx as u32,
                         );
-                        let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(
+                        let entry = crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
                             conn_index,
                             msg_ptr,
                             user_data.raw(),
@@ -4729,6 +4736,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         };
 
         self.chain.built.push(built);
+        self.chain.total_len += self.total_len;
         self.chain
     }
 }
