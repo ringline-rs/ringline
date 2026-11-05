@@ -568,14 +568,6 @@ impl Driver {
         }
     }
 
-    /// Request teardown of a connection. The only place (with the
-    /// `DriverCtx` close) that sets `Lifecycle::Closing` on this backend —
-    /// see the invariant on `Lifecycle::Closing`.
-    ///
-    /// Teardown itself (socket, buffers, executor state, slot release)
-    /// happens in the event loop's `drain_pending_closes`, which has
-    /// Executor access and defers until `pending_sends` has drained.
-    /// Marking `Closing` here makes the call idempotent.
     /// Clear both half flags for a slot being recycled.
     ///
     /// Called at the slot's recycle point. Named to match
@@ -589,6 +581,14 @@ impl Driver {
         }
     }
 
+    /// Request teardown of a connection. The only place (with the
+    /// `DriverCtx` close) that sets `Lifecycle::Closing` on this backend —
+    /// see the invariant on `Lifecycle::Closing`.
+    ///
+    /// Teardown itself (socket, buffers, executor state, slot release)
+    /// happens in the event loop's `drain_pending_closes`, which has
+    /// Executor access and defers until `pending_sends` has drained.
+    /// Marking `Closing` here makes the call idempotent.
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 

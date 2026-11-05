@@ -673,8 +673,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `is_recv_direct` have to be read from the `Connection` before it goes to a
   protocol client, and `offer_for_park` cannot be called on one a client holds.
   A dropped `Connection` leaves its socket open. An outbound one then stays
-  open until the peer closes it, `DriverCtx::close` is called with a saved
-  `ConnToken`, or the worker exits, so close it first. Design:
+  open until `DriverCtx::close` is called with a saved `ConnToken` or the worker
+  exits. A peer close also ends it, except on a plaintext io_uring connection
+  with received bytes unread. Close it first. Design:
   `docs/public-context-types-design.md`.
 - **Breaking:** `Connection::cancel` and `ConnCtx::cancel`. Neither had a
   caller, and mio returned `Unsupported`. `select` on a `CancellationToken`

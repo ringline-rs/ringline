@@ -3923,7 +3923,8 @@ impl Drop for SendFuture {
 /// [`UnixConnect`].
 ///
 /// Submits the connect on its first poll, waits for the completion, and
-/// resolves to an owned [`Connection`]. A future that is never polled allocates no socket and no connection slot.
+/// resolves to an owned [`Connection`]. A future that is never polled allocates
+/// no socket and no connection slot.
 ///
 /// Two of these futures awaited one after the other run serially. See
 /// [`connect`] for running them concurrently.
