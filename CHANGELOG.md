@@ -657,18 +657,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   change: sends after `shutdown_write` still fail at the socket. Design:
   `docs/write-half-design.md`.
 
-### Deprecated
-
-- `DriverCtx::connect`, `connect_unix`, `connect_with_timeout`,
-  `connect_tls` and `connect_tls_with_timeout`. No task owns a connection
-  opened this way, so the runtime closes it once it is established, and the
-  `on_connect` callback their docs described does not exist. Call
-  `ringline::connect` (or `connect_unix`) from a task instead;
-  `ringline::spawn` starts one from `on_tick` or `on_notify`. They will be
-  removed in the next breaking release (#579).
-
 ### Removed
 
+- **Breaking:** `DriverCtx::connect`, `connect_unix`, `connect_with_timeout`,
+  `connect_tls` and `connect_tls_with_timeout`. No task owned a connection
+  opened this way, so the runtime closed it once it was established. On the
+  mio backend in 0.6.x `connect`, `connect_tls` and their timeout forms left
+  the connection open, so code that relied on that must change; `connect_unix`
+  returned an error on mio, and `ringline::connect_unix` still does. Call
+  `ringline::connect` (or `connect_unix`) from a task instead; `ringline::spawn`
+  starts one from `on_tick` or `on_notify` (#579).
 - **Breaking:** on io_uring, the TCP provided-buffer ring: TCP and Unix
   connections receive directly (see Changed and Added), and only UDP
   receives through a provided ring. A worker no longer allocates the TCP
@@ -1027,8 +1025,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   They now queue their release, or the wake, and the event loop applies it
   before its next task-poll pass or before it waits for I/O. On mio, an
   outbound TCP or TLS connect that completes with no `ConnectFuture`
-  waiting is now closed, as on io_uring; this includes a connect started
-  with `DriverCtx::connect`. A child that exits after its `wait` future was
+  waiting is now closed, as on io_uring. A child that exits after its `wait` future was
   dropped no longer leaves a result entry behind (#575).
 
 - On io_uring, dropping a `fs::read_into` or `fs::write_from` future could

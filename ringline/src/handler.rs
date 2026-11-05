@@ -371,7 +371,7 @@ impl<'a> DriverCtx<'a> {
         cs.peer_addr.clone()
     }
 
-    /// Check if a connection is outbound (initiated via connect/connect_tls).
+    /// Check if a connection is outbound (opened with [`crate::connect`] or [`crate::connect_unix`]).
     pub fn is_outbound(&self, conn: ConnToken) -> bool {
         self.connections
             .get(conn.index)
@@ -1243,94 +1243,6 @@ impl<'a> DriverCtx<'a> {
                 Err(crate::error::UdpSendError::SubmissionQueueFull)
             }
         }
-    }
-
-    /// Start an outbound TCP connection and return its token.
-    ///
-    /// No task owns a connection opened this way, so the runtime closes it
-    /// once it is established. Use [`crate::connect`] from a task instead;
-    /// [`crate::spawn`] starts one from `on_tick` or `on_notify`.
-    #[deprecated(
-        since = "0.7.0",
-        note = "a connection opened here is closed once established, since no task owns it; call `ringline::connect` from a task (`ringline::spawn` works from `on_tick` and `on_notify`)"
-    )]
-    pub fn connect(&mut self, addr: SocketAddr) -> Result<ConnToken, crate::error::Error> {
-        self.start_connect(addr)
-    }
-
-    /// Start an outbound Unix domain socket connection and return its token.
-    ///
-    /// No task owns a connection opened this way, so the runtime closes it
-    /// once it is established. Use [`crate::connect_unix`] from a task
-    /// instead.
-    #[deprecated(
-        since = "0.7.0",
-        note = "a connection opened here is closed once established, since no task owns it; call `ringline::connect` from a task (`ringline::spawn` works from `on_tick` and `on_notify`)"
-    )]
-    pub fn connect_unix(
-        &mut self,
-        path: &std::path::Path,
-    ) -> Result<ConnToken, crate::error::Error> {
-        self.start_connect_unix(path)
-    }
-
-    /// Start an outbound TCP connection with a timeout and return its token.
-    ///
-    /// No task owns a connection opened this way, so the runtime closes it
-    /// once it is established. Use [`crate::connect`] with
-    /// [`TcpConnect::timeout`](crate::TcpConnect::timeout) from a task
-    /// instead.
-    #[deprecated(
-        since = "0.7.0",
-        note = "a connection opened here is closed once established, since no task owns it; call `ringline::connect` from a task (`ringline::spawn` works from `on_tick` and `on_notify`)"
-    )]
-    pub fn connect_with_timeout(
-        &mut self,
-        addr: SocketAddr,
-        timeout_ms: u64,
-    ) -> Result<ConnToken, crate::error::Error> {
-        let token = self.start_connect(addr)?;
-        self.arm_connect_timeout(token.index, timeout_ms);
-        Ok(token)
-    }
-
-    /// Start an outbound TLS connection and return its token.
-    ///
-    /// No task owns a connection opened this way, so the runtime closes it
-    /// once it is established. Use [`crate::connect`] with
-    /// [`TcpConnect::tls`](crate::TcpConnect::tls) from a task instead.
-    #[deprecated(
-        since = "0.7.0",
-        note = "a connection opened here is closed once established, since no task owns it; call `ringline::connect` from a task (`ringline::spawn` works from `on_tick` and `on_notify`)"
-    )]
-    pub fn connect_tls(
-        &mut self,
-        addr: SocketAddr,
-        server_name: &str,
-    ) -> Result<ConnToken, crate::error::Error> {
-        self.start_connect_tls(addr, server_name)
-    }
-
-    /// Start an outbound TLS connection with a timeout and return its token.
-    ///
-    /// No task owns a connection opened this way, so the runtime closes it
-    /// once it is established. Use [`crate::connect`] with
-    /// [`TcpConnect::tls`](crate::TcpConnect::tls) and
-    /// [`TcpConnect::timeout`](crate::TcpConnect::timeout) from a task
-    /// instead.
-    #[deprecated(
-        since = "0.7.0",
-        note = "a connection opened here is closed once established, since no task owns it; call `ringline::connect` from a task (`ringline::spawn` works from `on_tick` and `on_notify`)"
-    )]
-    pub fn connect_tls_with_timeout(
-        &mut self,
-        addr: SocketAddr,
-        server_name: &str,
-        timeout_ms: u64,
-    ) -> Result<ConnToken, crate::error::Error> {
-        let token = self.start_connect_tls(addr, server_name)?;
-        self.arm_connect_timeout(token.index, timeout_ms);
-        Ok(token)
     }
 
     /// Start an outbound TCP connection. Returns its token immediately; the
@@ -2705,8 +2617,7 @@ impl<'a> DriverCtx<'a> {
     /// Arm a connect timeout on a connect that has already been submitted. Does
     /// not depend on the transport.
     ///
-    /// `connect_with_timeout` and `connect_tls_with_timeout` call this after the
-    /// base connect; the connect builders call it directly (#528).
+    /// The connect builders call this after the base connect (#528).
     #[cfg(has_io_uring)]
     pub(crate) fn arm_connect_timeout(&mut self, conn_index: u32, timeout_ms: u64) {
         let ts = &mut self.connect_timespecs[conn_index as usize];
@@ -3143,94 +3054,6 @@ impl<'a> DriverCtx<'a> {
             io::ErrorKind::Unsupported,
             "cancel not supported on mio backend",
         ))
-    }
-
-    /// Start an outbound TCP connection and return its token.
-    ///
-    /// No task owns a connection opened this way, so the runtime closes it
-    /// once it is established. Use [`crate::connect`] from a task instead;
-    /// [`crate::spawn`] starts one from `on_tick` or `on_notify`.
-    #[deprecated(
-        since = "0.7.0",
-        note = "a connection opened here is closed once established, since no task owns it; call `ringline::connect` from a task (`ringline::spawn` works from `on_tick` and `on_notify`)"
-    )]
-    pub fn connect(&mut self, addr: SocketAddr) -> Result<ConnToken, crate::error::Error> {
-        self.start_connect(addr)
-    }
-
-    /// Start an outbound Unix domain socket connection and return its token.
-    ///
-    /// No task owns a connection opened this way, so the runtime closes it
-    /// once it is established. Use [`crate::connect_unix`] from a task
-    /// instead.
-    #[deprecated(
-        since = "0.7.0",
-        note = "a connection opened here is closed once established, since no task owns it; call `ringline::connect` from a task (`ringline::spawn` works from `on_tick` and `on_notify`)"
-    )]
-    pub fn connect_unix(
-        &mut self,
-        path: &std::path::Path,
-    ) -> Result<ConnToken, crate::error::Error> {
-        self.start_connect_unix(path)
-    }
-
-    /// Start an outbound TCP connection with a timeout and return its token.
-    ///
-    /// No task owns a connection opened this way, so the runtime closes it
-    /// once it is established. Use [`crate::connect`] with
-    /// [`TcpConnect::timeout`](crate::TcpConnect::timeout) from a task
-    /// instead.
-    #[deprecated(
-        since = "0.7.0",
-        note = "a connection opened here is closed once established, since no task owns it; call `ringline::connect` from a task (`ringline::spawn` works from `on_tick` and `on_notify`)"
-    )]
-    pub fn connect_with_timeout(
-        &mut self,
-        addr: SocketAddr,
-        timeout_ms: u64,
-    ) -> Result<ConnToken, crate::error::Error> {
-        let token = self.start_connect(addr)?;
-        self.arm_connect_timeout(token.index, timeout_ms);
-        Ok(token)
-    }
-
-    /// Start an outbound TLS connection and return its token.
-    ///
-    /// No task owns a connection opened this way, so the runtime closes it
-    /// once it is established. Use [`crate::connect`] with
-    /// [`TcpConnect::tls`](crate::TcpConnect::tls) from a task instead.
-    #[deprecated(
-        since = "0.7.0",
-        note = "a connection opened here is closed once established, since no task owns it; call `ringline::connect` from a task (`ringline::spawn` works from `on_tick` and `on_notify`)"
-    )]
-    pub fn connect_tls(
-        &mut self,
-        addr: SocketAddr,
-        server_name: &str,
-    ) -> Result<ConnToken, crate::error::Error> {
-        self.start_connect_tls(addr, server_name)
-    }
-
-    /// Start an outbound TLS connection with a timeout and return its token.
-    ///
-    /// No task owns a connection opened this way, so the runtime closes it
-    /// once it is established. Use [`crate::connect`] with
-    /// [`TcpConnect::tls`](crate::TcpConnect::tls) and
-    /// [`TcpConnect::timeout`](crate::TcpConnect::timeout) from a task
-    /// instead.
-    #[deprecated(
-        since = "0.7.0",
-        note = "a connection opened here is closed once established, since no task owns it; call `ringline::connect` from a task (`ringline::spawn` works from `on_tick` and `on_notify`)"
-    )]
-    pub fn connect_tls_with_timeout(
-        &mut self,
-        addr: SocketAddr,
-        server_name: &str,
-        timeout_ms: u64,
-    ) -> Result<ConnToken, crate::error::Error> {
-        let token = self.start_connect_tls(addr, server_name)?;
-        self.arm_connect_timeout(token.index, timeout_ms);
-        Ok(token)
     }
 
     /// Start an outbound TCP connection. Returns its token immediately; the
