@@ -5010,8 +5010,10 @@ pub unsafe fn nvme_write(
 /// A UDP socket, from
 /// [`AsyncEventHandler::on_udp_bind()`](crate::AsyncEventHandler::on_udp_bind).
 ///
-/// Each worker that binds a UDP address gets its own socket (via `SO_REUSEPORT`).
-/// Not `Copy`, not `Clone` and `!Send`, for the reasons [`Connection`] gives. Reads
+/// Each worker gets its own socket for each UDP bind. Workers share the port
+/// through `SO_REUSEPORT`, except on a connected zero-port bind, where each socket
+/// has its own port. It is not `Copy` or `Clone`, and it is `!Send`, for the reasons
+/// [`Connection`] gives. Reads
 /// and [`send_ready`](Self::send_ready) take `&mut self`, and their futures hold
 /// that borrow, because each has one waiter slot and a second waiter would replace
 /// the first. `send_to` and `send_to_gso` take `&self`.
@@ -5019,8 +5021,12 @@ pub unsafe fn nvme_write(
 /// Call [`split`](Self::split) to send while a read borrow is live, for example
 /// from inside a [`with_datagram`](Self::with_datagram) closure.
 ///
-/// Dropping a `UdpSocket` releases nothing. The socket lives until the worker
-/// exits.
+/// Dropping a `UdpSocket` or its `UdpRecvHalf` closes nothing. The socket lives
+/// until the worker exits, and arriving datagrams queue up to
+/// [`udp_recv_queue_capacity`](crate::ConfigBuilder::udp_recv_queue_capacity). On
+/// io_uring each queued datagram holds a buffer from the worker's UDP ring, which
+/// all its sockets share, so an undrained socket can stop the worker's other UDP
+/// sockets receiving.
 ///
 /// ```compile_fail
 /// # use ringline::UdpSocket;
@@ -5041,12 +5047,41 @@ pub struct UdpSocket {
 }
 
 /// The read side of a [`UdpSocket`], from [`UdpSocket::split`].
+///
+/// A socket has one receive waiter slot. `&mut self` allows one receive future at
+/// a time, so several consumers need one receive loop that forwards through a
+/// channel.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::UdpRecvHalf>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<ringline::UdpRecvHalf>();
+/// ```
 pub struct UdpRecvHalf {
     udp_index: u32,
     _not_send: PhantomData<*const ()>,
 }
 
 /// The write side of a [`UdpSocket`], from [`UdpSocket::split`].
+///
+/// Several tasks on a worker can send through an `Rc<UdpSendHalf>`, because
+/// `send_to` and `send_to_gso` take `&self`. `send_ready` takes `&mut self`, so a
+/// task that needs it owns the half, and other tasks forward to that task through
+/// a channel.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::UdpSendHalf>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<ringline::UdpSendHalf>();
+/// ```
 pub struct UdpSendHalf {
     udp_index: u32,
     _not_send: PhantomData<*const ()>,
@@ -5156,8 +5191,6 @@ impl UdpRecvHalf {
     /// per-socket recv buffer. Either way, the buffer is released as soon as
     /// the callback returns, so any data the caller wants to keep must be
     /// copied out inside `f`.
-    ///
-    /// Same single-consumer semantics as [`recv_from()`](Self::recv_from).
     pub fn with_datagram<F, R>(&mut self, f: F) -> UdpWithDatagramFuture<'_, F, R>
     where
         F: FnMut(&[u8], SocketAddr) -> R + Unpin,
@@ -5182,8 +5215,8 @@ impl UdpRecvHalf {
     /// network path and trigger spurious loss / congestion signals
     /// at high pps.
     ///
-    /// All other semantics — single-consumer, zero-copy borrow,
-    /// `max` trade-off — match [`recv_batch`](Self::recv_batch).
+    /// All other semantics, zero-copy borrow and the `max` trade-off, match
+    /// [`recv_batch`](Self::recv_batch).
     pub fn recv_batch_timed<F>(&mut self, max: usize, f: F) -> UdpRecvBatchTimedFuture<'_, F>
     where
         F: FnMut(&[u8], SocketAddr, Instant) + Unpin,
@@ -5228,8 +5261,6 @@ impl UdpRecvHalf {
     /// each invocation of `f` borrows directly from the kernel-provided
     /// buffer; the buffer is released back to the kernel after `f`
     /// returns and before the next datagram is dispatched.
-    ///
-    /// Same single-consumer semantics as [`recv_from()`](Self::recv_from).
     pub fn recv_batch<F>(&mut self, max: usize, f: F) -> UdpRecvBatchFuture<'_, F>
     where
         F: FnMut(&[u8], SocketAddr) + Unpin,
@@ -5427,19 +5458,11 @@ impl Future for UdpRecvFuture<'_> {
                 let _ = (bid, driver);
                 return Poll::Ready(owned);
             }
-            // Register as waiter so the CQE handler wakes us. There is
-            // only one waiter slot per socket; if a different task
-            // already registered, we'd silently overwrite and the prior
-            // task would get stuck forever. That's documented as
-            // "single-consumer" semantics on `recv_from`, but it's an
-            // easy mistake — fail loud in debug builds.
+            // Register as waiter so the CQE handler wakes us. `&mut self` allows
+            // one live future on this half. A dropped future leaves its task id
+            // here, so an overwrite is correct.
             let task_id = CURRENT_TASK_ID.with(|c| c.get());
             if idx < executor.udp_recv_waiters.len() {
-                debug_assert!(
-                    executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
-                    "two distinct tasks awaiting recv_from on UDP socket {idx}; \
-                     recv_from supports a single consumer per socket"
-                );
                 executor.udp_recv_waiters[idx] = Some(task_id);
             }
             Poll::Pending
@@ -5503,11 +5526,6 @@ where
             }
             let task_id = CURRENT_TASK_ID.with(|c| c.get());
             if idx < executor.udp_recv_waiters.len() {
-                debug_assert!(
-                    executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
-                    "two distinct tasks awaiting recv on UDP socket {idx}; \
-                     with_datagram supports a single consumer per socket"
-                );
                 executor.udp_recv_waiters[idx] = Some(task_id);
             }
             Poll::Pending
@@ -5545,11 +5563,6 @@ where
             if idx >= executor.udp_recv_queues.len() || executor.udp_recv_queues[idx].is_empty() {
                 let task_id = CURRENT_TASK_ID.with(|c| c.get());
                 if idx < executor.udp_recv_waiters.len() {
-                    debug_assert!(
-                        executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
-                        "two distinct tasks awaiting recv on UDP socket {idx}; \
-                         recv_batch supports a single consumer per socket"
-                    );
                     executor.udp_recv_waiters[idx] = Some(task_id);
                 }
                 return Poll::Pending;
@@ -5621,11 +5634,6 @@ where
             if idx >= executor.udp_recv_queues.len() || executor.udp_recv_queues[idx].is_empty() {
                 let task_id = CURRENT_TASK_ID.with(|c| c.get());
                 if idx < executor.udp_recv_waiters.len() {
-                    debug_assert!(
-                        executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
-                        "two distinct tasks awaiting recv on UDP socket {idx}; \
-                         recv_batch_timed supports a single consumer per socket"
-                    );
                     executor.udp_recv_waiters[idx] = Some(task_id);
                 }
                 return Poll::Pending;
@@ -5687,16 +5695,10 @@ impl Future for UdpSendReadyFuture<'_> {
             if idx < driver.udp_sockets.len() && !driver.udp_sockets[idx].send_freelist.is_empty() {
                 return Poll::Ready(());
             }
-            // Same single-consumer story as `recv_from` — if another
-            // task is already awaiting `send_ready`, overwriting their
-            // wakeup leaks them forever.
+            // `&mut self` allows one live future on this half. A dropped future
+            // leaves its task id here, so an overwrite is correct.
             let task_id = CURRENT_TASK_ID.with(|c| c.get());
             if idx < executor.udp_send_ready_waiters.len() {
-                debug_assert!(
-                    executor.udp_send_ready_waiters[idx].is_none_or(|t| t == task_id),
-                    "two distinct tasks awaiting send_ready on UDP socket {idx}; \
-                     send_ready supports a single consumer per socket"
-                );
                 executor.udp_send_ready_waiters[idx] = Some(task_id);
             }
             Poll::Pending

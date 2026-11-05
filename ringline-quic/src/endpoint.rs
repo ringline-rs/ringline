@@ -89,7 +89,7 @@ struct QuicConnection {
 /// equally-sized datagrams concatenated together (the last may be
 /// shorter). Runtime adapters that support `UDP_SEGMENT` should hand the
 /// whole buffer to the kernel in one syscall (e.g. via
-/// `UdpSocket::send_to_gso`); adapters without GSO support, or in-process
+/// `ringline::UdpSocket::send_to_gso`); adapters without GSO support, or in-process
 /// tests that feed datagrams back into [`QuicEndpoint::handle_datagram`],
 /// can call [`datagrams()`](Self::datagrams) to iterate the per-datagram
 /// slices.

@@ -178,6 +178,10 @@ Across the series:
   the `Connection` before it goes to the client. `offer_for_park` cannot be called
   on a connection held by a client.
 - A dropped half cannot be taken again.
+- A handler is `Send` and `UdpSocket` and its halves are not, so a handler cannot
+  keep a UDP handle in a field. `on_tick`, an `on_accept` task, or a task for
+  another socket reaches a socket through a channel or a `thread_local!` holding
+  an `Rc<UdpSendHalf>`.
 - `ConfigBuilder::close_notify_timeout_ms` is removed, and the internal fatal
   closes keep a fixed 5 s bound. An application has no way to bound a TLS close
   against a peer that stops reading. See [Owner decisions](#owner-decisions).

@@ -4,7 +4,7 @@
 //! These tests exercise the UDP API end-to-end on whichever backend is
 //! compiled in. The io_uring backend uses multishot recvmsg + a send slot
 //! ring; the mio backend uses synchronous `recv_from` / `send_to`. Both
-//! paths funnel through the same `UdpSocket` API so the tests are
+//! paths funnel through the same `ringline::UdpSocket` API so the tests are
 //! backend-agnostic except where noted.
 
 use ringline::ConfigBuilder;
@@ -2781,4 +2781,70 @@ fn udp_connected_bind_sends_after_peer_was_unreachable() {
     let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (results, _) = probe_closed_peer(2, false);
     assert_eq!(results, vec!["Ok(())", "Ok(())"]);
+}
+
+// ── Moving a half after an abandoned receive ───────────────────────────
+
+struct MovedHalfEcho {
+    started: Arc<AtomicUsize>,
+}
+
+static MOVED_STARTED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+
+impl AsyncEventHandler for MovedHalfEcho {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        MovedHalfEcho {
+            started: MOVED_STARTED.get_or_init(Default::default).clone(),
+        }
+    }
+    /// A receive abandoned by `select` leaves this task in the waiter slot. The
+    /// half then moves to another task, which is its only reader.
+    fn on_udp_bind(
+        &self,
+        udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        let started = self.started.clone();
+        Some(Box::pin(async move {
+            let (tx, mut rx) = udp.split();
+            let timeout = ringline::sleep(Duration::from_millis(10));
+            let _ = ringline::select(rx.recv_from(), timeout).await;
+            let echo = ringline::spawn_with_handle(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let (data, peer) = rx.recv_from().await;
+                let _ = tx.send_to(peer, &data);
+            })
+            .expect("spawn");
+            let _ = echo.await;
+        }))
+    }
+}
+
+#[test]
+fn a_half_moved_after_an_abandoned_receive_still_receives() {
+    let _guard = UDP_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (shutdown, handles) = RinglineBuilder::new(base_config())
+        .bind_udp("127.0.0.1:0".parse().unwrap())
+        .launch::<MovedHalfEcho>()
+        .expect("launch");
+    let addr: SocketAddr = shutdown.bound_udp_addr().expect("bound UDP address");
+    await_handler_started(MOVED_STARTED.get().unwrap());
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    // `fetch_add` and the receive's registration are one poll on the worker
+    // thread, which queues the datagram only after that poll returns.
+    client.send_to(b"moved", addr).unwrap();
+    let mut buf = [0u8; 16];
+    let (n, _) = client.recv_from(&mut buf).expect("echo");
+    assert_eq!(&buf[..n], b"moved");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
 }
