@@ -47,8 +47,9 @@ that.
 ### Other public signatures
 
 - `ConnStream::new` takes a `Connection` and owns it. `conn_ctx()` is replaced by
-  `connection_mut(&mut self) -> &mut Connection`, because `close` and
-  `shutdown_write` take `&mut self`. Today a caller writes
+  `send_half_mut(&mut self) -> &mut SendHalf`, because `close` and
+  `shutdown_write` take `&mut self`, and a `Connection` accessor would allow a
+  read past bytes cached in `fill_buf`. Today a caller writes
   `ConnStream::new(conn.as_conn())` and keeps `conn`, which leaves two values
   that can read one connection. `ConnStream` grows by 8 bytes, so the limit in
   `conn_stream_size` moves from 48 to 56.
@@ -104,9 +105,16 @@ let b = rx.with_data(|d| ParseResult::Consumed(d.len()));
 ```
 
 The ownership design lists two readers as a compile error, and with `ConnCtx`
-private the `&mut` on a half is the only guard left. `WithDataFuture`,
-`WithDataResultFuture`, `WithBytesFuture` and `RecvReadyFuture` gain a lifetime
+private the `&mut` on a half is the only compile-time check on reads.
+`WithDataFuture`, `WithDataResultFuture` and `WithBytesFuture` gain a lifetime
 that holds the half's borrow. `ForwardFuture` already does.
+
+`RecvReadyFuture` stays unborrowed. It consumes nothing, and `Client::recv_ready`
+exists so that a caller can fire while it is pending
+(`docs/send-while-receiving-design.md`), which a borrow would refuse with E0499.
+It gains `PhantomData<*const ()>`, so it is `!Send`, because with `ConnCtx`
+private it would otherwise be a `Send` value that indexes a worker's connection
+table.
 
 ## `DriverCtx` becomes `pub(crate)`
 
@@ -161,8 +169,9 @@ Across the series:
 - `RecvHalf` has no `close`, so a reader that detects a protocol error signals
   the task holding the `SendHalf`.
 - A protocol client exposes `close`, `is_alive` and its id. `peer_addr`,
-  `tls_info`, `listener` and `is_recv_direct` have to be read from the `Connection`
-  before it goes to the client.
+  `tls_info`, `listener`, `is_outbound` and `is_recv_direct` have to be read from
+  the `Connection` before it goes to the client. `offer_for_park` cannot be called
+  on a connection held by a client.
 - A dropped half cannot be taken again.
 - `DriverCtx::close` is the only close bounded by `close_notify_timeout_ms`. See
   [Open decisions](#open-decisions).
@@ -212,8 +221,9 @@ against a different socket table.
   has the same second-waiter defect as `recv_from`.
 - `send_to`, `send_to_gso` and `index` take `&self`.
 - `split(self) -> (UdpSendHalf, UdpRecvHalf)` for a send made while a read borrow
-  is live. `UdpRecvHalf` has the four receive methods and `index`. `UdpSendHalf`
-  has `send_to`, `send_to_gso`, `send_ready` and `index`.
+  is live. `UdpRecvHalf` has the four receive methods, taking `&mut self`, and
+  `index`. `UdpSendHalf` has `send_ready`, taking `&mut self`, and `send_to`,
+  `send_to_gso` and `index`, taking `&self`.
 - Dropping a `UdpSocket` releases nothing. The socket lives until the worker
   exits, as it does today when `on_udp_bind` returns `None`.
 
@@ -230,8 +240,8 @@ the borrows do not overlap there.
 `Drop` for `SendHalf` and `RecvHalf` only clears the claim flag, so dropping an
 outbound `Connection`, or a client built on one, leaves the socket open and the
 slot occupied. An accepted connection is closed when its task ends. An outbound
-one is not. Removing `ConnCtx` removes the only way to close a dropped outbound
-connection. One downstream load generator keeps a `ConnCtx` in a guard to close
+one is not. Removing `ConnCtx` and `DriverCtx` removes the only ways to close a dropped
+outbound connection. One downstream load generator keeps a `ConnCtx` in a guard to close
 the connection on every exit from its reconnect loop.
 
 The removal does not force a runtime change. That crate can wrap the client in a
@@ -255,9 +265,12 @@ to a spawned task.
   an unset drop would leave a stale flag, and the slot would leak or close while
   the other half was in use. The generation check makes a queued entry for a
   recycled slot do nothing.
-- During unwinding (`std::thread::panicking()`) the drop uses `close_connection`,
-  so a panicked handler sends no close_notify and the peer sees a truncated
-  stream, as it does today.
+- During unwinding (`std::thread::panicking()`) the io_uring drop uses
+  `close_connection`, so a panicked handler sends no close_notify, as it does
+  today. The panic arms in `poll_ready_tasks` call `close_connection` before
+  `drop(fut)`, because a half owned by a top-level `Select` is dropped after
+  `catch_unwind` returns, when `panicking()` is false. Mio has one close path,
+  and `finish_close` attempts the alert there, as it does today.
 - Park sets `socket_handed_off`, closes, and only then drops the task, so the drop
   finds the connection closing, or the generation changed, and does nothing. Mio
   has no park.
@@ -273,7 +286,7 @@ seven handlers that depend on the old behaviour and need `let _conn = conn;`
 inside the block: five in `tests/teardown_drops.rs`, `Sleeps` in
 `tests/peer_fin.rs` and `ExitingWorker` in `tests/accept_queue_shutdown.rs`.
 `peer_fin.rs` would otherwise keep passing without testing FIN detection. The scan
-was static, so the full suite on both backends has the final word.
+was static, so a run of the full suite on both backends has to confirm the count.
 
 ### What happens to `close_notify_timeout_ms`?
 
@@ -286,9 +299,16 @@ The recommendation is to remove `ConfigBuilder::close_notify_timeout_ms` and kee
 a fixed 5 s bound on those internal closes. `Connection::close` stays unbounded,
 as it is for plaintext. Bounding a close against a peer that stops reading is a
 separate change that would apply to TLS and plaintext alike.
+`a_slow_reader_gets_the_whole_reply_before_close_notify` sets the knob to 300 ms.
+It moves to a unit test that checks `close_notify_deadline` stays `None` after
+`close_connection_graceful`, because a 3.5 s drain cannot fail against a 5 s
+bound.
 
 The alternative is to arm the deadline in `close_connection_graceful`, which keeps
-the knob meaningful on io_uring but makes TLS and plaintext closes differ.
+the knob meaningful on io_uring, makes TLS and plaintext closes differ, and cuts
+off a TLS peer whose reply takes longer than the timeout to drain.
+`a_slow_reader_gets_the_whole_reply_before_close_notify` asserts the opposite and
+would be inverted.
 
 ## Series
 
@@ -306,10 +326,11 @@ Each step is one PR, and all are breaking.
 5. `UdpCtx` becomes `UdpSocket`.
 6. If approved, dropping the last half closes the connection.
 
-`README.md`, `ringline/README.md`, the client READMEs, `docs/architecture.md` and
-`CLAUDE.md` teach these types. Each step corrects what it removes, and step 1
+`README.md`, `ringline/README.md`, the client READMEs, `docs/architecture.md`,
+`docs/tls-unbuffered-design.md` and `CLAUDE.md` describe these types. Each step corrects what it removes, and step 1
 adds a dated note to `connection-handle-ownership-design.md` pointing here.
 
 No step adds work per send or receive. Step 3 removes one `make_ctx` per loop
-iteration on io_uring and two on mio. Step 6 adds a flag check to each half drop,
-which is per connection, so step 6 is measured with a connection-churn run.
+iteration on io_uring and two on mio. Step 6 adds a flag check to each half drop, and
+on io_uring two `Orphan` pushes to each teardown. These are per connection, so
+step 6 is measured with a connection-churn run.
