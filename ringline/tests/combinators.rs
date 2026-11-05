@@ -114,6 +114,53 @@ fn sleeps_complete_in_futures_unordered() {
     });
 }
 
+/// A connection task woken during its own poll is polled again: the wake is
+/// recorded in its slot, and parking the task queues it.
+#[test]
+fn a_connection_task_woken_during_its_poll_is_polled_again() {
+    static POLLED_AGAIN: AtomicBool = AtomicBool::new(false);
+
+    struct Handler;
+    impl AsyncEventHandler for Handler {
+        fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+            async {
+                let token = CancellationToken::new();
+                let mut cancelled = Box::pin(token.cancelled());
+                let mut polls = 0;
+                poll_fn(|cx| {
+                    polls += 1;
+                    if polls == 1 {
+                        // Registers the task, which `cancel` then wakes by id.
+                        assert!(cancelled.as_mut().poll(cx).is_pending());
+                        token.cancel();
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(())
+                })
+                .await;
+                POLLED_AGAIN.store(true, Ordering::SeqCst);
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            Handler
+        }
+    }
+
+    let (runtime, handles) = RinglineBuilder::new(config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<Handler>()
+        .expect("launch");
+    let _client = TcpStream::connect(runtime.bound_addr().expect("bound")).unwrap();
+    let deadline = std::time::Instant::now() + LIMIT;
+    while !POLLED_AGAIN.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let polled_again = POLLED_AGAIN.load(Ordering::SeqCst);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+    assert!(polled_again, "the connection task was not polled again");
+}
+
 /// One sleep finishing must not leave the other unpolled, and a child that is
 /// polled for another child's wake must register again.
 #[test]

@@ -33,7 +33,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::io as stdio;
 
-use self::task::{StandaloneTaskSlab, TaskSlab};
+use self::task::{StandaloneTaskSlab, TaskSlab, Wake};
 use self::waker::drain_ready_queue;
 
 /// I/O result stored per-connection for async task wakeup.
@@ -522,13 +522,6 @@ pub(crate) struct Executor {
     pub(crate) timer_pool: TimerSlotPool,
     /// Connection indices (and standalone task indices with STANDALONE_BIT) ready to poll.
     pub(crate) ready_queue: VecDeque<u32>,
-    /// The task currently being polled (its future is checked out of the
-    /// slab, so its slot reads `Polling`). `ready_task` consults this to record
-    /// self-wakes instead of dropping them.
-    pub(crate) currently_polling: Option<u32>,
-    /// Set by `ready_task` when the currently-polling task wakes itself;
-    /// consumed by the poll loop to re-queue the task after parking.
-    pub(crate) woken_while_polling: bool,
     /// Scratch for draining the thread-local waker queue and the cross-thread
     /// inbox.
     waker_drain_scratch: VecDeque<u32>,
@@ -686,8 +679,6 @@ impl Executor {
             standalone_slab: StandaloneTaskSlab::new(standalone_capacity),
             timer_pool: TimerSlotPool::new(timer_slots),
             ready_queue: VecDeque::with_capacity(64),
-            currently_polling: None,
-            woken_while_polling: false,
             waker_drain_scratch: VecDeque::with_capacity(64),
             recv_waiters: vec![false; cap],
             recv_errors: {
@@ -785,12 +776,11 @@ impl Executor {
     }
 
     /// Fire the task's kept wakers, then queue it. Leaf completions, which
-    /// wake a task by the ID it registered, and the self-wake re-queue call
-    /// this.
+    /// wake a task by the ID it registered, call this.
     ///
     /// Handles both connection tasks (plain index) and standalone tasks
-    /// (index | STANDALONE_BIT). Returns true if the task was parked and
-    /// is now ready.
+    /// (index | STANDALONE_BIT). Returns true if the task was parked, or the
+    /// wake was recorded on the poll in progress.
     pub(crate) fn wake_task(&mut self, task_id: u32) -> bool {
         waker::wake_combinators(task_id);
         self.ready_task(task_id)
@@ -799,26 +789,15 @@ impl Executor {
     /// Queue a task for its next poll. A wake through the task's own
     /// [`Waker`](std::task::Waker) comes here directly.
     fn ready_task(&mut self, task_id: u32) -> bool {
-        // A task waking itself from inside its own poll: the future is
-        // checked out of the slab (slot reads `Polling`), so slab.wake() has
-        // no parked future to transition and would silently drop the wake,
-        // leaving the task parked forever. Record it; the poll loop re-queues
-        // the task after parking it.
-        if self.currently_polling == Some(task_id) {
-            self.woken_while_polling = true;
-            return true;
-        }
-        if task_id & waker::STANDALONE_BIT != 0 {
-            let idx = task_id & !waker::STANDALONE_BIT;
-            if self.standalone_slab.wake(idx) {
-                self.ready_queue.push_back(task_id);
-                return true;
-            }
-        } else if self.task_slab.wake(task_id) {
+        let wake = if task_id & waker::STANDALONE_BIT != 0 {
+            self.standalone_slab.wake(task_id & !waker::STANDALONE_BIT)
+        } else {
+            self.task_slab.wake(task_id)
+        };
+        if wake == Wake::Ready {
             self.ready_queue.push_back(task_id);
-            return true;
         }
-        false
+        wake != Wake::None
     }
 
     /// Wake a task that was waiting for recv data.
@@ -1050,20 +1029,17 @@ mod tests {
     #[test]
     fn wake_task_during_own_poll_is_recorded() {
         // While a task is being polled its future is checked out (slot
-        // Empty); a self-wake must be recorded for post-park re-queue
-        // instead of being dropped.
+        // `Polling`); a self-wake must be recorded in the slot instead of
+        // being dropped.
         let mut exec = Executor::new(8, 8, 8, 0, 0);
         exec.task_slab.spawn(2, Box::pin(async {}));
         let fut = exec.task_slab.take_ready(2).unwrap();
 
-        exec.currently_polling = Some(2);
         assert!(exec.wake_task(2), "self-wake must be accepted");
-        assert!(exec.woken_while_polling);
-        exec.currently_polling = None;
+        assert!(exec.ready_queue.is_empty());
 
-        // The poll loop parks and re-queues:
-        exec.task_slab.park(2, fut);
-        assert!(exec.wake_task(2));
+        // The poll loop parks, which reports the wake:
+        assert!(exec.task_slab.park(2, fut));
         assert!(exec.task_slab.take_ready(2).is_some());
     }
 
