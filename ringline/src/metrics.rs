@@ -372,7 +372,10 @@ pub mod udp {
     /// Datagrams dropped by the runtime because the per-socket recv queue
     /// reached `Config::udp_recv_queue_capacity`. Usually means the
     /// handler future has stopped consuming (panicked, returned early,
-    /// or stalled).
+    /// or stalled). On io_uring this counts only when the capacity is below
+    /// the ring size. Otherwise a stalled reader stops the socket reading
+    /// (`pool::BUFFER_RING_EMPTY`), and the kernel drops what does not fit in
+    /// the receive buffer, which this counter does not see.
     pub const DATAGRAMS_DROPPED: usize = 3;
 }
 

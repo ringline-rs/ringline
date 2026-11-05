@@ -5066,10 +5066,9 @@ pub unsafe fn nvme_write(
 ///
 /// Dropping a `UdpSocket` or its `UdpRecvHalf` closes nothing. The socket lives
 /// until the worker exits, and arriving datagrams queue up to
-/// [`udp_recv_queue_capacity`](crate::ConfigBuilder::udp_recv_queue_capacity). On
-/// io_uring each queued datagram holds a buffer from the worker's UDP ring, which
-/// all its sockets share, so an undrained socket can stop the worker's other UDP
-/// sockets receiving.
+/// [`udp_recv_queue_capacity`](crate::ConfigBuilder::udp_recv_queue_capacity).
+/// Each socket has its own buffers on io_uring, so an unread socket does not
+/// stop the worker's other sockets receiving.
 ///
 /// ```compile_fail
 /// # use ringline::UdpSocket;
@@ -5481,7 +5480,7 @@ impl Future for UdpRecvFuture<'_> {
                         let bid = entry.bid_to_release();
                         #[cfg(has_io_uring)]
                         if let Some(bid) = bid {
-                            driver.udp_pending_replenish.push(bid);
+                            driver.udp_pending_replenish.push((self.udp_index, bid));
                         }
                         #[cfg(not(has_io_uring))]
                         let _ = bid;
@@ -5495,7 +5494,7 @@ impl Future for UdpRecvFuture<'_> {
                 let owned = entry.into_owned();
                 #[cfg(has_io_uring)]
                 if let Some(bid) = bid {
-                    driver.udp_pending_replenish.push(bid);
+                    driver.udp_pending_replenish.push((self.udp_index, bid));
                 }
                 #[cfg(not(has_io_uring))]
                 let _ = (bid, driver);
@@ -5550,19 +5549,12 @@ where
                 // One datagram per call: for a GRO-coalesced entry, run the
                 // callback on the next segment and keep the remainder queued.
                 let (start, end) = entry.next_segment_range();
+                let mut release = ReleaseUdpBuf::new(driver, this.udp_index, &entry);
                 let r = f(&entry.data()[start..end], entry.peer);
                 this.f.take();
                 entry.consumed = end as u32;
-                if entry.exhausted() {
-                    let bid = entry.bid_to_release();
-                    drop(entry);
-                    #[cfg(has_io_uring)]
-                    if let Some(bid) = bid {
-                        driver.udp_pending_replenish.push(bid);
-                    }
-                    #[cfg(not(has_io_uring))]
-                    let _ = (bid, driver);
-                } else {
+                if !entry.exhausted() {
+                    release.bid = None;
                     executor.udp_recv_queues[idx].push_front(entry);
                 }
                 return Poll::Ready(r);
@@ -5573,6 +5565,43 @@ where
             }
             Poll::Pending
         })
+    }
+}
+
+/// Returns a popped datagram's ring buffer when dropped, including when the
+/// receive callback panics. A task that panics in a callback leaves the worker
+/// running, and a lost buffer shrinks the socket's ring for good.
+struct ReleaseUdpBuf<'a> {
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    driver: &'a mut Driver,
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    udp_index: u32,
+    /// `None` when the entry goes back on the queue, and on mio.
+    bid: Option<u16>,
+}
+
+impl<'a> ReleaseUdpBuf<'a> {
+    fn new(
+        driver: &'a mut Driver,
+        udp_index: u32,
+        entry: &crate::runtime::PendingUdpDatagram,
+    ) -> Self {
+        ReleaseUdpBuf {
+            driver,
+            udp_index,
+            bid: entry.bid_to_release(),
+        }
+    }
+}
+
+impl Drop for ReleaseUdpBuf<'_> {
+    fn drop(&mut self) {
+        #[cfg(has_io_uring)]
+        if let Some(bid) = self.bid {
+            self.driver
+                .udp_pending_replenish
+                .push((self.udp_index, bid));
+        }
     }
 }
 
@@ -5620,30 +5649,16 @@ where
             while drained < this.max
                 && let Some(entry) = executor.udp_recv_queues[idx].pop_front()
             {
-                let bid = entry.bid_to_release();
+                let _release = ReleaseUdpBuf::new(driver, this.udp_index, &entry);
                 let peer = entry.peer;
                 // One callback per datagram: GRO-coalesced entries fan out
                 // into per-segment slices here. `drained` counts entries
                 // (kernel recv completions), so the bid lifetime stays simple
                 // — released once after the whole entry is consumed.
                 entry.for_each_segment(|seg| f(seg, peer));
-                drop(entry);
-                #[cfg(has_io_uring)]
-                if let Some(bid) = bid {
-                    driver.udp_pending_replenish.push(bid);
-                }
-                // On mio the bid is always `None` (no kernel buf ring) and
-                // `driver` is borrowed but never read inside the loop. Keep
-                // `let _ = bid;` here to silence the per-iteration unused
-                // warning without moving `driver` (which the loop will
-                // touch again on the next iteration).
-                #[cfg(not(has_io_uring))]
-                let _ = bid;
                 drained += 1;
             }
             this.f.take();
-            #[cfg(not(has_io_uring))]
-            let _ = driver;
             Poll::Ready(drained)
         })
     }
@@ -5691,25 +5706,16 @@ where
             while drained < this.max
                 && let Some(entry) = executor.udp_recv_queues[idx].pop_front()
             {
-                let bid = entry.bid_to_release();
+                let _release = ReleaseUdpBuf::new(driver, this.udp_index, &entry);
                 let recv_at = entry.recv_at;
                 let peer = entry.peer;
                 // One callback per datagram; GRO-coalesced entries fan out
                 // into per-segment slices, all sharing this entry's arrival
                 // timestamp. `drained` counts entries, not segments.
                 entry.for_each_segment(|seg| f(seg, peer, recv_at));
-                drop(entry);
-                #[cfg(has_io_uring)]
-                if let Some(bid) = bid {
-                    driver.udp_pending_replenish.push(bid);
-                }
-                #[cfg(not(has_io_uring))]
-                let _ = bid;
                 drained += 1;
             }
             this.f.take();
-            #[cfg(not(has_io_uring))]
-            let _ = driver;
             Poll::Ready(drained)
         })
     }

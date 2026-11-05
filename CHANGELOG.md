@@ -837,6 +837,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a UDP socket with no reader no longer stops the worker's other UDP
+  sockets receiving, and no longer pins the worker at 100% CPU. 128 datagrams
+  at an unread socket emptied the default ring, which all the worker's sockets
+  shared. Every socket then stopped receiving, and the worker re-armed on
+  `ENOBUFS` about 985,000 times per second. Each socket now has its own
+  provided ring, and a socket out of buffers is re-armed when one returns.
+  Until then its datagrams wait in the kernel receive buffer. `udp_recv_buffer`
+  now sizes a ring per socket, so memory and, on Linux 6.14+, `RLIMIT_MEMLOCK`
+  use grow with the number of bound sockets, and buffer groups number up from
+  `udp_recv_buffer_bgid`. A receive callback that panics now returns its buffer
+  to the ring (#742).
+
 - `ringline-http`: with the decompressed-size cap turned off
   (`set_max_decompressed_size(usize::MAX)` on `H1Conn` or `H2AsyncConn`), a
   gzip, zstd or brotli response body decoded as empty in release builds and

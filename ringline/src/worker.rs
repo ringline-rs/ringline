@@ -1760,7 +1760,7 @@ fn ensure_nofile_limit(
 /// before any worker thread exists.
 ///
 /// Every worker registers the configured regions as fixed buffers, and on
-/// Linux 6.14+ each worker's ring and its UDP provided buffer ring are charged too
+/// Linux 6.14+ each worker's ring and its UDP provided buffer rings are charged too
 /// (see [`crate::memlock`]). The kernel's default limit is 8 MiB (64 KiB
 /// before Linux 5.16), and it reports a shortfall as a bare `ENOMEM`. When
 /// the hard limit covers the need, this raises the soft limit to the hard
@@ -1821,8 +1821,8 @@ fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::er
 }
 
 /// The bytes `workers` workers charge to `RLIMIT_MEMLOCK` when they start:
-/// each worker's registered regions, plus its ring and its UDP provided
-/// buffer ring when the kernel charges those (`charges_rings`).
+/// each worker's registered regions, plus its ring and one provided buffer
+/// ring per UDP socket when the kernel charges those (`charges_rings`).
 #[cfg(any(has_io_uring, test))]
 fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: u64) -> u64 {
     use crate::memlock::{provided_ring_bytes, ring_bytes};
@@ -1839,9 +1839,8 @@ fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: 
         .sum();
     let rings = if charges_rings {
         let mut bytes = ring_bytes(config.sq_entries, page);
-        if !config.udp_bind.is_empty() {
-            bytes += provided_ring_bytes(config.udp_recv_buffer.ring_size, page);
-        }
+        bytes += config.udp_bind.len() as u64
+            * provided_ring_bytes(config.udp_recv_buffer.ring_size, page);
         bytes
     } else {
         0
@@ -2392,6 +2391,10 @@ mod memlock_required_tests {
         with.udp_connect_peers.push(None);
         // + 512 entries * 16 bytes = 2 pages.
         assert_eq!(memlock_required(&with, 1, true, PAGE), 7 * PAGE);
+        // Each socket has its own ring.
+        with.udp_bind.push("127.0.0.1:0".parse().unwrap());
+        with.udp_connect_peers.push(None);
+        assert_eq!(memlock_required(&with, 1, true, PAGE), 9 * PAGE);
     }
 
     /// A region at `addr`, for counting only: `memlock_required` reads its

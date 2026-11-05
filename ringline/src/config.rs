@@ -57,9 +57,9 @@ pub struct Config {
     ///
     /// Each buffer must fit an `io_uring_recvmsg_out`
     /// header (16 bytes) + `sockaddr_storage` (128 bytes) + the datagram
-    /// payload. Default: 128 buffers × 2048 bytes (room for a standard-MTU
-    /// datagram plus the multishot metadata); bump `buffer_size` if you
-    /// expect jumbo datagrams.
+    /// payload. Default: 128 buffers × 2048 bytes per socket (room for a
+    /// standard-MTU datagram plus the multishot metadata); bump `buffer_size`
+    /// if you expect jumbo datagrams.
     pub(crate) udp_recv_buffer: RecvBufferConfig,
     /// User-registered memory regions (e.g., mmap'd storage arenas).
     ///
@@ -284,7 +284,9 @@ pub struct Config {
     /// full, additional datagrams are dropped and
     /// `udp::DATAGRAMS_DROPPED` is incremented — this guards against
     /// unbounded memory growth when the handler future stalls, panics,
-    /// or returns early.
+    /// or returns early. On io_uring the capacity is clamped to the ring
+    /// size. A socket at that depth stops reading, and later datagrams wait
+    /// in the kernel receive buffer.
     ///
     /// Default: 1024.
     pub(crate) udp_recv_queue_capacity: usize,
@@ -585,6 +587,12 @@ impl Config {
                     "udp_recv_buffer.ring_size must be a power of two".into(),
                 ));
             }
+            // Each socket has its own buffer group, numbered up from `bgid`.
+            if self.udp_recv_buffer.bgid as usize + self.udp_bind.len() - 1 > u16::MAX as usize {
+                return Err(crate::error::Error::RingSetup(
+                    "udp_recv_buffer.bgid plus the number of UDP sockets must fit in u16".into(),
+                ));
+            }
             // Ceiling is 256 KiB so UDP GRO (which coalesces up to ~64 KiB of
             // payload plus the recvmsg header / sockaddr / control region into
             // one provided buffer) can be sized to fit. Non-GRO callers
@@ -628,7 +636,8 @@ pub(crate) struct RecvBufferConfig {
     pub ring_size: u16,
     /// Size of each buffer in bytes.
     pub buffer_size: u32,
-    /// Buffer group ID for the provided buffer ring.
+    /// Buffer group ID of the first socket's provided buffer ring. Later
+    /// sockets number up from it.
     pub bgid: u16,
 }
 
@@ -1035,13 +1044,19 @@ impl ConfigBuilder {
     /// Set the UDP recv buffer configuration (ring_size, buffer_size).
     /// The `bgid` is left at its default; override it with
     /// [`udp_recv_buffer_bgid`](Self::udp_recv_buffer_bgid).
+    ///
+    /// On io_uring every bound UDP socket has a ring of its own on each worker,
+    /// so memory use is `ring_size * buffer_size` per socket and worker. A
+    /// process binding many sockets should choose a small ring. On Linux 6.14+
+    /// each ring also charges at least one page to `RLIMIT_MEMLOCK`.
     pub fn udp_recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
         self.config.udp_recv_buffer.ring_size = ring_size;
         self.config.udp_recv_buffer.buffer_size = buffer_size;
         self
     }
 
-    /// Set the UDP recv buffer group ID (bgid).
+    /// Set the UDP recv buffer group ID (bgid) of the first bound socket.
+    /// Socket `n` uses `bgid + n`, and the last must fit in `u16`.
     pub fn udp_recv_buffer_bgid(mut self, bgid: u16) -> Self {
         self.config.udp_recv_buffer.bgid = bgid;
         self
@@ -1054,9 +1069,11 @@ impl ConfigBuilder {
     ///
     /// On the io_uring backend each queued datagram pins one provided
     /// ring buffer until it is consumed, so the effective capacity is
-    /// clamped to `udp_recv_buffer` ring_size — raise both knobs
-    /// together for deeper queues. The mio backend copies datagrams into
-    /// owned buffers and honors the full configured depth.
+    /// clamped to `udp_recv_buffer` ring_size. At that depth the socket
+    /// stops reading: later datagrams wait in its kernel receive buffer
+    /// and the kernel drops what does not fit, which this counter does not
+    /// see. The mio backend copies datagrams into owned buffers and
+    /// honors the full configured depth.
     pub fn udp_recv_queue_capacity(mut self, capacity: usize) -> Self {
         self.config.udp_recv_queue_capacity = capacity;
         self
@@ -1271,6 +1288,19 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn validate_udp_buffer_groups_fit_in_u16() {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let groups = |bgid| {
+            udp_config_with(|c| {
+                c.udp_bind = vec![addr; 3];
+                c.udp_recv_buffer.bgid = bgid;
+            })
+        };
+        assert!(groups(u16::MAX - 2).validate().is_ok());
+        assert!(groups(u16::MAX - 1).validate().is_err());
     }
 
     #[test]
