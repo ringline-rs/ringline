@@ -914,7 +914,7 @@ pub fn request_shutdown() -> io::Result<()> {
 pub(crate) struct ConnCtx {
     pub(crate) conn_index: u32,
     pub(crate) generation: u32,
-    /// Pins the handle to its owning worker thread — see "Thread affinity".
+    /// Pins the handle to its owning worker thread — see [`Connection`].
     /// `PhantomData<*const ()>` is how a type opts out of `Send`/`Sync` on
     /// stable Rust; `impl !Send` is still nightly-only (rust-lang/rust#68318).
     pub(crate) _not_send: PhantomData<*const ()>,
@@ -986,55 +986,7 @@ impl ConnCtx {
         self.conn_index as usize
     }
 
-    /// Offer this connection for rebalancing onto a less loaded worker
-    /// (tier 3, #443), carrying `state` across.
-    ///
-    /// Call it at a point where the handler holds nothing it cannot rebuild —
-    /// after finishing a response, not mid-request. Park drops the future and
-    /// makes a fresh one on the new worker via
-    /// [`AsyncEventHandler::on_adopt`](crate::AsyncEventHandler::on_adopt),
-    /// so `state` is the only thing that survives.
-    ///
-    /// Once the connection is parked, sends on this handle, from the handler,
-    /// a spawned task or `on_tick`, return `NotConnected` until the future is
-    /// dropped.
-    ///
-    /// **This is the opt-in.** A connection whose handler never calls this is
-    /// never parked, whatever the load imbalance.
-    ///
-    /// The offer is cleared when more data arrives, since that means a new
-    /// request started and the boundary is gone. So a handler offers once per
-    /// idle point and never has to revoke.
-    ///
-    /// Call it outside any reader callback, after the response to every
-    /// request read so far has been queued. An offer is ignored when it
-    /// is made from inside one of the connection's reader callbacks
-    /// (`with_data`, `with_bytes`, `try_with_data`), or
-    /// while the runtime holds received bytes for the connection, such as
-    /// the next request. Offer again at the next idle point.
-    /// A connection whose next request has always arrived by the time the
-    /// handler offers is therefore never parked. Only the innermost
-    /// running callback is detected. An offer for connection A made from
-    /// inside a callback on connection B, itself inside A's callback, is
-    /// declined only while the runtime still holds A's bytes. It does not
-    /// hold them in a `with_bytes` callback, or after a `forward_recv_buf`
-    /// that sent the whole accumulator.
-    /// `metrics::park_diag::OFFER_DECLINED` counts offers ignored because of
-    /// a running reader callback or held bytes.
-    ///
-    /// The runtime does not see bytes the handler has taken into its own
-    /// memory, for example a `ConnStream`'s buffered data, `Bytes` kept from
-    /// `with_bytes`, or requests the handler has queued. Do not offer while
-    /// holding any.
-    ///
-    /// A TLS connection keeps its TLS session when parked: the session moves
-    /// with it, with any ciphertext received but not yet decrypted, so the
-    /// peer sees no new handshake.
-    ///
-    /// Park also requires the io_uring backend and a kernel with
-    /// `IORING_OP_FIXED_FD_INSTALL` (mainline 6.8). On mio this does
-    /// nothing; on io_uring without that operation the offer is recorded
-    /// and never acted on.
+    /// See [`Connection::offer_for_park`].
     pub(crate) fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         let _ = try_with_state(|driver, _| {
             #[cfg(has_io_uring)]
@@ -1057,17 +1009,7 @@ impl ConnCtx {
 
     // ── Recv ─────────────────────────────────────────────────────────
 
-    /// Wait until recv data is available, then process it.
-    ///
-    /// The closure receives accumulated bytes and returns a [`ParseResult`]:
-    /// - `ParseResult::Consumed(n)` — `n` bytes were consumed from the buffer.
-    /// - `ParseResult::NeedMore` — the closure needs more data before making progress.
-    ///
-    /// Resolves immediately when data is already buffered (cache-hit hot path).
-    ///
-    /// If the closure returns `NeedMore` or `Consumed(0)` on non-empty data
-    /// (incomplete parse), the future parks and retries when more data arrives.
-    /// The closure must therefore be safe to call multiple times (`FnMut`).
+    /// See [`Connection::with_data`].
     pub(crate) fn with_data<F: FnMut(&[u8]) -> ParseResult>(&self, f: F) -> WithDataFuture<F> {
         WithDataFuture {
             conn_index: self.conn_index,
@@ -1076,35 +1018,7 @@ impl ConnCtx {
         }
     }
 
-    /// Like `with_data`, but the future distinguishes a
-    /// clean peer close from a transport failure.
-    ///
-    /// Resolves to:
-    /// - `Ok(n)` with `n > 0` — the closure consumed `n` bytes;
-    /// - `Ok(0)` — the peer closed cleanly (or this future is stale: the
-    ///   connection slot has been closed and reused) and no error was
-    ///   recorded;
-    /// - `Err(e)` — the socket read failed with a non-`WouldBlock` error
-    ///   (`ConnectionReset` after an RST, for example). Buffered bytes are
-    ///   always delivered before the error is surfaced.
-    ///
-    /// The error is reported once: a later `with_data_result` on the same
-    /// connection resolves to `Ok(0)`. And `Ok(n)` echoes whatever the
-    /// closure returned, including from the empty-slice call made once the
-    /// connection is closed — a closure that returns `Consumed(n > 0)` for
-    /// empty input will see `Ok(n)` there and the recorded error only on the
-    /// following call.
-    ///
-    /// Only a failed socket read is reported this way. A TLS record-layer
-    /// error (a bad record, a failed decrypt) still closes the connection
-    /// through the EOF path and resolves to `Ok(0)`, indistinguishable from a
-    /// clean close, exactly as with `with_data`.
-    ///
-    /// `with_data` keeps returning `0` for both cases; nothing about it
-    /// changes. Use this variant when a protocol handler must tell "the peer
-    /// hung up" from "the transport broke". Check
-    /// `eof_truncated` after `Ok(0)` on TLS
-    /// connections, exactly as with `with_data`.
+    /// See [`Connection::with_data_result`].
     pub(crate) fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
         &self,
         f: F,
@@ -1114,14 +1028,7 @@ impl ConnCtx {
         }
     }
 
-    /// Wait until recv data is available, then provide it as zero-copy `Bytes`.
-    ///
-    /// Like [`with_data()`](Self::with_data), but the closure receives a `Bytes`
-    /// handle that can be sliced (O(1), refcounted) instead of copied. The
-    /// closure returns a [`ParseResult`] indicating bytes consumed.
-    ///
-    /// This enables zero-copy RESP parsing: the parser can call `bytes.slice()`
-    /// to extract sub-ranges without allocating.
+    /// See [`Connection::with_bytes`].
     pub(crate) fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&self, f: F) -> WithBytesFuture<F> {
         WithBytesFuture {
             conn_index: self.conn_index,
@@ -1150,8 +1057,7 @@ impl ConnCtx {
         .flatten()
     }
 
-    /// Non-blocking accumulator access. Calls `f` with buffered data if any,
-    /// returning `Some(result)`. Returns `None` if the accumulator is empty.
+    /// See [`Connection::try_with_data`].
     pub(crate) fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(
         &self,
         f: F,
@@ -1190,21 +1096,7 @@ impl ConnCtx {
 
     // ── Send (synchronous / fire-and-forget) ─────────────────────────
 
-    /// Fire-and-forget send: copies data into the send pool and submits the SQE.
-    /// One copy, no heap allocation, no future.
-    ///
-    /// This is the hot-path send for cache responses. The CQE is handled
-    /// internally by the executor (resource cleanup + send queue advancement).
-    ///
-    /// # Errors
-    ///
-    /// Same error contract as `send()`: pool admission errors
-    /// only (`Other` when the pool cannot admit the whole buffer,
-    /// `InvalidInput` when it never could), nothing committed on `Err`,
-    /// submission-queue pressure absorbed by the queue. With no future to resolve, persistent
-    /// submission-queue starvation surfaces only as the connection closing.
-    ///
-    /// For backpressure-aware sending, use `send()` instead.
+    /// See [`SendHalf::send_nowait`].
     pub(crate) fn send_nowait(&self, data: &[u8]) -> io::Result<()> {
         with_state(|driver, _| {
             let mut ctx = driver.make_ctx();
@@ -1392,11 +1284,7 @@ impl ConnCtx {
         }
     }
 
-    /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
-    ///
-    /// This mirrors `DriverCtx::send_parts()` — use `.copy(data)` for copied parts
-    /// and `.guard(guard)` for zero-copy parts backed by `SendGuard`. Call `.submit()`
-    /// to submit the SQE. Fire-and-forget: no future returned.
+    /// See [`SendHalf::send_parts`].
     #[cfg(has_io_uring)]
     pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
         AsyncSendBuilder {
@@ -1406,28 +1294,7 @@ impl ConnCtx {
 
     // ── Send (awaitable) ─────────────────────────────────────────────
 
-    /// Send data and await completion. Copies data into the send pool, submits
-    /// the SQE eagerly, then returns a future that resolves with `data.len()`
-    /// once this send's last byte has gone to the socket, or with the error
-    /// that ended it. Under TLS that is the plaintext length, not the
-    /// ciphertext's. Each future resolves with its own send's result, so
-    /// several may be awaited at once.
-    ///
-    /// Use this when you need backpressure or send completion notification.
-    /// For fire-and-forget sending, use `send_nowait()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the send copy pool cannot admit the whole buffer
-    /// (`Other`, retryable once in-flight sends complete) or if the buffer
-    /// is wider than the entire pool (`InvalidInput`). Nothing was queued or
-    /// transmitted on `Err`, so the same buffer may be sent again later. On a
-    /// TLS connection the pool is checked against the *ciphertext* bound
-    /// before anything is encrypted, which is what keeps that true there.
-    /// Submission-queue pressure is not an error: the send is queued
-    /// and retried. Persistent submission-queue starvation is reported like
-    /// a write error: the awaited `SendFuture` resolves `Err` and the
-    /// connection is closed.
+    /// See [`SendHalf::send`].
     pub(crate) fn send(&self, data: &[u8]) -> io::Result<SendFuture> {
         with_state(|driver, executor| {
             let id = executor.register_send(self.conn_index);
@@ -1440,30 +1307,7 @@ impl ConnCtx {
         })
     }
 
-    /// Send `data`, waiting for send-pool capacity instead of failing when
-    /// the pool is full.
-    ///
-    /// The counterpart to `send`, which fails immediately when
-    /// the copy pool is exhausted. Reach for this when the peer should set
-    /// the pace rather than the pool — forwarding a fast source to a slow
-    /// sink, for instance — and for `send` when a full pool means you would
-    /// rather drop the message than wait.
-    ///
-    /// Nothing is submitted, and no queue is joined, until the returned
-    /// future is polled; dropping one you never awaited does nothing. See
-    /// [`BackpressuredSendFuture`] for admission order, cancellation
-    /// semantics and the error kinds.
-    ///
-    /// `data` is borrowed until the future resolves, so it is read at
-    /// submission time rather than copied up front.
-    ///
-    /// ```no_run
-    /// # async fn f(tx: &mut ringline::SendHalf, body: &[u8]) -> std::io::Result<()> {
-    /// let sent = tx.send_backpressured(body).await?;
-    /// assert_eq!(sent as usize, body.len());
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// See [`SendHalf::send_backpressured`].
     pub(crate) fn send_backpressured<'a>(&self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
         BackpressuredSendFuture {
             conn_index: self.conn_index,
@@ -1560,7 +1404,7 @@ impl ConnCtx {
 
     // ── TLS ──────────────────────────────────────────────────────────
 
-    /// Query TLS session info for this connection.
+    /// See [`Connection::tls_info`].
     pub(crate) fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         with_state(|driver, _| {
             let ctx = driver.make_ctx();
@@ -1568,17 +1412,7 @@ impl ConnCtx {
         })
     }
 
-    /// Whether this TLS connection's EOF was a truncation: the peer's TCP
-    /// FIN arrived *without* a preceding close_notify alert. A truncated
-    /// stream may be missing data the peer (or an active attacker injecting
-    /// the FIN) cut off — length- or delimiter-framed protocols should treat
-    /// it as an error rather than a clean end-of-stream.
-    ///
-    /// Check this when a recv (`with_data`/`with_bytes`) reports EOF. The
-    /// flag is readable while the connection slot is still held (the wake
-    /// that delivered the EOF and this check run before the slot is
-    /// recycled); it returns `false` for plaintext connections, for clean
-    /// TLS shutdowns, and once the slot has been reused.
+    /// See [`Connection::eof_truncated`].
     pub(crate) fn eof_truncated(&self) -> bool {
         with_state(|driver, _| {
             driver
@@ -1592,23 +1426,7 @@ impl ConnCtx {
 
     // ── Close / metadata ─────────────────────────────────────────────
 
-    /// Close this connection.
-    ///
-    /// Queued sends drain first, then, on a TLS connection, a close_notify
-    /// alert, then the FIN. The drain has no time bound: a peer that stops
-    /// reading holds the connection until it reads, resets, or the worker
-    /// exits. On io_uring, if a close is already pending, for example because
-    /// the peer closed first, this sends no alert; mio writes the alert at
-    /// teardown regardless. No alert follows a write shutdown
-    /// (`shutdown_write`).
-    ///
-    /// On io_uring a TLS send made after `close()` returns `NotConnected`,
-    /// because it would follow the alert. On mio it is queued and sent ahead of
-    /// the alert, which mio writes once the queue drains.
-    ///
-    /// Does nothing if the connection has already been released (its slot may
-    /// now hold another connection), or when called outside the worker's
-    /// executor.
+    /// See [`SendHalf::close`].
     pub(crate) fn close(&self) {
         let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
         if opt_non_null.is_none() {
@@ -1626,11 +1444,7 @@ impl ConnCtx {
         driver.close_connection(self.conn_index);
     }
 
-    /// Which listener accepted this connection, or `None` if it is outbound.
-    ///
-    /// A runtime can bind several listeners and they all feed the same
-    /// `on_accept`; this is how a handler tells them apart. Ids follow
-    /// `bind()` call order — see [`ListenerId`](crate::ListenerId).
+    /// See [`Connection::listener`].
     pub(crate) fn listener(&self) -> Option<crate::ListenerId> {
         with_state(|driver, _| {
             let conn = driver.connections.get(self.conn_index)?;
@@ -1641,7 +1455,7 @@ impl ConnCtx {
         })
     }
 
-    /// Access peer address.
+    /// See [`Connection::peer_addr`].
     pub(crate) fn peer_addr(&self) -> Option<crate::connection::PeerAddr> {
         with_state(|driver, _| {
             let conn = driver.connections.get(self.conn_index)?;
@@ -1652,7 +1466,7 @@ impl ConnCtx {
         })
     }
 
-    /// Check if this connection is outbound (initiated via connect).
+    /// See [`Connection::is_outbound`].
     pub(crate) fn is_outbound(&self) -> bool {
         with_state(|driver, _| {
             driver
@@ -1663,28 +1477,7 @@ impl ConnCtx {
         })
     }
 
-    /// Whether this handle still refers to a live, usable connection.
-    ///
-    /// Returns `false` if the slot has been released and its generation bumped
-    /// (a stale handle after slot reuse) **or** if the connection is closing
-    /// (`close()` was called — `lifecycle` is `Closing` — even before the Close
-    /// CQE has released the slot). Because a proactive `close()` flips the state
-    /// synchronously, this is a *deterministic* poison probe: a caller that owns
-    /// the connection (e.g. a connection pool) can detect a client's poison
-    /// close on the very next turn, without waiting for the Close CQE to bump
-    /// the generation.
-    ///
-    /// A FIN or reset from the peer closes the connection whether or not a
-    /// read is parked, so this returns `false` once the runtime has seen it.
-    /// On io_uring the runtime detects it on every plaintext or TLS
-    /// connection with a `POLLRDHUP` poll. On a plaintext connection, when
-    /// bytes the peer sent before it are queued or buffered, the connection
-    /// stays open, and this returns `true`, until they have been read (see
-    /// [`connect`]). On a TLS connection the close takes effect when the
-    /// receive reads the close_notify or the FIN; plaintext already decrypted
-    /// stays readable. On io_uring, a close_notify the peer sends without a FIN
-    /// is read when a receive next completes (see [`connect`] for when one is
-    /// armed), and this returns `true` until then.
+    /// See [`Connection::is_alive`].
     pub(crate) fn is_alive(&self) -> bool {
         // `try_with_state`, not `with_state`: this is reachable from a `Drop`
         // that runs outside a task poll. A connection-bound task is dropped by
@@ -1705,12 +1498,7 @@ impl ConnCtx {
         .unwrap_or(false)
     }
 
-    /// Whether the connection receives directly into its accumulator: on
-    /// io_uring, every plaintext connection, accepted or from [`connect`] or
-    /// [`connect_unix`]. A TLS connection receives into its TLS engine's
-    /// buffer instead, and this returns `false` for it. Always `false` on the
-    /// mio backend, outside the executor, and once the runtime has released
-    /// the connection's slot after its close completes.
+    /// See [`Connection::is_recv_direct`].
     pub(crate) fn is_recv_direct(&self) -> bool {
         #[cfg(has_io_uring)]
         {
@@ -1885,9 +1673,7 @@ pub struct AsyncSendBuilder {
 
 #[cfg(not(has_io_uring))]
 impl ConnCtx {
-    /// Begin building a scatter-gather send.
-    ///
-    /// On the mio backend, this degrades to copy-only sends.
+    /// See [`SendHalf::send_parts`].
     pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
         AsyncSendBuilder {
             token: self.token(),
@@ -2370,7 +2156,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
 
 // ── RecvHalf — the exclusive read side of a connection ───────────────
 
-/// The exclusive **read side** of a connection.
+/// The exclusive read side of a connection.
 ///
 /// Obtained from [`Connection::split`]. Neither `Copy` nor `Clone`, and every
 /// read method takes `&mut self`.
@@ -2402,8 +2188,6 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
 /// `with_data`, `with_data_result`, `with_bytes` and `recv_ready` return futures
 /// with no lifetime parameter, so the borrow ends with the call and two of them
 /// can be held at once. Those rely on runtime checks.
-///
-/// Dropping the half releases its claim.
 ///
 /// Available on both backends.
 pub struct RecvHalf {
@@ -2550,7 +2334,7 @@ impl RecvHalf {
     }
 }
 
-/// An owned connection: the pair of claimed halves.
+/// An owned connection: its two halves.
 ///
 /// Delivered to
 /// [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept) for
@@ -2558,8 +2342,8 @@ impl RecvHalf {
 /// [`connect_unix`](crate::connect_unix) for outbound ones.
 ///
 /// Not `Copy`, not `Clone`, and `!Send`, so one task owns one connection. A
-/// `Copy` handle carrying the read surface allowed two readers to interleave on
-/// one connection and desynchronise the protocol (#423, #425, #429).
+/// `Copy` handle would let two readers interleave on one connection and
+/// desynchronise the protocol (#423, #425, #429).
 ///
 /// Most handlers can use this directly: the read and write methods are the
 /// same ones on [`SendHalf`] and [`RecvHalf`].
@@ -2738,6 +2522,16 @@ impl RecvHalf {
 /// assert_send::<ringline::RecvHalf>();
 /// ```
 ///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<ringline::SendHalf>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<ringline::RecvHalf>();
+/// ```
+///
 /// Ringline is thread-per-core: each worker owns its own driver and
 /// `ConnectionTable`, and a connection is an `(index, generation)` pair into
 /// that worker's table. Used from another worker the index is still in bounds,
@@ -2815,12 +2609,50 @@ impl Connection {
 
     // ── recv ────────────────────────────────────────────────────────────
 
-    /// See [`Connection::with_data`].
+    /// Wait until recv data is available, then process it.
+    ///
+    /// The closure receives accumulated bytes and returns a [`ParseResult`]:
+    /// - `ParseResult::Consumed(n)` — `n` bytes were consumed from the buffer.
+    /// - `ParseResult::NeedMore` — the closure needs more data before making progress.
+    ///
+    /// Resolves immediately when data is already buffered (cache-hit hot path).
+    ///
+    /// If the closure returns `NeedMore` or `Consumed(0)` on non-empty data
+    /// (incomplete parse), the future parks and retries when more data arrives.
+    /// The closure must therefore be safe to call multiple times (`FnMut`).
     pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<F> {
         self.rx.with_data(f)
     }
 
-    /// See [`Connection::with_data_result`].
+    /// Like `with_data`, but the future distinguishes a
+    /// clean peer close from a transport failure.
+    ///
+    /// Resolves to:
+    /// - `Ok(n)` with `n > 0` — the closure consumed `n` bytes;
+    /// - `Ok(0)` — the peer closed cleanly (or this future is stale: the
+    ///   connection slot has been closed and reused) and no error was
+    ///   recorded;
+    /// - `Err(e)` — the socket read failed with a non-`WouldBlock` error
+    ///   (`ConnectionReset` after an RST, for example). Buffered bytes are
+    ///   always delivered before the error is surfaced.
+    ///
+    /// The error is reported once: a later `with_data_result` on the same
+    /// connection resolves to `Ok(0)`. And `Ok(n)` echoes whatever the
+    /// closure returned, including from the empty-slice call made once the
+    /// connection is closed — a closure that returns `Consumed(n > 0)` for
+    /// empty input will see `Ok(n)` there and the recorded error only on the
+    /// following call.
+    ///
+    /// Only a failed socket read is reported this way. A TLS record-layer
+    /// error (a bad record, a failed decrypt) still closes the connection
+    /// through the EOF path and resolves to `Ok(0)`, indistinguishable from a
+    /// clean close, exactly as with `with_data`.
+    ///
+    /// `with_data` keeps returning `0` for both cases; nothing about it
+    /// changes. Use this variant when a protocol handler must tell "the peer
+    /// hung up" from "the transport broke". Check
+    /// `eof_truncated` after `Ok(0)` on TLS
+    /// connections, exactly as with `with_data`.
     pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
         &mut self,
         f: F,
@@ -2828,7 +2660,14 @@ impl Connection {
         self.rx.with_data_result(f)
     }
 
-    /// See [`Connection::with_bytes`].
+    /// Wait until recv data is available, then provide it as zero-copy `Bytes`.
+    ///
+    /// Like [`with_data()`](Self::with_data), but the closure receives a `Bytes`
+    /// handle that can be sliced (O(1), refcounted) instead of copied. The
+    /// closure returns a [`ParseResult`] indicating bytes consumed.
+    ///
+    /// This enables zero-copy RESP parsing: the parser can call `bytes.slice()`
+    /// to extract sub-ranges without allocating.
     pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&mut self, f: F) -> WithBytesFuture<F> {
         self.rx.with_bytes(f)
     }
@@ -2885,7 +2724,7 @@ impl Connection {
     }
 
     /// Offer this connection for rebalancing onto a less loaded worker
-    /// (tier 3, #443), carrying `state` across.
+    /// (#443), carrying `state` across.
     ///
     /// Call it at a point where the handler holds nothing it cannot rebuild —
     /// after finishing a response, not mid-request. Park drops the future and
@@ -2897,7 +2736,7 @@ impl Connection {
     /// a spawned task or `on_tick`, return `NotConnected` until the future is
     /// dropped.
     ///
-    /// **This is the opt-in.** A connection whose handler never calls this is
+    /// A connection is parked only if its handler calls this. A connection whose handler never calls this is
     /// never parked, whatever the load imbalance.
     ///
     /// The offer is cleared when more data arrives, since that means a new
@@ -2944,14 +2783,10 @@ impl Connection {
 
     /// Whether this handle still refers to a live, usable connection.
     ///
-    /// Returns `false` if the slot has been released and its generation bumped
-    /// (a stale handle after slot reuse) **or** if the connection is closing
-    /// (`close()` was called — `lifecycle` is `Closing` — even before the Close
-    /// CQE has released the slot). Because a proactive `close()` flips the state
-    /// synchronously, this is a *deterministic* poison probe: a caller that owns
-    /// the connection (e.g. a connection pool) can detect a client's poison
-    /// close on the very next turn, without waiting for the Close CQE to bump
-    /// the generation.
+    /// Returns `false` if the slot has been released and its generation bumped,
+    /// or if the connection is closing, even before the Close CQE has released
+    /// the slot. Because `close()` sets `Closing` synchronously, a caller such as
+    /// a pool sees a client's close on its next turn.
     ///
     /// A FIN or reset from the peer closes the connection whether or not a
     /// read is parked, so this returns `false` once the runtime has seen it.
@@ -2999,7 +2834,17 @@ impl Connection {
 
     // ── the rest of the connection surface ─────────────────────────────────
 
-    /// See [`Connection::eof_truncated`].
+    /// Whether this TLS connection's EOF was a truncation: the peer's TCP
+    /// FIN arrived *without* a preceding close_notify alert. A truncated
+    /// stream may be missing data the peer (or an active attacker injecting
+    /// the FIN) cut off — length- or delimiter-framed protocols should treat
+    /// it as an error rather than a clean end-of-stream.
+    ///
+    /// Check this when a recv (`with_data`/`with_bytes`) reports EOF. The
+    /// flag is readable while the connection slot is still held (the wake
+    /// that delivered the EOF and this check run before the slot is
+    /// recycled); it returns `false` for plaintext connections, for clean
+    /// TLS shutdowns, and once the slot has been reused.
     pub fn eof_truncated(&self) -> bool {
         self.rx.as_conn_ref().eof_truncated()
     }
@@ -3027,7 +2872,8 @@ impl Connection {
         self.rx.recv_arrival()
     }
 
-    /// See [`Connection::try_with_data`].
+    /// Non-blocking accumulator access. Calls `f` with buffered data if any,
+    /// returning `Some(result)`. Returns `None` if the accumulator is empty.
     pub fn try_with_data<F: FnOnce(&[u8]) -> ParseResult>(&mut self, f: F) -> Option<ParseResult> {
         self.rx.as_conn_ref().try_with_data(f)
     }
@@ -3071,7 +2917,7 @@ impl Connection {
     }
 }
 
-/// The **write side** of a connection, from [`Connection::split`].
+/// The write side of a connection, from [`Connection::split`].
 ///
 /// Not `Copy` and not `Clone`, so one task owns the writes. Several producers
 /// feeding one connection is an explicit queue — `runtime::channel`'s
@@ -3094,22 +2940,84 @@ pub struct SendHalf {
 }
 
 impl SendHalf {
-    /// See [`SendHalf::send`].
+    /// Send data and await completion. Copies data into the send pool, submits
+    /// the SQE eagerly, then returns a future that resolves with `data.len()`
+    /// once this send's last byte has gone to the socket, or with the error
+    /// that ended it. Under TLS that is the plaintext length, not the
+    /// ciphertext's. Each future resolves with its own send's result, so
+    /// several may be awaited at once.
+    ///
+    /// Use this when you need backpressure or send completion notification.
+    /// For fire-and-forget sending, use `send_nowait()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the send copy pool cannot admit the whole buffer
+    /// (`Other`, retryable once in-flight sends complete) or if the buffer
+    /// is wider than the entire pool (`InvalidInput`). Nothing was queued or
+    /// transmitted on `Err`, so the same buffer may be sent again later. On a
+    /// TLS connection the pool is checked against the *ciphertext* bound
+    /// before anything is encrypted, which is what keeps that true there.
+    /// Submission-queue pressure is not an error: the send is queued
+    /// and retried. Persistent submission-queue starvation is reported like
+    /// a write error: the awaited `SendFuture` resolves `Err` and the
+    /// connection is closed.
     pub fn send(&mut self, data: &[u8]) -> io::Result<SendFuture> {
         self.conn.send(data)
     }
 
-    /// See [`SendHalf::send_nowait`].
+    /// Fire-and-forget send: copies data into the send pool and submits the SQE.
+    /// One copy, no heap allocation, no future.
+    ///
+    /// This is the hot-path send for cache responses. The CQE is handled
+    /// internally by the executor (resource cleanup + send queue advancement).
+    ///
+    /// # Errors
+    ///
+    /// Same error contract as `send()`: pool admission errors
+    /// only (`Other` when the pool cannot admit the whole buffer,
+    /// `InvalidInput` when it never could), nothing committed on `Err`,
+    /// submission-queue pressure absorbed by the queue. With no future to resolve, persistent
+    /// submission-queue starvation surfaces only as the connection closing.
+    ///
+    /// For backpressure-aware sending, use `send()` instead.
     pub fn send_nowait(&mut self, data: &[u8]) -> io::Result<()> {
         self.conn.send_nowait(data)
     }
 
-    /// See [`SendHalf::send_parts`].
+    /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
+    ///
+    /// This mirrors `DriverCtx::send_parts()` — use `.copy(data)` for copied parts
+    /// and `.guard(guard)` for zero-copy parts backed by `SendGuard`. Call `.submit()`
+    /// to submit the SQE. Fire-and-forget: no future returned.
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.conn.send_parts()
     }
 
-    /// See [`SendHalf::send_backpressured`].
+    /// Send `data`, waiting for send-pool capacity instead of failing when
+    /// the pool is full.
+    ///
+    /// The counterpart to `send`, which fails immediately when
+    /// the copy pool is exhausted. Reach for this when the peer should set
+    /// the pace rather than the pool — forwarding a fast source to a slow
+    /// sink, for instance — and for `send` when a full pool means you would
+    /// rather drop the message than wait.
+    ///
+    /// Nothing is submitted, and no queue is joined, until the returned
+    /// future is polled; dropping one you never awaited does nothing. See
+    /// [`BackpressuredSendFuture`] for admission order, cancellation
+    /// semantics and the error kinds.
+    ///
+    /// `data` is borrowed until the future resolves, so it is read at
+    /// submission time rather than copied up front.
+    ///
+    /// ```no_run
+    /// # async fn f(tx: &mut ringline::SendHalf, body: &[u8]) -> std::io::Result<()> {
+    /// let sent = tx.send_backpressured(body).await?;
+    /// assert_eq!(sent as usize, body.len());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
         self.conn.send_backpressured(data)
     }
@@ -3261,12 +3169,9 @@ impl SendHalf {
 }
 
 impl Drop for SendHalf {
-    /// Release the write claim, **if it is still ours**.
-    ///
-    /// Generation-gated for the same reason as [`RecvHalf`]'s: the claim is per
-    /// *slot*, and a half can outlive its connection inside a standalone task,
-    /// so clearing unconditionally would steal the claim of whoever owns the
-    /// slot now.
+    /// Clear this half's flag if the slot still holds this connection. A half
+    /// can outlive its connection inside a standalone task, and the slot's new
+    /// occupant has its own flag.
     fn drop(&mut self) {
         let _ = try_with_state(|driver, _executor| {
             if driver.connections.generation(self.conn.conn_index) != self.conn.generation {
@@ -3283,17 +3188,8 @@ impl Drop for SendHalf {
 }
 
 impl Drop for RecvHalf {
-    /// Release the claim, **if it is still ours**.
-    ///
-    /// The claim is per *slot*, and a half can outlive its connection:
-    /// [`spawn`] requires only `'static`, not `Send`, so a standalone task can
-    /// hold one past teardown. If the slot has since been recycled and its new
-    /// occupant has taken its own half, clearing unconditionally would steal
-    /// that claim and permit a second `RecvHalf` on a live connection.
-    ///
-    /// `Driver::clear_conn_claims` at the recycle point is what guarantees a
-    /// fresh slot starts clean; this only releases a claim of our own
-    /// generation.
+    /// See [`SendHalf`]'s `drop`. `Driver::clear_conn_claims` at the recycle
+    /// point starts each slot with both flags clear.
     fn drop(&mut self) {
         let _ = try_with_state(|driver, _executor| {
             if driver.connections.generation(self.conn.conn_index) != self.conn.generation {
@@ -3367,6 +3263,11 @@ impl Drop for ForwardFuture<'_> {
     /// queued — it is on its way and cannot be recalled — but no further bytes
     /// are taken from the source.
     fn drop(&mut self) {
+        // A refused future installed nothing, and a forward running on this
+        // source belongs to another future.
+        if self.refused.is_some() {
+            return;
+        }
         let _ = try_with_state(|driver, _executor| {
             let idx = self.conn_index as usize;
             if driver.connections.generation(self.conn_index) != self.generation {
@@ -3392,7 +3293,7 @@ pub struct ForwardFuture<'a> {
     refused: Option<i32>,
     /// The running forward; `None` once it resolved or if it was refused.
     direct: Option<DirectForward>,
-    /// Ties the future to the sink the caller borrowed.
+    /// Ties the future to the source and sink the caller borrowed.
     _borrow: PhantomData<&'a ()>,
 }
 

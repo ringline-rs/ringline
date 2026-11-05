@@ -63,7 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   such a connection sends each
   received chunk from the accumulator through the sink's send queue,
   zero-copy at or above `send_zc_threshold`. Counters in
-  `ringline/recv_direct`. `ConnCtx::is_recv_direct` (also on `Connection`
+  `ringline/recv_direct`. `Connection::is_recv_direct` (also on `ConnStream`
   and `RecvHalf`) tells whether a connection receives this way.
   - As a client, against Valkey and memcached with 1,000 connections (63 per
     worker), client CPU at a fixed rate was 1.8 to 6.8% lower than the ring
@@ -202,14 +202,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   recv completion and one send completion. A slot whose discriminant no tag
   uses is never registered; a metrics dump reports it as `idxN` at zero
   rather than omitting it (#486).
-- `ConnCtx::with_data_result`: like `with_data`, but resolves to
+- `Connection::with_data_result`: like `with_data`, but resolves to
   `io::Result<usize>` so a handler can tell a clean peer close (`Ok(0)`)
   from a transport failure (`Err(e)`, e.g. `ConnectionReset` after an RST).
   Buffered bytes are delivered before the error, and the error is reported
   once. `with_data` is unchanged and still reports `0` for both. First PR of
   the series that lands #318 (design:
   `docs/backpressured-sends-series-design.md`).
-- `ConnCtx::send_backpressured` and `BackpressuredSendFuture`: a send that
+- `SendHalf::send_backpressured` and `BackpressuredSendFuture`: a send that
   waits for send-pool capacity instead of failing when the pool is full.
   Admission is first-come-first-served per worker, so a large message cannot
   be starved by a stream of small ones, and a message that could never fit
@@ -625,7 +625,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   suppressed at run time for Unix binds. Each listener now answers for itself.
 
   Connections carry the [`ListenerId`] of the listener that accepted them,
-  exposed as `listener()` on `ConnCtx`, `Connection` and `SendHalf` (`None` for
+  exposed as `listener()` on `Connection` and `SendHalf` (`None` for
   outbound), so one `on_accept` can dispatch across listeners. Ids follow
   `bind()` call order. `Runtime` gains `bound_addr_of()`, `bound_addrs()`
   and `listener_count()`; `bound_addr()` still returns the first TCP listener's
@@ -669,7 +669,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   again. A task that closes a connection it does not otherwise own needs the
   `SendHalf`. `peer_addr`, `tls_info`, `listener`, `is_outbound` and
   `is_recv_direct` have to be read from the `Connection` before it goes to a
-  protocol client. Design: `docs/public-context-types-design.md`.
+  protocol client, and `offer_for_park` cannot be called on one a client holds.
+  A dropped `Connection` leaves its socket open, and nothing can then reach an
+  outbound one to close it, so close it first. Design:
+  `docs/public-context-types-design.md`.
 - **Breaking:** `Connection::cancel` and `ConnCtx::cancel`. Neither had a
   caller, and mio returned `Unsupported`. `select` on a `CancellationToken`
   interrupts a parked read.

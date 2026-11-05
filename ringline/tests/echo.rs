@@ -81,7 +81,7 @@ impl AsyncEventHandler for BurstSender {
 
 // ── Split-halves echo handler ──────────────────────
 
-/// Echoes through `ConnCtx::split()`.
+/// Echoes through `Connection::split()`.
 ///
 /// The send happens *inside* the `with_data` closure, while the read side is
 /// mutably borrowed by the in-flight recv future. That is the whole point of
@@ -787,9 +787,9 @@ impl AsyncEventHandler for SleepEchoHandler {
 
             // Several producers feeding one connection is an explicit queue
             // drained by the task that owns the write half — the documented
-            // alternative to a shared send handle, and now the only one: the
-            // send half is not `Clone`, and `ConnCtx` no longer carries the
-            // capability. See `docs/connection-handle-ownership-design.md`.
+            // alternative to a shared send handle, and the only one: the send
+            // half is not `Clone`. See
+            // `docs/connection-handle-ownership-design.md`.
             let (outbox, drain) = ringline::mpsc::channel::<Vec<u8>>(8);
             ringline::spawn(async move {
                 while let Some(msg) = drain.recv().await {
@@ -7684,8 +7684,8 @@ impl AsyncEventHandler for BusyForwardProxy {
             };
 
             // Two forwards in flight at once are a compile error through
-            // `&mut RecvHalf`. A forward whose future was leaked is still
-            // running, and that is the case the driver refuses at run time.
+            // `&mut RecvHalf`. A leaked forward leaves the source marked as
+            // forwarding, and the driver refuses a further forward on that mark.
             let (mut backend_tx, _backend_rx) = backend.split();
             std::mem::forget(client.forward_to_conn(&mut backend_tx, 1 << 30));
             let second = client.forward_to_conn(&mut backend_tx, 16);
@@ -7693,6 +7693,13 @@ impl AsyncEventHandler for BusyForwardProxy {
                 Ok(_) => -1,
                 Err(e) => e.raw_os_error().unwrap_or(-1),
             };
+            // Dropping a refused future leaves the leaked forward in place, so
+            // the next forward is refused as well.
+            let third = match client.forward_to_conn(&mut backend_tx, 0).await {
+                Ok(_) => -1,
+                Err(e) => e.raw_os_error().unwrap_or(-1),
+            };
+            let errno = if third == errno { errno } else { -1 };
             let _ = BUSY_FORWARD_ERRNO.set(errno);
             // Report it on the wire so the test sees it without shared state
             // timing games.

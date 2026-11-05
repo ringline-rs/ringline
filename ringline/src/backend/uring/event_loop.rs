@@ -8817,8 +8817,8 @@ mod tests {
         );
     }
 
-    /// A forward refuses at the call, without marking either slot, a stale
-    /// source or sink with `EPIPE`. An accepted forward marks its source, so a
+    /// A stale source or sink is refused with `EPIPE`, and neither slot is
+    /// marked. An accepted forward marks its source, so a
     /// second forward from it gets `EBUSY` until the first is dropped.
     #[test]
     fn forward_refuses_stale_slots_and_a_running_forward() {
@@ -9027,6 +9027,50 @@ mod tests {
                 .unwrap()
                 .close_requested()
         );
+    }
+
+    /// A half that outlives its connection must not clear the slot's new
+    /// occupant's flag: the flags are per slot, and `spawn` needs only
+    /// `'static`, so a standalone task can hold a stale half.
+    #[test]
+    fn a_stale_half_drop_keeps_the_new_occupants_flag() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let old_gen = el.driver.connections.generation(conn_index);
+        let stale = crate::Connection::from_claimed(ConnCtx::new(conn_index, old_gen));
+
+        // Recycle the slot, as teardown does.
+        el.driver.clear_conn_claims(conn_index);
+        el.driver.connections.release(conn_index);
+        let new_index = accept_connection(&mut el);
+        assert_eq!(new_index, conn_index, "the test needs the slot reused");
+        assert_ne!(
+            el.driver.connections.generation(conn_index),
+            old_gen,
+            "release must bump the generation"
+        );
+        el.driver.recv_half_taken[conn_index as usize] = true;
+        el.driver.send_half_taken[conn_index as usize] = true;
+
+        with_driver_state(&mut el, || drop(stale));
+
+        assert!(el.driver.recv_half_taken[conn_index as usize]);
+        assert!(el.driver.send_half_taken[conn_index as usize]);
+    }
+
+    /// A half dropped during teardown, with no driver in scope, leaves its flag
+    /// set, and the flags are indexed by slot, so the recycle point clears them.
+    #[test]
+    fn half_flags_do_not_survive_slot_reuse() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.recv_half_taken[conn_index as usize] = true;
+        el.driver.send_half_taken[conn_index as usize] = true;
+
+        el.driver.clear_conn_claims(conn_index);
+
+        assert!(!el.driver.recv_half_taken[conn_index as usize]);
+        assert!(!el.driver.send_half_taken[conn_index as usize]);
     }
 
     fn make_socketpair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {

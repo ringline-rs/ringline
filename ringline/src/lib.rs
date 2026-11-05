@@ -282,7 +282,7 @@ pub use runtime::io::BackpressuredSendFuture;
 pub use runtime::io::BlockingJoinHandle;
 /// Future that completes when a connect finishes.
 pub use runtime::io::ConnectFuture;
-/// An owned connection: the pair of claimed halves, from `on_accept` or `connect`.
+/// An owned connection: its two halves, from `on_accept` or `connect`.
 pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;

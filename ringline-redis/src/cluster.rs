@@ -99,8 +99,6 @@ impl ClusterConfig {
 
 enum NodeState {
     /// A pooled connection *is* a client — see the note in `sharded.rs`.
-    /// Holding a bare connection handle meant a `split()` plus a throwaway client on
-    /// every command once the halves became claims (#439, #440).
     Connected(Box<Client>),
     Disconnected,
 }

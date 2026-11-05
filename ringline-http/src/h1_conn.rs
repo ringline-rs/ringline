@@ -1,6 +1,6 @@
 //! HTTP/1.1 connection.
 //!
-//! Simple request-response on a single `ConnCtx`. No multiplexing — each
+//! Simple request-response on a single `Connection`. No multiplexing — each
 //! request blocks until its response is fully received.
 
 use std::net::SocketAddr;

@@ -1,7 +1,7 @@
 # Connection handle ownership
 
 Note (2026-11-04): `ConnCtx` is `pub(crate)` and `as_conn` is gone; see
-`docs/public-context-types-design.md`. References to it below are historical.
+`docs/public-context-types-design.md`. References to `ConnCtx` and `as_conn` below predate this change.
 
 Note (2026-10-25): the segment readers (`segments`, `recv_owned_segment`,
 `with_segments`, `end_segments`) and `SegmentReader` were removed.

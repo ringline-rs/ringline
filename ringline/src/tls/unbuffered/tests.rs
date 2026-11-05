@@ -999,7 +999,7 @@ fn server_with_undriven_peer_flight() -> TlsConn {
 // a generic `WouldBlock` reads as "try again later", which is precisely wrong
 // when a record has just been thrown away.
 //
-// ringline's own call sites cannot reach this (a `ConnCtx` is only handed out
+// ringline's own call sites cannot reach this (a `Connection` is only handed out
 // once the handshake completes), but the engine is one call away from it, which
 // is why the arm is explicit rather than assumed-unreachable.
 #[test]

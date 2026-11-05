@@ -867,7 +867,7 @@ fn encrypt_with<C: UnbufferedEngine>(
         // record permanently while reporting a bland `WouldBlock`. Encoding it
         // into `dst` is not the alternative: `dst` is an application-data pool
         // slot mid-stream, and a handshake record written there reorders the
-        // wire. ringline's own call sites cannot reach this — a `ConnCtx` is
+        // wire. ringline's own call sites cannot reach this — a `Connection` is
         // only handed out once the handshake completes, and any successful
         // `drive` leaves `sendable_tls` empty — but the engine is one direct
         // call away from it, so the arm is explicit rather than
@@ -890,7 +890,7 @@ fn encrypt_with<C: UnbufferedEngine>(
         // Genuinely benign for this path: `BlockedHandshake`,
         // `TransmitTlsData`, `ReadTraffic`, `Closed`, `ReadEarlyData`, and
         // whatever `#[non_exhaustive]` adds next. The send path never sees
-        // these for a handshaked connection (ringline only hands out a ConnCtx
+        // these for a handshaked connection (ringline only hands out a `Connection`
         // after the handshake completes), so this is a guard, not a workflow.
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::WouldBlock,

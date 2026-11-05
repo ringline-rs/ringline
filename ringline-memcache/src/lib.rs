@@ -493,8 +493,7 @@ impl ClientBuilder {
         BinaryClient { inner: client }
     }
 
-    /// [`build_binary`](Self::build_binary) without the driver. See
-    /// [`build_for_test`](Self::build_for_test).
+    /// [`build_binary`](Self::build_binary) for the in-memory unit tests.
     #[cfg(test)]
     pub(crate) fn build_binary_for_test(self) -> BinaryClient {
         let mut client = self.build();
@@ -1822,9 +1821,8 @@ impl Client {
 /// ```
 ///
 /// This client owns the connection outright: it holds both halves, so there is
-/// no way to hand the connection back out and drive the same connection with an
-/// ASCII [`Client`]. That used to be possible through `conn()`, and doing it
-/// desynced the connection.
+/// no way to hand the connection back out and drive it with an ASCII
+/// [`Client`].
 pub struct BinaryClient {
     inner: Client,
 }

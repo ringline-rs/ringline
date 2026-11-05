@@ -445,18 +445,13 @@ pub(crate) struct Driver {
     /// Connections lifted off this worker, waiting to be handed over.
     /// `OwnedFd` means an entry left here is closed rather than leaked.
     pub(crate) park_ready: Vec<ParkedFd>,
-    /// The connection's [`RecvHalf`] has been taken.
-    ///
-    /// The recv side of a connection is exclusive — nine entry points that
-    /// cannot run concurrently — but `ConnCtx` is `Copy`, so exclusivity has to
-    /// be claimed rather than owned. Taking the half claims it; dropping the
-    /// half releases it. See `docs/connection-handle-ownership-design.md`.
+    /// Per connection index: is a [`RecvHalf`] out? Set when the connection is
+    /// delivered and cleared when the half drops. Nothing reads it yet; see the
+    /// close-on-drop decision in `docs/public-context-types-design.md`.
     pub(crate) recv_half_taken: Vec<bool>,
     /// Per connection index: is a [`SendHalf`](crate::SendHalf) currently out?
     ///
-    /// The write-side twin of `recv_half_taken`. It makes "one owner of the
-    /// writes" a real claim rather than a convention, and it is what lets a
-    /// forward refuse a sink somebody else is already writing to.
+    /// The write-side twin of `recv_half_taken`.
     pub(crate) send_half_taken: Vec<bool>,
     pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: every merged listener's sockets, `(listener index,
@@ -1226,10 +1221,9 @@ impl Driver {
     /// `RecvHalf::drop` and `SendHalf::drop` release their own claims, but
     /// both go through `try_with_state`, which is a **no-op during unguarded
     /// teardown** — `executor.remove_connection` drops a parked task's future
-    /// with `CURRENT_DRIVER` unset. A claim can therefore outlive its claimant,
+    /// with `CURRENT_DRIVER` unset. A flag can therefore outlive its half,
     /// and since the flags are indexed by slot rather than by generation, the
-    /// *next* occupant would inherit it and have its reads refused with `EBUSY`
-    /// forever.
+    /// next occupant would inherit it.
     ///
     /// Clearing here, at the recycle point, makes that impossible regardless of
     /// how the previous occupant died.

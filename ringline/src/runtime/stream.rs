@@ -72,6 +72,21 @@ impl ConnStream {
         self.conn.send_half()
     }
 
+    /// See [`Connection::eof_truncated`].
+    pub fn eof_truncated(&self) -> bool {
+        self.conn.eof_truncated()
+    }
+
+    /// See [`Connection::recv_arrival`].
+    pub fn recv_arrival(&self) -> Option<crate::RecvArrival> {
+        self.conn.recv_arrival()
+    }
+
+    /// See [`Connection::is_recv_direct`].
+    pub fn is_recv_direct(&self) -> bool {
+        self.conn.is_recv_direct()
+    }
+
     /// Check whether the connection's recv side is closed.
     fn is_recv_closed(driver: &mut crate::backend::Driver, conn_index: u32) -> bool {
         driver
