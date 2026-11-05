@@ -16,14 +16,55 @@ enum TaskSlot {
     /// finished, reclaim its index" from "there was never a task here, do
     /// not push a duplicate onto the free list".
     ///
-    /// `wake` cannot transition this state — there is no future here to mark
-    /// ready — which is why a task that wakes during its own poll is recorded
-    /// in `Executor::woken_while_polling` and re-queued after parking instead.
-    Polling,
+    /// There is no future here for a wake to mark ready, so a wake during the
+    /// poll is recorded in `woken`, and `park` makes the task ready.
+    Polling { woken: bool },
     /// Task is parked (waiting for a wakeup).
     Parked(BoxFuture),
     /// Task is ready to be polled.
     Ready(BoxFuture),
+}
+
+/// What a wake did to a task's slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wake {
+    /// The task was parked and is now ready: queue it.
+    Ready,
+    /// The task is being polled. `park` makes it ready if the poll returns
+    /// Pending.
+    DuringPoll,
+    /// There is no task, or it is already queued.
+    None,
+}
+
+fn wake_slot(slot: &mut TaskSlot) -> Wake {
+    match std::mem::replace(slot, TaskSlot::Empty) {
+        TaskSlot::Parked(fut) => {
+            *slot = TaskSlot::Ready(fut);
+            Wake::Ready
+        }
+        TaskSlot::Ready(fut) => {
+            *slot = TaskSlot::Ready(fut);
+            Wake::None
+        }
+        TaskSlot::Polling { .. } => {
+            *slot = TaskSlot::Polling { woken: true };
+            Wake::DuringPoll
+        }
+        TaskSlot::Empty => Wake::None,
+    }
+}
+
+/// Put a polled future back in its slot. Returns true if a wake arrived during
+/// the poll: the task is then ready, and the caller queues it.
+fn park_slot(slot: &mut TaskSlot, future: BoxFuture) -> bool {
+    let woken = matches!(slot, TaskSlot::Polling { woken: true });
+    *slot = if woken {
+        TaskSlot::Ready(future)
+    } else {
+        TaskSlot::Parked(future)
+    };
+    woken
 }
 
 /// Slab of per-connection async tasks, indexed by connection index.
@@ -63,7 +104,7 @@ impl TaskSlab {
         if idx >= self.tasks.len() {
             return None;
         }
-        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Polling) {
+        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Polling { woken: false }) {
             TaskSlot::Ready(fut) => Some(fut),
             other => {
                 // Put it back — was not Ready.
@@ -73,36 +114,19 @@ impl TaskSlab {
         }
     }
 
-    /// Park a task back after it returned Poll::Pending.
-    pub(crate) fn park(&mut self, conn_index: u32, future: BoxFuture) {
+    /// Park a task back after it returned Poll::Pending. Returns true if it
+    /// was woken during the poll and has to be queued.
+    pub(crate) fn park(&mut self, conn_index: u32, future: BoxFuture) -> bool {
         let idx = conn_index as usize;
         debug_assert!(idx < self.tasks.len());
-        self.tasks[idx] = TaskSlot::Parked(future);
+        park_slot(&mut self.tasks[idx], future)
     }
 
-    /// Mark a Parked task as Ready (called when the waker fires).
-    /// Returns true if the task was parked and is now ready.
-    pub(crate) fn wake(&mut self, conn_index: u32) -> bool {
-        let idx = conn_index as usize;
-        if idx >= self.tasks.len() {
-            return false;
-        }
-        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty) {
-            TaskSlot::Parked(fut) => {
-                self.tasks[idx] = TaskSlot::Ready(fut);
-                true
-            }
-            TaskSlot::Ready(fut) => {
-                // Already ready — put it back.
-                self.tasks[idx] = TaskSlot::Ready(fut);
-                false // already queued
-            }
-            TaskSlot::Polling => {
-                self.tasks[idx] = TaskSlot::Polling;
-                false
-            }
-            TaskSlot::Empty => false,
-        }
+    /// Record a wake of the task.
+    pub(crate) fn wake(&mut self, conn_index: u32) -> Wake {
+        self.tasks
+            .get_mut(conn_index as usize)
+            .map_or(Wake::None, wake_slot)
     }
 
     /// Remove a task (connection closed or future completed).
@@ -159,7 +183,7 @@ impl StandaloneTaskSlab {
         if idx >= self.tasks.len() {
             return None;
         }
-        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Polling) {
+        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Polling { woken: false }) {
             TaskSlot::Ready(fut) => Some(fut),
             other => {
                 self.tasks[idx] = other;
@@ -168,34 +192,19 @@ impl StandaloneTaskSlab {
         }
     }
 
-    /// Park a task back after Poll::Pending.
-    pub(crate) fn park(&mut self, task_idx: u32, future: BoxFuture) {
+    /// Park a task back after Poll::Pending. Returns true if it was woken
+    /// during the poll and has to be queued.
+    pub(crate) fn park(&mut self, task_idx: u32, future: BoxFuture) -> bool {
         let idx = task_idx as usize;
         debug_assert!(idx < self.tasks.len());
-        self.tasks[idx] = TaskSlot::Parked(future);
+        park_slot(&mut self.tasks[idx], future)
     }
 
-    /// Mark a Parked task as Ready. Returns true if it was parked.
-    pub(crate) fn wake(&mut self, task_idx: u32) -> bool {
-        let idx = task_idx as usize;
-        if idx >= self.tasks.len() {
-            return false;
-        }
-        match std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty) {
-            TaskSlot::Parked(fut) => {
-                self.tasks[idx] = TaskSlot::Ready(fut);
-                true
-            }
-            TaskSlot::Ready(fut) => {
-                self.tasks[idx] = TaskSlot::Ready(fut);
-                false
-            }
-            TaskSlot::Polling => {
-                self.tasks[idx] = TaskSlot::Polling;
-                false
-            }
-            TaskSlot::Empty => false,
-        }
+    /// Record a wake of the task.
+    pub(crate) fn wake(&mut self, task_idx: u32) -> Wake {
+        self.tasks
+            .get_mut(task_idx as usize)
+            .map_or(Wake::None, wake_slot)
     }
 
     /// Remove a completed or cancelled task, returning its slot to the free
@@ -320,10 +329,42 @@ mod tests {
         assert!(slab.take_ready(1).is_none());
 
         // Wake it.
-        assert!(slab.wake(1));
+        assert_eq!(slab.wake(1), Wake::Ready);
 
         // Now it's ready.
         assert!(slab.take_ready(1).is_some());
+    }
+
+    #[test]
+    fn a_wake_during_the_poll_makes_the_task_ready_at_park() {
+        let mut slab = TaskSlab::new(4);
+        slab.spawn(1, Box::pin(CountdownFuture(1)));
+        let fut = slab.take_ready(1).unwrap();
+        assert_eq!(slab.wake(1), Wake::DuringPoll);
+        assert!(slab.park(1, fut));
+        assert!(slab.take_ready(1).is_some());
+
+        // Taking the future again clears the record.
+        slab.remove(1);
+        slab.spawn(1, Box::pin(CountdownFuture(1)));
+        let fut = slab.take_ready(1).unwrap();
+        assert!(!slab.park(1, fut));
+        assert!(slab.take_ready(1).is_none());
+    }
+
+    /// A panic drops the future and removes the slot. A wake recorded before
+    /// that must not bring the task back.
+    #[test]
+    fn removing_a_task_woken_during_its_poll_leaves_nothing() {
+        let mut slab = StandaloneTaskSlab::new(1);
+        let idx = slab.spawn(Box::pin(CountdownFuture(1))).unwrap();
+        let fut = slab.take_ready(idx).unwrap();
+        assert_eq!(slab.wake(idx), Wake::DuringPoll);
+        drop(fut);
+        slab.remove(idx);
+        assert!(!slab.has_task(idx));
+        assert_eq!(slab.wake(idx), Wake::None);
+        assert!(slab.spawn(Box::pin(CountdownFuture(1))).is_some());
     }
 
     #[test]
@@ -339,7 +380,7 @@ mod tests {
     #[test]
     fn wake_empty_slot() {
         let mut slab = TaskSlab::new(4);
-        assert!(!slab.wake(3));
+        assert_eq!(slab.wake(3), Wake::None);
     }
 
     #[test]
@@ -347,8 +388,8 @@ mod tests {
         let mut slab = TaskSlab::new(4);
         slab.spawn(0, Box::pin(CountdownFuture(0)));
 
-        // Already ready — wake should return false (already queued).
-        assert!(!slab.wake(0));
+        // Already ready — already queued.
+        assert_eq!(slab.wake(0), Wake::None);
     }
 
     // ── StandaloneTaskSlab tests ──────────────────────────────────────
@@ -374,7 +415,7 @@ mod tests {
         let fut = slab.take_ready(idx).unwrap();
         slab.park(idx, fut);
         assert!(slab.take_ready(idx).is_none());
-        assert!(slab.wake(idx));
+        assert_eq!(slab.wake(idx), Wake::Ready);
         assert!(slab.take_ready(idx).is_some());
     }
 

@@ -1499,22 +1499,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(raw_id));
-                    executor.currently_polling = Some(raw_id);
-                    executor.woken_while_polling = false;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         fut.as_mut().poll(&mut cx)
                     }));
-                    executor.currently_polling = None;
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             executor.standalone_slab.remove(task_idx);
                         }
                         Ok(std::task::Poll::Pending) => {
-                            executor.standalone_slab.park(task_idx, fut);
-                            // Self-wake during poll (slot read `Polling`) —
-                            // re-queue now that the task is parked.
-                            if executor.woken_while_polling {
-                                let _ = executor.wake_task(raw_id);
+                            // Woken during the poll: its slot read `Polling`.
+                            if executor.standalone_slab.park(task_idx, fut) {
+                                executor.ready_queue.push_back(raw_id);
                             }
                         }
                         Err(payload) => {
@@ -1539,12 +1534,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(conn_index));
-                    executor.currently_polling = Some(conn_index);
-                    executor.woken_while_polling = false;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         fut.as_mut().poll(&mut cx)
                     }));
-                    executor.currently_polling = None;
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             // Task completed — connection handler is done.
@@ -1552,11 +1544,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             executor.remove_connection(conn_index);
                         }
                         Ok(std::task::Poll::Pending) => {
-                            executor.task_slab.park(conn_index, fut);
-                            // Self-wake during poll (slot read `Polling`) —
-                            // re-queue now that the task is parked.
-                            if executor.woken_while_polling {
-                                let _ = executor.wake_task(conn_index);
+                            // Woken during the poll: its slot read `Polling`.
+                            if executor.task_slab.park(conn_index, fut) {
+                                executor.ready_queue.push_back(conn_index);
                             }
                         }
                         Err(payload) => {

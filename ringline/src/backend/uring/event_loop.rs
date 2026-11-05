@@ -738,7 +738,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         //
         // Only the *internal* wake path appends mid-pass: executor.wake_task()
         // pushes straight onto executor.ready_queue (and, for the task being
-        // polled right now, records woken_while_polling so the poll loop
+        // polled right now, records the wake in its slot, so the poll loop
         // re-queues it after parking). A std::task::Waker does NOT — what a
         // future gets from its Context pushes onto the thread-local queue (or,
         // from another thread, the worker's inbox) in runtime/waker.rs, which
@@ -788,23 +788,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(raw_id));
-                    executor.currently_polling = Some(raw_id);
-                    executor.woken_while_polling = false;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         fut.as_mut().poll(&mut cx)
                     }));
-                    executor.currently_polling = None;
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             executor.standalone_slab.remove(task_idx);
                         }
                         Ok(std::task::Poll::Pending) => {
-                            executor.standalone_slab.park(task_idx, fut);
-                            // The task woke itself mid-poll (its slot read
-                            // `Polling`, which the wake cannot transition) —
-                            // re-queue now that it is parked.
-                            if executor.woken_while_polling {
-                                let _ = executor.wake_task(raw_id);
+                            // Woken during the poll: its slot read `Polling`.
+                            if executor.standalone_slab.park(task_idx, fut) {
+                                executor.ready_queue.push_back(raw_id);
                             }
                         }
                         Err(payload) => {
@@ -835,12 +829,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     let mut cx = Context::from_waker(&waker);
 
                     CURRENT_TASK_ID.with(|c| c.set(conn_index));
-                    executor.currently_polling = Some(conn_index);
-                    executor.woken_while_polling = false;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         fut.as_mut().poll(&mut cx)
                     }));
-                    executor.currently_polling = None;
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             // Task completed — connection handler is done.
@@ -848,11 +839,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             executor.remove_connection(conn_index);
                         }
                         Ok(std::task::Poll::Pending) => {
-                            executor.task_slab.park(conn_index, fut);
-                            // Self-wake during poll (slot read `Polling`) —
-                            // re-queue now that the task is parked.
-                            if executor.woken_while_polling {
-                                let _ = executor.wake_task(conn_index);
+                            // Woken during the poll: its slot read `Polling`.
+                            if executor.task_slab.park(conn_index, fut) {
+                                executor.ready_queue.push_back(conn_index);
                             }
                         }
                         Err(payload) => {
@@ -11005,7 +10994,7 @@ mod tests {
     fn self_wake_via_channel_completes() {
         // join(rx.recv(), try_send) inside ONE task: recv registers its
         // waiter, try_send wakes it while the task is mid-poll (slot
-        // Empty). The wake used to be dropped -> permanent deadlock.
+        // `Polling`). The wake used to be dropped -> permanent deadlock.
         use crate::runtime::{channel::mpsc, join::join};
         let mut el = make_test_loop();
         let (tx, rx) = mpsc::channel::<u32>(4);
