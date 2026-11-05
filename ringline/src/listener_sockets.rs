@@ -44,8 +44,8 @@ impl ListenerSockets {
     /// On Linux `shutdown(SHUT_RD)` on a listening socket wakes a thread
     /// blocked in `accept4` (with `EINVAL`), fails a multishot accept armed on
     /// it, and takes the socket out of the listening state. On macOS it does
-    /// not wake a blocked `accept`, and the acceptor stays parked until a peer
-    /// connects (#560).
+    /// not wake a blocked `accept`, so the acceptor there polls and checks the
+    /// shutdown flag.
     ///
     /// `SO_REUSEADDR` is set first. `SHUT_RD` does nothing to a socket that
     /// never listened, such as a deferred listener that was never opened, so

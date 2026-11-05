@@ -4,7 +4,7 @@
 //!
 //! Its own test binary, because it counts the process's open fds. Linux only:
 //! it reads `/proc/self/fd`, and on macOS a shut-down listener keeps its port
-//! until its acceptor exits (#560).
+//! until its acceptor exits, within about 100 ms.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::manual_async_fn)]

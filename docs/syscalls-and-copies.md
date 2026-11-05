@@ -111,7 +111,7 @@ loop can apply:
 | Wait | 1 per iteration | `poll.poll()` (`epoll_wait`/`kevent`) with a timer-heap-derived timeout. Amortizes over every ready connection in the batch. |
 | Drain a readable connection | N+1 per wake | mio registrations are edge-triggered: `handle_readable` calls `read()` until `WouldBlock`, so N successful reads plus one terminal `EAGAIN`. Pipelined requests arriving together share one read. |
 | Flush sends | ≥1 per dirty connection per pass | `Driver::flush_sends` gathers the connection's whole pending queue into one `writev()` (up to 1024 iovecs), looping only if the queue didn't fit or until `WouldBlock`. |
-| Accept | 1 per connection | Same acceptor thread; the wake pipe's read end is registered in the poll, so the worker pays a `read()` to drain it per wake (coalescing any number of pending accepts). |
+| Accept | 1 per connection | Same acceptor thread, which on macOS makes a `poll` before each `accept` and one `poll` every 100 ms while idle; the wake pipe's read end is registered in the poll, so the worker pays a `read()` to drain it per wake (coalescing any number of pending accepts). |
 
 A request-response exchange on an otherwise idle connection therefore costs
 about 3–4 syscalls (read, EAGAIN read, writev, plus a share of the
