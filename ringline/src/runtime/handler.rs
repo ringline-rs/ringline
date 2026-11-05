@@ -41,8 +41,14 @@ use crate::runtime::io::{Connection, UdpSocket};
 /// }
 /// ```
 pub trait AsyncEventHandler: Send + 'static {
-    /// Handle an accepted connection. Runs for the connection's lifetime.
-    /// When the returned future completes, the connection is closed.
+    /// Handle an accepted connection. When the returned future completes, the
+    /// connection is closed, even if a half moved to a spawned task.
+    ///
+    /// Dropping the [`Connection`] also closes it, and the task then ends when
+    /// the close completes. An unused `_conn` parameter is not captured by an
+    /// `async move` block, so it drops when this method returns. To keep the
+    /// connection open for the task's life, bind it inside the block:
+    /// `let _conn = conn;`.
     ///
     /// The handler is given an owned [`Connection`], not a `Copy` handle: one
     /// task owns one connection, and the read side cannot be aliased. Call

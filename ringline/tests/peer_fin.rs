@@ -35,9 +35,10 @@ fn wait_accepted(n: usize) {
 struct Sleeps;
 
 impl AsyncEventHandler for Sleeps {
-    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         ACCEPTED.fetch_add(1, Ordering::SeqCst);
         async move {
+            let _conn = conn;
             ringline::sleep(Duration::from_secs(60)).await;
         }
     }

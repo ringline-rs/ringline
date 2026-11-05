@@ -228,6 +228,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** dropping the last half of a connection closes it, gracefully, as
+  `close` does. Before, a dropped outbound `Connection`, or a client built on one,
+  left the socket open and its slot taken. On a plaintext io_uring connection
+  with bytes unread, a peer close did not end it either. A handler that names its
+  parameter `_conn` and returns a future with a real body now closes the
+  connection before the task first polls, because `async move` does not capture
+  the parameter; bind it inside the block with `let _conn = conn;`. A connection
+  task that drops its `Connection` ends when the close completes. An accepted
+  connection still closes when its `on_accept` task ends, even if a half moved to
+  a spawned task.
 - **Breaking:** `UdpCtx` is now `UdpSocket`, delivered to `on_udp_bind`. It is
   not `Copy` or `Clone`, and it is `!Send`, as a `Connection` is. `recv_from`,
   `with_datagram`, `recv_batch`, `recv_batch_timed` and `send_ready` take
@@ -708,9 +718,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `SendHalf`. `peer_addr`, `tls_info`, `listener`, `is_outbound` and
   `is_recv_direct` have to be read from the `Connection` before it goes to a
   protocol client, and `offer_for_park` cannot be called on one a client holds.
-  A dropped `Connection` leaves its socket open. An outbound one then stays
-  open until the worker exits. A peer close also ends it, except on a plaintext
-  io_uring connection with received bytes unread. Close it first. Design:
+  Design:
   `docs/public-context-types-design.md`.
 - **Breaking:** `Connection::cancel` and `ConnCtx::cancel`. Neither had a
   caller, and mio returned `Unsupported`. `select` on a `CancellationToken`

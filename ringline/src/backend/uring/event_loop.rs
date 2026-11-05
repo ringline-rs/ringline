@@ -865,8 +865,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             // A panicking connection handler tears down the
                             // connection but must not take the worker
                             // thread with it.
-                            drop(fut);
+                            // Close first: a half owned by a top-level `Select`
+                            // drops with `drop(fut)`, after `catch_unwind`
+                            // returned, and would otherwise send close_notify.
                             driver.close_connection(conn_index);
+                            drop(fut);
                             executor.remove_connection(conn_index);
                             driver.panic_reporter.report(
                                 &format!("connection task (connection {conn_index} closed)"),
@@ -942,8 +945,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Whether the run loop may block in `submit_and_wait(1)`. It may not
-    /// while a task is runnable or once shutdown is pending.
+    /// Whether the run loop may block in `submit_and_wait(1)`. It may not while a
+    /// task is runnable, while a close released by the orphan drain awaits the
+    /// end-of-iteration drain, or once shutdown is pending.
+    ///
+    /// Pending closes: `release_orphans` at the top of the iteration can push to
+    /// `pending_finalize_closes`, and only the drain at the end of the iteration
+    /// submits the Close. With no tick timeout, a blocking wait would hold that
+    /// Close until the next completion.
     ///
     /// Shutdown: the shutdown check in the run loop runs only after the wait.
     /// `request_shutdown()` sets `shutdown_local` without writing the eventfd.
@@ -954,7 +963,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
-        self.executor.ready_queue.is_empty() && !shutting_down
+        self.executor.ready_queue.is_empty()
+            && self.driver.pending_finalize_closes.is_empty()
+            && !shutting_down
     }
 
     /// Completion of a direct receive (`OpTag::RecvDirect`).
@@ -3500,10 +3511,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Remove the async task (drops the future).
         self.executor.remove_connection(conn_index);
-        // The future just dropped may have owned a `RecvHalf` or a
-        // `SendHalf`, whose `Drop` is a no-op here (unguarded teardown).
-        // Clear their claims before the slot is reused, or the next occupant
-        // inherits them.
+        // The future just dropped may have owned a half, whose `Drop` queues
+        // an orphan that finds a changed generation. Clear the flags before
+        // the slot is reused, or the next occupant inherits them.
         self.driver.clear_conn_claims(conn_index);
         self.driver.accumulators.release(conn_index);
         self.driver.arrival[conn_index as usize].release();
@@ -8146,6 +8156,45 @@ mod tests {
             !el.driver.send_queues[conn_index as usize].close_pending,
             "close must finalize once the chain drains"
         );
+    }
+
+    /// Dropping the last half closes gracefully, with a close_notify on TLS. An
+    /// unwinding handler passes `abrupt`, so the peer sees a truncated stream.
+    #[test]
+    fn the_last_half_sends_close_notify_unless_unwinding() {
+        use crate::runtime::io::{Half, release_half};
+        for abrupt in [false, true] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            let generation = el.driver.connections.generation(conn_index);
+            let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+            el.driver.send_half_taken[conn_index as usize] = true;
+            el.driver.recv_half_taken[conn_index as usize] = true;
+
+            release_half(&mut el.driver, conn_index, generation, Half::Send, abrupt);
+            assert!(
+                !el.driver
+                    .connections
+                    .get(conn_index)
+                    .unwrap()
+                    .close_requested(),
+                "a half is still alive"
+            );
+            release_half(&mut el.driver, conn_index, generation, Half::Recv, abrupt);
+
+            assert!(
+                el.driver
+                    .connections
+                    .get(conn_index)
+                    .unwrap()
+                    .close_requested(),
+                "the last half closes"
+            );
+            assert_eq!(
+                el.driver.send_queues[conn_index as usize].in_flight, !abrupt,
+                "close_notify went out unless unwinding"
+            );
+        }
     }
 
     /// `DriverCtx::close`, the fatal-encrypt close, bounds a TLS drain.

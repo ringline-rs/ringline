@@ -231,8 +231,8 @@ impl AsyncWrite for ConnStream {
         if !self.write_closed {
             self.write_closed = true;
             // Half-close: send TCP FIN so the peer sees EOF.
-            // The full close happens when the connection task returns and the
-            // executor drops the connection slot.
+            // The full close happens when this stream drops or the connection
+            // task returns.
             self.conn.shutdown_write();
         }
         Poll::Ready(Ok(()))

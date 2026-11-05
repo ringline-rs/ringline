@@ -139,7 +139,7 @@ impl Drop for Reservation<'_> {
 ///
 /// If the guard is dropped outside the executor, for example when its task is
 /// dropped at connection teardown, the slot is marked disconnected and the
-/// connection is not closed.
+/// connection closes when the worker next drains its orphans.
 pub struct PooledClient {
     client: Option<Box<Client>>,
     idx: usize,
@@ -164,10 +164,6 @@ impl Drop for PooledClient {
         let Some(mut client) = self.client.take() else {
             return;
         };
-        // Dropping a `Client` releases the connection's claim but does not
-        // close the socket, so any path that does not return the client to a
-        // slot must close it or the socket and driver slot leak.
-        //
         // `is_alive()` gates each close below. It is false once the connection
         // is closing or its slot has been released, and outside the executor;
         // `close` does nothing in each of those cases, so the gate only skips
@@ -243,9 +239,8 @@ impl Pool {
             // Reserve before awaiting, for the reason `client()` does: the
             // check would otherwise be stale by the time of the write, and a
             // concurrent checkout could connect the same slot. The loser's
-            // client would then be displaced and dropped, and dropping a
-            // `Client` does not close its connection, so the socket and the
-            // driver slot would leak.
+            // client would then be displaced and dropped, which wastes a
+            // connection.
             {
                 let mut slots = self.shared.slots.borrow_mut();
                 if !matches!(slots[i], Slot::Disconnected) {
@@ -317,8 +312,7 @@ impl Pool {
             // the reservation: the slot is `Lent` from here until either the
             // guard returns it or the `Reservation` releases it. Reserving
             // before the await is what stops a concurrent caller connecting
-            // the same slot and having its client displaced and dropped —
-            // dropping a `Client` does not close its connection.
+            // the same slot and having its client displaced and dropped.
             enum Next {
                 Ready(Box<Client>),
                 Connect,
