@@ -47,7 +47,7 @@ that.
 ### Other public signatures
 
 - `ConnStream::new` takes a `Connection` and owns it. `conn_ctx()` is replaced by
-  `send_half_mut(&mut self) -> &mut SendHalf`, because `close` and
+  `send_half(&mut self) -> &mut SendHalf`, because `close` and
   `shutdown_write` take `&mut self`, and a `Connection` accessor would allow a
   read past bytes cached in `fill_buf`. Today a caller writes
   `ConnStream::new(conn.as_conn())` and keeps `conn`, which leaves two values
@@ -105,16 +105,18 @@ let b = rx.with_data(|d| ParseResult::Consumed(d.len()));
 ```
 
 The ownership design lists two readers as a compile error, and with `ConnCtx`
-private the `&mut` on a half is the only compile-time check on reads.
+private the `&mut` on a half is the main compile-time check on reads.
 `WithDataFuture`, `WithDataResultFuture` and `WithBytesFuture` gain a lifetime
 that holds the half's borrow. `ForwardFuture` already does.
 
 `RecvReadyFuture` stays unborrowed. It consumes nothing, and `Client::recv_ready`
 exists so that a caller can fire while it is pending
 (`docs/send-while-receiving-design.md`), which a borrow would refuse with E0499.
-It gains `PhantomData<*const ()>`, so it is `!Send`, because with `ConnCtx`
-private it would otherwise be a `Send` value that indexes a worker's connection
-table.
+Today it is `Send`, holding only a connection index and generation. It gains
+`PhantomData<*const ()>`, so it is `!Send`, because a poll on another worker would
+index that worker's connection table. A `RecvReadyFuture` moved to another task on
+the same worker still compiles, and polling it takes `owner_task` from the reader,
+as it does today.
 
 ## `DriverCtx` becomes `pub(crate)`
 
@@ -267,10 +269,15 @@ to a spawned task.
   recycled slot do nothing.
 - During unwinding (`std::thread::panicking()`) the io_uring drop uses
   `close_connection`, so a panicked handler sends no close_notify, as it does
-  today. The panic arms in `poll_ready_tasks` call `close_connection` before
-  `drop(fut)`, because a half owned by a top-level `Select` is dropped after
-  `catch_unwind` returns, when `panicking()` is false. Mio has one close path,
-  and `finish_close` attempts the alert there, as it does today.
+  today. Step 6 reverses the order in the connection panic arm of
+  `poll_ready_tasks` on io_uring, which today calls `drop(fut)` and then
+  `close_connection`. It calls `close_connection` first, because a half owned by
+  a top-level `Select` is dropped after `catch_unwind` returns, when `panicking()`
+  is false. Spawned tasks do not get this: the standalone arm has no connection
+  index, and `spawn_with_handle` catches the panic inside the task. A last half
+  owned by a top-level `Select` in a spawned task therefore closes gracefully, and
+  the peer receives close_notify. Mio has one close path, and `finish_close`
+  attempts the alert there, as it does today.
 - Park sets `socket_handed_off`, closes, and only then drops the task, so the drop
   finds the connection closing, or the generation changed, and does nothing. Mio
   has no park.
@@ -317,7 +324,7 @@ Each step is one PR, and all are breaking.
 1. `ConnCtx` becomes `pub(crate)`, `as_conn` and `cancel` go, `ConnStream` owns its
    `Connection`, `ForwardFuture` replaces the two forward futures, and method
    docs move to the public types.
-2. Read futures borrow their half.
+2. Read futures borrow their half, and `RecvReadyFuture` becomes `!Send`.
 3. `DriverCtx` becomes `pub(crate)`, the callbacks lose `ctx`,
    `close_direct_io_file` and `close_nvme_device` gain free forms, `SendBuilder`
    becomes `pub(crate)`, `UdpToken` goes, and the `close_notify_timeout_ms`
@@ -331,6 +338,6 @@ Each step is one PR, and all are breaking.
 adds a dated note to `connection-handle-ownership-design.md` pointing here.
 
 No step adds work per send or receive. Step 3 removes one `make_ctx` per loop
-iteration on io_uring and two on mio. Step 6 adds a flag check to each half drop, and
-on io_uring two `Orphan` pushes to each teardown. These are per connection, so
+iteration on io_uring and two on mio. Step 6 adds a flag check to each half drop, and two
+`Orphan` pushes to each teardown that drops a parked task, on both backends. These are per connection, so
 step 6 is measured with a connection-churn run.
