@@ -40,9 +40,9 @@ and recommends starting with the smaller one.
 
 The runtime supports sending while receiving. `Connection::split()` returns a
 `SendHalf` and a `RecvHalf`, and `SendHalf` does not borrow `RecvHalf`:
-"sending while a reader is live is ordinary" (io:4182-4184). The futures
-`RecvHalf::with_bytes` and `with_segments` return do not borrow the half
-(io:3533-3540).
+"sending while a reader is live is ordinary" (io:4182-4184). The future
+`RecvHalf::with_bytes` returns borrows the half and the one from `recv_ready`
+does not; `SendHalf` is a separate value, so neither blocks a send through it.
 
 Both clients already hold the halves (`tx`, `rx`; R:685-723, M:572-607). What
 keeps them behind one `&mut self` is state that both paths touch:

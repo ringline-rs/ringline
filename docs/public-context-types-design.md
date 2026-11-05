@@ -99,8 +99,8 @@ example in `runtime/cancellation.rs` takes a `Connection`.
 
 ## Read futures borrow their half
 
-`rx.with_data(..)` takes `&mut self`, but `WithDataFuture` carries no lifetime, so
-the borrow ends when the call returns. This compiles on both backends:
+Before step 2, `WithDataFuture` carried no lifetime, so the borrow ended when the
+call returned, and this compiled on both backends:
 
 ```rust
 let a = rx.with_data(|d| ParseResult::Consumed(d.len()));
@@ -115,7 +115,7 @@ that holds the half's borrow. `ForwardFuture` already does.
 `RecvReadyFuture` stays unborrowed. It consumes nothing, and `Client::recv_ready`
 exists so that a caller can fire while it is pending
 (`docs/send-while-receiving-design.md`), which a borrow would refuse with E0499.
-Today it is `Send`, holding only a connection index and generation. It gains
+It was `Send`, holding only a connection index and generation. It gains
 `PhantomData<*const ()>`, so it is `!Send`, because a poll on another worker would
 index that worker's connection table. A `RecvReadyFuture` moved to another task on
 the same worker still compiles, and polling it takes `owner_task` from the reader,
@@ -178,8 +178,11 @@ Across the series:
   the `Connection` before it goes to the client. `offer_for_park` cannot be called
   on a connection held by a client.
 - A dropped half cannot be taken again.
-- `DriverCtx::close` is the only close bounded by `close_notify_timeout_ms`. See
-  [Owner decisions](#owner-decisions).
+- `ConfigBuilder::close_notify_timeout_ms` is removed, and the internal fatal
+  closes keep a fixed 5 s bound. See [Owner decisions](#owner-decisions).
+- On a `Connection` a held read future also blocks sends, so that case needs
+  `split()`. A read future is not `'static`: to spawn or box one with `'static`,
+  move the half into an `async move` block that makes the call.
 
 ### Consumers checked
 
@@ -248,12 +251,12 @@ Approved 2026-11-04.
 outbound `Connection`, or a client built on one, leaves the socket open and the
 slot occupied. An accepted connection is closed when its task ends. An outbound
 one is not. Removing `ConnCtx` and `DriverCtx` removes the only ways to close a
-dropped outbound connection. One downstream load generator keeps a `ConnCtx` in a guard to close
-the connection on every exit from its reconnect loop.
+dropped outbound connection. One downstream load generator keeps a `ConnCtx` in a
+guard to close the connection on every exit from its reconnect loop.
 
-The removal does not force a runtime change. That crate can wrap the client in a
-type whose `Drop` calls `Client::close`. Without a change, a connection dropped
-with no `close` leaks its slot, as it does today.
+This was not forced: that crate could wrap the client in a type whose `Drop` calls
+`Client::close`, but a connection dropped with no `close` would keep leaking its
+slot.
 
 Dropping the last half closes the connection, with the same graceful close as
 `Connection::close`. Inbound connections keep their second trigger: `on_accept`'s
@@ -334,8 +337,8 @@ Each step is one PR, and all are breaking.
 2. Read futures borrow their half, and `RecvReadyFuture` becomes `!Send`.
 3. `DriverCtx` becomes `pub(crate)`, the callbacks lose `ctx`,
    `close_direct_io_file` and `close_nvme_device` gain free forms, `SendBuilder`
-   becomes `pub(crate)`, `UdpToken` goes, and the `close_notify_timeout_ms`
-   decision lands.
+   becomes `pub(crate)`, `UdpToken` goes, and
+   `ConfigBuilder::close_notify_timeout_ms` is removed.
 4. `ConnToken` becomes `ConnId`.
 5. `UdpCtx` becomes `UdpSocket`.
 6. Dropping the last half closes the connection.

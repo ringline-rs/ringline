@@ -2210,8 +2210,9 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<'_, F> {
 /// ```
 ///
 /// [`recv_ready`](Self::recv_ready) does not. It consumes nothing, and a caller
-/// fires while it is pending. A `RecvReadyFuture` moved to another task on the
-/// same worker takes the connection's receive wakeups from the reader.
+/// fires while it is pending. Polling a `RecvReadyFuture` from another task on the
+/// same worker replaces the reader as the connection's receive waiter, so the
+/// reader is not woken by that arrival or by later ones until it is polled again.
 ///
 /// Available on both backends.
 pub struct RecvHalf {
