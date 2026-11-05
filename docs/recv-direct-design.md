@@ -628,7 +628,9 @@ checked whether the cancel can still be pending after 10 s.
   with that error and puts the chunk back in front of the accumulator.
 - `forward_recv_buf` is a send from the accumulator and is not refused. The
   `forward_echo_*` tests in `ringline/tests/echo.rs` run it on accepted
-  direct connections.
+  direct connections. A connection that holds `forward_hold_cap` send slab
+  entries after one, with the slab over half used, arms no receive when a read
+  parks, and arms it when that changes (#733).
 - TLS: a TLS connection receives through the provided-buffer ring. The
   kernel's bytes are ciphertext, and rustls copies the plaintext into the
   accumulator in any case.

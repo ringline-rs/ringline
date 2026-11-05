@@ -110,8 +110,8 @@ pub struct Config {
     /// Most bytes of free buffers a worker keeps for direct connections to
     /// borrow. See `ConfigBuilder::recv_direct_pool_max`.
     pub(crate) recv_direct_pool_max: usize,
-    /// Sends a `forward_to_conn` sink may queue before its source stops
-    /// reading (mio). See `ConfigBuilder::forward_hold_cap`.
+    /// How much a connection may have queued before a forward stops reading
+    /// from it. See `ConfigBuilder::forward_hold_cap`.
     pub(crate) forward_hold_cap: usize,
     /// Fault the send copy pool's pages in at worker startup instead of on
     /// first use. See `ConfigBuilder::prefault_buffers`.
@@ -942,11 +942,24 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set how many sends a [`forward_to_conn`](crate::RecvHalf::forward_to_conn)
-    /// sink may have queued before its source stops reading, on mio.
+    /// Set how much a connection may have outstanding before a forward stops
+    /// reading.
     ///
-    /// The source's TCP receive window then closes, and it reads again once
-    /// the sink drains. On io_uring it has no effect. Must be `>= 1`.
+    /// On mio it is the sends queued on the sink of a
+    /// [`forward_to_conn`](crate::RecvHalf::forward_to_conn). On io_uring it is
+    /// the send slab entries held by a connection that sends its own receive
+    /// buffers with [`forward_recv_buf`](crate::SendHalf::forward_recv_buf),
+    /// and it applies once the slab is over half used. The source's TCP
+    /// receive window then closes, and it reads again once that no longer
+    /// holds. Must be `>= 1`.
+    ///
+    /// The cap is per connection and applies only over half used, so one stuck
+    /// peer can take half the slab and each later one `cap` entries:
+    /// `1 + (send_slab_slots / 2) / cap` stuck peers on one worker fill it (5
+    /// with the defaults). Peers that each hold fewer than `cap` entries are
+    /// never held, however many there are. Guarded sends on that worker then
+    /// fail with `send slab exhausted`, and further peers are not held, because
+    /// they hold no entries.
     ///
     /// Default: 64.
     pub fn forward_hold_cap(mut self, cap: usize) -> Self {
