@@ -112,6 +112,14 @@ pub(crate) enum DirectRecvBuf {
     Tls(Option<Vec<u8>>),
 }
 
+/// How long worker exit gives a peer to take the data of a zero-copy send
+/// before it closes the connection with an RST (#607).
+const ABORT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest worker exit waits for connections to close and send slab entries
+/// to be released.
+const SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Driver {
     /// Whether a connection that forwards its receive buffers should stop
     /// receiving: it holds `forward_hold_cap` send slab entries, and the slab
@@ -2468,10 +2476,12 @@ impl Driver {
 
         // 2. Close all active connections and drain their send queues.
         let max = self.connections.max_slots();
+        let mut holding_sends = Vec::new();
+        let mut cancels_to_retry = Vec::new();
         for i in 0..max {
             if self.connections.get(i).is_some() {
                 // Clear a deferred close so draining does not submit it with
-                // a shutdown; the one plain Close below replaces it.
+                // a shutdown; the Close below replaces it.
                 self.send_queues[i as usize].close_pending = false;
                 self.drain_conn_send_queue(i);
                 // Cancel the connection's requests ahead of the Close. A
@@ -2481,32 +2491,76 @@ impl Driver {
                 // 6.0, below the 6.1 io_uring minimum. No shutdown: each peer
                 // gets a FIN once the socket is released, or an RST if
                 // received data was unread.
-                let _ = self.ring.submit_close(i, super::ring::CloseLead::CancelAll);
+                //
+                // A connection still holding slab entries stays open for now.
+                // A zero-copy entry waits for the peer to take its data, and
+                // once the socket is closed nothing can give up on that.
+                let generation = self.connections.generation(i);
+                if self.send_slab.held_by(i, generation) > 0 {
+                    if self.ring.submit_cancel_all(i).is_err() {
+                        cancels_to_retry.push(i);
+                    }
+                    holding_sends.push(i);
+                } else {
+                    let _ = self.ring.submit_close(i, super::ring::CloseLead::CancelAll);
+                }
             }
         }
 
         // 3. Submit + drain loop until every connection's Close has
         //    completed and every slab entry is released, for at most
-        //    100 × 100 ms. Arm a timeout SQE each
-        //    iteration so submit_and_wait(1) never blocks indefinitely (the
-        //    tick timeout from the main loop is not armed here).
+        //    `SHUTDOWN_BOUND`. Keep one timeout SQE armed so
+        //    submit_and_wait(1) never blocks indefinitely (the tick timeout
+        //    from the main loop is not armed here). A pass ends at any CQE, so
+        //    neither the pass count nor one timeout per pass measures time.
         //
         //    A zero-copy entry is released only once its notifications land,
         //    and the kernel posts those when the peer has acknowledged the data
-        //    and the kernel has freed it. A peer that does not read keeps the
-        //    data queued after the close, so such an entry holds the loop for
-        //    its whole bound; the guards are then dropped with the driver.
+        //    and the kernel has freed it. A connection whose entries are not
+        //    released within `ABORT_AFTER` is closed with an RST, whether its
+        //    peer stopped reading or is reading slowly. The RST discards the
+        //    queued data, so the notifications land. Such an entry holds the
+        //    loop for its whole bound on a kernel without `setsockopt` through
+        //    io_uring (below 6.7), or when its connection had closed before
+        //    exit began, so nothing can abort it. Its guards and the send pool's
+        //    memory are then leaked, because the kernel can still read them.
         let shutdown_ts = crate::backend::uring::abi::Timespec::new().nsec(100_000_000); // 100ms
-        for _ in 0..100 {
+        let started = std::time::Instant::now();
+        let mut timeout_armed = false;
+        while started.elapsed() < SHUTDOWN_BOUND {
+            for i in std::mem::take(&mut cancels_to_retry) {
+                if self.ring.submit_cancel_all(i).is_err() {
+                    cancels_to_retry.push(i);
+                }
+            }
+            for i in std::mem::take(&mut holding_sends) {
+                let held = self.send_slab.held_by(i, self.connections.generation(i)) > 0;
+                let lead = match (held, started.elapsed() >= ABORT_AFTER) {
+                    (false, _) => super::ring::CloseLead::CancelAll,
+                    (true, true) => super::ring::CloseLead::Abort,
+                    (true, false) => {
+                        holding_sends.push(i);
+                        continue;
+                    }
+                };
+                // A full SQ tries again next round.
+                if self.ring.submit_close(i, lead).is_err() {
+                    holding_sends.push(i);
+                }
+            }
             if self.connections.active_count() == 0
                 && !self.send_slab.has_in_flight()
                 && self.direct_recvs.iter().all(Option::is_none)
             {
                 break;
             }
-            let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
-            // Best effort: the 100-iteration bound prevents infinite block.
-            let _ = self.ring.submit_tick_timeout(&shutdown_ts, ud.raw());
+            if !timeout_armed {
+                let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
+                timeout_armed = self
+                    .ring
+                    .submit_tick_timeout(&shutdown_ts, ud.raw())
+                    .is_ok();
+            }
             if self.ring.submit_and_wait(1).is_err() {
                 break;
             }
@@ -2523,6 +2577,7 @@ impl Driver {
                 };
 
                 match tag {
+                    OpTag::TickTimeout => timeout_armed = false,
                     OpTag::Send | OpTag::TlsSend | OpTag::SendPollOut => {
                         // Payload low 16 bits are the pool slot (high bits
                         // carry the truncated generation / is_tls flag).
@@ -2622,6 +2677,11 @@ impl Driver {
                     _ => {}
                 }
             }
+        }
+
+        if self.send_slab.has_in_flight() {
+            self.send_slab.leak_in_flight();
+            self.send_copy_pool.leak_backing();
         }
 
         // 4. Unregister the UDP provided buffer rings before Driver is dropped

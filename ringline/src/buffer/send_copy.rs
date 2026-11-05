@@ -73,6 +73,13 @@ pub struct SendCopyPool {
 }
 
 impl SendCopyPool {
+    /// Leak the pool's memory. An in-flight zero-copy send can name a slot, and
+    /// the kernel can read it after the driver is gone. Called at worker exit,
+    /// when the bound on waiting has run out.
+    pub fn leak_backing(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.backing));
+    }
+
     /// Create a new pool with `count` slots, each `slot_size` bytes.
     pub fn new(count: u16, slot_size: u32) -> Self {
         let total = count as usize * slot_size as usize;

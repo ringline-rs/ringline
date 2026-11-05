@@ -844,6 +844,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: worker exit no longer waits out its bound for a zero-copy send on an
+  open connection, on Linux 6.7+. The peer gets 1 s to take the data, then the
+  connection closes with an RST, which discards the rest, so a peer reading too
+  slowly loses it. Exit is now bounded by 10 s of time, not by passes of its loop,
+  which ended in about 5 s or less and could leave connections unclosed. Guards
+  still in flight at the bound, and the send pool's memory, are leaked, where they
+  used to be freed while the kernel could read them (#607).
 - Ringline's futures work inside combinators that poll a child only when the
   child's own waker fires, such as `FuturesUnordered` and `Shared`. They used to
   hang, because a completion woke the task by id and nothing polled the child
@@ -1101,9 +1108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   closed connections without cancelling their requests, and released only
   zero-copy send entries. It now cancels each connection's requests ahead of
   its close and releases those entries, so the worker exits within
-  milliseconds instead of after 10 s. A zero-copy send queued to a peer that
-  does not read still holds shutdown until the 10 s shutdown bound, because
-  its guards stay in use until the kernel's notification (#607).
+  milliseconds instead of after 10 s.
 
 - On Linux 6.13 and later, an io_uring connection close cancels the
   connection's requests ahead of its `Close` instead of sending a
