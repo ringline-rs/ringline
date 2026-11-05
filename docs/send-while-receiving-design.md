@@ -149,15 +149,13 @@ forwarding (`ringline/tests/recv_arrival.rs:177`, `recv_lend_cap.rs:24`,
 
 ### Waking
 
-`RecvReadyFuture::poll` ignores its `Context` (io:6011). It registers the
-current task in `owner_task` and `recv_waiters` (io:6046-6047), and an arrival
-wakes that task by id. A task that waits on `recv_ready` together with a timer
-and a queue in one `poll_fn`, or a `select!` that polls every branch on each
-wake, works: each wake re-polls `recv_ready`, which registers again. A
-combinator that re-polls only the child whose own waker fired, such as
-`FuturesUnordered`, never re-polls it and hangs. Every ringline recv future
-behaves this way (io:3283, 3461, 3510); this is the first design that asks
-callers to combine one with other futures, so the client method documents it.
+`RecvReadyFuture::poll` registers the current task in `owner_task` and
+`recv_waiters`, and an arrival wakes that task by id. A task that waits on
+`recv_ready` together with a timer and a queue in one `poll_fn`, or a `select!`
+that polls every branch on each wake, works: each wake re-polls `recv_ready`,
+which registers again. A combinator that re-polls only the child whose own waker
+fired, such as `FuturesUnordered`, works too: `waker::pending` keeps its waker
+for the next completion of a leaf in that task (#641).
 
 A `RecvReadyFuture` dropped while pending leaves its registration in place, and
 the wake is one-shot. The next arrival wakes the task once with nothing to

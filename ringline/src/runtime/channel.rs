@@ -22,6 +22,7 @@ use std::task::{Context, Poll};
 
 use super::CURRENT_TASK_ID;
 use super::io::try_with_state;
+use super::waker::pending;
 
 /// Wake a task if a waiter is registered. Outside a task poll (a sender or
 /// receiver dropped with its connection's task) the id goes on this
@@ -33,6 +34,7 @@ fn wake_waiter(waiter: Option<u32>) {
             executor.wake_task(id);
         });
         if woken.is_none() {
+            super::waker::wake_combinators(id);
             let _ = super::waker::READY_QUEUE.try_with(|q| q.borrow_mut().push_back(id));
         }
     }
@@ -206,7 +208,7 @@ pub mod oneshot {
     impl<T> Future for Receiver<T> {
         type Output = Result<T, RecvError>;
 
-        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let mut s = self.state.borrow_mut();
             if let Some(value) = s.value.take() {
                 return Poll::Ready(Ok(value));
@@ -215,7 +217,7 @@ pub mod oneshot {
                 return Poll::Ready(Err(RecvError));
             }
             s.recv_waiter = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            Poll::Pending
+            pending(cx)
         }
     }
 }
@@ -232,12 +234,30 @@ pub mod mpsc {
         queue: VecDeque<T>,
         capacity: usize,
         recv_waiter: Option<u32>,
-        /// Tasks blocked in `send().await` on a full queue, in arrival
-        /// order. A single slot here loses wakes with multiple producers:
-        /// the second blocked sender overwrote the first, which then hung
-        /// forever (this executor never re-polls spuriously).
-        send_waiters: VecDeque<u32>,
+        /// Sends blocked on a full queue, in arrival order.
+        send_waiters: VecDeque<SendWaiter>,
+        /// The next [`SendWaiter::token`].
+        next_send_token: u64,
         sender_count: usize,
+    }
+
+    /// One blocked [`SendFuture`]. The token tells two sends in one task apart.
+    /// Each push takes a new token, so the queue is sorted by token.
+    struct SendWaiter {
+        token: u64,
+        task: u32,
+    }
+
+    impl<T> State<T> {
+        fn send_waiter(&self, token: u64) -> Option<usize> {
+            self.send_waiters
+                .binary_search_by_key(&token, |w| w.token)
+                .ok()
+        }
+
+        fn pop_send_waiter(&mut self) -> Option<u32> {
+            self.send_waiters.pop_front().map(|w| w.task)
+        }
     }
 
     /// Create a bounded mpsc channel with the given capacity.
@@ -255,6 +275,7 @@ pub mod mpsc {
             capacity,
             recv_waiter: None,
             send_waiters: VecDeque::new(),
+            next_send_token: 0,
             sender_count: 1,
         }));
         (
@@ -306,7 +327,7 @@ pub mod mpsc {
             SendFuture {
                 state: &self.state,
                 value: Some(value),
-                registered: None,
+                token: None,
             }
         }
     }
@@ -336,8 +357,9 @@ pub mod mpsc {
     pub struct SendFuture<'a, T> {
         state: &'a Rc<RefCell<State<T>>>,
         value: Option<T>,
-        /// Task id this future registered in `send_waiters`, if any.
-        registered: Option<u32>,
+        /// This future's token, once it has blocked. Its entry in
+        /// `send_waiters` is gone if a wake consumed it.
+        token: Option<u64>,
     }
 
     // SAFETY: SendFuture has no self-referential data; it's safe to unpin.
@@ -346,7 +368,7 @@ pub mod mpsc {
     impl<T> Future for SendFuture<'_, T> {
         type Output = Result<(), SendError<T>>;
 
-        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
             let mut s = this.state.borrow_mut();
             // Receiver dropped?
@@ -357,36 +379,48 @@ pub mod mpsc {
             if s.queue.len() < s.capacity {
                 let value = this.value.take().unwrap();
                 s.queue.push_back(value);
-                // This future's registration (if any) was consumed by the
-                // wake that got us here.
-                this.registered = None;
+                // A wake for another reason can reach this poll with the
+                // entry still queued, and a receive must not spend a wake on
+                // it.
+                if let Some(pos) = this.token.take().and_then(|t| s.send_waiter(t)) {
+                    s.send_waiters.remove(pos);
+                }
                 let waiter = s.recv_waiter.take();
                 drop(s);
                 wake_waiter(waiter);
                 return Poll::Ready(Ok(()));
             }
             // Full — park in FIFO order behind other blocked senders.
-            let id = CURRENT_TASK_ID.with(|c| c.get());
-            if this.registered != Some(id) {
-                s.send_waiters.push_back(id);
-                this.registered = Some(id);
+            // Registered on each poll: a wake consumed the entry if this future
+            // lost the slot to another sender, and a `Shared` can pass this
+            // future between tasks, which keeps its place in the queue.
+            let task = CURRENT_TASK_ID.with(|c| c.get());
+            match this.token.and_then(|token| s.send_waiter(token)) {
+                Some(pos) => s.send_waiters[pos].task = task,
+                None => {
+                    let token = s.next_send_token;
+                    s.next_send_token += 1;
+                    this.token = Some(token);
+                    debug_assert!(s.send_waiters.back().is_none_or(|w| w.token < token));
+                    s.send_waiters.push_back(SendWaiter { token, task });
+                }
             }
-            Poll::Pending
+            pending(cx)
         }
     }
 
     impl<T> Drop for SendFuture<'_, T> {
         fn drop(&mut self) {
-            let Some(id) = self.registered else { return };
+            let Some(token) = self.token else { return };
             let mut s = self.state.borrow_mut();
-            if let Some(pos) = s.send_waiters.iter().position(|&w| w == id) {
+            if let Some(pos) = s.send_waiter(token) {
                 // Still registered — the wake was not consumed; just leave.
                 s.send_waiters.remove(pos);
             } else {
                 // Our registration was already popped: a capacity wake was
                 // delivered to a future that will never act on it. Pass it
                 // to the next blocked sender so the free slot isn't lost.
-                let next = s.send_waiters.pop_front();
+                let next = s.pop_send_waiter();
                 drop(s);
                 wake_waiter(next);
             }
@@ -404,7 +438,7 @@ pub mod mpsc {
             let mut s = self.state.borrow_mut();
             if let Some(value) = s.queue.pop_front() {
                 // Wake the longest-blocked sender if there is one.
-                let waiter = s.send_waiters.pop_front();
+                let waiter = s.pop_send_waiter();
                 drop(s);
                 wake_waiter(waiter);
                 return Ok(value);
@@ -430,8 +464,8 @@ pub mod mpsc {
             // Wake every blocked sender so it re-polls and observes
             // Disconnected instead of parking forever.
             let waiters = std::mem::take(&mut self.state.borrow_mut().send_waiters);
-            for id in waiters {
-                wake_waiter(Some(id));
+            for waiter in waiters {
+                wake_waiter(Some(waiter.task));
             }
         }
     }
@@ -444,10 +478,10 @@ pub mod mpsc {
     impl<T> Future for RecvFuture<'_, T> {
         type Output = Option<T>;
 
-        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let mut s = self.state.borrow_mut();
             if let Some(value) = s.queue.pop_front() {
-                let waiter = s.send_waiters.pop_front();
+                let waiter = s.pop_send_waiter();
                 drop(s);
                 wake_waiter(waiter);
                 return Poll::Ready(Some(value));
@@ -456,7 +490,7 @@ pub mod mpsc {
                 return Poll::Ready(None);
             }
             s.recv_waiter = Some(CURRENT_TASK_ID.with(|c| c.get()));
-            Poll::Pending
+            pending(cx)
         }
     }
 }

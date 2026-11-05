@@ -34,6 +34,7 @@ use std::task::{Context, Poll};
 use crate::completion::{OpTag, UserData};
 use crate::runtime::CURRENT_TASK_ID;
 use crate::runtime::io::{try_with_state, with_state};
+use crate::runtime::waker::pending;
 
 /// A spawned child process.
 ///
@@ -136,7 +137,7 @@ impl Drop for WaitFuture {
 impl Future for WaitFuture {
     type Output = io::Result<ExitStatus>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         with_state(|_driver, executor| {
             if let Some(result) = executor.pidfd_results.remove(&self.seq) {
                 // pidfd is readable -- child has exited.
@@ -164,7 +165,7 @@ impl Future for WaitFuture {
                 // Not yet ready -- re-register waiter.
                 let task_id = CURRENT_TASK_ID.with(|c| c.get());
                 executor.pidfd_waiters.insert(self.seq, task_id);
-                Poll::Pending
+                pending(cx)
             }
         })
     }
@@ -283,6 +284,9 @@ impl Command {
 }
 
 /// Future returned by [`Command::spawn()`]. Resolves to a [`Child`].
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 pub struct SpawnFuture {
     request_id: u64,
     /// The worker whose executor holds `request_id`.
@@ -313,8 +317,13 @@ impl Drop for SpawnFuture {
 impl Future for SpawnFuture {
     type Output = io::Result<Child>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         with_state(|_driver, executor| {
+            // On another worker this id names that worker's entry, and the
+            // result is not there.
+            if self.owner != crate::runtime::waker::current_worker() {
+                return pending(cx);
+            }
             if let Some((_, slot)) = executor.pending_spawns.get_mut(&self.request_id)
                 && let Some(result) = slot.take()
             {
@@ -324,7 +333,11 @@ impl Future for SpawnFuture {
                     pidfd: r.pidfd,
                 }));
             }
-            Poll::Pending
+            // A `Shared` can pass this future between tasks of a worker.
+            if let Some((owner, _)) = executor.pending_spawns.get_mut(&self.request_id) {
+                *owner = CURRENT_TASK_ID.with(|c| c.get());
+            }
+            pending(cx)
         })
     }
 }

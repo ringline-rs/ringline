@@ -818,10 +818,7 @@ impl Client {
     /// fire that would pass the scatter-gather limit, or the next `flush`,
     /// `recv_ready` or `recv`.
     ///
-    /// The future registers the task that polls it and does not use the
-    /// `Context`'s waker, so it works in a `poll_fn` or a select that polls
-    /// every branch on each wake, and never resolves under a combinator that
-    /// re-polls only the child whose own waker fired, such as
+    /// It works in a `poll_fn`, a select and a combinator such as
     /// `FuturesUnordered`. Dropping it while pending loses no bytes.
     ///
     /// Returns `Err(Error::NoPending)` if no request is in flight after the
