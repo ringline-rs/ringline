@@ -144,7 +144,7 @@ impl ringline::AsyncEventHandler for RinglineUdpEchoHandler {
 
     fn on_udp_bind(
         &self,
-        udp: ringline::UdpCtx,
+        udp: ringline::UdpSocket,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>> {
         // Echo each datagram with the minimum number of userspace
         // memcpys.
@@ -170,9 +170,10 @@ impl ringline::AsyncEventHandler for RinglineUdpEchoHandler {
         // tokio reference at 32 KiB messages.
         Some(Box::pin(async move {
             let mut scratch: Vec<u8> = Vec::with_capacity(65535);
+            let (mut tx, mut rx) = udp.split();
             loop {
-                let retry_target = udp
-                    .with_datagram(|data, peer| match udp.send_to(peer, data) {
+                let retry_target = rx
+                    .with_datagram(|data, peer| match tx.send_to(peer, data) {
                         Ok(()) => None,
                         Err(ringline::UdpSendError::PoolExhausted)
                         | Err(ringline::UdpSendError::SubmissionQueueFull) => {
@@ -185,11 +186,11 @@ impl ringline::AsyncEventHandler for RinglineUdpEchoHandler {
                     .await;
                 if let Some(peer) = retry_target {
                     loop {
-                        match udp.send_to(peer, &scratch) {
+                        match tx.send_to(peer, &scratch) {
                             Ok(()) => break,
                             Err(ringline::UdpSendError::PoolExhausted)
                             | Err(ringline::UdpSendError::SubmissionQueueFull) => {
-                                udp.send_ready().await;
+                                tx.send_ready().await;
                             }
                             Err(_) => break,
                         }
@@ -380,7 +381,7 @@ impl ringline::AsyncEventHandler for RinglineUdpClient {
 
     fn on_udp_bind(
         &self,
-        udp: ringline::UdpCtx,
+        mut udp: ringline::UdpSocket,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>> {
         let state = RINGLINE_UDP_CLIENT_CFG.lock().ok()?.as_ref()?.clone();
         Some(Box::pin(async move {

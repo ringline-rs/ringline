@@ -228,6 +228,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `UdpCtx` is now `UdpSocket`, delivered to `on_udp_bind`. It is
+  not `Copy` or `Clone`, and it is `!Send`, as a `Connection` is. `recv_from`,
+  `with_datagram`, `recv_batch`, `recv_batch_timed` and `send_ready` take
+  `&mut self`, and their futures take a lifetime and hold that borrow, so a second
+  waiter on a socket is a compile error. `send_to` and `send_to_gso` take `&self`.
+  `split()` gives a `UdpSendHalf` and a `UdpRecvHalf`, for a send from inside a
+  `with_datagram` closure. Several tasks on a worker can send through an
+  `Rc<UdpSendHalf>`, because `send_to` and `send_to_gso` take `&self`. `send_ready`
+  takes `&mut self`, so a task that needs it owns the half, and other tasks
+  forward to that task through a channel. All the UDP futures are exported.
 - **Breaking:** `ConnToken` is now `ConnId`, and `token()` is `id()` on
   `Connection`, `SendHalf`, `RecvHalf` and the protocol clients. `ConnId`
   implements `Hash`. `index()` on `Connection` and `SendHalf` is gone; use

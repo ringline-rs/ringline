@@ -123,7 +123,7 @@ handler instance. On the io_uring backend, each worker also owns:
 
 - **Outbound connections** — `connect()` and `connect_unix()`, with `.tls()` and `.timeout()` on the returned builder
 - **TLS** — built-in TLS through ringline-tls, a fork of rustls 0.23 (server and client)
-- **UDP** — `on_udp_bind()` handler with `UdpCtx` for datagram protocols
+- **UDP** — `on_udp_bind()` handler with `UdpSocket` for datagram protocols
 - **Timers** — `sleep()`, `timeout()`, `sleep_until()`, `timeout_at()` with fallible variants
 - **Standalone tasks** — `spawn()` for tasks not tied to a connection
 - **NVMe passthrough** — direct NVMe command submission via io_uring

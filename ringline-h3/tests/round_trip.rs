@@ -14,7 +14,7 @@ use quinn_proto::{
     ClientConfig, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event,
 };
 use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder, UdpCtx, select, sleep,
+    AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder, select, sleep,
 };
 use ringline_h3::{H3Connection, H3Event, HeaderField, Settings};
 use ringline_quic::{QuicConfig, QuicEndpoint};
@@ -101,7 +101,10 @@ impl AsyncEventHandler for H3Server {
         async {}
     }
 
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let quic_config = SERVER_CONFIG
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()

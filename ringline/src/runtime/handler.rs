@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::runtime::io::{Connection, UdpCtx};
+use crate::runtime::io::{Connection, UdpSocket};
 
 /// Trait for async connection handlers.
 ///
@@ -100,9 +100,9 @@ pub trait AsyncEventHandler: Send + 'static {
     /// Handle a bound UDP socket. Called once per UDP socket during startup.
     ///
     /// Return `Some(future)` to spawn a standalone task that handles datagrams
-    /// for this socket. The future typically loops on [`UdpCtx::recv_from()`].
+    /// for this socket. The future typically loops on [`UdpSocket::recv_from()`].
     /// Return `None` to ignore this UDP socket.
-    fn on_udp_bind(&self, _udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(&self, _udp: UdpSocket) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         None
     }
 

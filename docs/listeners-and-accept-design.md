@@ -347,7 +347,7 @@ Viability is not cache-versus-web, it is **request/response versus multiplexed**
 | RESP, memcache | after every response | empty, or a DB index / auth flag | easy |
 | HTTP/1.1 keep-alive | after every response | near none | easy |
 | HTTP/2 | zero open streams | `H2Connection` is plain data (`ringline-h2/src/connection.rs:190`) — sans-IO, so it moves | idle connections yes, saturated no |
-| HTTP/3 | — | rides `UdpCtx`, not the connection table; QUIC migrates at the protocol level | out of scope |
+| HTTP/3 | — | rides `UdpSocket`, not the connection table; QUIC migrates at the protocol level | out of scope |
 
 The h2 gate predicate is already written and public: `H2Conn::pending_count()`
 (`ringline-http/src/h2_conn.rs:457`). `pending_count() == 0` is the park gate.

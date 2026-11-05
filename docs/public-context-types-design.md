@@ -1,7 +1,7 @@
 # Removing the public context types
 
 **Status:** approved, 2026-11-04, including both [owner decisions](#owner-decisions).
-Series for 0.7.0. Steps 1 to 4 landed in #737, #738, #739 and #740. Follows
+Series for 0.7.0. Steps 1 to 5 landed in #737, #738, #739, #740 and #741. Follows
 `docs/connection-handle-ownership-design.md`, which moved reading and writing
 onto `RecvHalf` and `SendHalf` and left `ConnCtx` as a `Copy` token.
 
@@ -178,6 +178,10 @@ Across the series:
   the `Connection` before it goes to the client. `offer_for_park` cannot be called
   on a connection held by a client.
 - A dropped half cannot be taken again.
+- A handler is `Send` and `UdpSocket` and its halves are not, so a handler cannot
+  keep a UDP handle in a field. `on_tick`, an `on_accept` task, or a task for
+  another socket reaches a socket through a channel or a `thread_local!` holding
+  an `Rc<UdpSendHalf>`.
 - `ConfigBuilder::close_notify_timeout_ms` is removed, and the internal fatal
   closes keep a fixed 5 s bound. An application has no way to bound a TLS close
   against a peer that stops reading. See [Owner decisions](#owner-decisions).

@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder, UdpCtx};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder, UdpSocket};
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -27,7 +27,10 @@ impl AsyncEventHandler for UdpRecv {
         async {}
     }
 
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async move {
             STARTED.store(true, Ordering::Release);
             loop {

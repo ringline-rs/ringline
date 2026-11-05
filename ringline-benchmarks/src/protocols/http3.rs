@@ -370,7 +370,7 @@ impl ringline::AsyncEventHandler for H3EchoHandler {
 
     fn on_udp_bind(
         &self,
-        udp: ringline::UdpCtx,
+        mut udp: ringline::UdpSocket,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>> {
         let config = SERVER_CFG.lock().ok()?.take()?;
         let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -525,7 +525,7 @@ impl ringline::AsyncEventHandler for RinglineH3Bench {
 
     fn on_udp_bind(
         &self,
-        udp: ringline::UdpCtx,
+        mut udp: ringline::UdpSocket,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>> {
         let state = RINGLINE_H3_CFG.lock().ok()?.as_ref()?.clone();
         let quic_config = ringline_quic_client_config(&state.certs);

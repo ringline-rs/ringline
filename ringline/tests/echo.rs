@@ -3954,7 +3954,7 @@ fn async_timeout_at_expires() {
 
 // ── UDP ───────────────────────────────────────────────────────────
 
-/// Async handler that echoes UDP datagrams via UdpCtx.
+/// Async handler that echoes UDP datagrams via UdpSocket.
 struct UdpEchoAsync;
 
 impl AsyncEventHandler for UdpEchoAsync {
@@ -3972,7 +3972,7 @@ impl AsyncEventHandler for UdpEchoAsync {
     }
     fn on_udp_bind(
         &self,
-        udp: ringline::UdpCtx,
+        mut udp: ringline::UdpSocket,
     ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async move {
             loop {

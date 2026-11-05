@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::connection::{Lifecycle, ReadHalf};
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
-use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded};
+use crate::runtime::io::{ConnCtx, DriverState, UdpSocket, set_driver_state_guarded};
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor};
 
@@ -134,12 +134,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     pub(crate) fn run(&mut self) -> Result<(), crate::error::Error> {
         // Spawn UDP handler tasks for each bound UDP socket.
         for udp_index in 0..self.driver.udp_sockets.len() {
-            let udp_ctx = UdpCtx {
-                udp_index: udp_index as u32,
-            };
+            let udp_socket = UdpSocket::new(udp_index as u32);
             // A panic while building the future is a task panic too.
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.handler.on_udp_bind(udp_ctx)
+                self.handler.on_udp_bind(udp_socket)
             }));
             let future = match built {
                 Ok(future) => future,

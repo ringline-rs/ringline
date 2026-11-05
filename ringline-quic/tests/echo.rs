@@ -13,7 +13,7 @@ use quinn_proto::{
     ClientConfig, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event,
 };
 use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder, UdpCtx, select, sleep,
+    AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder, select, sleep,
 };
 use ringline_quic::{QuicConfig, QuicEndpoint, QuicEvent};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -107,7 +107,7 @@ impl AsyncEventHandler for QuicEchoServer {
 
     fn on_udp_bind(
         &self,
-        udp: UdpCtx,
+        mut udp: ringline::UdpSocket,
     ) -> Option<Pin<Box<dyn std::future::Future<Output = ()> + 'static>>> {
         let config = SERVER_CONFIG
             .get_or_init(|| std::sync::Mutex::new(None))

@@ -308,10 +308,22 @@ pub use runtime::io::SleepFuture;
 pub use runtime::io::TcpConnect;
 /// Future returned by [`timeout()`].
 pub use runtime::io::TimeoutFuture;
-/// Async context for a UDP socket.
-pub use runtime::io::UdpCtx;
-/// Future returned by [`UdpCtx::recv_from()`].
+/// Future returned by [`UdpRecvHalf::recv_batch()`].
+pub use runtime::io::UdpRecvBatchFuture;
+/// Future returned by [`UdpRecvHalf::recv_batch_timed()`].
+pub use runtime::io::UdpRecvBatchTimedFuture;
+/// Future returned by [`UdpRecvHalf::recv_from()`].
 pub use runtime::io::UdpRecvFuture;
+/// The read side of a [`UdpSocket`].
+pub use runtime::io::UdpRecvHalf;
+/// The write side of a [`UdpSocket`].
+pub use runtime::io::UdpSendHalf;
+/// Future returned by [`UdpSendHalf::send_ready()`].
+pub use runtime::io::UdpSendReadyFuture;
+/// A UDP socket, from `on_udp_bind`.
+pub use runtime::io::UdpSocket;
+/// Future returned by [`UdpRecvHalf::with_datagram()`].
+pub use runtime::io::UdpWithDatagramFuture;
 /// Builder for an outbound Unix-domain connection, from [`connect_unix`].
 pub use runtime::io::UnixConnect;
 /// Future that provides received data as zero-copy `Bytes`.

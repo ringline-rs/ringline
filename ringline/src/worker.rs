@@ -166,7 +166,7 @@ impl Runtime {
         self.udp_addrs.first().copied().flatten()
     }
 
-    /// Every UDP bind's address, in the order [`UdpCtx::index`] uses:
+    /// Every UDP bind's address, in the order [`UdpSocket::index`] uses:
     /// `ConfigBuilder::udp_bind` / `udp_bind_connected` addresses first, then
     /// `RinglineBuilder::bind_udp` / `bind_udp_connected`, each in call order.
     ///
@@ -175,7 +175,7 @@ impl Runtime {
     /// `None`. Each worker's socket has its own port and receives the replies
     /// to what it sent.
     ///
-    /// [`UdpCtx::index`]: crate::UdpCtx::index
+    /// [`UdpSocket::index`]: crate::UdpSocket::index
     pub fn bound_udp_addrs(&self) -> Vec<Option<SocketAddr>> {
         self.udp_addrs.clone()
     }
