@@ -16,7 +16,7 @@ use crate::backend::Driver;
 #[cfg(has_io_uring)]
 use crate::completion::{OpTag, UserData};
 use crate::error::TimerExhausted;
-use crate::handler::ConnToken;
+use crate::handler::ConnId;
 #[cfg(has_io_uring)]
 use crate::runtime::TimerSlotPool;
 use crate::runtime::send_completion::SendId;
@@ -980,11 +980,6 @@ impl ConnCtx {
         }
     }
 
-    /// Returns the connection slot index. Useful for indexing into per-connection arrays.
-    pub(crate) fn index(&self) -> usize {
-        self.conn_index as usize
-    }
-
     /// See [`Connection::offer_for_park`].
     pub(crate) fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         let _ = try_with_state(|driver, _| {
@@ -1001,9 +996,9 @@ impl ConnCtx {
         });
     }
 
-    /// Returns the `ConnToken` for this connection.
-    pub(crate) fn token(&self) -> ConnToken {
-        ConnToken::new(self.conn_index, self.generation)
+    /// This connection's [`ConnId`].
+    pub(crate) fn id(&self) -> ConnId {
+        ConnId::new(self.conn_index, self.generation)
     }
 
     // ── Recv ─────────────────────────────────────────────────────────
@@ -1108,7 +1103,7 @@ impl ConnCtx {
     pub(crate) fn send_nowait(&self, data: &[u8]) -> io::Result<()> {
         with_state(|driver, _| {
             let mut ctx = driver.make_ctx();
-            ctx.send(self.token(), data)
+            ctx.send(self.id(), data)
         })
     }
 
@@ -1159,7 +1154,7 @@ impl ConnCtx {
                     // The delivery future must not also advance past these
                     // bytes — they are no longer in the accumulator.
                     driver.forward_zc_consumed[conn_index as usize] = frozen.len() as u32;
-                    let token = self.token();
+                    let token = self.id();
                     // A refused send drops the guard; this handle puts the
                     // bytes back, so nothing is committed on `Err`.
                     let keep = frozen.clone();
@@ -1180,7 +1175,7 @@ impl ConnCtx {
 
             // Not the whole accumulator, or mio: copy send.
             let mut ctx = driver.make_ctx();
-            ctx.send(self.token(), data)
+            ctx.send(self.id(), data)
         })
     }
 
@@ -1295,9 +1290,7 @@ impl ConnCtx {
     /// See [`SendHalf::send_parts`].
     #[cfg(has_io_uring)]
     pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
-        AsyncSendBuilder {
-            token: self.token(),
-        }
+        AsyncSendBuilder { token: self.id() }
     }
 
     // ── Send (awaitable) ─────────────────────────────────────────────
@@ -1307,7 +1300,7 @@ impl ConnCtx {
         with_state(|driver, executor| {
             let id = executor.register_send(self.conn_index);
             let mut ctx = driver.make_ctx();
-            if let Err(e) = ctx.send_awaited(self.token(), data, id) {
+            if let Err(e) = ctx.send_awaited(self.id(), data, id) {
                 executor.withdraw_send(id);
                 return Err(e);
             }
@@ -1343,7 +1336,7 @@ impl ConnCtx {
     {
         with_state(|driver, _| {
             let mut ctx = driver.make_ctx();
-            let token = ConnToken::new(self.conn_index, self.generation);
+            let token = ConnId::new(self.conn_index, self.generation);
             let builder = ctx.send_chain(token);
             f(builder)
         })
@@ -1366,7 +1359,7 @@ impl ConnCtx {
         with_state(|driver, executor| {
             let id = executor.register_send(self.conn_index);
             let mut ctx = driver.make_ctx();
-            let token = ConnToken::new(self.conn_index, self.generation);
+            let token = ConnId::new(self.conn_index, self.generation);
             let builder = ctx.send_chain_awaited(token, id);
             if let Err(e) = f(builder) {
                 executor.withdraw_send(id);
@@ -1400,7 +1393,7 @@ impl ConnCtx {
     pub(crate) fn shutdown_write(&self) {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
-            ctx.shutdown_write(self.token());
+            ctx.shutdown_write(self.id());
             executor.fail_waiting_bounded_sends(
                 self.conn_index,
                 self.generation,
@@ -1416,7 +1409,7 @@ impl ConnCtx {
     pub(crate) fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         with_state(|driver, _| {
             let ctx = driver.make_ctx();
-            ctx.tls_info(self.token())
+            ctx.tls_info(self.id())
         })
     }
 
@@ -1534,7 +1527,7 @@ impl ConnCtx {
 /// chains `.copy()` and `.guard()` and ends with `.submit()`. This is a synchronous
 /// builder; the send is fire-and-forget (no future).
 pub struct AsyncSendBuilder {
-    token: ConnToken,
+    token: ConnId,
 }
 
 #[cfg(has_io_uring)]
@@ -1676,16 +1669,14 @@ fn total_part_len(parts: &[crate::handler::SendPart<'_>]) -> usize {
 /// sent as one operation. Zero-copy guards are consumed by copying their
 /// data.
 pub struct AsyncSendBuilder {
-    token: ConnToken,
+    token: ConnId,
 }
 
 #[cfg(not(has_io_uring))]
 impl ConnCtx {
     /// See [`SendHalf::send_parts`].
     pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
-        AsyncSendBuilder {
-            token: self.token(),
-        }
+        AsyncSendBuilder { token: self.id() }
     }
 }
 
@@ -2246,9 +2237,9 @@ impl RecvHalf {
         self.conn.offer_for_park(state);
     }
 
-    /// See [`Connection::token`].
-    pub fn token(&self) -> ConnToken {
-        self.conn.token()
+    /// See [`Connection::id`].
+    pub fn id(&self) -> ConnId {
+        self.conn.id()
     }
 
     /// See [`Connection::is_alive`].
@@ -2801,9 +2792,9 @@ impl Connection {
         self.tx.offer_for_park(state);
     }
 
-    /// Returns the `ConnToken` for this connection.
-    pub fn token(&self) -> ConnToken {
-        self.tx.token()
+    /// This connection's [`ConnId`].
+    pub fn id(&self) -> ConnId {
+        self.tx.id()
     }
 
     /// Whether this handle still refers to a live, usable connection.
@@ -2934,11 +2925,6 @@ impl Connection {
     /// Query TLS session info for this connection.
     pub fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         self.tx.conn.tls_info()
-    }
-
-    /// Returns the connection slot index. Useful for indexing into per-connection arrays.
-    pub fn index(&self) -> usize {
-        self.tx.conn.index()
     }
 }
 
@@ -3113,11 +3099,6 @@ impl SendHalf {
         self.conn.shutdown_write();
     }
 
-    /// See [`Connection::index`].
-    pub fn index(&self) -> usize {
-        self.conn.index()
-    }
-
     /// See [`Connection::tls_info`].
     pub fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         self.conn.tls_info()
@@ -3171,9 +3152,9 @@ impl SendHalf {
         self.conn.offer_for_park(state);
     }
 
-    /// See [`Connection::token`].
-    pub fn token(&self) -> ConnToken {
-        self.conn.token()
+    /// See [`Connection::id`].
+    pub fn id(&self) -> ConnId {
+        self.conn.id()
     }
 
     /// See [`Connection::is_alive`].
@@ -3450,7 +3431,7 @@ impl DirectForward {
                 }
                 driver.accumulators.note_consumed(source, take);
                 let id = executor.register_send(self.sink_index);
-                let token = ConnToken::new(self.sink_index, self.sink_generation);
+                let token = ConnId::new(self.sink_index, self.sink_generation);
                 let submitted = driver
                     .make_ctx()
                     .send_parts(token)
@@ -3799,7 +3780,7 @@ impl BackpressuredSendFuture<'_> {
         if !executor.send_capacity_turn(id, free) {
             return Poll::Pending;
         }
-        let token = ConnToken::new(self.conn_index, self.generation);
+        let token = ConnId::new(self.conn_index, self.generation);
         let submit = {
             let mut ctx = driver.make_ctx();
             ctx.send_bounded(token, self.data, id)

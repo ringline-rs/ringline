@@ -13,7 +13,7 @@ impl AsyncEventHandler for TlsEcho {
             let (mut tx, mut rx) = conn.split();
             eprintln!(
                 "[worker {worker_id}] TLS connection accepted {}",
-                tx.index()
+                tx.id().index()
             );
             loop {
                 let consumed = rx
@@ -29,7 +29,10 @@ impl AsyncEventHandler for TlsEcho {
                     break;
                 }
             }
-            eprintln!("[worker {worker_id}] TLS connection {} closed", tx.index());
+            eprintln!(
+                "[worker {worker_id}] TLS connection {} closed",
+                tx.id().index()
+            );
         }
     }
 

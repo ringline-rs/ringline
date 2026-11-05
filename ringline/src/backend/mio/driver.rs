@@ -1106,7 +1106,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::config::ConfigBuilder;
-    use crate::handler::ConnToken;
+    use crate::handler::ConnId;
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::time::Duration;
@@ -1211,8 +1211,8 @@ pub(crate) mod tests {
     }
 
     /// The token for an attached connection, for the `DriverCtx` entry points.
-    pub(crate) fn token(driver: &Driver, conn_index: u32) -> ConnToken {
-        ConnToken::new(conn_index, driver.connections.generation(conn_index))
+    pub(crate) fn token(driver: &Driver, conn_index: u32) -> ConnId {
+        ConnId::new(conn_index, driver.connections.generation(conn_index))
     }
 
     /// Smoke test for the scaffolding itself: a plain send queues on the

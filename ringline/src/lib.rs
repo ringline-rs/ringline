@@ -242,8 +242,8 @@ pub use topology::physical_core_count;
 pub use config::AcceptMode;
 /// Peer address for a connection — TCP or Unix domain socket.
 pub use connection::PeerAddr;
-/// Opaque connection handle.
-pub use handler::ConnToken;
+/// Identifies a connection.
+pub use handler::ConnId;
 /// Identifies which listener a connection arrived on.
 pub use handler::ListenerId;
 /// Pre-classified part for scatter-gather sends via `submit_batch`.

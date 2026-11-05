@@ -228,6 +228,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `ConnToken` is now `ConnId`, and `token()` is `id()` on
+  `Connection`, `SendHalf`, `RecvHalf` and the protocol clients. `ConnId`
+  implements `Hash`. `index()` on `Connection` and `SendHalf` is gone; use
+  `id().index()`.
 - **Breaking:** `WithDataFuture`, `WithDataResultFuture` and `WithBytesFuture`
   take a lifetime and hold the borrow of the `RecvHalf` or `Connection` they
   came from, so a second read while one is held is a compile error. On a
@@ -240,7 +244,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking:** `ConnStream::new` takes and owns a `Connection`, and
   `conn_ctx()` is replaced by `send_half()`, `eof_truncated()` and
   `is_recv_direct()`. `mark_disconnected` on the redis, memcache and ping pools
-  takes a `ConnToken`.
+  takes a `ConnId`.
 - `AsyncSendBuilder` is exported on mio as well as io_uring.
 - When a `with_data` parser stops at an incomplete message, or `with_data`
   parks with nothing buffered, an accumulator that grows through `append`
