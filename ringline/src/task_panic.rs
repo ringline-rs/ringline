@@ -11,8 +11,9 @@
 //! poll, so a panic there is reported as that task's panic.
 //!
 //! Not covered: a future's `Drop` while a worker drains at shutdown, which
-//! unwinds the worker thread, and `create_for_worker`, whose panic fails
-//! `launch()`.
+//! unwinds the worker thread; `create_for_worker`, whose panic fails
+//! `launch()`; and the `wake` of a waker kept for a combinator, whose panic
+//! goes to the panic hook only, under either policy.
 //!
 //! By default ([`TaskPanicPolicy::Contain`]) a caught panic is contained: the
 //! task is dropped, a connection task's connection is closed, the worker keeps

@@ -83,9 +83,17 @@ on that worker's thread, it pushes the index onto the thread-local
 `READY_QUEUE`. Woken on any other thread, it pushes the index into the worker's
 inbox and, if no wake since the worker last drained it has done so, writes the
 worker's wake descriptor. A wake for a worker that has
-exited is dropped. `Executor::collect_wakeups` drains both through
-`wake_task`, transitions parked tasks to ready, and appends them to the
-worker's `ready_queue`.
+exited is dropped. `Executor::collect_wakeups` drains both, transitions parked
+tasks to ready, and appends them to the worker's `ready_queue`.
+
+A leaf future registers its task's id, and `Executor::wake_task` wakes that task
+when the leaf completes. A leaf polled with a waker other than its task's own was
+polled by a combinator such as `FuturesUnordered`, which polls a child only when
+that child's waker fires. `waker::pending` keeps such a waker, and `wake_task`
+fires all of a task's kept wakers on each wake, and so does the task's end. A
+completion does not say which leaf it was for, so every leaf in those combinators
+is polled again, and a `FuturesUnordered` of N pending leaves costs N polls per
+completion. A wake through a task's own waker does not fire them.
 `CURRENT_DRIVER` and `CURRENT_TASK_ID` expose the current worker state only
 while a future is being polled.
 

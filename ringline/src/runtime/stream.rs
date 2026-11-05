@@ -16,11 +16,11 @@
 //!
 //! # Waker note
 //!
-//! ringline does not use [`std::task::Waker`]. The `Context` argument to each
-//! `poll_*` method is ignored. Wakeups are driven by the internal waiter-flag
-//! system (`recv_waiters`), which is set inside `poll_read` before returning
-//! `Poll::Pending`. `poll_write` copies into the send pool with `send_nowait`
-//! and does not wait for the send to complete.
+//! Wakeups are driven by the internal waiter-flag system (`recv_waiters`), which
+//! is set inside `poll_read` before it returns `Poll::Pending`. `waker::pending`
+//! keeps the `Context`'s waker if it is not the task's own. `poll_write` copies
+//! into the send pool with `send_nowait` and does not wait for the send to
+//! complete.
 
 use bytes::{Buf, Bytes};
 use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
@@ -29,6 +29,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use super::io::{Connection, SendHalf, park_recv, with_state};
+use super::waker::pending;
 
 /// Wraps a [`Connection`] and implements [`AsyncRead`], [`AsyncWrite`], and
 /// [`AsyncBufRead`].
@@ -95,7 +96,7 @@ impl ConnStream {
 impl AsyncRead for ConnStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         // Drain any leftover from a prior poll_fill_buf call first.
@@ -137,13 +138,13 @@ impl AsyncRead for ConnStream {
             }
 
             park_recv(driver, executor, conn_index, None);
-            Poll::Pending
+            pending(cx)
         })
     }
 }
 
 impl AsyncBufRead for ConnStream {
-    fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
 
         // Return cached buffer if present and non-empty.
@@ -176,7 +177,7 @@ impl AsyncBufRead for ConnStream {
         });
 
         match frozen {
-            Err(()) => Poll::Pending,
+            Err(()) => pending(cx),
             Ok(None) => {
                 // EOF — return empty slice.
                 Poll::Ready(Ok(&[]))

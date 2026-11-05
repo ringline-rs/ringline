@@ -110,6 +110,7 @@ impl TaskSlab {
         let idx = conn_index as usize;
         if idx < self.tasks.len() {
             self.tasks[idx] = TaskSlot::Empty;
+            super::waker::wake_combinators(conn_index);
         }
     }
 
@@ -210,6 +211,7 @@ impl StandaloneTaskSlab {
         let prev = std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty);
         if !matches!(prev, TaskSlot::Empty) {
             self.free_list.push(task_idx);
+            super::waker::wake_combinators(task_idx | super::waker::STANDALONE_BIT);
         }
     }
 
