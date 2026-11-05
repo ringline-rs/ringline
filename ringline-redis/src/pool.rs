@@ -26,6 +26,10 @@ use ringline::ConnId;
 
 use crate::{Client, Error};
 
+/// Connects `connect_all` runs at a time. Each takes a send pool slot for a TLS
+/// handshake or AUTH, before any completes.
+const CONNECT_CONCURRENCY: usize = 16;
+
 /// Configuration for a connection pool.
 pub struct PoolConfig {
     /// Backend address to connect to.
@@ -263,32 +267,46 @@ impl Pool {
     /// Connect every slot that is disconnected.
     ///
     /// Slots that are connected or checked out are left as they are, so this
-    /// can be called again, or while clients are checked out. Returns the
-    /// first connect error; slots connected before it stay connected.
+    /// can be called again, or while clients are checked out. Up to
+    /// `CONNECT_CONCURRENCY` (16) connects run at a time, so a TLS pool needs
+    /// that many free send pool slots, and a slot being connected counts as
+    /// checked out. A failed connect does not end the
+    /// call: every connect runs to its end, slots that connected stay
+    /// connected, and the first error, by slot order, is returned. A server that
+    /// accepts and does not answer AUTH or a TLS handshake holds the call
+    /// until the caller's own timeout. If the call is cancelled, slots already
+    /// connected stay connected.
     pub async fn connect_all(&self) -> Result<(), Error> {
-        for i in 0..self.len() {
-            // Reserve before awaiting, for the reason `client()` does: the
-            // check would otherwise be stale by the time of the write, and a
-            // concurrent checkout could connect the same slot. The loser's
-            // client would then be displaced and dropped, which wastes a
-            // connection.
-            {
-                let mut slots = self.shared.slots.borrow_mut();
-                if !matches!(slots[i], Slot::Disconnected) {
-                    continue;
-                }
-                slots[i] = Slot::Lent;
+        let connects = (0..self.len()).map(|i| self.connect_slot(i));
+        ringline::join_all_limited(connects, CONNECT_CONCURRENCY)
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    /// Connect slot `i` if it is disconnected.
+    async fn connect_slot(&self, i: usize) -> Result<(), Error> {
+        // Reserve before awaiting, for the reason `client()` does: the
+        // check would otherwise be stale by the time of the write, and a
+        // concurrent checkout could connect the same slot. The loser's
+        // client would then be displaced and dropped, which wastes a
+        // connection.
+        {
+            let mut slots = self.shared.slots.borrow_mut();
+            if !matches!(slots[i], Slot::Disconnected) {
+                return Ok(());
             }
-            let mut reservation = Reservation {
-                shared: &self.shared,
-                idx: i,
-                armed: true,
-            };
-            // On `Err` or cancellation the reservation releases the slot.
-            let client = self.do_connect().await?;
-            reservation.disarm();
-            self.shared.slots.borrow_mut()[i] = Slot::Connected(Box::new(client));
+            slots[i] = Slot::Lent;
         }
+        let mut reservation = Reservation {
+            shared: &self.shared,
+            idx: i,
+            armed: true,
+        };
+        // On `Err` or cancellation the reservation releases the slot.
+        let client = self.do_connect().await?;
+        reservation.disarm();
+        self.shared.slots.borrow_mut()[i] = Slot::Connected(Box::new(client));
         Ok(())
     }
 

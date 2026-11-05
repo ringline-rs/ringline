@@ -161,6 +161,91 @@ fn a_connection_task_woken_during_its_poll_is_polled_again() {
     assert!(polled_again, "the connection task was not polled again");
 }
 
+/// `join_all` runs every child at once, waits for them all, and keeps their
+/// order, whichever finishes first.
+#[test]
+fn join_all_returns_outputs_in_order() {
+    run_on_start(|| {
+        Box::pin(async {
+            let delays = [30u64, 5, 15];
+            let running = Rc::new(Cell::new(0));
+            let most = Rc::new(Cell::new(0));
+            let children = delays.iter().map(|&ms| {
+                let running = running.clone();
+                let most = most.clone();
+                async move {
+                    running.set(running.get() + 1);
+                    most.set(most.get().max(running.get()));
+                    ringline::sleep(Duration::from_millis(ms)).await;
+                    running.set(running.get() - 1);
+                    ms
+                }
+            });
+            let outputs = ringline::timeout(LIMIT, ringline::join_all(children))
+                .await
+                .expect("join_all did not finish");
+            assert_eq!(outputs, delays);
+            assert_eq!(most.get(), delays.len(), "the children ran one at a time");
+            let none = ringline::join_all(std::iter::empty::<std::future::Ready<()>>()).await;
+            assert!(none.is_empty());
+        })
+    });
+}
+
+/// `join_all_limited` never has more than its limit running, and runs them all.
+#[test]
+fn join_all_limited_holds_back_the_rest() {
+    run_on_start(|| {
+        Box::pin(async {
+            let running = Rc::new(Cell::new(0u32));
+            let most = Rc::new(Cell::new(0u32));
+            let children = (0..8u64).map(|i| {
+                let running = running.clone();
+                let most = most.clone();
+                async move {
+                    running.set(running.get() + 1);
+                    most.set(most.get().max(running.get()));
+                    ringline::sleep(Duration::from_millis(1 + i)).await;
+                    running.set(running.get() - 1);
+                    i
+                }
+            });
+            let outputs = ringline::timeout(LIMIT, ringline::join_all_limited(children, 3))
+                .await
+                .expect("join_all_limited did not finish");
+            assert_eq!(outputs, (0..8).collect::<Vec<u64>>());
+            assert_eq!(most.get(), 3);
+        })
+    });
+}
+
+/// Dropping a `join_all` drops the children that are still pending.
+#[test]
+fn dropping_join_all_drops_its_children() {
+    run_on_start(|| {
+        Box::pin(async {
+            struct Counted(Rc<Cell<u32>>);
+            impl Drop for Counted {
+                fn drop(&mut self) {
+                    self.0.set(self.0.get() + 1);
+                }
+            }
+            let dropped = Rc::new(Cell::new(0));
+            let children = (0..3).map(|_| {
+                let counted = Counted(dropped.clone());
+                async move {
+                    ringline::sleep(Duration::from_secs(60)).await;
+                    drop(counted);
+                }
+            });
+            let elapsed =
+                ringline::timeout(Duration::from_millis(5), ringline::join_all(children)).await;
+            assert!(elapsed.is_err());
+            assert_eq!(dropped.get(), 3);
+        })
+    });
+}
+
 /// One sleep finishing must not leave the other unpolled, and a child that is
 /// polled for another child's wake must register again.
 #[test]

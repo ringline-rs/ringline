@@ -9,6 +9,10 @@ use std::ops::{Deref, DerefMut};
 use crate::client::HttpClient;
 use crate::error::HttpError;
 
+/// Connects `connect_all` runs at a time. Each takes send pool slots for a TLS
+/// handshake or a client preface, before any completes.
+const CONNECT_CONCURRENCY: usize = 16;
+
 /// Configuration for an HTTP connection pool.
 pub struct PoolConfig {
     /// Server address to connect to.
@@ -96,13 +100,23 @@ impl Pool {
         }
     }
 
-    /// Eagerly connect all slots.
+    /// Eagerly connect all slots, up to `CONNECT_CONCURRENCY` (16) at a time, so
+    /// the worker needs send pool slots free for that many handshakes.
+    ///
+    /// A failed connect does not end the call: every connect runs to its end,
+    /// those that connected are kept, and the first error, by slot order, is
+    /// returned. If the call is cancelled, no slot is filled.
     pub async fn connect_all(&mut self) -> Result<(), HttpError> {
-        for i in 0..self.slots.len() {
-            let client = self.do_connect().await?;
-            self.slots[i] = Slot::Connected(Box::new(client));
+        let connects = self.slots.iter().map(|_| self.do_connect());
+        let clients = ringline::join_all_limited(connects, CONNECT_CONCURRENCY).await;
+        let mut result = Ok(());
+        for (slot, client) in self.slots.iter_mut().zip(clients) {
+            match client {
+                Ok(client) => *slot = Slot::Connected(Box::new(client)),
+                Err(error) => result = result.and(Err(error)),
+            }
         }
-        Ok(())
+        result
     }
 
     /// Get a client bound to the next healthy connection.

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ringline::join_all` polls any number of futures concurrently and returns
+  their outputs in order, and `join_all_limited` runs at most a given number at
+  a time (#532).
 - The `ringline/pool` counter `standalone_tasks_exhausted` counts spawns refused
   because the standalone task slab was full. Before, a full slab showed only as
   an error from `spawn`, which is how a slot leak stayed hidden in #478. The
@@ -232,6 +235,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `connect_all` on the pools and sharded clients of `ringline-redis`,
+  `ringline-memcache`, `ringline-ping` and `ringline-http`, and `ClusterClient`'s
+  topology refresh, run up to 16 connects at a time, where they ran one. A failed
+  connect no longer ends `connect_all`: it waits for the others, so a server that
+  accepts and does not answer AUTH or a TLS handshake holds the call until the
+  caller's own timeout. On a pool, a slot being connected counts as checked out,
+  so `client()` during `connect_all` can return `PoolExhausted` (#532).
 - `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
   standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
   call outside the executor (#481).

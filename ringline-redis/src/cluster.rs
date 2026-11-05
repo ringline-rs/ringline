@@ -30,6 +30,10 @@ use resp_proto::{RedirectKind, Request, SlotMap, Value, hash_slot, parse_redirec
 
 use crate::{Client, Error, parse_bytes_array};
 
+/// Connects a topology refresh runs at a time. Each takes a send pool slot for
+/// a TLS handshake or AUTH, before any completes.
+const CONNECT_CONCURRENCY: usize = 16;
+
 /// Maximum number of MOVED/ASK redirect hops before giving up.
 const MAX_REDIRECTS: usize = 5;
 
@@ -273,22 +277,19 @@ impl ClusterClient {
         });
 
         // Connect to new primaries we don't have yet.
-        for addr_str in new_primaries.keys() {
-            if !self.nodes.contains_key(addr_str) {
-                let parsed: SocketAddr = match addr_str.parse() {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                match self.do_connect(parsed).await {
-                    Ok(client) => {
-                        self.nodes
-                            .insert(addr_str.clone(), NodeState::Connected(Box::new(client)));
-                    }
-                    Err(_) => {
-                        self.nodes.insert(addr_str.clone(), NodeState::Disconnected);
-                    }
-                }
-            }
+        let new_nodes: Vec<(&String, SocketAddr)> = new_primaries
+            .keys()
+            .filter(|addr_str| !self.nodes.contains_key(*addr_str))
+            .filter_map(|addr_str| Some((addr_str, addr_str.parse().ok()?)))
+            .collect();
+        let connects = new_nodes.iter().map(|&(_, addr)| self.do_connect(addr));
+        let clients = ringline::join_all_limited(connects, CONNECT_CONCURRENCY).await;
+        for ((addr_str, _), client) in new_nodes.into_iter().zip(clients) {
+            let state = match client {
+                Ok(client) => NodeState::Connected(Box::new(client)),
+                Err(_) => NodeState::Disconnected,
+            };
+            self.nodes.insert(addr_str.clone(), state);
         }
 
         self.slot_map = new_map;

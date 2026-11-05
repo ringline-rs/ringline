@@ -2585,13 +2585,20 @@ impl Client {
         password: Option<&str>,
         username: Option<&str>,
     ) -> Result<(), Error> {
-        if let Some(password) = password {
-            match username {
-                Some(username) => self.auth_username(username, password).await,
-                None => self.auth(password).await,
-            }
-        } else {
-            Ok(())
+        let Some(password) = password else {
+            return Ok(());
+        };
+        let mut request = Request::cmd(b"AUTH");
+        if let Some(username) = username {
+            request = request.arg(username.as_bytes());
+        }
+        let encoded = Self::encode_request(&request.arg(password.as_bytes()));
+        // Waits for a send pool slot: `connect_all` authenticates connections
+        // at once, which can pass what a small pool holds.
+        self.tx.send_backpressured(&encoded).await?;
+        match redis_error(self.read_value().await?)? {
+            Value::SimpleString(_) => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
         }
     }
 
