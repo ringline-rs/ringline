@@ -76,13 +76,14 @@ pub enum OpTag {
     ParkInstall = 32,
     /// `shutdown(SHUT_RDWR)` hard-linked ahead of a connection's `Close`
     /// before Linux 6.13, so the peer gets its FIN even while older in-flight
-    /// requests keep the socket from being released (#581). Its completion is ignored; the
-    /// `Close` CQE releases the slot.
+    /// requests keep the socket from being released (#581), or `SO_LINGER`
+    /// hard-linked ahead of it at worker exit (#607). Its completion is ignored;
+    /// the `Close` CQE releases the slot.
     CloseShutdown = 33,
     /// `ASYNC_CANCEL` of every request on a connection's fixed file,
     /// hard-linked ahead of its `Close` from Linux 6.13 (#586), and at worker
-    /// exit on every kernel. Its completion is ignored; the `Close` CQE
-    /// releases the slot.
+    /// exit on every kernel, where a connection holding send slab entries gets
+    /// it alone. Its completion is ignored; the `Close` CQE releases the slot.
     CloseCancel = 34,
     /// Plain (copying) `send` of the first non-empty unsent iovec of a
     /// zero-copy send whose `sendmsg` returned `-EAGAIN`; see

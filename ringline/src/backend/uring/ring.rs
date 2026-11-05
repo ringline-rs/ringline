@@ -42,6 +42,13 @@ pub(crate) fn is_memlock_enomem(err: &Error) -> bool {
     }
 }
 
+/// The value of the `SO_LINGER` set by [`CloseLead::Abort`]. A static, so it
+/// outlives the operation.
+static ABORT_LINGER: libc::linger = libc::linger {
+    l_onoff: 1,
+    l_linger: 0,
+};
+
 /// What is hard-linked ahead of a connection's `Close`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseLead {
@@ -59,6 +66,11 @@ pub(crate) enum CloseLead {
     /// an RST if received data is unread. Also used at worker exit on every
     /// kernel (`Driver::run_shutdown`). The cancel runs inline (#586).
     CancelAll,
+    /// `SO_LINGER {on, 0}`, so the `Close` sends an RST and discards the data
+    /// queued on the socket, whose zero-copy notifications then land at once.
+    /// Used at worker exit for a peer that is not reading. On a kernel below
+    /// 6.7 it fails, and the hard link still runs the `Close` (#607).
+    Abort,
 }
 
 /// The [`CloseLead`] for a connection close on `kernel`: [`Shutdown`] before
@@ -511,15 +523,35 @@ impl Ring {
                 },
                 UserData::encode(OpTag::CloseShutdown, conn_index, 0).raw(),
             ),
-            CloseLead::CancelAll => Sqe::new(
-                Op::CancelFdAll {
+            CloseLead::CancelAll => self.cancel_fd_all(conn_index),
+            CloseLead::Abort => Sqe::new(
+                Op::SetSockOpt {
                     fd: sqe::Fd::Fixed(conn_index),
+                    level: libc::SOL_SOCKET as u32,
+                    optname: libc::SO_LINGER as u32,
+                    optval: (&raw const ABORT_LINGER).cast(),
+                    optlen: std::mem::size_of::<libc::linger>() as u32,
                 },
-                UserData::encode(OpTag::CloseCancel, conn_index, 0).raw(),
+                UserData::encode(OpTag::CloseShutdown, conn_index, 0).raw(),
             ),
         };
         let first = first.link(Link::Hard);
         unsafe { self.engine.push_pair(&first, &close) }
+    }
+
+    /// Cancel every request on the connection, without closing it.
+    pub fn submit_cancel_all(&mut self, conn_index: u32) -> io::Result<()> {
+        let cancel = self.cancel_fd_all(conn_index);
+        unsafe { self.push_sqe(&cancel) }
+    }
+
+    fn cancel_fd_all(&self, conn_index: u32) -> Sqe {
+        Sqe::new(
+            Op::CancelFdAll {
+                fd: sqe::Fd::Fixed(conn_index),
+            },
+            UserData::encode(OpTag::CloseCancel, conn_index, 0).raw(),
+        )
     }
 
     /// Submit an async connect for a direct file descriptor.

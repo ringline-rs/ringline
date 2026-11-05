@@ -382,6 +382,17 @@ impl InFlightSendSlab {
         *held += 1;
     }
 
+    /// Leak the guards of entries still in use. The kernel can read their
+    /// memory until a notification that has not arrived, so they must not be
+    /// dropped. Called at worker exit, when the bound on waiting has run out.
+    pub fn leak_in_flight(&mut self) {
+        for entry in self.entries.iter_mut().filter(|entry| entry.in_use) {
+            for guard in entry.guards.iter_mut() {
+                std::mem::forget(guard.take());
+            }
+        }
+    }
+
     /// Whether more than half the entries are in use.
     pub fn over_half_used(&self) -> bool {
         self.free_list.len() * 2 < self.entries.len()

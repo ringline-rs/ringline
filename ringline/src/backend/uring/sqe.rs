@@ -102,6 +102,15 @@ pub(crate) enum Op {
     CancelFdAll {
         fd: Fd,
     },
+    /// `setsockopt` on `fd`, as a socket `URING_CMD`. Linux 6.7; earlier kernels
+    /// fail it with `-EOPNOTSUPP`. `optval` must stay valid until the CQE.
+    SetSockOpt {
+        fd: Fd,
+        level: u32,
+        optname: u32,
+        optval: *const libc::c_void,
+        optlen: u32,
+    },
     /// Cancel the request whose user_data is exactly `target`.
     Cancel {
         target: u64,

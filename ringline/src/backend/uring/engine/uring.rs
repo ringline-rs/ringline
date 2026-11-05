@@ -905,6 +905,16 @@ impl Sqe {
                     opcode::AsyncCancel2::new(CancelBuilder::fd(types::Fd(f)).all()).build()
                 }
             },
+            Op::SetSockOpt {
+                fd,
+                level,
+                optname,
+                optval,
+                optlen,
+            } => on!(fd, |t| opcode::SetSockOpt::new(
+                t, level, optname, optval, optlen
+            )
+            .build()),
             Op::Cancel { target } => opcode::AsyncCancel::new(target).build(),
             Op::Connect { fd, addr, addrlen } => {
                 on!(fd, |t| opcode::Connect::new(t, addr, addrlen).build())

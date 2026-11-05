@@ -29,3 +29,8 @@ threads-required = "num-test-threads"
 [[profile.default.overrides]]
 filter = 'binary(segment_backpressure) & (test(forward_recv_buf) | test(a_lone_peer))'
 threads-required = "num-test-threads"
+
+# Holds a zero-copy send to a peer that does not read through worker exit.
+[[profile.default.overrides]]
+filter = 'binary(shutdown_zero_copy)'
+threads-required = "num-test-threads"

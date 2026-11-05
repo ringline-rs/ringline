@@ -144,18 +144,21 @@ chain and closes the connection (#642, #734).
 
 `run_shutdown` closes every connection with the `CancelAll` lead, on every
 kernel, so a send waiting for room on a connection is cancelled, and a
-coalesced send's slab entry is released on its completion. Entries parked on
+coalesced send's slab entry is released on its completion. A connection holding
+slab entries gets the cancel alone, and its `Close` waits for them, as below. Entries parked on
 a retry list, with no operation in flight, are released first. It then waits,
-for at most 100 × 100 ms, until every connection's `Close` has completed and
+for at most 10 s (`SHUTDOWN_BOUND`), until every connection's `Close` has completed and
 every send-slab entry is released. A zero-copy entry is
 released only once its notifications land, and the kernel posts them when the
 peer has acknowledged the data and the kernel has freed it. A peer that does
-not read keeps that data queued after the close, so such an entry holds the
-worker for the whole bound, after which the guards are dropped with the
-driver. #607 proposes replacing that wait with an abortive close
-(`SO_LINGER {on, 0}`), which discards the queued data so the notifications land
-at once; it needs io_uring's setsockopt command (Linux 6.7), so it waits on the
-6.8 minimum proposed in #605.
+not read keeps that data queued, so a connection whose entries are not released
+within 1 s is closed with `SO_LINGER {on, 0}`, which sends an RST and discards the
+queued data, so the notifications land at once (#607). That includes a peer that
+is reading too slowly to take its data in that second. Setting the option on a
+fixed file needs io_uring's setsockopt command (Linux 6.7). Below 6.7, or for an
+entry whose connection had closed before exit began, nothing can abort it: the
+entry holds the worker for the 10 s bound, and its guards and the send pool's
+memory are then leaked, since the kernel can still read them.
 
 ## 5. Admission and parking
 
