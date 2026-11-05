@@ -983,7 +983,8 @@ impl ConfigBuilder {
     ///
     /// A spawn on a full slab fails with
     /// [`WouldBlock`](std::io::ErrorKind::WouldBlock), and the
-    /// `standalone_tasks_exhausted` pool counter records it.
+    /// `standalone_tasks_exhausted` pool counter records it. A slot frees when a
+    /// task on the worker finishes, and nothing signals that.
     pub fn standalone_task_capacity(mut self, n: u32) -> Self {
         self.config.standalone_task_capacity = n;
         self

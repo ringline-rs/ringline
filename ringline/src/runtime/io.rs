@@ -204,6 +204,10 @@ pub(crate) fn try_with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R)
 /// Returns `Err` if called outside the ringline async executor, or
 /// [`WouldBlock`](io::ErrorKind::WouldBlock) if the standalone task slab is
 /// full, which the `standalone_tasks_exhausted` pool counter also records.
+///
+/// The future is dropped with the error. A slot frees only when a task on this
+/// worker finishes, and nothing signals that, so a retry must await something
+/// first; a retry in a loop with no await never succeeds.
 pub fn spawn(future: impl Future<Output = ()> + 'static) -> io::Result<TaskId> {
     try_with_state(
         |_driver, executor| match executor.standalone_slab.spawn(Box::pin(future)) {
@@ -388,8 +392,9 @@ impl<F: Future> Future for CatchUnwind<F> {
 ///
 /// # Errors
 ///
-/// Returns `Err` if called outside the ringline executor or if the standalone
-/// task slab is exhausted.
+/// Returns `Err` if called outside the ringline executor, or
+/// [`WouldBlock`](io::ErrorKind::WouldBlock) if the standalone task slab is
+/// full. See [`spawn`] for what a retry must do.
 ///
 /// # Panics in the spawned task
 ///

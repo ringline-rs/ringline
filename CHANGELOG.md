@@ -11,10 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - The `ringline/pool` counter `standalone_tasks_exhausted` counts spawns refused
   because the standalone task slab was full. Before, a full slab showed only as
-  an error from `spawn`, which is how a slot leak stayed hidden in #478. `spawn`
-  and `spawn_with_handle` now return `ErrorKind::WouldBlock` for it, so a caller
-  can tell it from a call outside the executor, and the message names
-  `standalone_task_capacity` (#481).
+  an error from `spawn`, which is how a slot leak stayed hidden in #478. The
+  error message names `standalone_task_capacity` (#481).
 - `ringline::close_direct_io_file` and `close_nvme_device`. Before, only
   `DriverCtx` could close these handles. A close with commands in flight makes
   the handle stale at once, and on io_uring the last completion unregisters the
@@ -234,6 +232,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
+  standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
+  call outside the executor (#481).
 - **Breaking:** dropping the last half of a connection closes it, gracefully, as
   `close` does. Before, a dropped outbound `Connection`, or a client built on one,
   left the socket open and its slot taken. On a plaintext io_uring connection
@@ -1457,6 +1458,9 @@ Patch release of `ringline-redis` only, for ringline 0.6.
 
 ### Changed
 
+- `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
+  standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
+  call outside the executor (#481).
 - `metriken` 0.9 → 0.11.3 (`metriken-core` 0.2 → 0.3.3). The statics in
   `ringline::metrics` are `metriken` types, so they are now 0.11's
   `ShardedCounterGroup` and `Gauge`; their methods and the values they report
@@ -1731,6 +1735,9 @@ crate's development version was already bumped past 0.7.1.
 
 ### Changed
 
+- `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
+  standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
+  call outside the executor (#481).
 - Default `send_copy_slot_size` is 16448 (was 16384) so one maximum-size TLS
   1.3 record (16406 bytes) fits in a single send pool slot. Costs 0.4% more
   send pool memory at the default slot count. (#352)
@@ -1779,6 +1786,9 @@ under Changed below (#341).
 
 ### Changed
 
+- `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
+  standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
+  call outside the executor (#481).
 - `CiphertextBuf` no longer zero-fills (#341). It allocated with
   `vec![0u8; n]` and grew with `resize(n, 0)`, initializing memory the peer
   had not sent -- a per-connection `memset` and real resident memory at high
@@ -1858,6 +1868,9 @@ and memcache binary protocol support. Crate versions: **ringline 0.6.0**;
 
 ### Changed
 
+- `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
+  standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
+  call outside the executor (#481).
 - **Breaking (batched for the next release):** `ConnCtx` is no longer `Send` or
   `Sync`. Ringline is thread-per-core: each worker owns its own driver and
   `ConnectionTable`, and a `ConnCtx` is an `(index, generation)` pair into
@@ -2328,6 +2341,9 @@ NVMe passthrough path. Crate versions: **ringline 0.4.0**;
 
 ### Changed
 
+- `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
+  standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
+  call outside the executor (#481).
 - On io_uring, `udp_recv_queue_capacity` is clamped to the recv ring size —
   queued datagrams pin ring buffers, so the excess depth was unusable
   (overload now surfaces as counted drops instead of a silent stall).
@@ -2384,6 +2400,9 @@ Coordinated release of the 2026-06 performance audit:
 
 ### Changed
 
+- `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
+  standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
+  call outside the executor (#481).
 - TLS recv decrypts directly from rustls into the connection accumulator via
   `BufRead::fill_buf`/`consume`, removing the per-worker 16 KiB scratch buffer and
   one copy of every received plaintext byte (was rustls -> scratch -> accumulator,
@@ -2477,6 +2496,9 @@ Coordinated release of the 2026-06 performance audit:
 
 ### Changed
 
+- `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
+  standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
+  call outside the executor (#481).
 - Internal send queue is now `VecDeque<Bytes>`; queued bytes stay refcounted on backpressure (no memcpy on partial writes). All control-stream and request-stream sends route through the same chunks-based path. (#120)
 - `ringline-quic` dependency bumped to `0.2.1` for `stream_send_chunks` and the `WriteError` re-export.
 
@@ -2494,6 +2516,9 @@ Coordinated release of the 2026-06 performance audit:
 
 ### Changed
 
+- `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
+  standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
+  call outside the executor (#481).
 - `QuicConfig` now derives `Clone`. All inner state is `Arc`-backed, so cloning stays cheap and one config can drive multiple per-worker endpoints. (#115)
 
 ## [0.1.1] - 2026-04-24
@@ -2506,6 +2531,9 @@ Coordinated release of the 2026-06 performance audit:
 
 ### Changed
 
+- `spawn` and `spawn_with_handle` return `ErrorKind::WouldBlock` for a full
+  standalone task slab, not `ErrorKind::Other`, so a caller can tell it from a
+  call outside the executor (#481).
 - UDP sends are now pipelined on the io_uring backend — up to `Config::udp_send_slots` datagrams in flight per socket. (#115)
 - UDP recv now uses multishot `recvmsg` with a provided buffer ring on the io_uring backend, eliminating per-datagram SQE resubmission and the 65 KiB per-socket recv buffer. (#118)
 - Upgraded `metriken` to 0.9 and switched to its built-in `ShardedCounterGroup`; the metrics module now exposes counter groups (e.g. `metrics::UDP.increment(udp::DATAGRAMS_SENT)`) instead of standalone counters. (#114)
