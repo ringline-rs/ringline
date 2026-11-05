@@ -1450,7 +1450,7 @@ static TLS_TICK_CLOSE_TOKEN: Mutex<Option<ringline::ConnToken>> = Mutex::new(Non
 /// Echo one message, then hand the token to `on_tick`, which closes the
 /// connection through `DriverCtx::close`.
 ///
-/// The task deliberately does **not** call `Connection::close()`. That is a
+/// The task deliberately does not call `Connection::close()`. That is a
 /// different path (`Driver::close_connection_graceful`), covered by
 /// `tls_server_close_sends_close_notify`.
 #[cfg(has_io_uring)]

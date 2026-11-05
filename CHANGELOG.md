@@ -224,8 +224,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - **Breaking:** `ConnStream::new` takes and owns a `Connection`, and
-  `conn_ctx()` is replaced by `send_half()`. `mark_disconnected` on the redis,
-  memcache and ping pools takes a `ConnToken`.
+  `conn_ctx()` is replaced by `send_half()`, `eof_truncated()` and
+  `is_recv_direct()`. `mark_disconnected` on the redis, memcache and ping pools
+  takes a `ConnToken`.
 - When a `with_data` parser stops at an incomplete message, or `with_data`
   parks with nothing buffered, an accumulator that grows through `append`
   (every connection on mio, TLS connections on io_uring) moves the buffered
@@ -670,8 +671,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `SendHalf`. `peer_addr`, `tls_info`, `listener`, `is_outbound` and
   `is_recv_direct` have to be read from the `Connection` before it goes to a
   protocol client, and `offer_for_park` cannot be called on one a client holds.
-  A dropped `Connection` leaves its socket open, and nothing can then reach an
-  outbound one to close it, so close it first. Design:
+  A dropped `Connection` leaves its socket open. An outbound one then stays
+  open until the peer closes it, `DriverCtx::close` is called with a saved
+  `ConnToken`, or the worker exits, so close it first. Design:
   `docs/public-context-types-design.md`.
 - **Breaking:** `Connection::cancel` and `ConnCtx::cancel`. Neither had a
   caller, and mio returned `Unsupported`. `select` on a `CancellationToken`

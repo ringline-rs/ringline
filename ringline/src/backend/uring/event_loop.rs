@@ -9059,9 +9059,9 @@ mod tests {
     }
 
     /// A half dropped during teardown, with no driver in scope, leaves its flag
-    /// set, and the flags are indexed by slot, so the recycle point clears them.
+    /// set, and the flags are indexed by slot, so the recycle point clears both.
     #[test]
-    fn half_flags_do_not_survive_slot_reuse() {
+    fn clear_conn_claims_clears_both_flags() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         el.driver.recv_half_taken[conn_index as usize] = true;

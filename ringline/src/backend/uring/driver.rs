@@ -1216,7 +1216,7 @@ impl Driver {
         self.fail_send_ids(settles);
     }
 
-    /// Clear the recv-side exclusivity claims for a slot that is being reused.
+    /// Clear both half flags for a slot being recycled.
     ///
     /// `RecvHalf::drop` and `SendHalf::drop` release their own claims, but
     /// both go through `try_with_state`, which is a **no-op during unguarded

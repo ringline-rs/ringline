@@ -576,7 +576,7 @@ impl Driver {
     /// happens in the event loop's `drain_pending_closes`, which has
     /// Executor access and defers until `pending_sends` has drained.
     /// Marking `Closing` here makes the call idempotent.
-    /// Drop any recv-side exclusivity claims held against `conn_index`.
+    /// Clear both half flags for a slot being recycled.
     ///
     /// Called at the slot's recycle point. Named to match
     /// `uring::driver::Driver::clear_conn_claims`.

@@ -561,8 +561,7 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 ///
 /// Returns a builder. Nothing is submitted until the builder is awaited;
 /// [`BackpressuredSendFuture`] has the same contract. Awaiting resolves to an
-/// owned [`Connection`] with both halves claimed, the same type that
-/// `on_accept` receives.
+/// owned [`Connection`], the same type that `on_accept` receives.
 ///
 /// ```ignore
 /// let conn = connect(addr).await?;
@@ -2736,8 +2735,8 @@ impl Connection {
     /// a spawned task or `on_tick`, return `NotConnected` until the future is
     /// dropped.
     ///
-    /// A connection is parked only if its handler calls this. A connection whose handler never calls this is
-    /// never parked, whatever the load imbalance.
+    /// A connection is parked only if its handler calls this, whatever the load
+    /// imbalance.
     ///
     /// The offer is cleared when more data arrives, since that means a new
     /// request started and the boundary is gone. So a handler offers once per
@@ -2835,7 +2834,7 @@ impl Connection {
     // ── the rest of the connection surface ─────────────────────────────────
 
     /// Whether this TLS connection's EOF was a truncation: the peer's TCP
-    /// FIN arrived *without* a preceding close_notify alert. A truncated
+    /// FIN arrived without a preceding close_notify alert. A truncated
     /// stream may be missing data the peer (or an active attacker injecting
     /// the FIN) cut off — length- or delimiter-framed protocols should treat
     /// it as an error rather than a clean end-of-stream.
@@ -2956,7 +2955,7 @@ impl SendHalf {
     /// (`Other`, retryable once in-flight sends complete) or if the buffer
     /// is wider than the entire pool (`InvalidInput`). Nothing was queued or
     /// transmitted on `Err`, so the same buffer may be sent again later. On a
-    /// TLS connection the pool is checked against the *ciphertext* bound
+    /// TLS connection the pool is checked against the ciphertext bound
     /// before anything is encrypted, which is what keeps that true there.
     /// Submission-queue pressure is not an error: the send is queued
     /// and retried. Persistent submission-queue starvation is reported like
@@ -2985,11 +2984,15 @@ impl SendHalf {
         self.conn.send_nowait(data)
     }
 
-    /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
+    /// Begin building a scatter-gather send with mixed copy and zero-copy guard
+    /// parts.
     ///
-    /// This mirrors `DriverCtx::send_parts()` — use `.copy(data)` for copied parts
-    /// and `.guard(guard)` for zero-copy parts backed by `SendGuard`. Call `.submit()`
-    /// to submit the SQE. Fire-and-forget: no future returned.
+    /// [`build`](AsyncSendBuilder::build) takes a closure that chains
+    /// `.copy(data)` and `.guard(guard)` and ends with `.submit()`.
+    /// [`submit_batch`](AsyncSendBuilder::submit_batch) takes pre-classified
+    /// `SendPart`s. Both are fire-and-forget;
+    /// [`submit_batch_await`](AsyncSendBuilder::submit_batch_await) also returns
+    /// a [`SendFuture`]. On the mio backend every part is copied.
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.conn.send_parts()
     }
@@ -3920,8 +3923,7 @@ impl Drop for SendFuture {
 /// [`UnixConnect`].
 ///
 /// Submits the connect on its first poll, waits for the completion, and
-/// resolves to an owned [`Connection`] with both halves claimed. A future that
-/// is never polled allocates no socket and no connection slot.
+/// resolves to an owned [`Connection`]. A future that is never polled allocates no socket and no connection slot.
 ///
 /// Two of these futures awaited one after the other run serially. See
 /// [`connect`] for running them concurrently.

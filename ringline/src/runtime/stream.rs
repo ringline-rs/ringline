@@ -77,11 +77,6 @@ impl ConnStream {
         self.conn.eof_truncated()
     }
 
-    /// See [`Connection::recv_arrival`].
-    pub fn recv_arrival(&self) -> Option<crate::RecvArrival> {
-        self.conn.recv_arrival()
-    }
-
     /// See [`Connection::is_recv_direct`].
     pub fn is_recv_direct(&self) -> bool {
         self.conn.is_recv_direct()
