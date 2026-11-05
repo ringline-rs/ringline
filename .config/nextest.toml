@@ -3,9 +3,10 @@
 # profile; doctests run separately under `cargo test --doc`.
 
 [profile.default]
-# The slowest test takes about 1.3 s on 4 CPUs. A test still running after
-# 30 s is reported as slow, and ended after four periods (2 min), so a hang
-# fails one test instead of holding the job until its timeout.
+# The slowest tests take about 15 s, stalling on a peer that does not read. A
+# test still running after 30 s is reported as slow, and ended after four
+# periods (2 min), so a hang fails one test instead of holding the job until its
+# timeout.
 slow-timeout = { period = "30s", terminate-after = 4 }
 
 [profile.ci]
@@ -19,4 +20,12 @@ failure-output = "immediate-final"
 # thread keeps other tests from running while it does.
 [[profile.default.overrides]]
 filter = 'binary(memlock_rings)'
+threads-required = "num-test-threads"
+
+# These hold zero-copy sends to a peer that does not read. From Linux 6.15 each
+# charges its pages to RLIMIT_MEMLOCK until the peer has them, several MiB per
+# peer once the socket buffers fill, and ring setup in a test running alongside
+# draws on the same per-user limit.
+[[profile.default.overrides]]
+filter = 'binary(segment_backpressure) & (test(forward_recv_buf) | test(a_lone_peer))'
 threads-required = "num-test-threads"

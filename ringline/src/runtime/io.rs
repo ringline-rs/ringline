@@ -1181,6 +1181,8 @@ impl ConnCtx {
                     if result.is_err() {
                         driver.accumulators.put_back(conn_index, keep);
                         driver.forward_zc_consumed[conn_index as usize] = 0;
+                    } else {
+                        driver.forwards_recv_buf[conn_index as usize] = true;
                     }
                     return result;
                 }
@@ -3088,6 +3090,15 @@ impl SendHalf {
     /// connection it is always encrypted into the send pool; when `data` is
     /// the whole accumulator, the accumulator is detached first and gathered
     /// into a temporary buffer.
+    ///
+    /// On io_uring, a connection holding
+    /// [`forward_hold_cap`](crate::ConfigBuilder::forward_hold_cap) send slab
+    /// entries while the worker's slab is over half used stops receiving until
+    /// that changes. A peer that writes more before reading than half the slab
+    /// can queue, or more than the cap while other connections keep the slab
+    /// over half used, stalls until it reads or that changes. A TLS connection
+    /// is not held: it uses send pool slots, and a forward fails once the pool
+    /// is exhausted.
     ///
     /// # Errors
     ///

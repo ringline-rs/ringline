@@ -378,6 +378,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // submits any re-arm, so a socket that ran out of buffers receives
             // again without another completion to wake the worker.
             self.driver.return_udp_buffers();
+            self.resume_forward_recvs();
             // A task polled in the second pass may have consumed the bytes
             // ahead of a hangup; peek before blocking rather than at the next
             // completion.
@@ -3057,6 +3058,31 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
             } else {
                 self.executor.forget_send(id);
+            }
+        }
+    }
+
+    /// Arm the receives that `forward_recv_over_cap` held back, for reads still
+    /// parked on connections it no longer applies to.
+    fn resume_forward_recvs(&mut self) {
+        if self.driver.forward_recv_held_conns.is_empty() {
+            return;
+        }
+        for conn_index in std::mem::take(&mut self.driver.forward_recv_held_conns) {
+            let ci = conn_index as usize;
+            // Its slot was reset.
+            if !self.driver.forward_recv_held[ci] {
+                continue;
+            }
+            if self.driver.forward_recv_over_cap(conn_index) {
+                self.driver.forward_recv_held_conns.push(conn_index);
+                continue;
+            }
+            self.driver.forward_recv_held[ci] = false;
+            if self.executor.recv_waiters[ci]
+                && self.driver.arm_direct_recv_or_close(conn_index, None)
+            {
+                self.executor.wake_recv(conn_index);
             }
         }
     }
