@@ -227,6 +227,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `conn_ctx()` is replaced by `send_half()`, `eof_truncated()` and
   `is_recv_direct()`. `mark_disconnected` on the redis, memcache and ping pools
   takes a `ConnToken`.
+- `AsyncSendBuilder` is exported on mio as well as io_uring.
 - When a `with_data` parser stops at an incomplete message, or `with_data`
   parks with nothing buffered, an accumulator that grows through `append`
   (every connection on mio, TLS connections on io_uring) moves the buffered
