@@ -1,7 +1,7 @@
 # Removing the public context types
 
-**Status:** proposal, 2026-11-04, with two open owner decisions (see
-[Open decisions](#open-decisions)). Series for 0.7.0. Follows
+**Status:** approved, 2026-11-04, including both [owner decisions](#owner-decisions).
+Series for 0.7.0. Step 1 landed in #737. Follows
 `docs/connection-handle-ownership-design.md`, which moved reading and writing
 onto `RecvHalf` and `SendHalf` and left `ConnCtx` as a `Copy` token.
 
@@ -99,8 +99,8 @@ example in `runtime/cancellation.rs` takes a `Connection`.
 
 ## Read futures borrow their half
 
-`rx.with_data(..)` takes `&mut self`, but `WithDataFuture` carries no lifetime, so
-the borrow ends when the call returns. This compiles on both backends:
+Before step 2, `WithDataFuture` carried no lifetime, so the borrow ended when the
+call returned, and this compiled on both backends:
 
 ```rust
 let a = rx.with_data(|d| ParseResult::Consumed(d.len()));
@@ -115,7 +115,7 @@ that holds the half's borrow. `ForwardFuture` already does.
 `RecvReadyFuture` stays unborrowed. It consumes nothing, and `Client::recv_ready`
 exists so that a caller can fire while it is pending
 (`docs/send-while-receiving-design.md`), which a borrow would refuse with E0499.
-Today it is `Send`, holding only a connection index and generation. It gains
+It was `Send`, holding only a connection index and generation. It gains
 `PhantomData<*const ()>`, so it is `!Send`, because a poll on another worker would
 index that worker's connection table. A `RecvReadyFuture` moved to another task on
 the same worker still compiles, and polling it takes `owner_task` from the reader,
@@ -178,8 +178,11 @@ Across the series:
   the `Connection` before it goes to the client. `offer_for_park` cannot be called
   on a connection held by a client.
 - A dropped half cannot be taken again.
-- `DriverCtx::close` is the only close bounded by `close_notify_timeout_ms`. See
-  [Open decisions](#open-decisions).
+- `ConfigBuilder::close_notify_timeout_ms` is removed, and the internal fatal
+  closes keep a fixed 5 s bound. See [Owner decisions](#owner-decisions).
+- On a `Connection` a held read future also blocks sends, so that case needs
+  `split()`. A read future is not `'static`: to spawn or box one with `'static`,
+  move the half into an `async move` block that makes the call.
 
 ### Consumers checked
 
@@ -238,25 +241,26 @@ One call site needs `split`: the fast path in
 each datagram to `quinn-proto` and send after the receive future has finished, so
 the borrows do not overlap there.
 
-## Open decisions
+## Owner decisions
 
-### Should dropping a connection close it?
+### Dropping a connection closes it
+
+Approved 2026-11-04.
 
 `Drop` for `SendHalf` and `RecvHalf` only clears the claim flag, so dropping an
 outbound `Connection`, or a client built on one, leaves the socket open and the
 slot occupied. An accepted connection is closed when its task ends. An outbound
 one is not. Removing `ConnCtx` and `DriverCtx` removes the only ways to close a
-dropped outbound connection. One downstream load generator keeps a `ConnCtx` in a guard to close
-the connection on every exit from its reconnect loop.
+dropped outbound connection. One downstream load generator keeps a `ConnCtx` in a
+guard to close the connection on every exit from its reconnect loop.
 
-The removal does not force a runtime change. That crate can wrap the client in a
-type whose `Drop` calls `Client::close`. Without a change, a connection dropped
-with no `close` leaks its slot, as it does today.
+This was not forced: that crate could wrap the client in a type whose `Drop` calls
+`Client::close`, but a connection dropped with no `close` would keep leaking its
+slot.
 
-The proposal is that dropping the last half closes the connection, with the same
-graceful close as `Connection::close`. Inbound connections keep their second
-trigger: `on_accept`'s task ending closes the connection even if a half has moved
-to a spawned task.
+Dropping the last half closes the connection, with the same graceful close as
+`Connection::close`. Inbound connections keep their second trigger: `on_accept`'s
+task ending closes the connection even if a half has moved to a spawned task.
 
 - Dropping a half clears its claim flag. If the other half's flag is also clear,
   the connection closes. `recv_half_taken` and `send_half_taken` stay for this
@@ -299,15 +303,17 @@ inside the block: five in `tests/teardown_drops.rs`, `Sleeps` in
 `peer_fin.rs` would otherwise keep passing without testing FIN detection. The scan
 was static, so a run of the full suite on both backends has to confirm the count.
 
-### What happens to `close_notify_timeout_ms`?
+### `close_notify_timeout_ms` is removed
+
+Approved 2026-11-04.
 
 `DriverCtx::close` arms a deadline for a TLS close. `close_connection_graceful`,
 behind `Connection::close` and a handler return, arms none, and its drain is
 unbounded. With `DriverCtx` private, the public knob applies only to the two
 fatal encrypt closes in `handler.rs`, and it is already inert on mio.
 
-The recommendation is to remove `ConfigBuilder::close_notify_timeout_ms` and keep
-a fixed 5 s bound on those internal closes. `Connection::close` stays unbounded,
+Remove `ConfigBuilder::close_notify_timeout_ms` and keep a fixed 5 s bound on
+those internal closes. `Connection::close` stays unbounded,
 as it is for plaintext. Bounding a close against a peer that stops reading is a
 separate change that would apply to TLS and plaintext alike.
 `a_slow_reader_gets_the_whole_reply_before_close_notify` sets the knob to 300 ms.
@@ -315,7 +321,7 @@ It moves to a unit test that checks `close_notify_deadline` stays `None` after
 `close_connection_graceful`, because a 3.5 s drain cannot fail against a 5 s
 bound.
 
-The alternative is to arm the deadline in `close_connection_graceful`, which keeps
+The rejected alternative was to arm the deadline in `close_connection_graceful`, which keeps
 the knob meaningful on io_uring, makes TLS and plaintext closes differ, and cuts
 off a TLS peer whose reply takes longer than the timeout to drain.
 `a_slow_reader_gets_the_whole_reply_before_close_notify` asserts the opposite and
@@ -331,11 +337,11 @@ Each step is one PR, and all are breaking.
 2. Read futures borrow their half, and `RecvReadyFuture` becomes `!Send`.
 3. `DriverCtx` becomes `pub(crate)`, the callbacks lose `ctx`,
    `close_direct_io_file` and `close_nvme_device` gain free forms, `SendBuilder`
-   becomes `pub(crate)`, `UdpToken` goes, and the `close_notify_timeout_ms`
-   decision lands.
+   becomes `pub(crate)`, `UdpToken` goes, and
+   `ConfigBuilder::close_notify_timeout_ms` is removed.
 4. `ConnToken` becomes `ConnId`.
 5. `UdpCtx` becomes `UdpSocket`.
-6. If approved, dropping the last half closes the connection.
+6. Dropping the last half closes the connection.
 
 `README.md`, `ringline/README.md`, the client READMEs, `docs/architecture.md`,
 `docs/tls-unbuffered-design.md` and `CLAUDE.md` describe these types. Each step corrects what it removes, and step 1

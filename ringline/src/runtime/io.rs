@@ -1009,30 +1009,38 @@ impl ConnCtx {
     // ── Recv ─────────────────────────────────────────────────────────
 
     /// See [`Connection::with_data`].
-    pub(crate) fn with_data<F: FnMut(&[u8]) -> ParseResult>(&self, f: F) -> WithDataFuture<F> {
+    pub(crate) fn with_data<'a, F: FnMut(&[u8]) -> ParseResult>(
+        &self,
+        f: F,
+    ) -> WithDataFuture<'a, F> {
         WithDataFuture {
             conn_index: self.conn_index,
             generation: self.generation,
             f: Some(f),
+            _borrow: PhantomData,
         }
     }
 
     /// See [`Connection::with_data_result`].
-    pub(crate) fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
+    pub(crate) fn with_data_result<'a, F: FnMut(&[u8]) -> ParseResult>(
         &self,
         f: F,
-    ) -> WithDataResultFuture<F> {
+    ) -> WithDataResultFuture<'a, F> {
         WithDataResultFuture {
             inner: self.with_data(f),
         }
     }
 
     /// See [`Connection::with_bytes`].
-    pub(crate) fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&self, f: F) -> WithBytesFuture<F> {
+    pub(crate) fn with_bytes<'a, F: FnMut(Bytes) -> ParseResult>(
+        &self,
+        f: F,
+    ) -> WithBytesFuture<'a, F> {
         WithBytesFuture {
             conn_index: self.conn_index,
             generation: self.generation,
             f: Some(f),
+            _borrow: PhantomData,
         }
     }
 
@@ -1042,6 +1050,7 @@ impl ConnCtx {
         RecvReadyFuture {
             conn_index: self.conn_index,
             generation: self.generation,
+            _not_send: PhantomData,
         }
     }
 
@@ -1842,16 +1851,18 @@ fn park_forward_waiter(executor: &mut Executor, conn_index: u32) {
 }
 
 /// Future returned by [`Connection::with_data`].
-pub struct WithDataFuture<F> {
+pub struct WithDataFuture<'a, F> {
     conn_index: u32,
     /// Generation snapshot from `ConnCtx` at construction time. Compared on
     /// poll / drop so a stale future that survived a slot-reuse cycle
     /// doesn't read or wake the *new* connection's state.
     generation: u32,
     f: Option<F>,
+    /// Holds the half's borrow, so a second read on it is a compile error.
+    _borrow: PhantomData<&'a mut RecvHalf>,
 }
 
-impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
+impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<'_, F> {
     type Output = usize;
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
@@ -1876,7 +1887,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<F> {
     }
 }
 
-impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
+impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<'_, F> {
     /// `poll` for a future whose generation matches the connection's.
     fn poll_current(&mut self, driver: &mut Driver, executor: &mut Executor) -> Poll<usize> {
         let data = driver.accumulators.data(self.conn_index);
@@ -1987,11 +1998,11 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<F> {
 /// Dropping the future before it resolves is inert: it registers no state
 /// beyond what `WithDataFuture` registers, and the error slot stays readable,
 /// until taken, by a later `with_data_result` on the same connection.
-pub struct WithDataResultFuture<F> {
-    inner: WithDataFuture<F>,
+pub struct WithDataResultFuture<'a, F> {
+    inner: WithDataFuture<'a, F>,
 }
 
-impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataResultFuture<F> {
+impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataResultFuture<'_, F> {
     type Output = io::Result<usize>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -2016,14 +2027,16 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataResultFuture<F> 
 // ── WithBytesFuture ──────────────────────────────────────────────────
 
 /// Future returned by [`Connection::with_bytes`].
-pub struct WithBytesFuture<F> {
+pub struct WithBytesFuture<'a, F> {
     conn_index: u32,
     /// See `WithDataFuture` for the role of `generation`.
     generation: u32,
     f: Option<F>,
+    /// See `WithDataFuture`.
+    _borrow: PhantomData<&'a mut RecvHalf>,
 }
 
-impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
+impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<'_, F> {
     type Output = usize;
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
@@ -2055,7 +2068,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<F> {
     }
 }
 
-impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
+impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<'_, F> {
     /// `poll` for a future whose generation matches the connection's.
     /// `is_closed` is the connection's `recv_finished()`.
     fn poll_current(
@@ -2184,9 +2197,22 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
 /// # }
 /// ```
 ///
-/// `with_data`, `with_data_result`, `with_bytes` and `recv_ready` return futures
-/// with no lifetime parameter, so the borrow ends with the call and two of them
-/// can be held at once. Those rely on runtime checks.
+/// `with_data`, `with_data_result` and `with_bytes` hold the borrow the same way,
+/// so a second read is a compile error too:
+///
+/// ```compile_fail
+/// # use ringline::{ParseResult, RecvHalf};
+/// # async fn f(mut rx: RecvHalf) {
+/// let first = rx.with_data(|_| ParseResult::Consumed(0));
+/// let second = rx.with_data(|_| ParseResult::Consumed(0));
+/// drop((first, second));
+/// # }
+/// ```
+///
+/// [`recv_ready`](Self::recv_ready) does not. It consumes nothing, and a caller
+/// fires while it is pending. Polling a `RecvReadyFuture` from another task on the
+/// same worker replaces the reader as the connection's receive waiter, so the
+/// reader is not woken by that arrival or by later ones until it is polled again.
 ///
 /// Available on both backends.
 pub struct RecvHalf {
@@ -2197,7 +2223,7 @@ pub struct RecvHalf {
 
 impl RecvHalf {
     /// See [`Connection::with_data`].
-    pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<F> {
+    pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<'_, F> {
         self.conn.with_data(f)
     }
 
@@ -2205,12 +2231,12 @@ impl RecvHalf {
     pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
         &mut self,
         f: F,
-    ) -> WithDataResultFuture<F> {
+    ) -> WithDataResultFuture<'_, F> {
         self.conn.with_data_result(f)
     }
 
     /// See [`Connection::with_bytes`].
-    pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&mut self, f: F) -> WithBytesFuture<F> {
+    pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&mut self, f: F) -> WithBytesFuture<'_, F> {
         self.conn.with_bytes(f)
     }
 
@@ -2619,7 +2645,7 @@ impl Connection {
     /// If the closure returns `NeedMore` or `Consumed(0)` on non-empty data
     /// (incomplete parse), the future parks and retries when more data arrives.
     /// The closure must therefore be safe to call multiple times (`FnMut`).
-    pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<F> {
+    pub fn with_data<F: FnMut(&[u8]) -> ParseResult>(&mut self, f: F) -> WithDataFuture<'_, F> {
         self.rx.with_data(f)
     }
 
@@ -2655,7 +2681,7 @@ impl Connection {
     pub fn with_data_result<F: FnMut(&[u8]) -> ParseResult>(
         &mut self,
         f: F,
-    ) -> WithDataResultFuture<F> {
+    ) -> WithDataResultFuture<'_, F> {
         self.rx.with_data_result(f)
     }
 
@@ -2667,7 +2693,7 @@ impl Connection {
     ///
     /// This enables zero-copy RESP parsing: the parser can call `bytes.slice()`
     /// to extract sub-ranges without allocating.
-    pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&mut self, f: F) -> WithBytesFuture<F> {
+    pub fn with_bytes<F: FnMut(Bytes) -> ParseResult>(&mut self, f: F) -> WithBytesFuture<'_, F> {
         self.rx.with_bytes(f)
     }
 
@@ -3491,10 +3517,19 @@ impl Future for ForwardFuture<'_> {
 /// 1. The driver holds received bytes for the connection in its
 ///    accumulator, OR
 /// 2. The connection has finished receiving.
+///
+/// Does not borrow the half, and is `!Send`:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::RecvReadyFuture>();
+/// ```
 pub struct RecvReadyFuture {
     conn_index: u32,
     /// See `WithDataFuture` for the role of `generation`.
     generation: u32,
+    /// Pinned to the worker: a poll on another one would index its table.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl Future for RecvReadyFuture {

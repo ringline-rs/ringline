@@ -223,6 +223,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `WithDataFuture`, `WithDataResultFuture` and `WithBytesFuture`
+  take a lifetime and hold the borrow of the `RecvHalf` or `Connection` they
+  came from, so a second read while one is held is a compile error. On a
+  `Connection` the borrow covers the send side too, so sending while a read
+  future is held needs `split()`. A read future is no longer `'static`: to spawn
+  or box one with `'static`, move the half into an `async move` block that makes
+  the call. Other `RecvHalf` methods, such as `is_alive`, cannot be called while
+  one is held. They are `!Send`, as is `RecvReadyFuture`, which still does not borrow, so a client can
+  fire while it is pending.
 - **Breaking:** `ConnStream::new` takes and owns a `Connection`, and
   `conn_ctx()` is replaced by `send_half()`, `eof_truncated()` and
   `is_recv_direct()`. `mark_disconnected` on the redis, memcache and ping pools
