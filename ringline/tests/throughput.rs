@@ -36,9 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{AsyncReadExt, AsyncWriteExt};
-use ringline::{
-    AsyncEventHandler, Config, ConnStream, Connection, RinglineBuilder, UdpCtx, UdpSendError,
-};
+use ringline::{AsyncEventHandler, Config, ConnStream, Connection, RinglineBuilder, UdpSendError};
 
 // ── Shared test config ────────────────────────────────────────────────
 
@@ -320,7 +318,10 @@ impl AsyncEventHandler for AsyncUdpEcho {
     fn create_for_worker(_id: usize) -> Self {
         AsyncUdpEcho
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async move {
             UDP_HANDLER_STARTED.fetch_add(1, Ordering::SeqCst);
             loop {

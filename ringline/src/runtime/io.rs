@@ -5007,16 +5007,127 @@ pub unsafe fn nvme_write(
 
 // ── UDP async API ───────────────────────────────────────────────────
 
-/// Async context for a UDP socket.
+/// A UDP socket, from
+/// [`AsyncEventHandler::on_udp_bind()`](crate::AsyncEventHandler::on_udp_bind).
 ///
-/// Passed to [`AsyncEventHandler::on_udp_bind()`](crate::AsyncEventHandler::on_udp_bind)
-/// for each bound UDP socket. Provides async recv and fire-and-forget send.
-#[derive(Clone, Copy)]
-pub struct UdpCtx {
-    pub(crate) udp_index: u32,
+/// Each worker that binds a UDP address gets its own socket (via `SO_REUSEPORT`).
+/// Not `Copy`, not `Clone` and `!Send`, for the reasons [`Connection`] gives. Reads
+/// and [`send_ready`](Self::send_ready) take `&mut self`, and their futures hold
+/// that borrow, because each has one waiter slot and a second waiter would replace
+/// the first. `send_to` and `send_to_gso` take `&self`.
+///
+/// Call [`split`](Self::split) to send while a read borrow is live, for example
+/// from inside a [`with_datagram`](Self::with_datagram) closure.
+///
+/// Dropping a `UdpSocket` releases nothing. The socket lives until the worker
+/// exits.
+///
+/// ```compile_fail
+/// # use ringline::UdpSocket;
+/// # fn f(mut udp: UdpSocket) {
+/// let first = udp.recv_from();
+/// let second = udp.recv_from();
+/// drop((first, second));
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::UdpSocket>();
+/// ```
+pub struct UdpSocket {
+    tx: UdpSendHalf,
+    rx: UdpRecvHalf,
 }
 
-impl UdpCtx {
+/// The read side of a [`UdpSocket`], from [`UdpSocket::split`].
+pub struct UdpRecvHalf {
+    udp_index: u32,
+    _not_send: PhantomData<*const ()>,
+}
+
+/// The write side of a [`UdpSocket`], from [`UdpSocket::split`].
+pub struct UdpSendHalf {
+    udp_index: u32,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl UdpSocket {
+    /// The socket at `udp_index` on this worker.
+    pub(crate) fn new(udp_index: u32) -> Self {
+        UdpSocket {
+            tx: UdpSendHalf {
+                udp_index,
+                _not_send: PhantomData,
+            },
+            rx: UdpRecvHalf {
+                udp_index,
+                _not_send: PhantomData,
+            },
+        }
+    }
+
+    /// Split into the independently borrowable write and read halves.
+    pub fn split(self) -> (UdpSendHalf, UdpRecvHalf) {
+        (self.tx, self.rx)
+    }
+
+    /// See [`UdpRecvHalf::index`].
+    pub fn index(&self) -> usize {
+        self.rx.index()
+    }
+
+    /// See [`UdpRecvHalf::recv_from`].
+    pub fn recv_from(&mut self) -> UdpRecvFuture<'_> {
+        self.rx.recv_from()
+    }
+
+    /// See [`UdpRecvHalf::with_datagram`].
+    pub fn with_datagram<F, R>(&mut self, f: F) -> UdpWithDatagramFuture<'_, F, R>
+    where
+        F: FnMut(&[u8], SocketAddr) -> R + Unpin,
+    {
+        self.rx.with_datagram(f)
+    }
+
+    /// See [`UdpRecvHalf::recv_batch_timed`].
+    pub fn recv_batch_timed<F>(&mut self, max: usize, f: F) -> UdpRecvBatchTimedFuture<'_, F>
+    where
+        F: FnMut(&[u8], SocketAddr, Instant) + Unpin,
+    {
+        self.rx.recv_batch_timed(max, f)
+    }
+
+    /// See [`UdpRecvHalf::recv_batch`].
+    pub fn recv_batch<F>(&mut self, max: usize, f: F) -> UdpRecvBatchFuture<'_, F>
+    where
+        F: FnMut(&[u8], SocketAddr) + Unpin,
+    {
+        self.rx.recv_batch(max, f)
+    }
+
+    /// See [`UdpSendHalf::send_ready`].
+    pub fn send_ready(&mut self) -> UdpSendReadyFuture<'_> {
+        self.tx.send_ready()
+    }
+
+    /// See [`UdpSendHalf::send_to`].
+    pub fn send_to(&self, peer: SocketAddr, data: &[u8]) -> Result<(), crate::error::UdpSendError> {
+        self.tx.send_to(peer, data)
+    }
+
+    /// See [`UdpSendHalf::send_to_gso`].
+    pub fn send_to_gso(
+        &self,
+        peer: SocketAddr,
+        data: &[u8],
+        segment_size: u16,
+    ) -> Result<(), crate::error::UdpSendError> {
+        self.tx.send_to_gso(peer, data, segment_size)
+    }
+}
+
+impl UdpRecvHalf {
     /// Returns the UDP socket index within this worker.
     pub fn index(&self) -> usize {
         self.udp_index as usize
@@ -5028,14 +5139,12 @@ impl UdpCtx {
     /// datagram. The payload is copied into a `Vec<u8>` (datagrams are
     /// typically small, so this is acceptable for the initial implementation).
     ///
-    /// Only one task should await this per socket at a time; a second waiter
-    /// overwrites the first, which is then leaked (it must still be driven
-    /// from another wake source). If you need fan-out to multiple consumers,
-    /// run a single recv loop and forward the payloads through your own
-    /// channel.
-    pub fn recv_from(&self) -> UdpRecvFuture {
+    /// For fan-out to multiple consumers, run a single recv loop and forward the
+    /// payloads through your own channel.
+    pub fn recv_from(&mut self) -> UdpRecvFuture<'_> {
         UdpRecvFuture {
             udp_index: self.udp_index,
+            _borrow: PhantomData,
         }
     }
 
@@ -5049,7 +5158,7 @@ impl UdpCtx {
     /// copied out inside `f`.
     ///
     /// Same single-consumer semantics as [`recv_from()`](Self::recv_from).
-    pub fn with_datagram<F, R>(&self, f: F) -> UdpWithDatagramFuture<F, R>
+    pub fn with_datagram<F, R>(&mut self, f: F) -> UdpWithDatagramFuture<'_, F, R>
     where
         F: FnMut(&[u8], SocketAddr) -> R + Unpin,
     {
@@ -5057,6 +5166,7 @@ impl UdpCtx {
             udp_index: self.udp_index,
             f: Some(f),
             _marker: std::marker::PhantomData,
+            _borrow: PhantomData,
         }
     }
 
@@ -5074,7 +5184,7 @@ impl UdpCtx {
     ///
     /// All other semantics — single-consumer, zero-copy borrow,
     /// `max` trade-off — match [`recv_batch`](Self::recv_batch).
-    pub fn recv_batch_timed<F>(&self, max: usize, f: F) -> UdpRecvBatchTimedFuture<F>
+    pub fn recv_batch_timed<F>(&mut self, max: usize, f: F) -> UdpRecvBatchTimedFuture<'_, F>
     where
         F: FnMut(&[u8], SocketAddr, Instant) + Unpin,
     {
@@ -5083,6 +5193,7 @@ impl UdpCtx {
             udp_index: self.udp_index,
             max,
             f: Some(f),
+            _borrow: PhantomData,
         }
     }
 
@@ -5119,7 +5230,7 @@ impl UdpCtx {
     /// returns and before the next datagram is dispatched.
     ///
     /// Same single-consumer semantics as [`recv_from()`](Self::recv_from).
-    pub fn recv_batch<F>(&self, max: usize, f: F) -> UdpRecvBatchFuture<F>
+    pub fn recv_batch<F>(&mut self, max: usize, f: F) -> UdpRecvBatchFuture<'_, F>
     where
         F: FnMut(&[u8], SocketAddr) + Unpin,
     {
@@ -5128,24 +5239,29 @@ impl UdpCtx {
             udp_index: self.udp_index,
             max,
             f: Some(f),
+            _borrow: PhantomData,
         }
+    }
+}
+
+impl UdpSendHalf {
+    /// Returns the UDP socket index within this worker.
+    pub fn index(&self) -> usize {
+        self.udp_index as usize
     }
 
     /// Resolve when at least one UDP send slot is available on this socket.
     ///
-    /// Use this to back off when [`UdpCtx::send_to`] returns
+    /// Use this to back off when [`UdpSendHalf::send_to`] returns
     /// [`crate::error::UdpSendError::PoolExhausted`], rather than busy-looping.
     /// On the io_uring backend the future suspends until a completion frees
     /// a slot. On the mio backend sends are synchronous and this future is
     /// always immediately ready — callers can still use it to stay
     /// backend-agnostic.
-    ///
-    /// Only one task should await this per socket at a time; a second waiter
-    /// overwrites the first, which is then leaked (it must still be driven
-    /// from another wake source).
-    pub fn send_ready(&self) -> UdpSendReadyFuture {
+    pub fn send_ready(&mut self) -> UdpSendReadyFuture<'_> {
         UdpSendReadyFuture {
             udp_index: self.udp_index,
+            _borrow: PhantomData,
             #[cfg(not(has_io_uring))]
             yielded: false,
         }
@@ -5263,12 +5379,14 @@ impl UdpCtx {
     }
 }
 
-/// Future returned by [`UdpCtx::recv_from()`].
-pub struct UdpRecvFuture {
+/// Future returned by [`UdpRecvHalf::recv_from()`].
+pub struct UdpRecvFuture<'a> {
     udp_index: u32,
+    /// Holds the half's borrow: the socket has one receive waiter slot.
+    _borrow: PhantomData<&'a mut UdpRecvHalf>,
 }
 
-impl Future for UdpRecvFuture {
+impl Future for UdpRecvFuture<'_> {
     type Output = (Vec<u8>, SocketAddr);
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -5319,8 +5437,8 @@ impl Future for UdpRecvFuture {
             if idx < executor.udp_recv_waiters.len() {
                 debug_assert!(
                     executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
-                    "two distinct tasks awaiting recv_from on UdpCtx index {idx}; \
-                     UdpCtx::recv_from supports a single consumer per socket"
+                    "two distinct tasks awaiting recv_from on UDP socket {idx}; \
+                     recv_from supports a single consumer per socket"
                 );
                 executor.udp_recv_waiters[idx] = Some(task_id);
             }
@@ -5329,22 +5447,24 @@ impl Future for UdpRecvFuture {
     }
 }
 
-/// Future returned by [`UdpCtx::with_datagram()`].
+/// Future returned by [`UdpRecvHalf::with_datagram()`].
 ///
-/// Zero-copy alternative to [`UdpCtx::recv_from()`]: the callback is invoked
+/// Zero-copy alternative to [`UdpRecvHalf::recv_from()`]: the callback is invoked
 /// over a borrowed slice into the kernel-provided buffer (io_uring) or the
 /// owned recv buffer (mio), without ever allocating a `Vec` for the payload.
 /// The buffer is released back to the kernel once the callback returns.
-pub struct UdpWithDatagramFuture<F, R>
+pub struct UdpWithDatagramFuture<'a, F, R>
 where
     F: FnMut(&[u8], SocketAddr) -> R + Unpin,
 {
     udp_index: u32,
     f: Option<F>,
     _marker: std::marker::PhantomData<fn() -> R>,
+    /// See [`UdpRecvFuture`].
+    _borrow: PhantomData<&'a mut UdpRecvHalf>,
 }
 
-impl<F, R> Future for UdpWithDatagramFuture<F, R>
+impl<F, R> Future for UdpWithDatagramFuture<'_, F, R>
 where
     F: FnMut(&[u8], SocketAddr) -> R + Unpin,
 {
@@ -5385,8 +5505,8 @@ where
             if idx < executor.udp_recv_waiters.len() {
                 debug_assert!(
                     executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
-                    "two distinct tasks awaiting recv on UdpCtx index {idx}; \
-                     UdpCtx::with_datagram supports a single consumer per socket"
+                    "two distinct tasks awaiting recv on UDP socket {idx}; \
+                     with_datagram supports a single consumer per socket"
                 );
                 executor.udp_recv_waiters[idx] = Some(task_id);
             }
@@ -5395,22 +5515,24 @@ where
     }
 }
 
-/// Future returned by [`UdpCtx::recv_batch()`].
+/// Future returned by [`UdpRecvHalf::recv_batch()`].
 ///
 /// Drains up to `max` queued datagrams on the first poll where at
 /// least one is available. Returns the count of datagrams drained
-/// (between 1 and `max`). See [`UdpCtx::recv_batch`] for the rationale
+/// (between 1 and `max`). See [`UdpRecvHalf::recv_batch`] for the rationale
 /// on choosing `max`.
-pub struct UdpRecvBatchFuture<F>
+pub struct UdpRecvBatchFuture<'a, F>
 where
     F: FnMut(&[u8], SocketAddr) + Unpin,
 {
     udp_index: u32,
     max: usize,
     f: Option<F>,
+    /// See [`UdpRecvFuture`].
+    _borrow: PhantomData<&'a mut UdpRecvHalf>,
 }
 
-impl<F> Future for UdpRecvBatchFuture<F>
+impl<F> Future for UdpRecvBatchFuture<'_, F>
 where
     F: FnMut(&[u8], SocketAddr) + Unpin,
 {
@@ -5425,8 +5547,8 @@ where
                 if idx < executor.udp_recv_waiters.len() {
                     debug_assert!(
                         executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
-                        "two distinct tasks awaiting recv on UdpCtx index {idx}; \
-                         UdpCtx::recv_batch supports a single consumer per socket"
+                        "two distinct tasks awaiting recv on UDP socket {idx}; \
+                         recv_batch supports a single consumer per socket"
                     );
                     executor.udp_recv_waiters[idx] = Some(task_id);
                 }
@@ -5471,20 +5593,22 @@ where
     }
 }
 
-/// Future returned by [`UdpCtx::recv_batch_timed()`].
+/// Future returned by [`UdpRecvHalf::recv_batch_timed()`].
 ///
 /// Identical to [`UdpRecvBatchFuture`] except the callback receives
 /// the driver-captured arrival timestamp as a third argument.
-pub struct UdpRecvBatchTimedFuture<F>
+pub struct UdpRecvBatchTimedFuture<'a, F>
 where
     F: FnMut(&[u8], SocketAddr, Instant) + Unpin,
 {
     udp_index: u32,
     max: usize,
     f: Option<F>,
+    /// See [`UdpRecvFuture`].
+    _borrow: PhantomData<&'a mut UdpRecvHalf>,
 }
 
-impl<F> Future for UdpRecvBatchTimedFuture<F>
+impl<F> Future for UdpRecvBatchTimedFuture<'_, F>
 where
     F: FnMut(&[u8], SocketAddr, Instant) + Unpin,
 {
@@ -5499,8 +5623,8 @@ where
                 if idx < executor.udp_recv_waiters.len() {
                     debug_assert!(
                         executor.udp_recv_waiters[idx].is_none_or(|t| t == task_id),
-                        "two distinct tasks awaiting recv on UdpCtx index {idx}; \
-                         UdpCtx::recv_batch_timed supports a single consumer per socket"
+                        "two distinct tasks awaiting recv on UDP socket {idx}; \
+                         recv_batch_timed supports a single consumer per socket"
                     );
                     executor.udp_recv_waiters[idx] = Some(task_id);
                 }
@@ -5540,8 +5664,8 @@ where
     }
 }
 
-/// Future returned by [`UdpCtx::send_ready()`].
-pub struct UdpSendReadyFuture {
+/// Future returned by [`UdpSendHalf::send_ready()`].
+pub struct UdpSendReadyFuture<'a> {
     /// Mio: whether this future has yielded once (cooperative backoff).
     #[cfg(not(has_io_uring))]
     yielded: bool,
@@ -5549,9 +5673,11 @@ pub struct UdpSendReadyFuture {
     /// without looking at any per-socket state.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     udp_index: u32,
+    /// Holds the half's borrow: the socket has one send waiter slot.
+    _borrow: PhantomData<&'a mut UdpSendHalf>,
 }
 
-impl Future for UdpSendReadyFuture {
+impl Future for UdpSendReadyFuture<'_> {
     type Output = ();
 
     #[cfg(has_io_uring)]
@@ -5568,8 +5694,8 @@ impl Future for UdpSendReadyFuture {
             if idx < executor.udp_send_ready_waiters.len() {
                 debug_assert!(
                     executor.udp_send_ready_waiters[idx].is_none_or(|t| t == task_id),
-                    "two distinct tasks awaiting send_ready on UdpCtx index {idx}; \
-                     UdpCtx::send_ready supports a single consumer per socket"
+                    "two distinct tasks awaiting send_ready on UDP socket {idx}; \
+                     send_ready supports a single consumer per socket"
                 );
                 executor.udp_send_ready_waiters[idx] = Some(task_id);
             }

@@ -280,7 +280,7 @@ pub struct Config {
     /// Maximum number of datagrams buffered per UDP socket awaiting a
     /// consumer. The runtime fills this queue from `recvmsg` completions;
     /// the application's `on_udp_bind` future drains it via
-    /// [`UdpCtx::recv_from`](crate::UdpCtx::recv_from). When the queue is
+    /// [`UdpSocket::recv_from`](crate::UdpSocket::recv_from). When the queue is
     /// full, additional datagrams are dropped and
     /// `udp::DATAGRAMS_DROPPED` is incremented — this guards against
     /// unbounded memory growth when the handler future stalls, panics,
@@ -294,8 +294,8 @@ pub struct Config {
     /// kernel coalesces consecutive same-flow datagrams into one `recvmsg`
     /// delivery, carrying the per-segment size in a control message. The
     /// runtime splits the coalesced payload back into individual datagrams
-    /// transparently, so [`UdpCtx::recv_batch`](crate::UdpCtx::recv_batch) /
-    /// [`recv_batch_timed`](crate::UdpCtx::recv_batch_timed) callbacks still
+    /// transparently, so [`UdpSocket::recv_batch`](crate::UdpSocket::recv_batch) /
+    /// [`recv_batch_timed`](crate::UdpSocket::recv_batch_timed) callbacks still
     /// fire once per datagram. This cuts per-datagram syscall / wake overhead
     /// dramatically for high-pps flows (e.g. QUIC at large payloads).
     ///

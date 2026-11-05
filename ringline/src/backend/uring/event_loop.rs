@@ -13,7 +13,7 @@ use crate::completion::{OpTag, UserData};
 use crate::connection::{Lifecycle, ReadHalf};
 use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
-use crate::runtime::io::{ConnCtx, DriverState, UdpCtx, set_driver_state_guarded};
+use crate::runtime::io::{ConnCtx, DriverState, UdpSocket, set_driver_state_guarded};
 use crate::runtime::send_completion::SendId;
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
@@ -249,12 +249,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Spawn UDP handler tasks for each bound UDP socket.
         for udp_idx in 0..self.driver.udp_sockets.len() {
-            let udp_ctx = UdpCtx {
-                udp_index: udp_idx as u32,
-            };
+            let udp_socket = UdpSocket::new(udp_idx as u32);
             // A panic while building the future is a task panic too.
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.handler.on_udp_bind(udp_ctx)
+                self.handler.on_udp_bind(udp_socket)
             }));
             let future = match built {
                 Ok(future) => future,
@@ -3864,7 +3862,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
-        // A freed slot may unblock a task awaiting `UdpCtx::send_ready`.
+        // A freed slot may unblock a task awaiting `UdpSendHalf::send_ready`.
         if slot_returned {
             self.executor.wake_udp_send_ready(udp_index);
         }
@@ -10006,7 +10004,7 @@ mod tests {
             return;
         }
 
-        // Register a waiter as though a task had polled UdpCtx::send_ready.
+        // Register a waiter as though a task had polled UdpSendHalf::send_ready.
         el.executor.udp_send_ready_waiters[0] = Some(42);
 
         let data = b"wake";

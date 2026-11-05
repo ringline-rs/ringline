@@ -4,7 +4,7 @@
 //! These tests exercise the UDP API end-to-end on whichever backend is
 //! compiled in. The io_uring backend uses multishot recvmsg + a send slot
 //! ring; the mio backend uses synchronous `recv_from` / `send_to`. Both
-//! paths funnel through the same `UdpCtx` API so the tests are
+//! paths funnel through the same `UdpSocket` API so the tests are
 //! backend-agnostic except where noted.
 
 use ringline::ConfigBuilder;
@@ -16,9 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use ringline::{
-    AsyncEventHandler, Config, Connection, ParseResult, RinglineBuilder, UdpCtx, UdpSendError,
-};
+use ringline::{AsyncEventHandler, Config, Connection, ParseResult, RinglineBuilder, UdpSendError};
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -70,7 +68,10 @@ impl AsyncEventHandler for UdpEcho {
         }
     }
 
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         Some(Box::pin(async move {
             started.fetch_add(1, Ordering::SeqCst);
@@ -255,7 +256,10 @@ impl AsyncEventHandler for UdpClient {
     fn create_for_worker(id: usize) -> Self {
         UdpClient { worker: id }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let worker = self.worker;
         Some(Box::pin(async move {
             let server = CLIENT_SERVER
@@ -670,7 +674,10 @@ impl AsyncEventHandler for SendStress {
             sent_ok: SEND_STRESS_SENT.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         let saw_exhausted = self.saw_exhausted.clone();
         let sent_ok = self.sent_ok.clone();
@@ -830,7 +837,10 @@ impl AsyncEventHandler for OversizedSend {
             follow_up_ok: OVER_OK.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         let oversized_err = self.oversized_err.clone();
         let follow_up_ok = self.follow_up_ok.clone();
@@ -943,7 +953,10 @@ impl AsyncEventHandler for CountingEcho {
             received: COUNT_RECV.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         let received = self.received.clone();
         Some(Box::pin(async move {
@@ -1044,7 +1057,10 @@ impl AsyncEventHandler for ReuseportEcho {
             started: REUSE_STARTED.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let worker_id = self.worker_id;
         let started = self.started.clone();
         Some(Box::pin(async move {
@@ -1210,7 +1226,10 @@ impl AsyncEventHandler for TcpUdpHandler {
             started: TCP_UDP_STARTED.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         Some(Box::pin(async move {
             started.fetch_add(1, Ordering::SeqCst);
@@ -1293,7 +1312,10 @@ impl AsyncEventHandler for ExitingUdpHandler {
             started: EXITING_STARTED.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, _udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        _udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         Some(Box::pin(async move {
             started.fetch_add(1, Ordering::SeqCst);
@@ -1412,7 +1434,10 @@ impl AsyncEventHandler for PanickingUdpHandler {
             started: PANIC_STARTED.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         // Only the FIRST socket panics; the second is a normal echo so we
         // can verify the worker stayed alive.
@@ -1505,7 +1530,10 @@ impl AsyncEventHandler for InFlightSendHandler {
             started: INFLIGHT_STARTED.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         Some(Box::pin(async move {
             started.fetch_add(1, Ordering::SeqCst);
@@ -1585,7 +1613,10 @@ impl AsyncEventHandler for ConcurrentSenders {
             sent_total: CONC_SENT.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         let sent_total = self.sent_total.clone();
         Some(Box::pin(async move {
@@ -1763,7 +1794,10 @@ impl AsyncEventHandler for BlockedThenEcho {
             unblock: BLOCKED_UNBLOCK.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         let unblock = self.unblock.clone();
         Some(Box::pin(async move {
@@ -1901,7 +1935,10 @@ impl AsyncEventHandler for UnreachableProbe {
             follow_up_ok: UNREACH_FOLLOWUP.get_or_init(Default::default).clone(),
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         let follow_up_ok = self.follow_up_ok.clone();
         Some(Box::pin(async move {
@@ -2016,7 +2053,10 @@ impl AsyncEventHandler for GsoSendHandler {
             segments: GSO_SEG_COUNT.load(Ordering::SeqCst) as u16,
         }
     }
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         let sent = self.sent.clone();
         let seg_size = self.segment_size;
@@ -2155,7 +2195,10 @@ fn udp_gso_invalid_segment_size_returns_error() {
                 sane_send_ok: SANE_OK.get_or_init(Default::default).clone(),
             }
         }
-        fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        fn on_udp_bind(
+            &self,
+            mut udp: ringline::UdpSocket,
+        ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
             let started = self.started.clone();
             let ok_count = self.sane_send_ok.clone();
             Some(Box::pin(async move {
@@ -2261,7 +2304,10 @@ impl AsyncEventHandler for BatchEcho {
         }
     }
 
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         let poll_drains = self.poll_drains.clone();
         Some(Box::pin(async move {
@@ -2338,7 +2384,10 @@ impl AsyncEventHandler for TimedBatchEcho {
         }
     }
 
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let started = self.started.clone();
         let deltas = self.deltas.clone();
         Some(Box::pin(async move {
@@ -2528,7 +2577,10 @@ impl AsyncEventHandler for ConnectedRecorder {
         ConnectedRecorder
     }
 
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let peer = FILTER_PEER.lock().unwrap().expect("peer set");
         Some(Box::pin(async move {
             while udp.send_to(peer, b"hello").is_err() {
@@ -2607,7 +2659,10 @@ impl AsyncEventHandler for ProbesClosedPeer {
         ProbesClosedPeer
     }
 
-    fn on_udp_bind(&self, udp: UdpCtx) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+    fn on_udp_bind(
+        &self,
+        mut udp: ringline::UdpSocket,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
         let peer = UNREACH_PEER.lock().unwrap().expect("peer set");
         Some(Box::pin(async move {
             while udp.send_to(peer, b"hello").is_err() {

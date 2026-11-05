@@ -62,4 +62,4 @@ Those types follow ringline-quic-proto's version.
   ringline-quic-proto upgrade changes only `QuicConfig::from_proto` and the
   `proto` re-export
 - Connection and stream management
-- Integrates with ringline's UDP support (`UdpCtx`)
+- Integrates with ringline's UDP support (`UdpSocket`)

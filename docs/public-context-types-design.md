@@ -1,7 +1,7 @@
 # Removing the public context types
 
 **Status:** approved, 2026-11-04, including both [owner decisions](#owner-decisions).
-Series for 0.7.0. Steps 1 to 4 landed in #737, #738, #739 and #740. Follows
+Series for 0.7.0. Steps 1 to 5 landed in #737, #738, #739, #740 and #741. Follows
 `docs/connection-handle-ownership-design.md`, which moved reading and writing
 onto `RecvHalf` and `SendHalf` and left `ConnCtx` as a `Copy` token.
 
