@@ -945,8 +945,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Whether the run loop may block in `submit_and_wait(1)`. It may not
-    /// while a task is runnable or once shutdown is pending.
+    /// Whether the run loop may block in `submit_and_wait(1)`. It may not while a
+    /// task is runnable, while a close released by the orphan drain awaits the
+    /// end-of-iteration drain, or once shutdown is pending.
+    ///
+    /// Pending closes: `release_orphans` at the top of the iteration can push to
+    /// `pending_finalize_closes`, and only the drain at the end of the iteration
+    /// submits the Close. With no tick timeout, a blocking wait would hold that
+    /// Close until the next completion.
     ///
     /// Shutdown: the shutdown check in the run loop runs only after the wait.
     /// `request_shutdown()` sets `shutdown_local` without writing the eventfd.

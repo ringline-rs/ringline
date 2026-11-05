@@ -349,3 +349,61 @@ fn cancelling_the_task_that_holds_a_connection_closes_it() {
     runtime.shutdown();
     common::join_workers(&runtime, handles);
 }
+
+// ── A close from the orphan drain, with no tick to wake the worker ──
+
+#[cfg(has_io_uring)]
+struct StuckCloseHoldsBackend;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for StuckCloseHoldsBackend {
+    /// `pending()` arms no timer, so this task's teardown leaves no completion
+    /// behind that would wake the worker.
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let _backend = ringline::connect(peer_addr()).await.expect("connect");
+            let block = [0u8; 16384];
+            while conn.send_nowait(&block).is_ok() {}
+            conn.close();
+            std::future::pending::<()>().await;
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        StuckCloseHoldsBackend
+    }
+}
+
+/// A half queued at teardown closes its connection from the orphan drain. The
+/// worker must not block before the end-of-iteration drain submits that Close:
+/// with no tick timeout, nothing else would wake it.
+#[cfg(has_io_uring)]
+#[test]
+fn a_close_from_the_orphan_drain_is_submitted_without_a_tick() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = listen();
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .max_connections(16)
+        .send_pool(1024, 16384)
+        .tick_timeout_us(0)
+        .blocking_threads(0)
+        .resolver_threads(0)
+        .spawner_threads(0)
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<StuckCloseHoldsBackend>()
+        .expect("launch");
+    let addr = runtime.bound_addr().expect("bound address");
+    let mut client = TcpStream::connect(addr).unwrap();
+    let (mut backend, _) = listener.accept().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    expect_eof(&mut client);
+    expect_eof(&mut backend);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
