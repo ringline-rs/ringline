@@ -242,7 +242,7 @@ impl AsyncEventHandler for NotifyBlocker {
         async {}
     }
 
-    fn on_notify(&mut self, _ctx: &mut ringline::DriverCtx<'_>) {
+    fn on_notify(&mut self) {
         if NOTIFY_ARMED.swap(false, Ordering::AcqRel) {
             NOTIFY_BLOCKED.store(true, Ordering::Release);
             wait_until(&NOTIFY_RELEASED, HOLD_LIMIT);

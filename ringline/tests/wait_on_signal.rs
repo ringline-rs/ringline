@@ -29,7 +29,7 @@ impl AsyncEventHandler for PanicA {
     fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
-    fn on_tick(&mut self, _ctx: &mut ringline::DriverCtx<'_>) {
+    fn on_tick(&mut self) {
         if PANIC_A.swap(false, Ordering::SeqCst) {
             panic!("boom in A");
         }
@@ -43,7 +43,7 @@ impl AsyncEventHandler for PanicB {
     fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
-    fn on_tick(&mut self, _ctx: &mut ringline::DriverCtx<'_>) {
+    fn on_tick(&mut self) {
         if PANIC_B.swap(false, Ordering::SeqCst) {
             panic!("boom in B");
         }

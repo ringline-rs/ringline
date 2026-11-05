@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ringline::close_direct_io_file` and `close_nvme_device`. Before, only
+  `DriverCtx` could close these handles. A close with commands in flight makes
+  the handle stale at once, and on io_uring the last completion unregisters the
+  file, so a queued operation cannot land in the next file opened in that slot.
+  Until then the slot stays taken, so an open on a full table can fail.
 - New crate `ringline-tls-config`, holding `TlsConfig`, `TlsClientConfig`,
   their builders and the `TlsVersion` and `CipherSuite` enums. ringline
   re-exports the types at their old paths and the crate as
@@ -404,8 +409,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   poll that cannot be submitted is submitted again before the worker next
   waits for completions, unless the connection is being parked; a peek, once
   nothing is buffered or in flight. A FIN closes the connection even when
-  the task only sends. `cancel` finishes the read half and cancels the
-  receive in flight. A park (`offer_for_park`) cancels the connection's
+  the task only sends. A park (`offer_for_park`) cancels the connection's
   receive and poll before it moves the socket; the adopting worker arms the
   poll, and the reader's next parked read arms a receive.
 - ringline-http's HTTP/2 connection reads with `with_data` on every backend,
@@ -653,16 +657,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   dropped. (io_uring itself commits the Close before the task can respond
   when nothing was queued at the FIN; tracked as #371.) Previously a mio task could keep running indefinitely after
   EOF. `RecvMode::Closed` is now set only by `close_connection` on both
-  backends. The deferral is unbounded on mio (`close_notify_timeout_ms`
-  is inert there). Design: `docs/mio-close-lifecycle-design.md`.
+  backends. The deferral is unbounded on mio. Design: `docs/mio-close-lifecycle-design.md`.
 
 - Internal: connection lifecycle state is now three explicit fields on
   `ConnectionState` (`recv_arm`, `read`, `lifecycle`) instead of
   `RecvMode` doing triple duty; readers use `recv_finished()` and
-  `close_requested()`. No observable change except that a connection whose
-  receive was cancelled via `DriverCtx::cancel` (io_uring) can now be
-  closed afterwards — it used to leak its slot — and reports
-  `is_alive() == true` until it is closed. Design:
+  `close_requested()`. No observable change. Design:
   `docs/connection-state-model-design.md`.
 
 - Internal: the write half is explicit state on both backends
@@ -673,6 +673,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** `DriverCtx` is no longer public, and `on_tick` and `on_notify`
+  take no argument. The free functions work inside them:
+  `ringline::request_shutdown`, `open_direct_io_file`, `open_nvme_device` and
+  `spawn`. A disk read, write or fsync goes in a spawned task, because
+  `DriverCtx`'s versions returned a key that nothing could consume. Token-based
+  sends, closes, cancels and queries from `on_tick` have no replacement: the task that
+  holds the `Connection` does them, and other code reaches it through `mpsc` or
+  a `CancellationToken`. Design: `docs/public-context-types-design.md`.
+- **Breaking:** `UdpToken`, which no public API returned.
+- **Breaking:** `ConfigBuilder::close_notify_timeout_ms`. It applied only to
+  `DriverCtx::close`, and it was inert on mio. A TLS close after a fatal encrypt
+  error keeps a fixed 5 s bound. `Connection::close` and a handler return stay
+  unbounded, as they were.
 - **Breaking:** `ConnCtx` is no longer public, and `as_conn` is gone from
   `Connection` and `SendHalf`. Applications hold a `Connection` or its halves;
   `ConnCtx::split`, `take_send` and `take_recv` have no replacement, because
@@ -682,9 +695,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `is_recv_direct` have to be read from the `Connection` before it goes to a
   protocol client, and `offer_for_park` cannot be called on one a client holds.
   A dropped `Connection` leaves its socket open. An outbound one then stays
-  open until `DriverCtx::close` is called with a saved `ConnToken` or the worker
-  exits. A peer close also ends it, except on a plaintext io_uring connection
-  with received bytes unread. Close it first. Design:
+  open until the worker exits. A peer close also ends it, except on a plaintext
+  io_uring connection with received bytes unread. Close it first. Design:
   `docs/public-context-types-design.md`.
 - **Breaking:** `Connection::cancel` and `ConnCtx::cancel`. Neither had a
   caller, and mio returned `Unsupported`. `select` on a `CancellationToken`
@@ -845,8 +857,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the alert, so those paths sent a bare FIN, which the peer cannot tell from
   a truncation. The alert is queued behind any queued sends. The queue
   drains however long the peer takes, as before and as for a plaintext
-  connection; only `DriverCtx::close` bounds the drain with
-  `close_notify_timeout_ms`. A close the runtime makes after a receive
+  connection. A close the runtime makes after a receive
   error, a reset, a send that could not be pushed, or the peer closing first
   sends no alert; neither does `ConnCtx::close()` or a handler return after
   `shutdown_write`, including one still waiting for queued sends to drain.

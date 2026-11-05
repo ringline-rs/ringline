@@ -113,6 +113,11 @@ impl ConnToken {
     }
 }
 
+/// How long a TLS close after a fatal encrypt error waits for its queued sends and
+/// close_notify to drain before the connection is closed without them.
+#[cfg(has_io_uring)]
+const CLOSE_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Identifies which listener a connection arrived on.
 ///
 /// A runtime can bind several listeners — any mix of TCP and Unix — and every
@@ -153,20 +158,6 @@ impl ListenerId {
 impl std::fmt::Display for ListenerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "listener {}", self.0)
-    }
-}
-
-/// Opaque handle for a UDP socket.
-///
-/// Each worker that binds a UDP address gets its own socket (via `SO_REUSEPORT`).
-/// The token identifies a specific UDP socket within a worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UdpToken(pub(crate) u32);
-
-impl UdpToken {
-    /// Returns the UDP socket index within this worker.
-    pub fn index(&self) -> usize {
-        self.0 as usize
     }
 }
 
@@ -247,10 +238,8 @@ pub(crate) fn bounded_send_slots(
 }
 
 #[cfg(has_io_uring)]
-/// The context provided to handler callbacks for issuing operations.
-///
-/// This is a short-lived borrow into the driver's internal state.
-pub struct DriverCtx<'a> {
+/// A short-lived borrow of driver fields, built by `Driver::make_ctx`.
+pub(crate) struct DriverCtx<'a> {
     pub(crate) ring: &'a mut crate::backend::Ring,
     pub(crate) connections: &'a mut crate::connection::ConnectionTable,
     pub(crate) fixed_buffers: &'a mut crate::buffer::fixed::FixedBufferRegistry,
@@ -286,8 +275,6 @@ pub struct DriverCtx<'a> {
     /// loop's deadline check iterates this instead of all send queues
     /// so non-TLS workloads pay zero per-iteration cost.
     pub(crate) close_notify_armed: &'a mut Vec<u32>,
-    /// Per-worker UDP socket state.
-    pub(crate) udp_sockets: &'a mut Vec<crate::backend::UdpSocketState>,
     /// NVMe device table. `None` when NVMe is not configured.
     pub(crate) nvme_devices: &'a mut Option<crate::nvme::NvmeDeviceTable>,
     /// NVMe command slab. `None` when NVMe is not configured.
@@ -308,7 +295,7 @@ pub struct DriverCtx<'a> {
     pub(crate) fs_fd_base: u32,
     /// Connections whose `close_pending` was set from this ctx (e.g.
     /// `DriverCtx::close`); the event loop re-drives `try_finalize_close`
-    /// for each after the callback returns. This keeps ctx-initiated closes
+    /// for each before the iteration ends. This keeps ctx-initiated closes
     /// on the same deferred path as `close_connection` — the Close SQE is
     /// only submitted once in-flight sends, queued sends, and chains drain.
     pub(crate) pending_finalize_closes: &'a mut Vec<u32>,
@@ -334,7 +321,6 @@ pub struct DriverCtx<'a> {
     /// back to the pool so the event loop wakes the send-capacity head once
     /// per iteration rather than once per released slot.
     pub(crate) capacity_released: &'a mut bool,
-    pub(crate) close_notify_timeout: std::time::Duration,
     pub(crate) next_disk_io_seq: &'a mut u16,
     /// Set when `finish` on a TLS chain gave the chain's id to
     /// `attach_send_id`: on its last ciphertext send, or settled at once if the
@@ -360,23 +346,6 @@ impl<'a> DriverCtx<'a> {
     /// The worker will stop after the current iteration completes.
     pub fn request_shutdown(&mut self) {
         *self.shutdown_requested = true;
-    }
-
-    /// Get the peer address for a connection.
-    pub fn peer_addr(&self, conn: ConnToken) -> Option<crate::connection::PeerAddr> {
-        let cs = self.connections.get(conn.index)?;
-        if cs.generation != conn.generation {
-            return None;
-        }
-        cs.peer_addr.clone()
-    }
-
-    /// Check if a connection is outbound (opened with [`crate::connect`] or [`crate::connect_unix`]).
-    pub fn is_outbound(&self, conn: ConnToken) -> bool {
-        self.connections
-            .get(conn.index)
-            .map(|cs| cs.generation == conn.generation && cs.outbound)
-            .unwrap_or(false)
     }
 
     /// Get TLS session information for a connection.
@@ -1023,12 +992,6 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Returns the maximum number of SQEs per IO_LINK chain.
-    /// 0 means chaining is disabled.
-    pub fn max_chain_length(&self) -> u16 {
-        self.max_chain_length
-    }
-
     /// Begin building an IO_LINK send chain for a connection.
     ///
     /// Multiple sends (copy-only or scatter-gather) are collected and submitted
@@ -1131,7 +1094,7 @@ impl<'a> DriverCtx<'a> {
                     // that `close_pending` is actually set on this path.
                     let state = &mut self.send_queues[conn.index as usize];
                     state.close_notify_deadline =
-                        Some(std::time::Instant::now() + self.close_notify_timeout);
+                        Some(std::time::Instant::now() + CLOSE_NOTIFY_TIMEOUT);
                     if !self.close_notify_armed.contains(&conn.index) {
                         self.close_notify_armed.push(conn.index);
                     }
@@ -1139,7 +1102,7 @@ impl<'a> DriverCtx<'a> {
             }
 
             // Defer the Close behind whatever is outstanding; the event loop
-            // re-drives try_finalize_close after this callback returns, and
+            // re-drives try_finalize_close before the iteration ends, and
             // each send CQE re-drives it via note_send_finalized.
             self.send_queues[conn.index as usize].close_pending = true;
             if !self.pending_finalize_closes.contains(&conn.index) {
@@ -1182,65 +1145,6 @@ impl<'a> DriverCtx<'a> {
                 cs.write = crate::connection::WriteHalf::Shutdown;
                 // The slot must outlive the SQE: see `shutdown_inflight`.
                 self.send_queues[idx].shutdown_inflight = true;
-            }
-        }
-    }
-
-    /// Send a UDP datagram to the given peer address.
-    ///
-    /// Copies `data` into the send pool and submits a `sendmsg` SQE. Up to
-    /// `Config::udp_send_slots` sends can be in flight concurrently per
-    /// socket; exhaustion returns [`crate::error::UdpSendError::PoolExhausted`].
-    pub fn send_to(
-        &mut self,
-        socket: UdpToken,
-        peer: SocketAddr,
-        data: &[u8],
-    ) -> Result<(), crate::error::UdpSendError> {
-        let idx = socket.0 as usize;
-        if idx >= self.udp_sockets.len() {
-            return Err(crate::error::UdpSendError::Io(io::Error::other(
-                "invalid UDP socket index",
-            )));
-        }
-
-        let slot_idx = self.udp_sockets[idx]
-            .send_freelist
-            .pop()
-            .ok_or(crate::error::UdpSendError::PoolExhausted)?;
-
-        let (pool_slot, ptr, len) = match self.send_copy_pool.copy_in(data) {
-            Some(v) => v,
-            None => {
-                self.udp_sockets[idx].send_freelist.push(slot_idx);
-                return Err(crate::error::UdpSendError::PoolExhausted);
-            }
-        };
-
-        let fd_index = self.udp_sockets[idx].fd_index;
-        let slot = &mut self.udp_sockets[idx].send_slots[slot_idx as usize];
-        let addr_len = crate::backend::socket_addr_to_sockaddr(peer, &mut slot.send_addr);
-        slot.send_iov.iov_base = ptr as *mut libc::c_void;
-        slot.send_iov.iov_len = len as usize;
-        slot.send_msghdr.msg_namelen = addr_len;
-
-        let msghdr_ptr = &*slot.send_msghdr as *const libc::msghdr;
-        let payload = crate::backend::uring::driver::encode_udp_send_payload(slot_idx, pool_slot);
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::SendMsgUdp,
-            socket.0,
-            payload,
-        );
-
-        match self.ring.submit_sendmsg(fd_index, msghdr_ptr, ud) {
-            Ok(()) => {
-                crate::metrics::UDP.increment(crate::metrics::udp::DATAGRAMS_SENT);
-                Ok(())
-            }
-            Err(_e) => {
-                self.send_copy_pool.release(pool_slot);
-                self.udp_sockets[idx].send_freelist.push(slot_idx);
-                Err(crate::error::UdpSendError::SubmissionQueueFull)
             }
         }
     }
@@ -1504,74 +1408,6 @@ impl<'a> DriverCtx<'a> {
         Ok(ConnToken::new(conn_index, generation))
     }
 
-    /// Cancel pending operations on a connection.
-    pub fn cancel(&mut self, conn: ConnToken) -> io::Result<()> {
-        let cs = self
-            .connections
-            .get_mut(conn.index)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "invalid connection"))?;
-        if cs.generation != conn.generation {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "stale connection",
-            ));
-        }
-
-        // A close already requested owns the teardown (the close lead linked
-        // ahead of its Close ends its requests); a cancel in that window is a
-        // no-op.
-        if cs.close_requested() {
-            return Ok(());
-        }
-
-        // A connection's receive is armed when a read parks and stays in
-        // flight until it completes, even if that read is dropped; it is
-        // cancelled by the `direct_recvs` slot its user_data carries. The
-        // application cancelled the receive: recv futures resolve to EOF from
-        // here on, and the receive's `-ECANCELED` completion wakes a parked
-        // reader. The lifecycle is untouched: cancel is not a close, so a
-        // later close_connection still tears the connection down. A read
-        // half the peer already finished keeps its state, so an
-        // `Eof { truncated: true }` stays visible to `eof_truncated()`.
-        if !matches!(cs.lifecycle, crate::connection::Lifecycle::Connecting) {
-            if matches!(cs.read, crate::connection::ReadHalf::Open) {
-                cs.read = crate::connection::ReadHalf::Cancelled;
-            }
-            if cs.recv_direct_armed {
-                let target_ud = crate::completion::UserData::encode(
-                    crate::completion::OpTag::RecvDirect,
-                    conn.index,
-                    cs.recv_direct_slot,
-                );
-                self.ring.submit_async_cancel(target_ud.raw(), conn.index)?;
-            }
-            return Ok(());
-        }
-
-        // A connect in flight. With an armed timeout, also cancel the
-        // timeout so the Connect ECANCELED CQE is handled as user-initiated
-        // (not timeout-initiated).
-        if cs.connect_timeout_armed {
-            cs.connect_timeout_armed = false;
-            let timeout_ud = crate::completion::UserData::encode(
-                crate::completion::OpTag::Timeout,
-                conn.index,
-                0,
-            );
-            // Best effort cancel; timeout fires harmlessly if already established.
-            let _ = self.ring.submit_async_cancel(timeout_ud.raw(), conn.index);
-        }
-        if matches!(cs.read, crate::connection::ReadHalf::Open) {
-            cs.read = crate::connection::ReadHalf::Cancelled;
-        }
-        // A cancel matches its target by `user_data`, so the payload must be
-        // what the connect submitted: zero.
-        let target_ud =
-            crate::completion::UserData::encode(crate::completion::OpTag::Connect, conn.index, 0);
-        self.ring.submit_async_cancel(target_ud.raw(), conn.index)?;
-        Ok(())
-    }
-
     // ── NVMe passthrough methods ──────────────────────────────────────────
 
     /// Open an NVMe device for passthrough I/O.
@@ -1632,9 +1468,8 @@ impl<'a> DriverCtx<'a> {
     /// Reads `num_blocks` logical blocks starting at `lba` into the buffer
     /// at `buf_addr` with length `buf_len`.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`nvme_read`](crate::nvme_read) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`nvme_read`](crate::nvme_read) holds it
+    /// in a future that resolves to the result.
     ///
     /// # Safety
     ///
@@ -1701,9 +1536,8 @@ impl<'a> DriverCtx<'a> {
     /// Writes `num_blocks` logical blocks starting at `lba` from the buffer
     /// at `buf_addr` with length `buf_len`.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`nvme_write`](crate::nvme_write) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`nvme_write`](crate::nvme_write) holds it
+    /// in a future that resolves to the result.
     ///
     /// # Safety
     ///
@@ -1767,9 +1601,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit an NVMe flush command.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`nvme_flush`](crate::nvme_flush) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`nvme_flush`](crate::nvme_flush) holds it
+    /// in a future that resolves to the result.
     pub fn nvme_flush(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<u32> {
         let (fd_index, nsid) = self.validate_nvme_device(device)?;
 
@@ -1815,9 +1648,19 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Close an NVMe device.
+    /// Close an NVMe device. With commands in flight, the handle goes stale at
+    /// once and the last completion unregisters the device.
     pub fn close_nvme_device(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<()> {
         let (fd_index, _nsid) = self.validate_nvme_device(device)?;
+
+        if let Some(devices) = self.nvme_devices.as_mut()
+            && let Some(dev) = devices.get_mut(device.index)
+            && dev.in_flight > 0
+        {
+            dev.closing = true;
+            dev.generation = dev.generation.wrapping_add(1);
+            return Ok(());
+        }
 
         // Unregister from the fixed file table.
         self.ring.register_files_update(fd_index, &[-1i32])?;
@@ -1838,7 +1681,7 @@ impl<'a> DriverCtx<'a> {
         let dev = devices
             .get(device.index)
             .ok_or_else(|| io::Error::other("invalid NVMe device handle"))?;
-        if dev.generation != device.generation {
+        if dev.closing || dev.generation != device.generation {
             return Err(io::Error::other("stale NVMe device handle"));
         }
         Ok((dev.fd_index, dev.nsid))
@@ -1918,14 +1761,12 @@ impl<'a> DriverCtx<'a> {
     /// The buffer must be aligned to the logical block size and remain valid
     /// until the direct I/O completion fires.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`direct_io_read`](crate::direct_io_read) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`direct_io_read`](crate::direct_io_read) holds it
+    /// in a future that resolves to the result.
     ///
     /// # Safety
     /// `buf` must point to valid, aligned memory of at least `len` bytes
-    /// that remains valid until the operation completes. Nothing reports
-    /// completion, so keep the buffer for the life of the worker.
+    /// that remains valid until the operation completes.
     pub unsafe fn direct_io_read(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -1982,14 +1823,12 @@ impl<'a> DriverCtx<'a> {
     /// The buffer must be aligned to the logical block size and remain valid
     /// until the direct I/O completion fires.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`direct_io_write`](crate::direct_io_write) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`direct_io_write`](crate::direct_io_write) holds it
+    /// in a future that resolves to the result.
     ///
     /// # Safety
     /// `buf` must point to valid, aligned memory of at least `len` bytes
-    /// that remains valid until the operation completes. Nothing reports
-    /// completion, so keep the buffer for the life of the worker.
+    /// that remains valid until the operation completes.
     pub unsafe fn direct_io_write(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -2045,9 +1884,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit an fsync for a direct I/O file.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`direct_io_fsync`](crate::direct_io_fsync) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`direct_io_fsync`](crate::direct_io_fsync) holds it
+    /// in a future that resolves to the result.
     pub fn direct_io_fsync(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
         let fd_index = self.validate_direct_io_file(file)?;
 
@@ -2092,9 +1930,19 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Close a direct I/O file.
+    /// Close a direct I/O file. With commands in flight, the handle goes stale
+    /// at once and the last completion unregisters the file.
     pub fn close_direct_io_file(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<()> {
         let fd_index = self.validate_direct_io_file(file)?;
+
+        if let Some(files) = self.direct_io_files.as_mut()
+            && let Some(f) = files.get_mut(file.index)
+            && f.in_flight > 0
+        {
+            f.closing = true;
+            f.generation = f.generation.wrapping_add(1);
+            return Ok(());
+        }
 
         // Unregister from the fixed file table.
         self.ring.register_files_update(fd_index, &[-1i32])?;
@@ -2115,7 +1963,7 @@ impl<'a> DriverCtx<'a> {
         let f = files
             .get(file.index)
             .ok_or_else(|| io::Error::other("invalid direct I/O file handle"))?;
-        if f.generation != file.generation {
+        if f.closing || f.generation != file.generation {
             return Err(io::Error::other("stale direct I/O file handle"));
         }
         Ok(f.fd_index)
@@ -2650,11 +2498,9 @@ impl<'a> DriverCtx<'a> {
 // ── mio DriverCtx (minimal stub) ───────────────────────────────────────
 
 #[cfg(not(has_io_uring))]
-/// The context provided to handler callbacks for issuing operations.
-///
-/// This is a short-lived borrow into the driver's internal state.
+/// A short-lived borrow of driver fields, built by `Driver::make_ctx`.
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
-pub struct DriverCtx<'a> {
+pub(crate) struct DriverCtx<'a> {
     pub(crate) connections: &'a mut crate::connection::ConnectionTable,
     pub(crate) send_copy_pool: &'a mut SendCopyPool,
     pub(crate) tls_table: *mut crate::tls::TlsTable,
@@ -2718,18 +2564,6 @@ impl<'a> DriverCtx<'a> {
     /// Request shutdown of this worker's event loop.
     pub fn request_shutdown(&mut self) {
         *self.shutdown_requested = true;
-    }
-
-    /// Get the peer address for a connection.
-    pub fn peer_addr(&self, conn: ConnToken) -> Option<crate::connection::PeerAddr> {
-        self.connections.get(conn.index)?.peer_addr.clone()
-    }
-
-    /// Whether the connection is outbound (initiated by this worker).
-    pub fn is_outbound(&self, conn: ConnToken) -> bool {
-        self.connections
-            .get(conn.index)
-            .is_some_and(|cs| cs.outbound)
     }
 
     /// Send data on a connection (copy into pending send buffer).
@@ -3048,14 +2882,6 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Cancel an in-flight operation.
-    pub fn cancel(&mut self, _conn: ConnToken) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "cancel not supported on mio backend",
-        ))
-    }
-
     /// Start an outbound TCP connection. Returns its token immediately; the
     /// caller registers the waiter that takes the connection.
     pub(crate) fn start_connect(
@@ -3179,6 +3005,14 @@ impl<'a> DriverCtx<'a> {
         _path: &str,
         _nsid: u32,
     ) -> io::Result<crate::nvme::NvmeDevice> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "NVMe passthrough requires the io_uring backend",
+        ))
+    }
+
+    /// Close an NVMe device (not supported on mio backend).
+    pub fn close_nvme_device(&mut self, _device: crate::nvme::NvmeDevice) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "NVMe passthrough requires the io_uring backend",
@@ -3336,9 +3170,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit a direct I/O read via the disk I/O pool.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`direct_io_read`](crate::direct_io_read) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`direct_io_read`](crate::direct_io_read) holds it
+    /// in a future that resolves to the result.
     pub fn direct_io_read(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -3375,9 +3208,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit a direct I/O write via the disk I/O pool.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`direct_io_write`](crate::direct_io_write) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`direct_io_write`](crate::direct_io_write) holds it
+    /// in a future that resolves to the result.
     pub fn direct_io_write(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -4256,7 +4088,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
 /// as one send and queued behind the connection's other sends, so the chain
 /// completes as one send does.
 ///
-/// Created via [`DriverCtx::send_chain`].
+/// Passed to the closure given to [`SendHalf::send_chain`](crate::SendHalf::send_chain).
 pub struct SendChainBuilder<'b, 'a> {
     ctx: &'b mut DriverCtx<'a>,
     conn: ConnToken,

@@ -531,8 +531,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // on_tick callback (synchronous). Set the executor's
             // driver_state thread-local so user code that calls
             // `ringline::spawn()` / wakers / `with_state` works from
-            // inside the handler. Raw pointers dodge the borrow conflict
-            // with `make_ctx()` (which would otherwise hold &mut self.driver).
+            // inside the handler.
             let handler = &mut self.handler;
             let driver_ptr = &mut self.driver as *mut Driver;
             let executor_ptr = &mut self.executor as *mut crate::runtime::Executor;
@@ -541,19 +540,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 executor: unsafe { NonNull::new_unchecked(executor_ptr) },
             };
             let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
-            // Safety: driver_ptr is the only live reference to self.driver
-            // until the guard is dropped below. catch_unwind keeps a panic
-            // in user tick code from unwinding past the guard's scope with
-            // futures observing a dangling CURRENT_DRIVER, and from killing
-            // the worker.
-            let result = {
-                let mut ctx = unsafe { (*driver_ptr).make_ctx() };
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handler.on_tick(&mut ctx);
-                }))
-            };
+            // catch_unwind keeps a panic in user tick code from unwinding past
+            // the guard's scope with futures observing a dangling
+            // CURRENT_DRIVER, and from killing the worker.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.on_tick();
+            }));
             if let Err(payload) = result {
-                // SAFETY: `ctx` has ended, so this is the only reference.
+                // SAFETY: the handler call has ended, so this is the only reference.
                 unsafe {
                     (*driver_ptr)
                         .panic_reporter
@@ -1194,7 +1188,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             if -result == libc::ECANCELED {
-                // Cancelled by a close or `cancel`: a parked reader resolves.
+                // Cancelled with the connection open, by a park: the task re-arms when it
+                // parks again.
                 self.executor.wake_recv(conn_index);
                 return;
             }
@@ -2496,8 +2491,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // on_notify (synchronous). Set the executor's driver_state
         // thread-local so user code that calls `ringline::spawn()` /
-        // wakers / `with_state` works from inside the handler. Raw
-        // pointers dodge the borrow conflict with `make_ctx()`.
+        // wakers / `with_state` works from inside the handler.
         {
             let handler = &mut self.handler;
             let driver_ptr = &mut self.driver as *mut Driver;
@@ -2507,14 +2501,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 executor: unsafe { NonNull::new_unchecked(executor_ptr) },
             };
             let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
-            let result = {
-                let mut ctx = unsafe { (*driver_ptr).make_ctx() };
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handler.on_notify(&mut ctx);
-                }))
-            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.on_notify();
+            }));
             if let Err(payload) = result {
-                // SAFETY: `ctx` has ended, so this is the only reference.
+                // SAFETY: the handler call has ended, so this is the only reference.
                 unsafe {
                     (*driver_ptr)
                         .panic_reporter
@@ -4018,11 +4009,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let device_index = nvme_cmd_slab.release(slab_idx);
 
-        // Decrement in-flight count.
+        // Decrement in-flight count, and finish a close that waited for it.
         if let Some(ref mut devices) = self.driver.nvme_devices
             && let Some(dev) = devices.get_mut(device_index)
         {
             dev.in_flight = dev.in_flight.saturating_sub(1);
+            if dev.closing && dev.in_flight == 0 {
+                let _ = self
+                    .driver
+                    .ring
+                    .register_files_update(dev.fd_index, &[-1i32]);
+                devices.release(device_index);
+            }
         }
 
         // NVMe passthrough puts the device-level status word (positive,
@@ -4050,11 +4048,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let (file_index, _op) = cmd_slab.release(slab_idx);
 
-        // Decrement in-flight count.
+        // Decrement in-flight count, and finish a close that waited for it.
         if let Some(ref mut files) = self.driver.direct_io_files
             && let Some(f) = files.get_mut(file_index)
         {
             f.in_flight = f.in_flight.saturating_sub(1);
+            if f.closing && f.in_flight == 0 {
+                let _ = self.driver.ring.register_files_update(f.fd_index, &[-1i32]);
+                files.release(file_index);
+            }
         }
 
         // Wake the async task waiting for this Direct I/O completion.
@@ -8148,7 +8150,55 @@ mod tests {
         );
     }
 
-    /// DriverCtx::close (the on_tick-context close) must defer behind an
+    /// `DriverCtx::close`, the fatal-encrypt close, bounds a TLS drain.
+    #[test]
+    fn ctx_close_arms_a_close_notify_deadline_on_tls() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+
+        el.driver
+            .make_ctx()
+            .close(crate::handler::ConnToken::new(conn_index, generation));
+
+        assert!(
+            el.driver.send_queues[conn_index as usize]
+                .close_notify_deadline
+                .is_some()
+        );
+        assert!(
+            el.driver.send_queues[conn_index as usize].in_flight,
+            "the close_notify went out"
+        );
+    }
+
+    /// The application's close arms no deadline: a TLS drain takes as long as
+    /// the peer takes, as a plaintext one does.
+    #[test]
+    fn graceful_close_arms_no_close_notify_deadline() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+
+        el.driver.close_connection_graceful(conn_index);
+
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .close_requested(),
+            "the close was requested"
+        );
+        assert!(
+            el.driver.send_queues[conn_index as usize]
+                .close_notify_deadline
+                .is_none()
+        );
+    }
+
+    /// DriverCtx::close (the fatal-encrypt close) must defer behind an
     /// in-flight send instead of forcing in_flight=false and submitting
     /// Close directly (which orphaned the send's CQE).
     #[test]
@@ -8591,112 +8641,6 @@ mod tests {
         let state = &el.driver.send_queues[conn_index as usize];
         assert!(state.close_submitted, "drain must commit the Close");
         assert!(!state.close_pending);
-    }
-
-    /// A cancel that lands after a close was requested is a no-op: the close
-    /// owns the teardown (and its own recv cancel), and a read half the peer
-    /// already finished must keep its `Eof { truncated }` for
-    /// `eof_truncated()`. Before the state split the old `Closed` state
-    /// covered both cases and `cancel` returned early.
-    #[test]
-    fn cancel_after_close_is_a_no_op_and_keeps_truncation() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.note_eof(true); // TLS FIN without close_notify
-        }
-        el.driver.close_connection(conn_index);
-        let before = el.driver.pending_finalize_closes.len();
-        {
-            let mut ctx = el.driver.make_ctx();
-            let _ = ctx.cancel(crate::handler::ConnToken::new(conn_index, generation));
-        }
-        let cs = el.driver.connections.get(conn_index).unwrap();
-        assert_eq!(
-            cs.read,
-            ReadHalf::Eof { truncated: true },
-            "cancel after close must not relabel a finished read half"
-        );
-        assert!(cs.close_requested(), "cancel after close is a no-op");
-        assert_eq!(el.driver.pending_finalize_closes.len(), before);
-    }
-
-    /// Cancelling the receive (`DriverCtx::cancel`) finishes the read half
-    /// but is not a close: a later `close_connection` must still tear the
-    /// connection down. Before the state split, cancel set `Closed`, so the
-    /// later close was a no-op and the slot leaked.
-    #[test]
-    fn cancel_then_close_still_requests_teardown() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        {
-            let mut ctx = el.driver.make_ctx();
-            let _ = ctx.cancel(crate::handler::ConnToken::new(conn_index, generation));
-        }
-        let cs = el.driver.connections.get(conn_index).unwrap();
-        assert!(cs.recv_finished(), "cancel finishes the read half");
-        assert!(!cs.close_requested(), "cancel is not a close");
-
-        el.driver.close_connection(conn_index);
-        let cs = el.driver.connections.get(conn_index).unwrap();
-        assert!(cs.close_requested(), "close after cancel must be honoured");
-        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
-    }
-
-    /// Cancelling a direct connection's receive finishes its read half and
-    /// ends the direct receive in flight; no receive is armed afterwards.
-    #[test]
-    fn cancel_on_a_direct_connection_ends_its_receive() {
-        let mut el = make_test_loop();
-        // Another connection's receive takes `direct_recvs` slot 0, so this
-        // connection's slot differs from its generation.
-        let other = accept_connection(&mut el);
-        assert!(!el.driver.arm_direct_recv_or_close(other, None));
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
-        let slot = el
-            .driver
-            .connections
-            .get(conn_index)
-            .unwrap()
-            .recv_direct_slot;
-        el.driver.ring.pushed_cancels.clear();
-        {
-            let mut ctx = el.driver.make_ctx();
-            ctx.cancel(crate::handler::ConnToken::new(conn_index, generation))
-                .expect("cancel");
-        }
-        assert_eq!(
-            el.driver.ring.pushed_cancels,
-            vec![UserData::encode(OpTag::RecvDirect, conn_index, slot).raw()],
-            "cancel targets the direct receive by its slot"
-        );
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .unwrap()
-                .recv_finished(),
-            "cancel finishes the read half"
-        );
-        let ud = UserData::encode(OpTag::RecvDirect, conn_index, slot);
-        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
-        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
-        assert_eq!(
-            direct_flags(&el, conn_index),
-            (false, false),
-            "a cancelled connection arms no receive"
-        );
-        assert!(
-            !el.driver
-                .connections
-                .get(conn_index)
-                .unwrap()
-                .close_requested()
-        );
     }
 
     // ── Recv data delivery tests ───────────────────────────────────

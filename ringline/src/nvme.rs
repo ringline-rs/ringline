@@ -181,7 +181,7 @@ impl NvmeUringCmd {
 
 /// Opaque handle to an opened NVMe device.
 ///
-/// Returned by [`crate::DriverCtx::open_nvme_device`] and used to identify the
+/// Returned by [`crate::open_nvme_device`] and used to identify the
 /// device in subsequent read/write/close calls. The handle includes a
 /// generation counter for stale-handle detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +209,10 @@ pub(crate) struct NvmeDeviceState {
     pub generation: u16,
     /// Number of commands currently in flight.
     pub in_flight: u32,
+    /// Closed with commands in flight: the last completion unregisters the
+    /// device, because a queued SQE resolves its fixed-file index at submission.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub closing: bool,
 }
 
 impl NvmeDeviceState {
@@ -219,6 +223,7 @@ impl NvmeDeviceState {
             active: false,
             generation: 0,
             in_flight: 0,
+            closing: false,
         }
     }
 }
@@ -252,6 +257,7 @@ impl NvmeDeviceTable {
         slot.active = false;
         slot.fd_index = u32::MAX;
         slot.in_flight = 0;
+        slot.closing = false;
         slot.generation = slot.generation.wrapping_add(1);
         self.free_list.push(index);
     }

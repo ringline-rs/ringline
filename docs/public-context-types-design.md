@@ -1,7 +1,7 @@
 # Removing the public context types
 
 **Status:** approved, 2026-11-04, including both [owner decisions](#owner-decisions).
-Series for 0.7.0. Step 1 landed in #737. Follows
+Series for 0.7.0. Steps 1 and 2 landed in #737 and #738. Follows
 `docs/connection-handle-ownership-design.md`, which moved reading and writing
 onto `RecvHalf` and `SendHalf` and left `ConnCtx` as a `Copy` token.
 
@@ -150,8 +150,8 @@ from `&mut Driver` while `spawn` makes a second `&mut Driver` through
 | `max_chain_length` | the value passed to `ConfigBuilder::max_chain_length` |
 | `send_to` | removed, with `UdpToken`; no public API returns a `UdpToken`, so nothing outside the crate can call it |
 
-`SendBuilder` is reachable only from `DriverCtx::send_parts`, so it becomes
-`pub(crate)`. `SendChainBuilder` and `ChainPartsBuilder` stay public, through
+`SendBuilder` stays public, because `AsyncSendBuilder::build` passes it to the
+caller's closure. `SendChainBuilder` and `ChainPartsBuilder` stay public, through
 `send_chain`.
 
 A disk method on `DriverCtx` returns a `u32` key, and `DiskIoFuture::new` is
@@ -179,7 +179,8 @@ Across the series:
   on a connection held by a client.
 - A dropped half cannot be taken again.
 - `ConfigBuilder::close_notify_timeout_ms` is removed, and the internal fatal
-  closes keep a fixed 5 s bound. See [Owner decisions](#owner-decisions).
+  closes keep a fixed 5 s bound. An application has no way to bound a TLS close
+  against a peer that stops reading. See [Owner decisions](#owner-decisions).
 - On a `Connection` a held read future also blocks sends, so that case needs
   `split()`. A read future is not `'static`: to spawn or box one with `'static`,
   move the half into an `async move` block that makes the call.
@@ -197,11 +198,13 @@ In this repository the uses are `request_shutdown`, `open_direct_io_file` and
 `close_direct_io_file`, plus two tests that exist to exercise a `DriverCtx` path:
 
 - `tls_tick_close_sends_close_notify` closes by token. `DriverCtx::close` stays
-  in use for the fatal encrypt closes in `handler.rs`, so this becomes a unit test
-  in `uring/event_loop.rs`. `tls_server_close_sends_close_notify` and
+  in use for the fatal encrypt closes in `handler.rs`, so its deadline becomes a unit
+  test in `uring/event_loop.rs`. `tls_server_close_sends_close_notify` and
   `tls_handler_return_sends_close_notify` cover the public close paths.
 - `disk_io_stale_results.rs` (`RawThenFuture`) submits a read whose key nothing
-  holds. It moves to a unit test against `Driver`.
+  holds. It goes: the disk methods on `DriverCtx` have no other caller than the
+  free functions, which hold the key, and the same file covers keys left by
+  dropped futures.
 
 ## `ConnToken` becomes `ConnId`
 
@@ -316,10 +319,9 @@ Remove `ConfigBuilder::close_notify_timeout_ms` and keep a fixed 5 s bound on
 those internal closes. `Connection::close` stays unbounded,
 as it is for plaintext. Bounding a close against a peer that stops reading is a
 separate change that would apply to TLS and plaintext alike.
-`a_slow_reader_gets_the_whole_reply_before_close_notify` sets the knob to 300 ms.
-It moves to a unit test that checks `close_notify_deadline` stays `None` after
-`close_connection_graceful`, because a 3.5 s drain cannot fail against a 5 s
-bound.
+`a_slow_reader_gets_the_whole_reply_before_close_notify` stays as a delivery test.
+`graceful_close_arms_no_close_notify_deadline` checks that no deadline is armed,
+because a 3.5 s drain cannot fail against a 5 s bound.
 
 The rejected alternative was to arm the deadline in `close_connection_graceful`, which keeps
 the knob meaningful on io_uring, makes TLS and plaintext closes differ, and cuts
@@ -336,8 +338,7 @@ Each step is one PR, and all are breaking.
    docs move to the public types.
 2. Read futures borrow their half, and `RecvReadyFuture` becomes `!Send`.
 3. `DriverCtx` becomes `pub(crate)`, the callbacks lose `ctx`,
-   `close_direct_io_file` and `close_nvme_device` gain free forms, `SendBuilder`
-   becomes `pub(crate)`, `UdpToken` goes, and
+   `close_direct_io_file` and `close_nvme_device` gain free forms, `UdpToken` goes, and
    `ConfigBuilder::close_notify_timeout_ms` is removed.
 4. `ConnToken` becomes `ConnId`.
 5. `UdpCtx` becomes `UdpSocket`.

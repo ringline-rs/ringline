@@ -244,14 +244,10 @@ pub use config::AcceptMode;
 pub use connection::PeerAddr;
 /// Opaque connection handle.
 pub use handler::ConnToken;
-/// I/O context passed to [`AsyncEventHandler::on_tick`] and [`AsyncEventHandler::on_notify`].
-pub use handler::DriverCtx;
 /// Identifies which listener a connection arrived on.
 pub use handler::ListenerId;
 /// Pre-classified part for scatter-gather sends via `submit_batch`.
 pub use handler::SendPart;
-/// Opaque handle for a UDP socket.
-pub use handler::UdpToken;
 /// Handler state carried across a park (tier 3, #443).
 pub use park::ParkState;
 /// When the bytes a connection's most recent reader call consumed arrived.
@@ -326,6 +322,10 @@ pub use runtime::io::WithDataFuture;
 pub use runtime::io::WithDataResultFuture;
 /// Future returned by [`yield_now()`].
 pub use runtime::io::YieldNow;
+/// Close a Direct I/O file.
+pub use runtime::io::close_direct_io_file;
+/// Close an NVMe device.
+pub use runtime::io::close_nvme_device;
 /// Begin an outbound TCP connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect;
 /// Begin an outbound Unix-domain connection; awaiting resolves to a `Connection`.

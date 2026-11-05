@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, Connection, DriverCtx, GuardBox, ParseResult,
-    RegionId, RinglineBuilder, SendGuard,
+    AsyncEventHandler, Config, ConfigBuilder, Connection, GuardBox, ParseResult, RegionId,
+    RinglineBuilder, SendGuard,
 };
 
 /// Event-loop iterations of the runtime under test.
@@ -141,7 +141,7 @@ impl AsyncEventHandler for GuardSendAfterFin {
                 .expect("guard send accepted");
         }
     }
-    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {
+    fn on_tick(&mut self) {
         TICKS.fetch_add(1, Ordering::Relaxed);
     }
     fn create_for_worker(_id: usize) -> Self {

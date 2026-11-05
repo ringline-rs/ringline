@@ -115,6 +115,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # --all-features turns on force-mio, so the first run is the only one that
+      # renders the io_uring docs.
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 
   audit:

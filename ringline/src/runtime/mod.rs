@@ -9,7 +9,7 @@
 //!   - `task` — `TaskSlab`, `TaskSlot` (slab of per-connection futures)
 //!   - `waker` — `conn_waker()`, thread-local `READY_QUEUE`, cross-thread wake inboxes
 //!   - `mod.rs` — `Executor`, `IoResult` (waiter flags, ready queue, result storage)
-//!   - `handler` — `AsyncEventHandler` trait (references `DriverCtx` by borrowed ref only)
+//!   - `handler` — `AsyncEventHandler` trait
 //!
 //! - **Backend-specific** (tied to the concrete `Driver` type):
 //!   - `io` — `Connection`, futures (`WithDataFuture`, `SendFuture`, `ConnectFuture`)
@@ -907,7 +907,7 @@ impl Executor {
     /// before the operation completed), frees the buffer and discards the
     /// result. Otherwise, if a future holds the key ([`disk_io_key_held`]),
     /// stores the result and wakes the waiting task; if not (its future was
-    /// dropped, or it was submitted without one), discards the result.
+    /// dropped), discards the result.
     /// Waiters and results are keyed by the disk-I/O key, not the
     /// connection.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
@@ -916,8 +916,7 @@ impl Executor {
             return;
         }
         if !disk_io_key_held(seq) {
-            // Nothing will take this result: its future was dropped, or the
-            // operation was submitted without one.
+            // Nothing will take this result: its future was dropped.
             self.fs_stat_results.remove(&seq);
             return;
         }

@@ -541,8 +541,6 @@ pub(crate) struct Driver {
     /// non-TLS workloads — without this, the per-iteration deadline
     /// scan dominates worker CPU at high request rates.
     pub(crate) close_notify_armed: Vec<u32>,
-    /// Configured close_notify drain deadline (Config::close_notify_timeout_ms).
-    pub(crate) close_notify_timeout: std::time::Duration,
     /// Scratch for TLS output sends collected during CQE handling.
     pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
     /// Monotonic disk-I/O sequence (see DriverCtx::disk_io_key).
@@ -1021,7 +1019,6 @@ impl Driver {
             max_chain_length: config.max_chain_length,
             send_queues,
             close_notify_armed: Vec::new(),
-            close_notify_timeout: std::time::Duration::from_millis(config.close_notify_timeout_ms),
             tls_out_scratch: Vec::new(),
             next_disk_io_seq: 0,
             direct_recvs: Vec::new(),
@@ -1154,7 +1151,6 @@ impl Driver {
             max_chain_length: self.max_chain_length,
             send_queues: &mut self.send_queues,
             close_notify_armed: &mut self.close_notify_armed,
-            udp_sockets: &mut self.udp_sockets,
             nvme_devices: &mut self.nvme_devices,
             nvme_cmd_slab: &mut self.nvme_cmd_slab,
             nvme_fd_base: self.nvme_fd_base,
@@ -1168,7 +1164,6 @@ impl Driver {
             pending_send_retries: &mut self.pending_send_retries,
             settled_sends: &mut self.settled_sends,
             capacity_released: &mut self.capacity_released,
-            close_notify_timeout: self.close_notify_timeout,
             next_disk_io_seq: &mut self.next_disk_io_seq,
             tls_chain_carried: false,
         }

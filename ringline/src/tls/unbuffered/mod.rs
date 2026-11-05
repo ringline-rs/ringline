@@ -969,7 +969,7 @@ pub(crate) fn encrypt_to_vec(
 /// The caller routes `out` through the per-connection send queue, so the alert
 /// serializes behind any in-flight send and the deferred Close fires only once
 /// it completes — identical to the buffered path's contract, and to the
-/// `close_notify_timeout_ms` deadline armed alongside it.
+/// deadline `DriverCtx::close` arms alongside it.
 ///
 /// The unbuffered engine has no `send_close_notify`: `CommonState`'s is
 /// unreachable from `UnbufferedConnectionCommon` (`Deref` but no `DerefMut`),

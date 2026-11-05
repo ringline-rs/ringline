@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, Connection, DriverCtx, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
 struct OnTickSpawner {
     spawn_attempted: Arc<AtomicBool>,
@@ -24,7 +24,7 @@ impl AsyncEventHandler for OnTickSpawner {
         async {}
     }
 
-    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {
+    fn on_tick(&mut self) {
         if self.spawn_attempted.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -68,8 +68,8 @@ impl AsyncEventHandler for ObservedTickSpawner {
         async {}
     }
 
-    fn on_tick(&mut self, ctx: &mut DriverCtx<'_>) {
-        self.inner.on_tick(ctx);
+    fn on_tick(&mut self) {
+        self.inner.on_tick();
     }
 
     fn create_for_worker(id: usize) -> Self {
@@ -145,7 +145,7 @@ impl AsyncEventHandler for OnNotifySpawner {
         async {}
     }
 
-    fn on_notify(&mut self, _ctx: &mut DriverCtx<'_>) {
+    fn on_notify(&mut self) {
         let task_ran = self.task_ran.clone();
         if ringline::spawn(async move {
             task_ran.fetch_add(1, Ordering::AcqRel);

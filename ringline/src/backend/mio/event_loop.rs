@@ -334,8 +334,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 7. on_tick callback (synchronous). Set the executor's
             // driver_state thread-local so user code that calls
             // `ringline::spawn()` / wakers / `with_state` works from
-            // inside the handler. Raw pointers dodge the borrow conflict
-            // with `make_ctx()`.
+            // inside the handler.
             {
                 let handler = &mut self.handler;
                 let driver_ptr = &mut self.driver as *mut Driver;
@@ -345,14 +344,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     executor: unsafe { NonNull::new_unchecked(executor_ptr) },
                 };
                 let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
-                let result = {
-                    let mut ctx = unsafe { (*driver_ptr).make_ctx() };
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handler.on_tick(&mut ctx);
-                    }))
-                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler.on_tick();
+                }));
                 if let Err(payload) = result {
-                    // SAFETY: `ctx` has ended, so this is the only reference.
+                    // SAFETY: the handler call has ended, so this is the only reference.
                     unsafe {
                         (*driver_ptr)
                             .panic_reporter
@@ -600,8 +596,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // on_notify (synchronous). Set the executor's driver_state
         // thread-local so user code that calls `ringline::spawn()` /
-        // wakers / `with_state` works from inside the handler. Raw
-        // pointers dodge the borrow conflict with `make_ctx()`.
+        // wakers / `with_state` works from inside the handler.
         {
             let handler = &mut self.handler;
             let driver_ptr = &mut self.driver as *mut Driver;
@@ -611,14 +606,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 executor: unsafe { NonNull::new_unchecked(executor_ptr) },
             };
             let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
-            let result = {
-                let mut ctx = unsafe { (*driver_ptr).make_ctx() };
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handler.on_notify(&mut ctx);
-                }))
-            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.on_notify();
+            }));
             if let Err(payload) = result {
-                // SAFETY: `ctx` has ended, so this is the only reference.
+                // SAFETY: the handler call has ended, so this is the only reference.
                 unsafe {
                     (*driver_ptr)
                         .panic_reporter
@@ -1288,7 +1280,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// The deferral is unbounded, as on io_uring for plaintext; mio has no
     /// equivalent of io_uring's TLS `close_notify_deadline`, so a TLS peer
     /// that half-closes and stops reading holds its slot until the write
-    /// errors. `close_notify_timeout_ms` is inert on mio.
+    /// errors.
     ///
     /// Executor cleanup runs first — the slot must not be released (and
     /// reusable) while a stale parked future, waiter flags, or a recv-sink
