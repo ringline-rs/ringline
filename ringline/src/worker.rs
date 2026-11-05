@@ -376,8 +376,8 @@ impl Runtime {
     ///
     /// On Linux the listeners stop accepting at once. A listener's sockets
     /// close, and its port is free, once the threads accepting on it have
-    /// exited: its acceptor thread, which exits at once, or after about 100 ms
-    /// if it is holding a connection no worker has room for, or in merged
+    /// exited: its acceptor thread, which exits at once, or within about 100
+    /// ms if it is holding a connection no worker has room for, or in merged
     /// accept mode the workers. This `Runtime` does not hold them open. On macOS a
     /// blocked acceptor thread exits only when a peer connects, and the
     /// listener keeps its port until then (#560).

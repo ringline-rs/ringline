@@ -509,9 +509,10 @@ impl Config {
                 "max_connections must be > 0 and < 2^24".into(),
             ));
         }
-        // A zero-capacity crossbeam channel is a rendezvous channel: a send
-        // only succeeds while a receiver is blocked in recv(), and workers
-        // only ever try_recv, and are woken after a send completes.
+        // A zero-capacity crossbeam channel has no buffer, so a send completes
+        // only when a receiver takes it. Workers poll with try_recv and are
+        // woken after a send completes, so an idle worker would not take a
+        // held connection.
         if self.accept_queue_capacity == 0 {
             return Err(crate::error::Error::RingSetup(
                 "accept_queue_capacity must be > 0".into(),

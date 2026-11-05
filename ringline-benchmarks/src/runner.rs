@@ -43,7 +43,7 @@ pub fn start_tcp_echo_server(
             let socket = tokio::net::TcpSocket::new_v4().expect("failed to create socket");
             socket.set_reuseaddr(true).expect("failed to set reuseaddr");
             socket.bind(addr).expect("failed to bind");
-            let listener = socket.listen(1024).expect("failed to listen");
+            let listener = socket.listen(65535).expect("failed to listen");
 
             loop {
                 if stop.load(Ordering::Relaxed) {

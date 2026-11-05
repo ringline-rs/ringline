@@ -98,8 +98,8 @@ pub mod conn {
     /// The acceptor thread found every live worker's accept queue full
     /// (`ConfigBuilder::accept_queue_capacity`) and held a connection until
     /// one had room. Counted when the wait starts and once per 100 ms of it, so
-    /// a steady rate means the workers are not taking connections. While it
-    /// waits, connections stay in the kernel's listen queue.
+    /// a wait that does not end counts 10 per second. While it waits,
+    /// connections stay in the kernel's listen queue.
     pub const ACCEPT_QUEUE_FULL: usize = 7;
 }
 
