@@ -7158,7 +7158,7 @@ impl AsyncEventHandler for RespondAfterEofCountingTicks {
             }
         }
     }
-    fn on_tick(&mut self, _ctx: &mut ringline::DriverCtx<'_>) {
+    fn on_tick(&mut self) {
         DRAIN_TICKS.fetch_add(1, Ordering::Relaxed);
     }
     fn create_for_worker(_id: usize) -> Self {

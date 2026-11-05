@@ -1530,9 +1530,9 @@ impl ConnCtx {
 #[cfg(has_io_uring)]
 /// Builder for scatter-gather sends in the async API.
 ///
-/// Wraps `DriverCtx::send_parts()` — call `.copy()` and `.guard()` to add
-/// parts, then `.submit()`. This is a synchronous builder; the send is
-/// fire-and-forget (no future).
+/// From [`SendHalf::send_parts`]. [`build`](Self::build) takes a closure that
+/// chains `.copy()` and `.guard()` and ends with `.submit()`. This is a synchronous
+/// builder; the send is fire-and-forget (no future).
 pub struct AsyncSendBuilder {
     token: ConnToken,
 }
@@ -1540,7 +1540,7 @@ pub struct AsyncSendBuilder {
 #[cfg(has_io_uring)]
 impl AsyncSendBuilder {
     /// Build and submit the send by calling the provided closure with a
-    /// `SendBuilder` from the `DriverCtx`.
+    /// `SendBuilder`.
     ///
     /// The closure receives the `SendBuilder` and should chain `.copy()` / `.guard()`
     /// calls then call `.submit()`.
@@ -3622,7 +3622,7 @@ enum BackpressuredState {
 ///   closed while waiting or in flight.
 /// - [`NotConnected`](io::ErrorKind::NotConnected) — on io_uring, the
 ///   connection is TLS and its close_notify is already queued (`close()`, a
-///   handler return or `DriverCtx::close`); or the connection's close was
+///   handler return or a fatal encrypt error); or the connection's close was
 ///   *committed* while this send waited for capacity. A waiter in the admission
 ///   FIFO is neither in flight nor in the per-connection send queue, so it does
 ///   not hold off `try_finalize_close`; if the close is finalized while it
@@ -4802,6 +4802,33 @@ pub fn open_direct_io_file_with(
     with_state(|driver, _| {
         let mut ctx = driver.make_ctx();
         ctx.open_direct_io_file_with(path, options)
+    })
+}
+
+/// Close a Direct I/O file and release its slot.
+///
+/// The handle is invalid at once. On mio the fd closes once the operations
+/// already queued on it have finished.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor.
+pub fn close_direct_io_file(file: crate::direct_io::DirectIoFile) -> io::Result<()> {
+    with_state(|driver, _| {
+        let mut ctx = driver.make_ctx();
+        ctx.close_direct_io_file(file)
+    })
+}
+
+/// Close an NVMe device and release its slot. Returns `Unsupported` on mio.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor.
+pub fn close_nvme_device(device: crate::nvme::NvmeDevice) -> io::Result<()> {
+    with_state(|driver, _| {
+        let mut ctx = driver.make_ctx();
+        ctx.close_nvme_device(device)
     })
 }
 

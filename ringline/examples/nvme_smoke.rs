@@ -30,12 +30,12 @@ impl AsyncEventHandler for SmokeHandler {
         }
     }
 
-    fn on_tick(&mut self, ctx: &mut ringline::DriverCtx<'_>) {
+    fn on_tick(&mut self) {
         // Spawn the smoke task once, from inside the runtime.
         static SPAWNED: AtomicBool = AtomicBool::new(false);
         if SPAWNED.swap(true, Ordering::AcqRel) {
             if DONE.load(Ordering::Acquire) {
-                ctx.request_shutdown();
+                ringline::request_shutdown().unwrap();
             }
             return;
         }

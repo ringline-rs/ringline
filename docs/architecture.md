@@ -235,14 +235,14 @@ ciphertext chunks are serialized through the same connection queue: independent
 io_uring SQEs are not wire-ordered, so parallel TLS record submissions can
 interleave records.
 
-On a close the application requests (`Connection::close()`, a handler return,
-`DriverCtx::close`), the runtime queues `close_notify` behind the
+On a close the application requests (`Connection::close()` or a handler return),
+the runtime queues `close_notify` behind the
 connection's queued sends and closes the socket once they drain. On io_uring,
 a close the runtime makes after a receive error, a reset, a send that could
 not be pushed, or after the peer closed sends no alert, a TLS send after the
-alert is refused, and `close_notify_timeout_ms` bounds the drain only for
-`DriverCtx::close`. On mio every TLS close attempts to write the alert once,
-without blocking, after the queued sends drain, and the timeout is not used.
+alert is refused, and a fixed 5 s bound applies to the drain only after a fatal
+encrypt error. On mio every TLS close attempts to write the alert once, without
+blocking, after the queued sends drain.
 `Connection::eof_truncated` distinguishes a TCP FIN without peer `close_notify`
 from a clean TLS EOF.
 

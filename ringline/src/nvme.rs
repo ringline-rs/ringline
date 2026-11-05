@@ -181,7 +181,7 @@ impl NvmeUringCmd {
 
 /// Opaque handle to an opened NVMe device.
 ///
-/// Returned by [`crate::DriverCtx::open_nvme_device`] and used to identify the
+/// Returned by [`crate::open_nvme_device`] and used to identify the
 /// device in subsequent read/write/close calls. The handle includes a
 /// generation counter for stale-handle detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

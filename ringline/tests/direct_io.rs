@@ -107,7 +107,7 @@ impl AsyncEventHandler for RoundtripTickHandler {
         async {}
     }
 
-    fn on_tick(&mut self, ctx: &mut ringline::DriverCtx) {
+    fn on_tick(&mut self) {
         static STARTED: AtomicBool = AtomicBool::new(false);
         if STARTED.swap(true, Ordering::AcqRel) {
             return;
@@ -119,24 +119,24 @@ impl AsyncEventHandler for RoundtripTickHandler {
         if let Err(e) = std::fs::write(&path, [0u8; 4096]) {
             let _ = ROUNDTRIP_ERR.set(format!("file create failed: {e}"));
             ROUNDTRIP_DONE.store(true, Ordering::Release);
-            ctx.request_shutdown();
+            ringline::request_shutdown().unwrap();
             return;
         }
 
         let path_str = path.to_str().unwrap();
-        match ctx.open_direct_io_file(path_str) {
+        match ringline::open_direct_io_file(path_str) {
             Ok(_file) => {
                 // File opened successfully - the full roundtrip test
                 // would need completion callbacks which aren't available
                 // in the async on_tick. Mark as done.
                 ROUNDTRIP_OK.store(true, Ordering::Release);
                 ROUNDTRIP_DONE.store(true, Ordering::Release);
-                ctx.request_shutdown();
+                ringline::request_shutdown().unwrap();
             }
             Err(e) => {
                 let _ = ROUNDTRIP_ERR.set(format!("open failed: {e}"));
                 ROUNDTRIP_DONE.store(true, Ordering::Release);
-                ctx.request_shutdown();
+                ringline::request_shutdown().unwrap();
             }
         }
     }
@@ -197,7 +197,7 @@ impl AsyncEventHandler for MultiFileTickHandler {
         async {}
     }
 
-    fn on_tick(&mut self, ctx: &mut ringline::DriverCtx) {
+    fn on_tick(&mut self) {
         static STARTED: AtomicBool = AtomicBool::new(false);
         if STARTED.swap(true, Ordering::AcqRel) {
             return;
@@ -209,7 +209,7 @@ impl AsyncEventHandler for MultiFileTickHandler {
             if let Err(e) = std::fs::write(&path, [0u8; 4096]) {
                 let _ = MULTI_FILE_ERR.set(format!("file create failed: {e}"));
                 MULTI_FILE_DONE.store(true, Ordering::Release);
-                ctx.request_shutdown();
+                ringline::request_shutdown().unwrap();
                 return;
             }
             paths.push(path);
@@ -219,12 +219,12 @@ impl AsyncEventHandler for MultiFileTickHandler {
         let mut files = Vec::new();
         for path in &paths {
             let path_str = path.to_str().unwrap();
-            match ctx.open_direct_io_file(path_str) {
+            match ringline::open_direct_io_file(path_str) {
                 Ok(file) => files.push(file),
                 Err(e) => {
                     let _ = MULTI_FILE_ERR.set(format!("open failed: {e}"));
                     MULTI_FILE_DONE.store(true, Ordering::Release);
-                    ctx.request_shutdown();
+                    ringline::request_shutdown().unwrap();
                     return;
                 }
             }
@@ -232,12 +232,12 @@ impl AsyncEventHandler for MultiFileTickHandler {
 
         // Close all files.
         for file in &files {
-            let _ = ctx.close_direct_io_file(*file);
+            let _ = ringline::close_direct_io_file(*file);
         }
 
         MULTI_FILE_OK.store(true, Ordering::Release);
         MULTI_FILE_DONE.store(true, Ordering::Release);
-        ctx.request_shutdown();
+        ringline::request_shutdown().unwrap();
     }
 
     fn create_for_worker(_id: usize) -> Self {

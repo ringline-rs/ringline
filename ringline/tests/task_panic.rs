@@ -535,7 +535,7 @@ impl AsyncEventHandler for TickPanics {
         async {}
     }
 
-    fn on_tick(&mut self, _ctx: &mut ringline::DriverCtx<'_>) {
+    fn on_tick(&mut self) {
         if TICKS.fetch_add(1, Ordering::SeqCst) == 3 {
             panic!("boom in on_tick");
         }

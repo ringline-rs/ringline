@@ -37,10 +37,6 @@ pub enum ReadHalf {
     /// A socket read failed. The exact error, if a task wants it, is in
     /// `Executor::recv_errors` (generation-tagged; see `with_data_result`).
     Error,
-    /// The application cancelled the pending receive (`DriverCtx::cancel`;
-    /// io_uring only — mio's `cancel` is `Unsupported`).
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
-    Cancelled,
 }
 
 /// Where the connection is in its life.
@@ -594,12 +590,10 @@ mod tests {
             "a requested close finishes the read half"
         );
 
-        for read in [ReadHalf::Error, ReadHalf::Cancelled] {
-            let mut cs = ConnectionState::new();
-            cs.activate();
-            cs.read = read;
-            assert!(cs.recv_finished(), "{read:?} finishes the read half");
-        }
+        let mut cs = ConnectionState::new();
+        cs.activate();
+        cs.read = ReadHalf::Error;
+        assert!(cs.recv_finished(), "a read error finishes the read half");
     }
 
     #[test]

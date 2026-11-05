@@ -24,7 +24,7 @@
 //! - otherwise, when the kernel cannot finish them without blocking: other
 //!   opens, reads and writes.
 //!
-//! [`DriverCtx::direct_io_fsync`](crate::DriverCtx::direct_io_fsync) always
+//! [`direct_io_fsync`](crate::direct_io_fsync) always
 //! uses the pool too. Direct I/O reads and writes use it always on overlayfs
 //! and tmpfs, and elsewhere when they would block.
 //!
@@ -68,9 +68,8 @@
 //!   is idle.
 //!
 //! On every kernel, `shutdown_write` (on
-//! [`Connection`](crate::Connection::shutdown_write),
-//! [`SendHalf`](crate::SendHalf::shutdown_write) or
-//! [`DriverCtx`](crate::DriverCtx::shutdown_write)) sends a `shutdown` that
+//! [`Connection`](crate::Connection::shutdown_write) or
+//! [`SendHalf`](crate::SendHalf::shutdown_write)) sends a `shutdown` that
 //! runs on the pool. A close issued before that `shutdown` finishes waits for
 //! it.
 //!

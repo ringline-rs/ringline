@@ -975,9 +975,9 @@ impl AsyncEventHandler for TlsBigReplyThenReturn {
     }
 }
 
-/// A graceful close whose queued reply takes longer than
-/// `close_notify_timeout_ms` to drain delivers the whole reply and then the
-/// close_notify: the graceful close arms no deadline.
+/// A graceful close of a slow reader delivers the whole reply and then the
+/// close_notify. `graceful_close_arms_no_close_notify_deadline` checks that no
+/// deadline bounds the drain.
 #[cfg(has_io_uring)]
 #[test]
 fn a_slow_reader_gets_the_whole_reply_before_close_notify() {
@@ -987,7 +987,6 @@ fn a_slow_reader_gets_the_whole_reply_before_close_notify() {
     let config = test_config_builder()
         .tls(ringline_server_tls(certs.clone(), key))
         .send_pool(1024, 16448)
-        .close_notify_timeout_ms(300)
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
@@ -1021,8 +1020,7 @@ fn a_slow_reader_gets_the_whole_reply_before_close_notify() {
     }
 
     // Sleep 5 ms after each `read_tls` (rustls reads at most a few KiB per
-    // call): the drain takes about 3.5 s, well over the 300 ms
-    // `close_notify_timeout_ms`.
+    // call): the drain takes about 3.5 s.
     let started = Instant::now();
     let mut received = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
@@ -1439,153 +1437,6 @@ fn a_tls_send_chain_is_encrypted() {
     expected.extend_from_slice(b"--chain-b");
     assert_eq!(plaintext, expected);
     assert!(peer_closed, "no close_notify after the chain");
-}
-
-// ── Test 6: Server-initiated clean TLS close from on_tick (io_uring) ─────
-
-/// Where `on_accept` parks the connection's `ConnToken` for `on_tick` to close.
-#[cfg(has_io_uring)]
-static TLS_TICK_CLOSE_TOKEN: Mutex<Option<ringline::ConnToken>> = Mutex::new(None);
-
-/// Echo one message, then hand the token to `on_tick`, which closes the
-/// connection through `DriverCtx::close`.
-///
-/// The task deliberately does not call `Connection::close()`. That is a
-/// different path (`Driver::close_connection_graceful`), covered by
-/// `tls_server_close_sends_close_notify`.
-#[cfg(has_io_uring)]
-struct TlsTickCloseHandler;
-
-#[cfg(has_io_uring)]
-impl AsyncEventHandler for TlsTickCloseHandler {
-    #[allow(clippy::manual_async_fn)]
-    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
-        async move {
-            let (mut tx, mut rx) = conn.split();
-            // Echo once so the connection reaches full TLS traffic state —
-            // `WriteTraffic::queue_close_notify` is only reachable there, and a
-            // handshaking connection would have no alert to produce.
-            rx.with_data(|data| {
-                let _ = tx.send_nowait(data);
-                ParseResult::Consumed(data.len())
-            })
-            .await;
-            *TLS_TICK_CLOSE_TOKEN.lock().unwrap() = Some(tx.token());
-            // Park until the connection goes away rather than returning, which
-            // would close it from the task side and race the tick-driven close
-            // under test.
-            loop {
-                if rx.with_data(|d| ParseResult::Consumed(d.len())).await == 0 {
-                    break;
-                }
-            }
-        }
-    }
-
-    fn on_tick(&mut self, ctx: &mut ringline::DriverCtx<'_>) {
-        if let Some(token) = TLS_TICK_CLOSE_TOKEN.lock().unwrap().take() {
-            ctx.close(token);
-        }
-    }
-
-    fn create_for_worker(_id: usize) -> Self {
-        TlsTickCloseHandler
-    }
-}
-
-/// A ringline TLS server closing a connection from `on_tick` must emit a
-/// close_notify alert before the FIN, so the peer can tell a clean shutdown
-/// from a truncation attack. Both engines owe this and produce the alert
-/// differently (the buffered engine queues it with `send_close_notify`, the
-/// unbuffered one encrypts it through `WriteTraffic::queue_close_notify`), so
-/// this is the guard on `TlsTable::send_close_notify_queued` dispatching by
-/// engine at all — it must pass in the default build and under
-/// `--features tls-buffered`.
-///
-/// **io_uring only, and `DriverCtx::close` specifically.** That is the
-/// handler-facing close reachable from `on_tick`/`on_notify` against any live
-/// connection. `Connection::close()` and a handler return are covered by
-/// `tls_server_close_sends_close_notify` and
-/// `tls_handler_return_sends_close_notify`, on both backends.
-///
-/// The assertion is `peer_has_closed()`, not "the read returned 0": a server
-/// that sends only a FIN also ends the client's reads, and rustls reports that
-/// as `UnexpectedEof` instead.
-#[cfg(has_io_uring)]
-#[test]
-fn tls_tick_close_sends_close_notify() {
-    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
-    *TLS_TICK_CLOSE_TOKEN.lock().unwrap() = None;
-
-    let (certs, key) = generate_self_signed();
-    let server_config = ringline_server_tls(certs.clone(), key);
-
-    let config = test_config_builder()
-        .tls(server_config)
-        .build()
-        .expect("valid config");
-    let (shutdown, handles) = RinglineBuilder::new(config)
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<TlsTickCloseHandler>()
-        .expect("launch failed");
-    let addr = shutdown.bound_addr().expect("bound address").to_string();
-
-    wait_for_server(&addr);
-
-    let client_config = client_tls_config(&certs);
-    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
-    let mut tls_conn = rustls::ClientConnection::new(client_config, server_name).unwrap();
-    let mut tcp = TcpStream::connect(&addr).unwrap();
-    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-
-    {
-        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
-        let msg = b"close me";
-        stream.write_all(msg).unwrap();
-        stream.flush().unwrap();
-        let mut buf = [0u8; 8];
-        stream.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, msg, "echo mismatch before close");
-    }
-
-    // Drain the rest of the connection by hand: `rustls::Stream` maps both a
-    // clean close and a truncation to a read of 0, which is exactly the
-    // distinction under test.
-    //
-    // Check before reading as well as after. The alert can arrive in the same
-    // TCP segment as the echo, in which case `Stream::read_exact` above already
-    // fed it to the deframer and there is nothing left on the socket — a loop
-    // that only inspected the state after a fresh read would see the FIN and
-    // wrongly report a truncation (this raced roughly one run in three on the
-    // mio sibling).
-    let mut peer_closed = tls_conn
-        .process_new_packets()
-        .expect("server sent a malformed record")
-        .peer_has_closed();
-    while !peer_closed {
-        match tls_conn.read_tls(&mut tcp) {
-            Ok(0) => break, // FIN
-            Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => panic!("read_tls failed: {e}"),
-        }
-        peer_closed = tls_conn
-            .process_new_packets()
-            .expect("server sent a malformed record after echoing")
-            .peer_has_closed();
-    }
-
-    assert!(
-        peer_closed,
-        "server closed from on_tick without close_notify — the peer cannot \
-         distinguish a clean shutdown from a truncated stream"
-    );
-
-    shutdown.shutdown();
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
 }
 
 // ── TLS source for forward_to_conn ──────────────────────────────────────

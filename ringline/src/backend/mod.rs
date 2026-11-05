@@ -21,7 +21,6 @@ pub(crate) mod uring;
 #[cfg(has_io_uring)]
 pub(crate) use uring::driver::Driver;
 #[cfg(has_io_uring)]
-pub(crate) use uring::driver::UdpSocketState;
 #[cfg(has_io_uring)]
 pub(crate) use uring::event_loop::AsyncEventLoop;
 #[cfg(has_io_uring)]

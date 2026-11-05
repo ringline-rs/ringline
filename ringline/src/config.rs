@@ -346,13 +346,6 @@ pub struct Config {
     /// 0 = disabled (filesystem/direct I/O operations return `Unsupported`).
     /// Default: 2.
     pub(crate) disk_io_threads: usize,
-    /// How long, in milliseconds, a TLS close requested through
-    /// `DriverCtx::close` waits for its queued sends and close_notify to drain
-    /// before the connection is closed without them. `Connection::close()` and a
-    /// handler return are not bounded: their queued sends drain until the peer
-    /// reads them or the connection fails. Not used on the mio backend.
-    /// Default: 5000.
-    pub(crate) close_notify_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -425,7 +418,6 @@ impl Default for Config {
             spawner_threads: 1,
             blocking_threads: 4,
             disk_io_threads: 2,
-            close_notify_timeout_ms: 5000,
         }
     }
 }
@@ -624,11 +616,6 @@ impl Config {
                         .into(),
                 ));
             }
-        }
-        if self.close_notify_timeout_ms == 0 || self.close_notify_timeout_ms > 60000 {
-            return Err(crate::error::Error::RingSetup(
-                "close_notify_timeout_ms must be > 0 and <= 60000".into(),
-            ));
         }
         Ok(())
     }
@@ -1135,17 +1122,6 @@ impl ConfigBuilder {
     /// Set the number of disk I/O threads (mio backend only). 0 = disabled.
     pub fn disk_io_threads(mut self, threads: usize) -> Self {
         self.config.disk_io_threads = threads;
-        self
-    }
-
-    /// How long, in milliseconds, a TLS close requested through
-    /// `DriverCtx::close` waits for its queued sends and close_notify to drain
-    /// before the connection is closed without them. `Connection::close()` and a
-    /// handler return are not bounded: their queued sends drain until the peer
-    /// reads them or the connection fails. Not used on the mio backend.
-    /// Default: 5000.
-    pub fn close_notify_timeout_ms(mut self, ms: u64) -> Self {
-        self.config.close_notify_timeout_ms = ms;
         self
     }
 

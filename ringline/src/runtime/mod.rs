@@ -9,7 +9,7 @@
 //!   - `task` — `TaskSlab`, `TaskSlot` (slab of per-connection futures)
 //!   - `waker` — `conn_waker()`, thread-local `READY_QUEUE`, cross-thread wake inboxes
 //!   - `mod.rs` — `Executor`, `IoResult` (waiter flags, ready queue, result storage)
-//!   - `handler` — `AsyncEventHandler` trait (references `DriverCtx` by borrowed ref only)
+//!   - `handler` — `AsyncEventHandler` trait
 //!
 //! - **Backend-specific** (tied to the concrete `Driver` type):
 //!   - `io` — `Connection`, futures (`WithDataFuture`, `SendFuture`, `ConnectFuture`)

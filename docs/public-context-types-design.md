@@ -1,7 +1,7 @@
 # Removing the public context types
 
 **Status:** approved, 2026-11-04, including both [owner decisions](#owner-decisions).
-Series for 0.7.0. Step 1 landed in #737. Follows
+Series for 0.7.0. Steps 1 and 2 landed in #737 and #738. Follows
 `docs/connection-handle-ownership-design.md`, which moved reading and writing
 onto `RecvHalf` and `SendHalf` and left `ConnCtx` as a `Copy` token.
 
@@ -150,8 +150,8 @@ from `&mut Driver` while `spawn` makes a second `&mut Driver` through
 | `max_chain_length` | the value passed to `ConfigBuilder::max_chain_length` |
 | `send_to` | removed, with `UdpToken`; no public API returns a `UdpToken`, so nothing outside the crate can call it |
 
-`SendBuilder` is reachable only from `DriverCtx::send_parts`, so it becomes
-`pub(crate)`. `SendChainBuilder` and `ChainPartsBuilder` stay public, through
+`SendBuilder` stays public, because `AsyncSendBuilder::build` passes it to the
+caller's closure. `SendChainBuilder` and `ChainPartsBuilder` stay public, through
 `send_chain`.
 
 A disk method on `DriverCtx` returns a `u32` key, and `DiskIoFuture::new` is
@@ -197,11 +197,13 @@ In this repository the uses are `request_shutdown`, `open_direct_io_file` and
 `close_direct_io_file`, plus two tests that exist to exercise a `DriverCtx` path:
 
 - `tls_tick_close_sends_close_notify` closes by token. `DriverCtx::close` stays
-  in use for the fatal encrypt closes in `handler.rs`, so this becomes a unit test
-  in `uring/event_loop.rs`. `tls_server_close_sends_close_notify` and
+  in use for the fatal encrypt closes in `handler.rs`, so its deadline becomes a unit
+  test in `uring/event_loop.rs`. `tls_server_close_sends_close_notify` and
   `tls_handler_return_sends_close_notify` cover the public close paths.
 - `disk_io_stale_results.rs` (`RawThenFuture`) submits a read whose key nothing
-  holds. It moves to a unit test against `Driver`.
+  holds. It goes: the disk methods on `DriverCtx` have no other caller than the
+  free functions, which hold the key, and the same file covers keys left by
+  dropped futures.
 
 ## `ConnToken` becomes `ConnId`
 
@@ -336,8 +338,7 @@ Each step is one PR, and all are breaking.
    docs move to the public types.
 2. Read futures borrow their half, and `RecvReadyFuture` becomes `!Send`.
 3. `DriverCtx` becomes `pub(crate)`, the callbacks lose `ctx`,
-   `close_direct_io_file` and `close_nvme_device` gain free forms, `SendBuilder`
-   becomes `pub(crate)`, `UdpToken` goes, and
+   `close_direct_io_file` and `close_nvme_device` gain free forms, `UdpToken` goes, and
    `ConfigBuilder::close_notify_timeout_ms` is removed.
 4. `ConnToken` becomes `ConnId`.
 5. `UdpCtx` becomes `UdpSocket`.

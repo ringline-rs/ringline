@@ -30,18 +30,18 @@ pub enum DirectIoOp {
 }
 
 /// Options for opening a direct I/O file, passed to
-/// [`crate::DriverCtx::open_direct_io_file_with`] and
+/// [`crate::open_direct_io_file_with`] and
 /// [`crate::open_direct_io_file_with`].
 ///
 /// The default opens the file as
-/// [`crate::DriverCtx::open_direct_io_file`] does.
+/// [`crate::open_direct_io_file`] does.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectIoOpenOptions {
     dsync: bool,
 }
 
 impl DirectIoOpenOptions {
-    /// Options that open the file as [`crate::DriverCtx::open_direct_io_file`]
+    /// Options that open the file as [`crate::open_direct_io_file`]
     /// does.
     pub fn new() -> Self {
         Self::default()
@@ -74,7 +74,7 @@ impl DirectIoOpenOptions {
 
 /// Opaque handle to an opened direct I/O file.
 ///
-/// Returned by [`crate::DriverCtx::open_direct_io_file`] and used to identify the
+/// Returned by [`crate::open_direct_io_file`] and used to identify the
 /// file in subsequent read/write/fsync/close calls. The handle includes a
 /// generation counter for stale-handle detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

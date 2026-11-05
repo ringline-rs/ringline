@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::handler::DriverCtx;
 use crate::runtime::io::{Connection, UdpCtx};
 
 /// Trait for async connection handlers.
@@ -90,8 +89,13 @@ pub trait AsyncEventHandler: Send + 'static {
         Box::pin(self.on_accept(conn))
     }
 
-    /// Periodic tick (synchronous). Called on each io_uring completion cycle.
-    fn on_tick(&mut self, _ctx: &mut DriverCtx<'_>) {}
+    /// Periodic tick (synchronous). Called on each event loop iteration.
+    ///
+    /// Runs on the worker, so the free functions such as
+    /// [`spawn`](crate::spawn) and [`request_shutdown`](crate::request_shutdown)
+    /// work here. It does not run in a task, so a future made here has to go to
+    /// [`spawn`](crate::spawn) to be polled.
+    fn on_tick(&mut self) {}
 
     /// Handle a bound UDP socket. Called once per UDP socket during startup.
     ///
@@ -105,8 +109,8 @@ pub trait AsyncEventHandler: Send + 'static {
     /// Called after the worker's wake fd fires on io_uring (a
     /// [`WakeHandle::wake`](crate::WakeHandle::wake), a service-pool response,
     /// or a runtime `Waker` woken on another thread); on mio, every loop
-    /// iteration. Synchronous.
-    fn on_notify(&mut self, _ctx: &mut DriverCtx<'_>) {}
+    /// iteration. Synchronous, and has the same rules as [`Self::on_tick`].
+    fn on_notify(&mut self) {}
 
     /// Async entry point called once during worker startup.
     ///
