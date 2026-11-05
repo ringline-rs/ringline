@@ -3290,7 +3290,7 @@ impl<'a> DriverCtx<'a> {
         let f = files
             .get(file.index)
             .ok_or_else(|| io::Error::other("invalid direct I/O file handle"))?;
-        if f.closing || f.generation != file.generation {
+        if f.generation != file.generation {
             return Err(io::Error::other("stale direct I/O file handle"));
         }
         self.direct_io_fds[file.index as usize]

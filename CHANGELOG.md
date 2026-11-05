@@ -678,7 +678,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ringline::request_shutdown`, `open_direct_io_file`, `open_nvme_device` and
   `spawn`. A disk read, write or fsync goes in a spawned task, because
   `DriverCtx`'s versions returned a key that nothing could consume. Token-based
-  sends, closes and queries from `on_tick` have no replacement: the task that
+  sends, closes, cancels and queries from `on_tick` have no replacement: the task that
   holds the `Connection` does them, and other code reaches it through `mpsc` or
   a `CancellationToken`. Design: `docs/public-context-types-design.md`.
 - **Breaking:** `UdpToken`, which no public API returned.

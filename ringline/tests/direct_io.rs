@@ -422,11 +422,12 @@ async fn write_close_open(first: &str, second: &str) -> Result<(), String> {
     let a = ringline::open_direct_io_file(first).map_err(|e| e.to_string())?;
     let write = unsafe { ringline::direct_io_write(a, 0, block.as_ptr(), 4096) }
         .map_err(|e| e.to_string())?;
-    ringline::close_direct_io_file(a).map_err(|e| e.to_string())?;
+    let closed = ringline::close_direct_io_file(a).map_err(|e| e.to_string());
     let stale = ringline::close_direct_io_file(a).is_err();
     let b = ringline::open_direct_io_file(second).map_err(|e| e.to_string());
     // Awaited before any return, so `buf` outlives the write.
     let written = write.await.map_err(|e| e.to_string())?;
+    closed?;
     ringline::close_direct_io_file(b?).map_err(|e| e.to_string())?;
     if !stale {
         return Err("a second close of the handle succeeded".to_string());
@@ -438,7 +439,7 @@ async fn write_close_open(first: &str, second: &str) -> Result<(), String> {
 }
 
 /// Every deferred close releases its slot: with more rounds than slots, an open
-/// fails once a slot leaks, whether the last operation succeeded or failed.
+/// fails once a slot leaks.
 async fn deferred_closes_release_their_slots(path: &str) -> Result<(), String> {
     let mut buf = vec![0u8; 8192];
     let block = aligned_block(&mut buf);
@@ -452,8 +453,10 @@ async fn deferred_closes_release_their_slots(path: &str) -> Result<(), String> {
             _ => ringline::direct_io_fsync(file),
         }
         .map_err(|e| format!("round {round}: submit: {e}"))?;
-        ringline::close_direct_io_file(file).map_err(|e| format!("round {round}: close: {e}"))?;
+        let closed = ringline::close_direct_io_file(file);
+        // Awaited before any return, so `buf` outlives the operation.
         op.await.map_err(|e| format!("round {round}: op: {e}"))?;
+        closed.map_err(|e| format!("round {round}: close: {e}"))?;
     }
     Ok(())
 }
@@ -529,7 +532,7 @@ fn nvme_close_path() -> PathBuf {
 }
 
 /// With a flush in flight the handle goes stale at once, and the completion
-/// releases the slot: an open fails within `max_devices(2)` rounds otherwise. A
+/// releases the slot: with `max_devices(2)`, the third open fails otherwise. A
 /// regular file stands in for a device: opening registers the fd, and the flush
 /// completes with an error, which is all this needs.
 #[cfg(has_io_uring)]
