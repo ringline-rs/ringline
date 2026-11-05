@@ -14,7 +14,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, Config, ConfigBuilder, Connection, RinglineBuilder};
+use ringline::{
+    AsyncEventHandler, Config, ConfigBuilder, Connection, ParseResult, RinglineBuilder,
+};
 
 /// Tests share the statics below, so they run one at a time under `cargo test`.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -64,7 +66,7 @@ fn expect_eof(stream: &mut TcpStream) {
 
 // ── An outbound connection ──────────────────────────────────────────
 
-/// Connects, holds the connection for `hold`, and drops it.
+/// Connects, holds the connection briefly, and drops it.
 struct DropsOutbound;
 
 impl AsyncEventHandler for DropsOutbound {
@@ -76,8 +78,8 @@ impl AsyncEventHandler for DropsOutbound {
             let conn = ringline::connect(peer_addr()).await.expect("connect");
             ringline::sleep(Duration::from_millis(50)).await;
             drop(conn);
-            ringline::sleep(Duration::from_millis(50)).await;
-            ringline::request_shutdown().ok();
+            // Shutdown closes every connection, so it must not come first.
+            ringline::sleep(Duration::from_secs(60)).await;
         }))
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -94,6 +96,7 @@ fn dropping_an_outbound_connection_closes_it() {
         .expect("launch");
     let (mut peer, _) = listener.accept().unwrap();
     expect_eof(&mut peer);
+    runtime.shutdown();
     common::join_workers(&runtime, handles);
 }
 
@@ -108,6 +111,7 @@ fn dropping_an_outbound_connection_with_unread_bytes_closes_it() {
     let (mut peer, _) = listener.accept().unwrap();
     peer.write_all(&[7u8; 100]).unwrap();
     expect_eof(&mut peer);
+    runtime.shutdown();
     common::join_workers(&runtime, handles);
 }
 
@@ -127,8 +131,7 @@ impl AsyncEventHandler for DropsHalves {
             ringline::sleep(Duration::from_millis(200)).await;
             LAST_HALF_DROPPED.store(true, Ordering::SeqCst);
             drop(rx);
-            ringline::sleep(Duration::from_millis(50)).await;
-            ringline::request_shutdown().ok();
+            ringline::sleep(Duration::from_secs(60)).await;
         }))
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -150,6 +153,7 @@ fn the_connection_stays_open_until_the_last_half_drops() {
         LAST_HALF_DROPPED.load(Ordering::SeqCst),
         "the connection closed with a half still alive"
     );
+    runtime.shutdown();
     common::join_workers(&runtime, handles);
 }
 
@@ -217,6 +221,131 @@ fn a_task_dropped_at_teardown_closes_the_connections_it_held() {
     drop(client);
     expect_eof(&mut backend);
     assert!(started.elapsed() < Duration::from_secs(5));
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
+
+// ── Queued sends ────────────────────────────────────────────────────
+
+/// Fewer than the 16 send-pool slots in `config`.
+const QUEUED_SENDS: usize = 12;
+
+struct DropsWithSendsQueued;
+
+impl AsyncEventHandler for DropsWithSendsQueued {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let mut conn = ringline::connect(peer_addr()).await.expect("connect");
+            for i in 0..QUEUED_SENDS {
+                conn.send_nowait(&[i as u8; 4096]).expect("send");
+            }
+            drop(conn);
+            ringline::sleep(Duration::from_secs(60)).await;
+        }))
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        DropsWithSendsQueued
+    }
+}
+
+#[test]
+fn sends_queued_before_the_drop_arrive_ahead_of_the_close() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = listen();
+    let (runtime, handles) = RinglineBuilder::new(config())
+        .launch::<DropsWithSendsQueued>()
+        .expect("launch");
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut received = Vec::new();
+    peer.read_to_end(&mut received)
+        .expect("EOF after the sends");
+    assert_eq!(received.len(), QUEUED_SENDS * 4096);
+    for (i, block) in received.chunks(4096).enumerate() {
+        assert!(
+            block.iter().all(|&b| b == i as u8),
+            "block {i} out of order"
+        );
+    }
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
+
+// ── A half dropped inside another connection's read ─────────────────
+
+struct DropsBackendInRead;
+
+impl AsyncEventHandler for DropsBackendInRead {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let mut backend = Some(ringline::connect(peer_addr()).await.expect("connect"));
+            conn.with_data(|data| {
+                backend.take();
+                ParseResult::Consumed(data.len())
+            })
+            .await;
+            ringline::sleep(Duration::from_secs(60)).await;
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        DropsBackendInRead
+    }
+}
+
+#[test]
+fn a_connection_dropped_inside_a_read_closure_closes() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = listen();
+    let (runtime, handles) = RinglineBuilder::new(config())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<DropsBackendInRead>()
+        .expect("launch");
+    let addr = runtime.bound_addr().expect("bound address");
+    let mut client = TcpStream::connect(addr).unwrap();
+    let (mut backend, _) = listener.accept().unwrap();
+    client.write_all(b"x").unwrap();
+    expect_eof(&mut backend);
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
+
+// ── A cancelled task ────────────────────────────────────────────────
+
+struct CancelsHolder;
+
+impl AsyncEventHandler for CancelsHolder {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let holder = ringline::spawn(async {
+                let _conn = ringline::connect(peer_addr()).await.expect("connect");
+                ringline::sleep(Duration::from_secs(60)).await;
+            })
+            .expect("spawn");
+            ringline::sleep(Duration::from_millis(50)).await;
+            holder.cancel();
+            ringline::sleep(Duration::from_secs(60)).await;
+        }))
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        CancelsHolder
+    }
+}
+
+#[test]
+fn cancelling_the_task_that_holds_a_connection_closes_it() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = listen();
+    let (runtime, handles) = RinglineBuilder::new(config())
+        .launch::<CancelsHolder>()
+        .expect("launch");
+    let (mut peer, _) = listener.accept().unwrap();
+    expect_eof(&mut peer);
     runtime.shutdown();
     common::join_workers(&runtime, handles);
 }

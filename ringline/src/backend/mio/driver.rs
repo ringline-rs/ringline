@@ -672,9 +672,9 @@ impl Driver {
         self.send_queues[idx].in_flight = false;
         self.send_queues[idx].close_pending = false;
 
-        // A future dropped during teardown may have owned a `RecvHalf` whose
-        // `Drop` could not run (no driver in scope). Clear the flags before the
-        // slot is reused, or its next occupant inherits them.
+        // The future dropped at teardown may have owned a half, whose `Drop`
+        // queues an orphan that finds a changed generation. Clear the flags
+        // before the slot is reused, or its next occupant inherits them.
         self.clear_conn_claims(conn_index);
 
         if self.connections.get(conn_index).is_some() {

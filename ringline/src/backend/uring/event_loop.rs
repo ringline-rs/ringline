@@ -957,7 +957,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
-        self.executor.ready_queue.is_empty() && !shutting_down
+        self.executor.ready_queue.is_empty()
+            && self.driver.pending_finalize_closes.is_empty()
+            && !shutting_down
     }
 
     /// Completion of a direct receive (`OpTag::RecvDirect`).
@@ -3503,10 +3505,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Remove the async task (drops the future).
         self.executor.remove_connection(conn_index);
-        // The future just dropped may have owned a `RecvHalf` or a
-        // `SendHalf`, whose `Drop` is a no-op here (unguarded teardown).
-        // Clear their claims before the slot is reused, or the next occupant
-        // inherits them.
+        // The future just dropped may have owned a half, whose `Drop` queues
+        // an orphan that finds a changed generation. Clear the flags before
+        // the slot is reused, or the next occupant inherits them.
         self.driver.clear_conn_claims(conn_index);
         self.driver.accumulators.release(conn_index);
         self.driver.arrival[conn_index as usize].release();

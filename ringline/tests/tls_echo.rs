@@ -1497,16 +1497,18 @@ fn a_panicked_handler_sends_no_close_notify() {
     let mut tcp = TcpStream::connect(&addr).unwrap();
     tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-    let _ = tls_conn.complete_io(&mut tcp);
+    tls_conn.complete_io(&mut tcp).expect("handshake");
+    assert!(!tls_conn.is_handshaking());
 
     let mut peer_closed = false;
     loop {
         match tls_conn.read_tls(&mut tcp) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(_) => match tls_conn.process_new_packets() {
                 Ok(state) => peer_closed |= state.peer_has_closed(),
                 Err(e) => panic!("server sent a malformed record: {e}"),
             },
+            Err(e) => panic!("no EOF from the panicked handler's connection: {e}"),
         }
     }
     assert!(!peer_closed, "a panicked handler sent close_notify");

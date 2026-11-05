@@ -1,7 +1,7 @@
 # Removing the public context types
 
 **Status:** approved, 2026-11-04, including both [owner decisions](#owner-decisions).
-Series for 0.7.0. Steps 1 to 6 landed in #737, #738, #739, #740, #741 and #743. Follows
+Series for 0.7.0. Steps 1 to 5 landed in #737, #738, #739, #740 and #741. Follows
 `docs/connection-handle-ownership-design.md`, which moved reading and writing
 onto `RecvHalf` and `SendHalf` and left `ConnCtx` as a `Copy` token.
 
@@ -256,10 +256,10 @@ the borrows do not overlap there.
 
 Approved 2026-11-04.
 
-`Drop` for `SendHalf` and `RecvHalf` only clears the claim flag, so dropping an
-outbound `Connection`, or a client built on one, leaves the socket open and the
-slot occupied. An accepted connection is closed when its task ends. An outbound
-one is not. Removing `ConnCtx` and `DriverCtx` removes the only ways to close a
+`Drop` for `SendHalf` and `RecvHalf` only cleared the claim flag, so dropping an
+outbound `Connection`, or a client built on one, left the socket open and the
+slot occupied. An accepted connection was closed when its task ended. An outbound
+one was not. Removing `ConnCtx` and `DriverCtx` removes the only ways to close a
 dropped outbound connection. One downstream load generator keeps a `ConnCtx` in a
 guard to close the connection on every exit from its reconnect loop.
 
@@ -276,7 +276,7 @@ task ending closes the connection even if a half has moved to a spawned task.
   purpose.
 - A half can be dropped with `CURRENT_DRIVER` unset: at connection teardown, and
   in the synchronous body of `on_accept` or `on_adopt`, which run outside a task
-  poll. The drop then queues `Orphan::ConnHalf { index, generation, half }`
+  poll. The drop then queues `Orphan::ConnHalf { index, generation, half, abrupt }`
   through `defer_release`, as `ConnectFuture` does with `Orphan::Connect`. The
   drain clears that half's flag and closes if the other flag is also clear,
   through the function the driver-set path uses. Without the half in the entry,
@@ -300,12 +300,12 @@ task ending closes the connection even if a half has moved to a spawned task.
   has no park.
 
 A connection task that drops its `Connection` and keeps running ends when the
-Close completes, because `remove_connection` drops the task. Today it runs on.
+Close completes, because `remove_connection` drops the task. It used to run on.
 
 A handler that names its parameter `_conn` and returns a future with a real body
 drops the `Connection` when `on_accept` returns, because `async move` does not
-capture an unused parameter. Today that connection lives until the task ends.
-After the change it closes before the task's first poll. A scan of the tree found
+capture an unused parameter. That connection used to live until the task ended,
+and now closes before the task's first poll. A scan of the tree found
 seven handlers that depend on the old behaviour and need `let _conn = conn;`
 inside the block: five in `tests/teardown_drops.rs`, `Sleeps` in
 `tests/peer_fin.rs` and `ExitingWorker` in `tests/accept_queue_shutdown.rs`.
@@ -358,5 +358,6 @@ No step adds work per send or receive. Step 3 removes one `make_ctx` per loop
 iteration on io_uring and two on mio. Step 6 adds a flag check to each half drop, and
 two `Orphan` pushes to each teardown that drops a parked task, on both backends.
 These are per connection. A local loopback churn test (connect, one round trip,
-close, 6 interleaved runs of 20,000 connections) gave 15,593 connections/s on main
-and 15,524 with step 6, a 0.4% difference inside a run-to-run spread of about 10%.
+client close with the task parked, so teardown takes the orphan path; 8 interleaved
+runs of 20,000 connections) gave 16,522 connections/s on main and 16,512 with step
+6, a 0.06% difference inside a run-to-run spread of about 14%.

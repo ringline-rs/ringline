@@ -2384,8 +2384,8 @@ impl RecvHalf {
 ///
 /// Dropping the last half closes the connection, with the same graceful close as
 /// [`SendHalf::close`]. On a TLS connection the peer receives close_notify, unless
-/// the drop is an unwinding panic in an accepted connection's own task. Mio
-/// attempts the alert in that case too.
+/// the drop happens during unwinding, or the half is held by the top-level future
+/// of a panicked `on_accept` task. Mio attempts the alert in those cases too.
 ///
 /// Fan-in from several tasks to one connection is an explicit queue
 /// (`runtime::channel`) drained by the owning task, not a shared handle. See

@@ -1213,12 +1213,11 @@ impl Driver {
 
     /// Clear both half flags for a slot being recycled.
     ///
-    /// `RecvHalf::drop` and `SendHalf::drop` release their own claims, but
-    /// both go through `try_with_state`, which is a **no-op during unguarded
-    /// teardown** — `executor.remove_connection` drops a parked task's future
-    /// with `CURRENT_DRIVER` unset. A flag can therefore outlive its half,
-    /// and since the flags are indexed by slot rather than by generation, the
-    /// next occupant would inherit it.
+    /// `executor.remove_connection` drops a parked task's future with
+    /// `CURRENT_DRIVER` unset, so a half's `Drop` queues an orphan that finds a
+    /// changed generation and clears nothing. A flag can therefore outlive its
+    /// half, and since the flags are indexed by slot rather than by generation,
+    /// the next occupant would inherit it.
     ///
     /// Clearing here, at the recycle point, makes that impossible regardless of
     /// how the previous occupant died.
