@@ -375,10 +375,11 @@ impl Runtime {
     /// worker on which a task panicked.
     ///
     /// The listeners stop accepting at once on Linux, and within about 100 ms
-    /// elsewhere. A listener's sockets close, and its port is free, once the threads accepting on it have
-    /// exited: its acceptor thread, which exits at once, or within about 100
-    /// ms if it is holding a connection no worker has room for, or in merged
-    /// accept mode the workers. This `Runtime` does not hold them open.
+    /// elsewhere. A listener's sockets close, and its port is free, once the
+    /// threads accepting on it have exited: its acceptor thread, or in merged
+    /// accept mode the workers. An acceptor exits at once on Linux. On other
+    /// platforms, or holding a connection no worker has room for, it exits
+    /// within about 100 ms. This `Runtime` does not hold the sockets open.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
     }

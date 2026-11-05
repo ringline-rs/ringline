@@ -18,7 +18,7 @@ pub struct AcceptedConn {
 /// Configuration for one acceptor thread.
 pub struct AcceptorConfig {
     /// The listener's socket. The acceptor's hold keeps it open while the
-    /// acceptor runs. Shutdown wakes it from `accept4` with
+    /// acceptor runs. On Linux, shutdown wakes it from `accept4` with
     /// [`ListenerSockets::shut_down`](crate::listener_sockets::ListenerSockets::shut_down).
     pub sockets: Arc<crate::listener_sockets::ListenerSockets>,
     /// Which listener this acceptor serves. Travels with every accepted fd so
@@ -68,9 +68,10 @@ pub(crate) fn apply_accepted_sockopts(fd: RawFd, nodelay: bool) {
     }
 }
 
-/// Run one listener's acceptor loop. Terminates when all channels disconnect.
+/// Run one listener's acceptor loop, until shutdown, a fatal accept error, or
+/// every worker has exited.
 ///
-/// Accepts connections via blocking `accept4` and distributes them to
+/// Accepts connections with `accept_nonblock` and distributes them to
 /// workers round-robin, waking each worker via eventfd. One of these runs
 /// per listener; they share the worker channels, so accepts from different
 /// listeners interleave and each carries its own `ListenerId`.
@@ -381,7 +382,6 @@ mod tests {
 
     /// The listener, gates and acceptor config for one worker, whose queue
     /// holds one connection and is already full.
-    #[cfg(target_os = "linux")]
     fn acceptor_with_a_full_queue(
         wake: crate::wakeup::WakeHandle,
     ) -> (
@@ -421,7 +421,6 @@ mod tests {
         (addr, sockets, gates, rx, config)
     }
 
-    #[cfg(target_os = "linux")]
     fn queue_full_count() -> u64 {
         crate::metrics::CONNECTIONS
             .value(crate::metrics::conn::ACCEPT_QUEUE_FULL)
@@ -485,7 +484,6 @@ mod tests {
 
     /// An acceptor holding a connection does not wait for the workers to exit
     /// at shutdown, as a blocked `accept4` does not.
-    #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_ends_an_acceptor_waiting_for_room() {
         use std::time::Duration;
@@ -516,7 +514,6 @@ mod tests {
     }
 
     /// The last worker exiting ends an acceptor holding a connection.
-    #[cfg(target_os = "linux")]
     #[test]
     fn the_last_worker_exiting_ends_an_acceptor_waiting_for_room() {
         use std::time::Duration;
