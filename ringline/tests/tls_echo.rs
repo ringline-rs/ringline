@@ -384,10 +384,23 @@ fn tls_single_send_larger_than_rustls_buffer() {
     assert_eq!(total, BIG_SEND_SIZE, "short read");
     assert_eq!(buf, expected, "byte-exact mismatch — chunk reorder or loss");
 
+    // The last byte can reach this client before the worker has polled the
+    // task the send's completion wakes, and on io_uring a shutdown seen first
+    // drops that task before it records the result.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while BIG_SEND_RESULT.lock().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let settled = BIG_SEND_RESULT.lock().unwrap().is_some();
+
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();
     }
+    assert!(
+        settled,
+        "the awaited TLS send did not settle within 5 s of its last byte arriving"
+    );
     // The awaited send reports the plaintext it was handed, not the
     // ciphertext of its records.
     assert_eq!(
