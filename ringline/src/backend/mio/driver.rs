@@ -1919,7 +1919,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// The connect-time slot-reuse clear (`DriverCtx::connect`) disposes of
+    /// The connect-time slot-reuse clear (`start_connect`) disposes of
     /// whatever the previous occupant left queued: permit back, id failed.
     ///
     /// One of four permit-disposal sites; a bare `pending_sends[idx].clear()`

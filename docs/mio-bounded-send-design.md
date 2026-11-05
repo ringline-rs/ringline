@@ -208,7 +208,7 @@ Driver-level:
   what disposes of the entry.
 - `connect_time_slot_reuse_fails_a_stale_bounded_send`: a bounded send is
   queued, the slot is released with the queue still populated, and
-  `DriverCtx::connect` reuses it (LIFO free list) → the stranded id gets
+  `DriverCtx::start_connect` reuses it (LIFO free list) → the stranded id gets
   `ConnectionAborted` ("reused by a new connect") and its permit back.
 - `empty_iovec_bailout_fails_the_bounded_entry_it_discards`: a zero-length
   bounded entry built by hand (only kind that reaches the bail-out;

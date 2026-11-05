@@ -197,8 +197,9 @@ pub(crate) fn try_with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R)
 ///
 /// Unlike connection tasks (which are 1:1 with connections), standalone tasks
 /// are not bound to any connection. They run on the same single-threaded
-/// executor and can use [`sleep()`](crate::sleep) and [`timeout()`](crate::timeout),
-/// but cannot perform connection I/O directly.
+/// executor, can use [`sleep()`](crate::sleep) and [`timeout()`](crate::timeout),
+/// and can open and use connections with [`connect`](crate::connect). `on_tick`
+/// and `on_notify` run inside the executor, so they can call `spawn`.
 ///
 /// Returns `Err` if called outside the ringline async executor or if the
 /// standalone task slab is full.
