@@ -324,13 +324,14 @@ struct ExitingWorker {
 }
 
 impl AsyncEventHandler for ExitingWorker {
-    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         if self.id == 1 {
             SERVED_BY_WORKER_1.fetch_add(1, Ordering::AcqRel);
         }
         // Hold a served connection open on worker 1, so only worker 0's
         // connections read EOF while the runtime is running.
-        async {
+        async move {
+            let _conn = conn;
             std::future::pending::<()>().await;
         }
     }

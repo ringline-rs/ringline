@@ -1439,6 +1439,84 @@ fn a_tls_send_chain_is_encrypted() {
     assert!(peer_closed, "no close_notify after the chain");
 }
 
+// ── A panicking handler ─────────────────────────────────────────────────
+
+/// A top-level future that holds the connection in a field. A panic in `poll`
+/// leaves the field in place, so the half drops after `catch_unwind` returns.
+#[cfg(has_io_uring)]
+struct PanicsHoldingConn(#[allow(dead_code)] Connection);
+
+#[cfg(has_io_uring)]
+impl Future for PanicsHoldingConn {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        panic!("expected: the handler panics");
+    }
+}
+
+#[cfg(has_io_uring)]
+struct TlsPanicHandler;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for TlsPanicHandler {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        PanicsHoldingConn(conn)
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsPanicHandler
+    }
+}
+
+/// A panicked handler sends no close_notify, so a length-delimited client reads
+/// a truncated stream, not a clean end, even when the last half drops after the
+/// panic was caught.
+#[cfg(has_io_uring)]
+#[test]
+fn a_panicked_handler_sends_no_close_notify() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(ringline_server_tls(certs.clone(), key))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsPanicHandler>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    let _ = tls_conn.complete_io(&mut tcp);
+
+    let mut peer_closed = false;
+    loop {
+        match tls_conn.read_tls(&mut tcp) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => match tls_conn.process_new_packets() {
+                Ok(state) => peer_closed |= state.peer_has_closed(),
+                Err(e) => panic!("server sent a malformed record: {e}"),
+            },
+        }
+    }
+    assert!(!peer_closed, "a panicked handler sent close_notify");
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+}
+
 // ── TLS source for forward_to_conn ──────────────────────────────────────
 
 /// A TLS-terminating proxy: decrypt the client's stream and forward the

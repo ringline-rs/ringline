@@ -426,6 +426,13 @@ pub(crate) enum Orphan {
     Wait(u32),
     /// A `ConnectFuture`'s outbound connection.
     Connect { conn_index: u32, generation: u32 },
+    /// A half of a connection, dropped outside a task poll.
+    ConnHalf {
+        conn_index: u32,
+        generation: u32,
+        half: io::Half,
+        abrupt: bool,
+    },
     /// A `BlockingJoinHandle`'s `pending_blocking` entry, and with it a
     /// delivered result.
     Blocking(u64),
@@ -470,6 +477,14 @@ pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mu
                 generation,
             } => {
                 io::release_connect(driver, executor, conn_index, generation);
+            }
+            Orphan::ConnHalf {
+                conn_index,
+                generation,
+                half,
+                abrupt,
+            } => {
+                io::release_half(driver, conn_index, generation, half, abrupt);
             }
             Orphan::Blocking(request_id) => {
                 executor.pending_blocking.remove(&request_id);

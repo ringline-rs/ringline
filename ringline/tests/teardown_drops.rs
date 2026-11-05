@@ -38,8 +38,9 @@ impl Drop for CountDrop {
 struct SleepsInConnection;
 
 impl AsyncEventHandler for SleepsInConnection {
-    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let _conn = conn;
             // The first connection holds all but `FREE_SLOTS` timer slots, so
             // the rest of the test works against a small pool.
             if !FILLER_TAKEN.swap(true, Ordering::SeqCst) {
@@ -218,8 +219,9 @@ struct SpawnsInConnection;
 
 #[cfg(target_os = "linux")]
 impl AsyncEventHandler for SpawnsInConnection {
-    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let _conn = conn;
             let _spawn = ringline::process::Command::new("true")
                 .spawn()
                 .expect("submit spawn");
@@ -321,8 +323,9 @@ impl Drop for CountedResult {
 struct BlockingInConnection;
 
 impl AsyncEventHandler for BlockingInConnection {
-    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let _conn = conn;
             let _mark = MarkTaskDropped;
             let _handle = ringline::spawn_blocking(|| {
                 let deadline = Instant::now() + Duration::from_secs(60);
@@ -413,8 +416,9 @@ impl AsyncEventHandler for SenderInConnection {
             *RECV_OUTCOME.lock().unwrap() = Some(outcome);
         }))
     }
-    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let _conn = conn;
             let _tx = SENDER.with(|s| s.borrow_mut().take());
             std::future::pending::<()>().await;
         }
@@ -481,8 +485,9 @@ impl Drop for CountConnectDrop {
 struct ConnectsInConnection;
 
 impl AsyncEventHandler for ConnectsInConnection {
-    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let _conn = conn;
             let _count = CountConnectDrop;
             let target = CONNECT_TARGET.lock().unwrap().expect("target set");
             let connect = if CONNECT_TLS.load(Ordering::SeqCst) {

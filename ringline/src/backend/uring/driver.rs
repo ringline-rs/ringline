@@ -446,8 +446,8 @@ pub(crate) struct Driver {
     /// `OwnedFd` means an entry left here is closed rather than leaked.
     pub(crate) park_ready: Vec<ParkedFd>,
     /// Per connection index: is a [`RecvHalf`] out? Set when the connection is
-    /// delivered and cleared when the half drops. Nothing reads it yet; see the
-    /// close-on-drop decision in `docs/public-context-types-design.md`.
+    /// delivered and cleared when the half drops. The last half to go closes
+    /// the connection (`release_half`).
     pub(crate) recv_half_taken: Vec<bool>,
     /// Per connection index: is a [`SendHalf`](crate::SendHalf) currently out?
     ///

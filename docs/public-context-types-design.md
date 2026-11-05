@@ -1,7 +1,7 @@
 # Removing the public context types
 
 **Status:** approved, 2026-11-04, including both [owner decisions](#owner-decisions).
-Series for 0.7.0. Steps 1 to 5 landed in #737, #738, #739, #740 and #741. Follows
+Series for 0.7.0. Steps 1 to 6 landed in #737, #738, #739, #740, #741 and #743. Follows
 `docs/connection-handle-ownership-design.md`, which moved reading and writing
 onto `RecvHalf` and `SendHalf` and left `ConnCtx` as a `Copy` token.
 
@@ -355,6 +355,8 @@ Each step is one PR, and all are breaking.
 adds a dated note to `connection-handle-ownership-design.md` pointing here.
 
 No step adds work per send or receive. Step 3 removes one `make_ctx` per loop
-iteration on io_uring and two on mio. Step 6 adds a flag check to each half drop, and two `Orphan`
-pushes to each teardown that drops a parked task, on both backends. These are per connection, so
-step 6 is measured with a connection-churn run.
+iteration on io_uring and two on mio. Step 6 adds a flag check to each half drop, and
+two `Orphan` pushes to each teardown that drops a parked task, on both backends.
+These are per connection. A local loopback churn test (connect, one round trip,
+close, 6 interleaved runs of 20,000 connections) gave 15,593 connections/s on main
+and 15,524 with step 6, a 0.4% difference inside a run-to-run spread of about 10%.

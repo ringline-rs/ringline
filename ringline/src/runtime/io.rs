@@ -2382,6 +2382,11 @@ impl RecvHalf {
 /// let n = rx.with_data(|d| { let _ = tx.send_nowait(d); ParseResult::Consumed(d.len()) }).await;
 /// ```
 ///
+/// Dropping the last half closes the connection, with the same graceful close as
+/// [`SendHalf::close`]. On a TLS connection the peer receives close_notify, unless
+/// the drop is an unwinding panic in an accepted connection's own task. Mio
+/// attempts the alert in that case too.
+///
 /// Fan-in from several tasks to one connection is an explicit queue
 /// (`runtime::channel`) drained by the owning task, not a shared handle. See
 /// `docs/connection-handle-ownership-design.md`.
@@ -3178,40 +3183,78 @@ impl SendHalf {
     }
 }
 
-impl Drop for SendHalf {
-    /// Clear this half's flag if the slot still holds this connection. A half
-    /// can outlive its connection inside a standalone task, and the slot's new
-    /// occupant has its own flag.
-    fn drop(&mut self) {
-        let _ = try_with_state(|driver, _executor| {
-            if driver.connections.generation(self.conn.conn_index) != self.conn.generation {
-                return;
-            }
-            if let Some(taken) = driver
-                .send_half_taken
-                .get_mut(self.conn.conn_index as usize)
-            {
-                *taken = false;
-            }
+/// Which half of a connection a [`release_half`] call is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Half {
+    Send,
+    Recv,
+}
+
+/// A half of `conn_index` is gone: clear its flag, and close the connection if
+/// the other half is gone too. Does nothing if the slot holds a later connection.
+///
+/// With `abrupt` set the close sends no TLS close_notify. An unwinding handler
+/// passes it, so the peer sees a truncated stream, not a clean end. Mio has one
+/// close path, which attempts the alert either way.
+pub(crate) fn release_half(
+    driver: &mut Driver,
+    conn_index: u32,
+    generation: u32,
+    half: Half,
+    #[allow(unused_variables)] abrupt: bool,
+) {
+    if driver.connections.generation(conn_index) != generation {
+        return;
+    }
+    let idx = conn_index as usize;
+    let (mine, other) = match half {
+        Half::Send => (&mut driver.send_half_taken, &driver.recv_half_taken),
+        Half::Recv => (&mut driver.recv_half_taken, &driver.send_half_taken),
+    };
+    if let Some(taken) = mine.get_mut(idx) {
+        *taken = false;
+    }
+    if other.get(idx).copied().unwrap_or(false) {
+        return;
+    }
+    #[cfg(has_io_uring)]
+    if abrupt {
+        driver.close_connection(conn_index);
+    } else {
+        driver.close_connection_graceful(conn_index);
+    }
+    #[cfg(not(has_io_uring))]
+    driver.close_connection(conn_index);
+}
+
+/// Run [`release_half`] now, or queue it if the half was dropped outside a task
+/// poll, as at connection teardown or in the synchronous body of `on_accept`.
+fn drop_half(conn: ConnCtx, half: Half) {
+    let abrupt = std::thread::panicking();
+    let released = try_with_state(|driver, _executor| {
+        release_half(driver, conn.conn_index, conn.generation, half, abrupt);
+    });
+    if released.is_none() {
+        crate::runtime::defer_release(crate::runtime::Orphan::ConnHalf {
+            conn_index: conn.conn_index,
+            generation: conn.generation,
+            half,
+            abrupt,
         });
     }
 }
 
-impl Drop for RecvHalf {
-    /// See [`SendHalf`]'s `drop`. `Driver::clear_conn_claims` at the recycle
-    /// point starts each slot with both flags clear.
+impl Drop for SendHalf {
+    /// Dropping the last half closes the connection.
     fn drop(&mut self) {
-        let _ = try_with_state(|driver, _executor| {
-            if driver.connections.generation(self.conn.conn_index) != self.conn.generation {
-                return;
-            }
-            if let Some(taken) = driver
-                .recv_half_taken
-                .get_mut(self.conn.conn_index as usize)
-            {
-                *taken = false;
-            }
-        });
+        drop_half(self.conn, Half::Send);
+    }
+}
+
+impl Drop for RecvHalf {
+    /// Dropping the last half closes the connection.
+    fn drop(&mut self) {
+        drop_half(self.conn, Half::Recv);
     }
 }
 
