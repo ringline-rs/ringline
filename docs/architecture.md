@@ -280,7 +280,9 @@ their own backing without touching a reused connection.
 `Runtime::shutdown` sets a shared atomic flag, releases the listen gates, sets
 `SO_REUSEADDR` and calls `shutdown(SHUT_RD)` on each listener socket, and wakes
 every worker. On Linux `SHUT_RD` wakes an acceptor blocked in `accept4` and
-takes the socket out of the listening state. An acceptor holding a connection
+takes the socket out of the listening state. On other platforms `SHUT_RD` does
+not wake a blocked `accept`, so the acceptor polls a non-blocking listener and
+sees the flag within about 100 ms. An acceptor holding a connection
 sees the flag within about 100 ms. Each listener's sockets are owned
 by a shared `ListenerSockets`. Every thread that passes their fd numbers to a
 syscall holds it, and the sockets close when the last holder drops it: after

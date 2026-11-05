@@ -844,6 +844,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- macOS: an acceptor thread exits at shutdown within about 100 ms. It used to
+  stay blocked in `accept` until a peer connected, and its listener kept the
+  port until then (#560).
 - The acceptor thread no longer closes a connection when every worker's accept
   queue is full. It holds the connection until a queue has room, so later
   connections wait in the kernel's listen queue. A burst of 10,000 connections
