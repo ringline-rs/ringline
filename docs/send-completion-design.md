@@ -108,7 +108,9 @@ rest with the entry's own operation. The entry stays the one operation in
 flight on the connection, so byte order holds. A zero-copy entry's drain is
 a copying `send` and posts no notification.
 Zero-copy sends inside a `send_chain` are linked SQEs and are not drained: an
-`-EAGAIN` there fails the chain.
+`-EAGAIN` there fails the chain and closes the connection, so a chain part larger
+than the send buffer's free space cannot reach a half-closed peer, even one that
+is reading. `send_parts` drains.
 
 A `send` waits in this state by running on an io-wq worker thread from the
 **unbound** pool, which `ConfigBuilder::iowq_max_workers` does not cap: one
@@ -136,7 +138,7 @@ including a resubmission that waited on a full SQ, also goes out as plain
 most one `-ENOMEM`, counted by the `ringline/pool` counter `send_zc_enomem`.
 A process with `CAP_IPC_LOCK` in the initial user namespace is not charged
 and does not reach this path. Inside a `send_chain`, `-ENOMEM` fails the
-chain (#642).
+chain and closes the connection (#642, #734).
 
 ### At worker shutdown
 

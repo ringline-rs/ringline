@@ -26,7 +26,9 @@ pub(crate) struct ChainState {
     cqes_received: u16,
     /// Cumulative bytes from successful SQEs.
     pub(crate) bytes_sent: u32,
-    /// Chain broke (partial write or error on a linked SQE).
+    /// Bytes in the chain's SQEs. 0 if unset.
+    expected_bytes: u32,
+    /// Chain broke (an error on a linked SQE).
     broken: bool,
     /// First error errno encountered (if any).
     pub(crate) first_error: Option<i32>,
@@ -38,6 +40,24 @@ pub(crate) struct ChainState {
 }
 
 impl ChainState {
+    /// Why the stream has a gap, if it does. A failed SQE leaves one. So does
+    /// an SQE that sent part of its bytes and then failed, whose CQE reports
+    /// the part it sent, and whose error is lost: the SQEs after it report only
+    /// `ECANCELED`.
+    pub(crate) fn failure(&self) -> Option<std::io::Error> {
+        let short = self.bytes_sent < self.expected_bytes;
+        match self.first_error {
+            Some(errno) if !(short && errno == -libc::ECANCELED) => {
+                Some(std::io::Error::from_raw_os_error(-errno))
+            }
+            _ if short => Some(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "send chain sent part of its bytes",
+            )),
+            _ => None,
+        }
+    }
+
     fn is_complete(&self) -> bool {
         self.cqes_received == self.total_sqes && self.zc_notifs_pending == 0
     }
@@ -89,11 +109,19 @@ impl SendChainTable {
             total_sqes,
             cqes_received: 0,
             bytes_sent: 0,
+            expected_bytes: 0,
             broken: false,
             first_error: None,
             zc_notifs_pending: 0,
             send_id: None,
         });
+    }
+
+    /// Record how many bytes the connection's active chain carries.
+    pub fn set_expected_bytes(&mut self, conn_index: u32, bytes: u32) {
+        if let Some(Some(chain)) = self.chains.get_mut(conn_index as usize) {
+            chain.expected_bytes = bytes;
+        }
     }
 
     /// Attach the awaited send `id` to the connection's active chain. Does
@@ -187,6 +215,40 @@ impl SendChainTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chain_short_of_its_bytes_failed() {
+        let mut table = SendChainTable::new(16);
+        table.start(0, 2);
+        table.set_expected_bytes(0, 100);
+        table.on_operation_cqe(0, 60);
+        table.on_operation_cqe(0, 40);
+        assert!(table.take(0).unwrap().failure().is_none());
+
+        // The last SQE sent part and then failed: its CQE reports the part.
+        table.start(0, 2);
+        table.set_expected_bytes(0, 100);
+        table.on_operation_cqe(0, 60);
+        table.on_operation_cqe(0, 10);
+        let failure = table.take(0).unwrap().failure().unwrap();
+        assert_eq!(failure.kind(), std::io::ErrorKind::WriteZero);
+
+        // A middle SQE did: the next is cancelled, and that says nothing.
+        table.start(0, 2);
+        table.set_expected_bytes(0, 100);
+        table.on_operation_cqe(0, 60);
+        table.on_operation_cqe(0, -libc::ECANCELED);
+        let failure = table.take(0).unwrap().failure().unwrap();
+        assert_eq!(failure.kind(), std::io::ErrorKind::WriteZero);
+
+        // A real error is reported as itself.
+        table.start(0, 2);
+        table.set_expected_bytes(0, 100);
+        table.on_operation_cqe(0, -libc::EPIPE);
+        table.on_operation_cqe(0, -libc::ECANCELED);
+        let failure = table.take(0).unwrap().failure().unwrap();
+        assert_eq!(failure.raw_os_error(), Some(libc::EPIPE));
+    }
 
     #[test]
     fn single_sqe_chain() {

@@ -3138,6 +3138,21 @@ impl SendHalf {
     /// it behind the connection's other sends, so it does not refuse while
     /// earlier sends are in flight.
     ///
+    /// A chain that fails closes the connection, because an unknown part of it
+    /// was sent and the sends queued behind it are lost, so later bytes would
+    /// reach the peer after a gap. That includes a zero-copy part that fails
+    /// with `ENOMEM`, or with `EAGAIN` because the peer has half-closed, which
+    /// an ordinary send recovers from with plain sends. So a chain part larger
+    /// than the send buffer's room cannot reach a half-closed peer, even one
+    /// that is reading: use [`send_parts`](Self::send_parts) for that.
+    ///
+    /// If a part sends some of its bytes and then fails, the error is
+    /// [`WriteZero`](io::ErrorKind::WriteZero), whatever the cause, including a
+    /// reset by the peer.
+    ///
+    /// [`close`](Self::close) waits for a running chain, and a chain waits for
+    /// the peer to read.
+    ///
     /// For fire-and-forget chained sending, use `send_chain_nowait()`.
     #[cfg(has_io_uring)]
     pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendFuture>
@@ -3153,6 +3168,9 @@ impl SendHalf {
     /// for constructing linked SQEs. Call `.copy()`, `.parts()...add()` to add
     /// SQEs, then `.finish()` to submit the chain. On a TLS connection the
     /// chain is encrypted and queued as one send; see
+    /// [`send_chain`](Self::send_chain).
+    ///
+    /// A chain that fails closes the connection, as for
     /// [`send_chain`](Self::send_chain).
     ///
     /// For backpressure-aware chained sending, use `send_chain()`.
