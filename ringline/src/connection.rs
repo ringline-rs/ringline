@@ -244,8 +244,7 @@ impl ConnectionState {
     }
 
     /// A recv future must resolve to EOF instead of parking: the peer
-    /// closed, the read failed, the receive was cancelled, or a close was
-    /// requested.
+    /// closed, the read failed, or a close was requested.
     pub fn recv_finished(&self) -> bool {
         !matches!(self.read, ReadHalf::Open) || matches!(self.lifecycle, Lifecycle::Closing)
     }

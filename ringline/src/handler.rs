@@ -238,9 +238,7 @@ pub(crate) fn bounded_send_slots(
 }
 
 #[cfg(has_io_uring)]
-/// The context provided to handler callbacks for issuing operations.
-///
-/// This is a short-lived borrow into the driver's internal state.
+/// A short-lived borrow of driver fields, built by `Driver::make_ctx`.
 pub(crate) struct DriverCtx<'a> {
     pub(crate) ring: &'a mut crate::backend::Ring,
     pub(crate) connections: &'a mut crate::connection::ConnectionTable,
@@ -277,7 +275,6 @@ pub(crate) struct DriverCtx<'a> {
     /// loop's deadline check iterates this instead of all send queues
     /// so non-TLS workloads pay zero per-iteration cost.
     pub(crate) close_notify_armed: &'a mut Vec<u32>,
-    /// Per-worker UDP socket state.
     /// NVMe device table. `None` when NVMe is not configured.
     pub(crate) nvme_devices: &'a mut Option<crate::nvme::NvmeDeviceTable>,
     /// NVMe command slab. `None` when NVMe is not configured.
@@ -298,7 +295,7 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) fs_fd_base: u32,
     /// Connections whose `close_pending` was set from this ctx (e.g.
     /// `DriverCtx::close`); the event loop re-drives `try_finalize_close`
-    /// for each after the callback returns. This keeps ctx-initiated closes
+    /// for each before the iteration ends. This keeps ctx-initiated closes
     /// on the same deferred path as `close_connection` — the Close SQE is
     /// only submitted once in-flight sends, queued sends, and chains drain.
     pub(crate) pending_finalize_closes: &'a mut Vec<u32>,
@@ -1105,7 +1102,7 @@ impl<'a> DriverCtx<'a> {
             }
 
             // Defer the Close behind whatever is outstanding; the event loop
-            // re-drives try_finalize_close after this callback returns, and
+            // re-drives try_finalize_close before the iteration ends, and
             // each send CQE re-drives it via note_send_finalized.
             self.send_queues[conn.index as usize].close_pending = true;
             if !self.pending_finalize_closes.contains(&conn.index) {
@@ -1471,9 +1468,8 @@ impl<'a> DriverCtx<'a> {
     /// Reads `num_blocks` logical blocks starting at `lba` into the buffer
     /// at `buf_addr` with length `buf_len`.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`nvme_read`](crate::nvme_read) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`nvme_read`](crate::nvme_read) holds it
+    /// in a future that resolves to the result.
     ///
     /// # Safety
     ///
@@ -1540,9 +1536,8 @@ impl<'a> DriverCtx<'a> {
     /// Writes `num_blocks` logical blocks starting at `lba` from the buffer
     /// at `buf_addr` with length `buf_len`.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`nvme_write`](crate::nvme_write) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`nvme_write`](crate::nvme_write) holds it
+    /// in a future that resolves to the result.
     ///
     /// # Safety
     ///
@@ -1606,9 +1601,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit an NVMe flush command.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`nvme_flush`](crate::nvme_flush) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`nvme_flush`](crate::nvme_flush) holds it
+    /// in a future that resolves to the result.
     pub fn nvme_flush(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<u32> {
         let (fd_index, nsid) = self.validate_nvme_device(device)?;
 
@@ -1654,9 +1648,19 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Close an NVMe device.
+    /// Close an NVMe device. With commands in flight, the handle goes stale at
+    /// once and the last completion unregisters the device.
     pub fn close_nvme_device(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<()> {
         let (fd_index, _nsid) = self.validate_nvme_device(device)?;
+
+        if let Some(devices) = self.nvme_devices.as_mut()
+            && let Some(dev) = devices.get_mut(device.index)
+            && dev.in_flight > 0
+        {
+            dev.closing = true;
+            dev.generation = dev.generation.wrapping_add(1);
+            return Ok(());
+        }
 
         // Unregister from the fixed file table.
         self.ring.register_files_update(fd_index, &[-1i32])?;
@@ -1677,7 +1681,7 @@ impl<'a> DriverCtx<'a> {
         let dev = devices
             .get(device.index)
             .ok_or_else(|| io::Error::other("invalid NVMe device handle"))?;
-        if dev.generation != device.generation {
+        if dev.closing || dev.generation != device.generation {
             return Err(io::Error::other("stale NVMe device handle"));
         }
         Ok((dev.fd_index, dev.nsid))
@@ -1757,14 +1761,12 @@ impl<'a> DriverCtx<'a> {
     /// The buffer must be aligned to the logical block size and remain valid
     /// until the direct I/O completion fires.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`direct_io_read`](crate::direct_io_read) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`direct_io_read`](crate::direct_io_read) holds it
+    /// in a future that resolves to the result.
     ///
     /// # Safety
     /// `buf` must point to valid, aligned memory of at least `len` bytes
-    /// that remains valid until the operation completes. Nothing reports
-    /// completion, so keep the buffer for the life of the worker.
+    /// that remains valid until the operation completes.
     pub unsafe fn direct_io_read(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -1821,14 +1823,12 @@ impl<'a> DriverCtx<'a> {
     /// The buffer must be aligned to the logical block size and remain valid
     /// until the direct I/O completion fires.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`direct_io_write`](crate::direct_io_write) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`direct_io_write`](crate::direct_io_write) holds it
+    /// in a future that resolves to the result.
     ///
     /// # Safety
     /// `buf` must point to valid, aligned memory of at least `len` bytes
-    /// that remains valid until the operation completes. Nothing reports
-    /// completion, so keep the buffer for the life of the worker.
+    /// that remains valid until the operation completes.
     pub unsafe fn direct_io_write(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -1884,9 +1884,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit an fsync for a direct I/O file.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`direct_io_fsync`](crate::direct_io_fsync) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`direct_io_fsync`](crate::direct_io_fsync) holds it
+    /// in a future that resolves to the result.
     pub fn direct_io_fsync(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
         let fd_index = self.validate_direct_io_file(file)?;
 
@@ -1931,9 +1930,19 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Close a direct I/O file.
+    /// Close a direct I/O file. With commands in flight, the handle goes stale
+    /// at once and the last completion unregisters the file.
     pub fn close_direct_io_file(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<()> {
         let fd_index = self.validate_direct_io_file(file)?;
+
+        if let Some(files) = self.direct_io_files.as_mut()
+            && let Some(f) = files.get_mut(file.index)
+            && f.in_flight > 0
+        {
+            f.closing = true;
+            f.generation = f.generation.wrapping_add(1);
+            return Ok(());
+        }
 
         // Unregister from the fixed file table.
         self.ring.register_files_update(fd_index, &[-1i32])?;
@@ -1954,7 +1963,7 @@ impl<'a> DriverCtx<'a> {
         let f = files
             .get(file.index)
             .ok_or_else(|| io::Error::other("invalid direct I/O file handle"))?;
-        if f.generation != file.generation {
+        if f.closing || f.generation != file.generation {
             return Err(io::Error::other("stale direct I/O file handle"));
         }
         Ok(f.fd_index)
@@ -2489,9 +2498,7 @@ impl<'a> DriverCtx<'a> {
 // ── mio DriverCtx (minimal stub) ───────────────────────────────────────
 
 #[cfg(not(has_io_uring))]
-/// The context provided to handler callbacks for issuing operations.
-///
-/// This is a short-lived borrow into the driver's internal state.
+/// A short-lived borrow of driver fields, built by `Driver::make_ctx`.
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) struct DriverCtx<'a> {
     pub(crate) connections: &'a mut crate::connection::ConnectionTable,
@@ -3163,9 +3170,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit a direct I/O read via the disk I/O pool.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`direct_io_read`](crate::direct_io_read) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`direct_io_read`](crate::direct_io_read) holds it
+    /// in a future that resolves to the result.
     pub fn direct_io_read(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -3202,9 +3208,8 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit a direct I/O write via the disk I/O pool.
     ///
-    /// Returns the operation's disk-I/O key. Nothing reports the result: it is
-    /// discarded when it arrives. [`direct_io_write`](crate::direct_io_write) returns a future that
-    /// resolves to it.
+    /// Returns the operation's disk-I/O key. [`direct_io_write`](crate::direct_io_write) holds it
+    /// in a future that resolves to the result.
     pub fn direct_io_write(
         &mut self,
         file: crate::direct_io::DirectIoFile,
@@ -3285,7 +3290,7 @@ impl<'a> DriverCtx<'a> {
         let f = files
             .get(file.index)
             .ok_or_else(|| io::Error::other("invalid direct I/O file handle"))?;
-        if f.generation != file.generation {
+        if f.closing || f.generation != file.generation {
             return Err(io::Error::other("stale direct I/O file handle"));
         }
         self.direct_io_fds[file.index as usize]
@@ -4083,7 +4088,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
 /// as one send and queued behind the connection's other sends, so the chain
 /// completes as one send does.
 ///
-/// Created via [`DriverCtx::send_chain`].
+/// Passed to the closure given to [`SendHalf::send_chain`](crate::SendHalf::send_chain).
 pub struct SendChainBuilder<'b, 'a> {
     ctx: &'b mut DriverCtx<'a>,
     conn: ConnToken,

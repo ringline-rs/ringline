@@ -179,7 +179,8 @@ Across the series:
   on a connection held by a client.
 - A dropped half cannot be taken again.
 - `ConfigBuilder::close_notify_timeout_ms` is removed, and the internal fatal
-  closes keep a fixed 5 s bound. See [Owner decisions](#owner-decisions).
+  closes keep a fixed 5 s bound. An application has no way to bound a TLS close
+  against a peer that stops reading. See [Owner decisions](#owner-decisions).
 - On a `Connection` a held read future also blocks sends, so that case needs
   `split()`. A read future is not `'static`: to spawn or box one with `'static`,
   move the half into an `async move` block that makes the call.
@@ -318,10 +319,9 @@ Remove `ConfigBuilder::close_notify_timeout_ms` and keep a fixed 5 s bound on
 those internal closes. `Connection::close` stays unbounded,
 as it is for plaintext. Bounding a close against a peer that stops reading is a
 separate change that would apply to TLS and plaintext alike.
-`a_slow_reader_gets_the_whole_reply_before_close_notify` sets the knob to 300 ms.
-It moves to a unit test that checks `close_notify_deadline` stays `None` after
-`close_connection_graceful`, because a 3.5 s drain cannot fail against a 5 s
-bound.
+`a_slow_reader_gets_the_whole_reply_before_close_notify` stays as a delivery test.
+`graceful_close_arms_no_close_notify_deadline` checks that no deadline is armed,
+because a 3.5 s drain cannot fail against a 5 s bound.
 
 The rejected alternative was to arm the deadline in `close_connection_graceful`, which keeps
 the knob meaningful on io_uring, makes TLS and plaintext closes differ, and cuts

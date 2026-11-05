@@ -392,3 +392,208 @@ fn a_dsync_file_round_trips_and_its_fsync_future_resolves() {
         .expect("on_start did not finish")
         .unwrap();
 }
+
+// ── Closing a file with an operation queued ─────────────────────────
+
+static QUEUED_DONE: AtomicBool = AtomicBool::new(false);
+static QUEUED_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn queued_paths() -> (PathBuf, PathBuf) {
+    let pid = std::process::id();
+    (
+        temp_file_path(&format!(".krio_direct_io_queued_a_{pid}")),
+        temp_file_path(&format!(".krio_direct_io_queued_b_{pid}")),
+    )
+}
+
+/// A 4 KiB-aligned 4 KiB slice of `buf`, which holds 8 KiB.
+fn aligned_block(buf: &mut [u8]) -> &mut [u8] {
+    let offset = buf.as_ptr().align_offset(4096);
+    &mut buf[offset..offset + 4096]
+}
+
+/// A write queued before a close lands in the closed file, the handle goes
+/// stale at once, and the next file opened gets none of it.
+async fn write_close_open(first: &str, second: &str) -> Result<(), String> {
+    let mut buf = vec![0u8; 8192];
+    let block = aligned_block(&mut buf);
+    block.fill(0xab);
+
+    let a = ringline::open_direct_io_file(first).map_err(|e| e.to_string())?;
+    let write = unsafe { ringline::direct_io_write(a, 0, block.as_ptr(), 4096) }
+        .map_err(|e| e.to_string())?;
+    ringline::close_direct_io_file(a).map_err(|e| e.to_string())?;
+    let stale = ringline::close_direct_io_file(a).is_err();
+    let b = ringline::open_direct_io_file(second).map_err(|e| e.to_string());
+    // Awaited before any return, so `buf` outlives the write.
+    let written = write.await.map_err(|e| e.to_string())?;
+    ringline::close_direct_io_file(b?).map_err(|e| e.to_string())?;
+    if !stale {
+        return Err("a second close of the handle succeeded".to_string());
+    }
+    if written != 4096 {
+        return Err(format!("write returned {written}"));
+    }
+    Ok(())
+}
+
+/// Every deferred close releases its slot: with more rounds than slots, an open
+/// fails once a slot leaks, whether the last operation succeeded or failed.
+async fn deferred_closes_release_their_slots(path: &str) -> Result<(), String> {
+    let mut buf = vec![0u8; 8192];
+    let block = aligned_block(&mut buf);
+    for round in 0..16 {
+        let file =
+            ringline::open_direct_io_file(path).map_err(|e| format!("round {round}: open: {e}"))?;
+        let ptr = block.as_mut_ptr();
+        let op = match round % 3 {
+            0 => unsafe { ringline::direct_io_write(file, 0, ptr, 4096) },
+            1 => unsafe { ringline::direct_io_read(file, 0, ptr, 4096) },
+            _ => ringline::direct_io_fsync(file),
+        }
+        .map_err(|e| format!("round {round}: submit: {e}"))?;
+        ringline::close_direct_io_file(file).map_err(|e| format!("round {round}: close: {e}"))?;
+        op.await.map_err(|e| format!("round {round}: op: {e}"))?;
+    }
+    Ok(())
+}
+
+struct QueuedWriteHandler;
+
+impl AsyncEventHandler for QueuedWriteHandler {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let (first, second) = queued_paths();
+            let (first, second) = (first.to_str().unwrap(), second.to_str().unwrap());
+            let mut result = write_close_open(first, second).await;
+            if result.is_ok() {
+                result = deferred_closes_release_their_slots(second).await;
+            }
+            let _ = QUEUED_RESULT.set(result);
+            QUEUED_DONE.store(true, Ordering::Release);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        QueuedWriteHandler
+    }
+}
+
+#[test]
+fn a_close_with_an_operation_queued_finishes_it_on_the_closed_file() {
+    if !o_direct_supported() {
+        eprintln!("skipping: O_DIRECT is not supported here");
+        return;
+    }
+    let (first, second) = queued_paths();
+    std::fs::write(&first, [0u8; 4096]).unwrap();
+    std::fs::write(&second, [0u8; 4096]).unwrap();
+
+    let config = direct_io_test_config_builder()
+        .direct_io(
+            DirectIoConfig::default()
+                .max_files(2)
+                .max_commands_in_flight(32),
+        )
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<QueuedWriteHandler>()
+        .expect("launch failed");
+    common::join_workers(&runtime, handles);
+
+    let a = std::fs::read(&first).unwrap();
+    let _ = std::fs::remove_file(&first);
+    let _ = std::fs::remove_file(&second);
+    assert!(
+        QUEUED_DONE.load(Ordering::Acquire),
+        "the task did not finish"
+    );
+    QUEUED_RESULT.get().unwrap().clone().unwrap();
+    assert!(a.iter().all(|&x| x == 0xab), "the write missed its file");
+}
+
+// ── Closing an NVMe handle ──────────────────────────────────────────
+
+#[cfg(has_io_uring)]
+static NVME_CLOSE_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+
+#[cfg(has_io_uring)]
+fn nvme_close_path() -> PathBuf {
+    temp_file_path(&format!(".krio_nvme_close_{}", std::process::id()))
+}
+
+/// With a flush in flight the handle goes stale at once, and the completion
+/// releases the slot: an open fails within `max_devices(2)` rounds otherwise. A
+/// regular file stands in for a device: opening registers the fd, and the flush
+/// completes with an error, which is all this needs.
+#[cfg(has_io_uring)]
+async fn nvme_closes_release_their_slots(path: &str) -> Result<(), String> {
+    for round in 0..12 {
+        let device =
+            ringline::open_nvme_device(path, 1).map_err(|e| format!("round {round}: open: {e}"))?;
+        let flush =
+            ringline::nvme_flush(device).map_err(|e| format!("round {round}: flush: {e}"))?;
+        ringline::close_nvme_device(device).map_err(|e| format!("round {round}: close: {e}"))?;
+        let stale = ringline::close_nvme_device(device).is_err();
+        let _ = flush.await;
+        if !stale {
+            return Err(format!("round {round}: a second close succeeded"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(has_io_uring)]
+struct NvmeCloseHandler;
+
+#[cfg(has_io_uring)]
+impl AsyncEventHandler for NvmeCloseHandler {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let path = nvme_close_path();
+            let result = nvme_closes_release_their_slots(path.to_str().unwrap()).await;
+            let _ = NVME_CLOSE_RESULT.set(result);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        NvmeCloseHandler
+    }
+}
+
+#[cfg(has_io_uring)]
+#[test]
+fn closing_an_nvme_handle_with_a_command_in_flight_releases_it() {
+    let path = nvme_close_path();
+    std::fs::write(&path, [0u8; 4096]).unwrap();
+    let config = ConfigBuilder::new()
+        .workers(1)
+        .pin_to_core(false)
+        .sq_entries(64)
+        .max_connections(8)
+        .send_pool(8, 16384)
+        .nvme(ringline::NvmeConfig::default().max_devices(2))
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<NvmeCloseHandler>()
+        .expect("launch failed");
+    common::join_workers(&runtime, handles);
+    let _ = std::fs::remove_file(&path);
+    NVME_CLOSE_RESULT
+        .get()
+        .expect("the task finished")
+        .clone()
+        .unwrap();
+}

@@ -334,8 +334,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 7. on_tick callback (synchronous). Set the executor's
             // driver_state thread-local so user code that calls
             // `ringline::spawn()` / wakers / `with_state` works from
-            // inside the handler. Raw pointers dodge the borrow conflict
-            // with `make_ctx()`.
+            // inside the handler.
             {
                 let handler = &mut self.handler;
                 let driver_ptr = &mut self.driver as *mut Driver;
@@ -597,8 +596,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // on_notify (synchronous). Set the executor's driver_state
         // thread-local so user code that calls `ringline::spawn()` /
-        // wakers / `with_state` works from inside the handler. Raw
-        // pointers dodge the borrow conflict with `make_ctx()`.
+        // wakers / `with_state` works from inside the handler.
         {
             let handler = &mut self.handler;
             let driver_ptr = &mut self.driver as *mut Driver;

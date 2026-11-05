@@ -30,7 +30,6 @@ pub enum DirectIoOp {
 }
 
 /// Options for opening a direct I/O file, passed to
-/// [`crate::open_direct_io_file_with`] and
 /// [`crate::open_direct_io_file_with`].
 ///
 /// The default opens the file as
@@ -101,6 +100,10 @@ pub(crate) struct DirectIoFileState {
     pub generation: u16,
     /// Number of commands currently in flight.
     pub in_flight: u32,
+    /// Closed with commands in flight: the last completion unregisters the
+    /// file, because a queued SQE resolves its fixed-file index at submission.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub closing: bool,
 }
 
 impl DirectIoFileState {
@@ -110,6 +113,7 @@ impl DirectIoFileState {
             active: false,
             generation: 0,
             in_flight: 0,
+            closing: false,
         }
     }
 }
@@ -143,6 +147,7 @@ impl DirectIoFileTable {
         slot.active = false;
         slot.fd_index = u32::MAX;
         slot.in_flight = 0;
+        slot.closing = false;
         slot.generation = slot.generation.wrapping_add(1);
         self.free_list.push(index);
     }

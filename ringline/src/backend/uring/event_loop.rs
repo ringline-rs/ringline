@@ -540,10 +540,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 executor: unsafe { NonNull::new_unchecked(executor_ptr) },
             };
             let guard = unsafe { set_driver_state_guarded(&mut driver_state) };
-            // catch_unwind keeps a panic
-            // in user tick code from unwinding past the guard's scope with
-            // futures observing a dangling CURRENT_DRIVER, and from killing
-            // the worker.
+            // catch_unwind keeps a panic in user tick code from unwinding past
+            // the guard's scope with futures observing a dangling
+            // CURRENT_DRIVER, and from killing the worker.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handler.on_tick();
             }));
@@ -1189,7 +1188,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             if -result == libc::ECANCELED {
-                // Cancelled by a close: a parked reader resolves.
+                // Cancelled with the connection open, by a park: the task re-arms when it
+                // parks again.
                 self.executor.wake_recv(conn_index);
                 return;
             }
@@ -4009,11 +4009,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let device_index = nvme_cmd_slab.release(slab_idx);
 
-        // Decrement in-flight count.
+        // Decrement in-flight count, and finish a close that waited for it.
         if let Some(ref mut devices) = self.driver.nvme_devices
             && let Some(dev) = devices.get_mut(device_index)
         {
             dev.in_flight = dev.in_flight.saturating_sub(1);
+            if dev.closing && dev.in_flight == 0 {
+                let _ = self
+                    .driver
+                    .ring
+                    .register_files_update(dev.fd_index, &[-1i32]);
+                devices.release(device_index);
+            }
         }
 
         // NVMe passthrough puts the device-level status word (positive,
@@ -4041,11 +4048,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let (file_index, _op) = cmd_slab.release(slab_idx);
 
-        // Decrement in-flight count.
+        // Decrement in-flight count, and finish a close that waited for it.
         if let Some(ref mut files) = self.driver.direct_io_files
             && let Some(f) = files.get_mut(file_index)
         {
             f.in_flight = f.in_flight.saturating_sub(1);
+            if f.closing && f.in_flight == 0 {
+                let _ = self.driver.ring.register_files_update(f.fd_index, &[-1i32]);
+                files.release(file_index);
+            }
         }
 
         // Wake the async task waiting for this Direct I/O completion.
@@ -8156,6 +8167,10 @@ mod tests {
                 .close_notify_deadline
                 .is_some()
         );
+        assert!(
+            el.driver.send_queues[conn_index as usize].in_flight,
+            "the close_notify went out"
+        );
     }
 
     /// The application's close arms no deadline: a TLS drain takes as long as
@@ -8183,7 +8198,7 @@ mod tests {
         );
     }
 
-    /// DriverCtx::close (the on_tick-context close) must defer behind an
+    /// DriverCtx::close (the fatal-encrypt close) must defer behind an
     /// in-flight send instead of forcing in_flight=false and submitting
     /// Close directly (which orphaned the send's CQE).
     #[test]

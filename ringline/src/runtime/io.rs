@@ -4805,10 +4805,12 @@ pub fn open_direct_io_file_with(
     })
 }
 
-/// Close a Direct I/O file and release its slot.
+/// Close a Direct I/O file.
 ///
-/// The handle is invalid at once. On mio the fd closes once the operations
-/// already queued on it have finished.
+/// The handle is invalid at once. An operation already submitted finishes on
+/// this file, on both backends. On io_uring the slot is free once the last of
+/// them completes, so until then an open can fail with
+/// "direct I/O file table full".
 ///
 /// # Panics
 ///
@@ -4820,7 +4822,11 @@ pub fn close_direct_io_file(file: crate::direct_io::DirectIoFile) -> io::Result<
     })
 }
 
-/// Close an NVMe device and release its slot. Returns `Unsupported` on mio.
+/// Close an NVMe device. Returns `Unsupported` on mio.
+///
+/// The handle is invalid at once, and a command already submitted finishes on
+/// this device. The slot is free once the last of them completes, so until then
+/// an open can fail because the device table is full.
 ///
 /// # Panics
 ///

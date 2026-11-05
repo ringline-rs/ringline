@@ -238,8 +238,6 @@ fn a_resolved_futures_key_can_be_reused() {
         .unwrap();
 }
 
-// ── An operation submitted without a future ─────────────────────────────
-
 // ── A future dropped with its connection ───────────────────────────────
 
 static TD_FIFO_FILE: Mutex<Option<ringline::fs::File>> = Mutex::new(None);
