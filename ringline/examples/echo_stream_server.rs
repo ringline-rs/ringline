@@ -20,7 +20,7 @@ impl AsyncEventHandler for StreamEcho {
     fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         let worker_id = self.worker_id;
         async move {
-            let index = conn.index();
+            let index = conn.id().index();
             eprintln!("[worker {worker_id}] accepted connection {index}");
             let mut stream = ConnStream::new(conn);
 

@@ -384,7 +384,7 @@ impl PoolSemanticsHandler {
         // Both are live and independent.
         a.ping().await.map_err(|e| format!("ping a: {e}"))?;
         b.ping().await.map_err(|e| format!("ping b: {e}"))?;
-        if a.token() == b.token() {
+        if a.id() == b.id() {
             return Err("both guards hold the same connection".to_string());
         }
 
@@ -412,7 +412,7 @@ impl PoolSemanticsHandler {
             .map_err(|e| format!("ping a after connect_all: {e}"))?;
 
         // Dropping a guard returns its connection to the slot.
-        let a_token = a.token();
+        let a_token = a.id();
         drop(a);
         if pool.lent_count() != 1 || pool.connected_count() != 1 {
             return Err(format!(
@@ -427,7 +427,7 @@ impl PoolSemanticsHandler {
             .client()
             .await
             .map_err(|e| format!("checkout c: {e}"))?;
-        if c.token() != a_token {
+        if c.id() != a_token {
             return Err("the returned slot was reconnected, not reused".to_string());
         }
         c.ping().await.map_err(|e| format!("ping c: {e}"))?;

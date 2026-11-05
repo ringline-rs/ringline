@@ -143,7 +143,7 @@ worker is the io_uring-specific mapping of that architecture.
 
 ## Connection and request lifecycle
 
-Each connection occupies a `ConnectionTable` slot. `Connection` and `ConnToken`
+Each connection occupies a `ConnectionTable` slot. `Connection` and `ConnId`
 carry both its index and generation. Every long-lived future and completion
 path must reject a generation mismatch because a slot can be reused while old
 work is still completing.

@@ -29,7 +29,7 @@ enum TaskSlot {
 /// Slab of per-connection async tasks, indexed by connection index.
 ///
 /// One long-lived task per connection. Spawned on accept/connect,
-/// dropped on close. O(1) lookup by `ConnToken::index()`.
+/// dropped on close. O(1) lookup by `ConnId::index()`.
 pub(crate) struct TaskSlab {
     tasks: Vec<TaskSlot>,
 }

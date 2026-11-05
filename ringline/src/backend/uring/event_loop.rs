@@ -6097,7 +6097,7 @@ mod tests {
         el.handle_park_install(park_install_ud(conn_index, generation), probe.installed);
         std::mem::forget(probe); // the fd now belongs to the ParkedFd
         let _parked = el.driver.park_ready.pop().expect("lifted off");
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let sent = el.driver.make_ctx().send(token, b"SECRET-PLAINTEXT");
         assert!(sent.is_err(), "a send after the handoff is refused");
         el.driver.ring.submit_and_wait(0).unwrap();
@@ -6596,7 +6596,7 @@ mod tests {
         let mut el = make_test_loop_with_config(config);
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (ours, peer) = attach_socketpair(&mut el, conn_index);
         // A small send buffer, so a 16 KiB send cannot complete while the
         // peer does not read. Then only the fixed slot holds our end.
@@ -6962,7 +6962,7 @@ mod tests {
         );
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
 
         // Hold three of the four slots so only one is free.
         let (_f1, _, _) = el.driver.send_copy_pool.copy_in(b"a").unwrap();
@@ -7003,7 +7003,7 @@ mod tests {
         );
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         assert_eq!(el.driver.send_copy_pool.free_count(), 4);
 
         // 300 bytes over 64-byte slots needs 5 slots; the pool has 4.
@@ -7037,7 +7037,7 @@ mod tests {
         );
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
 
         // Pool of 6, one slot held, a 4-slot send: the final free count then
         // tells "reservation consumed" (1 free) from "reservation still
@@ -7158,7 +7158,7 @@ mod tests {
         );
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
 
         el.driver.ring.force_push_failures(1);
@@ -7389,7 +7389,7 @@ mod tests {
         );
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let id = el.executor.register_send(conn_index);
 
         // The initial push and both retries are refused.
@@ -7461,7 +7461,7 @@ mod tests {
         );
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
 
         el.driver.ring.force_push_failures(1);
@@ -7692,7 +7692,7 @@ mod tests {
         );
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         el.driver.ring.force_push_failures(1);
         el.driver
             .make_ctx()
@@ -7980,7 +7980,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
 
         el.driver.chain_table.start(conn_index, 1);
         {
@@ -8022,7 +8022,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let free_before = el.driver.send_copy_pool.free_count();
 
@@ -8114,7 +8114,7 @@ mod tests {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         el.driver.connections.release(conn_index);
         let free_before = el.driver.send_copy_pool.free_count();
 
@@ -8160,7 +8160,7 @@ mod tests {
 
         el.driver
             .make_ctx()
-            .close(crate::handler::ConnToken::new(conn_index, generation));
+            .close(crate::handler::ConnId::new(conn_index, generation));
 
         assert!(
             el.driver.send_queues[conn_index as usize]
@@ -8213,7 +8213,7 @@ mod tests {
 
         {
             let mut ctx = el.driver.make_ctx();
-            ctx.close(crate::handler::ConnToken::new(conn_index, generation));
+            ctx.close(crate::handler::ConnId::new(conn_index, generation));
         }
         assert!(el.driver.send_queues[conn_index as usize].close_pending);
 
@@ -11363,7 +11363,7 @@ mod tests {
     /// `DriverCtx::send_bounded`, mark it submitted.
     fn admit_bounded_send(
         el: &mut AsyncEventLoop<NoopHandler>,
-        conn: crate::handler::ConnToken,
+        conn: crate::handler::ConnId,
         data: &[u8],
         required_slots: usize,
     ) -> SendId {
@@ -11587,7 +11587,7 @@ mod tests {
         let mut el = tls_bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, peer_fd) = attach_socketpair(&mut el, conn_index);
         let mut peer = install_handshaked_tls_with_peer(&mut el, conn_index);
 
@@ -11628,7 +11628,7 @@ mod tests {
         let mut el = tls_bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, peer_fd) = attach_socketpair(&mut el, conn_index);
         let mut peer = install_handshaked_tls_with_peer(&mut el, conn_index);
 
@@ -11656,7 +11656,7 @@ mod tests {
         let mut el = tls_bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, peer_fd) = attach_socketpair(&mut el, conn_index);
         let mut peer = install_handshaked_tls_with_peer(&mut el, conn_index);
 
@@ -11706,7 +11706,7 @@ mod tests {
         );
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, _peer_fd) = attach_socketpair(&mut el, conn_index);
         install_handshaked_tls(&mut el, conn_index);
         assert_eq!(
@@ -11763,7 +11763,7 @@ mod tests {
         let mut el = tls_bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
         install_handshaked_tls(&mut el, conn_index);
 
@@ -11828,7 +11828,7 @@ mod tests {
         let mut el = tls_bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
         install_handshaked_tls(&mut el, conn_index);
 
@@ -11877,7 +11877,7 @@ mod tests {
         let mut el = tls_bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
         install_handshaked_tls(&mut el, conn_index);
 
@@ -11923,7 +11923,7 @@ mod tests {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
 
         let id = admit_bounded_send(&mut el, token, b"hello", 1);
@@ -11966,7 +11966,7 @@ mod tests {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
 
         // 100 bytes over 64-byte slots: chunks of 64 and 36.
@@ -12010,7 +12010,7 @@ mod tests {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
 
         // 150 bytes over 64-byte slots: chunks of 64, 64 and 22.
@@ -12042,7 +12042,7 @@ mod tests {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
 
         let id = admit_bounded_send(&mut el, token, b"", 0);
         assert!(
@@ -13183,7 +13183,7 @@ mod tests {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
 
         // The initial push and both retries are refused.
         el.driver.ring.force_push_failures(3);
@@ -13230,7 +13230,7 @@ mod tests {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
 
         // A send is already in flight, so the whole message queues.
         el.driver.send_queues[conn_index as usize].in_flight = true;
@@ -13275,7 +13275,7 @@ mod tests {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
 
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let id = admit_bounded_send(&mut el, token, b"abandoned", 1);
@@ -13370,7 +13370,7 @@ mod tests {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
-        let token = crate::handler::ConnToken::new(conn_index, generation);
+        let token = crate::handler::ConnId::new(conn_index, generation);
         let (_ours, peer) = attach_socketpair(&mut el, conn_index);
 
         let id = admit_bounded_send(&mut el, token, b"delivered", 1);

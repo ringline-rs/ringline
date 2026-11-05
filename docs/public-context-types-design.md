@@ -1,7 +1,7 @@
 # Removing the public context types
 
 **Status:** approved, 2026-11-04, including both [owner decisions](#owner-decisions).
-Series for 0.7.0. Steps 1 and 2 landed in #737 and #738. Follows
+Series for 0.7.0. Steps 1 to 4 landed in #737, #738, #739 and #740. Follows
 `docs/connection-handle-ownership-design.md`, which moved reading and writing
 onto `RecvHalf` and `SendHalf` and left `ConnCtx` as a `Copy` token.
 
@@ -214,8 +214,10 @@ which compares it, so the name no longer describes it. `ConnId` keeps `index()`,
 `token()`. The `index()` methods on `Connection` and `SendHalf` are removed; the
 examples that log them use `id().index()`.
 
-`ConnId` is `Send`, and has no operations that reach a driver, so using one on
-the wrong worker can only produce a wrong comparison.
+`ConnId` is `Send`, and no method on it reaches a driver. An id used on the wrong
+worker gives a wrong comparison, and on a pool's `mark_disconnected` that closes
+an unrelated connection. A pool cannot cross workers, so this needs an id sent
+by hand.
 
 ## `UdpCtx` becomes `UdpSocket`
 

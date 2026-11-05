@@ -94,20 +94,27 @@ impl ConnSendState {
     }
 }
 
-/// Opaque connection token handed to the handler.
-/// Encodes the connection index and generation for stale detection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConnToken {
+/// Identifies a connection, from `id()` on [`Connection`](crate::Connection), its
+/// halves and the protocol clients.
+///
+/// Encodes the connection index and generation, so an id does not match a later
+/// connection in the same slot until the slot's `u32` generation wraps. It
+/// compares and hashes. No public method takes one except `mark_disconnected` on
+/// the protocol pools. Ids are per worker, and two workers can hold equal ids, so
+/// compare them or use them as keys only on the worker that owns the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnId {
     pub(crate) index: u32,
     pub(crate) generation: u32,
 }
 
-impl ConnToken {
+impl ConnId {
     pub(crate) fn new(index: u32, generation: u32) -> Self {
-        ConnToken { index, generation }
+        ConnId { index, generation }
     }
 
-    /// Returns the connection slot index. Useful for indexing into per-connection arrays.
+    /// The connection's slot index on its worker. A later connection can reuse
+    /// the slot; use the whole `ConnId` to tell them apart.
     pub fn index(&self) -> usize {
         self.index as usize
     }
@@ -349,7 +356,7 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Get TLS session information for a connection.
-    pub fn tls_info(&self, conn: ConnToken) -> Option<crate::tls::TlsInfo> {
+    pub fn tls_info(&self, conn: ConnId) -> Option<crate::tls::TlsInfo> {
         let cs = self.connections.get(conn.index)?;
         if cs.generation != conn.generation {
             return None;
@@ -384,7 +391,7 @@ impl<'a> DriverCtx<'a> {
     /// lets it emit records the peer will reject.
     ///
     /// The caller has checked that `conn` is current and has TLS state.
-    fn encrypt_tls_send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<Vec<BuiltSend>> {
+    fn encrypt_tls_send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<Vec<BuiltSend>> {
         // SAFETY: read-only probe; see the `tls_table` field's contract.
         if unsafe { (*self.tls_table).close_notify_sent(conn.index) } {
             return Err(close_notify_sent_error());
@@ -456,7 +463,7 @@ impl<'a> DriverCtx<'a> {
     /// rustls mutates, so the same holds there (see `encrypt_tls_send`,
     /// which also names the one case that stays fatal). The user-facing
     /// contract lives on `SendHalf::send`.
-    pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
+    pub fn send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<()> {
         self.send_inner(conn, data, None)
     }
 
@@ -465,7 +472,7 @@ impl<'a> DriverCtx<'a> {
     /// queued and `id` is the caller's to cancel.
     pub(crate) fn send_awaited(
         &mut self,
-        conn: ConnToken,
+        conn: ConnId,
         data: &[u8],
         id: crate::runtime::send_completion::SendId,
     ) -> io::Result<()> {
@@ -474,7 +481,7 @@ impl<'a> DriverCtx<'a> {
 
     fn send_inner(
         &mut self,
-        conn: ConnToken,
+        conn: ConnId,
         data: &[u8],
         id: Option<crate::runtime::send_completion::SendId>,
     ) -> io::Result<()> {
@@ -636,7 +643,7 @@ impl<'a> DriverCtx<'a> {
     /// operation and closes the connection.
     pub(crate) fn send_bounded(
         &mut self,
-        conn: ConnToken,
+        conn: ConnId,
         data: &[u8],
         id: crate::runtime::send_completion::SendId,
     ) -> io::Result<()> {
@@ -1003,7 +1010,7 @@ impl<'a> DriverCtx<'a> {
     ///
     /// Returns a [`SendChainBuilder`]. Call `.copy()`, `.parts()...add()` to
     /// add SQEs, then `.finish()` to submit.
-    pub fn send_chain(&mut self, conn: ConnToken) -> SendChainBuilder<'_, 'a> {
+    pub fn send_chain(&mut self, conn: ConnId) -> SendChainBuilder<'_, 'a> {
         // SAFETY: read-only probe; see the `tls_table` field's contract.
         let tls = !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) };
         SendChainBuilder {
@@ -1022,7 +1029,7 @@ impl<'a> DriverCtx<'a> {
     /// completion once `finish` submits it.
     pub(crate) fn send_chain_awaited(
         &mut self,
-        conn: ConnToken,
+        conn: ConnId,
         id: crate::runtime::send_completion::SendId,
     ) -> SendChainBuilder<'_, 'a> {
         let mut builder = self.send_chain(conn);
@@ -1031,7 +1038,7 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Begin building a scatter-gather send with mixed copy + zero-copy guard parts.
-    pub fn send_parts(&mut self, conn: ConnToken) -> SendBuilder<'_, 'a> {
+    pub fn send_parts(&mut self, conn: ConnId) -> SendBuilder<'_, 'a> {
         SendBuilder {
             ctx: self,
             conn,
@@ -1057,7 +1064,7 @@ impl<'a> DriverCtx<'a> {
     /// submitting it, forced `in_flight = false` while a send SQE was still
     /// in the kernel, and submitted Close directly — orphaning the send's
     /// CQE past its connection slot's lifetime.
-    pub fn close(&mut self, conn: ConnToken) {
+    pub fn close(&mut self, conn: ConnId) {
         if let Some(conn_state) = self.connections.get_mut(conn.index) {
             if conn_state.generation != conn.generation {
                 return;
@@ -1115,7 +1122,7 @@ impl<'a> DriverCtx<'a> {
     ///
     /// If sends are in-flight or queued, the shutdown is deferred until the
     /// send queue drains to avoid racing with pending Send SQEs.
-    pub fn shutdown_write(&mut self, conn: ConnToken) {
+    pub fn shutdown_write(&mut self, conn: ConnId) {
         let Some(cs) = self.connections.get_mut(conn.index) else {
             return;
         };
@@ -1154,7 +1161,7 @@ impl<'a> DriverCtx<'a> {
     pub(crate) fn start_connect(
         &mut self,
         addr: SocketAddr,
-    ) -> Result<ConnToken, crate::error::Error> {
+    ) -> Result<ConnId, crate::error::Error> {
         let conn_index = self
             .connections
             .allocate_outbound()
@@ -1228,7 +1235,7 @@ impl<'a> DriverCtx<'a> {
             return Err(crate::error::Error::Io(e));
         }
 
-        Ok(ConnToken::new(conn_index, generation))
+        Ok(ConnId::new(conn_index, generation))
     }
 
     /// Start an outbound Unix domain socket connection. Returns its token
@@ -1236,7 +1243,7 @@ impl<'a> DriverCtx<'a> {
     pub(crate) fn start_connect_unix(
         &mut self,
         path: &std::path::Path,
-    ) -> Result<ConnToken, crate::error::Error> {
+    ) -> Result<ConnId, crate::error::Error> {
         let conn_index = self
             .connections
             .allocate_outbound()
@@ -1291,7 +1298,7 @@ impl<'a> DriverCtx<'a> {
             return Err(crate::error::Error::Io(e));
         }
 
-        Ok(ConnToken::new(conn_index, generation))
+        Ok(ConnId::new(conn_index, generation))
     }
 
     /// Start an outbound TLS connection. Returns its token immediately; the
@@ -1301,7 +1308,7 @@ impl<'a> DriverCtx<'a> {
         &mut self,
         addr: SocketAddr,
         server_name: &str,
-    ) -> Result<ConnToken, crate::error::Error> {
+    ) -> Result<ConnId, crate::error::Error> {
         if self.tls_table.is_null() {
             return Err(crate::error::Error::RingSetup(
                 "TLS not configured".to_string(),
@@ -1405,7 +1412,7 @@ impl<'a> DriverCtx<'a> {
             return Err(crate::error::Error::Io(e));
         }
 
-        Ok(ConnToken::new(conn_index, generation))
+        Ok(ConnId::new(conn_index, generation))
     }
 
     // ── NVMe passthrough methods ──────────────────────────────────────────
@@ -2573,7 +2580,7 @@ impl<'a> DriverCtx<'a> {
     ///
     /// For TLS connections, data is encrypted and written directly to the
     /// TcpStream (bypassing the pending send queue).
-    pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
+    pub fn send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<()> {
         self.send_inner(conn, data, None)
     }
 
@@ -2583,7 +2590,7 @@ impl<'a> DriverCtx<'a> {
     /// cancel.
     pub(crate) fn send_awaited(
         &mut self,
-        conn: ConnToken,
+        conn: ConnId,
         data: &[u8],
         id: crate::runtime::send_completion::SendId,
     ) -> io::Result<()> {
@@ -2592,7 +2599,7 @@ impl<'a> DriverCtx<'a> {
 
     fn send_inner(
         &mut self,
-        conn: ConnToken,
+        conn: ConnId,
         data: &[u8],
         id: Option<crate::runtime::send_completion::SendId>,
     ) -> io::Result<()> {
@@ -2656,7 +2663,7 @@ impl<'a> DriverCtx<'a> {
     /// `Executor`'s send-capacity FIFO says it is this id's turn.
     pub(crate) fn send_bounded(
         &mut self,
-        conn: ConnToken,
+        conn: ConnId,
         data: &[u8],
         id: crate::runtime::send_completion::SendId,
     ) -> io::Result<()> {
@@ -2824,7 +2831,7 @@ impl<'a> DriverCtx<'a> {
     /// buffers, executor cleanup, slot release) to the event loop's
     /// drain_pending_closes — releasing the slot here left the executor's
     /// parked future and waiter flags alive into the slot's next occupant.
-    pub fn close(&mut self, conn: ConnToken) {
+    pub fn close(&mut self, conn: ConnId) {
         if let Some(cs) = self.connections.get_mut(conn.index) {
             if cs.generation != conn.generation {
                 return;
@@ -2841,7 +2848,7 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Get TLS session info for a connection.
-    pub fn tls_info(&self, conn: ConnToken) -> Option<crate::tls::TlsInfo> {
+    pub fn tls_info(&self, conn: ConnId) -> Option<crate::tls::TlsInfo> {
         let cs = self.connections.get(conn.index)?;
         if cs.generation != conn.generation {
             return None;
@@ -2856,7 +2863,7 @@ impl<'a> DriverCtx<'a> {
     /// Shut down the write half of a connection.
     ///
     /// Flushes any buffered pending sends before issuing the TCP half-close.
-    pub fn shutdown_write(&mut self, conn: ConnToken) {
+    pub fn shutdown_write(&mut self, conn: ConnId) {
         let idx = conn.index as usize;
         let Some(cs) = self.connections.get_mut(conn.index) else {
             return;
@@ -2887,7 +2894,7 @@ impl<'a> DriverCtx<'a> {
     pub(crate) fn start_connect(
         &mut self,
         addr: SocketAddr,
-    ) -> Result<ConnToken, crate::error::Error> {
+    ) -> Result<ConnId, crate::error::Error> {
         let conn_index = self
             .connections
             .allocate_outbound()
@@ -2928,14 +2935,14 @@ impl<'a> DriverCtx<'a> {
         }
 
         let generation = self.connections.generation(conn_index);
-        Ok(ConnToken::new(conn_index, generation))
+        Ok(ConnId::new(conn_index, generation))
     }
 
     /// Unix domain socket connects are not implemented on mio.
     pub(crate) fn start_connect_unix(
         &mut self,
         _path: &std::path::Path,
-    ) -> Result<ConnToken, crate::error::Error> {
+    ) -> Result<ConnId, crate::error::Error> {
         Err(crate::error::Error::Io(io::Error::other(
             "mio connect_unix not yet implemented",
         )))
@@ -2960,7 +2967,7 @@ impl<'a> DriverCtx<'a> {
         &mut self,
         addr: SocketAddr,
         server_name: &str,
-    ) -> Result<ConnToken, crate::error::Error> {
+    ) -> Result<ConnId, crate::error::Error> {
         if self.tls_table.is_null() {
             return Err(crate::error::Error::RingSetup(
                 "TLS not configured".to_string(),
@@ -3631,7 +3638,7 @@ enum PartSlot {
 /// Builder for scatter-gather sends with mixed copy + zero-copy guard parts.
 pub struct SendBuilder<'b, 'a> {
     ctx: &'b mut DriverCtx<'a>,
-    conn: ConnToken,
+    conn: ConnId,
     parts: [PartSlot; MAX_IOVECS],
     part_count: u8,
     copy_slices: [(*const u8, usize); MAX_IOVECS],
@@ -4091,7 +4098,7 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
 /// Passed to the closure given to [`SendHalf::send_chain`](crate::SendHalf::send_chain).
 pub struct SendChainBuilder<'b, 'a> {
     ctx: &'b mut DriverCtx<'a>,
-    conn: ConnToken,
+    conn: ConnId,
     built: Vec<BuiltSend>,
     /// On a TLS connection, the chain's plaintext in order. The parts are not
     /// sent as linked SQEs: `finish` encrypts them as one send through the

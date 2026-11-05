@@ -112,9 +112,9 @@ impl H1Conn {
         self.peer_will_close
     }
 
-    /// The connection's identity token, for pool bookkeeping.
-    pub fn token(&self) -> ringline::ConnToken {
-        self.tx.token()
+    /// This connection's [`ConnId`](ringline::ConnId).
+    pub fn id(&self) -> ringline::ConnId {
+        self.tx.id()
     }
 
     /// Is the connection still usable?

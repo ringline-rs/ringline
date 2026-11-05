@@ -191,7 +191,7 @@ Close, on both backends: only `close_connection` (and the `DriverCtx` close) mov
 
 Connection state is three fields on `ConnectionState`: `read` (the TCP read half as we observed it: `Open`, `Eof { truncated }`, `Error`), `lifecycle` (`Inactive`/`Connecting`/`Open`/`Closing`), and `write` (the TCP write half as we drive it: `Open`, `ShutdownPending`, `Shutdown`). Readers ask `recv_finished()` ("resolve to EOF instead of parking?") or `close_requested()` ("is a close already pending?") rather than matching variants; a peer FIN sets `read` first and then requests the close, so the two steps stay visible. Design: `docs/connection-state-model-design.md`.
 
-Generation-based stale detection: `ConnToken(index, generation)` prevents use-after-close when slots are reused. Completion handlers must check the generation before acting on a CQE — slots recycle while CQEs for the old occupant may still be in flight.
+Generation-based stale detection: `ConnId(index, generation)` prevents use-after-close when slots are reused. Completion handlers must check the generation before acting on a CQE — slots recycle while CQEs for the old occupant may still be in flight.
 
 ### Waker Implementation
 

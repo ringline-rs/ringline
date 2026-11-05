@@ -82,7 +82,7 @@ pub struct ConnectionState {
     pub write: WriteHalf,
     /// Whether the connection is active.
     pub active: bool,
-    /// Generation counter to detect stale ConnTokens.
+    /// Generation counter to detect stale ConnIds.
     ///
     /// `u32` wraps after 2^32 close/reuse cycles on the same slot — at a
     /// sustained 10 000 reuses per second per slot that's ~5 days, at

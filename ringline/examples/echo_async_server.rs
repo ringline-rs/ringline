@@ -15,7 +15,10 @@ impl AsyncEventHandler for AsyncEcho {
         let worker_id = self.worker_id;
         async move {
             let (mut tx, mut rx) = conn.split();
-            eprintln!("[worker {worker_id}] accepted connection {}", tx.index());
+            eprintln!(
+                "[worker {worker_id}] accepted connection {}",
+                tx.id().index()
+            );
             loop {
                 let consumed = rx
                     .with_data(|data| {
@@ -29,7 +32,7 @@ impl AsyncEventHandler for AsyncEcho {
                     break;
                 }
             }
-            eprintln!("[worker {worker_id}] connection {} closed", tx.index());
+            eprintln!("[worker {worker_id}] connection {} closed", tx.id().index());
         }
     }
 
