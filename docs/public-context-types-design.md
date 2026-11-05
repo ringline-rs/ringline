@@ -1,7 +1,7 @@
 # Removing the public context types
 
-**Status:** proposal, 2026-11-04, with two open owner decisions (see
-[Open decisions](#open-decisions)). Series for 0.7.0. Follows
+**Status:** approved, 2026-11-04, including both [owner decisions](#owner-decisions).
+Series for 0.7.0. Step 1 landed in #737. Follows
 `docs/connection-handle-ownership-design.md`, which moved reading and writing
 onto `RecvHalf` and `SendHalf` and left `ConnCtx` as a `Copy` token.
 
@@ -179,7 +179,7 @@ Across the series:
   on a connection held by a client.
 - A dropped half cannot be taken again.
 - `DriverCtx::close` is the only close bounded by `close_notify_timeout_ms`. See
-  [Open decisions](#open-decisions).
+  [Owner decisions](#owner-decisions).
 
 ### Consumers checked
 
@@ -238,9 +238,11 @@ One call site needs `split`: the fast path in
 each datagram to `quinn-proto` and send after the receive future has finished, so
 the borrows do not overlap there.
 
-## Open decisions
+## Owner decisions
 
-### Should dropping a connection close it?
+### Dropping a connection closes it
+
+Approved 2026-11-04.
 
 `Drop` for `SendHalf` and `RecvHalf` only clears the claim flag, so dropping an
 outbound `Connection`, or a client built on one, leaves the socket open and the
@@ -253,10 +255,9 @@ The removal does not force a runtime change. That crate can wrap the client in a
 type whose `Drop` calls `Client::close`. Without a change, a connection dropped
 with no `close` leaks its slot, as it does today.
 
-The proposal is that dropping the last half closes the connection, with the same
-graceful close as `Connection::close`. Inbound connections keep their second
-trigger: `on_accept`'s task ending closes the connection even if a half has moved
-to a spawned task.
+Dropping the last half closes the connection, with the same graceful close as
+`Connection::close`. Inbound connections keep their second trigger: `on_accept`'s
+task ending closes the connection even if a half has moved to a spawned task.
 
 - Dropping a half clears its claim flag. If the other half's flag is also clear,
   the connection closes. `recv_half_taken` and `send_half_taken` stay for this
@@ -299,15 +300,17 @@ inside the block: five in `tests/teardown_drops.rs`, `Sleeps` in
 `peer_fin.rs` would otherwise keep passing without testing FIN detection. The scan
 was static, so a run of the full suite on both backends has to confirm the count.
 
-### What happens to `close_notify_timeout_ms`?
+### `close_notify_timeout_ms` is removed
+
+Approved 2026-11-04.
 
 `DriverCtx::close` arms a deadline for a TLS close. `close_connection_graceful`,
 behind `Connection::close` and a handler return, arms none, and its drain is
 unbounded. With `DriverCtx` private, the public knob applies only to the two
 fatal encrypt closes in `handler.rs`, and it is already inert on mio.
 
-The recommendation is to remove `ConfigBuilder::close_notify_timeout_ms` and keep
-a fixed 5 s bound on those internal closes. `Connection::close` stays unbounded,
+Remove `ConfigBuilder::close_notify_timeout_ms` and keep a fixed 5 s bound on
+those internal closes. `Connection::close` stays unbounded,
 as it is for plaintext. Bounding a close against a peer that stops reading is a
 separate change that would apply to TLS and plaintext alike.
 `a_slow_reader_gets_the_whole_reply_before_close_notify` sets the knob to 300 ms.
@@ -315,7 +318,7 @@ It moves to a unit test that checks `close_notify_deadline` stays `None` after
 `close_connection_graceful`, because a 3.5 s drain cannot fail against a 5 s
 bound.
 
-The alternative is to arm the deadline in `close_connection_graceful`, which keeps
+The rejected alternative was to arm the deadline in `close_connection_graceful`, which keeps
 the knob meaningful on io_uring, makes TLS and plaintext closes differ, and cuts
 off a TLS peer whose reply takes longer than the timeout to drain.
 `a_slow_reader_gets_the_whole_reply_before_close_notify` asserts the opposite and
@@ -335,7 +338,7 @@ Each step is one PR, and all are breaking.
    decision lands.
 4. `ConnToken` becomes `ConnId`.
 5. `UdpCtx` becomes `UdpSocket`.
-6. If approved, dropping the last half closes the connection.
+6. Dropping the last half closes the connection.
 
 `README.md`, `ringline/README.md`, the client READMEs, `docs/architecture.md`,
 `docs/tls-unbuffered-design.md` and `CLAUDE.md` describe these types. Each step corrects what it removes, and step 1
