@@ -2,17 +2,17 @@
 
 **ringline-native Redis client.**
 
-A RESP protocol client built on [`ringline::ConnCtx`](https://docs.rs/ringline) for
+A RESP protocol client built on [`ringline::Connection`](https://docs.rs/ringline) for
 use inside the ringline async runtime. Single-threaded, single-connection,
 zero-copy recv.
 
 ## Quick Start
 
 ```rust
-use ringline::ConnCtx;
+use ringline::Connection;
 use ringline_redis::Client;
 
-async fn example(conn: ConnCtx) -> Result<(), ringline_redis::Error> {
+async fn example(conn: Connection) -> Result<(), ringline_redis::Error> {
     let mut client = Client::new(conn);
     client.set("hello", "world").await?;
     let val = client.get("hello").await?;

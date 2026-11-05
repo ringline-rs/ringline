@@ -51,8 +51,10 @@ that.
   `shutdown_write` take `&mut self`, and a `Connection` accessor would allow a
   read past bytes cached in `fill_buf`. Today a caller writes
   `ConnStream::new(conn.as_conn())` and keeps `conn`, which leaves two values
-  that can read one connection. `ConnStream` grows by 8 bytes, so the limit in
-  `conn_stream_size` moves from 48 to 56.
+  that can read one connection. `eof_truncated()` and `is_recv_direct()` are
+  added to `ConnStream`, because a caller that gave up the `Connection` needs
+  them; a `ConnStream` read does not report `recv_arrival`. `ConnStream` grows by
+  8 bytes, so the limit in `conn_stream_size` moves from 48 to 56.
 - `mark_disconnected` on the redis, memcache and ping pools takes a `ConnToken`,
   and then a `ConnId` from the rename onward. It only compares the value.
 - `RecvHalf::forward_to_conn` and `Connection::forward_to_conn` return one type
@@ -90,7 +92,8 @@ example in `runtime/cancellation.rs` takes a `Connection`.
 | `stream_echo.rs`, `throughput.rs`, `recv_direct.rs:590`, `echo_stream_server` | pass the `Connection` to `ConnStream::new` |
 | `fs_fd_ownership.rs`, `disk_io_stale_results.rs`, `disk_io_teardown_buffers*.rs` | split, and move the `SendHalf` into the task that closes |
 | `tls_echo.rs:2118` (`EPROTOTYPE` on a TLS sink) | go through `RecvHalf::forward_to_conn` |
-| `echo.rs:7692`, `recv_direct.rs:781` (second forward on a source) | the concurrent case becomes a `compile_fail` doctest on `ForwardFuture`; the tests keep the assertion that a forward succeeds after the first is dropped, using `drop(source.forward_to_conn(&mut tx, 1))` |
+| `echo.rs:7692` (second forward on a source) | the concurrent case becomes a `compile_fail` doctest on `RecvHalf`; the test keeps `EBUSY` through a leaked forward |
+| `recv_direct.rs:781` (forward after a dropped forward) | keeps the assertion, using `drop(source.forward_to_conn(&mut tx, 1))` |
 | `forward_to_conn_refuses_stale_slots_and_a_claimed_sink` | drops the claimed-sink case and calls `direct_forward` with an in-crate sink |
 | `echo.rs:7806` (`take_recv` while claimed) | removed |
 

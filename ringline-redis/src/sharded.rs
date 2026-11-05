@@ -102,11 +102,8 @@ impl ShardedConfig {
 enum ShardConn {
     /// A pooled connection *is* a client.
     ///
-    /// The slot used to hold a bare `ConnCtx` and `route_command` built a
-    /// throwaway `Client` per command. Once the halves became claims (#439,
-    /// #440) that meant a `split()` — two driver round trips and two claim
-    /// writes — plus a client construction, on every command. Owning the
-    /// client here costs one split per *connection* instead.
+    /// Owning the client costs one construction per connection rather than one
+    /// per command.
     ///
     /// Boxed so the enum is a pointer rather than a whole `Client` per slot.
     Connected(Box<Client>),

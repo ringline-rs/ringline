@@ -12,7 +12,7 @@
 //!   - `handler` — `AsyncEventHandler` trait (references `DriverCtx` by borrowed ref only)
 //!
 //! - **Backend-specific** (tied to the concrete `Driver` type):
-//!   - `io` — `ConnCtx`, futures (`WithDataFuture`, `SendFuture`, `ConnectFuture`)
+//!   - `io` — `Connection`, futures (`WithDataFuture`, `SendFuture`, `ConnectFuture`)
 //!     accesses `Driver` via thread-local pointer
 //!
 //! A mio backend would provide an alternative `driver.rs`, `async_event_loop.rs`,

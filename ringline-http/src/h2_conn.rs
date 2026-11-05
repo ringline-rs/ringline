@@ -326,7 +326,7 @@ fn dispatch_h2_events(
 
 /// Async HTTP/2 connection with multiplexed request support.
 ///
-/// Wraps a sans-IO `H2Connection` and a `ConnCtx`, providing a pump loop
+/// Wraps a sans-IO `H2Connection` and a `Connection`, providing a pump loop
 /// that bridges bytes between the transport and the H2 state machine.
 pub struct H2AsyncConn {
     tx: SendHalf,

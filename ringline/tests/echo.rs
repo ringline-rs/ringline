@@ -81,7 +81,7 @@ impl AsyncEventHandler for BurstSender {
 
 // ── Split-halves echo handler ──────────────────────
 
-/// Echoes through `ConnCtx::split()`.
+/// Echoes through `Connection::split()`.
 ///
 /// The send happens *inside* the `with_data` closure, while the read side is
 /// mutably borrowed by the in-flight recv future. That is the whole point of
@@ -671,7 +671,7 @@ impl AsyncEventHandler for RequestShutdownHandler {
             rx.with_data(|data| {
                 // Echo back, then request shutdown.
                 let _ = tx.send_nowait(data);
-                tx.request_shutdown();
+                ringline::request_shutdown().unwrap();
                 ParseResult::Consumed(data.len())
             })
             .await;
@@ -787,9 +787,9 @@ impl AsyncEventHandler for SleepEchoHandler {
 
             // Several producers feeding one connection is an explicit queue
             // drained by the task that owns the write half — the documented
-            // alternative to a shared send handle, and now the only one: the
-            // send half is not `Clone`, and `ConnCtx` no longer carries the
-            // capability. See `docs/connection-handle-ownership-design.md`.
+            // alternative to a shared send handle, and the only one: the send
+            // half is not `Clone`. See
+            // `docs/connection-handle-ownership-design.md`.
             let (outbox, drain) = ringline::mpsc::channel::<Vec<u8>>(8);
             ringline::spawn(async move {
                 while let Some(msg) = drain.recv().await {
@@ -4044,7 +4044,7 @@ impl AsyncEventHandler for StandaloneConnectHandler {
             }
 
             // Spawn a standalone task that connects to the backend.
-            // ConnCtx is Copy — standalone tasks can use it for send().
+            // The send half moves into the task.
             ringline::spawn(async move {
                 let backend = match ringline::connect(backend_addr).await {
                     Ok(ctx) => ctx,
@@ -7683,26 +7683,27 @@ impl AsyncEventHandler for BusyForwardProxy {
                 Err(_) => return,
             };
 
-            // Hold one forward open (far more than the client will send), then
-            // ask for a second on the same connection while the first is live.
-            // Two forwards *in flight at once* is what this test is about, and
-            // `&mut RecvHalf` makes that a compile error rather than the
-            // runtime `EBUSY` being asserted here. Go through the `Copy`
-            // handle so the refusal is still exercised.
-            let client_ctx = client.as_conn();
-            // Bound so the `ConnCtx` outlives both borrows.
-            let backend_ctx = backend.as_conn();
-            let first = client_ctx.forward_to_conn(&backend_ctx, 1 << 30);
-            let second = client_ctx.forward_to_conn(&backend_ctx, 16);
+            // Two forwards in flight at once are a compile error through
+            // `&mut RecvHalf`. A leaked forward leaves the source marked as
+            // forwarding, and the driver refuses a further forward on that mark.
+            let (mut backend_tx, _backend_rx) = backend.split();
+            std::mem::forget(client.forward_to_conn(&mut backend_tx, 1 << 30));
+            let second = client.forward_to_conn(&mut backend_tx, 16);
             let errno = match second.await {
                 Ok(_) => -1,
                 Err(e) => e.raw_os_error().unwrap_or(-1),
             };
+            // Dropping a refused future leaves the leaked forward in place, so
+            // the next forward is refused as well.
+            let third = match client.forward_to_conn(&mut backend_tx, 0).await {
+                Ok(_) => -1,
+                Err(e) => e.raw_os_error().unwrap_or(-1),
+            };
+            let errno = if third == errno { errno } else { -1 };
             let _ = BUSY_FORWARD_ERRNO.set(errno);
             // Report it on the wire so the test sees it without shared state
             // timing games.
             let _ = client.send_nowait(&errno.to_be_bytes());
-            drop(first);
         }
     }
 
@@ -7786,68 +7787,6 @@ fn split_halves_echo_round_trip() {
     let big: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
     assert_eq!(echo_round_trip(&addr, &big), big);
 
-    shutdown.shutdown();
-    for h in handles {
-        h.join().unwrap().unwrap();
-    }
-}
-
-/// The read side is exclusive on **both** backends: a second `split()` on a
-/// connection whose half is still out must be refused with `EBUSY`.
-///
-/// The verdict travels over the wire because the mio event loop has no
-/// in-process test harness for driver state — asserting through a real
-/// connection is what works uniformly on both.
-struct DoubleSplitReporter;
-
-impl AsyncEventHandler for DoubleSplitReporter {
-    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
-        async move {
-            let ctx = conn.as_conn();
-            let (mut tx, _rx) = conn.split();
-            // `_rx` is still alive, so the read side is still claimed. The
-            // handler was handed the only legitimate claim at accept time, so
-            // this asks the underlying handle for a second one.
-            let verdict = match ctx.take_recv() {
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => "EBUSY",
-                Err(_) => "WRONG-ERRNO",
-                Ok(_) => "HANDED-OUT-TWICE",
-            };
-            let _ = tx.send_nowait(verdict.as_bytes());
-            // Hold the halves until the client has read the verdict.
-            ringline::sleep(Duration::from_millis(200)).await;
-        }
-    }
-    fn create_for_worker(_id: usize) -> Self {
-        DoubleSplitReporter
-    }
-}
-
-#[test]
-fn a_second_split_is_refused_on_both_backends() {
-    let (shutdown, handles) = RinglineBuilder::new(test_config())
-        .bind("127.0.0.1:0".parse().unwrap())
-        .launch::<DoubleSplitReporter>()
-        .expect("launch failed");
-    let addr = shutdown
-        .bound_addr()
-        .expect("bound_addr after a TCP bind")
-        .to_string();
-    wait_for_server(&addr);
-
-    let mut stream = TcpStream::connect(&addr).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut buf = [0u8; 32];
-    let n = stream.read(&mut buf).expect("verdict from the handler");
-    assert_eq!(
-        &buf[..n],
-        b"EBUSY",
-        "a second split while the read half is live must be refused with EBUSY"
-    );
-
-    drop(stream);
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();

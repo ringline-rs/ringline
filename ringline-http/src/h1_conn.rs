@@ -1,6 +1,6 @@
 //! HTTP/1.1 connection.
 //!
-//! Simple request-response on a single `ConnCtx`. No multiplexing — each
+//! Simple request-response on a single `Connection`. No multiplexing — each
 //! request blocks until its response is fully received.
 
 use std::net::SocketAddr;
@@ -29,7 +29,7 @@ pub const DEFAULT_MAX_TRAILER_SECTION: usize = 4 * 1024;
 /// `Content-Length` bodies and the cumulative size of chunked bodies.
 pub const DEFAULT_MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 
-/// An HTTP/1.1 connection wrapping a `ConnCtx`.
+/// An HTTP/1.1 connection wrapping a `Connection`.
 pub struct H1Conn {
     tx: SendHalf,
     rx: RecvHalf,

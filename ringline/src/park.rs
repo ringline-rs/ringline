@@ -41,7 +41,7 @@ pub(crate) struct ParkedFd {
 /// # Why this is not statically typed
 ///
 /// The state crosses from a connection handle to the handler, and
-/// `Connection`/`ConnCtx` are plain tokens — not generic over the handler
+/// `Connection` holds plain indices — not generic over the handler
 /// type. So the deposit site cannot name the handler's state type, and an
 /// associated type on the handler trait would give a typed *take* while
 /// leaving the *deposit* untyped: the mismatch would move rather than

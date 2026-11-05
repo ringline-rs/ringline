@@ -20,8 +20,9 @@ impl AsyncEventHandler for StreamEcho {
     fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         let worker_id = self.worker_id;
         async move {
-            eprintln!("[worker {worker_id}] accepted connection {}", conn.index());
-            let mut stream = ConnStream::new(conn.as_conn());
+            let index = conn.index();
+            eprintln!("[worker {worker_id}] accepted connection {index}");
+            let mut stream = ConnStream::new(conn);
 
             // AsyncBufRead::fill_buf returns a zero-copy slice into the recv
             // accumulator. No memcpy on the read side.
@@ -41,7 +42,7 @@ impl AsyncEventHandler for StreamEcho {
                 }
                 futures_util::AsyncBufReadExt::consume_unpin(&mut stream, n);
             }
-            eprintln!("[worker {worker_id}] connection {} closed", conn.index());
+            eprintln!("[worker {worker_id}] connection {index} closed");
         }
     }
 

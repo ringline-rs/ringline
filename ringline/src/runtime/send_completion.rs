@@ -1,11 +1,11 @@
 //! Per-worker completion table for awaited sends, and the admission FIFO
 //! for bounded sends.
 //!
-//! Every awaited send (`ConnCtx::send`, `submit_batch_await`, `send_chain`,
+//! Every awaited send (`SendHalf::send`, `submit_batch_await`, `send_chain`,
 //! `send_backpressured`) holds an entry here, named by the
 //! [`SendId`] its future keeps. The driver settles the entry when that send
 //! completes, and the future resolves with the result of that one send.
-//! A bounded send (`ConnCtx::send_backpressured`) is also admission-
+//! A bounded send (`SendHalf::send_backpressured`) is also admission-
 //! controlled: it may only reserve copy-pool slots once it is the *oldest*
 //! waiter on the worker and the pool can admit its whole message.
 //!
@@ -266,7 +266,7 @@ impl SendCompletions {
     /// Register an awaited send that needs no admission, already `InFlight`,
     /// and return its id.
     ///
-    /// Called by the awaiting send APIs (`ConnCtx::send`,
+    /// Called by the awaiting send APIs (`SendHalf::send`,
     /// `submit_batch_await`, `send_chain`) before they
     /// submit. A submission that fails must [`withdraw`](Self::withdraw) the id
     /// it registered.
@@ -571,7 +571,7 @@ impl SendCompletions {
     /// Returns the owners' task ids for waking, plus the new head's task id
     /// if the head was among the failed.
     ///
-    /// `ConnCtx::shutdown_write` calls this with `BrokenPipe` so that bounded
+    /// `SendHalf::shutdown_write` calls this with `BrokenPipe` so that bounded
     /// sends queued behind a write shutdown fail instead of waiting forever.
     ///
     /// Records `Done`, not the provisional `Aborted`
@@ -730,7 +730,7 @@ impl Executor {
     }
 
     /// [`SendCompletions::fail_waiting`] plus a wake of every returned
-    /// task. `ConnCtx::shutdown_write`, with `BrokenPipe`.
+    /// task. `SendHalf::shutdown_write`, with `BrokenPipe`.
     pub(crate) fn fail_waiting_bounded_sends(
         &mut self,
         conn_index: u32,

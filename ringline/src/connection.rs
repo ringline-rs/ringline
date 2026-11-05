@@ -92,7 +92,7 @@ pub struct ConnectionState {
     /// sustained 10 000 reuses per second per slot that's ~5 days, at
     /// realistic per-slot reuse rates many years. Widening to `u64`
     /// cascades into a clippy `large_enum_variant` warning in downstream
-    /// protocol crates whose `Client` structs carry a `ConnCtx` — if the
+    /// protocol crates whose `Client` structs carry a `Connection` — if the
     /// wrap risk becomes practical, widen *and* box the affected
     /// downstream variants in the same change.
     pub generation: u32,

@@ -22,7 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use ringline::ConnCtx;
+use ringline::ConnToken;
 
 use crate::{Client, Error};
 
@@ -283,7 +283,7 @@ impl Pool {
     /// returned [`PooledClient`] does not borrow the pool and several may be
     /// held at once.
     ///
-    /// A slot whose connection is no longer alive (`ringline::ConnCtx::is_alive`
+    /// A slot whose connection is no longer alive (`ringline::Connection::is_alive`
     /// is `false`, for example because the server closed it while it sat idle
     /// in the pool) is reconnected instead of handed out. A close the worker
     /// has not yet seen is not detected, and a command sent on that connection
@@ -378,12 +378,12 @@ impl Pool {
 
     /// Mark a connection as dead after a `ConnectionClosed` error.
     ///
-    /// Matches by [`ConnCtx::token()`] and sets the slot to disconnected.
+    /// Matches by [`ConnToken`], from `token()` on the client, and sets the slot
+    /// to disconnected.
     /// A connection that is currently checked out is not matched; call
     /// [`Client::close`] on its guard instead.
     /// The next [`client()`](Pool::client) call will lazily reconnect.
-    pub fn mark_disconnected(&self, conn: ConnCtx) {
-        let token = conn.token();
+    pub fn mark_disconnected(&self, token: ConnToken) {
         for slot in self.shared.slots.borrow_mut().iter_mut() {
             if let Slot::Connected(conn) = slot
                 && conn.token() == token

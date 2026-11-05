@@ -86,8 +86,9 @@
 //! - **[`AsyncEventHandler`]** — Users implement this trait. `on_accept(Connection)`
 //!   returns a future that runs for the connection's lifetime.
 //!
-//! - **[`ConnCtx`]** — Async connection handle. `with_data()`/`with_bytes()` for recv,
-//!   `send()`/`send_nowait()` for send. Internally indexes into the driver's
+//! - **[`Connection`]** — An owned connection, from `on_accept` or [`connect`].
+//!   `with_data()`/`with_bytes()` for recv, `send()`/`send_nowait()` for send, and
+//!   `split()` for independently borrowable halves. Internally indexes into the driver's
 //!   connection table via `(conn_index, generation)`.
 //!
 //! - **[`RinglineBuilder`]** — Builder for launching workers. Call `.bind(addr)`
@@ -271,7 +272,6 @@ pub use listen_gate::begin_listening_all;
 pub use runtime::TIMER_SLOTS;
 /// Trait for async event handlers (one task per connection).
 pub use runtime::handler::AsyncEventHandler;
-#[cfg(has_io_uring)]
 /// Async scatter-gather send builder.
 pub use runtime::io::AsyncSendBuilder;
 /// Future returned by [`SendHalf::send_backpressured()`]: a send that waits
@@ -279,11 +279,9 @@ pub use runtime::io::AsyncSendBuilder;
 pub use runtime::io::BackpressuredSendFuture;
 /// Future returned by [`spawn_blocking()`]. Resolves to the closure's return value, or a [`JoinError`] if it panicked.
 pub use runtime::io::BlockingJoinHandle;
-/// Async connection context with send/recv futures.
-pub use runtime::io::ConnCtx;
 /// Future that completes when a connect finishes.
 pub use runtime::io::ConnectFuture;
-/// An owned connection: the pair of claimed halves, from `on_accept` or `connect`.
+/// An owned connection: its two halves, from `on_accept` or `connect`.
 pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;
@@ -292,17 +290,13 @@ pub use runtime::io::Deadline;
 pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
-/// Future returned by the mio [`ConnCtx::forward_to_conn()`] (copy path).
-#[cfg(not(has_io_uring))]
-pub use runtime::io::ForwardToConnFuture;
-/// Future returned by the io_uring [`ConnCtx::forward_to_conn()`].
-#[cfg(has_io_uring)]
-pub use runtime::io::ForwardToFuture;
+/// Future returned by [`RecvHalf::forward_to_conn()`].
+pub use runtime::io::ForwardFuture;
 /// Handle to a spawned task's return value, obtained from [`spawn_with_handle()`].
 pub use runtime::io::JoinHandle;
 /// Result of a parse closure: consumed bytes or need more data.
 pub use runtime::io::ParseResult;
-/// The exclusive read side of a connection, from [`Connection::split()`] or [`ConnCtx::take_recv()`].
+/// The exclusive read side of a connection, from [`Connection::split()`].
 pub use runtime::io::RecvHalf;
 /// Future that resolves when recv data is available (sink, accumulator, or close).
 pub use runtime::io::RecvReadyFuture;
@@ -310,7 +304,7 @@ pub use runtime::io::RecvReadyFuture;
 pub use runtime::io::ResolveFuture;
 /// Future that completes when a send finishes.
 pub use runtime::io::SendFuture;
-/// The single-owner write side of a connection, from [`Connection::split()`] or [`ConnCtx::take_send()`].
+/// The single-owner write side of a connection, from [`Connection::split()`].
 pub use runtime::io::SendHalf;
 /// Future returned by [`sleep()`].
 pub use runtime::io::SleepFuture;
@@ -438,7 +432,7 @@ pub use signal::Signal;
 
 // ── Re-exports: Stream adapter ──────────────────────────────────────────
 
-/// Wraps a [`ConnCtx`] and implements `futures_io::{AsyncRead, AsyncWrite, AsyncBufRead}`.
+/// Wraps a [`Connection`] and implements `futures_io::{AsyncRead, AsyncWrite, AsyncBufRead}`.
 pub use runtime::stream::ConnStream;
 
 // ── Re-exports: Shared types ────────────────────────────────────────────

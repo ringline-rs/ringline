@@ -1,6 +1,6 @@
 //! ringline-native RESP client for use inside the ringline async runtime.
 //!
-//! This client wraps a [`ringline::ConnCtx`] and provides typed Redis command
+//! This client wraps a [`ringline::Connection`] and provides typed Redis command
 //! methods that use `with_bytes()` + `Value::parse_bytes()` for zero-copy
 //! incremental RESP parsing. It is designed for single-threaded,
 //! single-connection use within ringline's `AsyncEventHandler::on_start()` or
@@ -597,28 +597,11 @@ impl ClientBuilder {
     /// Cannot fail: the builder holds a [`Connection`], which owns both halves
     /// (#528).
     pub fn build(self) -> Client {
-        self.finish(None)
-    }
-
-    /// `build` without the driver, for the in-memory unit tests.
-    ///
-    /// See [`ConnCtx::split_for_test`]: the halves are unclaimed and the
-    /// connection is dangling, so the result is only safe on the buffered
-    /// paths (encoders, write buffer, pending queue) that never reach the
-    /// wire — the same contract `ConnCtx::for_test` already carries.
-    #[cfg(test)]
-    pub(crate) fn build_for_test(self) -> Client {
-        let halves = self.conn.as_conn().split_for_test();
-        self.finish(Some(halves))
+        self.finish()
     }
 
     /// Assemble the client from the builder's fields.
-    ///
-    /// The builder is destructured first because `Connection::split` consumes the
-    /// connection and the other fields are still needed. When `halves` is
-    /// `Some`, it is used instead of splitting the connection; the in-memory unit
-    /// tests pass a dangling handle this way.
-    fn finish(self, halves: Option<(SendHalf, RecvHalf)>) -> Client {
+    fn finish(self) -> Client {
         let Self {
             conn,
             on_result,
@@ -630,7 +613,7 @@ impl ClientBuilder {
             #[cfg(feature = "metrics")]
             with_metrics,
         } = self;
-        let (tx, rx) = halves.unwrap_or_else(|| conn.split());
+        let (tx, rx) = conn.split();
         let command_names = if get_command.is_none() && set_command.is_none() {
             None
         } else {
@@ -1716,7 +1699,7 @@ impl Client {
     /// Send an already-encoded command on this client's write half.
     ///
     /// Lets the sharded/cluster routers own a `Client` per pooled connection
-    /// and do their one send through it, rather than holding a bare `ConnCtx`
+    /// and do their one send through it, rather than holding a bare connection handle
     /// and building a throwaway client — plus a `split()` — per command.
     pub(crate) fn send_raw(&mut self, encoded: &[u8]) -> Result<(), Error> {
         self.tx.send(encoded)?;
@@ -2933,7 +2916,7 @@ impl Client {
     /// # Backends
     ///
     /// Works on both io_uring and mio. v1 copies each chunk into the send pool
-    /// via [`ConnCtx::send`](ringline::ConnCtx::send) (awaited per chunk for
+    /// via [`SendHalf::send`](ringline::SendHalf::send) (awaited per chunk for
     /// backpressure). Zero-copy guarded streaming is a later optimization.
     pub async fn set_stream(
         &mut self,
@@ -3669,7 +3652,7 @@ mod zc_threshold_tests {
         let conn = ringline::Connection::for_test(0, 0);
         let mut client = Client::builder(conn).max_batch_size(max_batch_size);
         client = client.zc_threshold(zc_threshold);
-        client.build_for_test()
+        client.build()
     }
 
     #[test]
@@ -4053,7 +4036,7 @@ mod command_name_tests {
     /// the paths that stop at `write_buf` are safe on it.
     fn buffered(builder: impl FnOnce(ClientBuilder) -> ClientBuilder) -> Client {
         let conn = ringline::Connection::for_test(0, 0);
-        builder(Client::builder(conn).max_batch_size(8)).build_for_test()
+        builder(Client::builder(conn).max_batch_size(8)).build()
     }
 
     #[test]

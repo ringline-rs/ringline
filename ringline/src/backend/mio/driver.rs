@@ -568,15 +568,7 @@ impl Driver {
         }
     }
 
-    /// Request teardown of a connection. The only place (with the
-    /// `DriverCtx` close) that sets `Lifecycle::Closing` on this backend —
-    /// see the invariant on `Lifecycle::Closing`.
-    ///
-    /// Teardown itself (socket, buffers, executor state, slot release)
-    /// happens in the event loop's `drain_pending_closes`, which has
-    /// Executor access and defers until `pending_sends` has drained.
-    /// Marking `Closing` here makes the call idempotent.
-    /// Drop any recv-side exclusivity claims held against `conn_index`.
+    /// Clear both half flags for a slot being recycled.
     ///
     /// Called at the slot's recycle point. Named to match
     /// `uring::driver::Driver::clear_conn_claims`.
@@ -589,6 +581,14 @@ impl Driver {
         }
     }
 
+    /// Request teardown of a connection. The only place (with the
+    /// `DriverCtx` close) that sets `Lifecycle::Closing` on this backend —
+    /// see the invariant on `Lifecycle::Closing`.
+    ///
+    /// Teardown itself (socket, buffers, executor state, slot release)
+    /// happens in the event loop's `drain_pending_closes`, which has
+    /// Executor access and defers until `pending_sends` has drained.
+    /// Marking `Closing` here makes the call idempotent.
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
@@ -673,9 +673,8 @@ impl Driver {
         self.send_queues[idx].close_pending = false;
 
         // A future dropped during teardown may have owned a `RecvHalf` whose
-        // `Drop` could not run (no driver in scope). Clear the claim before the
-        // slot is reused, or its next occupant inherits it and can never take
-        // its own read side.
+        // `Drop` could not run (no driver in scope). Clear the flags before the
+        // slot is reused, or its next occupant inherits them.
         self.clear_conn_claims(conn_index);
 
         if self.connections.get(conn_index).is_some() {

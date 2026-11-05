@@ -2,17 +2,17 @@
 //!
 //! Provides HTTP/2 and HTTP/1.1 client connections built on top of the sans-IO
 //! `ringline-h2` framing layer and the ringline async runtime. The crate
-//! bridges the gap between the sans-IO state machines and the `ConnCtx` I/O
+//! bridges the gap between the sans-IO state machines and the `Connection` I/O
 //! primitives.
 //!
 //! # Architecture
 //!
 //! `H2AsyncConn` wraps an `H2Connection` (sans-IO) with a pump loop that
-//! continuously transfers bytes between `ConnCtx` and the H2 state machine.
+//! continuously transfers bytes between `Connection` and the H2 state machine.
 //! This uses a fire/recv pipelining pattern: fire requests
 //! synchronously, then pump until responses arrive.
 //!
-//! `H1Conn` provides simple HTTP/1.1 request-response over a `ConnCtx`,
+//! `H1Conn` provides simple HTTP/1.1 request-response over a `Connection`,
 //! with header parsing and chunked transfer decoding.
 //!
 //! `HttpClient` is the top-level API wrapping either protocol with a
