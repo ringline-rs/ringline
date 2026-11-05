@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The `ringline/pool` counter `standalone_tasks_exhausted` counts spawns refused
+  because the standalone task slab was full. Before, a full slab showed only as
+  an error from `spawn`, which is how a slot leak stayed hidden in #478. `spawn`
+  and `spawn_with_handle` now return `ErrorKind::WouldBlock` for it, so a caller
+  can tell it from a call outside the executor, and the message names
+  `standalone_task_capacity` (#481).
 - `ringline::close_direct_io_file` and `close_nvme_device`. Before, only
   `DriverCtx` could close these handles. A close with commands in flight makes
   the handle stale at once, and on io_uring the last completion unregisters the

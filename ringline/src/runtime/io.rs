@@ -201,8 +201,9 @@ pub(crate) fn try_with_state<R>(f: impl FnOnce(&mut Driver, &mut Executor) -> R)
 /// and can open and use connections with [`connect`](crate::connect). `on_tick`
 /// and `on_notify` run inside the executor, so they can call `spawn`.
 ///
-/// Returns `Err` if called outside the ringline async executor or if the
-/// standalone task slab is full.
+/// Returns `Err` if called outside the ringline async executor, or
+/// [`WouldBlock`](io::ErrorKind::WouldBlock) if the standalone task slab is
+/// full, which the `standalone_tasks_exhausted` pool counter also records.
 pub fn spawn(future: impl Future<Output = ()> + 'static) -> io::Result<TaskId> {
     try_with_state(
         |_driver, executor| match executor.standalone_slab.spawn(Box::pin(future)) {
@@ -210,10 +211,17 @@ pub fn spawn(future: impl Future<Output = ()> + 'static) -> io::Result<TaskId> {
                 executor.ready_queue.push_back(idx | STANDALONE_BIT);
                 Ok(TaskId(idx))
             }
-            None => Err(io::Error::other("standalone task slab exhausted")),
+            None => Err(standalone_slab_full()),
         },
     )
     .unwrap_or_else(|| Err(io::Error::other("called outside executor")))
+}
+
+fn standalone_slab_full() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "standalone task slab full, see ConfigBuilder::standalone_task_capacity",
+    )
 }
 
 impl TaskId {
@@ -435,7 +443,7 @@ pub fn spawn_with_handle<T: 'static>(
                     task_id: TaskId(idx),
                 })
             }
-            None => Err(io::Error::other("standalone task slab exhausted")),
+            None => Err(standalone_slab_full()),
         },
     )
     .unwrap_or_else(|| Err(io::Error::other("called outside executor")))

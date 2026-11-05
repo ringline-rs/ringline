@@ -144,7 +144,10 @@ impl StandaloneTaskSlab {
 
     /// Spawn a task. Returns the slot index, or None if the slab is full.
     pub(crate) fn spawn(&mut self, future: BoxFuture) -> Option<u32> {
-        let idx = self.free_list.pop()?;
+        let Some(idx) = self.free_list.pop() else {
+            crate::metrics::POOL.increment(crate::metrics::pool::STANDALONE_TASKS_EXHAUSTED);
+            return None;
+        };
         self.tasks[idx as usize] = TaskSlot::Ready(future);
         Some(idx)
     }

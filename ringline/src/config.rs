@@ -978,7 +978,12 @@ impl ConfigBuilder {
 
     // ── Task/timer settings ──────────────────────────────────────────
 
-    /// Set the maximum number of standalone async tasks per worker.
+    /// Set the maximum number of standalone async tasks per worker. Default:
+    /// 256.
+    ///
+    /// A spawn on a full slab fails with
+    /// [`WouldBlock`](std::io::ErrorKind::WouldBlock), and the
+    /// `standalone_tasks_exhausted` pool counter records it.
     pub fn standalone_task_capacity(mut self, n: u32) -> Self {
         self.config.standalone_task_capacity = n;
         self

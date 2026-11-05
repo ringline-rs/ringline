@@ -21,7 +21,7 @@ pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
 pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(6);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
-pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(5);
+pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(6);
 
 #[metric(
     name = "ringline/recv_ring",
@@ -362,6 +362,11 @@ pub mod pool {
     /// Sustained counts mean zero-copy sends are paying a failed submission
     /// and a copy: raise the memlock limit, or raise `send_zc_threshold`.
     pub const SEND_ZC_ENOMEM: usize = 4;
+    /// A standalone task did not fit in the worker's slab of
+    /// `ConfigBuilder::standalone_task_capacity` slots. `spawn` and
+    /// `spawn_with_handle` return `WouldBlock`, and an `on_start` or
+    /// `on_udp_bind` task is dropped.
+    pub const STANDALONE_TASKS_EXHAUSTED: usize = 5;
 }
 
 /// Counter slot indices for UDP metrics.
@@ -528,6 +533,11 @@ pub fn init_metadata() {
     POOL.insert_metadata(pool::SEND_EXHAUSTED, "op".into(), "send_exhausted".into());
     POOL.insert_metadata(pool::TIMER_EXHAUSTED, "op".into(), "timer_exhausted".into());
     POOL.insert_metadata(
+        pool::STANDALONE_TASKS_EXHAUSTED,
+        "op".into(),
+        "standalone_tasks_exhausted".into(),
+    );
+    POOL.insert_metadata(
         pool::BUFFER_RING_EMPTY,
         "op".into(),
         "buffer_ring_empty".into(),
@@ -590,6 +600,7 @@ mod tests {
         for idx in [
             pool::SEND_EXHAUSTED,
             pool::TIMER_EXHAUSTED,
+            pool::STANDALONE_TASKS_EXHAUSTED,
             pool::BUFFER_RING_EMPTY,
             pool::SEND_EAGAIN,
             pool::SEND_ZC_ENOMEM,
