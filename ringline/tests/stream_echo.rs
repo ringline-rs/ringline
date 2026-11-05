@@ -18,7 +18,7 @@ struct StreamEcho;
 impl AsyncEventHandler for StreamEcho {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let mut stream = ConnStream::new(conn.as_conn());
+            let mut stream = ConnStream::new(conn);
             loop {
                 let data = match futures_util::AsyncBufReadExt::fill_buf(&mut stream).await {
                     Ok([]) => break, // EOF
@@ -45,7 +45,7 @@ struct ReadEcho;
 impl AsyncEventHandler for ReadEcho {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let mut stream = ConnStream::new(conn.as_conn());
+            let mut stream = ConnStream::new(conn);
             let mut buf = [0u8; 4096];
             loop {
                 let n = match stream.read(&mut buf).await {
@@ -74,7 +74,7 @@ impl AsyncEventHandler for CloseCounter {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         let closed = self.closed.clone();
         async move {
-            let mut stream = ConnStream::new(conn.as_conn());
+            let mut stream = ConnStream::new(conn);
             // Echo once, then close.
             let mut buf = [0u8; 256];
             if let Ok(n) = stream.read(&mut buf).await
@@ -101,7 +101,7 @@ struct TinyReadEcho;
 impl AsyncEventHandler for TinyReadEcho {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let mut stream = ConnStream::new(conn.as_conn());
+            let mut stream = ConnStream::new(conn);
             let mut byte = [0u8; 1];
             loop {
                 match stream.read(&mut byte).await {

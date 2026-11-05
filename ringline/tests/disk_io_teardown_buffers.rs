@@ -60,8 +60,8 @@ impl Drop for OnDrop {
 struct ReadsInConnection;
 
 impl AsyncEventHandler for ReadsInConnection {
-    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
-        let ctx = conn.send_half().as_conn();
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        let (mut tx, _rx) = conn.split();
         async move {
             let _guard = OnDrop;
             let dir = DIR.lock().unwrap().clone().unwrap();
@@ -77,7 +77,7 @@ impl AsyncEventHandler for ReadsInConnection {
             // read's future with it, is dropped outside any task poll.
             ringline::spawn(async move {
                 ringline::sleep(Duration::from_millis(100)).await;
-                ctx.close();
+                tx.close();
             })
             .unwrap();
             READ_QUEUED.store(true, Ordering::SeqCst);

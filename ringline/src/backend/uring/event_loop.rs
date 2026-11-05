@@ -8751,154 +8751,6 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), data.len() as i32, 0);
     }
 
-    /// `take_recv` hands out the read side exactly once, and dropping it hands
-    /// the connection back.
-    #[test]
-    fn recv_half_is_exclusive_and_released_on_drop() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let conn = ConnCtx::new(conn_index, generation);
-
-        let half = with_driver_state(&mut el, || conn.take_recv()).expect("first take_recv");
-        assert!(el.driver.recv_half_taken[conn_index as usize]);
-
-        match with_driver_state(&mut el, || conn.take_recv()) {
-            Err(e) => assert_eq!(
-                e.raw_os_error(),
-                Some(libc::EBUSY),
-                "a second take_recv must be refused with EBUSY"
-            ),
-            Ok(_) => panic!("the read side was handed out twice"),
-        }
-
-        with_driver_state(&mut el, || drop(half));
-        assert!(
-            !el.driver.recv_half_taken[conn_index as usize],
-            "dropping the half releases the claim"
-        );
-        let _again = with_driver_state(&mut el, || conn.take_recv())
-            .expect("the half is available again after drop");
-    }
-
-    /// `split()` takes the read claim, so it is refused exactly like a second
-    /// `take_recv`. The write half carries no claim of its own yet, so it is
-    /// dropping the *read* half that makes the connection splittable again.
-    #[test]
-    fn split_is_refused_while_the_read_side_is_out() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let conn = ConnCtx::new(conn_index, generation);
-
-        let (tx, rx) = with_driver_state(&mut el, || conn.split()).expect("first split");
-        assert!(el.driver.recv_half_taken[conn_index as usize]);
-
-        match with_driver_state(&mut el, || conn.split()) {
-            Err(e) => assert_eq!(
-                e.raw_os_error(),
-                Some(libc::EBUSY),
-                "a second split must be refused with EBUSY"
-            ),
-            Ok(_) => panic!("the read side was handed out twice"),
-        }
-
-        // Dropping only the send half releases the *write* claim and leaves
-        // the read claim alone — the reader is still live and still exclusive.
-        //
-        // The drop happens inside `with_driver_state` on purpose: both halves'
-        // `Drop` go through `try_with_state`, so a half dropped with no driver
-        // in scope cannot release anything. In production that is covered by
-        // `clear_conn_claims` at the slot's recycle point; in a unit test there
-        // is no recycle, so dropping outside the driver would strand the claim
-        // and the re-split below would fail with `EBUSY`. It did, before this
-        // was fixed.
-        with_driver_state(&mut el, || drop(tx));
-        assert!(
-            el.driver.recv_half_taken[conn_index as usize],
-            "dropping the send half must not release the read claim"
-        );
-        assert!(
-            !el.driver.send_half_taken[conn_index as usize],
-            "dropping the send half releases the write claim"
-        );
-
-        with_driver_state(&mut el, || drop(rx));
-        assert!(!el.driver.recv_half_taken[conn_index as usize]);
-        let _again = with_driver_state(&mut el, || conn.split()).expect("splittable again");
-    }
-
-    /// Taking the write side twice is refused, and dropping it hands it back.
-    #[test]
-    fn take_send_is_exclusive_and_released_on_drop() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let conn = ConnCtx::new(conn_index, generation);
-
-        let tx = with_driver_state(&mut el, || conn.take_send()).expect("first take_send");
-        assert!(el.driver.send_half_taken[conn_index as usize]);
-
-        match with_driver_state(&mut el, || conn.take_send()) {
-            Err(e) => assert_eq!(
-                e.raw_os_error(),
-                Some(libc::EBUSY),
-                "a second take_send must be refused with EBUSY"
-            ),
-            Ok(_) => panic!("the write side was handed out twice"),
-        }
-
-        // `split` needs both, so it is refused too — and must not strand the
-        // read claim on its way out.
-        match with_driver_state(&mut el, || conn.split()) {
-            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EBUSY)),
-            Ok(_) => panic!("split must not succeed while the write side is out"),
-        }
-        assert!(
-            !el.driver.recv_half_taken[conn_index as usize],
-            "a split refused on the write claim must release the read claim it took"
-        );
-
-        with_driver_state(&mut el, || drop(tx));
-        assert!(!el.driver.send_half_taken[conn_index as usize]);
-        let _again = with_driver_state(&mut el, || conn.take_send()).expect("available again");
-    }
-
-    /// A stale handle must not take the write side of the slot's new occupant.
-    #[test]
-    fn take_send_refuses_a_stale_handle() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
-        match with_driver_state(&mut el, || stale.take_send()) {
-            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
-            Ok(_) => panic!("a stale handle must not take the write side"),
-        }
-        assert!(
-            !el.driver.send_half_taken[conn_index as usize],
-            "a refused take_send must not leave a claim behind"
-        );
-    }
-
-    /// A stale handle must not split the slot's new occupant, for the same
-    /// reason it must not `take_recv` it.
-    #[test]
-    fn split_refuses_a_stale_handle() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
-        match with_driver_state(&mut el, || stale.split()) {
-            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
-            Ok(_) => panic!("a stale handle must not split the connection"),
-        }
-        assert!(
-            !el.driver.recv_half_taken[conn_index as usize],
-            "a refused split must not leave a claim behind"
-        );
-    }
-
     /// A stale handle must not read — or consume — the new occupant's bytes.
     ///
     /// `try_with_data` both hands the caller the accumulator's contents and
@@ -8965,12 +8817,11 @@ mod tests {
         );
     }
 
-    /// `forward_to_conn` refuses at the call, without marking either slot: a
-    /// stale source or sink with `EPIPE`, and a sink whose send half is out
-    /// with `EBUSY`. An accepted forward marks its source, so a second
-    /// forward from it gets `EBUSY` until the first is dropped.
+    /// A forward refuses at the call, without marking either slot, a stale
+    /// source or sink with `EPIPE`. An accepted forward marks its source, so a
+    /// second forward from it gets `EBUSY` until the first is dropped.
     #[test]
-    fn forward_to_conn_refuses_stale_slots_and_a_claimed_sink() {
+    fn forward_refuses_stale_slots_and_a_running_forward() {
         let mut el = make_test_loop();
         let src = accept_connection(&mut el);
         let sink = accept_connection(&mut el);
@@ -8987,7 +8838,7 @@ mod tests {
                     })
                 };
                 let before = mark();
-                let mut fut = Box::pin(from.forward_to_conn(&to, 5));
+                let mut fut = Box::pin(from.forward_to(to.conn_index, to.generation, 5));
                 assert_eq!(mark(), before, "a refused forward changed the mark");
                 let mut cx = std::task::Context::from_waker(&waker);
                 match fut.as_mut().poll(&mut cx) {
@@ -9008,12 +8859,9 @@ mod tests {
         assert!(!marked(&el, src), "a stale source marked the occupant");
         let stale_sink = ConnCtx::new(sink, sink_gen.wrapping_add(1));
         assert_eq!(refused(&mut el, source, stale_sink), Some(libc::EPIPE));
-        el.driver.send_half_taken[sink as usize] = true;
-        assert_eq!(refused(&mut el, source, sink_ctx), Some(libc::EBUSY));
-        el.driver.send_half_taken[sink as usize] = false;
         assert!(!marked(&el, src), "a refusal marked the source");
 
-        let first = with_driver_state(&mut el, || source.forward_to_conn(&sink_ctx, 5));
+        let first = with_driver_state(&mut el, || source.forward_to(sink, sink_gen, 5));
         assert!(marked(&el, src), "an accepted forward marks its source");
         assert_eq!(refused(&mut el, source, sink_ctx), Some(libc::EBUSY));
         assert!(
@@ -9178,89 +9026,6 @@ mod tests {
                 .get(conn_index)
                 .unwrap()
                 .close_requested()
-        );
-    }
-
-    /// A stale handle must not take the read side of the slot's new occupant.
-    #[test]
-    fn take_recv_refuses_a_stale_handle() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let stale = ConnCtx::new(conn_index, generation.wrapping_add(1));
-        match with_driver_state(&mut el, || stale.take_recv()) {
-            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
-            Ok(_) => panic!("a stale handle must not take the read side"),
-        }
-        assert!(
-            !el.driver.recv_half_taken[conn_index as usize],
-            "a refused take must not leave a claim behind"
-        );
-    }
-
-    /// A stale half must not steal the *new* occupant's claim.
-    ///
-    /// The claim is per slot and a half can outlive its connection (`spawn`
-    /// needs only `'static`, not `Send`). If the slot recycles and the new
-    /// occupant takes its own half, a stale half dropping afterwards must not
-    /// clear that claim — doing so would permit a second `RecvHalf` on a live
-    /// connection, which is the whole thing this type prevents.
-    #[test]
-    fn a_stale_recv_half_drop_does_not_steal_the_new_claim() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let old_gen = el.driver.connections.generation(conn_index);
-        let old_conn = ConnCtx::new(conn_index, old_gen);
-        let stale_half = with_driver_state(&mut el, || old_conn.take_recv()).expect("take_recv");
-
-        // Recycle the slot, as teardown does.
-        el.driver.clear_conn_claims(conn_index);
-        el.driver.connections.release(conn_index);
-        let new_index = accept_connection(&mut el);
-        assert_eq!(new_index, conn_index, "the test needs the slot reused");
-        let new_gen = el.driver.connections.generation(conn_index);
-        assert_ne!(new_gen, old_gen, "release must bump the generation");
-
-        // New occupant claims the read side.
-        let new_conn = ConnCtx::new(conn_index, new_gen);
-        let _new_half = with_driver_state(&mut el, || new_conn.take_recv())
-            .expect("the new occupant takes its own half");
-        assert!(el.driver.recv_half_taken[conn_index as usize]);
-
-        // The stale half finally drops.
-        with_driver_state(&mut el, || drop(stale_half));
-
-        assert!(
-            el.driver.recv_half_taken[conn_index as usize],
-            "a stale half must not release the new occupant's claim"
-        );
-        match with_driver_state(&mut el, || new_conn.take_recv()) {
-            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EBUSY)),
-            Ok(_) => panic!("two live RecvHalfs on one connection"),
-        }
-    }
-
-    /// A claim must not outlive the slot it was made on.
-    ///
-    /// `RecvHalf::drop` releases through
-    /// `try_with_state`, which is a no-op during unguarded teardown — so a
-    /// claim can survive its claimant. The flags are indexed by slot, not by
-    /// generation, so without an explicit clear at the recycle point the *next*
-    /// occupant inherits the claim and has its reads refused forever.
-    #[test]
-    fn recv_claims_do_not_survive_slot_reuse() {
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-
-        // Simulate the claims outliving their owners, which is what an
-        // unguarded teardown produces.
-        el.driver.recv_half_taken[conn_index as usize] = true;
-
-        el.driver.clear_conn_claims(conn_index);
-
-        assert!(
-            !el.driver.recv_half_taken[conn_index as usize],
-            "a recycled slot must not inherit a recv-half claim"
         );
     }
 

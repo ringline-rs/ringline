@@ -1,4 +1,4 @@
-//! `ConnStream` — `futures-io` trait adapter for [`ConnCtx`].
+//! `ConnStream` — `futures-io` trait adapter for [`Connection`].
 //!
 //! Wraps a connection in the standard `AsyncRead + AsyncWrite + AsyncBufRead`
 //! interface for ecosystem compatibility (codecs, tower, hyper, etc.).
@@ -28,14 +28,13 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use super::io::{ConnCtx, park_recv, with_state};
+use super::io::{Connection, SendHalf, park_recv, with_state};
 
-/// Wraps a [`ConnCtx`] and implements [`AsyncRead`], [`AsyncWrite`], and
+/// Wraps a [`Connection`] and implements [`AsyncRead`], [`AsyncWrite`], and
 /// [`AsyncBufRead`].
 ///
-/// Created via [`ConnStream::new`]. The inner [`ConnCtx`] is still accessible
-/// via [`conn_ctx`](Self::conn_ctx) for operations that have no trait
-/// equivalent (e.g. `connect`, `shutdown_write`).
+/// Created via [`ConnStream::new`]. The write half is accessible via
+/// [`send_half`](Self::send_half) for operations that have no trait equivalent.
 ///
 /// # Copy profile
 ///
@@ -45,7 +44,7 @@ use super::io::{ConnCtx, park_recv, with_state};
 /// | [`AsyncBufRead::poll_fill_buf`] | 0 | refcounted `Bytes` slice |
 /// | [`AsyncWrite::poll_write`] | 1 | caller buf → send pool |
 pub struct ConnStream {
-    ctx: ConnCtx,
+    conn: Connection,
     write_closed: bool,
     /// Cached buffer detached from the accumulator for `AsyncBufRead`.
     /// Held until fully consumed, then dropped so new data flows from
@@ -54,21 +53,23 @@ pub struct ConnStream {
 }
 
 impl ConnStream {
-    /// Wrap a [`ConnCtx`] in a streaming adapter.
-    pub fn new(ctx: ConnCtx) -> Self {
+    /// Wrap a [`Connection`] in a streaming adapter.
+    pub fn new(conn: Connection) -> Self {
         ConnStream {
-            ctx,
+            conn,
             write_closed: false,
             fill_buf: None,
         }
     }
 
-    /// Borrow the inner [`ConnCtx`].
+    /// The connection's write half.
     ///
     /// Useful for operations without a trait equivalent, such as
-    /// [`ConnCtx::peer_addr`] or [`ConnCtx::close`].
-    pub fn conn_ctx(&self) -> ConnCtx {
-        self.ctx
+    /// [`SendHalf::peer_addr`] or [`SendHalf::close`]. The read half is not
+    /// reachable here, because a read would pass bytes cached by
+    /// `poll_fill_buf`.
+    pub fn send_half(&mut self) -> &mut SendHalf {
+        self.conn.send_half()
     }
 
     /// Check whether the connection's recv side is closed.
@@ -101,8 +102,8 @@ impl AsyncRead for ConnStream {
             self.fill_buf = None;
         }
 
-        let conn_index = self.ctx.conn_index;
-        let generation = self.ctx.generation;
+        let ctx = self.conn.ctx();
+        let (conn_index, generation) = (ctx.conn_index, ctx.generation);
 
         with_state(|driver, executor| {
             // Stale stream: the connection this stream was created for is
@@ -142,8 +143,8 @@ impl AsyncBufRead for ConnStream {
 
         // Empty or absent — fetch from accumulator.
         this.fill_buf = None;
-        let conn_index = this.ctx.conn_index;
-        let generation = this.ctx.generation;
+        let ctx = this.conn.ctx();
+        let (conn_index, generation) = (ctx.conn_index, ctx.generation);
 
         // Try to detach the accumulator as a refcounted Bytes (O(1)).
         let frozen = with_state(|driver, executor| {
@@ -198,7 +199,7 @@ impl AsyncWrite for ConnStream {
             return Poll::Ready(Ok(0));
         }
 
-        let ctx = self.ctx;
+        let ctx = self.conn.ctx();
 
         // Cap at the send pool's slot size so oversized writes become
         // partial writes (valid per the AsyncWrite contract).
@@ -222,7 +223,7 @@ impl AsyncWrite for ConnStream {
             // Half-close: send TCP FIN so the peer sees EOF.
             // The full close happens when the connection task returns and the
             // executor drops the connection slot.
-            self.ctx.shutdown_write();
+            self.conn.shutdown_write();
         }
         Poll::Ready(Ok(()))
     }
@@ -234,7 +235,7 @@ mod tests {
 
     #[test]
     fn conn_stream_size() {
-        // ConnStream should be small — ConnCtx (8 bytes) + bool + Option<Bytes>.
-        assert!(std::mem::size_of::<ConnStream>() <= 48);
+        // ConnStream should be small: Connection (16 bytes) + bool + Option<Bytes>.
+        assert!(std::mem::size_of::<ConnStream>() <= 56);
     }
 }

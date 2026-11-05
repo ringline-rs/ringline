@@ -2,17 +2,17 @@
 
 **ringline-native Ping client.**
 
-A simple PING/PONG protocol client built on [`ringline::ConnCtx`](https://docs.rs/ringline)
+A simple PING/PONG protocol client built on [`ringline::Connection`](https://docs.rs/ringline)
 for use inside the ringline async runtime. Useful for connection health checks
 and latency measurement.
 
 ## Quick Start
 
 ```rust
-use ringline::ConnCtx;
+use ringline::Connection;
 use ringline_ping::Client;
 
-async fn example(conn: ConnCtx) -> Result<(), ringline_ping::Error> {
+async fn example(conn: Connection) -> Result<(), ringline_ping::Error> {
     let mut client = Client::new(conn);
     client.ping().await?;
     Ok(())

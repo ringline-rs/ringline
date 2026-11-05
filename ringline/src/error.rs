@@ -12,7 +12,7 @@ use thiserror::Error;
 /// | `RingSetup` | io_uring refused or unsupported | Read the message: it names the sysctl/seccomp/kernel cause (`ENOMEM` on Linux 6.14+ is usually `RLIMIT_MEMLOCK`); or build with the `force-mio` feature |
 /// | `BufferRegistration` | io_uring refused to register memory | `ENOMEM`: `RLIMIT_MEMLOCK` (raise with `ulimit -l` / `LimitMEMLOCK=`, or grant `CAP_IPC_LOCK`) or a failed page migration; `EFAULT`: a buffer over 1 GiB or of length 0, an unpinnable mapping, or a failed page migration. The message says which apply |
 /// | `ConnectionLimitReached` | All connection slots in use | Increase via `ConfigBuilder::max_connections(...)` or close idle connections |
-/// | `InvalidConnection` | Stale token, connection closed | Re-establish connection; do not reuse the `ConnCtx` |
+/// | `InvalidConnection` | Stale token, connection closed | Re-establish connection; do not reuse the `Connection` |
 /// | `SendPoolExhausted` | All send buffer slots in use | Await pending sends to complete before sending more |
 /// | `InvalidRegion` | Region ID not registered | Check `MemoryRegion` registration; ensure region outlives usage |
 /// | `PointerOutOfRegion` | SendGuard pointer outside registered region | Verify pointer arithmetic; region boundaries are strict |
@@ -81,7 +81,7 @@ pub enum Error {
     ///
     /// This occurs when:
     /// - The connection was closed and the slot was reused
-    /// - The `ConnCtx` was used after the peer disconnected
+    /// - The connection was used after the peer disconnected
     /// - A `ConnToken` was incorrectly cached and reused
     ///
     /// Do not retry with the same token; establish a new connection.

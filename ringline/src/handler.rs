@@ -338,7 +338,7 @@ pub struct DriverCtx<'a> {
     pub(crate) next_disk_io_seq: &'a mut u16,
     /// Set when `finish` on a TLS chain gave the chain's id to
     /// `attach_send_id`: on its last ciphertext send, or settled at once if the
-    /// plaintext was empty. `ConnCtx::send_chain` reads it to return a pending
+    /// plaintext was empty. `SendHalf::send_chain` reads it to return a pending
     /// future, because a TLS chain does not use `chain_table`, so
     /// `chain_table.carries` is false for it.
     pub(crate) tls_chain_carried: bool,
@@ -486,7 +486,7 @@ impl<'a> DriverCtx<'a> {
     /// here. The TLS branch admits against the ciphertext bound before
     /// rustls mutates, so the same holds there (see `encrypt_tls_send`,
     /// which also names the one case that stays fatal). The user-facing
-    /// contract lives on `ConnCtx::send`.
+    /// contract lives on `SendHalf::send`.
     pub fn send(&mut self, conn: ConnToken, data: &[u8]) -> io::Result<()> {
         self.send_inner(conn, data, None)
     }
@@ -630,7 +630,7 @@ impl<'a> DriverCtx<'a> {
         Ok(())
     }
 
-    /// Submit a bounded (`ConnCtx::send_backpressured`) send, tagging the
+    /// Submit a bounded (`SendHalf::send_backpressured`) send, tagging the
     /// operation's identity onto the slot whose completion settles it.
     ///
     /// Byte-for-byte `send` — the same generation check, the

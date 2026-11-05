@@ -2107,18 +2107,14 @@ impl AsyncEventHandler for TlsSinkRefusedProxy {
     fn on_accept(&self, mut client: Connection) -> impl Future<Output = ()> + 'static {
         let backend_addr = self.backend_addr;
         async move {
-            let backend = match ringline::connect(backend_addr).await {
+            let mut backend = match ringline::connect(backend_addr).await {
                 Ok(ctx) => ctx,
                 Err(_) => return,
             };
 
             // `client` is the TLS connection. Forwarding backend -> client is
             // the case that must be refused.
-            let errno = match backend
-                .as_conn()
-                .forward_to_conn(&client.as_conn(), 16)
-                .await
-            {
+            let errno = match backend.forward_to_conn(client.send_half(), 16).await {
                 Ok(_) => -1,
                 Err(e) => e.raw_os_error().unwrap_or(-1),
             };

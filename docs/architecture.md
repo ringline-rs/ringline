@@ -5,7 +5,7 @@ I/O backend, executor, connection table, buffers, timers, and handler instance.
 Tasks never migrate between workers, and there is no work-stealing scheduler.
 
 This document describes the core `ringline` crate. Protocol crates build on its
-`ConnCtx` API, but do not change the runtime topology.
+`Connection` API, but do not change the runtime topology.
 
 ## Library outline
 
@@ -19,7 +19,7 @@ Within the core crate, the main boundaries are:
 
 - Startup and process-level control: `worker.rs`, `acceptor.rs`, `config.rs`,
   `signal.rs`, `topology.rs`, and `wakeup.rs`.
-- The portable executor and async API: `runtime/`, including `ConnCtx`, task
+- The portable executor and async API: `runtime/`, including `Connection`, task
   slabs, timers, channels, futures, and wakers.
 - Shared connection and buffer state: `connection.rs`, `accumulator.rs`,
   `recv/`, `handler.rs`, `buffer/`, and `tls/`.
@@ -31,7 +31,7 @@ Within the core crate, the main boundaries are:
   direct I/O, NVMe, and registered memory regions.
 
 The principal public abstractions are `RinglineBuilder`, `Runtime`,
-`AsyncEventHandler`, and `ConnCtx`. `AsyncEventHandler::create_for_worker`
+`AsyncEventHandler`, and `Connection`. `AsyncEventHandler::create_for_worker`
 constructs one handler instance per worker. Its `on_accept` method returns the
 long-lived future for an accepted connection; `on_start` is the client-only
 entry point; `on_tick` is a synchronous callback inside the worker loop.
@@ -143,7 +143,7 @@ worker is the io_uring-specific mapping of that architecture.
 
 ## Connection and request lifecycle
 
-Each connection occupies a `ConnectionTable` slot. `ConnCtx` and `ConnToken`
+Each connection occupies a `ConnectionTable` slot. `Connection` and `ConnToken`
 carry both its index and generation. Every long-lived future and completion
 path must reject a generation mismatch because a slot can be reused while old
 work is still completing.
@@ -175,7 +175,7 @@ executor's completion table, which wakes the task that awaits it.
 When the handler future returns or panics, the runtime closes that connection,
 clears executor state, and eventually releases the slot with a new generation.
 
-`ConnCtx::with_data` lends a byte slice; `ConnCtx::with_bytes` lends a
+`Connection::with_data` lends a byte slice; `Connection::with_bytes` lends a
 refcounted `Bytes` value whose slices can outlive the parse callback. Their
 futures complete on `ParseResult::Consumed(n)`. `NeedMore` and `Consumed(0)`
 register `owner_task` and `recv_waiters` and park without spinning;
@@ -235,7 +235,7 @@ ciphertext chunks are serialized through the same connection queue: independent
 io_uring SQEs are not wire-ordered, so parallel TLS record submissions can
 interleave records.
 
-On a close the application requests (`ConnCtx::close()`, a handler return,
+On a close the application requests (`Connection::close()`, a handler return,
 `DriverCtx::close`), the runtime queues `close_notify` behind the
 connection's queued sends and closes the socket once they drain. On io_uring,
 a close the runtime makes after a receive error, a reset, a send that could
@@ -243,7 +243,7 @@ not be pushed, or after the peer closed sends no alert, a TLS send after the
 alert is refused, and `close_notify_timeout_ms` bounds the drain only for
 `DriverCtx::close`. On mio every TLS close attempts to write the alert once,
 without blocking, after the queued sends drain, and the timeout is not used.
-`ConnCtx::eof_truncated` distinguishes a TCP FIN without peer `close_notify`
+`Connection::eof_truncated` distinguishes a TCP FIN without peer `close_notify`
 from a clean TLS EOF.
 
 ## Backpressure, shutdown, and failures

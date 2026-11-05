@@ -99,7 +99,7 @@ impl ClusterConfig {
 
 enum NodeState {
     /// A pooled connection *is* a client — see the note in `sharded.rs`.
-    /// Holding a bare `ConnCtx` meant a `split()` plus a throwaway client on
+    /// Holding a bare connection handle meant a `split()` plus a throwaway client on
     /// every command once the halves became claims (#439, #440).
     Connected(Box<Client>),
     Disconnected,
@@ -297,7 +297,7 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// Get or reconnect a ConnCtx for the given "host:port" address.
+    /// Get or reconnect a connection for the given "host:port" address.
     /// Ensure `addr` has a connected client, without handing out a borrow.
     ///
     /// Returning `&mut Client` here would hold `self` borrowed across the

@@ -823,7 +823,14 @@ fn render_request_flow_panel(svg: &mut String, offset: u32, backend: RequestBack
     let (parse_upper, parse_lower) = paired_edge_offsets(y(680) + 54 / 2, 20);
 
     arrow(svg, 1100, y(217), 955, y(217), "accepted fd");
-    arrow(svg, 655, y(230), 575, y(297), "generation-tagged ConnCtx");
+    arrow(
+        svg,
+        655,
+        y(230),
+        575,
+        y(297),
+        "generation-tagged Connection",
+    );
     arrow(svg, 475, y(324), 195, y(350), "established");
     arrow(svg, 295, y(377), 375, y(457), "await bytes");
     arrow(svg, 575, y(457), 655, backend_upper, "arm receive");

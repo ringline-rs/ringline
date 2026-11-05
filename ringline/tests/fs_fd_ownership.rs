@@ -404,16 +404,16 @@ mod mio {
             }))
         }
 
-        fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
             use std::sync::atomic::Ordering;
-            let ctx = conn.send_half().as_conn();
+            let (mut tx, _rx) = conn.split();
             async move {
                 // Close this connection while the open below is waiting, which
                 // drops this task, and the open's future with it, outside any
                 // task poll.
                 ringline::spawn(async move {
                     ringline::sleep(Duration::from_millis(100)).await;
-                    ctx.close();
+                    tx.close();
                 })
                 .unwrap();
                 let fifo = TEARDOWN_DIR.lock().unwrap().clone().unwrap().join("fifo");

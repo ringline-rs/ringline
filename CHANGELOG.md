@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   see them parked and adopted; before, they were refused. Once the park
   takes the connection, a send on the parking worker returns `NotConnected`
   until the handler's future is dropped.
-- `forward_to_conn` on `ConnCtx`, `Connection` and `RecvHalf` forwards the
+- `forward_to_conn` on `Connection` and `RecvHalf` forwards the
   next `len` received bytes to another connection on the same worker, on
   both backends. On io_uring it sends from the source's accumulator through
   the sink's send queue; on mio it copies the bytes into sends queued on the
@@ -223,6 +223,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `ConnStream::new` takes and owns a `Connection`, and
+  `conn_ctx()` is replaced by `send_half()`. `mark_disconnected` on the redis,
+  memcache and ping pools takes a `ConnToken`.
 - When a `with_data` parser stops at an incomplete message, or `with_data`
   parks with nothing buffered, an accumulator that grows through `append`
   (every connection on mio, TLS connections on io_uring) moves the buffered
@@ -659,6 +662,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** `ConnCtx` is no longer public, and `as_conn` is gone from
+  `Connection` and `SendHalf`. Applications hold a `Connection` or its halves;
+  `ConnCtx::split`, `take_send` and `take_recv` have no replacement, because
+  `Connection::split` is the only split and a dropped half cannot be taken
+  again. A task that closes a connection it does not otherwise own needs the
+  `SendHalf`. `peer_addr`, `tls_info`, `listener`, `is_outbound` and
+  `is_recv_direct` have to be read from the `Connection` before it goes to a
+  protocol client. Design: `docs/public-context-types-design.md`.
+- **Breaking:** `Connection::cancel` and `ConnCtx::cancel`. Neither had a
+  caller, and mio returned `Unsupported`. `select` on a `CancellationToken`
+  interrupts a parked read.
+- **Breaking:** `request_shutdown` on `Connection` and `SendHalf`; use
+  `ringline::request_shutdown`.
+- **Breaking:** the `ForwardToFuture` and `ForwardToConnFuture` exports.
+  `forward_to_conn` returns `ForwardFuture<'_>` on both backends, and it holds
+  the source half's borrow on mio as it does on io_uring, so a second forward
+  from one source is a compile error on mio too.
 - **Breaking:** `DriverCtx::connect`, `connect_unix`, `connect_with_timeout`,
   `connect_tls` and `connect_tls_with_timeout`. No task owned a connection
   opened this way, so the runtime closed it once it was established. On the

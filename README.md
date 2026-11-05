@@ -25,16 +25,17 @@ ringline is a thread-per-core I/O framework. It provides an async/await API
 ## Quick Start
 
 ```rust
-use ringline::{AsyncEventHandler, Config, ConnCtx, ParseResult, RinglineBuilder};
+use ringline::{AsyncEventHandler, Config, Connection, ParseResult, RinglineBuilder};
 
 struct Echo;
 
 impl AsyncEventHandler for Echo {
-    fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
+    fn on_accept(&self, conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
         async move {
+            let (mut tx, mut rx) = conn.split();
             loop {
-                let n = conn.with_data(|data| {
-                    conn.send_nowait(data).ok();
+                let n = rx.with_data(|data| {
+                    tx.send_nowait(data).ok();
                     ParseResult::Consumed(data.len())
                 }).await;
                 if n == 0 { break; }
@@ -110,7 +111,7 @@ handler instance. On the io_uring backend, each worker also owns:
 | Type | Description |
 |------|-------------|
 | `AsyncEventHandler` | Trait: `on_accept(Connection) -> Future` — one task per connection |
-| `ConnCtx` | Async connection context: `send()`, `send_nowait()`, `with_data()` |
+| `Connection` | An owned connection: `send()`, `send_nowait()`, `with_data()`; `split()` gives `SendHalf` and `RecvHalf` |
 | `ParseResult` | Closure return type: `Consumed(n)` or `NeedMore` |
 | `ConfigBuilder` | Discoverable builder: `ConfigBuilder::default().workers(4).build()` |
 | `RinglineBuilder` | Launch builder: `RinglineBuilder::new(config).bind(addr).launch::<H>()` |

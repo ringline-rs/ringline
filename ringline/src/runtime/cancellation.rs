@@ -9,7 +9,7 @@
 //! ```rust,no_run
 //! use ringline::CancellationToken;
 //!
-//! # async fn example(conn: ringline::ConnCtx) {
+//! # async fn example() {
 //! let token = CancellationToken::new();
 //! let child = token.child_token();
 //!

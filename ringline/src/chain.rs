@@ -32,7 +32,7 @@ pub(crate) struct ChainState {
     pub(crate) first_error: Option<i32>,
     /// Outstanding SendMsgZc NOTIF CQEs.
     zc_notifs_pending: u16,
-    /// The awaited send this chain settles (`ConnCtx::send_chain`), with
+    /// The awaited send this chain settles (`SendHalf::send_chain`), with
     /// `bytes_sent` on success; `None` for `send_chain_nowait`.
     pub(crate) send_id: Option<SendId>,
 }

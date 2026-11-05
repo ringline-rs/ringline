@@ -2,17 +2,17 @@
 
 **ringline-native Memcache client.**
 
-A Memcache ASCII protocol client built on [`ringline::ConnCtx`](https://docs.rs/ringline)
+A Memcache ASCII protocol client built on [`ringline::Connection`](https://docs.rs/ringline)
 for use inside the ringline async runtime. Single-threaded, single-connection,
 zero-copy recv.
 
 ## Quick Start
 
 ```rust
-use ringline::ConnCtx;
+use ringline::Connection;
 use ringline_memcache::Client;
 
-async fn example(conn: ConnCtx) -> Result<(), ringline_memcache::Error> {
+async fn example(conn: Connection) -> Result<(), ringline_memcache::Error> {
     let mut client = Client::new(conn);
     client.set("hello", "world").await?;
     let val = client.get("hello").await?;

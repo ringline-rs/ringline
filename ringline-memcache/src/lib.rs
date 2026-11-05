@@ -1,6 +1,6 @@
 //! ringline-native Memcache client for use inside the ringline async runtime.
 //!
-//! This client wraps a [`ringline::ConnCtx`] and provides typed Memcache command
+//! This client wraps a [`ringline::Connection`] and provides typed Memcache command
 //! methods that use `with_bytes()` + `ResponseBytes::parse()` for zero-copy
 //! incremental parsing. It is designed for single-threaded, single-connection
 //! use within ringline's `AsyncEventHandler::on_start()` or connection tasks.
@@ -497,7 +497,7 @@ impl ClientBuilder {
     /// [`build_for_test`](Self::build_for_test).
     #[cfg(test)]
     pub(crate) fn build_binary_for_test(self) -> BinaryClient {
-        let mut client = self.build_for_test();
+        let mut client = self.build();
         client.binary = true;
         BinaryClient { inner: client }
     }
@@ -508,28 +508,11 @@ impl ClientBuilder {
     ///
     /// Same as [`Client::new`]: the read side must be free.
     pub fn build(self) -> Client {
-        self.finish(None)
-    }
-
-    /// `build` without the driver, for the in-memory unit tests.
-    ///
-    /// See [`ConnCtx::split_for_test`]: the halves are unclaimed and the
-    /// connection is dangling, so the result is only safe on the buffered
-    /// paths (encoders, write buffer, pending queue) that never reach the
-    /// wire — the same contract `ConnCtx::for_test` already carries.
-    #[cfg(test)]
-    pub(crate) fn build_for_test(self) -> Client {
-        let halves = self.conn.as_conn().split_for_test();
-        self.finish(Some(halves))
+        self.finish()
     }
 
     /// Assemble the client from the builder's fields.
-    ///
-    /// The builder is destructured first because `Connection::split` consumes the
-    /// connection and the other fields are still needed. When `halves` is
-    /// `Some`, it is used instead of splitting the connection; the in-memory unit
-    /// tests pass a dangling handle this way.
-    fn finish(self, halves: Option<(SendHalf, RecvHalf)>) -> Client {
+    fn finish(self) -> Client {
         let Self {
             conn,
             on_result,
@@ -539,7 +522,7 @@ impl ClientBuilder {
             #[cfg(feature = "metrics")]
             with_metrics,
         } = self;
-        let (tx, rx) = halves.unwrap_or_else(|| conn.split());
+        let (tx, rx) = conn.split();
         Client {
             tx,
             rx,
@@ -1742,7 +1725,7 @@ impl Client {
     /// # Backends
     ///
     /// Works on both io_uring and mio. v1 copies each chunk into the send pool
-    /// via [`ConnCtx::send`](ringline::ConnCtx::send) (awaited per chunk for
+    /// via [`SendHalf::send`](ringline::SendHalf::send) (awaited per chunk for
     /// backpressure). Zero-copy guarded streaming is a later optimization.
     pub async fn set_stream(
         &mut self,
@@ -1839,7 +1822,7 @@ impl Client {
 /// ```
 ///
 /// This client owns the connection outright: it holds both halves, so there is
-/// no way to hand the `ConnCtx` back out and drive the same connection with an
+/// no way to hand the connection back out and drive the same connection with an
 /// ASCII [`Client`]. That used to be possible through `conn()`, and doing it
 /// desynced the connection.
 pub struct BinaryClient {
@@ -2556,7 +2539,7 @@ mod zc_threshold_tests {
         Client::builder(conn)
             .max_batch_size(max_batch_size)
             .zc_threshold(zc_threshold)
-            .build_for_test()
+            .build()
     }
 
     #[test]
@@ -2670,7 +2653,7 @@ mod binary_tests {
         }
     }
 
-    /// A [`BinaryClient`] backed by a dangling `ConnCtx`. A
+    /// A [`BinaryClient`] backed by a dangling `Connection`. A
     /// `max_batch_size` above 1 keeps every `fire_*` in the buffered path (no
     /// direct send, no recv), the only path safe to exercise without a live
     /// connection.
@@ -3037,7 +3020,7 @@ mod binary_tests {
         // The flag must not leak into the plain `build()` path.
         let c = Client::builder(ringline::Connection::for_test(0, 0))
             .max_batch_size(4)
-            .build_for_test();
+            .build();
         assert!(!c.binary);
         let mut buf = Vec::new();
         append_get(c.binary, KEY, &mut buf).unwrap();

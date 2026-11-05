@@ -348,7 +348,7 @@ pub struct Config {
     pub(crate) disk_io_threads: usize,
     /// How long, in milliseconds, a TLS close requested through
     /// `DriverCtx::close` waits for its queued sends and close_notify to drain
-    /// before the connection is closed without them. `ConnCtx::close()` and a
+    /// before the connection is closed without them. `Connection::close()` and a
     /// handler return are not bounded: their queued sends drain until the peer
     /// reads them or the connection fails. Not used on the mio backend.
     /// Default: 5000.
@@ -932,7 +932,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set how many sends a [`forward_to_conn`](crate::ConnCtx::forward_to_conn)
+    /// Set how many sends a [`forward_to_conn`](crate::RecvHalf::forward_to_conn)
     /// sink may have queued before its source stops reading, on mio.
     ///
     /// The source's TCP receive window then closes, and it reads again once
@@ -1140,7 +1140,7 @@ impl ConfigBuilder {
 
     /// How long, in milliseconds, a TLS close requested through
     /// `DriverCtx::close` waits for its queued sends and close_notify to drain
-    /// before the connection is closed without them. `ConnCtx::close()` and a
+    /// before the connection is closed without them. `Connection::close()` and a
     /// handler return are not bounded: their queued sends drain until the peer
     /// reads them or the connection fails. Not used on the mio backend.
     /// Default: 5000.

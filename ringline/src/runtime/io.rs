@@ -604,7 +604,7 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// are in that receive's buffer and `try_with_data` returns `None`.
 ///
 /// `forward_to_conn` sends from the accumulator (see
-/// [`ConnCtx::forward_to_conn`]).
+/// [`RecvHalf::forward_to_conn`]).
 ///
 /// A receive into the accumulator is armed only when a read parks.
 /// A poll for `POLLRDHUP`, armed when the connection opens, completes on a
@@ -612,7 +612,7 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// receive is in flight then, a one-byte `MSG_PEEK` receive checks the
 /// socket. When no bytes are queued in the socket and none are buffered in
 /// the accumulator, the connection closes as it would under a parked read,
-/// and [`ConnCtx::is_alive`] returns `false`. Otherwise the connection stays
+/// and [`Connection::is_alive`] returns `false`. Otherwise the connection stays
 /// open, and the bytes reach the next reads in order. Once they have been
 /// read, the end of the stream closes the connection, whether or not a read
 /// parks again, and a reset is reported to the read as an error. If the poll,
@@ -892,9 +892,9 @@ impl Future for ResolveFuture {
 
 /// Request graceful shutdown of the worker event loop from any async task.
 ///
-/// This is the free-function equivalent of [`ConnCtx::request_shutdown()`] —
-/// it can be called from standalone tasks or [`AsyncEventHandler::on_start()`](crate::AsyncEventHandler::on_start)
-/// futures where no `ConnCtx` is available.
+/// Callable from any task, from
+/// [`AsyncEventHandler::on_start()`](crate::AsyncEventHandler::on_start) futures,
+/// and from `on_tick` and `on_notify`.
 ///
 /// Returns `Err` if called outside the ringline async executor.
 pub fn request_shutdown() -> io::Result<()> {
@@ -905,202 +905,13 @@ pub fn request_shutdown() -> io::Result<()> {
     .ok_or_else(|| io::Error::other("called outside executor"))
 }
 
-/// Async connection context providing send, recv, and connect operations.
+/// A connection's slot index and generation, for runtime internals.
 ///
-/// # `ConnCtx` is a token, not a capability
-///
-/// As of step 4 and the write-claim work it grants no I/O of its own. The read
-/// entry points are crate-private (below) and so are the write ones — `send`,
-/// `send_nowait`, `send_parts`, `send_backpressured`, `send_chain`,
-/// `send_chain_nowait`, `forward_recv_buf`, `shutdown_write`. Reading goes
-/// through [`RecvHalf`], writing through [`SendHalf`], and neither is `Copy`.
-///
-/// `ConnCtx` is `Copy` because it carries no I/O capability. A copyable handle
-/// that did carry one allowed two tasks to write to a single socket.
-///
-/// A `ConnCtx` identifies a connection (`token`, `index`, `peer_addr`,
-/// `is_outbound`, `is_alive`, `tls_info`), manages its lifecycle (`close`,
-/// `cancel`, `request_shutdown`), and names a forward sink. It can also mint the
-/// halves with [`take_recv`](Self::take_recv), [`take_send`](Self::take_send)
-/// and [`split`](Self::split); each is exclusive and fails if the half is
-/// already held. Connections delivered as a [`Connection`] already own their
-/// halves, so those methods are for the cases that start from a bare handle.
-///
-/// # The read entry points are crate-private
-///
-/// `with_data`, `with_bytes` and the other readers are `pub(crate)`: reading
-/// a connection goes through [`Connection`] or [`RecvHalf`], which are not
-/// `Copy`, so the read side cannot be aliased. A `ConnCtx` is a
-/// send/identity/lifecycle handle plus a way to *obtain* the read side
-/// ([`take_recv`](Self::take_recv), [`split`](Self::split)).
-///
-/// `forward_to_conn` stays public. Its "one forward at a time" rule is
-/// refused at runtime by the driver, and that refusal is reachable, and so
-/// testable, only through this handle, because `&mut RecvHalf` turns a second
-/// concurrent forward into a compile error.
-///
-/// Both accepted and outbound connections are delivered as a [`Connection`]:
-/// accepted ones in
-/// [`AsyncEventHandler::on_accept`](crate::AsyncEventHandler::on_accept),
-/// outbound ones from [`connect`](crate::connect) and
-/// [`connect_unix`](crate::connect_unix) (#528).
-///
-/// A `ConnCtx` is valid for the lifetime of the connection's async task.
-/// When the connection is closed, the task is dropped along with the `ConnCtx`.
-///
-/// # Example: Echo Handler
-///
-/// ```no_run
-/// use ringline::{AsyncEventHandler, Connection, ParseResult};
-///
-/// struct Echo;
-///
-/// impl AsyncEventHandler for Echo {
-///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
-///         async move {
-///             let (mut tx, mut rx) = conn.split();
-///             loop {
-///                 let n = rx.with_data(|data| {
-///                     // Echo back whatever we received
-///                     tx.send_nowait(data).ok();
-///                     ParseResult::Consumed(data.len())
-///                 }).await;
-///                 // n == 0 means connection closed (EOF)
-///                 if n == 0 { break; }
-///             }
-///         }
-///     }
-///     fn create_for_worker(_id: usize) -> Self { Echo }
-/// }
-/// ```
-///
-/// # Example: Line-Based Protocol
-///
-/// ```no_run
-/// use ringline::{AsyncEventHandler, Connection, ParseResult};
-///
-/// struct LineEcho;
-///
-/// impl AsyncEventHandler for LineEcho {
-///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
-///         async move {
-///             let (mut tx, mut rx) = conn.split();
-///             loop {
-///                 let n = rx.with_data(|data| {
-///                     // Find newline
-///                     if let Some(pos) = data.iter().position(|&b| b == b'\n') {
-///                         let line = &data[..=pos];
-///                         tx.send_nowait(line).ok();
-///                         ParseResult::Consumed(pos + 1)
-///                     } else {
-///                         ParseResult::NeedMore
-///                     }
-///                 }).await;
-///                 if n == 0 { break; }
-///             }
-///         }
-///     }
-///     fn create_for_worker(_id: usize) -> Self { LineEcho }
-/// }
-/// ```
-///
-/// # Example: Zero-Copy with `with_bytes`
-///
-/// For protocols where you want to avoid copying parsed values, use
-/// `with_bytes` which provides `Bytes` handles:
-///
-/// ```no_run
-/// use ringline::{AsyncEventHandler, Connection, ParseResult};
-/// use bytes::Bytes;
-///
-/// struct ZeroCopyHandler;
-///
-/// impl AsyncEventHandler for ZeroCopyHandler {
-///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
-///         async move {
-///             let (mut tx, mut rx) = conn.split();
-///             loop {
-///                 let n = rx.with_bytes(|bytes| {
-///                     // Parse protocol, return Bytes::slice() for the value
-///                     // The slice stays valid even after the accumulator advances
-///                     if let Some((consumed, value)) = parse_message(&bytes) {
-///                         process_value(value); // value: Bytes
-///                         ParseResult::Consumed(consumed)
-///                     } else {
-///                         ParseResult::NeedMore
-///                     }
-///                 }).await;
-///                 if n == 0 { break; }
-///             }
-///         }
-///     }
-///     fn create_for_worker(_id: usize) -> Self { ZeroCopyHandler }
-/// }
-///
-/// fn parse_message(data: &[u8]) -> Option<(usize, Bytes)> {
-///     // Parse length-prefixed message: 4-byte big-endian length + payload
-///     if data.len() < 4 { return None; }
-///     let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-///     if data.len() < 4 + len { return None; }
-///     let value = Bytes::copy_from_slice(&data[4..4+len]);
-///     Some((4 + len, value))
-/// }
-///
-/// fn process_value(_value: Bytes) {
-///     // Process the zero-copy value
-/// }
-/// ```
-///
-/// # Send Patterns
-///
-/// ```no_run
-/// use ringline::{AsyncEventHandler, Connection, ParseResult};
-///
-/// struct SendExample;
-///
-/// impl AsyncEventHandler for SendExample {
-///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
-///         async move {
-///             let (mut tx, mut rx) = conn.split();
-///             // Fire-and-forget (returns Err if send pool exhausted)
-///             tx.send_nowait(b"hello").ok();
-///
-///             // Await send completion
-///             if let Ok(future) = tx.send(b"world") {
-///                 future.await.ok();
-///             }
-///         }
-///     }
-///     fn create_for_worker(_id: usize) -> Self { SendExample }
-/// }
-/// ```
-/// # Thread affinity
-///
-/// A `ConnCtx` is meaningful only on the worker thread that owns the
-/// connection, so it is deliberately **neither `Send` nor `Sync`**:
-///
-/// ```compile_fail
-/// fn assert_send<T: Send>() {}
-/// assert_send::<ringline::ConnCtx>();
-/// ```
-///
-/// ```compile_fail
-/// fn assert_sync<T: Sync>() {}
-/// assert_sync::<ringline::ConnCtx>();
-/// ```
-///
-/// Ringline is thread-per-core: each worker owns its own driver and
-/// `ConnectionTable`, and a `ConnCtx` is just an `(index, generation)` pair
-/// into *that* worker's table. Used from another worker the index is still in
-/// bounds, so the lookup does not fail — it resolves against a different
-/// table, and if the generation happens to match too, I/O lands on an
-/// unrelated connection. That is a silent wrong-socket write rather than a
-/// crash, so the type system rules it out instead. This also makes capturing a
-/// `ConnCtx` in a [`spawn_blocking`] closure a compile error, which is correct:
-/// its pool threads have no driver. [`spawn`] is unaffected — it requires only
-/// `'static`, not `Send`.
+/// `Copy`, and `!Send` for the same reason as [`Connection`]: the index means
+/// something only on the worker that owns the connection. Applications hold a
+/// [`Connection`] or its halves.
 #[derive(Clone, Copy)]
-pub struct ConnCtx {
+pub(crate) struct ConnCtx {
     pub(crate) conn_index: u32,
     pub(crate) generation: u32,
     /// Pins the handle to its owning worker thread — see "Thread affinity".
@@ -1170,23 +981,8 @@ impl ConnCtx {
         }
     }
 
-    /// Construct a `ConnCtx` with arbitrary index/generation for use in
-    /// downstream-crate unit tests that exercise buffering / encoding logic
-    /// without a live io_uring driver.
-    ///
-    /// The returned handle does **not** refer to any real connection. Any I/O
-    /// method (`with_data`, `send`, `flush`, …) will index into a driver table
-    /// that has no slot for it and is therefore undefined to call. It is only
-    /// safe to use in tests that touch in-memory client state (write buffers,
-    /// pending queues, encoders) and never reach the wire.
-    #[cfg(feature = "testing")]
-    #[doc(hidden)]
-    pub fn for_test(conn_index: u32, generation: u32) -> Self {
-        ConnCtx::new(conn_index, generation)
-    }
-
     /// Returns the connection slot index. Useful for indexing into per-connection arrays.
-    pub fn index(&self) -> usize {
+    pub(crate) fn index(&self) -> usize {
         self.conn_index as usize
     }
 
@@ -1239,7 +1035,7 @@ impl ConnCtx {
     /// `IORING_OP_FIXED_FD_INSTALL` (mainline 6.8). On mio this does
     /// nothing; on io_uring without that operation the offer is recorded
     /// and never acted on.
-    pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
+    pub(crate) fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         let _ = try_with_state(|driver, _| {
             #[cfg(has_io_uring)]
             {
@@ -1255,125 +1051,11 @@ impl ConnCtx {
     }
 
     /// Returns the `ConnToken` for this connection.
-    pub fn token(&self) -> ConnToken {
+    pub(crate) fn token(&self) -> ConnToken {
         ConnToken::new(self.conn_index, self.generation)
     }
 
     // ── Recv ─────────────────────────────────────────────────────────
-
-    /// Take this connection's exclusive **recv half**.
-    ///
-    /// The recv side of a connection is exclusive: its entry points
-    /// (`with_data`, `with_data_result`, `with_bytes`, `recv_ready` and
-    /// `forward_to_conn`) all drive one
-    /// stream and none of them may run
-    /// concurrently with another. `ConnCtx` is `Copy`, so that exclusivity
-    /// cannot be owned — every rule has to be re-checked at run time, and the
-    /// ones that are missed are silent hangs (#423) or interleaved wire bytes.
-    ///
-    /// [`RecvHalf`] is neither `Copy` nor `Clone`, and its methods take
-    /// `&mut self`, so the borrow checker enforces what those checks
-    /// approximate. A second forward while one is running stops being an
-    /// `EBUSY` you must remember to handle and becomes a compile error.
-    ///
-    /// See `docs/connection-handle-ownership-design.md`.
-    ///
-    /// # Errors
-    ///
-    /// - `EBUSY` — the half is already out for this connection.
-    /// - `EPIPE` — this handle is stale; the slot was closed and recycled.
-    ///
-    /// io_uring only, for now: the mio backend shares the recv entry points but
-    /// not the driver-side claim.
-    /// Split this connection into its write and read halves.
-    ///
-    /// The read side is exclusive and the write side is single-owner; see
-    /// [`SendHalf`] and [`RecvHalf`]. Fan-in to one connection is an explicit
-    /// queue with the owning task draining it, not a shared handle.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`take_recv`](Self::take_recv): `EBUSY` if the read side is
-    /// already out, `EPIPE` if this handle is stale.
-    pub fn split(&self) -> io::Result<(SendHalf, RecvHalf)> {
-        let rx = self.take_recv()?;
-        // If the write side is already out, the read claim must not be left
-        // stuck: `rx` drops on the `?` and its `Drop` releases it.
-        let tx = self.take_send()?;
-        Ok((tx, rx))
-    }
-
-    /// Take the connection's **write side**, exclusively.
-    ///
-    /// The twin of [`take_recv`](Self::take_recv). One owner of the writes is
-    /// now a claim rather than a convention: several producers feeding one
-    /// connection is an explicit queue drained by the owning task.
-    ///
-    /// It is also what lets a forward refuse a sink somebody else is already
-    /// writing to.
-    ///
-    /// # Errors
-    ///
-    /// `EBUSY` if the write side is already out, `EPIPE` if this handle is
-    /// stale.
-    pub fn take_send(&self) -> io::Result<SendHalf> {
-        with_state(|driver, _executor| {
-            if driver.connections.generation(self.conn_index) != self.generation {
-                return Err(io::Error::from_raw_os_error(libc::EPIPE));
-            }
-            let idx = self.conn_index as usize;
-            if driver.send_half_taken[idx] {
-                return Err(io::Error::from_raw_os_error(libc::EBUSY));
-            }
-            driver.send_half_taken[idx] = true;
-            Ok(())
-        })?;
-        Ok(SendHalf {
-            conn: *self,
-            _not_send: PhantomData,
-        })
-    }
-
-    /// [`split`](Self::split) without the driver.
-    ///
-    /// `split` records the read claim in the driver, so it cannot run outside
-    /// a worker. This hands back unclaimed halves for the same narrow case
-    /// [`for_test`](Self::for_test) exists for: tests that exercise in-memory
-    /// client state (encoders, write buffers, pending queues) and never reach
-    /// the wire. Calling any I/O method on the result is undefined, exactly as
-    /// it is for a `for_test` handle.
-    #[cfg(feature = "testing")]
-    #[doc(hidden)]
-    pub fn split_for_test(&self) -> (SendHalf, RecvHalf) {
-        (
-            SendHalf {
-                conn: *self,
-                _not_send: PhantomData,
-            },
-            RecvHalf {
-                conn: *self,
-                _not_send: PhantomData,
-            },
-        )
-    }
-
-    pub fn take_recv(&self) -> io::Result<RecvHalf> {
-        with_state(|driver, _executor| {
-            if driver.connections.generation(self.conn_index) != self.generation {
-                return Err(io::Error::from_raw_os_error(libc::EPIPE));
-            }
-            let idx = self.conn_index as usize;
-            if driver.recv_half_taken[idx] {
-                return Err(io::Error::from_raw_os_error(libc::EBUSY));
-            }
-            driver.recv_half_taken[idx] = true;
-            Ok(())
-        })?;
-        Ok(RecvHalf {
-            conn: *self,
-            _not_send: PhantomData,
-        })
-    }
 
     /// Wait until recv data is available, then process it.
     ///
@@ -1602,87 +1284,17 @@ impl ConnCtx {
         })
     }
 
-    /// Forward the next `len` received bytes to **another connection on this
-    /// worker**.
-    ///
-    /// The sink is named by its [`ConnCtx`], so a bidirectional proxy runs
-    /// one forward in each direction.
-    ///
-    /// ```ignore
-    /// let backend = ringline::connect(addr)?.await?;
-    /// // client -> backend; a second task forwards backend -> client
-    /// conn.forward_to_conn(&backend, len).await?;
-    /// ```
-    ///
-    /// On io_uring the forward takes the bytes the source's accumulator holds
-    /// and sends them through the sink's send queue; see "The source" below.
-    /// A result `< len` means the peer sent FIN first.
-    ///
-    /// # Thread affinity
-    ///
-    /// Both connections must belong to this worker. That is not a rule you can
-    /// break: [`ConnCtx`] is `!Send`, so a handle from another worker cannot
-    /// reach this call. A sink obtained from [`connect`](crate::connect) inside
-    /// the handler is always on the right worker.
-    ///
-    /// # TLS
-    ///
-    /// The **source** may be a TLS connection: rustls' plaintext is collected
-    /// and forwarded, which is what makes a TLS-terminating proxy work. The
-    /// **sink** may not — the forward writes bytes as they are, with nothing
-    /// on the path to encrypt them — and a TLS sink is refused with
-    /// `EPROTOTYPE` rather than put plaintext on the wire.
-    ///
-    /// # Errors
-    ///
-    /// Refused at the call, resolving on the first poll without having
-    /// installed anything: `EBUSY` if a forward is already running on this
-    /// connection, `EPIPE` if the source or sink slot is already stale, and
-    /// `EPROTOTYPE` if the sink is a TLS connection.
-    ///
-    /// Resolves `Err(EPIPE)` if the sink connection closes *mid*-forward — its
-    /// slot may be reused, and writing to a recycled index would deliver this
-    /// stream to a different peer. The sink's generation is checked before
-    /// every write.
-    ///
-    /// The mio backend exposes the same signature, but as a copy path — see
-    /// the `not(has_io_uring)` sibling below. Both backends refuse the same
-    /// three conditions with the same errnos.
-    ///
-    /// # The source
-    ///
-    /// A plaintext source receives directly into its accumulator, and a TLS
-    /// source's decrypted plaintext lands there too. The forward takes the
-    /// bytes the accumulator holds, up to what is left of `len`, and sends
-    /// them on the sink through the sink's send queue under a guard: zero-copy
-    /// at or above `send_zc_threshold`, copied into a pool slot below it. One
-    /// send is in flight at a time, and the source receives the next chunk
-    /// while it is. Because the sends go through the sink's queue, they are
-    /// ordered with other sends on the sink. A send the runtime cannot submit,
-    /// for example with the worker's send slab
-    /// ([`ConfigBuilder::send_slab_slots`](crate::ConfigBuilder::send_slab_slots))
-    /// full, resolves the forward with that error and leaves the chunk
-    /// buffered on the source. Dropping the future lets a chunk already
-    /// submitted go out and leaves the rest buffered.
-    #[cfg(has_io_uring)]
-    pub fn forward_to_conn<'a>(&self, sink: &'a ConnCtx, len: usize) -> ForwardToFuture<'a> {
-        self.direct_forward(sink.conn_index, sink.generation, len, false)
-    }
-
     /// A forward from this connection to the sink connection that sends from
     /// this connection's accumulator. Refuses, resolving on the first poll: a
     /// forward already running from this connection (`EBUSY`), a stale source
-    /// or sink (`EPIPE`), a TLS sink (`EPROTOTYPE`), and, unless the caller
-    /// holds the sink's [`SendHalf`], a sink whose send half is claimed
-    /// (`EBUSY`).
+    /// or sink (`EPIPE`) and a TLS sink (`EPROTOTYPE`).
     #[cfg(has_io_uring)]
-    fn direct_forward<'a>(
+    pub(crate) fn forward_to<'a>(
         &self,
         sink_index: u32,
         sink_generation: u32,
         len: usize,
-        sink_owned: bool,
-    ) -> ForwardToFuture<'a> {
+    ) -> ForwardFuture<'a> {
         let refusal = with_state(|driver, _| {
             let refusal = if driver.connections.generation(self.conn_index) != self.generation {
                 Some(libc::EPIPE)
@@ -1696,8 +1308,6 @@ impl ConnCtx {
                 Some(libc::EPIPE)
             } else if driver.tls_table.as_ref().is_some_and(|t| t.has(sink_index)) {
                 Some(libc::EPROTOTYPE)
-            } else if !sink_owned && driver.send_half_taken[sink_index as usize] {
-                Some(libc::EBUSY)
             } else {
                 None
             };
@@ -1708,7 +1318,7 @@ impl ConnCtx {
             }
             refusal
         });
-        ForwardToFuture {
+        ForwardFuture {
             conn_index: self.conn_index,
             generation: self.generation,
             refused: refusal,
@@ -1723,42 +1333,14 @@ impl ConnCtx {
         }
     }
 
-    /// Forward the next `len` received bytes to another connection on this
-    /// worker.
-    ///
-    /// The mio counterpart of the io_uring `forward_to_conn`, with the same
-    /// signature, the same truncation semantics — a result `< len` means the
-    /// peer sent FIN first — and the same thread affinity, which [`ConnCtx`]
-    /// being `!Send` enforces for free.
-    ///
-    /// # This is a copy path
-    ///
-    /// Bytes are read into a queued send on the sink and copied on the way.
-    /// It exists so that a proxy built on ringline runs without io_uring.
-    ///
-    /// # Backpressure
-    ///
-    /// The source stops reading once it holds the hold cap of entries
-    /// awaiting the sink (`forward_hold_cap`), which closes
-    /// the source's TCP window rather than growing the queue without bound,
-    /// and resumes when the sink drains.
-    ///
-    /// # TLS
-    ///
-    /// The **source** may be a TLS connection: rustls' plaintext is collected
-    /// and forwarded, which is what makes a TLS-terminating proxy work. The
-    /// **sink** may not — the forward queues bytes as they are, with nothing
-    /// on the path to encrypt them — and a TLS sink is refused with
-    /// `EPROTOTYPE` rather than put plaintext on the wire.
-    ///
-    /// # Errors
-    ///
-    /// `EPIPE` if the sink closes or its slot is recycled mid-forward;
-    /// `EPROTOTYPE` if the sink is a TLS connection; `EBUSY` if a forward is
-    /// already running on this connection.
+    /// See [`RecvHalf::forward_to_conn`].
     #[cfg(not(has_io_uring))]
-    pub fn forward_to_conn<'a>(&self, sink: &'a ConnCtx, len: usize) -> ForwardToConnFuture<'a> {
-        let (sink_index, sink_generation) = (sink.conn_index, sink.generation);
+    pub(crate) fn forward_to<'a>(
+        &self,
+        sink_index: u32,
+        sink_generation: u32,
+        len: usize,
+    ) -> ForwardFuture<'a> {
         let source = self.conn_index;
         let generation = self.generation;
         let armed = with_state(|driver, _executor| {
@@ -1802,7 +1384,7 @@ impl ConnCtx {
             driver.forward_take_accumulated(source);
             Ok(())
         });
-        ForwardToConnFuture {
+        ForwardFuture {
             conn_index: source,
             generation,
             refused: armed.err(),
@@ -1976,26 +1558,10 @@ impl ConnCtx {
         })
     }
 
-    /// Cancel pending I/O operations on this connection.
-    pub fn cancel(&self) -> io::Result<()> {
-        with_state(|driver, _| {
-            let mut ctx = driver.make_ctx();
-            ctx.cancel(self.token())
-        })
-    }
-
-    /// Request graceful shutdown of the worker event loop.
-    pub fn request_shutdown(&self) {
-        with_state(|driver, _| {
-            let mut ctx = driver.make_ctx();
-            ctx.request_shutdown();
-        })
-    }
-
     // ── TLS ──────────────────────────────────────────────────────────
 
     /// Query TLS session info for this connection.
-    pub fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    pub(crate) fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         with_state(|driver, _| {
             let ctx = driver.make_ctx();
             ctx.tls_info(self.token())
@@ -2043,7 +1609,7 @@ impl ConnCtx {
     /// Does nothing if the connection has already been released (its slot may
     /// now hold another connection), or when called outside the worker's
     /// executor.
-    pub fn close(&self) {
+    pub(crate) fn close(&self) {
         let opt_non_null = CURRENT_DRIVER.with(|c| c.get());
         if opt_non_null.is_none() {
             return;
@@ -2065,7 +1631,7 @@ impl ConnCtx {
     /// A runtime can bind several listeners and they all feed the same
     /// `on_accept`; this is how a handler tells them apart. Ids follow
     /// `bind()` call order — see [`ListenerId`](crate::ListenerId).
-    pub fn listener(&self) -> Option<crate::ListenerId> {
+    pub(crate) fn listener(&self) -> Option<crate::ListenerId> {
         with_state(|driver, _| {
             let conn = driver.connections.get(self.conn_index)?;
             if conn.generation != self.generation {
@@ -2076,7 +1642,7 @@ impl ConnCtx {
     }
 
     /// Access peer address.
-    pub fn peer_addr(&self) -> Option<crate::connection::PeerAddr> {
+    pub(crate) fn peer_addr(&self) -> Option<crate::connection::PeerAddr> {
         with_state(|driver, _| {
             let conn = driver.connections.get(self.conn_index)?;
             if conn.generation != self.generation {
@@ -2087,7 +1653,7 @@ impl ConnCtx {
     }
 
     /// Check if this connection is outbound (initiated via connect).
-    pub fn is_outbound(&self) -> bool {
+    pub(crate) fn is_outbound(&self) -> bool {
         with_state(|driver, _| {
             driver
                 .connections
@@ -2104,7 +1670,7 @@ impl ConnCtx {
     /// (`close()` was called — `lifecycle` is `Closing` — even before the Close
     /// CQE has released the slot). Because a proactive `close()` flips the state
     /// synchronously, this is a *deterministic* poison probe: a caller that owns
-    /// a `ConnCtx` copy (e.g. a connection pool) can detect a client's poison
+    /// the connection (e.g. a connection pool) can detect a client's poison
     /// close on the very next turn, without waiting for the Close CQE to bump
     /// the generation.
     ///
@@ -2119,7 +1685,7 @@ impl ConnCtx {
     /// stays readable. On io_uring, a close_notify the peer sends without a FIN
     /// is read when a receive next completes (see [`connect`] for when one is
     /// armed), and this returns `true` until then.
-    pub fn is_alive(&self) -> bool {
+    pub(crate) fn is_alive(&self) -> bool {
         // `try_with_state`, not `with_state`: this is reachable from a `Drop`
         // that runs outside a task poll. A connection-bound task is dropped by
         // the teardown path (`remove_connection` on mio, `handle_close` on
@@ -2145,7 +1711,7 @@ impl ConnCtx {
     /// buffer instead, and this returns `false` for it. Always `false` on the
     /// mio backend, outside the executor, and once the runtime has released
     /// the connection's slot after its close completes.
-    pub fn is_recv_direct(&self) -> bool {
+    pub(crate) fn is_recv_direct(&self) -> bool {
         #[cfg(has_io_uring)]
         {
             try_with_state(|driver, _| {
@@ -2806,43 +2372,43 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<F> {
 
 /// The exclusive **read side** of a connection.
 ///
-/// Obtained from [`ConnCtx::take_recv`]. Neither `Copy` nor `Clone`, and every
-/// method takes `&mut self`.
+/// Obtained from [`Connection::split`]. Neither `Copy` nor `Clone`, and every
+/// read method takes `&mut self`.
 ///
-/// # How much the compiler actually enforces
+/// `&mut self` prevents a second call only while the return value carries the
+/// borrow. [`forward_to_conn`](Self::forward_to_conn) returns
+/// `ForwardFuture<'_>`, so a read during a forward is a compile error:
 ///
-/// `&mut self` only prevents a second call while the **return value carries the
-/// borrow**. On io_uring one method does that, and for it the conflict is a
-/// compile error rather than a runtime refusal:
-///
-/// - [`forward_to_conn`](Self::forward_to_conn) — returns `ForwardToFuture<'_>`
-///
-/// The rest — `with_data`, `with_data_result`, `with_bytes`, `recv_ready` —
-/// return futures built from
-/// `conn_index`/`generation` by value, with no lifetime parameter, so the
-/// borrow ends at the end of the call expression and two of them can be held at
-/// once. Those still rely on the runtime checks. Giving them a borrow-carrying
-/// wrapper is what would make the type enforce the whole rule; until then this
-/// section is the honest statement of what it buys.
-///
-/// The one that is enforced:
-///
-/// ```ignore
-/// let mut rx = conn.take_recv()?;
-/// let mut f = rx.forward_to_conn(&mut sink, len);
-/// rx.with_data(|_| ParseResult::Consumed(0)).await;  // compile error
+/// ```compile_fail
+/// # use ringline::{ParseResult, RecvHalf, SendHalf};
+/// # async fn f(mut rx: RecvHalf, mut sink: SendHalf) {
+/// let forward = rx.forward_to_conn(&mut sink, 16);
+/// rx.with_data(|_| ParseResult::Consumed(0)).await;
+/// drop(forward);
+/// # }
 /// ```
 ///
-/// Dropping the half releases the claim, so a connection can be handed on.
+/// A second forward from one source is refused the same way:
 ///
-/// Sends stay on [`ConnCtx`], which is still `Copy` — that half has its own
-/// exclusivity rule ("forward *or* send, not both") that this step does not yet
-/// enforce. See `docs/connection-handle-ownership-design.md`.
+/// ```compile_fail
+/// # use ringline::{RecvHalf, SendHalf};
+/// # async fn f(mut rx: RecvHalf, mut a: SendHalf, mut b: SendHalf) {
+/// let first = rx.forward_to_conn(&mut a, 16);
+/// let second = rx.forward_to_conn(&mut b, 16);
+/// drop((first, second));
+/// # }
+/// ```
+///
+/// `with_data`, `with_data_result`, `with_bytes` and `recv_ready` return futures
+/// with no lifetime parameter, so the borrow ends with the call and two of them
+/// can be held at once. Those rely on runtime checks.
+///
+/// Dropping the half releases its claim.
 ///
 /// Available on both backends.
 pub struct RecvHalf {
     conn: ConnCtx,
-    /// Same reason as [`ConnCtx`]: pinned to its owning worker thread.
+    /// Pinned to its owning worker thread; see [`Connection`].
     _not_send: PhantomData<*const ()>,
 }
 
@@ -2866,28 +2432,27 @@ impl RecvHalf {
     }
 
     /// Offer this connection for rebalancing. See
-    /// [`ConnCtx::offer_for_park`].
+    /// [`Connection::offer_for_park`].
     pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         self.conn.offer_for_park(state);
     }
 
-    /// See [`ConnCtx::token`].
+    /// See [`Connection::token`].
     pub fn token(&self) -> ConnToken {
         self.conn.token()
     }
 
-    /// See [`ConnCtx::is_alive`].
+    /// See [`Connection::is_alive`].
     pub fn is_alive(&self) -> bool {
         self.conn.is_alive()
     }
 
-    /// See [`ConnCtx::is_recv_direct`].
+    /// See [`Connection::is_recv_direct`].
     pub fn is_recv_direct(&self) -> bool {
         self.conn.is_recv_direct()
     }
 
-    /// The underlying handle, for the read-side APIs that are still only on
-    /// `ConnCtx`. Crate-internal: it hands back the full surface.
+    /// The connection's slot index and generation.
     pub(crate) fn as_conn_ref(&self) -> ConnCtx {
         self.conn
     }
@@ -2912,37 +2477,76 @@ impl RecvHalf {
         self.conn.recv_ready()
     }
 
-    /// Forward the next `len` received bytes into another connection.
+    /// Forward the next `len` received bytes to another connection on this
+    /// worker.
     ///
-    /// The sink is its [`SendHalf`], borrowed mutably for as long as the
-    /// forward runs. The forward sends through the sink's send queue; see
-    /// [`ConnCtx::forward_to_conn`].
-    #[cfg(has_io_uring)]
+    /// The sink is its [`SendHalf`], borrowed mutably for as long as the forward
+    /// runs, so a bidirectional proxy splits both connections and runs one
+    /// forward in each direction.
+    ///
+    /// ```ignore
+    /// let backend = ringline::connect(addr).await?;
+    /// let (mut backend_tx, backend_rx) = backend.split();
+    /// // client -> backend; a second task forwards backend -> client
+    /// client_rx.forward_to_conn(&mut backend_tx, len).await?;
+    /// ```
+    ///
+    /// A result `< len` means the peer sent FIN first.
+    ///
+    /// # Thread affinity
+    ///
+    /// Both connections belong to this worker, because [`SendHalf`] is `!Send`
+    /// and a half from another worker cannot reach this call.
+    ///
+    /// # TLS
+    ///
+    /// The source may be a TLS connection: rustls' plaintext is collected and
+    /// forwarded, which is what makes a TLS-terminating proxy work. The sink may
+    /// not, because the forward sends bytes as they are, with nothing on the path
+    /// to encrypt them. A TLS sink is refused with `EPROTOTYPE`.
+    ///
+    /// # Errors
+    ///
+    /// Refused at the call, resolving on the first poll without having installed
+    /// anything: `EBUSY` if a forward is already running on this connection,
+    /// `EPIPE` if the source or sink slot is already stale, and `EPROTOTYPE` if
+    /// the sink is a TLS connection.
+    ///
+    /// Resolves `Err(EPIPE)` if the sink connection closes mid-forward. Its slot
+    /// may be reused, and writing to a recycled index would deliver this stream
+    /// to a different peer, so the sink's generation is checked before every
+    /// write.
+    ///
+    /// # The source on io_uring
+    ///
+    /// A plaintext source receives directly into its accumulator, and a TLS
+    /// source's decrypted plaintext lands there too. The forward takes the
+    /// bytes the accumulator holds, up to what is left of `len`, and sends
+    /// them on the sink through the sink's send queue under a guard: zero-copy
+    /// at or above `send_zc_threshold`, copied into a pool slot below it. One
+    /// send is in flight at a time, and the source receives the next chunk
+    /// while it is. Because the sends go through the sink's queue, they are
+    /// ordered with other sends on the sink. A send the runtime cannot submit,
+    /// for example with the worker's send slab
+    /// ([`ConfigBuilder::send_slab_slots`](crate::ConfigBuilder::send_slab_slots))
+    /// full, resolves the forward with that error and leaves the chunk
+    /// buffered on the source. Dropping the future lets a chunk already
+    /// submitted go out and leaves the rest buffered.
+    ///
+    /// # The source on mio
+    ///
+    /// Bytes are read into a queued send on the sink and copied on the way.
+    /// This path exists so that a proxy built on ringline runs without io_uring.
+    /// The source stops reading once it holds the hold cap of entries awaiting
+    /// the sink (`forward_hold_cap`), which closes the source's TCP window rather
+    /// than growing the queue without bound, and resumes when the sink drains.
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
         sink: &'s mut SendHalf,
         len: usize,
-    ) -> ForwardToFuture<'h> {
+    ) -> ForwardFuture<'h> {
         self.conn
-            .direct_forward(sink.conn.conn_index, sink.conn.generation, len, true)
-    }
-
-    /// Forward the next `len` received bytes into another connection.
-    ///
-    /// The sink is its [`SendHalf`], borrowed mutably for as long as the
-    /// forward runs. The forward sends through the sink's send queue; see
-    /// [`ConnCtx::forward_to_conn`].
-    ///
-    /// The two backends return different futures (io_uring sends from the
-    /// accumulator through the sink's send queue; mio pumps through the
-    /// accumulator), so this is two signatures rather than one.
-    #[cfg(not(has_io_uring))]
-    pub fn forward_to_conn<'h, 's: 'h>(
-        &'h mut self,
-        sink: &'s mut SendHalf,
-        len: usize,
-    ) -> ForwardToConnFuture<'s> {
-        self.conn.forward_to_conn(&sink.conn, len)
+            .forward_to(sink.conn.conn_index, sink.conn.generation, len)
     }
 }
 
@@ -2958,7 +2562,7 @@ impl RecvHalf {
 /// one connection and desynchronise the protocol (#423, #425, #429).
 ///
 /// Most handlers can use this directly: the read and write methods are the
-/// same ones `ConnCtx` used to carry.
+/// same ones on [`SendHalf`] and [`RecvHalf`].
 ///
 /// ```ignore
 /// async move {
@@ -2981,19 +2585,178 @@ impl RecvHalf {
 /// Fan-in from several tasks to one connection is an explicit queue
 /// (`runtime::channel`) drained by the owning task, not a shared handle. See
 /// `docs/connection-handle-ownership-design.md`.
+///
+/// # Example: Echo Handler
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
+///
+/// struct Echo;
+///
+/// impl AsyncEventHandler for Echo {
+///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
+///         async move {
+///             let (mut tx, mut rx) = conn.split();
+///             loop {
+///                 let n = rx.with_data(|data| {
+///                     // Echo back whatever we received
+///                     tx.send_nowait(data).ok();
+///                     ParseResult::Consumed(data.len())
+///                 }).await;
+///                 // n == 0 means connection closed (EOF)
+///                 if n == 0 { break; }
+///             }
+///         }
+///     }
+///     fn create_for_worker(_id: usize) -> Self { Echo }
+/// }
+/// ```
+///
+/// # Example: Line-Based Protocol
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
+///
+/// struct LineEcho;
+///
+/// impl AsyncEventHandler for LineEcho {
+///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
+///         async move {
+///             let (mut tx, mut rx) = conn.split();
+///             loop {
+///                 let n = rx.with_data(|data| {
+///                     // Find newline
+///                     if let Some(pos) = data.iter().position(|&b| b == b'\n') {
+///                         let line = &data[..=pos];
+///                         tx.send_nowait(line).ok();
+///                         ParseResult::Consumed(pos + 1)
+///                     } else {
+///                         ParseResult::NeedMore
+///                     }
+///                 }).await;
+///                 if n == 0 { break; }
+///             }
+///         }
+///     }
+///     fn create_for_worker(_id: usize) -> Self { LineEcho }
+/// }
+/// ```
+///
+/// # Example: Zero-Copy with `with_bytes`
+///
+/// For protocols where you want to avoid copying parsed values, use
+/// `with_bytes` which provides `Bytes` handles:
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
+/// use bytes::Bytes;
+///
+/// struct ZeroCopyHandler;
+///
+/// impl AsyncEventHandler for ZeroCopyHandler {
+///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
+///         async move {
+///             let (mut tx, mut rx) = conn.split();
+///             loop {
+///                 let n = rx.with_bytes(|bytes| {
+///                     // Parse protocol, return Bytes::slice() for the value
+///                     // The slice stays valid even after the accumulator advances
+///                     if let Some((consumed, value)) = parse_message(&bytes) {
+///                         process_value(value); // value: Bytes
+///                         ParseResult::Consumed(consumed)
+///                     } else {
+///                         ParseResult::NeedMore
+///                     }
+///                 }).await;
+///                 if n == 0 { break; }
+///             }
+///         }
+///     }
+///     fn create_for_worker(_id: usize) -> Self { ZeroCopyHandler }
+/// }
+///
+/// fn parse_message(data: &[u8]) -> Option<(usize, Bytes)> {
+///     // Parse length-prefixed message: 4-byte big-endian length + payload
+///     if data.len() < 4 { return None; }
+///     let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+///     if data.len() < 4 + len { return None; }
+///     let value = Bytes::copy_from_slice(&data[4..4+len]);
+///     Some((4 + len, value))
+/// }
+///
+/// fn process_value(_value: Bytes) {
+///     // Process the zero-copy value
+/// }
+/// ```
+///
+/// # Send Patterns
+///
+/// ```no_run
+/// use ringline::{AsyncEventHandler, Connection, ParseResult};
+///
+/// struct SendExample;
+///
+/// impl AsyncEventHandler for SendExample {
+///     fn on_accept(&self, mut conn: Connection) -> impl std::future::Future<Output = ()> + 'static {
+///         async move {
+///             let (mut tx, mut rx) = conn.split();
+///             // Fire-and-forget (returns Err if send pool exhausted)
+///             tx.send_nowait(b"hello").ok();
+///
+///             // Await send completion
+///             if let Ok(future) = tx.send(b"world") {
+///                 future.await.ok();
+///             }
+///         }
+///     }
+///     fn create_for_worker(_id: usize) -> Self { SendExample }
+/// }
+/// ```
+///
+/// # Thread affinity
+///
+/// A connection is meaningful only on the worker thread that owns it, so
+/// `Connection` and its halves are neither `Send` nor `Sync`:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::Connection>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<ringline::Connection>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::SendHalf>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::RecvHalf>();
+/// ```
+///
+/// Ringline is thread-per-core: each worker owns its own driver and
+/// `ConnectionTable`, and a connection is an `(index, generation)` pair into
+/// that worker's table. Used from another worker the index is still in bounds,
+/// so the lookup does not fail. It resolves against a different table, and if
+/// the generation also matches, I/O lands on an unrelated connection. Capturing
+/// a `Connection` in a [`spawn_blocking`] closure is a compile error for the same
+/// reason: its pool threads have no driver. [`spawn`] is unaffected, because it
+/// requires only `'static`.
 pub struct Connection {
     tx: SendHalf,
     rx: RecvHalf,
 }
 
 impl Connection {
-    /// The connection handed to `on_accept`, built without going through
-    /// [`ConnCtx::split`].
+    /// The connection handed to `on_accept`.
     ///
-    /// `split` records the read claim via `with_state`, but `spawn_accept_task`
-    /// runs *outside* a task poll, so there is no `CURRENT_DRIVER` to reach.
-    /// The event loop owns `&mut Driver` at that point and sets the claim
-    /// itself; the slot is freshly accepted, so the claim is always free.
+    /// `spawn_accept_task` runs outside a task poll, so the event loop sets the
+    /// claim itself while it owns `&mut Driver`. The slot is freshly accepted, so
+    /// the claim is always free.
     pub(crate) fn for_accept(conn: ConnCtx) -> Self {
         Self::from_claimed(conn)
     }
@@ -3004,7 +2767,6 @@ impl Connection {
     /// Two callers use this. `spawn_accept_task` runs outside a task poll, and
     /// the event loop sets the claim while it owns `&mut Driver`.
     /// `ConnectFuture::poll` runs inside `with_state` and sets the claim there.
-    /// Neither goes through [`ConnCtx::split`].
     pub(crate) fn from_claimed(conn: ConnCtx) -> Self {
         Self {
             tx: SendHalf {
@@ -3020,14 +2782,18 @@ impl Connection {
 
     /// A dangling pair for in-memory unit tests.
     ///
-    /// Mirrors `ConnCtx::for_test`: the halves are unclaimed and the connection
-    /// does not exist. The result is only safe on buffered paths (encoders,
+    /// The halves are unclaimed and the connection does not exist. The result is only safe on buffered paths (encoders,
     /// write buffers, pending queues) that never reach the wire. Gated on the
-    /// `testing` feature for the same reason as `ConnCtx::for_test`.
+    /// `testing` feature because calling an I/O method on it is undefined.
     #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn for_test(conn_index: u32, generation: u32) -> Self {
         Self::from_claimed(ConnCtx::new(conn_index, generation))
+    }
+
+    /// The connection's slot index and generation.
+    pub(crate) fn ctx(&self) -> ConnCtx {
+        self.tx.conn
     }
 
     /// Split into the independently borrowable write and read halves.
@@ -3080,23 +2846,12 @@ impl Connection {
         self.rx.recv_ready()
     }
 
-    /// See [`ConnCtx::forward_to_conn`].
-    #[cfg(has_io_uring)]
+    /// See [`RecvHalf::forward_to_conn`].
     pub fn forward_to_conn<'h, 's: 'h>(
         &'h mut self,
         sink: &'s mut SendHalf,
         len: usize,
-    ) -> ForwardToFuture<'h> {
-        self.rx.forward_to_conn(sink, len)
-    }
-
-    /// See [`ConnCtx::forward_to_conn`].
-    #[cfg(not(has_io_uring))]
-    pub fn forward_to_conn<'h, 's: 'h>(
-        &'h mut self,
-        sink: &'s mut SendHalf,
-        len: usize,
-    ) -> ForwardToConnFuture<'s> {
+    ) -> ForwardFuture<'h> {
         self.rx.forward_to_conn(sink, len)
     }
 
@@ -3124,54 +2879,125 @@ impl Connection {
 
     // ── lifecycle and identity ──────────────────────────────────────────
 
-    /// See [`ConnCtx::close`].
+    /// See [`SendHalf::close`].
     pub fn close(&mut self) {
         self.tx.close();
     }
 
-    /// Offer this connection for rebalancing. See
-    /// [`ConnCtx::offer_for_park`].
+    /// Offer this connection for rebalancing onto a less loaded worker
+    /// (tier 3, #443), carrying `state` across.
+    ///
+    /// Call it at a point where the handler holds nothing it cannot rebuild —
+    /// after finishing a response, not mid-request. Park drops the future and
+    /// makes a fresh one on the new worker via
+    /// [`AsyncEventHandler::on_adopt`](crate::AsyncEventHandler::on_adopt),
+    /// so `state` is the only thing that survives.
+    ///
+    /// Once the connection is parked, sends on this handle, from the handler,
+    /// a spawned task or `on_tick`, return `NotConnected` until the future is
+    /// dropped.
+    ///
+    /// **This is the opt-in.** A connection whose handler never calls this is
+    /// never parked, whatever the load imbalance.
+    ///
+    /// The offer is cleared when more data arrives, since that means a new
+    /// request started and the boundary is gone. So a handler offers once per
+    /// idle point and never has to revoke.
+    ///
+    /// Call it outside any reader callback, after the response to every
+    /// request read so far has been queued. An offer is ignored when it
+    /// is made from inside one of the connection's reader callbacks
+    /// (`with_data`, `with_bytes`, `try_with_data`), or
+    /// while the runtime holds received bytes for the connection, such as
+    /// the next request. Offer again at the next idle point.
+    /// A connection whose next request has always arrived by the time the
+    /// handler offers is therefore never parked. Only the innermost
+    /// running callback is detected. An offer for connection A made from
+    /// inside a callback on connection B, itself inside A's callback, is
+    /// declined only while the runtime still holds A's bytes. It does not
+    /// hold them in a `with_bytes` callback, or after a `forward_recv_buf`
+    /// that sent the whole accumulator.
+    /// `metrics::park_diag::OFFER_DECLINED` counts offers ignored because of
+    /// a running reader callback or held bytes.
+    ///
+    /// The runtime does not see bytes the handler has taken into its own
+    /// memory, for example a `ConnStream`'s buffered data, `Bytes` kept from
+    /// `with_bytes`, or requests the handler has queued. Do not offer while
+    /// holding any.
+    ///
+    /// A TLS connection keeps its TLS session when parked: the session moves
+    /// with it, with any ciphertext received but not yet decrypted, so the
+    /// peer sees no new handshake.
+    ///
+    /// Park also requires the io_uring backend and a kernel with
+    /// `IORING_OP_FIXED_FD_INSTALL` (mainline 6.8). On mio this does
+    /// nothing; on io_uring without that operation the offer is recorded
+    /// and never acted on.
     pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         self.tx.offer_for_park(state);
     }
 
-    /// See [`ConnCtx::token`].
+    /// Returns the `ConnToken` for this connection.
     pub fn token(&self) -> ConnToken {
         self.tx.token()
     }
 
-    /// See [`ConnCtx::is_alive`].
+    /// Whether this handle still refers to a live, usable connection.
+    ///
+    /// Returns `false` if the slot has been released and its generation bumped
+    /// (a stale handle after slot reuse) **or** if the connection is closing
+    /// (`close()` was called — `lifecycle` is `Closing` — even before the Close
+    /// CQE has released the slot). Because a proactive `close()` flips the state
+    /// synchronously, this is a *deterministic* poison probe: a caller that owns
+    /// the connection (e.g. a connection pool) can detect a client's poison
+    /// close on the very next turn, without waiting for the Close CQE to bump
+    /// the generation.
+    ///
+    /// A FIN or reset from the peer closes the connection whether or not a
+    /// read is parked, so this returns `false` once the runtime has seen it.
+    /// On io_uring the runtime detects it on every plaintext or TLS
+    /// connection with a `POLLRDHUP` poll. On a plaintext connection, when
+    /// bytes the peer sent before it are queued or buffered, the connection
+    /// stays open, and this returns `true`, until they have been read (see
+    /// [`connect`]). On a TLS connection the close takes effect when the
+    /// receive reads the close_notify or the FIN; plaintext already decrypted
+    /// stays readable. On io_uring, a close_notify the peer sends without a FIN
+    /// is read when a receive next completes (see [`connect`] for when one is
+    /// armed), and this returns `true` until then.
     pub fn is_alive(&self) -> bool {
         self.tx.is_alive()
     }
 
-    /// See [`ConnCtx::is_recv_direct`].
+    /// Whether the connection receives directly into its accumulator: on
+    /// io_uring, every plaintext connection, accepted or from [`connect`] or
+    /// [`connect_unix`]. A TLS connection receives into its TLS engine's
+    /// buffer instead, and this returns `false` for it. Always `false` on the
+    /// mio backend, outside the executor, and once the runtime has released
+    /// the connection's slot after its close completes.
     pub fn is_recv_direct(&self) -> bool {
         self.rx.is_recv_direct()
     }
 
-    /// See [`ConnCtx::peer_addr`].
+    /// Access peer address.
     pub fn peer_addr(&self) -> Option<crate::connection::PeerAddr> {
         self.tx.peer_addr()
     }
 
-    /// See [`ConnCtx::listener`].
+    /// Which listener accepted this connection, or `None` if it is outbound.
+    ///
+    /// A runtime can bind several listeners and they all feed the same
+    /// `on_accept`; this is how a handler tells them apart. Ids follow
+    /// `bind()` call order — see [`ListenerId`](crate::ListenerId).
     pub fn listener(&self) -> Option<crate::ListenerId> {
         self.tx.listener()
     }
 
-    /// See [`ConnCtx::is_outbound`].
+    /// Check if this connection is outbound (initiated via connect).
     pub fn is_outbound(&self) -> bool {
         self.tx.is_outbound()
     }
 
-    /// The underlying `ConnCtx`, for the APIs that still take one — most
-    /// notably as a `forward_to_conn` sink. See [`SendHalf::as_conn`].
-    pub fn as_conn(&self) -> ConnCtx {
-        self.tx.as_conn()
-    }
-
-    // ── the rest of the ConnCtx surface ─────────────────────────────────
+    // ── the rest of the connection surface ─────────────────────────────────
 
     /// See [`Connection::eof_truncated`].
     pub fn eof_truncated(&self) -> bool {
@@ -3208,7 +3034,7 @@ impl Connection {
 
     /// See [`SendHalf::forward_recv_buf`].
     pub fn forward_recv_buf(&mut self, data: &[u8]) -> io::Result<()> {
-        self.tx.as_conn().forward_recv_buf(data)
+        self.tx.conn.forward_recv_buf(data)
     }
 
     /// See [`SendHalf::send_chain`].
@@ -3217,7 +3043,7 @@ impl Connection {
     where
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
     {
-        self.tx.as_conn().send_chain(f)
+        self.tx.conn.send_chain(f)
     }
 
     /// See [`SendHalf::send_chain_nowait`].
@@ -3226,36 +3052,26 @@ impl Connection {
     where
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> R,
     {
-        self.tx.as_conn().send_chain_nowait(f)
+        self.tx.conn.send_chain_nowait(f)
     }
 
     /// See [`SendHalf::shutdown_write`].
     pub fn shutdown_write(&mut self) {
-        self.tx.as_conn().shutdown_write();
+        self.tx.conn.shutdown_write();
     }
 
-    /// See [`ConnCtx::cancel`].
-    pub fn cancel(self) {
-        let _ = self.tx.as_conn().cancel();
-    }
-
-    /// See [`ConnCtx::tls_info`].
+    /// Query TLS session info for this connection.
     pub fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        self.tx.as_conn().tls_info()
+        self.tx.conn.tls_info()
     }
 
-    /// See [`ConnCtx::index`].
+    /// Returns the connection slot index. Useful for indexing into per-connection arrays.
     pub fn index(&self) -> usize {
-        self.tx.as_conn().index()
-    }
-
-    /// See [`ConnCtx::request_shutdown`].
-    pub fn request_shutdown(&self) {
-        self.tx.as_conn().request_shutdown();
+        self.tx.conn.index()
     }
 }
 
-/// The **write side** of a connection, from [`ConnCtx::split`].
+/// The **write side** of a connection, from [`Connection::split`].
 ///
 /// Not `Copy` and not `Clone`, so one task owns the writes. Several producers
 /// feeding one connection is an explicit queue — `runtime::channel`'s
@@ -3298,7 +3114,23 @@ impl SendHalf {
         self.conn.send_backpressured(data)
     }
 
-    /// See [`ConnCtx::close`].
+    /// Close this connection.
+    ///
+    /// Queued sends drain first, then, on a TLS connection, a close_notify
+    /// alert, then the FIN. The drain has no time bound: a peer that stops
+    /// reading holds the connection until it reads, resets, or the worker
+    /// exits. On io_uring, if a close is already pending, for example because
+    /// the peer closed first, this sends no alert; mio writes the alert at
+    /// teardown regardless. No alert follows a write shutdown
+    /// (`shutdown_write`).
+    ///
+    /// On io_uring a TLS send made after `close()` returns `NotConnected`,
+    /// because it would follow the alert. On mio it is queued and sent ahead of
+    /// the alert, which mio writes once the queue drains.
+    ///
+    /// Does nothing if the connection has already been released (its slot may
+    /// now hold another connection), or when called outside the worker's
+    /// executor.
     pub fn close(&mut self) {
         self.conn.close();
     }
@@ -3344,19 +3176,14 @@ impl SendHalf {
         self.conn.shutdown_write();
     }
 
-    /// See [`ConnCtx::index`].
+    /// See [`Connection::index`].
     pub fn index(&self) -> usize {
         self.conn.index()
     }
 
-    /// See [`ConnCtx::tls_info`].
+    /// See [`Connection::tls_info`].
     pub fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         self.conn.tls_info()
-    }
-
-    /// See [`ConnCtx::request_shutdown`].
-    pub fn request_shutdown(&self) {
-        self.conn.request_shutdown();
     }
 
     /// Build an IO_LINK chained send and await completion.
@@ -3402,44 +3229,34 @@ impl SendHalf {
     }
 
     /// Offer this connection for rebalancing. See
-    /// [`ConnCtx::offer_for_park`].
+    /// [`Connection::offer_for_park`].
     pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         self.conn.offer_for_park(state);
     }
 
-    /// See [`ConnCtx::token`].
+    /// See [`Connection::token`].
     pub fn token(&self) -> ConnToken {
         self.conn.token()
     }
 
-    /// See [`ConnCtx::is_alive`].
+    /// See [`Connection::is_alive`].
     pub fn is_alive(&self) -> bool {
         self.conn.is_alive()
     }
 
-    /// See [`ConnCtx::peer_addr`].
+    /// See [`Connection::peer_addr`].
     pub fn peer_addr(&self) -> Option<crate::connection::PeerAddr> {
         self.conn.peer_addr()
     }
 
-    /// See [`ConnCtx::listener`].
+    /// See [`Connection::listener`].
     pub fn listener(&self) -> Option<crate::ListenerId> {
         self.conn.listener()
     }
 
-    /// See [`ConnCtx::is_outbound`].
+    /// See [`Connection::is_outbound`].
     pub fn is_outbound(&self) -> bool {
         self.conn.is_outbound()
-    }
-
-    /// The underlying handle, for the APIs that still take a `ConnCtx` — most
-    /// notably as a `forward_to_conn` sink.
-    ///
-    /// This is an escape hatch, and it hands back the full `Copy` surface: the
-    /// ownership model is only advisory until step 4 takes the recv methods off
-    /// `ConnCtx` entirely. Do not use it to read.
-    pub fn as_conn(&self) -> ConnCtx {
-        self.conn
     }
 }
 
@@ -3494,12 +3311,13 @@ impl Drop for RecvHalf {
 
 // ── Forwarding to a connection ───────────────────────────────────────
 
-/// Future returned by the mio [`ConnCtx::forward_to_conn`]. Parks on the
-/// source's recv waiter slot; the event loop resolves it by writing into
-/// `Driver::forward_done` and calling `wake_recv`. Borrows the sink `ConnCtx`
-/// (`'a`) so it cannot be dropped mid-forward.
+/// Future returned by [`RecvHalf::forward_to_conn`].
+///
+/// Parks on the source's recv waiter slot; the event loop resolves it by writing
+/// into `Driver::forward_done` and calling `wake_recv`. Borrows the source and
+/// sink halves for its lifetime.
 #[cfg(not(has_io_uring))]
-pub struct ForwardToConnFuture<'a> {
+pub struct ForwardFuture<'a> {
     conn_index: u32,
     generation: u32,
     /// Set when the forward could not be installed at all (stale handle, or a
@@ -3509,7 +3327,7 @@ pub struct ForwardToConnFuture<'a> {
 }
 
 #[cfg(not(has_io_uring))]
-impl Future for ForwardToConnFuture<'_> {
+impl Future for ForwardFuture<'_> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -3538,7 +3356,7 @@ impl Future for ForwardToConnFuture<'_> {
 }
 
 #[cfg(not(has_io_uring))]
-impl Drop for ForwardToConnFuture<'_> {
+impl Drop for ForwardFuture<'_> {
     /// Cancel a forward that is dropped before it resolves.
     ///
     /// This matters more here than on io_uring, where writes only happen while
@@ -3562,11 +3380,10 @@ impl Drop for ForwardToConnFuture<'_> {
     }
 }
 
-/// Future returned by the io_uring [`ConnCtx::forward_to_conn`] and
-/// [`RecvHalf::forward_to_conn`]. Borrows the sink (`'a`) so it cannot be
-/// dropped mid-forward.
+/// Future returned by [`RecvHalf::forward_to_conn`]. Borrows the source and sink
+/// halves for its lifetime.
 #[cfg(has_io_uring)]
-pub struct ForwardToFuture<'a> {
+pub struct ForwardFuture<'a> {
     conn_index: u32,
     generation: u32,
     /// Set when the forward could not be installed at all — a forward already
@@ -3579,7 +3396,7 @@ pub struct ForwardToFuture<'a> {
     _borrow: PhantomData<&'a ()>,
 }
 
-/// State of a [`ForwardToFuture`] that sends from its source's accumulator.
+/// State of a [`ForwardFuture`] that sends from its source's accumulator.
 ///
 /// Each step takes the bytes the accumulator holds, up to what is left of
 /// `len`, and sends them on the sink through its send queue under a guard:
@@ -3734,7 +3551,7 @@ impl DirectForward {
 }
 
 #[cfg(has_io_uring)]
-impl Drop for ForwardToFuture<'_> {
+impl Drop for ForwardFuture<'_> {
     /// A chunk already submitted to the sink goes out; the rest stays
     /// buffered on the source.
     fn drop(&mut self) {
@@ -3745,7 +3562,7 @@ impl Drop for ForwardToFuture<'_> {
 }
 
 #[cfg(has_io_uring)]
-impl Future for ForwardToFuture<'_> {
+impl Future for ForwardFuture<'_> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

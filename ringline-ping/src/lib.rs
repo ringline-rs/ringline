@@ -1,6 +1,6 @@
 //! ringline-native Ping client for use inside the ringline async runtime.
 //!
-//! This client wraps a [`ringline::ConnCtx`] and provides a typed `ping()`
+//! This client wraps a [`ringline::Connection`] and provides a typed `ping()`
 //! method that sends `PING\r\n` and waits for a `PONG` response.
 //!
 //! # Example

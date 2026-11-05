@@ -83,7 +83,7 @@ impl ShardedConfig {
 
 enum ShardConn {
     /// A pooled connection *is* a client — see the note in
-    /// `ringline-redis`'s `sharded.rs`. Holding a bare `ConnCtx` meant a
+    /// `ringline-redis`'s `sharded.rs`. Holding a bare connection handle meant a
     /// `split()` plus a throwaway client on every command once the halves
     /// became claims.
     Connected(Box<Client>),

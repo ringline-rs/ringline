@@ -160,7 +160,7 @@ struct AsyncTcpEcho;
 impl AsyncEventHandler for AsyncTcpEcho {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
-            let mut stream = ConnStream::new(conn.as_conn());
+            let mut stream = ConnStream::new(conn);
             let mut buf = vec![0u8; 32 * 1024];
             loop {
                 let n = match stream.read(&mut buf).await {

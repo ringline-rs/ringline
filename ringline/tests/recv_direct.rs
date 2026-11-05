@@ -587,7 +587,7 @@ impl AsyncEventHandler for StreamRead {
                 let conn = ringline::connect(addr)
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
-                let mut stream = ringline::ConnStream::new(conn.as_conn());
+                let mut stream = ringline::ConnStream::new(conn);
                 let mut buf = [0u8; 5];
                 ringline::timeout(Duration::from_secs(2), stream.read_exact(&mut buf))
                     .await
@@ -768,26 +768,14 @@ impl AsyncEventHandler for DirectForwardClient {
                 let sink = ringline::connect(sink_addr)
                     .await
                     .map_err(|e| format!("connect sink: {e}"))?;
-                // A second forward from the same connection is refused while
-                // the first is alive, and allowed once it is dropped. The sink
-                // is a connection whose send half was split off and dropped,
-                // so its send half is not claimed and the only refusal left is
-                // the running forward.
+                // A forward that is dropped leaves the source free for another.
                 {
                     let spare = ringline::connect(sink_addr)
                         .await
                         .map_err(|e| format!("connect spare sink: {e}"))?;
-                    let (spare_tx, _spare_rx) = spare.split();
-                    let dst = spare_tx.as_conn();
-                    drop(spare_tx);
-                    let src = source.as_conn();
-                    let first = src.forward_to_conn(&dst, 1);
-                    match src.forward_to_conn(&dst, 1).await {
-                        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
-                        other => return Err(format!("second forward: {other:?}")),
-                    }
-                    drop(first);
-                    match src.forward_to_conn(&dst, 0).await {
+                    let (mut spare_tx, _spare_rx) = spare.split();
+                    drop(source.forward_to_conn(&mut spare_tx, 1));
+                    match source.forward_to_conn(&mut spare_tx, 0).await {
                         Ok(0) => {}
                         other => return Err(format!("forward after drop: {other:?}")),
                     }
