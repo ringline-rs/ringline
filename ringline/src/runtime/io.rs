@@ -21,7 +21,7 @@ use crate::handler::ConnId;
 use crate::runtime::TimerSlotPool;
 use crate::runtime::send_completion::SendId;
 use crate::runtime::task::TaskId;
-use crate::runtime::waker::STANDALONE_BIT;
+use crate::runtime::waker::{STANDALONE_BIT, pending};
 use crate::runtime::{CURRENT_TASK_ID, Executor, IoResult};
 
 /// Result of a parse closure passed to [`Connection::with_data`] or
@@ -346,14 +346,14 @@ impl<T> JoinHandle<T> {
 impl<T: 'static> Future for JoinHandle<T> {
     type Output = Result<T, crate::JoinError>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut s = self.state.borrow_mut();
         if let Some(result) = s.result.take() {
             return Poll::Ready(result);
         }
         // Register this task as the waiter so the child can wake us.
         s.waiter = Some(CURRENT_TASK_ID.with(|c| c.get()));
-        Poll::Pending
+        pending(cx)
     }
 }
 
@@ -520,6 +520,9 @@ pub fn spawn_blocking<T: Send + 'static>(
 /// created it, the handle releases the closure's result: at once if it has
 /// arrived, otherwise when it arrives. Dropped on another thread, the result
 /// is held until that worker exits.
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 pub struct BlockingJoinHandle<T> {
     request_id: u64,
     /// The worker whose executor holds the `pending_blocking` entry.
@@ -552,8 +555,13 @@ impl<T> Drop for BlockingJoinHandle<T> {
 impl<T: 'static> Future for BlockingJoinHandle<T> {
     type Output = Result<T, crate::JoinError>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         with_state(|_driver, executor| {
+            // On another worker this id names that worker's entry, and the
+            // result is not there.
+            if self.owner != crate::runtime::waker::current_worker() {
+                return pending(cx);
+            }
             if let Some((_, slot)) = executor.pending_blocking.get_mut(&self.request_id)
                 && let Some(boxed) = slot.take()
             {
@@ -565,7 +573,11 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
                     Err(payload) => Err(crate::JoinError::panicked(payload)),
                 });
             }
-            Poll::Pending
+            // A `Shared` can pass this future between tasks of a worker.
+            if let Some((owner, _)) = executor.pending_blocking.get_mut(&self.request_id) {
+                *owner = CURRENT_TASK_ID.with(|c| c.get());
+            }
+            pending(cx)
         })
     }
 }
@@ -861,6 +873,9 @@ pub fn resolve(host: &str, port: u16) -> io::Result<ResolveFuture> {
 }
 
 /// Future returned by [`resolve()`]. Resolves to a [`SocketAddr`].
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 pub struct ResolveFuture {
     request_id: u64,
     /// The worker whose executor holds the `pending_resolves` entry.
@@ -889,15 +904,24 @@ impl Drop for ResolveFuture {
 impl Future for ResolveFuture {
     type Output = io::Result<std::net::SocketAddr>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         with_state(|_driver, executor| {
+            // On another worker this id names that worker's entry, and the
+            // result is not there.
+            if self.owner != crate::runtime::waker::current_worker() {
+                return pending(cx);
+            }
             if let Some((_, slot)) = executor.pending_resolves.get_mut(&self.request_id)
                 && let Some(result) = slot.take()
             {
                 executor.pending_resolves.remove(&self.request_id);
                 return Poll::Ready(result);
             }
-            Poll::Pending
+            // A `Shared` can pass this future between tasks of a worker.
+            if let Some((owner, _)) = executor.pending_resolves.get_mut(&self.request_id) {
+                *owner = CURRENT_TASK_ID.with(|c| c.get());
+            }
+            pending(cx)
         })
     }
 }
@@ -1871,7 +1895,7 @@ pub struct WithDataFuture<'a, F> {
 impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<'_, F> {
     type Output = usize;
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
         with_state(|driver, executor| {
             // Reject stale futures that survived a slot-reuse cycle. A
             // standalone task holding a `ConnCtx` whose underlying
@@ -1884,7 +1908,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<'_, F> {
                 return Poll::Ready(0);
             }
             let before = arrival_mark(driver, self.conn_index);
-            let poll = self.poll_current(driver, executor);
+            let poll = self.poll_current(driver, executor, cx);
             if let Poll::Ready(consumed) = poll {
                 arrival_settle(driver, self.conn_index, before, consumed > 0);
             }
@@ -1895,7 +1919,12 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> Future for WithDataFuture<'_, F> {
 
 impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<'_, F> {
     /// `poll` for a future whose generation matches the connection's.
-    fn poll_current(&mut self, driver: &mut Driver, executor: &mut Executor) -> Poll<usize> {
+    fn poll_current(
+        &mut self,
+        driver: &mut Driver,
+        executor: &mut Executor,
+        cx: &Context<'_>,
+    ) -> Poll<usize> {
         let data = driver.accumulators.data(self.conn_index);
         if data.is_empty() {
             // Check if the connection has been closed — return 0 (EOF)
@@ -1926,7 +1955,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<'_, F> {
                 .accumulators
                 .compact_at_message_start(self.conn_index);
             park_recv(driver, executor, self.conn_index, None);
-            return Poll::Pending;
+            return pending(cx);
         }
 
         // Data available — call closure immediately (zero-overhead hot path).
@@ -1981,7 +2010,7 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<'_, F> {
             _ => None,
         };
         park_recv(driver, executor, self.conn_index, need);
-        Poll::Pending
+        pending(cx)
     }
 }
 
@@ -2045,7 +2074,7 @@ pub struct WithBytesFuture<'a, F> {
 impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<'_, F> {
     type Output = usize;
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
         with_state(|driver, executor| {
             // Single connection-table lookup: extract generation + closed
             // state together so the rest of poll needs no further accesses.
@@ -2065,7 +2094,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> Future for WithBytesFuture<'_, F> {
                 return Poll::Ready(0);
             }
             let before = arrival_mark(driver, self.conn_index);
-            let poll = self.poll_current(driver, executor, is_closed);
+            let poll = self.poll_current(driver, executor, is_closed, cx);
             if let Poll::Ready(consumed) = poll {
                 arrival_settle(driver, self.conn_index, before, consumed > 0);
             }
@@ -2082,6 +2111,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<'_, F> {
         driver: &mut Driver,
         executor: &mut Executor,
         is_closed: bool,
+        cx: &Context<'_>,
     ) -> Poll<usize> {
         let data = driver.accumulators.data(self.conn_index);
         if data.is_empty() {
@@ -2103,7 +2133,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<'_, F> {
             }
 
             park_recv(driver, executor, self.conn_index, None);
-            return Poll::Pending;
+            return pending(cx);
         }
 
         // Detach accumulator as frozen Bytes (O(1), tail capacity retained).
@@ -2168,7 +2198,7 @@ impl<F: FnMut(Bytes) -> ParseResult + Unpin> WithBytesFuture<'_, F> {
             _ => None,
         };
         park_recv(driver, executor, self.conn_index, need);
-        Poll::Pending
+        pending(cx)
     }
 }
 
@@ -2713,10 +2743,7 @@ impl Connection {
     ///
     /// The future consumes nothing and does not borrow the connection, so a
     /// reader started after it resolves sees the same bytes, and dropping it
-    /// loses none. Polling it registers the polling task, and an arrival
-    /// wakes that task by id; the [`Context`]'s waker is not used. A combinator that
-    /// re-polls only the child whose own waker fired, such as
-    /// `FuturesUnordered`, never re-polls it.
+    /// loses none.
     pub fn recv_ready(&mut self) -> RecvReadyFuture {
         self.rx.recv_ready()
     }
@@ -3321,7 +3348,7 @@ pub struct ForwardFuture<'a> {
 impl Future for ForwardFuture<'_> {
     type Output = io::Result<usize>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         if let Some(errno) = me.refused {
             return Poll::Ready(Err(io::Error::from_raw_os_error(errno)));
@@ -3341,7 +3368,7 @@ impl Future for ForwardFuture<'_> {
                 return Poll::Ready(Ok(forwarded as usize));
             }
             park_forward_waiter(executor, idx as u32);
-            Poll::Pending
+            pending(cx)
         })
     }
 }
@@ -3538,7 +3565,7 @@ impl DirectForward {
             });
             match step {
                 DirectStep::Done => return Poll::Ready(Ok(self.forwarded as usize)),
-                DirectStep::Park => return Poll::Pending,
+                DirectStep::Park => return pending(cx),
                 DirectStep::Fail(e) => return Poll::Ready(Err(e)),
                 DirectStep::Sent(send, chunk) => self.in_flight = Some((send, chunk)),
             }
@@ -3601,7 +3628,7 @@ pub struct RecvReadyFuture {
 impl Future for RecvReadyFuture {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         with_state(|driver, executor| {
             // Stale future from a reused slot — synthesize "ready" so the
             // caller's loop sees the closure and terminates.
@@ -3626,7 +3653,7 @@ impl Future for RecvReadyFuture {
 
             // Not ready — register as recv waiter and park.
             park_recv(driver, executor, self.conn_index, None);
-            Poll::Pending
+            pending(cx)
         })
     }
 }
@@ -3735,7 +3762,7 @@ impl BackpressuredSendFuture<'_> {
 impl Future for BackpressuredSendFuture<'_> {
     type Output = io::Result<u32>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u32>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u32>> {
         let this = self.get_mut();
         with_state(|driver, executor| {
             let task_id = CURRENT_TASK_ID.with(|c| c.get());
@@ -3812,7 +3839,7 @@ impl Future for BackpressuredSendFuture<'_> {
                     // Fall through: the pool is usually free, and costing the
                     // common case a wake-up round-trip would be a poor
                     // default for the API reached for under load.
-                    this.poll_waiting(driver, executor, id)
+                    this.poll_waiting(driver, executor, id, cx)
                 }
 
                 BackpressuredState::Waiting(id) => {
@@ -3830,7 +3857,7 @@ impl Future for BackpressuredSendFuture<'_> {
                     if driver.connections.generation(this.conn_index) != this.generation {
                         return this.abandon(executor, id);
                     }
-                    this.poll_waiting(driver, executor, id)
+                    this.poll_waiting(driver, executor, id, cx)
                 }
 
                 BackpressuredState::Submitted(id) => {
@@ -3845,7 +3872,7 @@ impl Future for BackpressuredSendFuture<'_> {
                         {
                             this.abandon(executor, id)
                         }
-                        None => Poll::Pending,
+                        None => pending(cx),
                     }
                 }
             }
@@ -3860,10 +3887,11 @@ impl BackpressuredSendFuture<'_> {
         driver: &mut Driver,
         executor: &mut Executor,
         id: SendId,
+        cx: &Context<'_>,
     ) -> Poll<io::Result<u32>> {
         let free = driver.send_copy_pool.free_count();
         if !executor.send_capacity_turn(id, free) {
-            return Poll::Pending;
+            return pending(cx);
         }
         let token = ConnId::new(self.conn_index, self.generation);
         let submit = {
@@ -3884,7 +3912,7 @@ impl BackpressuredSendFuture<'_> {
                 // side settled.
                 match executor.take_send_result(id) {
                     Some(result) => self.finish(result),
-                    None => Poll::Pending,
+                    None => pending(cx),
                 }
             }
             Err(e) => {
@@ -3965,7 +3993,7 @@ impl SendFuture {
 impl Future for SendFuture {
     type Output = io::Result<u32>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u32>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u32>> {
         let this = self.get_mut();
         let id = match &mut this.state {
             SendFutureState::Ready(result) => {
@@ -3994,7 +4022,7 @@ impl Future for SendFuture {
                         "connection closed",
                     )))
                 }
-                None => Poll::Pending,
+                None => pending(cx),
             }
         })
     }
@@ -4029,6 +4057,9 @@ impl Drop for SendFuture {
 ///
 /// Two of these futures awaited one after the other run serially. See
 /// [`connect`] for running them concurrently.
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 #[must_use = "a connect future does nothing until polled"]
 pub struct ConnectFuture {
     state: ConnectState,
@@ -4107,12 +4138,12 @@ impl ConnectFuture {
 impl Future for ConnectFuture {
     type Output = io::Result<Connection>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Connection>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Connection>> {
         let this = self.get_mut();
         with_state(|driver, executor| {
             // First poll: submit. A submission failure holds no slot, so the
             // state moves to `Done` and `Drop` has nothing to release.
-            let (conn_index, generation) = match &this.state {
+            let (conn_index, generation, owner) = match &this.state {
                 ConnectState::Unsubmitted { target, timeout } => {
                     match Self::submit(target, *timeout, driver, executor) {
                         Ok(pair) => {
@@ -4121,7 +4152,7 @@ impl Future for ConnectFuture {
                                 generation: pair.1,
                                 owner: crate::runtime::waker::current_worker(),
                             };
-                            pair
+                            (pair.0, pair.1, crate::runtime::waker::current_worker())
                         }
                         Err(e) => {
                             this.state = ConnectState::Done;
@@ -4132,14 +4163,19 @@ impl Future for ConnectFuture {
                 ConnectState::Waiting {
                     conn_index,
                     generation,
-                    ..
-                } => (*conn_index, *generation),
+                    owner,
+                } => (*conn_index, *generation, *owner),
                 ConnectState::Done => {
                     return Poll::Ready(Err(io::Error::other(
                         "connect future polled after completion",
                     )));
                 }
             };
+
+            // On another worker this index is that worker's connection.
+            if owner != crate::runtime::waker::current_worker() {
+                return pending(cx);
+            }
 
             // Slot-reuse safety.
             if driver.connections.generation(conn_index) != generation {
@@ -4169,8 +4205,10 @@ impl Future for ConnectFuture {
                 }
                 _ => {
                     // Not ready yet — re-register waiter.
+                    executor.owner_task[conn_index as usize] =
+                        Some(CURRENT_TASK_ID.with(|c| c.get()));
                     executor.connect_waiters[conn_index as usize] = true;
-                    Poll::Pending
+                    pending(cx)
                 }
             }
         })
@@ -4335,6 +4373,9 @@ pub fn sleep(duration: Duration) -> SleepFuture {
 
 /// Future returned by [`sleep()`] or [`sleep_until()`]. Completes after
 /// the configured duration or at the given deadline.
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 pub struct SleepFuture {
     duration: Duration,
     /// None until first poll, then Some(slot_index).
@@ -4350,17 +4391,23 @@ pub struct SleepFuture {
 impl Future for SleepFuture {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         with_state(|driver, executor| {
             let _ = driver; // used only on io_uring path
             if let Some(slot) = self.timer_slot {
+                // On another worker this slot is that worker's timer.
+                if self.owner != crate::runtime::waker::current_worker() {
+                    return pending(cx);
+                }
                 // Already submitted — check if fired.
                 if executor.timer_pool.is_fired(slot) {
                     executor.timer_pool.release(slot);
                     self.timer_slot = None;
                     return Poll::Ready(());
                 }
-                return Poll::Pending;
+                // A `Shared` can pass this future between tasks of a worker.
+                executor.timer_pool.waker_ids[slot as usize] = CURRENT_TASK_ID.with(|c| c.get());
+                return pending(cx);
             }
 
             // First poll — allocate slot, fill timespec, submit SQE.
@@ -4424,7 +4471,7 @@ impl Future for SleepFuture {
             self.timer_slot = Some(slot);
             self.generation = generation;
             self.owner = crate::runtime::waker::current_worker();
-            Poll::Pending
+            pending(cx)
         })
     }
 }
@@ -4807,7 +4854,7 @@ impl DiskIoFuture {
 impl Future for DiskIoFuture {
     type Output = io::Result<i32>;
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<i32>> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<i32>> {
         assert!(!self.done, "DiskIoFuture polled after completion");
         let poll = with_state(|_driver, executor| {
             match executor.take_disk_io_result(self.seq) {
@@ -4819,7 +4866,7 @@ impl Future for DiskIoFuture {
                     // Re-register waiter (polled before CQE arrived or after spurious wake).
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
                     executor.wait_disk_io(self.seq, task_id);
-                    Poll::Pending
+                    pending(cx)
                 }
             }
         });
@@ -5504,7 +5551,7 @@ pub struct UdpRecvFuture<'a> {
 impl Future for UdpRecvFuture<'_> {
     type Output = (Vec<u8>, SocketAddr);
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         with_state(|driver, executor| {
             let idx = self.udp_index as usize;
             if idx < executor.udp_recv_queues.len()
@@ -5549,7 +5596,7 @@ impl Future for UdpRecvFuture<'_> {
             if idx < executor.udp_recv_waiters.len() {
                 executor.udp_recv_waiters[idx] = Some(task_id);
             }
-            Poll::Pending
+            pending(cx)
         })
     }
 }
@@ -5577,7 +5624,7 @@ where
 {
     type Output = R;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<R> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
         let this = self.get_mut();
         with_state(|driver, executor| {
             let idx = this.udp_index as usize;
@@ -5605,7 +5652,7 @@ where
             if idx < executor.udp_recv_waiters.len() {
                 executor.udp_recv_waiters[idx] = Some(task_id);
             }
-            Poll::Pending
+            pending(cx)
         })
     }
 }
@@ -5670,7 +5717,7 @@ where
 {
     type Output = usize;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
         let this = self.get_mut();
         with_state(|driver, executor| {
             let idx = this.udp_index as usize;
@@ -5679,7 +5726,7 @@ where
                 if idx < executor.udp_recv_waiters.len() {
                     executor.udp_recv_waiters[idx] = Some(task_id);
                 }
-                return Poll::Pending;
+                return pending(cx);
             }
 
             let f = this
@@ -5727,7 +5774,7 @@ where
 {
     type Output = usize;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
         let this = self.get_mut();
         with_state(|driver, executor| {
             let idx = this.udp_index as usize;
@@ -5736,7 +5783,7 @@ where
                 if idx < executor.udp_recv_waiters.len() {
                     executor.udp_recv_waiters[idx] = Some(task_id);
                 }
-                return Poll::Pending;
+                return pending(cx);
             }
 
             let f = this
@@ -5780,7 +5827,7 @@ impl Future for UdpSendReadyFuture<'_> {
     type Output = ();
 
     #[cfg(has_io_uring)]
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         with_state(|driver, executor| {
             let idx = self.udp_index as usize;
             if idx < driver.udp_sockets.len() && !driver.udp_sockets[idx].send_freelist.is_empty() {
@@ -5792,7 +5839,7 @@ impl Future for UdpSendReadyFuture<'_> {
             if idx < executor.udp_send_ready_waiters.len() {
                 executor.udp_send_ready_waiters[idx] = Some(task_id);
             }
-            Poll::Pending
+            pending(cx)
         })
     }
 

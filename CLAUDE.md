@@ -197,6 +197,8 @@ Generation-based stale detection: `ConnId(index, generation)` prevents use-after
 
 Zero-allocation wakers encode the `conn_index` (or `task_idx | STANDALONE_BIT`) in the low 32 bits of the pointer and the owning worker's process-unique id in the high 32. Waking on the owning worker's thread pushes the index onto thread-local `READY_QUEUE`; waking on any other thread pushes it into that worker's inbox (registry in `runtime/waker.rs`) and, if no wake since the worker last drained it has done so, writes its wake fd. The event loop drains both into the executor's ready list.
 
+A leaf future (recv, send, timer, disk, channel) registers its task's id and returns `waker::pending(cx)`, not `Poll::Pending`: if `cx` holds a waker other than the task's own, something other than the executor polled it, usually a combinator such as `FuturesUnordered`, and `pending` keeps that waker, once per distinct waker. `Executor::wake_task`, the path of every leaf completion except `channel.rs::wake_waiter` outside a poll, which fires them itself, fires all of the task's kept wakers, so a `FuturesUnordered` of N pending leaves costs N polls per completion. `collect_wakeups` does not fire them: `FuturesUnordered` wakes its own task when it yields after a poll budget, and firing on that wake would spin the worker. A kept waker runs where the completion runs, in the completion loop or inside another task's poll, so it must not call into ringline (#641).
+
 ### Buffer Systems
 
 - **ProvidedBufRing** — kernel-managed recv pool for UDP (multishot recvs select buffers at completion time; io_uring only). TCP and Unix connections have no ring: a plaintext connection receives into its accumulator, and a TLS connection into its TLS engine's ciphertext buffer
@@ -383,7 +385,7 @@ Two `ClientBuilder` knobs control batching of fired requests:
 
 ### Sending while a reply is pending
 
-`recv` takes `&mut self` and is not cancel-safe (it pops the pending op before its first await), so a task inside `recv` cannot fire. `recv_ready()` flushes and returns a `RecvReadyFuture` that does not borrow the client and resolves when bytes of the next reply have arrived or the connection has finished receiving. A caller waits on it together with its own request source, fires (and calls `recv_ready` again, which flushes) when a request is ready, and calls `recv` when it resolves. Polling it registers the task, an arrival wakes that task by id, and the `Context` waker is not used, so combine it with `select` or a `poll_fn` that polls every branch, not `FuturesUnordered`. Design: `docs/send-while-receiving-design.md` (Option B, a split `Sender`/`Receiver`, is not implemented).
+`recv` takes `&mut self` and is not cancel-safe (it pops the pending op before its first await), so a task inside `recv` cannot fire. `recv_ready()` flushes and returns a `RecvReadyFuture` that does not borrow the client and resolves when bytes of the next reply have arrived or the connection has finished receiving. A caller waits on it together with its own request source, fires (and calls `recv_ready` again, which flushes) when a request is ready, and calls `recv` when it resolves. Polling it registers the task, and an arrival wakes that task by id. Design: `docs/send-while-receiving-design.md` (Option B, a split `Sender`/`Receiver`, is not implemented).
 
 ### Design Notes
 

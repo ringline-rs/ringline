@@ -844,6 +844,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Ringline's futures work inside combinators that poll a child only when the
+  child's own waker fires, such as `FuturesUnordered` and `Shared`. They used to
+  hang, because a completion woke the task by id and nothing polled the child
+  again. A `FuturesUnordered` of N pending ringline futures costs N polls per
+  completion in its task (#641).
+- A blocked `mpsc` send no longer strands another sender when it takes a slot
+  without its wake, or when a sibling send in its task is dropped (#641).
 - `forward_recv_buf` on a plaintext connection is throttled on io_uring. A
   connection holding `forward_hold_cap` send slab entries while the worker's slab
   is over half used stops receiving until that changes, so a peer that does not

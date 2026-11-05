@@ -31,6 +31,7 @@ use std::task::{Context, Poll};
 
 use super::CURRENT_TASK_ID;
 use super::io::try_with_state;
+use super::waker::pending;
 
 /// Shared state for a cancellation token.
 struct State {
@@ -160,16 +161,16 @@ fn cancel_state(state: &Rc<RefCell<State>>) {
 /// Resolves when the associated token is cancelled.
 pub struct CancelledFuture {
     state: Rc<RefCell<State>>,
-    /// The task id this future registered as a waiter, if any. Pushed at
-    /// most once (avoids an O(n) `Vec::contains` scan on every re-poll)
-    /// and removed again on drop.
+    /// The task id this future registered as a waiter, if any. Pushed once
+    /// per polling task (avoids an O(n) `Vec::contains` scan on every
+    /// re-poll), and removed on drop or when another task polls it.
     registered: Option<u32>,
 }
 
 impl Future for CancelledFuture {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         // Check cancellation first.
         {
             let s = self.state.borrow();
@@ -177,13 +178,21 @@ impl Future for CancelledFuture {
                 return Poll::Ready(());
             }
         }
-        // Register as waiter exactly once.
-        if self.registered.is_none() {
-            let task_id = CURRENT_TASK_ID.with(|c| c.get());
-            self.state.borrow_mut().waiters.push(task_id);
+        // Register as waiter once per task: a `Shared` can pass this future
+        // between tasks.
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        if self.registered != Some(task_id) {
+            let mut s = self.state.borrow_mut();
+            if let Some(previous) = self.registered
+                && let Some(pos) = s.waiters.iter().position(|&w| w == previous)
+            {
+                s.waiters.swap_remove(pos);
+            }
+            s.waiters.push(task_id);
+            drop(s);
             self.registered = Some(task_id);
         }
-        Poll::Pending
+        pending(cx)
     }
 }
 

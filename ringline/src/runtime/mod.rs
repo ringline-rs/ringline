@@ -523,10 +523,10 @@ pub(crate) struct Executor {
     /// Connection indices (and standalone task indices with STANDALONE_BIT) ready to poll.
     pub(crate) ready_queue: VecDeque<u32>,
     /// The task currently being polled (its future is checked out of the
-    /// slab, so its slot reads `Polling`). `wake_task` consults this to record
+    /// slab, so its slot reads `Polling`). `ready_task` consults this to record
     /// self-wakes instead of dropping them.
     pub(crate) currently_polling: Option<u32>,
-    /// Set by `wake_task` when the currently-polling task wakes itself;
+    /// Set by `ready_task` when the currently-polling task wakes itself;
     /// consumed by the poll loop to re-queue the task after parking.
     pub(crate) woken_while_polling: bool,
     /// Scratch for draining the thread-local waker queue and the cross-thread
@@ -731,14 +731,14 @@ impl Executor {
     }
 
     /// Drain the thread-local waker queue and this worker's cross-thread
-    /// inbox, moving each woken task from Parked to Ready through `wake_task`
-    /// and queueing it for poll. `wake_task` also records a wake of the task
-    /// being polled.
+    /// inbox, moving each woken task from Parked to Ready through `ready_task`,
+    /// which does not fire kept wakers, and queueing it for poll. `ready_task`
+    /// also records a wake of the task being polled.
     pub(crate) fn collect_wakeups(&mut self) {
         drain_ready_queue(&mut self.waker_drain_scratch);
         self.wakes.drain_into(&mut self.waker_drain_scratch);
         while let Some(id) = self.waker_drain_scratch.pop_front() {
-            let _ = self.wake_task(id);
+            let _ = self.ready_task(id);
         }
     }
 
@@ -784,12 +784,21 @@ impl Executor {
         }
     }
 
-    /// Wake a task by its ID (connection task or standalone task).
+    /// Fire the task's kept wakers, then queue it. Leaf completions, which
+    /// wake a task by the ID it registered, and the self-wake re-queue call
+    /// this.
     ///
     /// Handles both connection tasks (plain index) and standalone tasks
     /// (index | STANDALONE_BIT). Returns true if the task was parked and
     /// is now ready.
     pub(crate) fn wake_task(&mut self, task_id: u32) -> bool {
+        waker::wake_combinators(task_id);
+        self.ready_task(task_id)
+    }
+
+    /// Queue a task for its next poll. A wake through the task's own
+    /// [`Waker`](std::task::Waker) comes here directly.
+    fn ready_task(&mut self, task_id: u32) -> bool {
         // A task waking itself from inside its own poll: the future is
         // checked out of the slab (slot reads `Polling`), so slab.wake() has
         // no parked future to transition and would silently drop the wake,

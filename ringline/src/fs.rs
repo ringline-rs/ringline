@@ -87,6 +87,7 @@ use bytes::BytesMut;
 
 use crate::runtime::CURRENT_TASK_ID;
 use crate::runtime::io::{CURRENT_DRIVER, DiskIoFuture, with_state};
+use crate::runtime::waker::pending;
 
 /// Opaque handle to an opened file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,7 +458,7 @@ pub struct OpenFuture {
 impl Future for OpenFuture {
     type Output = io::Result<File>;
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<File>> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<File>> {
         assert!(!self.done, "OpenFuture polled after completion");
         let poll = with_state(
             |_driver, executor| match executor.take_disk_io_result(self.seq) {
@@ -471,7 +472,7 @@ impl Future for OpenFuture {
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
                     executor.wait_disk_io(self.seq, task_id);
-                    Poll::Pending
+                    pending(cx)
                 }
             },
         );
@@ -781,7 +782,7 @@ pub struct ReadFuture {
 impl Future for ReadFuture {
     type Output = (io::Result<usize>, BytesMut);
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         assert!(me.buf.is_some(), "ReadFuture polled after completion");
         with_state(|_driver, executor| {
@@ -803,7 +804,7 @@ impl Future for ReadFuture {
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
                     executor.wait_disk_io(me.seq, task_id);
-                    Poll::Pending
+                    pending(cx)
                 }
             }
         })
@@ -832,7 +833,7 @@ pub struct WriteFuture {
 impl Future for WriteFuture {
     type Output = (io::Result<usize>, BytesMut);
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         assert!(me.buf.is_some(), "WriteFuture polled after completion");
         with_state(
@@ -848,7 +849,7 @@ impl Future for WriteFuture {
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
                     executor.wait_disk_io(me.seq, task_id);
-                    Poll::Pending
+                    pending(cx)
                 }
             },
         )
@@ -1020,7 +1021,7 @@ pub struct StatFuture {
 impl Future for StatFuture {
     type Output = io::Result<Metadata>;
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<Metadata>> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Metadata>> {
         assert!(!self.done, "StatFuture polled after completion");
         let poll = with_state(|_driver, executor| {
             // First check if there's a normal error result (negative).
@@ -1043,7 +1044,7 @@ impl Future for StatFuture {
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
                     executor.wait_disk_io(self.seq, task_id);
-                    Poll::Pending
+                    pending(cx)
                 }
             }
         });
