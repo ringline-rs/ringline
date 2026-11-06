@@ -144,7 +144,7 @@ fn a_gated_listener_refuses_until_the_handler_releases_it() {
         .bound_addr_of(ListenerId::from_index(0))
         .expect("bound address");
 
-    // The port is held — nothing else can bind it — but not listening.
+    // The port is held — nothing else can listen on it — but not listening.
     assert!(
         std::net::TcpListener::bind(addr).is_err(),
         "a gated listener must still reserve its port"

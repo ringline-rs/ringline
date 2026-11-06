@@ -216,14 +216,24 @@ mod uring {
             }
         }
 
+        // The FIFO's read end closes with the file's last reference. Linux 6.1
+        // drops that about 1.1 s after the slot is freed.
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        let fd = unsafe {
-            libc::open(
-                c.as_ptr(),
-                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
+        let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+        let (fd, err) = loop {
+            let fd = unsafe {
+                libc::open(
+                    c.as_ptr(),
+                    libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            let err = std::io::Error::last_os_error();
+            if fd < 0 || std::time::Instant::now() >= deadline {
+                break (fd, err);
+            }
+            unsafe { libc::close(fd) };
+            ringline::sleep(Duration::from_millis(20)).await;
         };
-        let err = std::io::Error::last_os_error();
         let _ = std::fs::remove_dir_all(&dir);
         if fd >= 0 {
             unsafe { libc::close(fd) };

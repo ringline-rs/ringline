@@ -780,10 +780,13 @@ impl RinglineBuilder {
 
     /// Bind the most recently added listener without listening on it.
     ///
-    /// The port is reserved, and the kernel does not complete handshakes on
-    /// it, so a TCP readiness probe fails while the server is not ready. On
-    /// Linux the peer is refused with `ECONNREFUSED`; on macOS and the BSDs
-    /// the SYN is dropped and the peer times out.
+    /// The port is reserved against sockets that do not set `SO_REUSEADDR`.
+    /// On Linux below 6.8, and on 7.4 or any stable kernel with upstream commit
+    /// 947ccedf683e, a socket that sets it can also bind the port, but cannot
+    /// listen on it while the port is held. The kernel does not complete
+    /// handshakes on this listener, so a TCP readiness probe fails while the
+    /// server is not ready. On Linux the peer is refused with `ECONNREFUSED`;
+    /// on macOS and the BSDs the SYN is dropped and the peer times out.
     ///
     /// Call [`begin_listening()`](crate::begin_listening) with this
     /// listener's [`ListenerId`](crate::ListenerId) once the server can
@@ -2047,9 +2050,10 @@ fn reserve_udp_port(addr: SocketAddr) -> io::Result<(std::os::fd::OwnedFd, Socke
 
 /// Create a bound TCP listener, without SO_REUSEPORT and without listening.
 ///
-/// SO_REUSEADDR is set for the bind and cleared immediately after it, so the
-/// port is not open to a second binder while the socket is not yet
-/// listening. `ListenGates` sets it again just before `listen(2)`.
+/// SO_REUSEADDR is set for the bind and cleared immediately after it, so a
+/// second socket cannot listen on the port, and on Linux 6.8 to 7.3 without
+/// 947ccedf683e cannot bind it, while this socket is not yet listening. `ListenGates` sets it again just
+/// before `listen(2)`.
 pub(crate) fn create_listener(addr: SocketAddr) -> Result<OwnedFd, crate::error::Error> {
     let domain = if addr.is_ipv4() {
         libc::AF_INET
@@ -2081,13 +2085,18 @@ pub(crate) fn create_listener(addr: SocketAddr) -> Result<OwnedFd, crate::error:
         return Err(crate::error::Error::Io(io::Error::last_os_error()));
     }
 
-    // Clear SO_REUSEADDR now that the bind has succeeded, so the port is
-    // reserved against another process for as long as this socket holds it.
+    // Clear SO_REUSEADDR now that the bind has succeeded, to reserve the port
+    // against another process for as long as this socket holds it.
     //
-    // Linux lets two sockets share an address while neither is listening, and
-    // only if both have SO_REUSEADDR set. A listener therefore reserves its
-    // port exclusively only once it listens, which with a deferred listen is
-    // however long the handler takes. Clearing the flag closes that window.
+    // Linux lets a second socket bind an address the first holds, while neither
+    // is listening, if both have SO_REUSEADDR set. A listener therefore reserves
+    // its port exclusively only once it listens, which with a deferred listen is
+    // however long the handler takes. Clearing the flag refuses that bind when
+    // the kernel runs the conflict check. The check is skipped when
+    // `tb->fastreuse` is 1 and the second socket sets the flag, and the first
+    // bind sets it to 1 below Linux 6.8 and on kernels with 947ccedf683e. On
+    // those kernels the second socket binds, but its `listen(2)` fails with
+    // EADDRINUSE while this socket has the flag cleared.
     // `listen_all` sets it again immediately before `listen(2)`, which
     // re-checks the port with the current flag and would otherwise fail
     // EADDRINUSE on a TIME_WAIT connection left by a previous instance.
@@ -2097,9 +2106,11 @@ pub(crate) fn create_listener(addr: SocketAddr) -> Result<OwnedFd, crate::error:
     //
     // Measured on Linux 6.12 aarch64 with plain sockets: left set, a second
     // bind succeeds; cleared after bind, it fails EADDRINUSE. Darwin refuses
-    // the second bind either way. If another process does bind in the
-    // window it must also call `listen(2)`, after which this socket's
-    // `listen` fails with EADDRINUSE and `begin_listening` reports it.
+    // the second bind either way. If another process binds in the window,
+    // its `listen(2)` fails with EADDRINUSE until `listen_all` sets the flag
+    // again. Only in the gap between that and this socket's `listen(2)` can it
+    // listen first; this socket's `listen` then fails and `begin_listening`
+    // reports it.
     //
     // Merged-mode sockets come from `bind_reuseport_socket`, not from here,
     // so SO_REUSEPORT sharing is unaffected.
