@@ -274,9 +274,8 @@ Backpressure is bounded and explicit at each layer:
   immediate admission failures. `send_backpressured` is the exception: copy-pool
   exhaustion parks it in the worker's admission FIFO instead of failing it.
 - Short sends retain their backing and resubmit the remainder. Socket `EAGAIN`
-  retains the send. On io_uring a vectored send answers it with a plain
-  `send` of its first unsent bytes, which waits for room, and a plain send
-  waits behind a `POLLOUT` poll (see "Waiting for room after `EAGAIN`" in
+  retains the send. On io_uring a short send or an `EAGAIN` waits behind a
+  `POLLOUT` poll (see "Waiting for room" in
   [send-completion-design.md](send-completion-design.md)). On mio the send
   waits for writable readiness. Transient ring submission pressure is handled
   by retry lists where the operation permits it.

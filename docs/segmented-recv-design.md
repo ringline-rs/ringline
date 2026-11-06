@@ -120,8 +120,7 @@ impl ConnCtx {
 - **File offset + opcode.** A seekable fd needs `pwrite`/`writev`-at-offset with
   a per-completion offset advance (a new field on the slab entry + a `Writev`
   path distinct from `SendMsg`); `sendmsg` carries no offset.
-- **Short writes (Inv #5).** `MSG_WAITALL` is socket-only; a file write can
-  short. Route through a completion handler that resubmits the remainder at the
+- **Short writes (Inv #5).** A file write can short. Route through a completion handler that resubmits the remainder at the
   advanced offset (the existing `try_advance` loop, extended with the offset).
 - **One write in flight (Inv #2).** Serialize writes to `sink` (like
   `send_queues.in_flight`); pipelining independent writes reorders bytes. This

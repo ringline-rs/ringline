@@ -1,7 +1,7 @@
 # Waiting for room on a half-closed socket
 
-**Status:** implemented, for #605: option B, `MSG_DONTWAIT` on every stream send, with
-ringline doing the waiting. Keeps the Linux 6.1 floor, so #605's raise to 6.8 is
+**Status:** implemented, for #605: `MSG_DONTWAIT` on every stream send, with ringline
+doing the waiting. Keeps the Linux 6.1 floor, so #605's raise to 6.8 is
 dropped. #607 no longer depends on it.
 
 ## Problem
@@ -36,9 +36,9 @@ were the same on a ring with ringline's flags (`SINGLE_ISSUER`, `COOP_TASKRUN`,
 | `SendMsgZc`, flags 0 or `MSG_WAITALL`, after the FIN | 1 | none |
 
 The 95,232 bytes are room that appears about 30 ms after the buffer fills, with or
-without a FIN. The vectored rows differ from `docs/send-completion-design.md` §4,
-which records `-EAGAIN` for them on Linux 6.12 and 7.1, so this is not settled across
-kernels.
+without a FIN. The vectored rows differ from Linux 6.12 and 7.1, where `SendMsg` with
+`MSG_WAITALL` and `SendMsgZc` returned `-EAGAIN` after the FIN, so this is not settled
+across kernels.
 
 Unix stream sockets behave the same way: `POLLRDHUP` on polls, a thread for
 `MSG_WAITALL`, and `-EAGAIN` for `MSG_DONTWAIT`.
@@ -73,9 +73,10 @@ cannot finish waits in ringline:
    `POLLOUT` that arrives while the resubmit is in flight is recorded, and acts if
    that resubmit returns short or `-EAGAIN`. A multishot poll that ends with the send
    still waiting is armed again.
-6. The poll stays armed until the connection closes. A half-closed connection is
-   always closing, so `try_finalize_close` is the one place that cancels it, by
-   user_data. Cancelling when each send finishes would race the next send's arm.
+6. The poll stays armed until the connection closes, when `try_finalize_close`, or
+   worker exit, cancels it. A half-closed connection is always closing, and a poll
+   armed for step 2 costs one ignored CQE per edge. Cancelling when each send finishes
+   would race the next send's arm.
 7. A timer resubmits every waiting send once a second, whichever poll it waits on.
    It covers a lost edge, and a Unix peer's `SHUT_RD`, which a send reports as `-EPIPE`
    and a poll does not report. The interval is a guess, and this retry is unmeasured.
@@ -122,9 +123,8 @@ why the wait is a poll. The timer is a 1 ms retry that does not back off.
 | timer | 87 to 91 | 1,151 to 1,164 | 0 |
 
 During the stall the multishot poll posted one CQE without `POLLOUT` and no others. A
-review ran 192 further combinations of send buffer, read size and reader pause with
-no stall and every byte intact, and confirmed that dropping one `POLLOUT` CQE stalls
-the send.
+further 192 combinations of send buffer, read size and reader pause ran with no stall
+and every byte intact, and dropping one `POLLOUT` CQE stalled the send.
 
 The cost is the kernel no longer retrying in place. Medians of 4 interleaved runs of
 1 MiB sends, steps 1 to 3 against `MSG_WAITALL`:
@@ -143,7 +143,7 @@ The cost is the kernel no longer retrying in place. Medians of 4 interleaved run
 - Throughput kept the reader's rate.
 - Resubmitting on a short send cost about 40% more enters than step 1.
 - Linking `PollAdd` ahead of the `Send`, with `IOSQE_CQE_SKIP_SUCCESS` on the poll,
-  cut enters by 26% to 47% in review. CPU showed no clear change, so it is left out.
+  cut enters by 26% to 47%. CPU showed no clear change, so it is left out.
 - CPU differences were at most about 18% and sit inside a run-position effect larger
   than the difference. Measuring CPU needs randomised order on the rig.
 
@@ -211,17 +211,19 @@ A close with a send waiting behaves as it did, and waits for the peer. Completio
 semantics do not change: a short result stays inside its handler, and the send settles
 once with its full length. Forward writes use `send_parts`, so they need nothing
 separate. `SEND_EAGAIN` is now a normal backpressure count. A chain part is built with
-`Sqe::chain_send` or `Sqe::chain_send_msg_zc`, and `push_sqe_chain` debug-asserts it,
-because a chain part with `MSG_DONTWAIT` restores #734.
+`Sqe::chain_send` or `Sqe::chain_send_msg_zc`, and `push_sqe_chain` debug-asserts it
+before a one-part chain takes the plain push, because a chain part with `MSG_DONTWAIT` restores #734.
 
 ## Tests
 
 `ringline/tests/half_closed_send_wait.rs` counts `iou-wrk` threads in
 `/proc/self/task`.
 
-- 16 half-closed stalled peers hold no thread, for coalesced, zero-copy and TLS sends,
+- 16 half-closed stalled peers hold no thread, for coalesced, guard and TLS sends,
   and for a single-slot send whose peer half-closes while it waits. Every byte arrives
-  when the peers read.
+  when the peers read. Under a small `RLIMIT_MEMLOCK` a guard send takes `-ENOMEM` and
+  continues as plain sends, so `a_zero_copy_send_waits_for_room` checks the zero-copy
+  wait, and fails on `-ENOMEM` under a limit of at least 64 MiB.
 - With `MSG_WAITALL` back on stream sends, the same tests fail: 16 stalled sends hold
   16 threads, on Linux 7.2.6 arm64.
 - A half-closed peer reading 64 MiB finishes within a limit the 1 s timer cannot meet.
@@ -230,15 +232,17 @@ because a chain part with `MSG_DONTWAIT` restores #734.
   `/proc/net/tcp`. Unit tests check the cancel, including with no close lead.
 - A control: a chain with a part waiting on a half-closed peer holds a thread.
 
-`a_paced_send_arrives_intact_without_a_fin` passes with `MSG_WAITALL` too, because
-ringline has no way to set the 64 KiB send buffer the 127 re-arm case needs. It checks
-that the bytes arrive, and nothing about threads.
+`a_paced_send_arrives_intact_without_a_fin` passes with `MSG_WAITALL` too. On a 64 KiB
+send buffer, a 64 MiB send with `MSG_WAITALL` takes a thread after io_uring's 127 poll
+re-arms, and ringline has no way to set that buffer.
 
 ## Not known
 
 - Whether a multishot poll behaves this way on a Linux 6.1 older than 6.1.159. No
   earlier 6.1 stable release was run.
-- Results on a real NIC. All run-time results are from loopback, on a raw ring.
+- Results on a real NIC. All run-time results are from loopback.
+- ringline itself on any kernel but Linux 7.2.6, where its tests ran. The results on
+  6.1 and 6.12 are from a raw ring with the same flags.
 - CPU cost, per the note under Measured.
 - Whether `POLLOUT` and `-EAGAIN` can coincide under TCP memory pressure. It is
   plausible from `tcp.c`, and step 7 bounds it.

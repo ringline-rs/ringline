@@ -65,7 +65,10 @@ struct InFlightSendEntry {
     /// A `SendMsgZc` of this entry returned `-ENOMEM`: the rest of the entry
     /// is sent with plain `send`s, which pin no pages.
     plain_send: bool,
-    pending_notifs: u8,
+    /// One per main CQE with `IORING_CQE_F_MORE`. A short send adds one, and a
+    /// slow reader can leave many unacknowledged, so the send buffer does not
+    /// bound this.
+    pending_notifs: u32,
     awaiting_notifications: bool,
     in_use: bool,
 }
@@ -305,7 +308,7 @@ impl InFlightSendSlab {
     }
 
     /// Decrement pending notification count. Returns the new count.
-    pub fn dec_pending_notifs(&mut self, idx: u16) -> u8 {
+    pub fn dec_pending_notifs(&mut self, idx: u16) -> u32 {
         let entry = &mut self.entries[idx as usize];
         debug_assert!(
             entry.pending_notifs > 0,

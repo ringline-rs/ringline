@@ -104,9 +104,8 @@ interesting part.
 Extend the microbenchmark harness that already exists on
 the local `bench/tls-send-microbench` branch (the one that produced the
 allocation counter) with a third arm: a real kTLS socket, keys installed by
-hand, plaintext sent with `IORING_OP_SEND` **and no `MSG_WAITALL`** — kTLS
-refuses it [P-19]. ringline's `STREAM_SEND_FLAGS` was `MSG_WAITALL` when this
-was written and has been `MSG_DONTWAIT` since #605. On hv01, at 1 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB, report:
+hand, plaintext sent with `IORING_OP_SEND` and no `MSG_WAITALL`, which kTLS
+refuses [P-19]. On hv01, at 1 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB, report:
 
 - **bytes allocated per operation inside the measured call**, the number that
   settled the last effort. Prediction from source: the kTLS arm allocates
@@ -210,16 +209,13 @@ Those are `sk_msg_zerocopy_from_iter` call counts. Reading them:
 - **N4** — the send-ordering hazard at the handshake→kTLS switch (see
   [Question 4](#4-what-breaks), "The switch is the sharp edge") has no clean
   answer within the per-connection send queue.
-- **N5** — reinstating a per-connection short-send resubmit loop for kTLS
-  connections (forced by [P-19]: kTLS refuses `MSG_WAITALL`) costs more than
-  the copies kTLS removes. This is a regression against a shipped, argued
-  decision ([`send-completion-design.md`](send-completion-design.md) §2), and
-  it is **now quantified** [P-24]: under a 64 KiB `SO_SNDBUF` with a slow
+- **N5** — the userspace short-send resubmit loop kTLS needs (forced by
+  [P-19]: kTLS refuses `MSG_WAITALL`) costs more than the copies kTLS removes.
+  Since #605 every stream send uses that loop, so this cost is no longer
+  specific to kTLS. It is quantified [P-24]: under a 64 KiB `SO_SNDBUF` with a slow
   reader, **20 logical 256 KiB sends cost 74 SQEs — 54 of them short sends**,
-  with `tls_sw_sendmsg` entered 127 times. That is the cost G2 has to absorb,
-  and it lands on exactly the backpressured connections `MSG_WAITALL` was
-  introduced to help. **This is now the leading NO-GO candidate**, because it
-  is a measured cost on the same axis as the measured win.
+  with `tls_sw_sendmsg` entered 127 times. That measurement predates #605 and
+  has not been repeated.
 
 **Explicitly not a GO criterion:** `TLS_HW`. It is unreachable on every host we
 own [P-7] and cannot be a gate on work we could validate.
@@ -533,7 +529,7 @@ reference point.
 | 2 | By-value access to the rustls connection | **Small** | Two accessors: `TlsTable::take(conn_index) -> Option<TlsConn>` and `UnbufferedConn::into_kind(self)`. The ownership chain is already consumable [P-18] |
 | 3 | TCP `RecvMsgMulti` on **both** backends | **Large** | See 3.3 |
 | 4 | `setsockopt` on a fixed descriptor | **Small** | `opcode::SetSockOpt` exists in the pinned `io-uring` 0.7.12 and takes `impl UseFixed` [P-11]; the kernel imposes no level restriction on the setsockopt direction, and both `TCP_ULP` and `TLS_TX` were **measured** installing successfully on a fixed descriptor [P-20]. Note the `optval` (which holds **key material**) must satisfy Domain Invariant 1 — live until the CQE — and be zeroized after |
-| 5 | A second short-send strategy | **Medium, and unbudgeted anywhere** | kTLS refuses `MSG_WAITALL` [P-19], so kTLS connections need the userspace partial-resubmit loop that `MSG_WAITALL` was landed to remove. Two strategies coexisting in `submit_next_queued`/`handle_send`, keyed on connection type |
+| 5 | Short sends | **None since #605** | kTLS refuses `MSG_WAITALL` [P-19], and stream sends use `MSG_DONTWAIT` and the userspace wait, so no second strategy is needed. The rest of this row predates #605. Two strategies coexisting in `submit_next_queued`/`handle_send`, keyed on connection type |
 | 6 | A cmsg helper | **Small** | The one cmsg parser, `backend/udp_gro.rs:21-52`, reads a single hardcoded option. Extract an iterator from it |
 
 ### 3.2 The unbuffered engine is genuinely the prerequisite — and better than we knew
@@ -761,7 +757,7 @@ Checked against `CLAUDE.md`'s *Domain Invariants* and
 | **2. io_uring does not order independent SQEs** | **Needs rethinking at exactly one point: the switch.** See below |
 | **3. Stale CQEs are normal** | **Survives, extended.** The `SetSockOpt` CQE needs generation validation like any other, and the recv re-arm across the switch will produce in-flight `RecvMulti` CQEs for a connection that is now `RecvMsgMulti` |
 | **4. No CQE-skip for pool-backed sends** | **Survives unchanged** |
-| **5. Short sends happen** | **BROKEN — this is the sharpest finding in the document.** kTLS refuses `MSG_WAITALL` with `-EOPNOTSUPP` [P-19], measured, and ringline sets it on every stream send. See below |
+| **5. Short sends happen** | **Survives since #605.** kTLS refuses `MSG_WAITALL` with `-EOPNOTSUPP` [P-19], measured. Stream sends use `MSG_DONTWAIT`, and only `send_chain` sets `MSG_WAITALL`. See below |
 | **6. `ENOBUFS` on multishot recv** | **Survives**, but the re-arm path must be written for `RecvMsgMulti`, which ringline does not have on TCP |
 | **7. `EINTR`/`EBUSY` on submit is backpressure** | **New hazard.** `EBUSY` from `SOCKET_URING_OP_SETSOCKOPT` is *not* backpressure — it is the rekey refusal [P-5]. Retrying it forever is a hang. The two must not be conflated |
 
@@ -778,25 +774,15 @@ if (msg->msg_flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
 ```
 
 `MSG_WAITALL` is not in it. `tls_device_sendmsg` (`tls_device.c:436-439`) is
-narrower still. ringline's `STREAM_SEND_FLAGS` was `MSG_WAITALL` when this was
-measured, set by every stream send builder, so **every ringline send on a kTLS
-socket failed immediately with `EOPNOTSUPP`**. Since #605 stream sends use
-`MSG_DONTWAIT` and a userspace wait, on every connection; the kTLS cost below
-has not been re-measured.
+narrower still. So a send with `CHAIN_SEND_FLAGS` on a kTLS socket fails
+immediately with `EOPNOTSUPP`.
 Measured on hv01, not inferred: the io_uring probe's `IORING_OP_SEND` returned
 `-95`.
 
-This is not a small compatibility fix. `MSG_WAITALL` on stream sends is a
-deliberate, argued, shipped decision —
-[`send-completion-design.md`](send-completion-design.md) §2 landed it precisely
-to collapse the CQE → userspace-resubmit → CQE round trips that short sends
-otherwise cost, and `CLAUDE.md`'s Domain Invariant 5 records it as the
-mechanism. Under kTLS, ringline must:
+Under kTLS, ringline must:
 
-- drop `MSG_WAITALL` for kTLS connections, and
-- reinstate the userspace partial-resubmit loop **for those connections only**,
-  so the send path carries two short-send strategies keyed on connection type,
-  and
+- refuse a `send_chain` or build it without `MSG_WAITALL`, since chains keep
+  that flag, and
 - keep the resubmit ordered — a partial kTLS send leaves a *partial TLS record
   open* in the kernel (`pending_open_record_frags`), so anything that
   interleaves on that socket corrupts the record stream. Invariant 2's
@@ -978,10 +964,7 @@ axis and weaker on the other, and the two do not cancel:
   **G0 counted kernel branches at 4 KiB–256 KiB. It did not show that anyone
   goes faster.**
 
-And the cost is high and front-loaded: **kTLS refuses `MSG_WAITALL`** [P-19],
-so Domain Invariant 5's mechanism does not survive and the userspace
-short-send resubmit loop has to come back for kTLS connections — undoing a
-shipped, argued decision; a `RecvMsgMulti` conversion of the TCP recv hot path
+And the cost is high and front-loaded: a `RecvMsgMulti` conversion of the TCP recv hot path
 on both backends (Large, and colliding with segmented recv); a send-ordering
 hazard at the switch that invariant 2 does not currently cover; a
 confidentiality-limit counter ringline would have to own; and — decisively for

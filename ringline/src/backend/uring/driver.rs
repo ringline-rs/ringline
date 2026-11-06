@@ -656,9 +656,8 @@ pub(crate) struct Driver {
     /// Whether the `SendBackstop` timer is armed.
     pub(crate) send_backstop_armed: bool,
     /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
-    /// Drained each tick — used when resubmitting a coalesced `sendmsg` (a
-    /// partial remainder, or a drain `send` that could not be pushed) found the
-    /// SQ full.
+    /// Drained each tick — used when resubmitting a coalesced `sendmsg` found
+    /// the SQ full.
     pub(crate) pending_coalesced_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
@@ -1369,10 +1368,9 @@ impl Driver {
         //
         // The current strategy preserves the queue's serialized
         // drain: leave in_flight + queue alone, mark `close_pending`,
-        // and let `note_send_finalized` (called from `handle_send` /
-        // `handle_send_pollout` after each completion) submit the
-        // deferred `Close` once both `in_flight` is false and the
-        // queue is empty.
+        // and let `note_send_finalized` (called from the send handlers
+        // after each completion) submit the deferred `Close` once both
+        // `in_flight` is false and the queue is empty.
         let state = &mut self.send_queues[conn_index as usize];
         state.close_pending = true;
         if state.in_flight {
@@ -1644,15 +1642,6 @@ impl Driver {
         if !(state.close_pending && sends_drained && chain_drained && shutdown_drained) {
             return;
         }
-        // A `SendPollOut` holds the socket open past the `Close`, and a multishot
-        // one outlives the shutdown lead. With no room for the cancel, nothing
-        // is committed yet.
-        if !self.cancel_send_poll(conn_index) {
-            if !self.pending_finalize_closes.contains(&conn_index) {
-                self.pending_finalize_closes.push(conn_index);
-            }
-            return;
-        }
         let st = &mut self.send_queues[conn_index as usize];
         st.close_pending = false;
         // From here the Close is committed (submitted below, or queued for
@@ -1672,8 +1661,7 @@ impl Driver {
         {
             self.close_notify_armed.swap_remove(pos);
         }
-        let lead = self.close_lead(conn_index);
-        if self.ring.submit_close(conn_index, lead).is_err() {
+        if self.submit_committed_close(conn_index).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
             // Queue this connection for retry on a later tick. (An earlier
             // version rebuilt the whole retry vec here — aging every other
@@ -1683,21 +1671,20 @@ impl Driver {
         }
     }
 
-    /// Cancel the connection's `SendPollOut`, if one is armed. Returns false
-    /// when the SQ has no room for the cancel.
-    fn cancel_send_poll(&mut self, conn_index: u32) -> bool {
+    /// Submit the `Close` of a connection whose close is committed, after
+    /// cancelling its `SendPollOut`: a poll holds the socket open past the
+    /// `Close`, and a multishot one outlives a shutdown lead. On an error the
+    /// caller retries this; a cancel that went through is not repeated.
+    pub(crate) fn submit_committed_close(&mut self, conn_index: u32) -> io::Result<()> {
         let generation = self.connections.generation(conn_index);
         let state = &mut self.send_queues[conn_index as usize];
-        if matches!(state.send_poll, SendPoll::OneShot | SendPoll::Multi)
-            && self
-                .ring
-                .submit_cancel_send_pollout(conn_index, generation)
-                .is_err()
-        {
-            return false;
+        if matches!(state.send_poll, SendPoll::OneShot | SendPoll::Multi) {
+            self.ring
+                .submit_cancel_send_pollout(conn_index, generation)?;
         }
         state.send_poll = SendPoll::None;
-        true
+        let lead = self.close_lead(conn_index);
+        self.ring.submit_close(conn_index, lead)
     }
 
     /// Hook called from the send-path CQE handlers after the queue
@@ -1718,7 +1705,9 @@ impl Driver {
     /// `close_submitted` set, release their slot or slab entry, and fail
     /// their send without pushing an SQE. A CQE that lands after the Close CQE
     /// fails the generation check and releases only its own slot. The next
-    /// occupant is protected by `reset_send_state` at reactivation.
+    /// occupant is protected by `reset_send_state` at reactivation. A send
+    /// waiting for room has only its poll in the kernel: `try_finalize_close`
+    /// cancels that, and the poll's CQE or `handle_close` fails the send.
     pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
         let state = &mut self.send_queues[conn_index as usize];
         let settles = Self::release_queued_sends(
@@ -1751,6 +1740,10 @@ impl Driver {
     /// Invariant 7); persistent starvation past the retry cap fails the
     /// queued sends and closes the connection there.
     pub(crate) fn submit_next_queued(&mut self, conn_index: u32) -> bool {
+        // The send that finished took its wait state with it.
+        let state = &mut self.send_queues[conn_index as usize];
+        state.pollout_seen = false;
+        state.resubmitted_on_pollout = false;
         self.submit_next_queued_inner(conn_index, 0)
     }
 

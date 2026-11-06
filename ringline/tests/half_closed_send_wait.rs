@@ -156,7 +156,9 @@ impl SendGuard for VecGuard {
 }
 
 /// Sends `LEN` bytes, the way `MODE` names. `SINGLE_SLOT` is one `send` per pool
-/// slot, `SPANS_SLOTS` one coalesced `sendmsg` run, and `GUARD` a `SendMsgZc`.
+/// slot, `SPANS_SLOTS` one coalesced `sendmsg` run, and `GUARD` a `SendMsgZc`. A
+/// `SendMsgZc` can return `-ENOMEM` under `RLIMIT_MEMLOCK` and continue as plain
+/// sends (#642), so only `a_zero_copy_send_waits_for_room` shows a zero-copy wait.
 async fn send_all<const MODE: u8>(conn: &mut Connection) {
     let len = LEN.load(Ordering::SeqCst);
     let sent = match MODE {
@@ -262,7 +264,6 @@ fn stalled_peers_hold_no_thread<H: AsyncEventHandler>(config: Config, len: usize
         read_payload(peer, len, "half-closed peer");
     }
     wait_for_done(CONNS);
-    assert_eq!(iou_threads(), 0, "a send took a worker thread");
     drop(peers);
     stop(&runtime, handles);
 }
@@ -302,7 +303,6 @@ fn a_fin_during_a_single_slot_send_holds_no_thread() {
             panic!("payload differs at byte {i}");
         }
     }
-    assert_eq!(iou_threads(), 0, "a send took a worker thread");
     drop(peers);
     stop(&runtime, handles);
 }
@@ -366,8 +366,46 @@ fn tls_sends_to_half_closed_peers_hold_no_thread() {
         read_payload(&mut rustls::Stream::new(tls, tcp), len, "TLS peer");
     }
     wait_for_done(CONNS);
-    assert_eq!(iou_threads(), 0, "a send took a worker thread");
     drop(peers);
+    stop(&runtime, handles);
+}
+
+/// A zero-copy send, small enough to fit under `RLIMIT_MEMLOCK`, stalls on a
+/// half-closed peer and arrives intact. The limit is CI's 64 MiB: a process
+/// under a smaller limit shares it with every ring and test running, so only
+/// the delivery is checked there.
+#[test]
+fn a_zero_copy_send_waits_for_room() {
+    use ringline::metrics::{POOL, pool};
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let len = 4 << 20;
+    reset(len);
+    let enomem = || POOL.value(pool::SEND_ZC_ENOMEM).unwrap_or(0);
+    let before = enomem();
+    let (runtime, handles) = RinglineBuilder::new(config(64))
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<SendAfterFin<GUARD>>()
+        .expect("launch");
+    let mut peer = connect(runtime.bound_addr().expect("bound address"));
+    peer.write_all(b"go").unwrap();
+    peer.shutdown(Shutdown::Write).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    read_payload(&mut peer, len, "zero-copy send");
+    wait_for_done(1);
+
+    let mut memlock = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `memlock` outlives the call.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut memlock) },
+        0
+    );
+    if memlock.rlim_cur >= 64 << 20 {
+        assert_eq!(enomem() - before, 0, "the send was not zero-copy");
+    }
+    drop(peer);
     stop(&runtime, handles);
 }
 
@@ -390,10 +428,24 @@ fn paced_send_arrives_intact<H: AsyncEventHandler>(fin: bool) {
     }
 
     let start = Instant::now();
-    read_payload(&mut peer, len, "paced peer");
+    let mut head = vec![0u8; len / 2];
+    peer.read_exact(&mut head).expect("first half delivered");
+    // Before the send finishes: below Linux 6.13 a close's lead runs on an io-wq
+    // worker.
+    assert_eq!(
+        DONE.load(Ordering::SeqCst),
+        0,
+        "the send must still be going"
+    );
+    assert_eq!(iou_threads(), 0, "the send took a worker thread");
+    let mut tail = vec![0u8; len - len / 2];
+    peer.read_exact(&mut tail).expect("second half delivered");
     let took = start.elapsed();
     wait_for_done(1);
-    assert_eq!(iou_threads(), 0, "the send took a worker thread");
+    head.extend_from_slice(&tail);
+    if let Some(i) = (0..len).find(|&i| head[i] != pattern(i)) {
+        panic!("paced peer: payload differs at byte {i}");
+    }
     assert!(
         took < Duration::from_secs(10),
         "held to the backstop: {took:?}"

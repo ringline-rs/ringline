@@ -86,10 +86,10 @@ one-shot poll spins the worker's event loop (#603). That result moves the send t
 a multishot poll, which is edge-triggered: it reports `POLLRDHUP` once and then
 `POLLOUT` when room appears.
 
-`MSG_WAITALL` waited in the kernel instead, on an io-wq worker from the
-**unbound** pool, which `ConfigBuilder::iowq_max_workers` does not cap: one
-thread for each connection whose send waited on a half-closed socket (#605).
-A `send_chain` still does, because its parts are linked. Zero-copy sends inside a
+`MSG_WAITALL` waits in the kernel instead, on an io-wq worker from the
+unbound pool, which `ConfigBuilder::iowq_max_workers` does not cap: one
+thread for each connection whose send waits on a half-closed socket (#605).
+A `send_chain` uses it, because its parts are linked. Zero-copy sends inside a
 `send_chain` can fail instead: an `-EAGAIN` there fails the chain and closes the
 connection, so a chain part larger than the send buffer's free space cannot reach
 a half-closed peer, even one that is reading. `send_parts` waits for room.

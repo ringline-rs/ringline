@@ -2688,8 +2688,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// one-shot poll completes at once with `POLLRDHUP` and no `POLLOUT`, so it
     /// cannot wait. `handle_send_pollout` then arms a multishot poll, which is
     /// edge-triggered: it reports `POLLRDHUP` once, and then `POLLOUT` when room
-    /// appears. A multishot poll stays armed until `Driver::try_finalize_close`,
-    /// because a half-closed connection is always closing.
+    /// appears. A multishot poll stays armed until the connection closes.
     ///
     /// `-EAGAIN` from a send made on a `POLLOUT` arms the multishot poll too. A
     /// socket reporting both would otherwise repeat a poll and a send forever.
@@ -2830,8 +2829,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             None
         };
         if let Some(error) = error {
-            // With nothing waiting, this is the cancel `try_finalize_close`
-            // submitted.
+            // With nothing waiting, this is the cancel the `Close` came with,
+            // or a poll that outlived its send.
             if let Some(raw) = state.waiting_send.take() {
                 self.fail_waiting_send(UserData(raw), error);
             }
@@ -2844,8 +2843,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             state.pollout_seen = pollout && state.in_flight;
             return;
         }
-        // An error or a hangup on a multishot poll: the resubmit returns what
-        // the socket has to say. The edge cannot repeat.
+        // On an error or a hangup, the resubmit returns the socket's error. A
+        // multishot poll's edge does not fire again, so this cannot spin.
         if pollout || (multi && mask & (libc::POLLERR | libc::POLLHUP) as u32 != 0) {
             self.resubmit_waiting_send(conn_index, true);
         } else if !more {
@@ -4555,8 +4554,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         let retries = std::mem::take(&mut self.driver.pending_close_retries);
         for (conn_index, retry) in retries {
-            let lead = self.driver.close_lead(conn_index);
-            if self.driver.ring.submit_close(conn_index, lead).is_err() {
+            if self.driver.submit_committed_close(conn_index).is_err() {
                 self.driver
                     .pending_close_retries
                     .push((conn_index, retry.saturating_add(1)));
@@ -6608,11 +6606,17 @@ mod tests {
     }
 
     /// Whether a forced close (`force_finalize_close`, as when a TLS
-    /// close_notify deadline passes) of a connection with a send waiting for
-    /// room, with `lead` ahead of its `Close`, releases the socket. The poll
-    /// holds the socket until something ends it; the peer never reads, and
-    /// sees a hang-up once the socket is shut down or released (#586).
-    fn forced_close_releases_a_stuck_send(lead: crate::backend::uring::ring::CloseLead) -> bool {
+    /// close_notify deadline passes) of a connection with a send stuck in the
+    /// kernel, with `lead` ahead of its `Close`, releases the socket. The send
+    /// is a chain part, whose `MSG_WAITALL` keeps it in the kernel, or (with
+    /// `chain` false) a send waiting for room, which leaves only its poll
+    /// there. Either holds the socket until something ends it; the peer never
+    /// reads, and sees a hang-up once the socket is shut down or released
+    /// (#586).
+    fn forced_close_releases_a_stuck_send(
+        lead: crate::backend::uring::ring::CloseLead,
+        chain: bool,
+    ) -> bool {
         use std::os::fd::AsRawFd;
         let mut config = test_config();
         config.close_lead_override = Some(lead);
@@ -6635,7 +6639,14 @@ mod tests {
         }
         drop(ours);
 
-        {
+        if chain {
+            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(&[7u8; 16384]).unwrap();
+            let payload = UserData::send_payload(slot, generation);
+            let ud = UserData::encode(OpTag::Send, conn_index, payload);
+            let entry = crate::backend::uring::sqe::Sqe::chain_send(conn_index, ptr, len, ud.raw());
+            unsafe { el.driver.ring.push_sqe(&entry) }.expect("push");
+            el.driver.send_queues[conn_index as usize].in_flight = true;
+        } else {
             let mut ctx = el.driver.make_ctx();
             ctx.send(token, &[7u8; 16384]).expect("send");
         }
@@ -6643,7 +6654,7 @@ mod tests {
         el.drain_completions();
         assert!(
             el.driver.send_queues[conn_index as usize].in_flight,
-            "the send must still be waiting"
+            "the send must still be outstanding"
         );
 
         // Request the close, then give up on the send.
@@ -6677,23 +6688,36 @@ mod tests {
     #[test]
     fn a_forced_close_led_by_a_cancel_releases_a_stuck_send() {
         assert!(forced_close_releases_a_stuck_send(
-            crate::backend::uring::ring::CloseLead::CancelAll
+            crate::backend::uring::ring::CloseLead::CancelAll,
+            true
         ));
     }
 
     #[test]
     fn a_forced_close_led_by_a_shutdown_releases_a_stuck_send() {
         assert!(forced_close_releases_a_stuck_send(
-            crate::backend::uring::ring::CloseLead::Shutdown
+            crate::backend::uring::ring::CloseLead::Shutdown,
+            true
         ));
     }
 
-    /// With nothing ahead of the `Close`, the cancel of the waiting send's poll
-    /// releases the socket.
+    /// The control: with nothing ahead of the `Close`, the stuck send holds
+    /// the socket open.
     #[test]
-    fn a_forced_close_led_by_nothing_releases_a_stuck_send() {
+    fn a_forced_close_led_by_nothing_leaves_a_stuck_send_holding_the_socket() {
+        assert!(!forced_close_releases_a_stuck_send(
+            crate::backend::uring::ring::CloseLead::Nothing,
+            true
+        ));
+    }
+
+    /// A waiting send leaves only its poll in the kernel, and the cancel of the
+    /// poll releases the socket with nothing ahead of the `Close`.
+    #[test]
+    fn a_forced_close_led_by_nothing_releases_a_waiting_send() {
         assert!(forced_close_releases_a_stuck_send(
-            crate::backend::uring::ring::CloseLead::Nothing
+            crate::backend::uring::ring::CloseLead::Nothing,
+            false
         ));
     }
 
@@ -9924,6 +9948,57 @@ mod tests {
 
         // The cancelled poll's CQE finds nothing to do.
         el.test_dispatch_cqe(poll, -libc::ECANCELED, 0);
+    }
+
+    /// With no room for the cancel, the close stays committed and the retry
+    /// submits both. Nothing re-drives a close left uncommitted on an idle
+    /// connection, and a park needs `close_submitted` at once.
+    #[test]
+    fn a_failed_cancel_keeps_the_close_committed() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert_waits_on_poll(&el, conn_index, true);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 2);
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+
+        el.driver.close_connection(conn_index);
+        el.driver.ring.force_push_failures(1);
+        for c in std::mem::take(&mut el.driver.pending_finalize_closes) {
+            el.driver.try_finalize_close(c);
+        }
+        assert!(el.driver.send_queues[conn_index as usize].close_submitted);
+        assert_eq!(el.driver.pending_close_retries, vec![(conn_index, 0)]);
+        assert!(el.driver.ring.pushed_cancels.is_empty());
+
+        el.driver.tick_count = 4;
+        el.drain_close_retries();
+        assert!(el.driver.pending_close_retries.is_empty());
+        assert_eq!(el.driver.ring.pushed_cancels, vec![poll]);
+    }
+
+    /// `-EAGAIN` on a send's first issue, after an earlier send's resubmit on a
+    /// `POLLOUT`, is an ordinary full socket and takes the one-shot poll.
+    #[test]
+    fn a_finished_send_leaves_no_wait_state() {
+        let mut el = make_test_loop();
+        let (conn_index, slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        el.test_dispatch_cqe(ud.raw(), 100, 0);
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(&[7u8; 100]).unwrap();
+        let generation = el.driver.connections.generation(conn_index);
+        let payload = UserData::send_payload(slot, generation);
+        let next = UserData::encode(OpTag::Send, conn_index, payload);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        el.test_dispatch_cqe(next.raw(), -libc::EAGAIN, 0);
+        assert_waits_on_poll(&el, conn_index, false);
     }
 
     /// A forced close leaves a waiting send to the cancel of its poll. That

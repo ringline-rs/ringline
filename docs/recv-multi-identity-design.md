@@ -22,8 +22,8 @@ occupied by the connection this recv was armed for" (Domain Invariant 3: *stale
 CQEs are normal*).
 
 Every other per-connection family already answers the second question: the send
-family packs a truncated generation via `UserData::send_payload`, `ForwardWrite`
-carries the generation at submit, slab-backed sends record it in the slab entry. `RecvMulti` was the gap.
+family packs a truncated generation via `UserData::send_payload`, and slab-backed
+sends record it in the slab entry. `RecvMulti` was the gap.
 
 ### The escape that makes it reachable
 
