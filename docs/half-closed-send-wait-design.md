@@ -136,6 +136,34 @@ The cost is the kernel no longer retrying in place. Medians of 4 interleaved run
 - CPU differences were at most about 18% and sit inside a run-position effect larger
   than the difference. Measuring CPU needs randomised order on the rig.
 
+### Other kernels
+
+The same raw-ring probe ran in guests on an x86 host. It checks the multishot sequence
+on TCP and Unix sockets, each send opcode with `MSG_DONTWAIT`, and 256 runs of steps 1
+to 6 against a reader. Those runs covered the default send buffer and 16, 64 and 256
+KiB, reads of 4 KiB to 1 MiB, pauses of 0 to 10 ms, and a FIN before and during the
+send. A control that drops one `POLLOUT` CQE has to be reported as stuck.
+
+| Kernel | Image | Multishot sequence | Each opcode | 256 runs, stuck or corrupt | Control caught |
+| --- | --- | --- | --- | --- | --- |
+| 6.1.159 | Amazon Linux 2023 | pass, see below | `-EAGAIN`, 0 threads | 0 | 5 of 5 |
+| 6.12.63 | Debian 13 | pass | `-EAGAIN`, 0 threads | 0 | 5 of 5 |
+
+6.12 ran once. 6.1 ran twice, and neither run had a stuck or corrupt transfer.
+
+On 6.1 TCP, the send after the FIN returned 32,768 bytes, where 6.12 and 7.2.6 return
+`-EAGAIN`, and the poll stayed silent. `SO_MEMINFO` shows this is the `POLLOUT`
+threshold and no lost edge. `wmem_queued` fell from 136,192 to 120,448 after the socket
+filled, with `sndbuf` 131,072. `send` needs `wmem_queued < sndbuf`, which held.
+`POLLOUT` needs free space of at least `wmem_queued / 2`, which was 10,624 against
+60,224 and did not hold. The next send returned `-EAGAIN`, and `POLLOUT` arrived when
+the reader drained. What freed the 15,744 bytes was not observed; the FIN's ACK is the
+likely source.
+
+So a send can have room while the socket does not poll writable. Step 4 waits in that
+state, the room stays unused until the reader frees enough to reach the threshold, and
+the wait ends when it does.
+
 ## Options not chosen
 
 ### A. Cap the unbound pool, and give a plain close a deadline
@@ -209,9 +237,8 @@ nothing separate.
 
 ## Not known
 
-- Whether a multishot poll behaves this way below 7.2.6. Linux 6.1's `poll.c` has the
-  same `EPOLLET` path, read from source, and nothing has run there. A lost edge would
-  leave only the 1 s backstop, so this has to run on 6.1 and 6.12 before implementing.
+- Whether a multishot poll behaves this way on a Linux 6.1 older than 6.1.159. No
+  earlier 6.1 stable release was run.
 - Results on a real NIC. All run-time results are from loopback, on a raw ring.
 - CPU cost, per the note under Measured.
 - Whether `POLLOUT` and `-EAGAIN` can coincide under TCP memory pressure. It is
