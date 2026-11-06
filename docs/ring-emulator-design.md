@@ -304,11 +304,10 @@ conformance tests confirm against the real ring first.
 | RecvMsgUdp | RECVMSG multishot | As RecvMulti, and write the `io_uring_recvmsg_out` header, name and control data into the buffer in the kernel's layout so `RecvMsgOut::parse` (or its replacement) reads it. On Linux the control data is what `recvmsg` returns (`UDP_GRO`). Off Linux there is no GRO, so each completion carries one datagram and no segment-size control message, which the driver already reads as a single datagram. | C, P |
 | RecvUdp | RECV multishot | As RecvMulti on a UDP socket. | B |
 | RecvFallback | RECV one-shot into a pool slot | Try at submit, then on readable; one CQE. | A |
-| Send, TlsSend, SendRecvBuf, *Drain | SEND, `MSG_WAITALL` | `write` until all bytes are sent, waiting for writable in between. Post the total, or, on an error, the bytes written before it if any *(verify)*, otherwise `-errno`. | B |
-| SendMsgCoalesced | SENDMSG, `MSG_WAITALL` | `writev` the iovecs with the same rule. The emulator need not reproduce `-EAGAIN` after a peer's half-close (#603); the driver's drain path is correct either way. | B |
-| ForwardWrite | SENDMSG to a socket; WRITEV to a regular file | Socket sink: as SendMsgCoalesced. File sink: readiness does not apply to regular files, so the `pwritev` runs on the disk-I/O pool. | B |
-| SendMsgZc | SENDMSG_ZC (no `MSG_WAITALL`) | One `writev` attempt per readable-to-writable cycle, posting a short count when that is all the socket took, as the kernel can *(verify)*. Then post the operation CQE with `F_MORE` and a separate `F_NOTIF` CQE in the same reap. A notification follows exactly when `F_MORE` is set, including on error and zero-length results (#487). The `writev` reads the guard's memory in place; the kernel copies it into the socket buffer, so the send is not zero-copy, but ringline makes no copy of its own. | C |
-| SendPollOut | POLL_ADD POLLOUT | Check writability at submit; otherwise post on the writable edge. | A |
+| Send, TlsSend, *Drain | SEND, `MSG_DONTWAIT`, or `MSG_WAITALL` in a chain | One `write`: post what it took, or `-EAGAIN` or another `-errno`. With `MSG_WAITALL`, `write` until all bytes are sent, waiting for writable in between. Post the total, or, on an error, the bytes written before it if any *(verify)*, otherwise `-errno`. | B |
+| SendMsgCoalesced | SENDMSG, `MSG_DONTWAIT` | One `writev` of the iovecs, with the same rule. | B |
+| SendMsgZc | SENDMSG_ZC, `MSG_DONTWAIT`, or `MSG_WAITALL` in a chain | One `writev`, posting a short count when that is all the socket took, or `-EAGAIN`. Then post the operation CQE with `F_MORE` and a separate `F_NOTIF` CQE in the same reap. A notification follows exactly when `F_MORE` is set, including on error and zero-length results (#487). The `writev` reads the guard's memory in place; the kernel copies it into the socket buffer, so the send is not zero-copy, but ringline makes no copy of its own. | C |
+| SendPollOut | POLL_ADD POLLOUT, one shot or multishot | Check writability at submit; otherwise post on the writable edge. A peer's half-close posts `POLLRDHUP` without `POLLOUT` at once. A multishot poll posts each edge with `F_MORE`, stays armed, and posts `-ECANCELED` without `F_MORE` when cancelled by user_data. | B |
 | Connect | CONNECT | Nonblocking `connect`, then `SO_ERROR` on writable, as the mio backend does today. | A |
 | Shutdown, CloseShutdown | SHUTDOWN | `shutdown(2)` on the op's fd. | A |
 | Close | CLOSE (fixed) | See the fixed-file table: cancel the slot's pending ops, then drop the emulator's fd. | C |
@@ -460,7 +459,7 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    the two. After this the driver compiles without the `io_uring` crate.
 3. **First emulated slice.** `EmulatedEngine` on Linux behind a
    `ring-emulator` feature, with RecvMulti on both ring kinds (incremental
-   offsets, `F_BUF_MORE` and `SOCK_NONEMPTY` included), Send, SendRecvBuf,
+   offsets, `F_BUF_MORE` and `SOCK_NONEMPTY` included), Send,
    Connect, Close, the close leads, Cancel, Timeout/TickTimeout/Timer and
    EventFdRead. Acceptance: the conformance tests for those ops pass on
    both engines, and the `tests/echo.rs` tests that use only those ops
@@ -506,9 +505,8 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
   from its table, "Copies per request" says why. "Receive
   under the shared-ring design" above gives the counts per engine.
 - kTLS is designed (`docs/ktls-design.md`) but not implemented. Its
-  design sends plaintext with `IORING_OP_SEND` without `MSG_WAITALL`, so
-  the emulator's Send follows the flag: with `MSG_WAITALL` it writes
-  until done, and without it posts what one `write` took. The kernel TLS
+  design sends plaintext with `IORING_OP_SEND` with `STREAM_SEND_FLAGS`, which
+  the emulator's Send already follows. The kernel TLS
   socket itself is a platform facility the emulator cannot provide off
   Linux; parity there needs the userspace TLS path, as today.
 

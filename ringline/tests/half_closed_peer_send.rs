@@ -11,9 +11,7 @@
 //! and compare the count with the loop's idle rate; the `shutdown_*` tests
 //! check that a worker exits promptly while such a send waits. The spin check
 //! for coalesced copy sends is `deferred_close_does_not_spin_on_half_closed_peer`
-//! in `echo.rs`, and the coalesced send's drain is covered by
-//! `coalesced_eagain_drains_with_a_plain_send` in the io_uring event loop's
-//! unit tests.
+//! in `echo.rs`, and `half_closed_send_wait.rs` covers the wait itself.
 //!
 //! The tests share the tick counter, so they take a lock.
 

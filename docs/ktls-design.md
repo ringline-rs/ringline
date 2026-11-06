@@ -1,5 +1,17 @@
 # Kernel TLS (kTLS) — scoping
 
+> **Since this was written:** #605 moved stream sends to `MSG_DONTWAIT` and a
+> userspace wait for room, on every connection. Only `send_chain` sets
+> `MSG_WAITALL`. Where this document says ringline sets `MSG_WAITALL` on every
+> stream send, or that kTLS needs a second short-send strategy, there is now one
+> strategy. Its cost is paid with or without kTLS, so N5 is no longer a cost of
+> kTLS, and G2 asks whether the kTLS win holds with that cost in both arms. P-24
+> has not been repeated. `tls_sw_sendmsg` and `tls_push_data`, which
+> `tls_device_sendmsg` calls, allow `MSG_DONTWAIT`, in the source at Linux 6.1,
+> 6.12 and 6.18. A `send_chain` part with `MSG_WAITALL` would still get
+> `-EOPNOTSUPP`, so kTLS has to refuse `send_chain` or gather its parts into one
+> queued send, as a TLS connection does today.
+
 Note (2026-10-25): `ConnCtx::forward_to` was removed.
 
 Note (2026-10-25): on io_uring a TLS receive writes ciphertext directly into

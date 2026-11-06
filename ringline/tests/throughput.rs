@@ -202,13 +202,7 @@ fn tcp_throughput_round_trip_vs_std_net() {
     // Chunked request-reply: write 64 KiB, read 64 KiB back, repeat
     // 128 times = 8 MiB total. With at most one chunk in flight on the
     // wire neither side's TCP buffers fill, which keeps the workload
-    // inside ringline's happy path. (Fire-and-forget large writes hit
-    // a separate limitation: when the kernel returns `EAGAIN` on send
-    // because the send buffer filled, `handle_send` currently drops
-    // the connection's pending queue instead of awaiting socket
-    // writability. The right fix is multishot poll-on-POLLOUT + retry,
-    // tracked separately. This test exercises the throughput path we
-    // can compare apples-to-apples against std::net today.)
+    // inside ringline's happy path.
     let total_bytes = 8 * 1024 * 1024;
     let chunk_size = 64 * 1024;
     let payload: Vec<u8> = (0..total_bytes).map(|i| (i & 0xFF) as u8).collect();

@@ -578,7 +578,7 @@ Checked against CLAUDE.md's *Domain Invariants*:
 3. **Stale CQEs** — completion handling untouched; same `OpTag`s, same generation
    validation.
 4. **No CQE-skip for pool-backed sends** — unchanged.
-5. **Short sends** — unchanged; same `BuiltSend` path and `MSG_WAITALL`.
+5. **Short sends** — unchanged; same `BuiltSend` path and `STREAM_SEND_FLAGS`.
 
 ## Testing
 

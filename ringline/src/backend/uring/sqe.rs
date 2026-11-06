@@ -129,9 +129,11 @@ pub(crate) enum Op {
     FixedFdInstall {
         index: u32,
     },
+    /// `multi` keeps the poll armed, posting a completion on each edge.
     PollAdd {
         fd: Fd,
         mask: u32,
+        multi: bool,
     },
     /// `openat(AT_FDCWD, …)`, installing the result into registered slot
     /// `file_index`.
@@ -184,7 +186,7 @@ impl Sqe {
     }
 
     /// A stream send of `len` bytes at `buf` on registered file `index`,
-    /// with `MSG_WAITALL` (Domain Invariant 5).
+    /// with `MSG_DONTWAIT` (Domain Invariant 5).
     pub(crate) fn stream_send(index: u32, buf: *const u8, len: u32, user_data: u64) -> Self {
         Sqe::new(
             Op::Send {
@@ -197,13 +199,26 @@ impl Sqe {
         )
     }
 
+    /// A stream send in a linked chain. See [`Sqe::chain_send_msg_zc`].
+    pub(crate) fn chain_send(index: u32, buf: *const u8, len: u32, user_data: u64) -> Self {
+        Sqe::new(
+            Op::Send {
+                fd: Fd::Fixed(index),
+                buf,
+                len,
+                flags: crate::completion::CHAIN_SEND_FLAGS,
+            },
+            user_data,
+        )
+    }
+
     /// A zero-copy `sendmsg` on registered file `index`.
     pub(crate) fn send_msg_zc(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
         Sqe::new(
             Op::SendMsgZc {
                 fd: Fd::Fixed(index),
                 msg,
-                flags: 0,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
             },
             user_data,
         )
@@ -217,7 +232,7 @@ impl Sqe {
             Op::SendMsgZc {
                 fd: Fd::Fixed(index),
                 msg,
-                flags: crate::completion::STREAM_SEND_FLAGS as u32,
+                flags: crate::completion::CHAIN_SEND_FLAGS as u32,
             },
             user_data,
         )

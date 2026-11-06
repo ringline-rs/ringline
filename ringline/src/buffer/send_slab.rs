@@ -65,7 +65,8 @@ struct InFlightSendEntry {
     /// A `SendMsgZc` of this entry returned `-ENOMEM`: the rest of the entry
     /// is sent with plain `send`s, which pin no pages.
     plain_send: bool,
-    pending_notifs: u8,
+    /// One per main CQE with `IORING_CQE_F_MORE`, so a short send adds one.
+    pending_notifs: u32,
     awaiting_notifications: bool,
     in_use: bool,
 }
@@ -305,7 +306,7 @@ impl InFlightSendSlab {
     }
 
     /// Decrement pending notification count. Returns the new count.
-    pub fn dec_pending_notifs(&mut self, idx: u16) -> u8 {
+    pub fn dec_pending_notifs(&mut self, idx: u16) -> u32 {
         let entry = &mut self.entries[idx as usize];
         debug_assert!(
             entry.pending_notifs > 0,
@@ -761,6 +762,25 @@ mod tests {
         let pool_slot = slab.release(idx);
         assert_eq!(pool_slot, 5);
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    /// A send that goes out in many short results owes one notification for
+    /// each, past what a `u8` holds.
+    #[test]
+    fn notifications_count_past_255() {
+        let mut slab = InFlightSendSlab::new(4);
+        let iov = [libc::iovec {
+            iov_base: std::ptr::dangling_mut(),
+            iov_len: 100,
+        }];
+        let guards = [const { None }; MAX_GUARDS];
+        let (idx, _) = slab.allocate(0, 0, &iov, u16::MAX, guards, 0, 100).unwrap();
+        for _ in 0..300 {
+            slab.inc_pending_notifs(idx);
+        }
+        slab.mark_awaiting_notifications(idx);
+        assert_eq!(slab.dec_pending_notifs(idx), 299);
+        assert!(!slab.should_release(idx));
     }
 
     /// Regression test for Z1: when no notification is expected (result == 0),

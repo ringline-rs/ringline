@@ -264,6 +264,7 @@ impl Ring {
             Op::PollAdd {
                 fd: sqe::Fd::Fixed(conn_index),
                 mask: libc::POLLRDHUP as u32,
+                multi: false,
             },
             user_data.raw(),
         );
@@ -374,7 +375,7 @@ impl Ring {
         let user_data = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
         let entry = Sqe::new(
             Op::SendMsgZc {
-                flags: 0,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
                 fd: sqe::Fd::Fixed(conn_index),
                 msg,
             },
@@ -410,15 +411,10 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a plain `send` of `len` bytes at `ptr` on a registered file,
-    /// after a vectored send returned `-EAGAIN`.
-    ///
-    /// io_uring reports `POLLRDHUP` on every poll, so once the peer has
-    /// half-closed a `POLLOUT` poll completes at once and the vectored send
-    /// fails with `-EAGAIN` again (#603). A `send` waits until the socket has
-    /// room; in that state it runs on an io-wq worker thread (#605). `user_data`
-    /// names the operation whose completion handler takes the result as a
-    /// partial write.
+    /// Submit a plain `send` of `len` bytes at `ptr` on a registered file, for
+    /// a zero-copy entry that took `-ENOMEM` (#642). It carries `MSG_DONTWAIT`
+    /// and pins no memory. `user_data` names the operation whose completion
+    /// handler takes the result as a partial write.
     ///
     /// # Safety
     /// The `len` bytes at `ptr` must stay valid until the CQE arrives.
@@ -791,6 +787,7 @@ impl Ring {
             Op::PollAdd {
                 fd: sqe::Fd::Raw(fd),
                 mask,
+                multi: false,
             },
             ud,
         );
@@ -800,28 +797,21 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a one-shot PollAdd on `POLLOUT` for a fixed-table TCP fd
-    /// after a Send returned `-EAGAIN`. The CQE encodes `pool_slot` so
-    /// the handler can resubmit the original send from where it
-    /// stopped. (`current_ptr_remaining(pool_slot)` gives the right
-    /// `(ptr, len)` to retry with.)
+    /// Submit a `POLL_ADD` for `POLLOUT` on a connection whose send waits for
+    /// room. `multi` keeps it armed, as `AsyncEventLoop::wait_for_room`
+    /// describes.
     pub fn submit_send_pollout(
         &mut self,
         conn_index: u32,
         generation: u32,
-        pool_slot: u16,
-        is_tls: bool,
+        multi: bool,
     ) -> io::Result<()> {
-        // Payload: pool_slot in the low 16 bits, is_tls flag in bit 16, and
-        // the connection generation's low 15 bits in bits 17..31 so the
-        // POLLOUT handler resubmits on the right completion path and can
-        // reject a CQE that outlived its connection slot.
-        let payload = UserData::send_pollout_payload(pool_slot, is_tls, generation);
-        let user_data = UserData::encode(OpTag::SendPollOut, conn_index, payload);
+        let user_data = UserData::encode(OpTag::SendPollOut, conn_index, generation);
         let entry = Sqe::new(
             Op::PollAdd {
                 fd: sqe::Fd::Fixed(conn_index),
                 mask: libc::POLLOUT as u32,
+                multi,
             },
             user_data.raw(),
         );
@@ -829,6 +819,24 @@ impl Ring {
             self.push_sqe(&entry)?;
         }
         Ok(())
+    }
+
+    /// Cancel the armed [`submit_send_pollout`](Self::submit_send_pollout) of
+    /// `conn_index`. A multishot poll holds the socket open past its `Close`.
+    pub fn submit_cancel_send_pollout(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+    ) -> io::Result<()> {
+        let target = UserData::encode(OpTag::SendPollOut, conn_index, generation);
+        let ud = UserData::encode(OpTag::Cancel, conn_index, 0);
+        let entry = Sqe::new(
+            Op::Cancel {
+                target: target.raw(),
+            },
+            ud.raw(),
+        );
+        unsafe { self.push_sqe(&entry) }
     }
 
     /// Submit a timeout SQE that fires after the given duration.
@@ -877,6 +885,18 @@ impl Ring {
         if entries.is_empty() {
             return Ok(());
         }
+        // A short part would be followed by the next one across a gap, and the
+        // chain's accounting does not resubmit one (#734).
+        debug_assert!(
+            entries.iter().all(|entry| match entry.op {
+                Op::Send { flags, .. } => flags == crate::completion::CHAIN_SEND_FLAGS,
+                Op::SendMsgZc { flags, .. } => {
+                    flags == crate::completion::CHAIN_SEND_FLAGS as u32
+                }
+                _ => true,
+            }),
+            "a chain part must be built with the chain send flags"
+        );
         if entries.len() == 1 {
             return unsafe { self.push_sqe(&entries[0]) };
         }

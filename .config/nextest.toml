@@ -30,6 +30,12 @@ threads-required = "num-test-threads"
 filter = 'binary(segment_backpressure) & (test(forward_recv_buf) | test(a_lone_peer))'
 threads-required = "num-test-threads"
 
+# Stall zero-copy sends of several MiB, and one test fails if RLIMIT_MEMLOCK
+# turns its send to plain sends, as a test running alongside can.
+[[profile.default.overrides]]
+filter = 'binary(half_closed_send_wait)'
+threads-required = "num-test-threads"
+
 # Holds a zero-copy send to a peer that does not read through worker exit.
 [[profile.default.overrides]]
 filter = 'binary(shutdown_zero_copy)'

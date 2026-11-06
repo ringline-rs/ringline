@@ -77,6 +77,35 @@ pub(crate) struct ConnSendState {
     /// `reset_send_state` at slot reactivation, like `close_submitted`.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub shutdown_inflight: bool,
+    /// The raw user_data of the send whose rest waits for room, which names its
+    /// pool slot or slab entry and its completion path. Nothing of it is in the
+    /// kernel. `in_flight` stays true, so nothing else sends meanwhile.
+    #[cfg(has_io_uring)]
+    pub waiting_send: Option<u64>,
+    /// The connection's `SendPollOut`.
+    #[cfg(has_io_uring)]
+    pub send_poll: SendPoll,
+    /// A `POLLOUT` arrived while the send was in the kernel. If that send
+    /// comes back short, it does not have to wait for another.
+    #[cfg(has_io_uring)]
+    pub pollout_seen: bool,
+    /// The send in the kernel was resubmitted on a `POLLOUT`.
+    #[cfg(has_io_uring)]
+    pub resubmitted_on_pollout: bool,
+    /// The connection is on `Driver::send_backstop_list`.
+    #[cfg(has_io_uring)]
+    pub on_send_backstop: bool,
+}
+
+/// The state of a connection's `SendPollOut`.
+#[cfg(has_io_uring)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendPoll {
+    None,
+    /// Queued on `Driver::pending_send_pollout_retries`: the SQ was full.
+    Pending,
+    OneShot,
+    Multi,
 }
 
 impl ConnSendState {
@@ -90,6 +119,16 @@ impl ConnSendState {
             close_send_count: 0,
             close_notify_deadline: None,
             shutdown_inflight: false,
+            #[cfg(has_io_uring)]
+            waiting_send: None,
+            #[cfg(has_io_uring)]
+            send_poll: SendPoll::None,
+            #[cfg(has_io_uring)]
+            pollout_seen: false,
+            #[cfg(has_io_uring)]
+            resubmitted_on_pollout: false,
+            #[cfg(has_io_uring)]
+            on_send_backstop: false,
         }
     }
 }
@@ -4150,12 +4189,8 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             self.conn.index,
             crate::completion::UserData::send_payload(slot, self.conn.generation),
         );
-        let entry = crate::backend::uring::sqe::Sqe::stream_send(
-            self.conn.index,
-            ptr,
-            len,
-            user_data.raw(),
-        );
+        let entry =
+            crate::backend::uring::sqe::Sqe::chain_send(self.conn.index, ptr, len, user_data.raw());
 
         self.built.push(BuiltSend {
             entry,
@@ -4509,7 +4544,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                         conn_index,
                         crate::completion::UserData::send_payload(slot, self.chain.conn.generation),
                     );
-                    let entry = crate::backend::uring::sqe::Sqe::stream_send(
+                    let entry = crate::backend::uring::sqe::Sqe::chain_send(
                         conn_index,
                         ptr,
                         len,
@@ -4542,7 +4577,7 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                         conn_index,
                         crate::completion::UserData::send_payload(slot, self.chain.conn.generation),
                     );
-                    let entry = crate::backend::uring::sqe::Sqe::stream_send(
+                    let entry = crate::backend::uring::sqe::Sqe::chain_send(
                         conn_index,
                         ptr,
                         len,
