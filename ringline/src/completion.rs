@@ -1,13 +1,20 @@
-/// Msg flags for TCP stream sends (`Send`/`SendMsg`, not the UDP paths).
+/// Msg flags for stream sends (`Send`/`SendMsg`/`SendMsgZc`, not the UDP
+/// paths).
 ///
-/// `MSG_WAITALL`: io_uring (kernel >= 5.19) retries a short stream send
-/// in-kernel until the full buffer is sent or an error occurs, collapsing
-/// the short-send CQE -> userspace resubmit -> CQE round trip into a single
-/// completion. On kernels that don't implement it for send, the socket
-/// layer ignores the flag (send(2) semantics) - a safe no-op. The userspace
-/// partial-send machinery stays in place as the fallback either way.
+/// `MSG_DONTWAIT`: a send takes what the socket has room for and returns, and
+/// never waits on an io-wq worker. A short result or `-EAGAIN` waits for room
+/// behind a `POLLOUT` poll in `AsyncEventLoop::wait_for_room` (#605).
 #[cfg(has_io_uring)]
-pub(crate) const STREAM_SEND_FLAGS: i32 = libc::MSG_WAITALL;
+pub(crate) const STREAM_SEND_FLAGS: i32 = libc::MSG_DONTWAIT;
+
+/// Msg flags for the sends of a linked chain.
+///
+/// `MSG_WAITALL`: the kernel retries a short send, and fails the link if it
+/// cannot finish, because the next SQE of the chain would otherwise follow a
+/// gap (#734). A chain part on a full socket whose peer has half-closed waits
+/// on an io-wq worker.
+#[cfg(has_io_uring)]
+pub(crate) const CHAIN_SEND_FLAGS: i32 = libc::MSG_WAITALL;
 
 /// Operation tags encoded in the upper 8 bits of user_data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,9 +49,10 @@ pub enum OpTag {
     Fs = 18,
     /// PollAdd on a pidfd for async child process exit notification.
     PidfdPoll = 19,
-    /// PollAdd on a TCP fd waiting for POLLOUT after a previous Send
-    /// returned `-EAGAIN` (the kernel send buffer was full). Payload =
-    /// pool_slot to resubmit when the poll fires.
+    /// `POLL_ADD` for `POLLOUT` on a connection whose send waits for room, one
+    /// shot or multishot (`AsyncEventLoop::wait_for_room`). A connection arms
+    /// one at a time, and its `ConnSendState` names the waiting send. Payload =
+    /// connection generation.
     SendPollOut = 21,
     /// Multishot recv on a connected UDP socket (no peer info in CQE,
     /// kernel filters to the connected peer). Lighter than `RecvMsgUdp`.
@@ -57,12 +65,6 @@ pub enum OpTag {
     /// several queued per-connection sends. Payload = InFlightSendSlab index;
     /// the slab entry holds the backing pool slots, released on completion.
     SendMsgCoalesced = 24,
-    /// Plain `send` of the first non-empty unsent iovec of a coalesced send
-    /// whose `sendmsg` returned `-EAGAIN`. A `send` waits until the socket has
-    /// room, which a `POLLOUT` poll does not do once the peer has half-closed
-    /// (#603). Its result is a partial write of the same entry.
-    /// Payload = InFlightSendSlab index.
-    SendMsgCoalescedDrain = 25,
     /// Multishot accept on a listener the worker owns (merged accept mode).
     /// The `conn_index` field carries the **listener index**, not a
     /// connection: no slot exists yet when the SQE is submitted. Payload
@@ -86,9 +88,8 @@ pub enum OpTag {
     /// it alone. Its completion is ignored; the `Close` CQE releases the slot.
     CloseCancel = 34,
     /// Plain (copying) `send` of the first non-empty unsent iovec of a
-    /// zero-copy send whose `sendmsg` returned `-EAGAIN`; see
-    /// `SendMsgCoalescedDrain`. It posts no notification. Payload =
-    /// InFlightSendSlab index.
+    /// zero-copy send whose `SendMsgZc` returned `-ENOMEM` (#642). It posts no
+    /// notification. Payload = InFlightSendSlab index.
     SendMsgZcDrain = 35,
     /// Direct receive, on a plaintext TCP or Unix connection: a one-shot
     /// recv into the
@@ -104,6 +105,9 @@ pub enum OpTag {
     /// The non-blocking one-byte `MSG_PEEK` receive a completed hangup poll
     /// submits when no receive is in flight. Payload = connection generation.
     HangupPeek = 38,
+    /// The worker's timer that retries sends waiting for room, as
+    /// `AsyncEventLoop::handle_send_backstop` describes.
+    SendBackstop = 25,
 }
 
 impl OpTag {
@@ -130,7 +134,7 @@ impl OpTag {
             22 => Some(OpTag::RecvUdp),
             23 => Some(OpTag::SendUdp),
             24 => Some(OpTag::SendMsgCoalesced),
-            25 => Some(OpTag::SendMsgCoalescedDrain),
+            25 => Some(OpTag::SendBackstop),
             31 => Some(OpTag::AcceptMulti),
             32 => Some(OpTag::ParkInstall),
             33 => Some(OpTag::CloseShutdown),
@@ -173,7 +177,6 @@ impl OpTag {
             OpTag::RecvUdp => "recv_udp",
             OpTag::SendUdp => "send_udp",
             OpTag::SendMsgCoalesced => "send_msg_coalesced",
-            OpTag::SendMsgCoalescedDrain => "send_msg_coalesced_drain",
             OpTag::AcceptMulti => "accept_multi",
             OpTag::ParkInstall => "park_install",
             OpTag::CloseShutdown => "close_shutdown",
@@ -182,6 +185,7 @@ impl OpTag {
             OpTag::RecvDirect => "recv_direct",
             OpTag::HangupPoll => "hangup_poll",
             OpTag::HangupPeek => "hangup_peek",
+            OpTag::SendBackstop => "send_backstop",
         }
     }
 }
@@ -306,25 +310,6 @@ impl UserData {
         (payload >> 16) as u16
     }
 
-    /// Pack a `SendPollOut` payload: pool slot (16 bits), `is_tls` flag
-    /// (bit 16), connection generation's low 15 bits (bits 17..31).
-    #[inline]
-    pub fn send_pollout_payload(slot: u16, is_tls: bool, generation: u32) -> u32 {
-        (slot as u32) | (u32::from(is_tls) << 16) | ((generation & 0x7FFF) << 17)
-    }
-
-    /// Unpack the `is_tls` flag of a `SendPollOut` payload.
-    #[inline]
-    pub fn send_pollout_is_tls(payload: u32) -> bool {
-        (payload >> 16) & 1 == 1
-    }
-
-    /// Unpack the truncated generation of a `SendPollOut` payload.
-    #[inline]
-    pub fn send_pollout_gen(payload: u32) -> u16 {
-        (payload >> 17) as u16 & 0x7FFF
-    }
-
     /// Get the raw u64 value.
     #[inline]
     pub fn raw(self) -> u64 {
@@ -371,32 +356,6 @@ mod tests {
                 (generation & 0xFFFF) as u16,
                 "generation half is not the low 16 bits at {generation:#x}"
             );
-        }
-    }
-
-    /// The `SendPollOut` layout keeps only 15 generation bits and carries the
-    /// `is_tls` flag at bit 16, so its truncation boundary is 0x8000 and a
-    /// mask of 0xFFFF here would collide with that flag.
-    #[test]
-    fn send_pollout_payload_truncates_the_generation_at_fifteen_bits() {
-        for generation in [0u32, 1, 0x7FFF, 0x8000, 0xFFFF, 0x1_0000, u32::MAX] {
-            for is_tls in [false, true] {
-                let payload = UserData::send_pollout_payload(0xBEEF, is_tls, generation);
-                assert_eq!(
-                    payload as u16, 0xBEEF,
-                    "slot half corrupted at generation {generation:#x}"
-                );
-                assert_eq!(
-                    (payload >> 16) & 1 == 1,
-                    is_tls,
-                    "is_tls flag corrupted at generation {generation:#x}"
-                );
-                assert_eq!(
-                    (payload >> 17) as u16,
-                    (generation & 0x7FFF) as u16,
-                    "generation half is not the low 15 bits at {generation:#x}"
-                );
-            }
         }
     }
 

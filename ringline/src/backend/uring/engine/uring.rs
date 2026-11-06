@@ -930,7 +930,9 @@ impl Sqe {
                 }
             }
             Op::FixedFdInstall { index } => opcode::FixedFdInstall::new(Fixed(index), 0).build(),
-            Op::PollAdd { fd, mask } => on!(fd, |t| opcode::PollAdd::new(t, mask).build()),
+            Op::PollAdd { fd, mask, multi } => {
+                on!(fd, |t| opcode::PollAdd::new(t, mask).multi(multi).build())
+            }
             Op::OpenAt {
                 path,
                 flags,
@@ -1051,6 +1053,12 @@ mod encode_tests {
                     .build()),
             ),
             (
+                Sqe::chain_send(9, p, 77, ud),
+                e(opcode::Send::new(fx, p, 77)
+                    .flags(crate::completion::CHAIN_SEND_FLAGS)
+                    .build()),
+            ),
+            (
                 Sqe::new(
                     Op::Send {
                         fd: Fd::Raw(11),
@@ -1088,12 +1096,14 @@ mod encode_tests {
             ),
             (
                 Sqe::send_msg_zc(9, msg, ud),
-                e(opcode::SendMsgZc::new(fx, msg).build()),
+                e(opcode::SendMsgZc::new(fx, msg)
+                    .flags(crate::completion::STREAM_SEND_FLAGS as u32)
+                    .build()),
             ),
             (
                 Sqe::chain_send_msg_zc(9, msg, ud),
                 e(opcode::SendMsgZc::new(fx, msg)
-                    .flags(crate::completion::STREAM_SEND_FLAGS as u32)
+                    .flags(crate::completion::CHAIN_SEND_FLAGS as u32)
                     .build()),
             ),
             (
@@ -1188,10 +1198,24 @@ mod encode_tests {
                     Op::PollAdd {
                         fd: Fd::Fixed(9),
                         mask: libc::POLLOUT as u32,
+                        multi: false,
                     },
                     ud,
                 ),
                 e(opcode::PollAdd::new(fx, libc::POLLOUT as u32).build()),
+            ),
+            (
+                Sqe::new(
+                    Op::PollAdd {
+                        fd: Fd::Fixed(9),
+                        mask: libc::POLLOUT as u32,
+                        multi: true,
+                    },
+                    ud,
+                ),
+                e(opcode::PollAdd::new(fx, libc::POLLOUT as u32)
+                    .multi(true)
+                    .build()),
             ),
             (
                 Sqe::new(

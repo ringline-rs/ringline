@@ -5,6 +5,7 @@ use std::task::Context;
 use std::time::Instant;
 
 use crate::backend::uring::abi::cqueue;
+use crate::handler::SendPoll;
 
 use crate::backend::Driver;
 use crate::backend::sockaddr_to_socket_addr;
@@ -355,6 +356,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 {
                     self.driver.tick_timeout_armed = true;
                 }
+            }
+
+            // A wait with `tick_timeout_us = 0` has no timer of its own. As
+            // above, a full SQ leaves this unarmed for the next iteration.
+            if !self.driver.send_backstop_armed && !self.driver.send_backstop_list.is_empty() {
+                let ud = UserData::encode(OpTag::SendBackstop, 0, 0);
+                let ts = &raw const self.driver.send_backstop_ts;
+                self.driver.send_backstop_armed =
+                    self.driver.ring.submit_tick_timeout(ts, ud.raw()).is_ok();
             }
 
             // The blocking wait itself is always performed; only the timing
@@ -1556,10 +1566,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::DirectIo => self.handle_direct_io(ud, result),
             OpTag::Fs => self.handle_fs(ud, result),
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
-            OpTag::SendPollOut => self.handle_send_pollout(ud, result),
+            OpTag::SendPollOut => self.handle_send_pollout(ud, result, flags),
+            OpTag::SendBackstop => self.handle_send_backstop(),
             OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
-            // A drain send's result is a partial write of the same entry.
-            OpTag::SendMsgCoalescedDrain => self.handle_send_msg_coalesced(ud, result),
             // No notification follows a plain `send`.
             OpTag::SendMsgZcDrain => self.handle_send_msg_zc(ud, result, 0),
         }
@@ -2601,10 +2610,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if result > 0 {
-            if let Some((ptr, remaining)) = self
+            if self
                 .driver
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
+                .is_some()
             {
                 if self.close_submitted(conn_index) {
                     let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
@@ -2614,22 +2624,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     return;
                 }
-                let generation = self.driver.connections.generation(conn_index);
-                if self
-                    .driver
-                    .ring
-                    .submit_send_copied(conn_index, generation, ptr, remaining, pool_slot)
-                    .is_err()
-                {
-                    // SQ full — queue for retry on next tick.
-                    self.driver.pending_copy_retries.push((
-                        conn_index,
-                        generation,
-                        pool_slot,
-                        0,
-                        OpTag::Send,
-                    ));
-                }
+                self.wait_for_room(conn_index, ud, false);
                 return;
             }
             let total = self.driver.send_copy_pool.original_len(pool_slot);
@@ -2658,12 +2653,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        // `EAGAIN` / `EWOULDBLOCK` from the kernel means the socket
-        // send buffer is full and we'd block. The right response is to
-        // wait for `POLLOUT` and resubmit the same data — the pool
-        // slot still holds the unsent bytes via
-        // `current_ptr_remaining`. Don't release the slot, don't drain
-        // the queue, don't settle the send.
+        // The socket send buffer is full. The pool slot still holds the unsent
+        // bytes, so don't release it, don't drain the queue and don't settle
+        // the send.
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             if self.close_submitted(conn_index) {
@@ -2674,18 +2666,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 return;
             }
-            let generation = self.driver.connections.generation(conn_index);
-            if self
-                .driver
-                .ring
-                .submit_send_pollout(conn_index, generation, pool_slot, false)
-                .is_err()
-            {
-                // SQ full now — queue for retry on the next tick.
-                self.driver
-                    .pending_send_pollout_retries
-                    .push((conn_index, generation, pool_slot, 0, false));
-            }
+            self.wait_for_room(conn_index, ud, true);
             metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
             return;
         }
@@ -2700,85 +2681,211 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Handle a `POLLOUT` CQE armed after a `Send` returned `-EAGAIN`.
+    /// Wait for room for the rest of send `ud`, after it came back short or
+    /// (`eagain`) with `-EAGAIN`. Resubmitting now would return `-EAGAIN`.
     ///
-    /// Resubmits the same send using `current_ptr_remaining(pool_slot)`,
-    /// which still points at the unsent bytes inside the same pool slot
-    /// we kept alive across the EAGAIN. If the resubmit also fails to
-    /// land (SQ full), pushes onto `pending_copy_retries` so the next
-    /// tick picks it up.
-    fn handle_send_pollout(&mut self, ud: UserData, result: i32) {
-        let conn_index = ud.conn_index();
-        // Payload: pool_slot in the low 16 bits, is_tls flag in bit 16 (the
-        // resubmit must keep a TLS chunk on the TlsSend completion path),
-        // truncated connection generation in bits 17..31.
-        let payload = ud.payload();
-        let pool_slot = UserData::send_payload_slot(payload);
-        let is_tls = UserData::send_pollout_is_tls(payload);
-
-        // Liveness: released on a pre-submission error path — nothing to do.
-        if !self.driver.send_copy_pool.in_use(pool_slot) {
-            return;
-        }
-        // Identity: the connection may have been closed (and its index
-        // reused) while we were waiting for POLLOUT. The slot is still owned
-        // by the orphaned send — release it and touch nothing else, exactly
-        // as `handle_send` does on generation mismatch.
-        if self.driver.connections.generation(conn_index) & 0x7FFF
-            != u32::from(UserData::send_pollout_gen(payload))
-        {
-            // Take-and-discard, exactly as in `handle_send`'s identity
-            // guard: the id must leave the slot so `release` does not trip,
-            // and it must not be settled, because teardown already aborted
-            // the dead occupant's operation and a driver result would
-            // override that abort (#381).
-            if let Some((id, _len)) = self.driver.send_copy_pool.take_send_id(pool_slot) {
-                self.executor.forget_send(id);
-            }
-            self.release_pool_slot(pool_slot);
-            return;
-        }
-
-        // Poll itself failed (e.g. fd closed unexpectedly). Treat
-        // the same as a generic send failure: drop everything for
-        // this connection.
-        if result < 0 {
-            let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-            self.release_pool_slot(pool_slot);
-            self.driver.drain_conn_send_queue(conn_index);
-            self.driver.note_send_finalized(conn_index);
-            if let Some((id, _logical_len)) = settles {
-                self.settle_send(id, Err(io::Error::from_raw_os_error(-result)));
-            }
-            return;
-        }
-
-        if self.close_submitted(conn_index) {
-            let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-            self.release_pool_slot(pool_slot);
-            if let Some((id, _logical_len)) = settles {
-                self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-            }
-            return;
-        }
-        let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
+    /// A `POLLOUT` poll usually ends the wait. Once the peer has half-closed, a
+    /// one-shot poll completes at once with `POLLRDHUP` and no `POLLOUT`, so it
+    /// cannot wait. `handle_send_pollout` then arms a multishot poll, which is
+    /// edge-triggered: it reports `POLLRDHUP` once, and then `POLLOUT` when room
+    /// appears. A multishot poll stays armed until `Driver::try_finalize_close`,
+    /// because a half-closed connection is always closing.
+    ///
+    /// `-EAGAIN` from a send made on a `POLLOUT` arms the multishot poll too. A
+    /// socket reporting both would otherwise repeat a poll and a send forever.
+    fn wait_for_room(&mut self, conn_index: u32, ud: UserData, eagain: bool) {
         let generation = self.driver.connections.generation(conn_index);
-        let resubmit = if is_tls {
+        let state = &mut self.driver.send_queues[conn_index as usize];
+        state.waiting_send = Some(ud.raw());
+        if !state.on_send_backstop {
+            state.on_send_backstop = true;
             self.driver
-                .ring
-                .submit_tls_send(conn_index, generation, ptr, remaining, pool_slot)
-        } else {
-            self.driver
-                .ring
-                .submit_send_copied(conn_index, generation, ptr, remaining, pool_slot)
-        };
-        if resubmit.is_err() {
-            // SQ full — pick up on the next tick.
-            let tag = if is_tls { OpTag::TlsSend } else { OpTag::Send };
-            self.driver
-                .pending_copy_retries
-                .push((conn_index, generation, pool_slot, 0, tag));
+                .send_backstop_list
+                .push((conn_index, generation));
         }
+        if std::mem::take(&mut state.pollout_seen) {
+            self.resubmit_waiting_send(conn_index, true);
+            return;
+        }
+        if state.send_poll == SendPoll::None {
+            let multi = eagain && state.resubmitted_on_pollout;
+            self.arm_send_poll(conn_index, multi);
+        }
+    }
+
+    /// Arm the connection's `SendPollOut`, or queue it if the SQ is full.
+    fn arm_send_poll(&mut self, conn_index: u32, multi: bool) {
+        let generation = self.driver.connections.generation(conn_index);
+        let armed = self
+            .driver
+            .ring
+            .submit_send_pollout(conn_index, generation, multi);
+        let state = &mut self.driver.send_queues[conn_index as usize];
+        state.send_poll = match (armed.is_ok(), multi) {
+            (true, true) => SendPoll::Multi,
+            (true, false) => SendPoll::OneShot,
+            (false, _) => {
+                self.driver
+                    .pending_send_pollout_retries
+                    .push((conn_index, generation, multi));
+                SendPoll::Pending
+            }
+        };
+    }
+
+    /// Resubmit the rest of the connection's waiting send, if it has one. With
+    /// the SQ full, the send moves to the retry list of its kind.
+    fn resubmit_waiting_send(&mut self, conn_index: u32, on_pollout: bool) {
+        let state = &mut self.driver.send_queues[conn_index as usize];
+        let Some(raw) = state.waiting_send.take() else {
+            return;
+        };
+        state.resubmitted_on_pollout = on_pollout;
+        let ud = UserData(raw);
+        let generation = self.driver.connections.generation(conn_index);
+        match ud.tag() {
+            Some(tag @ (OpTag::Send | OpTag::TlsSend)) => {
+                let pool_slot = UserData::send_payload_slot(ud.payload());
+                let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
+                let resubmit = if tag == OpTag::TlsSend {
+                    self.driver
+                        .ring
+                        .submit_tls_send(conn_index, generation, ptr, remaining, pool_slot)
+                } else {
+                    self.driver
+                        .ring
+                        .submit_send_copied(conn_index, generation, ptr, remaining, pool_slot)
+                };
+                if resubmit.is_err() {
+                    self.driver
+                        .pending_copy_retries
+                        .push((conn_index, generation, pool_slot, 0, tag));
+                }
+            }
+            Some(OpTag::SendMsgCoalesced) => {
+                let slab_idx = ud.payload() as u16;
+                let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+                if self
+                    .driver
+                    .ring
+                    .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
+                    .is_err()
+                {
+                    self.driver
+                        .pending_coalesced_retries
+                        .push((conn_index, generation, slab_idx, 0));
+                }
+            }
+            _ => {
+                let slab_idx = ud.payload() as u16;
+                let resubmit = if self.driver.send_slab.plain_send(slab_idx) {
+                    self.submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
+                } else {
+                    let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
+                    self.driver
+                        .ring
+                        .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
+                };
+                if resubmit.is_err() {
+                    self.driver
+                        .pending_zc_retries
+                        .push((conn_index, generation, slab_idx, 0));
+                }
+            }
+        }
+    }
+
+    /// Fail the send `ud` names, through the completion path it would have
+    /// taken, and so with what that path does for its kind of send: a TLS send
+    /// closes the connection, and a zero-copy entry stays for its notifications.
+    fn fail_waiting_send(&mut self, ud: UserData, result: i32) {
+        match ud.tag() {
+            Some(OpTag::Send) => self.handle_send(ud, result),
+            Some(OpTag::TlsSend) => self.handle_tls_send(ud, result),
+            Some(OpTag::SendMsgCoalesced) => self.handle_send_msg_coalesced(ud, result),
+            _ => self.handle_send_msg_zc(ud, result, 0),
+        }
+    }
+
+    /// Handle a `SendPollOut` CQE. See [`Self::wait_for_room`].
+    fn handle_send_pollout(&mut self, ud: UserData, result: i32, flags: u32) {
+        let conn_index = ud.conn_index();
+        // The poll outlived its connection. `handle_close` dealt with the send.
+        if self.driver.connections.generation(conn_index) != ud.payload() {
+            return;
+        }
+        let close_submitted = self.close_submitted(conn_index);
+        let state = &mut self.driver.send_queues[conn_index as usize];
+        let multi = state.send_poll == SendPoll::Multi;
+        let more = cqueue::more(flags);
+        if !more {
+            state.send_poll = SendPoll::None;
+        }
+
+        let error = if result < 0 {
+            Some(result)
+        } else if close_submitted {
+            Some(-libc::ECANCELED)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            // With nothing waiting, this is the cancel `try_finalize_close`
+            // submitted.
+            if let Some(raw) = state.waiting_send.take() {
+                self.fail_waiting_send(UserData(raw), error);
+            }
+            return;
+        }
+
+        let mask = result as u32;
+        let pollout = mask & libc::POLLOUT as u32 != 0;
+        if state.waiting_send.is_none() {
+            state.pollout_seen = pollout && state.in_flight;
+            return;
+        }
+        // An error or a hangup on a multishot poll: the resubmit returns what
+        // the socket has to say. The edge cannot repeat.
+        if pollout || (multi && mask & (libc::POLLERR | libc::POLLHUP) as u32 != 0) {
+            self.resubmit_waiting_send(conn_index, true);
+        } else if !more {
+            self.arm_send_poll(conn_index, !multi);
+        }
+    }
+
+    /// Resubmit every waiting send, once a second. A send can wait with no
+    /// `POLLOUT` to end it: a multishot poll's edge can be lost, and a poll does
+    /// not report a Unix peer's `SHUT_RD`, where a send fails `EPIPE`. The
+    /// interval is a guess, and the retry is unmeasured.
+    fn handle_send_backstop(&mut self) {
+        self.driver.send_backstop_armed = false;
+        std::mem::swap(
+            &mut self.driver.send_backstop_list,
+            &mut self.driver.send_backstop_scratch,
+        );
+        for idx in 0..self.driver.send_backstop_scratch.len() {
+            let (conn_index, generation) = self.driver.send_backstop_scratch[idx];
+            // A dead occupant's entry: `on_send_backstop` is the new occupant's.
+            if self.driver.connections.generation(conn_index) != generation {
+                continue;
+            }
+            let state = &mut self.driver.send_queues[conn_index as usize];
+            let Some(raw) = state.waiting_send else {
+                state.on_send_backstop = false;
+                continue;
+            };
+            if state.close_submitted {
+                state.waiting_send = None;
+                state.on_send_backstop = false;
+                self.fail_waiting_send(UserData(raw), -libc::ECANCELED);
+                continue;
+            }
+            self.driver
+                .send_backstop_list
+                .push((conn_index, generation));
+            self.resubmit_waiting_send(conn_index, false);
+        }
+        self.driver.send_backstop_scratch.clear();
     }
 
     /// True when a send-family CQE's slab entry still belongs to the live
@@ -2915,7 +3022,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         if result > 0 {
             // Partial send: advance the iovec array and resubmit the remainder.
-            if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
+            if self
+                .driver
+                .send_slab
+                .try_advance(slab_idx, result as u32)
+                .is_some()
+            {
                 // A run can span several sends (#628). Those whose bytes are
                 // all on the wire settle now with their own length; only the
                 // rest wait for, or fail with, the remainder.
@@ -2930,17 +3042,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     return;
                 }
-                if self
-                    .driver
-                    .ring
-                    .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
-                    .is_err()
-                {
-                    let generation = self.driver.connections.generation(conn_index);
-                    self.driver
-                        .pending_coalesced_retries
-                        .push((conn_index, generation, slab_idx, 0));
-                }
+                self.wait_for_room(conn_index, ud, false);
                 return;
             }
             // Fully sent.
@@ -2961,9 +3063,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // EAGAIN/EWOULDBLOCK: socket buffer full. Keep the slab entry (and its
-        // data) alive and send its first non-empty unsent iovec with a plain
-        // `send`, which waits until there is room; its completion comes back
-        // here as a partial write (#603).
+        // data) alive.
         let errno = -result;
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             if self.close_submitted(conn_index) {
@@ -2974,15 +3074,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 return;
             }
-            if self
-                .submit_slab_drain(OpTag::SendMsgCoalescedDrain, conn_index, slab_idx)
-                .is_err()
-            {
-                let generation = self.driver.connections.generation(conn_index);
-                self.driver
-                    .pending_coalesced_retries
-                    .push((conn_index, generation, slab_idx, 0));
-            }
+            self.wait_for_room(conn_index, ud, true);
             metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
             return;
         }
@@ -3005,11 +3097,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Submit a plain `send` of the first non-empty unsent iovec of slab entry
-    /// `slab_idx`, tagged `tag`, after its `sendmsg` returned `-EAGAIN` or
-    /// its `SendMsgZc` returned `-ENOMEM`, or to continue an entry marked
-    /// `plain_send`. A `send` waits until the socket has room, where a
-    /// `POLLOUT` poll completes at once once the peer has half-closed (#603).
-    /// The tag's handler takes the result as a partial write of the entry.
+    /// `slab_idx`, tagged `tag`, after its `SendMsgZc` returned `-ENOMEM`, or
+    /// to continue an entry marked `plain_send`. A plain `send` pins no memory
+    /// (#642). The tag's handler takes the result as a partial write of the
+    /// entry.
     fn submit_slab_drain(&mut self, tag: OpTag, conn_index: u32, slab_idx: u16) -> io::Result<()> {
         // An entry drained here has bytes left to send.
         let (ptr, len) = self
@@ -3206,27 +3297,26 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // EAGAIN/EWOULDBLOCK: socket buffer full. Keep the entry (and its
-        // guards) alive and send the first non-empty unsent iovec with a plain
-        // `send`, which waits until there is room; its completion
-        // (`SendMsgZcDrain`, no notification) comes back here as a partial
-        // write and the rest is resubmitted zero-copy (#603).
-        //
+        // guards) alive.
+        if (result == -libc::EAGAIN || result == -libc::EWOULDBLOCK)
+            && !self.close_submitted(conn_index)
+        {
+            self.wait_for_room(conn_index, ud, true);
+            metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
+            return;
+        }
+
         // ENOMEM from a `SendMsgZc` (not from its drain): the pages the send
         // would pin do not fit under `RLIMIT_MEMLOCK`. Nothing was sent. The
         // entry's bytes stay valid until it is released, so send them with
-        // plain `send`s, which pin nothing, through the same drain; the rest
-        // of the entry is sent the same way rather than retried zero-copy
-        // (#642).
-        let enomem = result == -libc::ENOMEM && ud.tag() == Some(OpTag::SendMsgZc);
-        if (result == -libc::EAGAIN || result == -libc::EWOULDBLOCK || enomem)
+        // plain `send`s, which pin nothing, through the drain; the rest of the
+        // entry is sent the same way rather than retried zero-copy (#642).
+        if result == -libc::ENOMEM
+            && ud.tag() == Some(OpTag::SendMsgZc)
             && !self.close_submitted(conn_index)
         {
-            if enomem {
-                metrics::POOL.increment(metrics::pool::SEND_ZC_ENOMEM);
-                self.driver.send_slab.set_plain_send(slab_idx);
-            } else {
-                metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
-            }
+            metrics::POOL.increment(metrics::pool::SEND_ZC_ENOMEM);
+            self.driver.send_slab.set_plain_send(slab_idx);
             if self
                 .submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
                 .is_err()
@@ -3242,7 +3332,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         #[allow(clippy::collapsible_if)]
         if result > 0 {
-            if let Some(msg_ptr) = self.driver.send_slab.try_advance(slab_idx, result as u32) {
+            if self
+                .driver
+                .send_slab
+                .try_advance(slab_idx, result as u32)
+                .is_some()
+            {
                 // Never resubmit a partial past a submitted Close: mirror the
                 // completion path's notification accounting minus the queue
                 // bookkeeping (the notification for the sent prefix
@@ -3258,25 +3353,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     return;
                 }
-                // Partial send — resubmit the remainder, with a plain `send`
-                // if a `SendMsgZc` of this entry got ENOMEM.
-                let resubmitted = if self.driver.send_slab.plain_send(slab_idx) {
-                    self.submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
-                } else {
-                    self.driver
-                        .ring
-                        .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
-                };
-                if resubmitted.is_ok() {
-                    return;
-                }
-                // Resubmission failed (SQ full) — queue for retry on the
-                // next event loop tick. The slab entry retains all iovec
-                // state from try_advance, so we can resubmit later.
-                let generation = self.driver.connections.generation(conn_index);
-                self.driver
-                    .pending_zc_retries
-                    .push((conn_index, generation, slab_idx, 0));
+                self.wait_for_room(conn_index, ud, false);
                 return;
             }
         }
@@ -3522,6 +3599,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn handle_close(&mut self, ud: UserData) {
         let conn_index = ud.conn_index();
 
+        // A forced close leaves a send waiting for room, and the poll's CQE can
+        // arrive after this one, when its generation no longer matches.
+        if let Some(raw) = self.driver.send_queues[conn_index as usize]
+            .waiting_send
+            .take()
+        {
+            self.fail_waiting_send(UserData(raw), -libc::ECANCELED);
+        }
+
         let was_established = self
             .driver
             .connections
@@ -3572,10 +3658,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         if result > 0
-            && let Some((ptr, remaining)) = self
+            && self
                 .driver
                 .send_copy_pool
                 .try_advance(pool_slot, result as u32)
+                .is_some()
         {
             if self.close_submitted(conn_index) {
                 // The send the slot carries, if any, fails with
@@ -3587,31 +3674,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 return;
             }
-            let generation = self.driver.connections.generation(conn_index);
-            if self
-                .driver
-                .ring
-                .submit_tls_send(conn_index, generation, ptr, remaining, pool_slot)
-                .is_err()
-            {
-                // SQ full — queue for retry on next tick. Use copy retry
-                // since TLS sends use SendCopyPool slots; the stored OpTag
-                // keeps the resubmission on the TlsSend completion path.
-                self.driver.pending_copy_retries.push((
-                    conn_index,
-                    generation,
-                    pool_slot,
-                    0,
-                    OpTag::TlsSend,
-                ));
-            }
+            self.wait_for_room(conn_index, ud, false);
             return;
         }
-        // Socket send buffer full: wait for POLLOUT and resubmit the same
-        // chunk. Tearing the connection down here (the old behavior) turned
-        // ordinary backpressure during a large TLS write into a broken
-        // connection. Keep the slot; is_tls=true keeps the resubmission on
-        // the TlsSend path.
+        // Socket send buffer full: keep the slot and resubmit the same chunk
+        // when there is room.
         if result < 0 {
             let errno = -result;
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
@@ -3625,17 +3692,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                     return;
                 }
-                let generation = self.driver.connections.generation(conn_index);
-                if self
-                    .driver
-                    .ring
-                    .submit_send_pollout(conn_index, generation, pool_slot, true)
-                    .is_err()
-                {
-                    self.driver
-                        .pending_send_pollout_retries
-                        .push((conn_index, generation, pool_slot, 0, true));
-                }
+                self.wait_for_room(conn_index, ud, true);
                 metrics::POOL.increment(metrics::pool::SEND_EAGAIN);
                 return;
             }
@@ -4507,94 +4564,25 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Retry POLLOUT arming that failed at EAGAIN time (SQ was full).
-    /// Max 3 attempts with backoff: attempt only every 2nd tick, keeping
-    /// entries queued in between.
+    /// Arm the `SendPollOut`s the SQ had no room for. An entry is stale if its
+    /// connection went, or if the wait ended without it.
     fn drain_send_pollout_retries(&mut self) {
-        if self.driver.pending_send_pollout_retries.is_empty() {
-            return;
+        for (conn_index, generation, multi) in
+            std::mem::take(&mut self.driver.pending_send_pollout_retries)
+        {
+            if self.driver.connections.generation(conn_index) != generation {
+                continue;
+            }
+            let state = &mut self.driver.send_queues[conn_index as usize];
+            if state.send_poll != SendPoll::Pending {
+                continue;
+            }
+            if state.waiting_send.is_none() || state.close_submitted {
+                state.send_poll = SendPoll::None;
+                continue;
+            }
+            self.arm_send_poll(conn_index, multi);
         }
-        std::mem::swap(
-            &mut self.driver.pending_send_pollout_retries,
-            &mut self.driver.send_pollout_retry_scratch,
-        );
-        let tick_mod = self.driver.tick_count % 2;
-        for idx in 0..self.driver.send_pollout_retry_scratch.len() {
-            let (conn_index, generation, pool_slot, retry, is_tls) =
-                self.driver.send_pollout_retry_scratch[idx];
-            if retry >= 3 {
-                // Max retries exceeded — release pool + drain queue + close.
-                // Identity first (the other branches below check it too): if
-                // the connection died while the retry aged, only the slot may
-                // be touched — draining/waking/closing would hit the index's
-                // new occupant.
-                let mut settles = None;
-                if self.driver.send_copy_pool.in_use(pool_slot) {
-                    settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-                    self.release_pool_slot(pool_slot);
-                }
-                if self.driver.connections.get(conn_index).is_none()
-                    || self.driver.connections.generation(conn_index) != generation
-                {
-                    // A dead occupant's slot. The id was taken so `release`
-                    // could not trip on it, and it is deliberately dropped
-                    // here rather than settled: teardown already aborted that
-                    // operation, and a driver result would override the abort
-                    // (#381) for a connection that no longer exists.
-                    continue;
-                }
-                self.driver.drain_conn_send_queue(conn_index);
-                if let Some((id, _logical_len)) = settles {
-                    self.settle_send(
-                        id,
-                        Err(io::Error::other("max retries during send pollout retry")),
-                    );
-                }
-                self.driver.close_connection(conn_index);
-                continue;
-            }
-            if tick_mod != 0 {
-                // Not this tick — keep the entry queued.
-                self.driver
-                    .pending_send_pollout_retries
-                    .push((conn_index, generation, pool_slot, retry, is_tls));
-                continue;
-            }
-            if !self.driver.send_copy_pool.in_use(pool_slot) {
-                continue;
-            }
-            let identity_ok = self.driver.connections.get(conn_index).is_some()
-                && self.driver.connections.generation(conn_index) == generation;
-            if !identity_ok || self.close_submitted(conn_index) {
-                if self.driver.send_copy_pool.in_use(pool_slot) {
-                    // Same split as `drain_copy_retries`: settle only when
-                    // the slot still belongs to the live occupant (the
-                    // `close_submitted` reason); a dead occupant's id is
-                    // taken and discarded.
-                    let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-                    self.release_pool_slot(pool_slot);
-                    if identity_ok && let Some((id, _logical_len)) = settles {
-                        self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-                    }
-                }
-                continue;
-            }
-            if self
-                .driver
-                .ring
-                .submit_send_pollout(conn_index, generation, pool_slot, is_tls)
-                .is_err()
-            {
-                self.driver.pending_send_pollout_retries.push((
-                    conn_index,
-                    generation,
-                    pool_slot,
-                    retry + 1,
-                    is_tls,
-                ));
-            }
-        }
-        self.driver.send_pollout_retry_scratch.clear();
     }
 
     /// Test-only: inject multiple NOPs and dispatch them all in one batch.
@@ -6620,11 +6608,10 @@ mod tests {
     }
 
     /// Whether a forced close (`force_finalize_close`, as when a TLS
-    /// close_notify deadline passes) of a connection with a send stuck in the
-    /// kernel, with `lead` ahead of its `Close`, releases the socket. The
-    /// stuck send holds the socket until something ends it; the peer never
-    /// reads, and sees a hang-up once the socket is shut down or released
-    /// (#586).
+    /// close_notify deadline passes) of a connection with a send waiting for
+    /// room, with `lead` ahead of its `Close`, releases the socket. The poll
+    /// holds the socket until something ends it; the peer never reads, and
+    /// sees a hang-up once the socket is shut down or released (#586).
     fn forced_close_releases_a_stuck_send(lead: crate::backend::uring::ring::CloseLead) -> bool {
         use std::os::fd::AsRawFd;
         let mut config = test_config();
@@ -6656,7 +6643,7 @@ mod tests {
         el.drain_completions();
         assert!(
             el.driver.send_queues[conn_index as usize].in_flight,
-            "the send must still be in the kernel"
+            "the send must still be waiting"
         );
 
         // Request the close, then give up on the send.
@@ -6701,11 +6688,11 @@ mod tests {
         ));
     }
 
-    /// The control: with nothing ahead of the `Close`, the stuck send holds
-    /// the socket open.
+    /// With nothing ahead of the `Close`, the cancel of the waiting send's poll
+    /// releases the socket.
     #[test]
-    fn a_forced_close_led_by_nothing_leaves_a_stuck_send_holding_the_socket() {
-        assert!(!forced_close_releases_a_stuck_send(
+    fn a_forced_close_led_by_nothing_releases_a_stuck_send() {
+        assert!(forced_close_releases_a_stuck_send(
             crate::backend::uring::ring::CloseLead::Nothing
         ));
     }
@@ -9668,17 +9655,15 @@ mod tests {
             .op
     }
 
-    /// An `EAGAIN` from a slab-backed `sendmsg` must be followed by a plain
-    /// `send` of the first unsent iovec, tagged so its completion reaches the
-    /// same handler. A `POLLOUT` poll completes at once on `POLLRDHUP` once the
-    /// peer has half-closed, and the loop spun on it (#603).
-    fn assert_eagain_drains(el: &AsyncEventLoop<NoopHandler>, drain_tag: OpTag, conn_index: u32) {
+    /// A slab entry's plain `send`, tagged so its completion reaches the same
+    /// handler, is what a `SendMsgZc`'s `-ENOMEM` must be followed by (#642).
+    fn assert_plain_drain(el: &AsyncEventLoop<NoopHandler>, conn_index: u32) {
         assert!(
             matches!(
                 last_pushed_op(el),
                 crate::backend::uring::sqe::Op::Send { .. }
             ),
-            "EAGAIN must be followed by a plain send, not a POLLOUT poll"
+            "the entry must continue with a plain send"
         );
         let ud = UserData(
             el.driver
@@ -9688,9 +9673,45 @@ mod tests {
                 .expect("an SQE was pushed")
                 .user_data,
         );
-        assert_eq!(ud.tag(), Some(drain_tag));
+        assert_eq!(ud.tag(), Some(OpTag::SendMsgZcDrain));
         assert_eq!(ud.conn_index(), conn_index);
         assert_eq!(ud.payload(), 0, "the drain names the same slab entry");
+    }
+
+    /// The last SQE is the connection's `POLLOUT` poll, one shot or multishot.
+    fn assert_waits_on_poll(el: &AsyncEventLoop<NoopHandler>, conn_index: u32, multi: bool) {
+        match last_pushed_op(el) {
+            crate::backend::uring::sqe::Op::PollAdd {
+                mask, multi: armed, ..
+            } => {
+                assert_eq!(mask, libc::POLLOUT as u32);
+                assert_eq!(armed, multi);
+            }
+            op => panic!("expected a POLLOUT poll, got {op:?}"),
+        }
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.waiting_send.is_some(), "the send must be waiting");
+        assert!(state.in_flight, "nothing else may send meanwhile");
+    }
+
+    /// The `SendPollOut` CQE of `conn_index`.
+    fn pollout_ud(el: &AsyncEventLoop<NoopHandler>, conn_index: u32) -> u64 {
+        let generation = el.driver.connections.generation(conn_index);
+        UserData::encode(OpTag::SendPollOut, conn_index, generation).raw()
+    }
+
+    /// A send of `data` in a pool slot, submitted on a new connection.
+    fn stage_send(el: &mut AsyncEventLoop<NoopHandler>, data: &[u8]) -> (u32, u16, UserData) {
+        let conn_index = accept_connection(el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let payload = UserData::send_payload(slot, generation);
+        (
+            conn_index,
+            slot,
+            UserData::encode(OpTag::Send, conn_index, payload),
+        )
     }
 
     /// A coalesced copy send of two 4096-byte pool slots in slab entry 0,
@@ -9720,60 +9741,320 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_eagain_drains_with_a_plain_send() {
+    fn coalesced_eagain_waits_for_room() {
         let mut el = make_test_loop();
         let conn_index = stage_coalesced(&mut el);
 
         let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, 0);
         el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
-        assert_eagain_drains(&el, OpTag::SendMsgCoalescedDrain, conn_index);
+        assert_waits_on_poll(&el, conn_index, false);
         assert!(el.driver.send_slab.in_use(0), "the entry stays alive");
 
-        // The drain sends the first iovec; its completion is a partial write
-        // of the entry, and the rest goes out as a sendmsg.
-        let drain = UserData::encode(OpTag::SendMsgCoalescedDrain, conn_index, 0);
-        el.test_dispatch_cqe(drain.raw(), 4096, 0);
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
         assert!(
             matches!(
                 last_pushed_op(&el),
                 crate::backend::uring::sqe::Op::SendMsg { .. }
             ),
-            "the rest of the entry is resubmitted"
+            "the entry is resubmitted"
         );
+
+        // A short result waits again, and is not resubmitted first.
+        el.test_dispatch_cqe(ud.raw(), 4096, 0);
+        assert_waits_on_poll(&el, conn_index, false);
         assert!(el.driver.send_slab.in_use(0));
 
-        let rest = UserData::encode(OpTag::SendMsgCoalesced, conn_index, 0);
-        el.test_dispatch_cqe(rest.raw(), 4096, 0);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        el.test_dispatch_cqe(ud.raw(), 4096, 0);
         assert!(!el.driver.send_slab.in_use(0), "fully sent: entry released");
     }
 
     #[test]
-    fn a_failed_drain_releases_the_entry() {
+    fn a_failed_poll_fails_the_waiting_send() {
         let mut el = make_test_loop();
         let conn_index = stage_coalesced(&mut el);
         let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, 0);
         el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
-        assert_eagain_drains(&el, OpTag::SendMsgCoalescedDrain, conn_index);
+        assert_waits_on_poll(&el, conn_index, false);
 
-        // The peer reset the connection while the drain waited.
         let pushed_before = el.driver.ring.last_pushed.as_ref().map(|e| e.user_data);
-        let drain = UserData::encode(OpTag::SendMsgCoalescedDrain, conn_index, 0);
-        el.test_dispatch_cqe(drain.raw(), -libc::EPIPE, 0);
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(poll, -libc::EBADF, 0);
         assert!(!el.driver.send_slab.in_use(0), "the entry is released");
         assert_eq!(
             el.driver.ring.last_pushed.as_ref().map(|e| e.user_data),
             pushed_before,
             "nothing is resubmitted after an error"
         );
+        assert!(!el.driver.send_queues[conn_index as usize].in_flight);
     }
 
-    /// A zero-copy send that gets `-EAGAIN` drains its first non-empty iovec
-    /// with a plain `send` and keeps the entry until every notification has
-    /// landed. The entry leads with an empty iovec, as
-    /// `.copy(&[]).guard(g)` builds: a drain of that iovec would send 0
-    /// bytes and complete the send with the guarded bytes unsent.
+    /// The sequence on a peer that has half-closed: the one-shot poll reports
+    /// `POLLRDHUP` and no `POLLOUT`, the multishot poll waits, and a `POLLOUT`
+    /// that lands while the resubmit is in the kernel answers its `-EAGAIN`.
     #[test]
-    fn zc_eagain_drains_and_holds_for_its_notifications() {
+    fn a_half_closed_peer_waits_on_a_multishot_poll() {
+        const F_MORE: u32 = 2; // IORING_CQE_F_MORE
+        let rdhup = libc::POLLRDHUP as i32;
+        let out = libc::POLLOUT as i32;
+        let mut el = make_test_loop();
+        let (conn_index, slot, ud) = stage_send(&mut el, &[7u8; 300]);
+        let poll = pollout_ud(&el, conn_index);
+
+        el.test_dispatch_cqe(ud.raw(), 100, 0);
+        assert_waits_on_poll(&el, conn_index, false);
+
+        el.test_dispatch_cqe(poll, rdhup, 0);
+        assert_waits_on_poll(&el, conn_index, true);
+
+        // The multishot poll's own report of the FIN changes nothing.
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(poll, rdhup, F_MORE);
+        assert!(el.driver.ring.last_pushed.is_none());
+
+        el.test_dispatch_cqe(poll, rdhup | out, F_MORE);
+        assert!(matches!(
+            last_pushed_op(&el),
+            crate::backend::uring::sqe::Op::Send { len: 200, .. }
+        ));
+
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(poll, rdhup | out, F_MORE);
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "the send is in the kernel: a second one would reorder the stream"
+        );
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert!(matches!(
+            last_pushed_op(&el),
+            crate::backend::uring::sqe::Op::Send { len: 200, .. }
+        ));
+
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "the multishot poll is still armed"
+        );
+        assert!(
+            el.driver.send_queues[conn_index as usize]
+                .waiting_send
+                .is_some()
+        );
+
+        el.test_dispatch_cqe(poll, out, F_MORE);
+        el.test_dispatch_cqe(ud.raw(), 200, 0);
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+        assert!(!el.driver.send_queues[conn_index as usize].in_flight);
+    }
+
+    /// A `POLLOUT` followed by `-EAGAIN` moves to the multishot poll, because a
+    /// one-shot poll would report the same `POLLOUT` and repeat the pair.
+    #[test]
+    fn eagain_after_pollout_does_not_repeat_the_poll() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let poll = pollout_ud(&el, conn_index);
+
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert_waits_on_poll(&el, conn_index, false);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert_waits_on_poll(&el, conn_index, true);
+    }
+
+    /// A multishot poll that ends with the send still waiting is armed again,
+    /// or the send would rest on the backstop alone.
+    #[test]
+    fn a_multishot_poll_that_ends_is_armed_again() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        el.test_dispatch_cqe(poll, libc::POLLRDHUP as i32, 0);
+        assert_waits_on_poll(&el, conn_index, true);
+
+        // No IORING_CQE_F_MORE.
+        el.test_dispatch_cqe(poll, libc::POLLRDHUP as i32, 0);
+        assert_waits_on_poll(&el, conn_index, false);
+    }
+
+    /// `POLLHUP` without `POLLOUT` on a multishot poll is a Unix peer's full
+    /// shutdown. The resubmit reports `EPIPE` without waiting for the backstop.
+    #[test]
+    fn a_multishot_hangup_resubmits() {
+        const F_MORE: u32 = 2; // IORING_CQE_F_MORE
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        el.test_dispatch_cqe(poll, libc::POLLRDHUP as i32, 0);
+        el.test_dispatch_cqe(poll, (libc::POLLHUP | libc::POLLRDHUP) as i32, F_MORE);
+        assert!(matches!(
+            last_pushed_op(&el),
+            crate::backend::uring::sqe::Op::Send { .. }
+        ));
+    }
+
+    /// The `Close` of a connection with an armed poll cancels it first: a
+    /// multishot poll keeps the socket open past the `Close` otherwise.
+    #[test]
+    fn close_cancels_an_armed_poll() {
+        const F_MORE: u32 = 2; // IORING_CQE_F_MORE
+        let mut el = make_test_loop();
+        let (conn_index, slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        el.test_dispatch_cqe(poll, libc::POLLRDHUP as i32, 0);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, F_MORE);
+        el.driver.close_connection(conn_index);
+        assert!(
+            el.driver.ring.pushed_cancels.is_empty(),
+            "a send is in flight"
+        );
+
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+        assert_eq!(el.driver.ring.pushed_cancels, vec![poll]);
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].send_poll,
+            SendPoll::None
+        );
+
+        // The cancelled poll's CQE finds nothing to do.
+        el.test_dispatch_cqe(poll, -libc::ECANCELED, 0);
+    }
+
+    /// A forced close leaves a waiting send to the cancel of its poll. That
+    /// CQE fails the send through its own completion path.
+    #[test]
+    fn a_forced_close_fails_the_waiting_send() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (id, slot) = bounded_slot(&mut el, conn_index, generation, b"blocked", 7);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let payload = UserData::send_payload(slot, generation);
+        let ud = UserData::encode(OpTag::Send, conn_index, payload);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+
+        el.driver.close_connection(conn_index);
+        el.driver.force_finalize_close(conn_index);
+        assert_eq!(el.driver.ring.pushed_cancels.len(), 1);
+
+        let poll = UserData::encode(OpTag::SendPollOut, conn_index, generation);
+        el.test_dispatch_cqe(poll.raw(), -libc::ECANCELED, 0);
+        let err = el
+            .executor
+            .take_send_result(id)
+            .expect("the send must settle")
+            .expect_err("the send never finished");
+        assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+    }
+
+    /// A poll's CQE can land after the `Close` CQE, which releases the slot.
+    /// The `Close` handles the send, so the poll's mismatched generation
+    /// cannot leak it.
+    #[test]
+    fn the_close_cqe_fails_a_send_still_waiting() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (id, slot) = bounded_slot(&mut el, conn_index, generation, b"blocked", 7);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let payload = UserData::send_payload(slot, generation);
+        let ud = UserData::encode(OpTag::Send, conn_index, payload);
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        el.driver.close_connection(conn_index);
+        el.driver.force_finalize_close(conn_index);
+
+        let close = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(close.raw(), 0, 0);
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+        assert!(
+            el.executor.take_send_result(id).is_some_and(|r| r.is_err()),
+            "the send must settle with an error"
+        );
+
+        let poll = UserData::encode(OpTag::SendPollOut, conn_index, generation);
+        el.test_dispatch_cqe(poll.raw(), -libc::ECANCELED, 0);
+    }
+
+    /// The backstop resubmits a waiting send and keeps the connection on its
+    /// list, and takes it off when nothing waits.
+    #[test]
+    fn the_backstop_resubmits_a_waiting_send() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        assert_eq!(el.driver.send_backstop_list.len(), 1);
+
+        el.handle_send_backstop();
+        assert!(matches!(
+            last_pushed_op(&el),
+            crate::backend::uring::sqe::Op::Send { len: 60, .. }
+        ));
+        assert_eq!(el.driver.send_backstop_list.len(), 1);
+        assert!(
+            el.driver.send_queues[conn_index as usize]
+                .waiting_send
+                .is_none()
+        );
+
+        // `-EAGAIN`: the one-shot poll is still armed, so no second one.
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(ud.raw(), -libc::EAGAIN, 0);
+        assert!(el.driver.ring.last_pushed.is_none());
+        assert_eq!(el.driver.send_backstop_list.len(), 1);
+
+        el.handle_send_backstop();
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        el.handle_send_backstop();
+        assert!(el.driver.send_backstop_list.is_empty());
+        assert!(!el.driver.send_queues[conn_index as usize].on_send_backstop);
+    }
+
+    /// A poll the SQ had no room for is armed by the next drain, with no limit
+    /// on the wait. An entry whose wait ended without it is dropped.
+    #[test]
+    fn a_pending_poll_is_armed_or_dropped() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        let generation = el.driver.connections.generation(conn_index);
+        let state = &mut el.driver.send_queues[conn_index as usize];
+        state.waiting_send = Some(ud.raw());
+        state.send_poll = SendPoll::Pending;
+        el.driver
+            .pending_send_pollout_retries
+            .push((conn_index, generation, true));
+        el.drain_send_pollout_retries();
+        assert_waits_on_poll(&el, conn_index, true);
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].send_poll,
+            SendPoll::Multi
+        );
+
+        let state = &mut el.driver.send_queues[conn_index as usize];
+        state.waiting_send = None;
+        state.send_poll = SendPoll::Pending;
+        el.driver.ring.last_pushed = None;
+        el.driver
+            .pending_send_pollout_retries
+            .push((conn_index, generation, false));
+        el.drain_send_pollout_retries();
+        assert!(el.driver.ring.last_pushed.is_none());
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].send_poll,
+            SendPoll::None
+        );
+    }
+
+    /// A zero-copy send that gets `-EAGAIN` waits for room and keeps the entry
+    /// until every notification has landed.
+    #[test]
+    fn zc_eagain_waits_and_holds_for_its_notifications() {
         const F_MORE: u32 = 2; // IORING_CQE_F_MORE
         const F_NOTIF: u32 = 8; // IORING_CQE_F_NOTIF
         let mut el = make_test_loop();
@@ -9809,16 +10090,14 @@ mod tests {
         // EAGAIN, with a notification to follow.
         let zc = UserData::encode(OpTag::SendMsgZc, conn_index, 0);
         el.test_dispatch_cqe(zc.raw(), -libc::EAGAIN, F_MORE);
-        assert_eagain_drains(&el, OpTag::SendMsgZcDrain, conn_index);
-        assert_eq!(
-            el.driver.send_slab.first_unsent(0),
-            Some((data.as_ptr(), 100)),
-            "the drain must skip the empty iovec"
-        );
+        assert_waits_on_poll(&el, conn_index, false);
 
-        // The drain sends 40 bytes: the rest is resubmitted zero-copy.
-        let drain = UserData::encode(OpTag::SendMsgZcDrain, conn_index, 0);
-        el.test_dispatch_cqe(drain.raw(), 40, 0);
+        // A short result waits too, and the rest stays zero-copy.
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        el.test_dispatch_cqe(zc.raw(), 40, 0);
+        assert_waits_on_poll(&el, conn_index, false);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
         assert!(matches!(
             last_pushed_op(&el),
             crate::backend::uring::sqe::Op::SendMsgZc { .. }
@@ -9872,32 +10151,40 @@ mod tests {
         let zc = UserData::encode(OpTag::SendMsgZc, conn_index, 0);
         let drain = UserData::encode(OpTag::SendMsgZcDrain, conn_index, 0);
         el.test_dispatch_cqe(zc.raw(), -libc::ENOMEM, F_MORE);
-        assert_eagain_drains(&el, OpTag::SendMsgZcDrain, conn_index);
+        assert_plain_drain(&el, conn_index);
         assert_eq!(
             el.driver.send_slab.first_unsent(0),
             Some((data.as_ptr(), 100))
         );
 
-        // The first iovec is sent: the second goes out plain too.
+        // The first iovec is sent: the rest waits, and goes out plain.
         el.test_dispatch_cqe(drain.raw(), 100, 0);
-        assert_eagain_drains(&el, OpTag::SendMsgZcDrain, conn_index);
+        assert_waits_on_poll(&el, conn_index, false);
+        let poll = pollout_ud(&el, conn_index);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        assert_plain_drain(&el, conn_index);
 
         // A short write of the second; its resubmission is a plain send. A
         // retry parked by a full SQ, injected here, is a plain send as well.
-        el.driver.ring.last_pushed = None;
         el.test_dispatch_cqe(drain.raw(), 50, 0);
+        assert_waits_on_poll(&el, conn_index, false);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
+        assert_plain_drain(&el, conn_index);
         el.driver.ring.last_pushed = None;
         el.driver
             .pending_zc_retries
             .push((conn_index, generation, slab_idx, 0));
         el.drain_zc_retries();
-        assert_eagain_drains(&el, OpTag::SendMsgZcDrain, conn_index);
+        assert_plain_drain(&el, conn_index);
         assert_eq!(
             el.driver.send_slab.first_unsent(0),
             Some((data[150..].as_ptr(), 50))
         );
 
+        // The rest of the second, then the third after its own wait.
         el.test_dispatch_cqe(drain.raw(), 50, 0);
+        assert_waits_on_poll(&el, conn_index, false);
+        el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
         el.test_dispatch_cqe(drain.raw(), 100, 0);
         assert!(
             !el.driver.send_queues[conn_index as usize].in_flight,
@@ -9936,7 +10223,7 @@ mod tests {
 
         let zc = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
         el.test_dispatch_cqe(zc.raw(), -libc::ENOMEM, 0);
-        assert_eagain_drains(&el, OpTag::SendMsgZcDrain, conn_index);
+        assert_plain_drain(&el, conn_index);
 
         el.driver.ring.last_pushed = None;
         let drain = UserData::encode(OpTag::SendMsgZcDrain, conn_index, slab_idx as u32);
@@ -10904,28 +11191,6 @@ mod tests {
             el.driver.pending_close_retries,
             vec![(7, 2)],
             "backoff tick must preserve the close-retry entry unchanged"
-        );
-    }
-
-    #[test]
-    fn pollout_retry_backoff_preserves_entry() {
-        // Same as above for the POLLOUT retry queue (every 2nd tick).
-        let mut el = make_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
-
-        el.driver.tick_count = 1;
-        el.driver
-            .pending_send_pollout_retries
-            .push((conn_index, generation, slot, 1, false));
-
-        el.drain_send_pollout_retries();
-
-        assert_eq!(
-            el.driver.pending_send_pollout_retries,
-            vec![(conn_index, generation, slot, 1, false)],
-            "backoff tick must preserve the pollout-retry entry unchanged"
         );
     }
 
@@ -13214,40 +13479,6 @@ mod tests {
         );
     }
 
-    /// `drain_send_pollout_retries`' give-up arm, on the id the parked pool
-    /// slot carries.
-    #[test]
-    fn send_pollout_retry_cap_settles_the_bounded_send_err() {
-        let mut el = bounded_test_loop();
-        let conn_index = accept_connection(&mut el);
-        let generation = el.driver.connections.generation(conn_index);
-
-        let id = submitted_id(&mut el, conn_index, generation);
-        let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"blocked").unwrap();
-        el.driver.send_copy_pool.set_send_id(slot, id, 7);
-        el.driver
-            .pending_send_pollout_retries
-            .push((conn_index, generation, slot, 3, false));
-
-        el.drain_send_pollout_retries();
-
-        let err = el
-            .executor
-            .take_send_result(id)
-            .expect("the give-up arm must settle the operation")
-            .expect_err("POLLOUT never armed");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert!(
-            err.to_string()
-                .contains("max retries during send pollout retry"),
-            "unexpected message: {err}"
-        );
-        assert!(
-            !el.driver.send_copy_pool.in_use(slot),
-            "give-up returns the slot"
-        );
-    }
-
     /// `drain_send_retries`' give-up arm holds no id at all: the parked
     /// entry is still *queued*, so `drain_conn_send_queue` takes the id off
     /// its pool slot and aborts it through
@@ -13494,8 +13725,7 @@ mod tests {
     //
     //   * the 64-bit `UserData` word survives a round trip through
     //     `io_uring`'s SQE and CQE — including `send_payload`'s truncated
-    //     generation in the payload's high half, and `send_pollout_payload`'s
-    //     15-bit variant with its `is_tls` bit wedged between;
+    //     generation in the payload's high half;
     //   * `drain_completions` decodes that word and `dispatch_cqe` routes it
     //     to the handler the `OpTag` names, rather than to a neighbour;
     //   * the CQE's `res` field carries the result the kernel wrote, signed,
@@ -13513,8 +13743,7 @@ mod tests {
     /// `UserData::send_payload` packs the generation into the payload's high
     /// half; at generation 0 that half is all zeros, which a round trip that
     /// lost the high bits would reproduce by accident. 0x2A3 cannot be
-    /// produced by accident, and it stays inside `send_pollout_payload`'s
-    /// narrower 15-bit field too.
+    /// produced by accident.
     const PATTERNED_GENERATION: u32 = 0x2A3;
 
     /// Recycle `conn_index` until its generation is `target`, leaving the
@@ -13716,7 +13945,7 @@ mod tests {
             UserData::send_payload(slot, generation),
         );
 
-        // 8 of 20 bytes. The handler keeps the slot (and its id) and
+        // 8 of 20 bytes. The handler keeps the slot (and its id), polls, and
         // resubmits bytes 8..20 as a real SQE against the socketpair.
         el.inject_and_dispatch(ud.raw(), 8);
         assert!(
@@ -13728,7 +13957,8 @@ mod tests {
             "a partial write must not settle the operation"
         );
 
-        // The resubmission's own completion, from the kernel.
+        // The poll, and the resubmission's own completion, from the kernel.
+        complete_one_cqe(&mut el);
         complete_one_cqe(&mut el);
 
         let result = el
@@ -14009,16 +14239,8 @@ mod tests {
         );
     }
 
-    /// A failed `POLLOUT` re-arm settles the bounded send waiting on the
-    /// parked slot.
-    ///
-    /// The third and last payload encoding: `send_pollout_payload` packs the
-    /// slot in the low 16 bits, `is_tls` in bit 16 and only *15* generation
-    /// bits above it, so it is a different bit layout from `send_payload`
-    /// with a different mask on the way back out. Nothing else in the suite
-    /// puts that layout through the kernel with an id attached —
-    /// `send_pollout_retry_cap_settles_the_bounded_send_err` drives the retry
-    /// drain, which never encodes a payload at all.
+    /// A failed `POLLOUT` poll settles the bounded send waiting behind it, and
+    /// a poll naming an earlier occupant of the connection does nothing.
     #[test]
     fn nop_inject_send_pollout_error_settles_the_bounded_send() {
         let mut el = bounded_test_loop();
@@ -14027,18 +14249,18 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         let (id, slot) = bounded_slot(&mut el, conn_index, generation, b"blocked", 7);
-        let payload = UserData::send_pollout_payload(slot, false, generation);
-        assert_eq!(
-            UserData::send_pollout_gen(payload),
-            0x02A3,
-            "test premise: the 15-bit generation field really does carry a pattern"
-        );
-        assert!(
-            !UserData::send_pollout_is_tls(payload),
-            "test premise: the flag between slot and generation is clear"
-        );
-        let ud = UserData::encode(OpTag::SendPollOut, conn_index, payload);
+        let payload = UserData::send_payload(slot, generation);
+        let send = UserData::encode(OpTag::Send, conn_index, payload);
+        let state = &mut el.driver.send_queues[conn_index as usize];
+        state.in_flight = true;
+        state.waiting_send = Some(send.raw());
+        state.send_poll = SendPoll::OneShot;
 
+        let stale = UserData::encode(OpTag::SendPollOut, conn_index, generation - 1);
+        el.inject_and_dispatch(stale.raw(), -libc::EBADF);
+        assert!(el.driver.send_copy_pool.in_use(slot));
+
+        let ud = UserData::encode(OpTag::SendPollOut, conn_index, generation);
         el.inject_and_dispatch(ud.raw(), -libc::EBADF);
 
         let err = el
@@ -14053,7 +14275,7 @@ mod tests {
         );
         assert!(
             !el.driver.send_copy_pool.in_use(slot),
-            "the failed re-arm returns the slot"
+            "the failed poll returns the slot"
         );
     }
 

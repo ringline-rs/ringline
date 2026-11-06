@@ -1,4 +1,4 @@
-# Send-completion overhead: CQE-skip analysis, MSG_WAITALL, zero-copy RX scoping
+# Send-completion overhead: CQE-skip analysis, short sends, zero-copy RX scoping
 
 ## 1. Why IOSQE_CQE_SKIP_SUCCESS does not apply to ringline sends
 
@@ -20,26 +20,16 @@ So the CQE must stay. The realistic levers are (a) making dead iterations
 cheaper (done: #239 no-block-with-ready-queue, #245 pre-block replenish),
 and (b) reducing the *number* of send CQEs under backpressure — see next.
 
-## 2. MSG_WAITALL on stream sends (prototype candidate)
+## 2. Short sends
 
-io_uring honors MSG_WAITALL for `IORING_OP_SEND`/`SENDMSG` on stream
-sockets: on a short send the kernel re-arms internally and retries until
-the full buffer is sent or an error occurs. Today, each short send costs:
-CQE → userspace resubmit of the remainder (new SQE) → another CQE. With
-MSG_WAITALL those intermediate round trips collapse into one final CQE.
+A stream send carries `MSG_DONTWAIT` (`STREAM_SEND_FLAGS`). It takes what the
+socket has room for and returns, and never waits on an io-wq worker thread. A
+short result or `-EAGAIN` waits for room as §4 describes, and the final CQE
+settles the send with its full length.
 
-- Win regime: backpressured connections (slow readers, deep pipelines,
-  large values). No effect when sends complete fully (the common case at
-  low load — this is a tail optimization).
-- Correctness: the final CQE still fires with the total length (or error),
-  so slot release and queue progression are unchanged. The userspace
-  partial-resubmit machinery stays as a fallback for kernels where a path
-  doesn't honor WAITALL.
-- Risk: a WAITALL send on a stuck peer holds its pool slot until the
-  socket errors or is closed — but the userspace resubmit loop has the
-  same property (the slot is held across resubmits), so no new hazard.
-- Non-goal: SendMsgZc + WAITALL interaction is murkier (notif semantics);
-  prototype plain Send/SendMsg first.
+The sends of a `send_chain` carry `MSG_WAITALL` (`CHAIN_SEND_FLAGS`): the kernel
+retries a short send until the buffer is sent or an error occurs. Its parts are
+linked, so a short part would be followed by the next one across a gap (#734).
 
 ## 3. io_uring zero-copy RX (kernel 6.15+) — scoping
 
@@ -81,49 +71,28 @@ phase. Prereq checklist for revisiting: kernel >= 6.15 on the rig, NIC with
 HDS (mlx5/bnxt/ice), a profile showing the kernel's receive copy >= ~5% of
 worker CPU.
 
-## 4. Waiting for room after `EAGAIN`
+## 4. Waiting for room
 
-io_uring adds `POLLRDHUP` to every poll's event mask. Once a TCP peer has
-half-closed (sent its FIN), a `PollAdd(POLLOUT)` on the socket completes at
-once with `POLLRDHUP` even while the send buffer is full. Measured on a socket
-with a full send buffer, before and after the peer's `shutdown(SHUT_WR)`, on
-Linux 6.12 (arm64 and x86_64) and 7.1 (x86_64):
+A send that comes back short or with `-EAGAIN` waits in the event loop, behind a
+`POLLOUT` poll. Its pool slot or slab entry stays allocated, nothing of it is in
+the kernel, and `in_flight` stays true, so byte order holds.
+`docs/half-closed-send-wait-design.md` has the design, the kernels it was
+measured on, and the options not chosen.
 
-| op | no FIN | after FIN |
-|---|---|---|
-| `Send` + `MSG_WAITALL` | waits | waits |
-| `SendMsg` + `MSG_WAITALL` | waits | `-EAGAIN` |
-| `SendMsgZc` | waits | `-EAGAIN` |
-| `Writev` | waits | `-EAGAIN` |
-| `PollAdd(POLLOUT)` | waits | completes with `POLLRDHUP` |
+io_uring adds `POLLRDHUP` to every poll's event mask. Once a peer has half-closed
+(sent its FIN), a `PollAdd(POLLOUT)` on the socket completes at once with
+`POLLRDHUP` even while the send buffer is full, so a send retried behind a
+one-shot poll spins the worker's event loop (#603). That result moves the send to
+a multishot poll, which is edge-triggered: it reports `POLLRDHUP` once and then
+`POLLOUT` when room appears.
 
-So a vectored send (`sendmsg`, `SendMsgZc`) that returns `-EAGAIN`
-is not retried behind a `POLLOUT` poll: that loop never waits and spins the
-worker's event loop (#603). The handler instead submits a plain `send` of the
-entry's first non-empty unsent iovec, under a `*Drain` tag
-(`SendMsgCoalescedDrain`, `SendMsgZcDrain`). Its result
-is a partial write of the same entry, so the drain tag's completion goes
-through the entry's own handler, which advances the iovecs and resubmits the
-rest with the entry's own operation. The entry stays the one operation in
-flight on the connection, so byte order holds. A zero-copy entry's drain is
-a copying `send` and posts no notification.
-Zero-copy sends inside a `send_chain` are linked SQEs and are not drained: an
-`-EAGAIN` there fails the chain and closes the connection, so a chain part larger
-than the send buffer's free space cannot reach a half-closed peer, even one that
-is reading. `send_parts` drains.
-
-A `send` waits in this state by running on an io-wq worker thread from the
+`MSG_WAITALL` waited in the kernel instead, on an io-wq worker from the
 **unbound** pool, which `ConfigBuilder::iowq_max_workers` does not cap: one
-thread for each connection whose send is waiting for room on a half-closed
-socket. Without a FIN the kernel waits with an internal poll and no thread.
-(Measured on Linux 6.12 arm64: 16 waiting sends held 16 `iou-wrk` threads
-after the peers' FINs, and none without them.)
-Waiting through an epoll fd instead would need an ordinary fd per connection;
-#605 tracks that.
-
-Plain `Send` paths (single-buffer copy sends, TLS) keep their `POLLOUT`
-fallback (`SendPollOut`): a `send` with `MSG_WAITALL` does not return
-`-EAGAIN` in this state, so the fallback is not reached.
+thread for each connection whose send waited on a half-closed socket (#605).
+A `send_chain` still does, because its parts are linked. Zero-copy sends inside a
+`send_chain` can fail instead: an `-EAGAIN` there fails the chain and closes the
+connection, so a chain part larger than the send buffer's free space cannot reach
+a half-closed peer, even one that is reading. `send_parts` waits for room.
 
 ### `-ENOMEM` from a zero-copy send
 
@@ -131,10 +100,11 @@ From Linux 6.15, a `SendMsgZc` from memory that is not a registered buffer
 charges `len / page_size + 2` pages to the user's `RLIMIT_MEMLOCK` while it
 is in flight. From 6.14 the same limit also holds every io_uring ring
 (`ringline/src/memlock.rs`). When the pages do not fit, the operation fails
-with `-ENOMEM` and sends nothing. The handler sends that entry through the
-same drain as `-EAGAIN`, and marks the entry so that the rest of it,
-including a resubmission that waited on a full SQ, also goes out as plain
-`send`s rather than as further `SendMsgZc`s. Each send therefore takes at
+with `-ENOMEM` and sends nothing. The handler sends that entry with a plain
+`send` of its first non-empty unsent iovec, under the `SendMsgZcDrain` tag, and
+marks the entry so that the rest of it, including a resubmission that waited on
+a full SQ or for room, also goes out as plain `send`s rather than as further
+`SendMsgZc`s. A plain `send` pins no memory and posts no notification. Each send therefore takes at
 most one `-ENOMEM`, counted by the `ringline/pool` counter `send_zc_enomem`.
 A process with `CAP_IPC_LOCK` in the initial user namespace is not charged
 and does not reach this path. Inside a `send_chain`, `-ENOMEM` fails the
@@ -142,9 +112,10 @@ chain and closes the connection (#642, #734).
 
 ### At worker shutdown
 
-`run_shutdown` closes every connection with the `CancelAll` lead, on every
-kernel, so a send waiting for room on a connection is cancelled, and a
-coalesced send's slab entry is released on its completion. A connection holding
+`run_shutdown` releases each send waiting for room first, since nothing of it
+is in the kernel. It closes every connection with the `CancelAll` lead, on every
+kernel, so a send in the kernel is cancelled, and a coalesced send's slab entry
+is released on its completion. A connection holding
 slab entries gets the cancel alone, and its `Close` waits for them, as below. Entries parked on
 a retry list, with no operation in flight, are released first. It then waits,
 for at most 10 s (`SHUTDOWN_BOUND`), until every connection's `Close` has completed and

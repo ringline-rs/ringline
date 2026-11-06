@@ -105,8 +105,8 @@ Extend the microbenchmark harness that already exists on
 the local `bench/tls-send-microbench` branch (the one that produced the
 allocation counter) with a third arm: a real kTLS socket, keys installed by
 hand, plaintext sent with `IORING_OP_SEND` **and no `MSG_WAITALL`** — kTLS
-refuses it [P-19], so ringline's own `STREAM_SEND_FLAGS` cannot be used
-verbatim. On hv01, at 1 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB, report:
+refuses it [P-19]. ringline's `STREAM_SEND_FLAGS` was `MSG_WAITALL` when this
+was written and has been `MSG_DONTWAIT` since #605. On hv01, at 1 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB, report:
 
 - **bytes allocated per operation inside the measured call**, the number that
   settled the last effort. Prediction from source: the kTLS arm allocates
@@ -778,9 +778,11 @@ if (msg->msg_flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
 ```
 
 `MSG_WAITALL` is not in it. `tls_device_sendmsg` (`tls_device.c:436-439`) is
-narrower still. ringline's `STREAM_SEND_FLAGS` **is** `MSG_WAITALL`
-(`ringline/src/completion.rs:1-10`), set by every stream send builder — so
-**every ringline send on a kTLS socket fails immediately with `EOPNOTSUPP`**.
+narrower still. ringline's `STREAM_SEND_FLAGS` was `MSG_WAITALL` when this was
+measured, set by every stream send builder, so **every ringline send on a kTLS
+socket failed immediately with `EOPNOTSUPP`**. Since #605 stream sends use
+`MSG_DONTWAIT` and a userspace wait, on every connection; the kTLS cost below
+has not been re-measured.
 Measured on hv01, not inferred: the io_uring probe's `IORING_OP_SEND` returned
 `-95`.
 

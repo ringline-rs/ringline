@@ -539,11 +539,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   A `SendFuture` polled again after it resolved panics; it used to return
   `Pending` (#617).
 
-- The per-operation completion counters (`op` label) for io_uring rename
-  `send_msg_coalesced_poll_out` and `send_recv_bufs_coalesced_poll_out` to
-  `send_msg_coalesced_drain` and `send_recv_bufs_coalesced_drain`, and add
-  `send_msg_zc_drain`. Those operations are now plain sends, not `POLLOUT`
-  polls (#603).
+- The per-operation completion counters (`op` label) for io_uring remove
+  `send_msg_coalesced_poll_out` and `send_recv_bufs_coalesced_poll_out`, and add
+  `send_msg_zc_drain` and `send_backstop`.
+
+- A stream send on io_uring carries `MSG_DONTWAIT` rather than `MSG_WAITALL` and
+  waits for room in the event loop, so a send to a slow or half-closed peer holds
+  no `iou-wrk` thread. Before, 16 stalled sends to half-closed peers held 16
+  threads, which `iowq_max_workers` does not cap. A send that fills its socket
+  costs more ring enters, and the `ringline/pool` counter `send_eagain` now counts
+  ordinary backpressure. A `send_chain` keeps `MSG_WAITALL`, and holds a thread
+  while a part waits on a half-closed peer (#605).
 
 - **Breaking (`ringline-quic`):** the `QuicEndpoint` methods that read the
   clock now take `now: Instant` as their first argument, as `flush`,

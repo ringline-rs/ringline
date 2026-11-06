@@ -19,7 +19,7 @@ use crate::chain::SendChainTable;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
 use crate::connection::{ConnectionTable, Lifecycle, WriteHalf};
-use crate::handler::{BuiltSend, ConnSendState, DriverCtx};
+use crate::handler::{BuiltSend, ConnSendState, DriverCtx, SendPoll};
 use crate::metrics;
 use crate::runtime::send_completion::SendId;
 
@@ -642,11 +642,19 @@ pub(crate) struct Driver {
     pub(crate) pending_zc_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending copy send retries: (conn_index, generation, pool_slot, retries). Drained each tick.
     pub(crate) pending_copy_retries: Vec<(u32, u32, u16, u8, OpTag)>,
-    /// Pending PollAdd-on-POLLOUT retries from the EAGAIN backpressure
-    /// path: (conn_index, generation, pool_slot, retries). Drained each tick.
-    /// Only used when `submit_send_pollout` itself failed (SQ full at
-    /// the time the EAGAIN CQE arrived).
-    pub(crate) pending_send_pollout_retries: Vec<(u32, u32, u16, u8, bool)>,
+    /// `SendPollOut`s the SQ had no room for: (conn_index, generation, multi).
+    /// Drained each tick.
+    pub(crate) pending_send_pollout_retries: Vec<(u32, u32, bool)>,
+    /// Connections with a send waiting for room, as (conn_index, generation),
+    /// for `handle_send_backstop`. An entry leaves when the timer finds nothing
+    /// waiting.
+    pub(crate) send_backstop_list: Vec<(u32, u32)>,
+    /// Scratch swapped with `send_backstop_list` while the timer walks it.
+    pub(crate) send_backstop_scratch: Vec<(u32, u32)>,
+    /// The `SendBackstop` timer's interval.
+    pub(crate) send_backstop_ts: crate::backend::uring::abi::Timespec,
+    /// Whether the `SendBackstop` timer is armed.
+    pub(crate) send_backstop_armed: bool,
     /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
     /// Drained each tick — used when resubmitting a coalesced `sendmsg` (a
     /// partial remainder, or a drain `send` that could not be pushed) found the
@@ -710,7 +718,6 @@ pub(crate) struct Driver {
     /// re-enqueues; `drain(..)` on the scratch keeps its capacity).
     pub(crate) zc_retry_scratch: Vec<(u32, u32, u16, u8)>,
     pub(crate) copy_retry_scratch: Vec<(u32, u32, u16, u8, OpTag)>,
-    pub(crate) send_pollout_retry_scratch: Vec<(u32, u32, u16, u8, bool)>,
     pub(crate) coalesced_retry_scratch: Vec<(u32, u32, u16, u8)>,
     pub(crate) send_retry_scratch: Vec<(u32, u32, u8)>,
     /// Per-worker UDP socket state.
@@ -1095,6 +1102,10 @@ impl Driver {
             pending_zc_retries: Vec::new(),
             pending_copy_retries: Vec::new(),
             pending_send_pollout_retries: Vec::new(),
+            send_backstop_list: Vec::new(),
+            send_backstop_scratch: Vec::new(),
+            send_backstop_ts: crate::backend::uring::abi::Timespec::new().sec(1),
+            send_backstop_armed: false,
             pending_coalesced_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             pending_send_retries: Vec::new(),
@@ -1103,7 +1114,6 @@ impl Driver {
             pending_finalize_closes: Vec::new(),
             zc_retry_scratch: Vec::new(),
             copy_retry_scratch: Vec::new(),
-            send_pollout_retry_scratch: Vec::new(),
             coalesced_retry_scratch: Vec::new(),
             send_retry_scratch: Vec::new(),
             udp_sockets,
@@ -1252,6 +1262,11 @@ impl Driver {
         // the next occupant must not inherit the block.
         state.shutdown_inflight = false;
         state.close_notify_deadline = None;
+        state.waiting_send = None;
+        state.send_poll = SendPoll::None;
+        state.pollout_seen = false;
+        state.resubmitted_on_pollout = false;
+        state.on_send_backstop = false;
         if let Some(pos) = self
             .close_notify_armed
             .iter()
@@ -1629,6 +1644,15 @@ impl Driver {
         if !(state.close_pending && sends_drained && chain_drained && shutdown_drained) {
             return;
         }
+        // A `SendPollOut` holds the socket open past the `Close`, and a multishot
+        // one outlives the shutdown lead. With no room for the cancel, nothing
+        // is committed yet.
+        if !self.cancel_send_poll(conn_index) {
+            if !self.pending_finalize_closes.contains(&conn_index) {
+                self.pending_finalize_closes.push(conn_index);
+            }
+            return;
+        }
         let st = &mut self.send_queues[conn_index as usize];
         st.close_pending = false;
         // From here the Close is committed (submitted below, or queued for
@@ -1657,6 +1681,23 @@ impl Driver {
             // close just failed, leaking its fd and slot permanently.)
             self.pending_close_retries.push((conn_index, 0));
         }
+    }
+
+    /// Cancel the connection's `SendPollOut`, if one is armed. Returns false
+    /// when the SQ has no room for the cancel.
+    fn cancel_send_poll(&mut self, conn_index: u32) -> bool {
+        let generation = self.connections.generation(conn_index);
+        let state = &mut self.send_queues[conn_index as usize];
+        if matches!(state.send_poll, SendPoll::OneShot | SendPoll::Multi)
+            && self
+                .ring
+                .submit_cancel_send_pollout(conn_index, generation)
+                .is_err()
+        {
+            return false;
+        }
+        state.send_poll = SendPoll::None;
+        true
     }
 
     /// Hook called from the send-path CQE handlers after the queue
@@ -2417,6 +2458,43 @@ impl Driver {
         }
     }
 
+    /// At shutdown, release a send's pool slot, settling any awaited send it
+    /// carries as aborted.
+    fn release_slot_at_shutdown(&mut self, pool_slot: u16) {
+        if !self.send_copy_pool.in_use(pool_slot) {
+            return;
+        }
+        // Take the id before releasing: `release` debug-asserts on a slot that
+        // still names a live operation. The record goes on a queue nobody will
+        // drain: the executor is going away with the driver, so there is no
+        // future left to resolve.
+        if let Some((id, _logical_len)) = self.send_copy_pool.take_send_id(pool_slot) {
+            self.settled_sends.push_back((
+                id,
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "worker shut down before the send completed",
+                )),
+            ));
+        }
+        self.send_copy_pool.release(pool_slot);
+    }
+
+    /// Release a zero-copy entry with no operation in the kernel at worker
+    /// exit, once any notification its earlier operations owe has landed.
+    fn release_zc_at_shutdown(&mut self, slab_idx: u16) {
+        if !self.send_slab.in_use(slab_idx) {
+            return;
+        }
+        self.send_slab.mark_awaiting_notifications(slab_idx);
+        if self.send_slab.should_release(slab_idx) {
+            let pool_slot = self.send_slab.release(slab_idx);
+            if pool_slot != u16::MAX {
+                self.send_copy_pool.release(pool_slot);
+            }
+        }
+    }
+
     /// At shutdown, release a coalesced copy send's slab entry and its pool
     /// slots, settling any awaited send it carries as aborted.
     fn release_coalesced_at_shutdown(&mut self, slab_idx: u16) {
@@ -2462,20 +2540,27 @@ impl Driver {
             self.release_coalesced_at_shutdown(slab_idx);
         }
         for (_, _, slab_idx, _) in std::mem::take(&mut self.pending_zc_retries) {
-            if !self.send_slab.in_use(slab_idx) {
+            self.release_zc_at_shutdown(slab_idx);
+        }
+        // A send waiting for room has nothing in the kernel either.
+        let max = self.connections.max_slots();
+        for i in 0..max {
+            let Some(raw) = self.send_queues[i as usize].waiting_send.take() else {
                 continue;
-            }
-            self.send_slab.mark_awaiting_notifications(slab_idx);
-            if self.send_slab.should_release(slab_idx) {
-                let pool_slot = self.send_slab.release(slab_idx);
-                if pool_slot != u16::MAX {
-                    self.send_copy_pool.release(pool_slot);
+            };
+            let ud = UserData(raw);
+            match ud.tag() {
+                Some(OpTag::Send | OpTag::TlsSend) => {
+                    self.release_slot_at_shutdown(UserData::send_payload_slot(ud.payload()));
                 }
+                Some(OpTag::SendMsgCoalesced) => {
+                    self.release_coalesced_at_shutdown(ud.payload() as u16);
+                }
+                _ => self.release_zc_at_shutdown(ud.payload() as u16),
             }
         }
 
         // 2. Close all active connections and drain their send queues.
-        let max = self.connections.max_slots();
         let mut holding_sends = Vec::new();
         let mut cancels_to_retry = Vec::new();
         for i in 0..max {
@@ -2578,37 +2663,12 @@ impl Driver {
 
                 match tag {
                     OpTag::TickTimeout => timeout_armed = false,
-                    OpTag::Send | OpTag::TlsSend | OpTag::SendPollOut => {
-                        // Payload low 16 bits are the pool slot (high bits
-                        // carry the truncated generation / is_tls flag).
-                        let pool_slot = ud.payload() as u16;
-                        if self.send_copy_pool.in_use(pool_slot) {
-                            // These are the three tags an awaited send's
-                            // final slot can wear, so take the id
-                            // before releasing — `release` debug-asserts on
-                            // a slot that still names a live operation. The
-                            // record goes on a queue nobody will drain,
-                            // which is the point: the executor is going away
-                            // with the driver, so there is no future left to
-                            // resolve.
-                            if let Some((id, _logical_len)) =
-                                self.send_copy_pool.take_send_id(pool_slot)
-                            {
-                                self.settled_sends.push_back((
-                                    id,
-                                    Err(io::Error::new(
-                                        io::ErrorKind::ConnectionAborted,
-                                        "worker shut down before the send completed",
-                                    )),
-                                ));
-                            }
-                            self.send_copy_pool.release(pool_slot);
-                        }
+                    OpTag::Send | OpTag::TlsSend => {
+                        self.release_slot_at_shutdown(UserData::send_payload_slot(ud.payload()));
                     }
-                    // A coalesced copy send, or its drain. Nothing is
-                    // resubmitted at shutdown, so a partial completion
-                    // releases too.
-                    OpTag::SendMsgCoalesced | OpTag::SendMsgCoalescedDrain => {
+                    // Nothing is resubmitted at shutdown, so a partial
+                    // completion releases too.
+                    OpTag::SendMsgCoalesced => {
                         self.release_coalesced_at_shutdown(ud.payload() as u16);
                     }
                     // A drain is a plain `send` on the same entry: its CQE

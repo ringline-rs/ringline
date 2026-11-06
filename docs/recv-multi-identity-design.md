@@ -22,9 +22,8 @@ occupied by the connection this recv was armed for" (Domain Invariant 3: *stale
 CQEs are normal*).
 
 Every other per-connection family already answers the second question: the send
-family packs a truncated generation via `UserData::send_payload`, `SendPollOut`
-via `send_pollout_payload`, `ForwardWrite` carries the generation at submit,
-slab-backed sends record it in the slab entry. `RecvMulti` was the gap.
+family packs a truncated generation via `UserData::send_payload`, `ForwardWrite`
+carries the generation at submit, slab-backed sends record it in the slab entry. `RecvMulti` was the gap.
 
 ### The escape that makes it reachable
 
@@ -91,7 +90,7 @@ release (`ConnectionState::deactivate`).
 
 The payload has 32 free bits and the generation is a `u32`, so this is an
 **exact** match — no truncation, and none of the mask-choice fragility that
-`handle_send` (`0xFFFF`) and `handle_send_pollout` (`0x7FFF`) carry. A wrapped
+`handle_send` (`0xFFFF`) carries. A wrapped
 `u32` generation needs 4 billion reuses of one index while a single CQE is in
 flight.
 
