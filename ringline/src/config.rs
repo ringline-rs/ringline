@@ -74,14 +74,15 @@ impl TestFault {
     #[cfg(has_io_uring)]
     pub(crate) fn check_cqe(&self, user_data: u64) {
         use std::sync::atomic::Ordering;
-        if crate::completion::UserData(user_data).tag()
-            == Some(crate::completion::OpTag::AcceptMulti)
-            && self
-                .panic_on_accept
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-                == Ok(1)
+        let left = self.panic_on_accept.load(Ordering::Acquire);
+        if left > 0
+            && crate::completion::UserData(user_data).tag()
+                == Some(crate::completion::OpTag::AcceptMulti)
         {
-            panic!("injected panic in a completion handler");
+            self.panic_on_accept.store(left - 1, Ordering::Release);
+            if left == 1 {
+                panic!("injected panic in a completion handler");
+            }
         }
     }
 }
