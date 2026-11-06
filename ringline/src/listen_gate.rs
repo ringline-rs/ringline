@@ -603,8 +603,9 @@ mod tests {
         assert!(gates.is_open(0));
     }
 
-    /// While a deferred listener is held, another socket must not be able to
-    /// bind its port, even with SO_REUSEADDR set.
+    /// While a deferred listener is held, a socket that does not set
+    /// `SO_REUSEADDR` cannot bind its port. One that sets it can on some
+    /// kernels: see `create_listener`.
     #[test]
     fn a_held_listener_reserves_its_port() {
         let fd = crate::worker::create_listener("127.0.0.1:0".parse().unwrap())
@@ -621,18 +622,23 @@ mod tests {
             },
             0
         );
+        let mut reuse: libc::c_int = 1;
+        let mut reuse_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
+                    &mut reuse as *mut _ as *mut libc::c_void,
+                    &mut reuse_len,
+                )
+            },
+            0
+        );
+        assert_eq!(reuse, 0, "a held listener must not keep SO_REUSEADDR set");
         let other = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(other >= 0);
-        let reuse: libc::c_int = 1;
-        unsafe {
-            libc::setsockopt(
-                other,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &reuse as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
         let ret = unsafe { libc::bind(other, &storage as *const _ as *const libc::sockaddr, len) };
         let err = io::Error::last_os_error();
         unsafe { libc::close(other) };

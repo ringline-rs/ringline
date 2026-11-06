@@ -4255,13 +4255,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// This exercises the full submit_and_wait → drain_completions → dispatch_cqe
     /// path, unlike test_dispatch_cqe which bypasses SQE submission.
     ///
-    /// Requires kernel 6.6+ for IORING_NOP_INJECT_RESULT.
+    /// Below Linux 6.10, which lacks `IORING_NOP_INJECT_RESULT`, the completion
+    /// starts at `reap` instead.
     #[cfg(test)]
     pub(crate) fn inject_and_dispatch(&mut self, user_data_raw: u64, result: i32) {
         self.driver
             .ring
             .submit_nop_inject(user_data_raw, result)
-            .expect("submit_nop_inject failed — kernel 6.6+ required");
+            .expect("submit_nop_inject failed");
         self.driver
             .ring
             .submit_and_wait(1)
@@ -4589,7 +4590,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     #[cfg(test)]
     /// Test-only: submit a linked chain of NOP injects and dispatch.
     /// The first N-1 SQEs have IO_LINK set; the last does not.
-    /// This tests IOSQE_IO_LINK error propagation through the kernel.
+    /// From Linux 6.10 this tests `IOSQE_IO_LINK` error propagation through
+    /// the kernel; below that it uses `inject`'s model of it.
     #[cfg(test)]
     pub(crate) fn inject_linked_chain_and_dispatch(&mut self, cqes: &[(u64, i32)]) {
         let last = cqes.len() - 1;
@@ -6681,7 +6683,9 @@ mod tests {
             events: libc::POLLRDHUP,
             revents: 0,
         };
-        let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
+        // Linux 6.1 releases a closed fixed file about 1.1 s later (`HZ` in
+        // `io_rsrc_node_ref_zero`), measured on 6.1.159.
+        let n = unsafe { libc::poll(&mut pfd, 1, 2500) };
         n > 0 && pfd.revents & (libc::POLLRDHUP | libc::POLLHUP) != 0
     }
 
@@ -10600,7 +10604,7 @@ mod tests {
     //
     // These tests use IORING_NOP_INJECT_RESULT to send CQEs through
     // the full submit_and_wait → drain_completions → dispatch_cqe path.
-    // Requires kernel 6.6+.
+    // Below Linux 6.10 `inject` queues the completion for `reap` instead.
 
     #[test]
     fn nop_inject_send_complete() {
@@ -11514,7 +11518,7 @@ mod tests {
         let id = await_chain(&mut el, conn_index);
 
         // Submit linked NOPs: first with injected error, rest linked.
-        // The kernel will deliver: error CQE, ECANCELED CQE, ECANCELED CQE.
+        // The completions are: error CQE, ECANCELED CQE, ECANCELED CQE.
         let ud1 = UserData::encode(OpTag::Send, conn_index, s1 as u32);
         let ud2 = UserData::encode(OpTag::Send, conn_index, s2 as u32);
         let ud3 = UserData::encode(OpTag::Send, conn_index, s3 as u32);
@@ -13808,8 +13812,9 @@ mod tests {
     //   * a *batch* of completions drained together does not cross-talk —
     //     each settles its own id, with its own length, in submission order.
     //
-    // `IORING_NOP_INJECT_RESULT` (kernel 6.6+) is the mechanism, as it is for
-    // the `nop_inject_*` tests above; `inject_and_dispatch`,
+    // `IORING_NOP_INJECT_RESULT` (Linux 6.10, modelled below it) is the
+    // mechanism, as it is for the `nop_inject_*` tests above;
+    // `inject_and_dispatch`,
     // `inject_batch_and_dispatch` and `inject_linked_chain_and_dispatch` are
     // the three shapes.
 

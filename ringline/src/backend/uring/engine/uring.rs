@@ -145,6 +145,13 @@ pub(crate) struct UringEngine {
     /// [`Engine::force_push_failures`].
     #[cfg(test)]
     forced_push_failures: usize,
+    /// Test-only: completions `inject` queued on a kernel without
+    /// `IORING_NOP_INJECT_RESULT`, for `reap` to hand out.
+    #[cfg(test)]
+    injected: Vec<(u64, i32, u32)>,
+    /// Test-only: the entry `inject` queued last failed and was linked.
+    #[cfg(test)]
+    injected_link_broken: bool,
 }
 
 impl UringEngine {
@@ -384,6 +391,10 @@ impl Engine for UringEngine {
             pbuf_resv_set: false,
             #[cfg(test)]
             forced_push_failures: 0,
+            #[cfg(test)]
+            injected: Vec::new(),
+            #[cfg(test)]
+            injected_link_broken: false,
         })
     }
 
@@ -612,6 +623,13 @@ impl Engine for UringEngine {
     /// - `EBUSY`: the CQ is backed up (overflow list non-empty); return `Ok`
     ///   so the caller drains completions, which frees CQ space.
     fn submit_and_wait(&self, min_complete: u32) -> io::Result<()> {
+        // What `inject` queued needs no wait.
+        #[cfg(test)]
+        let min_complete = if self.injected.is_empty() {
+            min_complete
+        } else {
+            0
+        };
         loop {
             match self.ring.submitter().submit_and_wait(min_complete as usize) {
                 Ok(_) => return Ok(()),
@@ -715,6 +733,8 @@ impl Engine for UringEngine {
     /// Append every completion the ring holds to `out` as
     /// `(user_data, result, flags)`, consuming them.
     fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>) {
+        #[cfg(test)]
+        out.append(&mut self.injected);
         out.extend(
             self.ring
                 .completion()
@@ -780,9 +800,22 @@ impl Engine for UringEngine {
 
     /// Post a completion with `user_data` and `result` through the real
     /// ring, by submitting a NOP with `IORING_NOP_INJECT_RESULT` (Linux
-    /// 6.6+). With `linked`, the next entry pushed is linked to it.
+    /// 6.10). With `linked`, the next entry pushed is linked to it.
     #[cfg(test)]
     fn inject(&mut self, user_data: u64, result: i32, linked: bool) -> io::Result<()> {
+        // `IORING_NOP_INJECT_RESULT` is Linux 6.10. On an older kernel the
+        // completion skips the ring and reaches `reap` directly.
+        if KernelVersion::current() < Some(KernelVersion::parse("6.10").expect("a version")) {
+            // As the kernel does for a link: a failed entry cancels the next.
+            let result = if self.injected_link_broken {
+                -libc::ECANCELED
+            } else {
+                result
+            };
+            self.injected_link_broken = linked && result < 0;
+            self.injected.push((user_data, result, 0));
+            return Ok(());
+        }
         let mut entry = opcode::Nop::new().build().user_data(user_data);
         if linked {
             entry = entry.flags(squeue::Flags::IO_LINK);

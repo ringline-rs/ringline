@@ -108,13 +108,14 @@ pub(crate) trait Engine: Sized {
 
     /// Test-only: post a completion with `user_data` and `result` as if an
     /// operation had completed. With `linked`, the next operation pushed is
-    /// linked to it.
+    /// linked to it. Below Linux 6.10 only the next `inject` is, and a chain
+    /// must end in an unlinked entry in the same submission.
     #[cfg(test)]
     fn inject(&mut self, user_data: u64, result: i32, linked: bool) -> io::Result<()>;
 
-    /// Test-only: make the next `count` calls to `push`, `push_pair` or
-    /// `inject` fail as if the queue were still full after a submit;
-    /// `push_chain` is not affected.
+    /// Test-only: make the next `count` calls to `push`, `push_pair` or, from
+    /// Linux 6.10, `inject` fail as if the queue were still full after a
+    /// submit; `push_chain` is not affected.
     #[cfg(test)]
     fn force_push_failures(&mut self, count: usize);
 }

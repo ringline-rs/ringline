@@ -177,7 +177,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `begin_listening` / `begin_listening_all` start it from code on a worker;
   `ListenHandle` (from `Runtime::listen_handle`) does the same from any
   thread; it is `Clone`, and dropping it does not shut the runtime down. The first call opens the listener for every worker. The port is
-  reserved while the gate is closed, but the kernel does not complete
+  reserved while the gate is closed, against sockets that do not set
+  `SO_REUSEADDR`, but the kernel does not complete
   handshakes, so a TCP readiness probe fails while the server is warming up
   instead of passing against a socket nothing will service. On Linux the peer is
   refused with `ECONNREFUSED`; on macOS and the BSDs the SYN is dropped and the

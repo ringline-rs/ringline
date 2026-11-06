@@ -1336,4 +1336,28 @@ mod tests {
         let ring = ring_with(Some(0));
         assert_eq!(ring.iowq_max_workers().expect("query")[0], kernel_default());
     }
+
+    /// A failed linked entry cancels the rest of its chain and no further, on
+    /// the kernel from Linux 6.10 and in `inject`'s model below it.
+    #[test]
+    fn an_injected_link_failure_cancels_the_rest_of_its_chain() {
+        let mut ring = ring_with(None);
+        ring.submit_nop_inject_linked(1, -libc::ECONNRESET).unwrap();
+        ring.submit_nop_inject_linked(2, 7).unwrap();
+        ring.submit_nop_inject(3, 7).unwrap();
+        ring.submit_and_wait(3).unwrap();
+        ring.submit_nop_inject(4, 7).unwrap();
+        ring.submit_and_wait(1).unwrap();
+        let mut completions = Vec::new();
+        ring.reap(&mut completions);
+        assert_eq!(
+            completions,
+            [
+                (1, -libc::ECONNRESET, 0),
+                (2, -libc::ECANCELED, 0),
+                (3, -libc::ECANCELED, 0),
+                (4, 7, 0),
+            ]
+        );
+    }
 }
