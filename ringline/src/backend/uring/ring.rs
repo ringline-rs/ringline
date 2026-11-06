@@ -411,15 +411,10 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a plain `send` of `len` bytes at `ptr` on a registered file,
-    /// after a vectored send returned `-EAGAIN`.
-    ///
-    /// io_uring reports `POLLRDHUP` on every poll, so once the peer has
-    /// half-closed a `POLLOUT` poll completes at once and the vectored send
-    /// fails with `-EAGAIN` again (#603). A `send` waits until the socket has
-    /// room; in that state it runs on an io-wq worker thread (#605). `user_data`
-    /// names the operation whose completion handler takes the result as a
-    /// partial write.
+    /// Submit a plain `send` of `len` bytes at `ptr` on a registered file, for
+    /// a zero-copy entry that took `-ENOMEM` (#642). It carries `MSG_DONTWAIT`
+    /// and pins no memory. `user_data` names the operation whose completion
+    /// handler takes the result as a partial write.
     ///
     /// # Safety
     /// The `len` bytes at `ptr` must stay valid until the CQE arrives.

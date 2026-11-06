@@ -65,9 +65,7 @@ struct InFlightSendEntry {
     /// A `SendMsgZc` of this entry returned `-ENOMEM`: the rest of the entry
     /// is sent with plain `send`s, which pin no pages.
     plain_send: bool,
-    /// One per main CQE with `IORING_CQE_F_MORE`. A short send adds one, and a
-    /// slow reader can leave many unacknowledged, so the send buffer does not
-    /// bound this.
+    /// One per main CQE with `IORING_CQE_F_MORE`, so a short send adds one.
     pending_notifs: u32,
     awaiting_notifications: bool,
     in_use: bool,
@@ -767,6 +765,25 @@ mod tests {
     }
 
     /// Regression test for Z1: when no notification is expected (result == 0),
+    /// A send that goes out in many short results owes one notification for
+    /// each, past what a `u8` holds.
+    #[test]
+    fn notifications_count_past_255() {
+        let mut slab = InFlightSendSlab::new(4);
+        let iov = [libc::iovec {
+            iov_base: std::ptr::dangling_mut(),
+            iov_len: 100,
+        }];
+        let guards = [const { None }; MAX_GUARDS];
+        let (idx, _) = slab.allocate(0, 0, &iov, u16::MAX, guards, 0, 100).unwrap();
+        for _ in 0..300 {
+            slab.inc_pending_notifs(idx);
+        }
+        slab.mark_awaiting_notifications(idx);
+        assert_eq!(slab.dec_pending_notifs(idx), 299);
+        assert!(!slab.should_release(idx));
+    }
+
     /// mark_awaiting with pending_notifs == 0 should make should_release return true.
     #[test]
     fn zero_notifs_mark_awaiting_releases_immediately() {

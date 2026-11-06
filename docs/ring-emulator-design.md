@@ -306,7 +306,6 @@ conformance tests confirm against the real ring first.
 | RecvFallback | RECV one-shot into a pool slot | Try at submit, then on readable; one CQE. | A |
 | Send, TlsSend, *Drain | SEND, `MSG_DONTWAIT`, or `MSG_WAITALL` in a chain | One `write`: post what it took, or `-EAGAIN` or another `-errno`. With `MSG_WAITALL`, `write` until all bytes are sent, waiting for writable in between. Post the total, or, on an error, the bytes written before it if any *(verify)*, otherwise `-errno`. | B |
 | SendMsgCoalesced | SENDMSG, `MSG_DONTWAIT` | One `writev` of the iovecs, with the same rule. | B |
-| ForwardWrite | SENDMSG to a socket; WRITEV to a regular file | Socket sink: as SendMsgCoalesced. File sink: readiness does not apply to regular files, so the `pwritev` runs on the disk-I/O pool. | B |
 | SendMsgZc | SENDMSG_ZC, `MSG_DONTWAIT`, or `MSG_WAITALL` in a chain | One `writev`, posting a short count when that is all the socket took, or `-EAGAIN`. Then post the operation CQE with `F_MORE` and a separate `F_NOTIF` CQE in the same reap. A notification follows exactly when `F_MORE` is set, including on error and zero-length results (#487). The `writev` reads the guard's memory in place; the kernel copies it into the socket buffer, so the send is not zero-copy, but ringline makes no copy of its own. | C |
 | SendPollOut | POLL_ADD POLLOUT, one shot or multishot | Check writability at submit; otherwise post on the writable edge. A peer's half-close posts `POLLRDHUP` without `POLLOUT` at once. A multishot poll posts each edge with `F_MORE`, stays armed, and posts `-ECANCELED` without `F_MORE` when cancelled by user_data. | B |
 | Connect | CONNECT | Nonblocking `connect`, then `SO_ERROR` on writable, as the mio backend does today. | A |
@@ -460,7 +459,7 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    the two. After this the driver compiles without the `io_uring` crate.
 3. **First emulated slice.** `EmulatedEngine` on Linux behind a
    `ring-emulator` feature, with RecvMulti on both ring kinds (incremental
-   offsets, `F_BUF_MORE` and `SOCK_NONEMPTY` included), Send, SendRecvBuf,
+   offsets, `F_BUF_MORE` and `SOCK_NONEMPTY` included), Send,
    Connect, Close, the close leads, Cancel, Timeout/TickTimeout/Timer and
    EventFdRead. Acceptance: the conformance tests for those ops pass on
    both engines, and the `tests/echo.rs` tests that use only those ops

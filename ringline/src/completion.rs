@@ -322,8 +322,8 @@ mod tests {
     use super::*;
 
     /// The send-family payload truncates the connection generation to 16
-    /// bits, and the completion handlers compare the packed half against the live generation masked the
-    /// same way. Every event-loop test recycles a slot only a handful of times,
+    /// bits, and the completion handlers compare the packed half against the
+    /// live generation masked the same way. Every event-loop test recycles a slot only a handful of times,
     /// so none of them ever reaches a generation where the truncation actually
     /// bites; reaching 0x8000 through `ConnectionTable` would take 32768
     /// recycles. These pin the boundary directly.

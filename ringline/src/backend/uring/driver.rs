@@ -1740,7 +1740,7 @@ impl Driver {
     /// Invariant 7); persistent starvation past the retry cap fails the
     /// queued sends and closes the connection there.
     pub(crate) fn submit_next_queued(&mut self, conn_index: u32) -> bool {
-        // The send that finished took its wait state with it.
+        // Clear the finished send's wait state.
         let state = &mut self.send_queues[conn_index as usize];
         state.pollout_seen = false;
         state.resubmitted_on_pollout = false;

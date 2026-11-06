@@ -3,9 +3,9 @@
 //! half-closed used to hold one `iou-wrk` thread per connection, with no limit
 //! from `iowq_max_workers` (#605).
 //!
-//! Each test sends more than loopback's socket buffers hold for a peer that does
-//! not read, checks that the send has stalled, and counts the process's
-//! `iou-wrk` threads. A send chain is the exception, and the control: its parts
+//! Most tests send more than loopback's socket buffers hold for a peer that does
+//! not read, check that the send has stalled, and count the process's `iou-wrk`
+//! threads. A send chain is the exception, and the control: its parts
 //! keep `MSG_WAITALL`.
 //!
 //! The tests share counters, so they take a lock.
@@ -158,7 +158,7 @@ impl SendGuard for VecGuard {
 /// Sends `LEN` bytes, the way `MODE` names. `SINGLE_SLOT` is one `send` per pool
 /// slot, `SPANS_SLOTS` one coalesced `sendmsg` run, and `GUARD` a `SendMsgZc`. A
 /// `SendMsgZc` can return `-ENOMEM` under `RLIMIT_MEMLOCK` and continue as plain
-/// sends (#642), so only `a_zero_copy_send_waits_for_room` shows a zero-copy wait.
+/// sends (#642).
 async fn send_all<const MODE: u8>(conn: &mut Connection) {
     let len = LEN.load(Ordering::SeqCst);
     let sent = match MODE {
@@ -370,12 +370,12 @@ fn tls_sends_to_half_closed_peers_hold_no_thread() {
     stop(&runtime, handles);
 }
 
-/// A zero-copy send, small enough to fit under `RLIMIT_MEMLOCK`, stalls on a
-/// half-closed peer and arrives intact. The limit is CI's 64 MiB: a process
-/// under a smaller limit shares it with every ring and test running, so only
-/// the delivery is checked there.
+/// A zero-copy send to a half-closed peer, small enough to fit under
+/// `RLIMIT_MEMLOCK`, arrives intact. It checks delivery, and that the send stayed
+/// zero-copy under a limit of at least 64 MiB, which is CI's. It shows nothing
+/// about threads: `MSG_WAITALL` on `SendMsgZc` holds none here either.
 #[test]
-fn a_zero_copy_send_waits_for_room() {
+fn a_zero_copy_send_arrives_intact() {
     use ringline::metrics::{POOL, pool};
     let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let len = 4 << 20;

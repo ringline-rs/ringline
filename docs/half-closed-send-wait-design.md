@@ -43,8 +43,11 @@ across kernels.
 Unix stream sockets behave the same way: `POLLRDHUP` on polls, a thread for
 `MSG_WAITALL`, and `-EAGAIN` for `MSG_DONTWAIT`.
 
-Every plain or vectored send on a half-closed full socket takes a thread unless it
-carries `MSG_DONTWAIT`, and a send already waiting takes one when the FIN arrives.
+In this setup, a 16 MiB send on an already full socket, every plain or vectored send
+takes a thread unless it carries `MSG_DONTWAIT`, and a send already waiting takes one
+when the FIN arrives. It does not hold for every send: in
+`half_closed_send_wait.rs`, a coalesced or guard send with `MSG_WAITALL` held no
+thread at the stall point. The cause of the difference is not known.
 A one-shot poll cannot replace that wait, because io_uring reports `POLLRDHUP` on
 every poll. A multishot poll can: it is edge-triggered, so it posts `POLLRDHUP` once
 and then posts `POLLOUT` when room appears.
@@ -177,7 +180,7 @@ the wait ends when it does.
 
 ## Options not chosen
 
-### A. Cap the unbound pool, and give a plain close a deadline
+### Cap the unbound pool, and give a plain close a deadline
 
 Threads stay in use, up to workers × cap. At a full cap, sends that need a thread
 queue with no error, and the deadline would cut off half-closing clients still
@@ -185,7 +188,7 @@ reading, because a FIN already calls `close_connection`. With a cap of 1 and one
 stalled half-closed send, a 256 MiB send to a reading peer stopped at 123 MiB for
 12 s, where it took 143 ms uncapped.
 
-### C. `MSG_DONTWAIT` only after ringline observes the FIN
+### `MSG_DONTWAIT` only after ringline observes the FIN
 
 A cancel sent from the hangup CQE returned `-ENOENT` under `DEFER_TASKRUN`, and the
 send moved to a thread, 16 of 16. A cancelled send reports `-EINTR` or `-ECANCELED`,
@@ -201,7 +204,7 @@ send buffer per interval, as in the table above.
 It works only from 6.8, costs one fd per stalled connection, and closing the fixed
 slot sends no FIN while the installed fd is open.
 
-### D. Leave it, and document a limit
+### Leave it, and document a limit
 
 The threads count against `RLIMIT_NPROC`, and a client controls how many.
 
@@ -209,23 +212,28 @@ The threads count against `RLIMIT_NPROC`, and a client controls how many.
 
 A close with a send waiting behaves as it did, and waits for the peer. Completion
 semantics do not change: a short result stays inside its handler, and the send settles
-once with its full length. Forward writes use `send_parts`, so they need nothing
-separate. `SEND_EAGAIN` is now a normal backpressure count. A chain part is built with
-`Sqe::chain_send` or `Sqe::chain_send_msg_zc`, and `push_sqe_chain` debug-asserts it
-before a one-part chain takes the plain push, because a chain part with `MSG_DONTWAIT` restores #734.
+once with its full length. `SEND_EAGAIN` is now a normal backpressure count. A chain part is built with
+`Sqe::chain_send` or `Sqe::chain_send_msg_zc`, and `push_sqe_chain` debug-asserts it,
+because a chain part with `MSG_DONTWAIT` restores #734.
 
 ## Tests
 
 `ringline/tests/half_closed_send_wait.rs` counts `iou-wrk` threads in
 `/proc/self/task`.
 
-- 16 half-closed stalled peers hold no thread, for coalesced, guard and TLS sends,
-  and for a single-slot send whose peer half-closes while it waits. Every byte arrives
-  when the peers read. Under a small `RLIMIT_MEMLOCK` a guard send takes `-ENOMEM` and
-  continues as plain sends, so `a_zero_copy_send_waits_for_room` checks the zero-copy
-  wait, and fails on `-ENOMEM` under a limit of at least 64 MiB.
-- With `MSG_WAITALL` back on stream sends, the same tests fail: 16 stalled sends hold
-  16 threads, on Linux 7.2.6 arm64.
+- 16 half-closed stalled peers hold no thread, for coalesced, guard and TLS sends.
+  Every byte arrives when the peers read.
+- 16 single-slot sends hold no thread while they wait and after their peers
+  half-close. The FIN closes each connection when its send finishes, so a peer sees a
+  prefix of the handler's sends, with no gap.
+- With `MSG_WAITALL` back on stream sends, the single-slot, TLS and 64 MiB half-closed
+  reader tests fail, the first with 16 threads for 16 sends. The coalesced and guard
+  tests still pass, because those sends hold no thread at the stall point.
+- Nothing tests the `MSG_DONTWAIT` flag on the stream `SendMsgZc` behaviourally:
+  `MSG_WAITALL` on that site alone passes every test. Under a small `RLIMIT_MEMLOCK` a
+  guard send takes `-ENOMEM` and continues as plain sends.
+  `a_zero_copy_send_arrives_intact` checks delivery, and no `-ENOMEM` under a limit of
+  at least 64 MiB.
 - A half-closed peer reading 64 MiB finishes within a limit the 1 s timer cannot meet.
 - A Unix peer's `SHUT_RD` fails the send within the timer's interval.
 - A close with a multishot poll armed: the peer sees EOF, and the socket leaves
