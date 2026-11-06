@@ -34,6 +34,59 @@ pub enum AcceptMode {
 
 pub use ringline_tls_config::{TlsClientConfig, TlsConfig};
 
+/// A failure for a test to inject into a running worker's event loop.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestFault {
+    /// Panic in the event loop.
+    pub(crate) panic: std::sync::atomic::AtomicBool,
+    /// Return an error from the event loop.
+    pub(crate) error: std::sync::atomic::AtomicBool,
+    /// Return an error from this worker's event loop, plus one. Zero is off.
+    #[cfg(has_io_uring)]
+    pub(crate) error_on_worker: std::sync::atomic::AtomicU32,
+    /// Panic before dispatching the Nth accept completion, counting from 1.
+    /// Zero is off.
+    #[cfg(has_io_uring)]
+    pub(crate) panic_on_accept: std::sync::atomic::AtomicU32,
+    /// Panic in the drain that follows.
+    #[cfg(has_io_uring)]
+    pub(crate) panic_in_drain: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl TestFault {
+    /// Fail as asked, once. Called by the event loops.
+    pub(crate) fn check(&self) -> Result<(), crate::error::Error> {
+        use std::sync::atomic::Ordering;
+        if self.panic.swap(false, Ordering::AcqRel) {
+            panic!("injected event loop panic");
+        }
+        if self.error.swap(false, Ordering::AcqRel) {
+            return Err(crate::error::Error::Io(std::io::Error::other(
+                "injected event loop error",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fail as asked before dispatching a completion.
+    #[cfg(has_io_uring)]
+    pub(crate) fn check_cqe(&self, user_data: u64) {
+        use std::sync::atomic::Ordering;
+        let left = self.panic_on_accept.load(Ordering::Acquire);
+        if left > 0
+            && crate::completion::UserData(user_data).tag()
+                == Some(crate::completion::OpTag::AcceptMulti)
+        {
+            self.panic_on_accept.store(left - 1, Ordering::Release);
+            if left == 1 {
+                panic!("injected panic in a completion handler");
+            }
+        }
+    }
+}
+
 /// Configuration for the io_uring driver.
 #[derive(Clone)]
 pub struct Config {
@@ -209,6 +262,9 @@ pub struct Config {
     /// The runtime's shutdown, so a task panic under
     /// `TaskPanicPolicy::Shutdown` can trigger it. Set by `launch()`.
     pub(crate) runtime_shutdown: Option<std::sync::Arc<crate::worker::RuntimeShutdown>>,
+    /// Makes a running worker fail, see [`TestFault`].
+    #[cfg(test)]
+    pub(crate) test_fault: Option<std::sync::Arc<TestFault>>,
     /// This worker's index, so it can find its own slot in `worker_loads` and
     /// avoid handing a connection back to itself.
     pub(crate) worker_index: usize,
@@ -398,6 +454,8 @@ impl Default for Config {
             merged_accept_live: None,
             wake_keep_alive: None,
             runtime_shutdown: None,
+            #[cfg(test)]
+            test_fault: None,
             worker_index: 0,
             worker_loads: None,
             worker_accepting: None,

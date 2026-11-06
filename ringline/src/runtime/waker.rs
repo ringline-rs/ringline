@@ -119,12 +119,25 @@ impl WorkerWakes {
     }
 }
 
-impl Drop for WorkerWakes {
-    fn drop(&mut self) {
+/// Whether this thread is a worker's.
+pub(crate) fn on_worker() -> bool {
+    CURRENT_WORKER.try_with(|c| c.get() != 0).unwrap_or(false)
+}
+
+impl WorkerWakes {
+    /// Remove the inbox, for a worker that leaks this registration. A later
+    /// wake for this worker is dropped.
+    pub(crate) fn deregister(&self) {
         inboxes()
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
+    }
+}
+
+impl Drop for WorkerWakes {
+    fn drop(&mut self) {
+        self.deregister();
         CURRENT_WORKER.with(|c| {
             if c.get() == self.id {
                 c.set(0);

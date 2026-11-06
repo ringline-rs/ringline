@@ -77,7 +77,19 @@ impl GuardBox {
 
 impl Drop for GuardBox {
     fn drop(&mut self) {
-        unsafe { (self.vtable.drop_fn)(self.storage.as_mut_ptr() as *mut u8) }
+        let drop_fn = self.vtable.drop_fn;
+        let ptr = self.storage.as_mut_ptr() as *mut u8;
+        // `Drop` is user code, and a worker can run it from a completion
+        // handler, where a panic would end the worker.
+        if crate::runtime::waker::on_worker() {
+            let dropped =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { drop_fn(ptr) }));
+            if let Err(payload) = dropped {
+                crate::task_panic::note_guard_drop_panic(payload);
+            }
+        } else {
+            unsafe { drop_fn(ptr) }
+        }
     }
 }
 

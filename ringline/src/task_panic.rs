@@ -6,16 +6,17 @@
 //! build them; building the `on_accept` (or `on_adopt`) future; `on_tick`;
 //! `on_notify`; and, on the blocking pool, `spawn_blocking` closures.
 //!
-//! A future's `Drop` run by [`JoinHandle::abort`](crate::JoinHandle::abort) or
-//! [`TaskId::cancel`](crate::TaskId::cancel) runs inside the cancelling task's
-//! poll, so a panic there is reported as that task's panic. A task that cancels
-//! itself has its future dropped when the poll returns, and a panic there is
-//! caught and reported the same way.
+//! A future's `Drop` is caught wherever the runtime drops a task: after `Ready`,
+//! after a panic in its poll, on cancellation, when its connection closes, and
+//! when the worker exits. So is a [`SendGuard`](crate::SendGuard)'s `Drop` on a
+//! worker's thread, and that of a `spawn_blocking` result whose future was
+//! dropped, on the worker or on the blocking pool.
 //!
-//! Not covered: a future's `Drop` while a worker drains at shutdown, or after the
-//! future returned `Ready` or panicked in its poll, which unwinds the worker
-//! thread; `create_for_worker`, whose panic fails `launch()`; and the `wake` of a waker kept for a combinator, whose panic
-//! goes to the panic hook only, under either policy.
+//! Not covered: the handler's own `Drop` at worker exit, which is reported by
+//! the worker's join handle; the `Drop` of a [`ParkState`](crate::ParkState),
+//! which stops the worker; `create_for_worker`, whose panic fails `launch()`;
+//! and the `wake` of a waker kept for a combinator, whose panic goes to the
+//! panic hook only, under either policy.
 //!
 //! By default ([`TaskPanicPolicy::Contain`]) a caught panic is contained: the
 //! task is dropped, a connection task's connection is closed, the worker keeps
@@ -24,6 +25,7 @@
 
 use std::any::Any;
 use std::fmt;
+use std::io::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -189,6 +191,31 @@ pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> Option<String> {
     }
 }
 
+/// What `catch_unwind` returns for a panic.
+pub(crate) type PanicPayload = Box<dyn Any + Send>;
+
+thread_local! {
+    /// Panics caught on this thread in a [`GuardBox`](crate::GuardBox)'s drop,
+    /// for its event loop to report.
+    static GUARD_DROP_PANICS: std::cell::RefCell<Vec<PanicPayload>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record a panic caught in a guard's `Drop`.
+pub(crate) fn note_guard_drop_panic(payload: PanicPayload) {
+    let _ = GUARD_DROP_PANICS.try_with(|p| p.borrow_mut().push(payload));
+}
+
+/// Take the panics caught on this thread in guards' `Drop`.
+pub(crate) fn take_guard_drop_panics() -> Vec<PanicPayload> {
+    GUARD_DROP_PANICS.with(|p| std::mem::take(&mut *p.borrow_mut()))
+}
+
+/// Drop `value`, returning the payload of a panic in its `Drop`.
+pub(crate) fn drop_caught<T>(value: T) -> Option<PanicPayload> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))).err()
+}
+
 /// A worker's handling of caught task panics, under its runtime's policy.
 pub(crate) struct PanicReporter {
     policy: TaskPanicPolicy,
@@ -234,6 +261,38 @@ impl PanicReporter {
                     None => self.shutdown_flag.store(true, Ordering::Release),
                 }
             }
+        }
+    }
+
+    /// Report that worker `worker` stopped for `cause`, a panic in the runtime
+    /// or an error from its ring or poll. Wakes
+    /// [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal), and under
+    /// `Shutdown` shuts the runtime down. A `Contain` runtime keeps serving on
+    /// its other workers.
+    pub(crate) fn report_worker_exit(&self, worker: usize, cause: &str) {
+        let shutdown = self.policy == TaskPanicPolicy::Shutdown;
+        let outcome = if shutdown {
+            "shutting down"
+        } else {
+            "other workers continue until shutdown"
+        };
+        // Not `eprintln!`, which panics if stderr fails, and the worker's drain
+        // comes next.
+        let _ = writeln!(
+            std::io::stderr(),
+            "ringline: worker {worker} exited: {cause}; {outcome}"
+        );
+        match &self.runtime_shutdown {
+            Some(runtime) => runtime.worker_exited(worker, shutdown),
+            None if shutdown => self.shutdown_flag.store(true, Ordering::Release),
+            None => {}
+        }
+    }
+
+    /// Close what reached `worker`'s sockets during its drain.
+    pub(crate) fn report_worker_drained(&self, worker: usize) {
+        if let Some(runtime) = &self.runtime_shutdown {
+            runtime.worker_drained(worker);
         }
     }
 

@@ -59,7 +59,8 @@ pub(crate) trait Engine: Sized {
 
     /// Start queued operations and block until at least `min_complete`
     /// completions are ready. `EINTR` restarts; `EBUSY` (completions backed
-    /// up) returns `Ok` so the caller reaps.
+    /// up) and `EAGAIN` (no memory for a request) return `Ok` so the caller
+    /// reaps.
     fn submit_and_wait(&self, min_complete: u32) -> io::Result<()>;
 
     /// Start queued operations and make ready completions reapable, without

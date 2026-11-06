@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::task_panic::{PanicPayload, drop_caught};
+
 pub(crate) type BoxFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
 /// Opaque handle for a standalone task spawned via [`spawn()`](crate::spawn).
@@ -90,6 +92,9 @@ fn park_slot(slot: &mut TaskSlot, future: BoxFuture) -> bool {
 /// dropped on close. O(1) lookup by `ConnId::index()`.
 pub(crate) struct TaskSlab {
     tasks: Vec<TaskSlot>,
+    /// Panics caught in the `Drop` of removed futures, for the event loop to
+    /// report.
+    drop_panics: Vec<PanicPayload>,
 }
 
 impl TaskSlab {
@@ -99,7 +104,10 @@ impl TaskSlab {
         for _ in 0..max_connections {
             tasks.push(TaskSlot::Empty);
         }
-        TaskSlab { tasks }
+        TaskSlab {
+            tasks,
+            drop_panics: Vec::new(),
+        }
     }
 
     /// Spawn a new task for the given connection index.
@@ -156,9 +164,29 @@ impl TaskSlab {
     pub(crate) fn remove(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
         if idx < self.tasks.len() {
-            self.tasks[idx] = TaskSlot::Empty;
+            let prev = std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty);
+            self.drop_panics.extend(drop_caught(prev));
             super::waker::wake_combinators(conn_index);
         }
+    }
+
+    /// Drop every task, at worker exit.
+    pub(crate) fn clear(&mut self) {
+        for idx in 0..self.tasks.len() {
+            let prev = std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty);
+            self.drop_panics.extend(drop_caught(prev));
+        }
+    }
+
+    /// Drop a value the runtime holds for user code, for the event loop to
+    /// report a panic in its `Drop`.
+    pub(crate) fn drop_noting_panic<T>(&mut self, value: T) {
+        self.drop_panics.extend(drop_caught(value));
+    }
+
+    /// Take the panics caught since the last call.
+    pub(crate) fn take_drop_panics(&mut self) -> Vec<PanicPayload> {
+        std::mem::take(&mut self.drop_panics)
     }
 
     /// Check if a task exists for the given connection index.
@@ -176,6 +204,9 @@ impl TaskSlab {
 pub(crate) struct StandaloneTaskSlab {
     tasks: Vec<TaskSlot>,
     free_list: Vec<u32>,
+    /// Panics caught in the `Drop` of removed futures, for the event loop to
+    /// report.
+    drop_panics: Vec<PanicPayload>,
 }
 
 impl StandaloneTaskSlab {
@@ -187,7 +218,11 @@ impl StandaloneTaskSlab {
             tasks.push(TaskSlot::Empty);
             free_list.push(i);
         }
-        StandaloneTaskSlab { tasks, free_list }
+        StandaloneTaskSlab {
+            tasks,
+            free_list,
+            drop_panics: Vec::new(),
+        }
     }
 
     /// Spawn a task. Returns the slot index, or None if the slab is full.
@@ -269,9 +304,23 @@ impl StandaloneTaskSlab {
         }
         let prev = std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty);
         if !matches!(prev, TaskSlot::Empty) {
+            self.drop_panics.extend(drop_caught(prev));
             self.free_list.push(task_idx);
             super::waker::wake_combinators(task_idx | super::waker::STANDALONE_BIT);
         }
+    }
+
+    /// Drop every task, at worker exit.
+    pub(crate) fn clear(&mut self) {
+        for idx in 0..self.tasks.len() {
+            let prev = std::mem::replace(&mut self.tasks[idx], TaskSlot::Empty);
+            self.drop_panics.extend(drop_caught(prev));
+        }
+    }
+
+    /// Take the panics caught since the last call.
+    pub(crate) fn take_drop_panics(&mut self) -> Vec<PanicPayload> {
+        std::mem::take(&mut self.drop_panics)
     }
 
     /// Check if a task exists at the given index.

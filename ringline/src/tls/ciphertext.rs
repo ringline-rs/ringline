@@ -455,7 +455,7 @@ impl Drop for CiphertextBuf {
     /// with a receive in flight.
     fn drop(&mut self) {
         if self.recv_in_flight {
-            // Not while unwinding a worker panic: a second panic aborts.
+            // Not while unwinding: a second panic aborts.
             if !std::thread::panicking() {
                 debug_assert!(false, "TLS state dropped with a receive in flight");
             }
