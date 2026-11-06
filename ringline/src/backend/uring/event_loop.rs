@@ -15,6 +15,7 @@ use crate::metrics;
 use crate::runtime::handler::AsyncEventHandler;
 use crate::runtime::io::{ConnCtx, DriverState, UdpSocket, set_driver_state_guarded};
 use crate::runtime::send_completion::SendId;
+use crate::runtime::task::Park;
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
 use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
 
@@ -796,9 +797,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             executor.standalone_slab.remove(task_idx);
                         }
                         Ok(std::task::Poll::Pending) => {
-                            // Woken during the poll: its slot read `Polling`.
-                            if executor.standalone_slab.park(task_idx, fut) {
-                                executor.ready_queue.push_back(raw_id);
+                            match executor.standalone_slab.park(task_idx, fut) {
+                                Park::Parked => {}
+                                // Woken during the poll: its slot read `Polling`.
+                                Park::Woken => executor.ready_queue.push_back(raw_id),
+                                // It cancelled itself. `Drop` is user code, and a
+                                // panic in it must not end the worker.
+                                Park::Cancelled(fut) => {
+                                    let dropped = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| drop(fut)),
+                                    );
+                                    executor.standalone_slab.remove(task_idx);
+                                    if let Err(payload) = dropped {
+                                        driver.panic_reporter.report("standalone task", &*payload);
+                                    }
+                                }
                             }
                         }
                         Err(payload) => {

@@ -8,11 +8,13 @@
 //!
 //! A future's `Drop` run by [`JoinHandle::abort`](crate::JoinHandle::abort) or
 //! [`TaskId::cancel`](crate::TaskId::cancel) runs inside the cancelling task's
-//! poll, so a panic there is reported as that task's panic.
+//! poll, so a panic there is reported as that task's panic. A task that cancels
+//! itself has its future dropped when the poll returns, and a panic there is
+//! caught and reported the same way.
 //!
-//! Not covered: a future's `Drop` while a worker drains at shutdown, which
-//! unwinds the worker thread; `create_for_worker`, whose panic fails
-//! `launch()`; and the `wake` of a waker kept for a combinator, whose panic
+//! Not covered: a future's `Drop` while a worker drains at shutdown, or after the
+//! future returned `Ready` or panicked in its poll, which unwinds the worker
+//! thread; `create_for_worker`, whose panic fails `launch()`; and the `wake` of a waker kept for a combinator, whose panic
 //! goes to the panic hook only, under either policy.
 //!
 //! By default ([`TaskPanicPolicy::Contain`]) a caught panic is contained: the

@@ -859,6 +859,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A task that cancels itself with `TaskId::cancel` or `JoinHandle::abort` no longer
+  corrupts the standalone task slab. The slot was freed while the task's future was
+  out being polled, and the future was then parked in it, so the task ran on, its
+  index could be handed out twice, and a task spawned into the slot was lost. Its
+  future is now dropped when the poll returns, and a handle on it resolves then.
 - io_uring: worker exit no longer waits out its bound for a zero-copy send on an
   open connection, on Linux 6.7+. The peer gets 1 s to take the data, then the
   connection closes with an RST, which discards the rest, so a peer reading too

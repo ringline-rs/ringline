@@ -230,7 +230,8 @@ fn standalone_slab_full() -> io::Error {
 
 impl TaskId {
     /// Cancel a standalone task. Drops the future immediately, freeing
-    /// the slab slot.
+    /// the slab slot. A task that cancels itself keeps running until it next
+    /// returns to the executor, and its future is dropped then.
     ///
     /// A `TaskId` carries no generation: once the task has completed, its
     /// slot can be reused, and cancelling the old id cancels whatever task
@@ -245,7 +246,7 @@ impl TaskId {
     /// silently skipped when the executor encounters them.
     pub fn cancel(self) {
         with_state(|_driver, executor| {
-            executor.standalone_slab.remove(self.0);
+            executor.standalone_slab.cancel(self.0);
         });
     }
 }
@@ -317,7 +318,8 @@ impl<T> Drop for CancelOnDrop<T> {
 ///
 /// [`abort()`](Self::abort) cancels the spawned task. The handle then resolves
 /// to a [`JoinError`](crate::JoinError) for which
-/// [`is_cancelled`](crate::JoinError::is_cancelled) is true.
+/// [`is_cancelled`](crate::JoinError::is_cancelled) is true, unless the task
+/// aborted itself and finished before it next yielded.
 pub struct JoinHandle<T> {
     state: Rc<RefCell<JoinState<T>>>,
     task_id: TaskId,
@@ -333,8 +335,11 @@ impl<T> JoinHandle<T> {
     ///
     /// The future is dropped immediately and its slab slot is freed. Awaiting
     /// the handle then resolves to a cancelled [`JoinError`](crate::JoinError).
-    /// If the task has already finished, this does nothing and the handle
-    /// keeps its outcome.
+    /// A task aborting itself runs until it next returns to the executor: if
+    /// that is a yield, the future is dropped then and the handle resolves as
+    /// cancelled; if the task returns or panics first, the handle keeps that
+    /// outcome. If the task has already finished, this does nothing and the
+    /// handle keeps its outcome.
     pub fn abort(&self) {
         if self.state.borrow().finished {
             return;
