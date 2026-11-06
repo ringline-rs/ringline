@@ -80,10 +80,12 @@ fn blocking_thread(rx: Receiver<BlockingRequest>) {
         // payload goes back to the requesting worker instead.
         let work = req.work;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-        let _ = req.response_tx.send(BlockingResponse {
+        // A send to a stopped worker returns the response here, and a panic in
+        // its `Drop` must not take the pool thread either.
+        let _ = crate::task_panic::drop_caught(req.response_tx.send(BlockingResponse {
             request_id: req.request_id,
             result,
-        });
+        }));
         // Wake the requesting worker so it drains the response channel.
         req.wake_handle.wake();
     }

@@ -29,6 +29,46 @@ pub(crate) struct AsyncEventLoop<A: AsyncEventHandler> {
 }
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
+    /// Report the panics caught in the `Drop` of removed futures.
+    fn report_drop_panics(&mut self) {
+        for payload in self.executor.take_drop_panics() {
+            self.driver.panic_reporter.report("task drop", &*payload);
+        }
+    }
+
+    /// Drop every task at worker exit and report panics in their `Drop`.
+    pub(crate) fn drop_tasks(&mut self) {
+        self.executor.drop_tasks();
+        // Results delivered after their futures went.
+        if let Some(rx) = self.driver.blocking_rx.take() {
+            for response in rx.try_iter() {
+                self.executor.task_slab.drop_noting_panic(response);
+            }
+            // Dropping it discards a response sent since the loop above.
+            self.executor.task_slab.drop_noting_panic(rx);
+        }
+        self.report_drop_panics();
+    }
+
+    /// Report that this worker stopped for `cause`.
+    pub(crate) fn report_worker_exit(&self, worker: usize, cause: &str) {
+        self.driver.panic_reporter.report_worker_exit(worker, cause);
+    }
+
+    /// Report that this worker's drain has ended.
+    pub(crate) fn report_worker_drained(&self, worker: usize) {
+        self.driver.panic_reporter.report_worker_drained(worker);
+    }
+
+    /// The mio backend has nothing in the kernel to wait for.
+    pub(crate) fn drain_after_failure(&mut self) {}
+
+    /// The mio backend has no ring.
+    ///
+    /// # Safety
+    /// No requirement; the signature matches the io_uring backend.
+    pub(crate) unsafe fn close_ring(&mut self) {}
+
     /// The first task panic recorded under `TaskPanicPolicy::Shutdown`.
     pub(crate) fn take_task_panic(&mut self) -> Option<crate::JoinError> {
         self.driver.panic_reporter.take()
@@ -215,6 +255,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(crate::error::Error::Io(e)),
             }
+            #[cfg(test)]
+            if let Some(fault) = &self.driver.test_fault {
+                fault.check()?;
+            }
 
             // The readable sockets handled below are one batch: the reads
             // among them share one arrival time, read by the first.
@@ -359,6 +403,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 drop(guard);
             }
+
+            self.report_drop_panics();
 
             // 8. Flush any sends queued by on_tick, deliver their
             // completions, and finish any closes it triggered.
@@ -1532,6 +1578,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             executor.standalone_slab.remove(task_idx);
+                            if let Some(payload) = crate::task_panic::drop_caught(fut) {
+                                driver.panic_reporter.report("standalone task", &*payload);
+                            }
                         }
                         Ok(std::task::Poll::Pending) => {
                             match executor.standalone_slab.park(task_idx, fut) {
@@ -1541,20 +1590,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                                 // It cancelled itself. `Drop` is user code, and a
                                 // panic in it must not end the worker.
                                 Park::Cancelled(fut) => {
-                                    let dropped = std::panic::catch_unwind(
-                                        std::panic::AssertUnwindSafe(|| drop(fut)),
-                                    );
+                                    let dropped = crate::task_panic::drop_caught(fut);
                                     executor.standalone_slab.remove(task_idx);
-                                    if let Err(payload) = dropped {
+                                    if let Some(payload) = dropped {
                                         driver.panic_reporter.report("standalone task", &*payload);
                                     }
                                 }
                             }
                         }
                         Err(payload) => {
-                            drop(fut);
+                            let dropped = crate::task_panic::drop_caught(fut);
                             executor.standalone_slab.remove(task_idx);
                             driver.panic_reporter.report("standalone task", &*payload);
+                            if let Some(payload) = dropped {
+                                driver.panic_reporter.report("standalone task", &*payload);
+                            }
                         }
                     }
                 }
@@ -1581,6 +1631,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             // Task completed — connection handler is done.
                             driver.close_connection(conn_index);
                             executor.remove_connection(conn_index);
+                            if let Some(payload) = crate::task_panic::drop_caught(fut) {
+                                driver.panic_reporter.report(
+                                    &format!("connection task (connection {conn_index} closed)"),
+                                    &*payload,
+                                );
+                            }
                         }
                         Ok(std::task::Poll::Pending) => {
                             // Woken during the poll: its slot read `Polling`.
@@ -1589,13 +1645,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             }
                         }
                         Err(payload) => {
-                            drop(fut);
+                            let dropped = crate::task_panic::drop_caught(fut);
                             driver.close_connection(conn_index);
                             executor.remove_connection(conn_index);
-                            driver.panic_reporter.report(
-                                &format!("connection task (connection {conn_index} closed)"),
-                                &*payload,
-                            );
+                            let site = format!("connection task (connection {conn_index} closed)");
+                            driver.panic_reporter.report(&site, &*payload);
+                            if let Some(payload) = dropped {
+                                driver.panic_reporter.report(&site, &*payload);
+                            }
                         }
                     }
                 }

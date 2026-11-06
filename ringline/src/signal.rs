@@ -58,6 +58,12 @@ pub enum Signal {
     /// the runtime down. Returned only by
     /// [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal).
     TaskPanic,
+    /// Not an OS signal: a worker stopped because of a panic in the runtime or
+    /// an error from its ring or poll, and its connections are closing. Returned
+    /// only by [`Runtime::wait_on_signal`](crate::Runtime::wait_on_signal),
+    /// which then shuts the runtime down, so a supervisor can restart the
+    /// process.
+    WorkerExited,
 }
 
 impl fmt::Display for Signal {
@@ -66,6 +72,7 @@ impl fmt::Display for Signal {
             Signal::Interrupt => f.write_str("SIGINT"),
             Signal::Terminate => f.write_str("SIGTERM"),
             Signal::TaskPanic => f.write_str("task panic"),
+            Signal::WorkerExited => f.write_str("worker exited"),
         }
     }
 }
@@ -143,19 +150,21 @@ pub fn wait() -> Signal {
     }
 }
 
-/// Block until `SIGINT` or `SIGTERM` is received or `ready_fd` becomes
-/// readable; the latter returns [`Signal::TaskPanic`].
-pub(crate) fn wait_or_ready(ready_fd: i32) -> Signal {
+/// Block until `SIGINT` or `SIGTERM` is received or one of the runtime's fds
+/// becomes readable: `panic_fd` returns [`Signal::TaskPanic`], and `exit_fd`
+/// returns [`Signal::WorkerExited`].
+pub(crate) fn wait_or_ready(panic_fd: i32, exit_fd: i32) -> Signal {
     loop {
-        if let Some(signal) = wait_inner(Some(ready_fd)) {
+        if let Some(signal) = wait_inner(Some((panic_fd, exit_fd))) {
             return signal;
         }
     }
 }
 
-/// Poll the signal pipe, and `ready_fd` if given, until one is readable.
-/// Returns `None` when another waiter took the signal byte first.
-fn wait_inner(ready_fd: Option<i32>) -> Option<Signal> {
+/// Poll the signal pipe, and the runtime's panic and worker-exit fds if given,
+/// until one is readable. Returns `None` when another waiter took the signal
+/// byte first.
+fn wait_inner(runtime_fds: Option<(i32, i32)>) -> Option<Signal> {
     setup();
 
     let (read_fd, _) = *PIPE.get().unwrap();
@@ -166,16 +175,24 @@ fn wait_inner(ready_fd: Option<i32>) -> Option<Signal> {
             revents: 0,
         },
         libc::pollfd {
-            fd: ready_fd.unwrap_or(-1),
+            fd: runtime_fds.map_or(-1, |(panic_fd, _)| panic_fd),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: runtime_fds.map_or(-1, |(_, exit_fd)| exit_fd),
             events: libc::POLLIN,
             revents: 0,
         },
     ];
-    let count = if ready_fd.is_some() { 2 } else { 1 };
+    let count = if runtime_fds.is_some() { 3 } else { 1 };
     // EINTR: interrupted by a signal we don't handle — poll again.
     while unsafe { libc::poll(fds.as_mut_ptr(), count, -1) } <= 0 {}
-    if count == 2 && fds[1].revents != 0 {
+    if count == 3 && fds[1].revents != 0 {
         return Some(Signal::TaskPanic);
+    }
+    if count == 3 && fds[2].revents != 0 {
+        return Some(Signal::WorkerExited);
     }
     // The pipe is process-global and never closed by ringline; an invalid or
     // broken read end would make every later poll return at once.

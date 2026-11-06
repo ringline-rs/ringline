@@ -30,6 +30,14 @@ pub(crate) fn retry_with_resv_set(err: &io::Error, kernel: Option<KernelVersion>
     err.raw_os_error() == Some(libc::EINVAL) && kernel == Some(PBUF_RESV_INVERTED_ON)
 }
 
+/// Whether an `io_uring_enter` failure is temporary, so the caller carries on
+/// and reaps. `EBUSY`: the CQ is backed up (overflow list non-empty), and
+/// reaping frees it. `EAGAIN`: the kernel could not allocate a request for the
+/// first SQE (`io_submit_sqes`), which stays queued for the next enter.
+fn is_enter_backpressure(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EBUSY | libc::EAGAIN))
+}
+
 /// `struct io_uring_buf_reg`, which the `io-uring` crate fills with `resv`
 /// zeroed and does not let the caller set.
 #[repr(C)]
@@ -155,6 +163,16 @@ pub(crate) struct UringEngine {
 }
 
 impl UringEngine {
+    /// After a failed enter: a submit that took no SQE returns before it runs
+    /// `DEFER_TASKRUN` work, so `EAGAIN` needs a second enter for there to be
+    /// completions to reap. The worker would otherwise spin without them.
+    fn reap_after_backpressure(&self, error: &io::Error) {
+        if error.raw_os_error() == Some(libc::EAGAIN) {
+            // Safety: enters with no SQEs, no wait and no argument.
+            let _ = unsafe { self.ring.submitter().enter::<()>(0, 0, 1, None) };
+        }
+    }
+
     /// # Safety
     ///
     /// As [`pbuf_ring_register`].
@@ -545,10 +563,9 @@ impl Engine for UringEngine {
         // `provided`'s mmap'd ring, mapped at the call. The `io-uring`
         // crate's contract, which `pbuf_ring_register` repeats, asks for it
         // to stay mapped until the group is unregistered or the io_uring
-        // instance is dropped. `Driver::run_shutdown` meets that. `Driver`'s
-        // error and panic exits, and the path after a failed unregister,
-        // unmap the ring while its group is still registered. That frees no
-        // memory the kernel reads. Registration pins the ring's pages
+        // instance is dropped. `Driver::run_shutdown` meets that. The path
+        // after a failed unregister unmaps the ring while its group is still
+        // registered. That frees no memory the kernel reads. Registration pins the ring's pages
         // (`io_pin_pages`, called from `io_uring/kbuf.c` or
         // `io_uring/memmap.c`), and the kernel reads entries through its own
         // mapping of those pages. The kernel unpins them only when the group
@@ -620,8 +637,7 @@ impl Engine for UringEngine {
     /// it) on the first transient `io_uring_enter` failure:
     /// - `EINTR`: any signal delivered to the worker interrupts the wait
     ///   regardless of `SA_RESTART` — restart it.
-    /// - `EBUSY`: the CQ is backed up (overflow list non-empty); return `Ok`
-    ///   so the caller drains completions, which frees CQ space.
+    /// - `EBUSY`, `EAGAIN`: see [`is_enter_backpressure`].
     fn submit_and_wait(&self, min_complete: u32) -> io::Result<()> {
         // What `inject` queued needs no wait.
         #[cfg(test)]
@@ -634,7 +650,10 @@ impl Engine for UringEngine {
             match self.ring.submitter().submit_and_wait(min_complete as usize) {
                 Ok(_) => return Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Ok(()),
+                Err(e) if is_enter_backpressure(&e) => {
+                    self.reap_after_backpressure(&e);
+                    return Ok(());
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -672,7 +691,10 @@ impl Engine for UringEngine {
             } {
                 Ok(_) => return Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Ok(()),
+                Err(e) if is_enter_backpressure(&e) => {
+                    self.reap_after_backpressure(&e);
+                    return Ok(());
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1409,5 +1431,20 @@ mod sq_room_tests {
             exercised > 0,
             "the SQ thread consumed every round's NOPs before the pair push"
         );
+    }
+}
+
+#[cfg(test)]
+mod enter_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_temporary_enter_failure_is_backpressure_and_lost_completions_are_not() {
+        for errno in [libc::EBUSY, libc::EAGAIN] {
+            assert!(is_enter_backpressure(&io::Error::from_raw_os_error(errno)));
+        }
+        for errno in [libc::EBADR, libc::EBADF, libc::EINVAL] {
+            assert!(!is_enter_backpressure(&io::Error::from_raw_os_error(errno)));
+        }
     }
 }

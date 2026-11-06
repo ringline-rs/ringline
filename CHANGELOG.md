@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Signal::WorkerExited`: `Runtime::wait_on_signal` returns it, and shuts the
+  runtime down, when a worker stops on a panic in the runtime or an error from
+  its ring or poll. Before, nothing woke `wait_on_signal` for a stopped worker,
+  under either `TaskPanicPolicy`.
 - `ringline::join_all` polls any number of futures concurrently and returns
   their outputs in order, and `join_all_limited` runs at most a given number at
   a time (#532).
@@ -866,6 +870,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A panic in a future's `Drop` no longer ends the worker, after the future
+  returned `Ready`, after a panic in its poll, when its connection closed, or
+  at worker exit. Nor does a panic in a `SendGuard`'s `Drop` on a worker's
+  thread, or in the `Drop` of a `spawn_blocking` result whose future was
+  dropped. Each is a task panic under `TaskPanicPolicy`. A panic in the `Drop` of
+  a cancelled task is now reported as its own, not as a panic in the task that
+  cancelled it.
+- `EAGAIN` from `io_uring_enter`, when the kernel has no memory for a request,
+  no longer ends the worker.
+- A worker that stops closes its connections, on io_uring through
+  `run_shutdown`, and stops receiving new ones. Before, it unwound past
+  `run_shutdown`, and in `AcceptMode::Merged` its socket kept taking connections
+  that were never served. `TaskPanicPolicy::Shutdown` now applies to it.
 - A task that cancels itself with `TaskId::cancel` or `JoinHandle::abort` no longer
   corrupts the standalone task slab. The slot was freed while the task's future was
   out being polled, and the future was then parked in it, so the task ran on, its

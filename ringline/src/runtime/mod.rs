@@ -487,7 +487,8 @@ pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mu
                 io::release_half(driver, conn_index, generation, half, abrupt);
             }
             Orphan::Blocking(request_id) => {
-                executor.pending_blocking.remove(&request_id);
+                let dropped = executor.pending_blocking.remove(&request_id);
+                executor.task_slab.drop_noting_panic(dropped);
             }
             Orphan::Resolve(request_id) => {
                 executor.pending_resolves.remove(&request_id);
@@ -733,6 +734,25 @@ impl Executor {
         }
     }
 
+    /// Drop every task, catching a panic in any future's `Drop`. Run at worker
+    /// exit, so that one panic does not abort the process by way of a second
+    /// during the unwind.
+    pub(crate) fn drop_tasks(&mut self) {
+        self.task_slab.clear();
+        self.standalone_slab.clear();
+        for (_, entry) in std::mem::take(&mut self.pending_blocking) {
+            self.task_slab.drop_noting_panic(entry);
+        }
+    }
+
+    /// Take the panics caught in the `Drop` of removed futures.
+    pub(crate) fn take_drop_panics(&mut self) -> Vec<crate::task_panic::PanicPayload> {
+        let mut panics = self.task_slab.take_drop_panics();
+        panics.append(&mut self.standalone_slab.take_drop_panics());
+        panics.append(&mut crate::task_panic::take_guard_drop_panics());
+        panics
+    }
+
     /// Reset all per-connection state for a connection that was closed.
     pub(crate) fn remove_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
@@ -970,6 +990,8 @@ impl Executor {
             *slot = Some(result);
             let task_id = *task_id;
             self.wake_task(task_id);
+        } else {
+            self.task_slab.drop_noting_panic(result);
         }
     }
 

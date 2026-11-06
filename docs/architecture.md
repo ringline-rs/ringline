@@ -306,8 +306,22 @@ follow `TaskPanicPolicy`. Under the default, `Contain`, a connection handler
 panic closes that connection while preserving its worker, and standalone task,
 `on_tick` and `on_notify` panics are also contained. Under `Shutdown`, a task
 panic shuts the runtime down as `Runtime::shutdown` does, and each worker
-that saw a panic returns `Error::TaskPanicked`. Fatal accept errors stop the
-acceptor, while `EINTR`, `EAGAIN` and aborted connections retry and descriptor exhaustion
+that saw a panic returns `Error::TaskPanicked`. A panic in a future's `Drop`
+is a task panic wherever the runtime drops the future.
+
+A worker stops on a panic in the runtime's own event loop, or on an error from
+its ring or poll, such as `EBADR` when the kernel dropped completions. A panic
+in the `Drop` of a `ParkState` the event loop discards stops it too. It leaves
+the accept rotation, closes its connections (on io_uring through
+`run_shutdown`), and wakes `Runtime::wait_on_signal` with
+`Signal::WorkerExited`, which shuts the runtime down so a supervisor can restart
+the process. Until then, and in a process that does not call `wait_on_signal`,
+the other workers keep serving. A worker is not replaced. Under
+`TaskPanicPolicy::Shutdown` a stopped worker shuts the runtime down. If
+`run_shutdown` panics, the worker drops its ring and leaks the heap memory its
+event loop owns, which the kernel can still be using.
+
+Fatal accept errors stop the acceptor, while `EINTR`, `EAGAIN` and aborted connections retry and descriptor exhaustion
 backs off briefly.
 
 ## Architectural invariants

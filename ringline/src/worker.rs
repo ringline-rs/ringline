@@ -1,5 +1,7 @@
 use std::any::Any;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -209,10 +211,14 @@ impl Runtime {
     ///
     /// Returns `InvalidInput` if this would leave no worker accepting — a
     /// group that can select nothing accepts nothing, which is worse than the
-    /// imbalance it was meant to fix.
+    /// imbalance it was meant to fix — or to put back a worker that has
+    /// stopped.
     ///
-    /// No-op when no listener is steerable (pool mode, Unix listeners,
-    /// client-only, or a non-Linux build).
+    /// A worker taken out returns to the rotation by itself if every worker
+    /// in it stops.
+    ///
+    /// Otherwise a no-op when no listener is steerable (pool mode, Unix
+    /// listeners, client-only, or a non-Linux build).
     #[cfg(target_os = "linux")]
     pub fn set_worker_accepting(&self, worker: usize, accepting: bool) -> io::Result<()> {
         use std::sync::atomic::Ordering;
@@ -220,6 +226,17 @@ impl Runtime {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "worker index out of range",
+            ));
+        }
+        let _steering = self
+            .shutdown
+            .steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if accepting && self.shutdown.has_exited(worker) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker has exited",
             ));
         }
         if self.accepting[worker].load(Ordering::Acquire) == accepting {
@@ -351,17 +368,27 @@ impl Runtime {
         }
     }
 
-    /// Block the calling thread until `SIGINT` or `SIGTERM` is received, or a
+    /// Block the calling thread until `SIGINT` or `SIGTERM` is received, a
     /// task panic shuts the runtime down under
-    /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown), then
-    /// trigger graceful shutdown.
+    /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown), or a
+    /// worker stops, then trigger graceful shutdown.
     ///
-    /// Returns which signal was caught, or
-    /// [`Signal::TaskPanic`](crate::signal::Signal::TaskPanic). After a task
-    /// panic, the handle of each worker on which a task panicked returns
+    /// Returns which signal was caught,
+    /// [`Signal::TaskPanic`](crate::signal::Signal::TaskPanic), or
+    /// [`Signal::WorkerExited`](crate::signal::Signal::WorkerExited). After a
+    /// task panic, the handle of each worker on which a task panicked returns
     /// [`Error::TaskPanicked`](crate::Error::TaskPanicked).
+    ///
+    /// A worker stops on a panic in the runtime or an error from its ring or
+    /// poll, under either policy. Its handle returns the error or the panic,
+    /// or [`Error::TaskPanicked`](crate::Error::TaskPanicked) if a task panicked
+    /// on it first under `Shutdown`. Its connections close and the other
+    /// workers keep serving until the runtime shuts down, so a process that
+    /// does not call this method runs on with fewer workers, and
+    /// [`register_region`](Self::register_region) and
+    /// [`unregister_region`](Self::unregister_region) fail from then on.
     pub fn wait_on_signal(&self) -> crate::signal::Signal {
-        let sig = crate::signal::wait_or_ready(self.shutdown.panic_fd());
+        let sig = crate::signal::wait_or_ready(self.shutdown.panic_fd(), self.shutdown.exit_fd());
         self.shutdown();
         sig
     }
@@ -391,15 +418,75 @@ impl Runtime {
 pub(crate) struct RuntimeShutdown {
     flag: Arc<AtomicBool>,
     listen_gates: Arc<crate::listen_gate::ListenGates>,
-    /// Each listener's sockets, added as `launch()` creates the listeners and
-    /// released by `shutdown()`.
-    listeners: std::sync::Mutex<Vec<Arc<ListenerSockets>>>,
+    /// Each listener's sockets and whether it is merged, added as `launch()`
+    /// creates the listeners and released by `shutdown()`.
+    listeners: std::sync::Mutex<Vec<(Arc<ListenerSockets>, bool)>>,
     wake: crate::wakeup::WakeKeepAlive,
     /// Readable once a task panic has shut the runtime down;
     /// [`Runtime::wait_on_signal`] polls it alongside the signal pipe.
     panic_read: OwnedFd,
     panic_write: OwnedFd,
     panicked: AtomicBool,
+    /// Readable once a worker has stopped abnormally.
+    /// [`Runtime::wait_on_signal`] polls it alongside the signal pipe.
+    exit_read: OwnedFd,
+    exit_write: OwnedFd,
+    /// The workers that stopped abnormally.
+    exited: std::sync::Mutex<Vec<usize>>,
+    /// The accept rotation, set by `launch()`. See `Runtime::accepting`.
+    accepting: std::sync::OnceLock<Arc<Vec<AtomicBool>>>,
+    /// Held from reading the rotation through attaching the program built from
+    /// it, so two changes cannot attach out of order.
+    #[cfg(target_os = "linux")]
+    steering: std::sync::Mutex<()>,
+}
+
+/// Accept and close every connection queued on a listening socket.
+#[cfg(target_os = "linux")]
+fn close_queued(fd: RawFd) {
+    let nonblocking: libc::c_int = 1;
+    unsafe { libc::ioctl(fd, libc::FIONBIO, &nonblocking) };
+    loop {
+        let conn = unsafe {
+            libc::accept4(
+                fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        };
+        if conn < 0 {
+            return;
+        }
+        unsafe { libc::close(conn) };
+    }
+}
+
+/// A non-blocking, close-on-exec pipe: `(read end, write end)`.
+fn nonblocking_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as RawFd; 2];
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for fd in fds {
+            unsafe {
+                libc::fcntl(
+                    fd,
+                    libc::F_SETFL,
+                    libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+                );
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+    }
+    // SAFETY: `pipe` returned two fresh descriptors nothing else owns.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 impl RuntimeShutdown {
@@ -408,30 +495,8 @@ impl RuntimeShutdown {
         listen_gates: Arc<crate::listen_gate::ListenGates>,
         wake: crate::wakeup::WakeKeepAlive,
     ) -> io::Result<Self> {
-        let mut fds = [0 as RawFd; 2];
-        #[cfg(target_os = "linux")]
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            for fd in fds {
-                unsafe {
-                    libc::fcntl(
-                        fd,
-                        libc::F_SETFL,
-                        libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
-                    );
-                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                }
-            }
-        }
-        // SAFETY: `pipe` returned two fresh descriptors nothing else owns.
-        let (panic_read, panic_write) =
-            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let (panic_read, panic_write) = nonblocking_pipe()?;
+        let (exit_read, exit_write) = nonblocking_pipe()?;
         Ok(RuntimeShutdown {
             flag,
             listen_gates,
@@ -440,14 +505,20 @@ impl RuntimeShutdown {
             panic_read,
             panic_write,
             panicked: AtomicBool::new(false),
+            exit_read,
+            exit_write,
+            exited: std::sync::Mutex::new(Vec::new()),
+            accepting: std::sync::OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            steering: std::sync::Mutex::new(()),
         })
     }
 
-    fn add_listener(&self, sockets: Arc<ListenerSockets>) {
+    fn add_listener(&self, sockets: Arc<ListenerSockets>, merged: bool) {
         self.listeners
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(sockets);
+            .push((sockets, merged));
         // A shutdown that ran before this listener was added did not shut it
         // down; run it again now that it is added. Idempotent.
         if self.flag.load(Ordering::Acquire) {
@@ -469,7 +540,7 @@ impl RuntimeShutdown {
         self.listen_gates.shutdown();
         let listeners =
             std::mem::take(&mut *self.listeners.lock().unwrap_or_else(|e| e.into_inner()));
-        for sockets in listeners {
+        for (sockets, _) in listeners {
             // Wakes an acceptor blocked in `accept4`, and in merged mode ends
             // the multishot accept a worker has armed on each socket.
             sockets.shut_down();
@@ -493,6 +564,127 @@ impl RuntimeShutdown {
 
     fn panic_fd(&self) -> RawFd {
         self.panic_read.as_raw_fd()
+    }
+
+    fn exit_fd(&self) -> RawFd {
+        self.exit_read.as_raw_fd()
+    }
+
+    /// Record that `worker` stopped abnormally: take it out of the accept
+    /// rotation, wake [`Runtime::wait_on_signal`], and shut the runtime down if
+    /// `shutdown` is set. Runs on that worker's thread, before it closes its
+    /// connections.
+    pub(crate) fn worker_exited(&self, worker: usize, shutdown: bool) {
+        self.exited
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(worker);
+        #[cfg(target_os = "linux")]
+        self.stop_accepting(worker);
+        let byte = 1u8;
+        unsafe {
+            libc::write(self.exit_write.as_raw_fd(), (&byte as *const u8).cast(), 1);
+        }
+        if shutdown {
+            self.shutdown();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn has_exited(&self, worker: usize) -> bool {
+        self.exited
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&worker)
+    }
+
+    /// Steer the merged listeners away from `worker` and close what is queued
+    /// on its sockets. The sockets stay bound until the runtime shuts down:
+    /// closing one reorders its group, and a steering program selects by
+    /// position in the group. With no worker left to accept, the listeners are
+    /// shut down. If only workers taken out of the rotation are left, they go
+    /// back in.
+    #[cfg(target_os = "linux")]
+    fn stop_accepting(&self, worker: usize) {
+        let Some(accepting) = self.accepting.get() else {
+            return;
+        };
+        let _steering = self.steering.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(flag) = accepting.get(worker) {
+            flag.store(false, Ordering::Release);
+        }
+        let exited = self
+            .exited
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let alive: Vec<u32> = (0..accepting.len() as u32)
+            .filter(|i| !exited.contains(&(*i as usize)))
+            .collect();
+        let mut live: Vec<u32> = alive
+            .iter()
+            .copied()
+            .filter(|i| accepting[*i as usize].load(Ordering::Acquire))
+            .collect();
+        if live.is_empty() && !alive.is_empty() {
+            let _ = writeln!(
+                io::stderr(),
+                "ringline: worker {worker} exited; returning {alive:?} to the accept rotation"
+            );
+            for i in &alive {
+                accepting[*i as usize].store(true, Ordering::Release);
+            }
+            live = alive;
+        }
+        let listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
+        for (sockets, _) in listeners.iter().filter(|(_, merged)| *merged) {
+            if live.is_empty() {
+                sockets.shut_down();
+                continue;
+            }
+            if let Some(fd) = sockets.fds().next()
+                && let Err(e) = crate::reuseport_bpf::attach_live_set(fd, &live)
+            {
+                let _ = writeln!(
+                    io::stderr(),
+                    "ringline: steering around worker {worker} failed: {e}"
+                );
+            }
+            close_queued(sockets.fd(worker));
+        }
+    }
+
+    /// Close what reached `worker`'s merged sockets while it drained: a
+    /// handshake that began before the steering can finish after it.
+    pub(crate) fn worker_drained(&self, worker: usize) {
+        #[cfg(target_os = "linux")]
+        for (sockets, merged) in self
+            .listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if *merged {
+                close_queued(sockets.fd(worker));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = worker;
+    }
+
+    /// Apply earlier worker exits to listeners added since.
+    fn reapply_exits(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            let exited = self
+                .exited
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            for worker in exited {
+                self.stop_accepting(worker);
+            }
+        }
     }
 }
 
@@ -999,13 +1191,49 @@ impl RinglineBuilder {
                 // errors rather than burying them in an unjoined worker.
                 let _ = startup_tx.send(Ok(()));
                 drop(startup_tx);
-                let run_result = event_loop.run();
+                // An unwind out of here would free memory the kernel can
+                // still use and skip the close of every connection, so a
+                // panic in the runtime is caught where `event_loop` outlives
+                // it.
+                let run_result = catch_unwind(AssertUnwindSafe(|| event_loop.run()));
+                let cause = match &run_result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(payload) => Some(format!("panic: {}", panic_payload(&**payload))),
+                };
+                if let Some(cause) = cause {
+                    event_loop.report_worker_exit(worker_id, &cause);
+                    let drained =
+                        catch_unwind(AssertUnwindSafe(|| event_loop.drain_after_failure()));
+                    event_loop.report_worker_drained(worker_id);
+                    if drained.is_err() {
+                        let task_panic = event_loop.take_task_panic();
+                        // Safety: `event_loop` is leaked on the next line, so
+                        // nothing uses the ring again.
+                        unsafe { event_loop.close_ring() };
+                        std::mem::forget(event_loop);
+                        return match (task_panic, run_result) {
+                            (Some(panic), _) => Err(crate::error::Error::TaskPanicked(panic)),
+                            (None, Ok(result)) => result,
+                            (None, Err(payload)) => std::panic::resume_unwind(payload),
+                        };
+                    }
+                }
+                event_loop.drop_tasks();
                 // Under `TaskPanicPolicy::Shutdown`, a panic on this worker
                 // shut the runtime down; report it as this worker's result,
                 // ahead of any error from the drain that followed.
-                match event_loop.take_task_panic() {
-                    Some(panic) => Err(crate::error::Error::TaskPanicked(panic)),
-                    None => run_result,
+                let task_panic = event_loop.take_task_panic();
+                // A `Drop` that panics here must not replace the panic below.
+                if run_result.is_err() {
+                    let _ = crate::task_panic::drop_caught(event_loop);
+                } else {
+                    drop(event_loop);
+                }
+                match (task_panic, run_result) {
+                    (Some(panic), _) => Err(crate::error::Error::TaskPanicked(panic)),
+                    (None, Ok(result)) => result,
+                    (None, Err(payload)) => std::panic::resume_unwind(payload),
                 }
             },
         )
@@ -1314,11 +1542,12 @@ impl RinglineBuilder {
         // Shared by `Runtime::set_worker_accepting` and every worker's
         // accept-time placement: one mask, so steering and placement cannot
         // disagree about who is in the rotation.
-        let worker_accepting: Arc<Vec<std::sync::atomic::AtomicBool>> = Arc::new(
+        let worker_accepting: Arc<Vec<AtomicBool>> = Arc::new(
             (0..num_threads)
                 .map(|_| std::sync::atomic::AtomicBool::new(true))
                 .collect(),
         );
+        let _ = runtime_shutdown.accepting.set(worker_accepting.clone());
 
         for worker_id in 0..num_threads {
             let mut config = self.config.clone();
@@ -1608,7 +1837,7 @@ impl RinglineBuilder {
                 // Merged mode has no acceptor thread: the workers arm their own
                 // multishot accept on these sockets. Record the listener and
                 // move on.
-                runtime_shutdown.add_listener(Arc::clone(&sockets));
+                runtime_shutdown.add_listener(Arc::clone(&sockets), merged_entry.is_some());
                 if merged_entry.is_some() {
                     listeners.push(ListenerHandle {
                         sockets: Arc::downgrade(&sockets),
@@ -1659,6 +1888,7 @@ impl RinglineBuilder {
             // its own schedule still sees it.
             // A task panic during launch shut the runtime down: leave the
             // workers unarmed.
+            runtime_shutdown.reapply_exits();
             if let Some(ref live) = merged_live
                 && !shutdown_flag.load(Ordering::Acquire)
             {
@@ -2437,5 +2667,725 @@ mod memlock_required_tests {
             .unwrap();
         assert_eq!(memlock_required(&config, 3, false, PAGE), 9 * PAGE);
         assert_eq!(memlock_required(&config, 3, true, PAGE), 3 * (3 + 5) * PAGE);
+    }
+}
+
+/// A worker that stops because of a failure in the runtime: reported, steered
+/// around, and its connections closed.
+#[cfg(test)]
+mod worker_exit_tests {
+    use std::future::Future;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::Arc;
+    #[cfg(has_io_uring)]
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use crate::config::{ConfigBuilder, TestFault};
+    use crate::error::Error;
+    use crate::signal::Signal;
+    use crate::{AcceptMode, AsyncEventHandler, Connection, ParseResult, RinglineBuilder};
+    use crate::{Runtime, TaskPanicPolicy};
+
+    /// A message that blocks the worker's thread for [`STALL_FOR`], so that
+    /// connections and completions pile up behind it.
+    const STALL: &[u8] = b"stall";
+    const STALL_FOR: Duration = Duration::from_millis(300);
+
+    struct Echo;
+
+    impl AsyncEventHandler for Echo {
+        #[allow(clippy::manual_async_fn)]
+        fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+            async move {
+                loop {
+                    let mut got = Vec::new();
+                    let n = conn
+                        .with_data(|d| {
+                            got.extend_from_slice(d);
+                            ParseResult::Consumed(d.len())
+                        })
+                        .await;
+                    if got == STALL {
+                        std::thread::sleep(STALL_FOR);
+                    }
+                    if n == 0 || conn.send_nowait(&got).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        fn create_for_worker(_id: usize) -> Self {
+            Echo
+        }
+    }
+
+    type Handles = Vec<JoinHandle<Result<(), Error>>>;
+
+    fn launch(
+        workers: usize,
+        mode: AcceptMode,
+        policy: TaskPanicPolicy,
+    ) -> (Arc<Runtime>, Handles, Arc<TestFault>) {
+        let mut config = ConfigBuilder::new()
+            .workers(workers)
+            .pin_to_core(false)
+            .sq_entries(64)
+            .max_connections(64)
+            .send_pool(32, 16384)
+            .blocking_threads(1)
+            .resolver_threads(0)
+            .spawner_threads(0)
+            .task_panic_policy(policy)
+            .accept_mode(mode)
+            .build()
+            .expect("valid config");
+        let fault = Arc::new(TestFault::default());
+        config.test_fault = Some(fault.clone());
+        let (runtime, handles) = RinglineBuilder::new(config)
+            .bind("127.0.0.1:0".parse().unwrap())
+            .launch::<Echo>()
+            .expect("launch");
+        (Arc::new(runtime), handles, fault)
+    }
+
+    fn wake_all(runtime: &Runtime, workers: usize) {
+        for i in 0..workers {
+            runtime.worker_wake_handle(i).unwrap().wake();
+        }
+    }
+
+    /// What became of a connection when a byte was echoed through it.
+    #[derive(Debug, PartialEq)]
+    enum Echoed {
+        Yes,
+        Closed,
+        Hung,
+    }
+
+    fn echo(stream: &mut TcpStream) -> Echoed {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        if stream.write_all(b"x").is_err() {
+            return Echoed::Closed;
+        }
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(1) => Echoed::Yes,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Echoed::Hung
+            }
+            _ => Echoed::Closed,
+        }
+    }
+
+    /// Wait for `wait_on_signal` to return, for at most `within`.
+    fn signal_within(runtime: &Arc<Runtime>, within: Duration) -> Option<Signal> {
+        let waiter = runtime.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(waiter.wait_on_signal());
+        });
+        rx.recv_timeout(within).ok()
+    }
+
+    fn wait_for_exit(handles: &Handles, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handles.iter().filter(|h| h.is_finished()).count() < count {
+            assert!(Instant::now() < deadline, "no worker exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn connect_all(addr: std::net::SocketAddr, count: usize) -> Vec<TcpStream> {
+        let mut streams: Vec<TcpStream> = (0..count)
+            .map(|_| TcpStream::connect(addr).unwrap())
+            .collect();
+        for stream in &mut streams {
+            assert_eq!(echo(stream), Echoed::Yes);
+        }
+        streams
+    }
+
+    /// The dead worker's connections close, the others keep working, and new
+    /// connections are served.
+    fn check_service_after_exit(runtime: &Runtime, streams: &mut [TcpStream], workers: usize) {
+        let results: Vec<Echoed> = streams.iter_mut().map(echo).collect();
+        let closed = results.iter().filter(|r| **r == Echoed::Closed).count();
+        let served = results.iter().filter(|r| **r == Echoed::Yes).count();
+        assert_eq!(
+            closed + served,
+            results.len(),
+            "a connection hung: {results:?}"
+        );
+        assert!(closed > 0, "no connection closed: {results:?}");
+        assert!(served > 0, "no connection survived: {results:?}");
+        let addr = runtime.bound_addr().unwrap();
+        for _ in 0..workers * 6 {
+            let mut fresh = TcpStream::connect(addr).unwrap();
+            assert_eq!(echo(&mut fresh), Echoed::Yes);
+        }
+    }
+
+    #[test]
+    fn a_panic_in_the_event_loop_leaves_the_other_workers_serving() {
+        let (runtime, handles, fault) = launch(2, AcceptMode::Pool, TaskPanicPolicy::Contain);
+        let mut streams = connect_all(runtime.bound_addr().unwrap(), 8);
+
+        fault.panic.store(true, Ordering::Release);
+        wake_all(&runtime, 2);
+
+        wait_for_exit(&handles, 1);
+        check_service_after_exit(&runtime, &mut streams, 2);
+
+        runtime.shutdown();
+        let panicked = handles
+            .into_iter()
+            .map(|h| h.join())
+            .filter(Result::is_err)
+            .count();
+        assert_eq!(panicked, 1, "the join keeps the panic");
+    }
+
+    #[test]
+    fn an_error_from_the_event_loop_leaves_the_other_workers_serving() {
+        let (runtime, handles, fault) = launch(2, AcceptMode::Pool, TaskPanicPolicy::Contain);
+        let mut streams = connect_all(runtime.bound_addr().unwrap(), 8);
+
+        fault.error.store(true, Ordering::Release);
+        wake_all(&runtime, 2);
+
+        wait_for_exit(&handles, 1);
+        check_service_after_exit(&runtime, &mut streams, 2);
+
+        runtime.shutdown();
+        let errors = handles
+            .into_iter()
+            .map(|h| h.join().expect("no panic"))
+            .filter(Result::is_err)
+            .count();
+        assert_eq!(errors, 1);
+    }
+
+    /// `wait_on_signal` returns for a stopped worker, and shuts the runtime
+    /// down so a supervisor can restart the process.
+    #[test]
+    fn wait_on_signal_reports_a_worker_exit_and_shuts_down() {
+        for fail in [
+            (|fault: &TestFault| fault.panic.store(true, Ordering::Release)) as fn(&TestFault),
+            |fault| fault.error.store(true, Ordering::Release),
+        ] {
+            let (runtime, handles, fault) = launch(2, AcceptMode::Pool, TaskPanicPolicy::Contain);
+            fail(&fault);
+            wake_all(&runtime, 2);
+            assert_eq!(
+                signal_within(&runtime, Duration::from_secs(5)),
+                Some(Signal::WorkerExited)
+            );
+            wait_for_exit(&handles, 2);
+        }
+    }
+
+    /// With nobody in `wait_on_signal`, the `Shutdown` policy stops the runtime.
+    #[test]
+    fn a_worker_exit_shuts_the_runtime_down_under_the_shutdown_policy() {
+        let (runtime, handles, fault) = launch(2, AcceptMode::Pool, TaskPanicPolicy::Shutdown);
+        fault.panic.store(true, Ordering::Release);
+        wake_all(&runtime, 2);
+        wait_for_exit(&handles, 2);
+        drop(runtime);
+    }
+
+    /// In merged mode the dead worker's socket stays in the `SO_REUSEPORT`
+    /// group, so without steering a quarter of these would connect and hang.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_merged_listener_stops_choosing_a_dead_worker() {
+        const WORKERS: usize = 4;
+        let (runtime, handles, fault) =
+            launch(WORKERS, AcceptMode::Merged, TaskPanicPolicy::Contain);
+        let addr = runtime.bound_addr().unwrap();
+        let mut streams = connect_all(addr, 16);
+
+        fault.error.store(true, Ordering::Release);
+        wake_all(&runtime, WORKERS);
+        wait_for_exit(&handles, 1);
+        check_service_after_exit(&runtime, &mut streams, WORKERS);
+
+        let dead = handles.iter().position(|h| h.is_finished()).unwrap();
+        assert!(runtime.set_worker_accepting(dead, true).is_err());
+        runtime.shutdown();
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    #[cfg(has_io_uring)]
+    static GUARD_DROPPED: AtomicBool = AtomicBool::new(false);
+    #[cfg(has_io_uring)]
+    static GUARD_SENT: AtomicBool = AtomicBool::new(false);
+
+    #[cfg(has_io_uring)]
+    struct FlaggedGuard(Vec<u8>);
+
+    #[cfg(has_io_uring)]
+    impl crate::SendGuard for FlaggedGuard {
+        fn as_ptr_len(&self) -> (*const u8, u32) {
+            (self.0.as_ptr(), self.0.len() as u32)
+        }
+        fn region(&self) -> crate::RegionId {
+            crate::RegionId::UNREGISTERED
+        }
+    }
+
+    #[cfg(has_io_uring)]
+    impl Drop for FlaggedGuard {
+        fn drop(&mut self) {
+            GUARD_DROPPED.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Sends a guarded body larger than the loopback socket buffers hold, and
+    /// keeps the connection open.
+    #[cfg(has_io_uring)]
+    struct GuardSender;
+
+    #[cfg(has_io_uring)]
+    impl AsyncEventHandler for GuardSender {
+        #[allow(clippy::manual_async_fn)]
+        fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+            async move {
+                conn.with_data(|d| ParseResult::Consumed(d.len())).await;
+                let guard = crate::GuardBox::new(FlaggedGuard(vec![7; 4 << 20]));
+                conn.send_parts()
+                    .build(|b| b.guard(guard).submit())
+                    .expect("guard send accepted");
+                GUARD_SENT.store(true, Ordering::SeqCst);
+                while conn.with_data(|d| ParseResult::Consumed(d.len())).await > 0 {}
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            GuardSender
+        }
+    }
+
+    /// A stopped worker runs the normal drain, so a zero-copy guard outlives
+    /// the kernel's use of it. Dropping the event loop at once would free
+    /// memory the kernel still holds.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_stopped_worker_holds_a_guard_the_kernel_still_uses() {
+        let mut config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .sq_entries(64)
+            .max_connections(16)
+            .send_pool(16, 16384)
+            .build()
+            .expect("valid config");
+        let fault = Arc::new(TestFault::default());
+        config.test_fault = Some(fault.clone());
+        let enomem = || {
+            crate::metrics::POOL
+                .value(crate::metrics::pool::SEND_ZC_ENOMEM)
+                .unwrap_or(0)
+        };
+        let before = enomem();
+        let (runtime, handles) = RinglineBuilder::new(config)
+            .bind("127.0.0.1:0".parse().unwrap())
+            .launch::<GuardSender>()
+            .expect("launch");
+        let mut peer = TcpStream::connect(runtime.bound_addr().unwrap()).unwrap();
+        peer.write_all(b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !GUARD_SENT.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the send never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Bytes on the socket: the send reached the kernel, and a `-ENOMEM` has
+        // been handled, so the count below is settled.
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        peer.peek(&mut [0u8; 1]).expect("the send's first bytes");
+
+        fault.error.store(true, Ordering::Release);
+        wake_all(&runtime, 1);
+        std::thread::sleep(Duration::from_millis(300));
+        // Over `RLIMIT_MEMLOCK` the send falls back to plain sends (#642), which
+        // owe no notification, so the drain frees the guard.
+        if enomem() == before {
+            assert!(
+                !GUARD_DROPPED.load(Ordering::SeqCst),
+                "the guard was freed while its data was queued"
+            );
+        }
+        drop(peer);
+        runtime.shutdown();
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    /// With no worker left, the listeners stop taking connections.
+    #[cfg(has_io_uring)]
+    fn check_refused_or_closed(runtime: &Runtime) {
+        let addr = runtime.bound_addr().unwrap();
+        for _ in 0..8 {
+            if let Ok(mut fresh) = TcpStream::connect(addr) {
+                assert_eq!(echo(&mut fresh), Echoed::Closed);
+            }
+        }
+    }
+
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_merged_listener_with_one_worker_stops_taking_connections() {
+        let (runtime, handles, fault) = launch(1, AcceptMode::Merged, TaskPanicPolicy::Contain);
+        fault.error.store(true, Ordering::Release);
+        wake_all(&runtime, 1);
+        wait_for_exit(&handles, 1);
+        check_refused_or_closed(&runtime);
+    }
+
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_merged_listener_stops_taking_connections_when_every_worker_stops() {
+        let (runtime, handles, fault) = launch(2, AcceptMode::Merged, TaskPanicPolicy::Contain);
+        for stopped in 1..=2 {
+            fault.error.store(true, Ordering::Release);
+            wake_all(&runtime, 2);
+            wait_for_exit(&handles, stopped);
+        }
+        check_refused_or_closed(&runtime);
+    }
+
+    /// The last worker in the rotation stops while another was taken out: the
+    /// live one goes back in.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_worker_out_of_the_rotation_returns_when_the_others_stop() {
+        let (runtime, handles, fault) = launch(2, AcceptMode::Merged, TaskPanicPolicy::Contain);
+        runtime.set_worker_accepting(0, false).unwrap();
+        fault.error_on_worker.store(2, Ordering::Release);
+        wake_all(&runtime, 2);
+        wait_for_exit(&handles, 1);
+        assert!(handles[1].is_finished());
+        let addr = runtime.bound_addr().unwrap();
+        for _ in 0..8 {
+            let mut fresh = TcpStream::connect(addr).unwrap();
+            assert_eq!(echo(&mut fresh), Echoed::Yes);
+        }
+        runtime.shutdown();
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    /// Connections in a batch of completions when a handler panics are closed,
+    /// not lost with the rest of the batch.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn accepted_connections_behind_a_panic_are_closed() {
+        let (runtime, handles, fault) = launch(1, AcceptMode::Merged, TaskPanicPolicy::Contain);
+        let addr = runtime.bound_addr().unwrap();
+        let mut staller = connect_all(addr, 1).pop().unwrap();
+        fault.panic_on_accept.store(3, Ordering::Release);
+        staller.write_all(STALL).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let mut streams: Vec<TcpStream> =
+            (0..8).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        wait_for_exit(&handles, 1);
+        for stream in &mut streams {
+            assert_eq!(echo(stream), Echoed::Closed);
+        }
+    }
+
+    /// `launch()` ends when a worker has stopped before the listeners exist.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_worker_stopping_during_launch_does_not_hang_it() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut config = ConfigBuilder::new()
+                .workers(2)
+                .pin_to_core(false)
+                .sq_entries(64)
+                .max_connections(64)
+                .send_pool(32, 16384)
+                .accept_mode(AcceptMode::Merged)
+                .build()
+                .expect("valid config");
+            let fault = Arc::new(TestFault::default());
+            fault.error.store(true, Ordering::Release);
+            config.test_fault = Some(fault);
+            let (runtime, handles) = RinglineBuilder::new(config)
+                .bind("127.0.0.1:0".parse().unwrap())
+                .launch::<Echo>()
+                .expect("launch");
+            // The listener went live after the worker stopped, so these reach
+            // the other worker only if `launch()` steered it around.
+            let addr = runtime.bound_addr().unwrap();
+            let results: Vec<Echoed> = (0..16)
+                .map(|_| echo(&mut TcpStream::connect(addr).unwrap()))
+                .collect();
+            drop(runtime);
+            for handle in handles {
+                let _ = handle.join();
+            }
+            let _ = tx.send(results);
+        });
+        let results = rx
+            .recv_timeout(Duration::from_secs(90))
+            .expect("launch hung");
+        assert!(results.iter().all(|r| *r == Echoed::Yes), "{results:?}");
+    }
+
+    /// What is queued on a stopped worker's merged socket closes, both when it
+    /// leaves the rotation and after its drain.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_worker_closes_what_is_queued_on_its_socket() {
+        use std::os::fd::OwnedFd;
+        let listeners: Vec<std::net::TcpListener> = (0..2)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addr = listeners[1].local_addr().unwrap();
+        let fds: Vec<OwnedFd> = listeners.into_iter().map(OwnedFd::from).collect();
+        let sockets = super::ListenerSockets::new(fds);
+        let shutdown = super::RuntimeShutdown::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            crate::listen_gate::ListenGates::new(0, 128),
+            Arc::from(Vec::new()),
+        )
+        .unwrap();
+        let accepting = (0..2)
+            .map(|_| std::sync::atomic::AtomicBool::new(true))
+            .collect();
+        let _ = shutdown.accepting.set(Arc::new(accepting));
+        shutdown.add_listener(sockets, true);
+
+        let mut at_exit = TcpStream::connect(addr).unwrap();
+        shutdown.worker_exited(1, false);
+        assert_eq!(echo(&mut at_exit), Echoed::Closed);
+
+        let mut after_drain = TcpStream::connect(addr).unwrap();
+        shutdown.worker_drained(1);
+        assert_eq!(echo(&mut after_drain), Echoed::Closed);
+    }
+
+    /// A connection arriving as the worker stops does not hang.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn connections_arriving_as_a_worker_stops_do_not_hang() {
+        const WORKERS: usize = 2;
+        let (runtime, handles, fault) =
+            launch(WORKERS, AcceptMode::Merged, TaskPanicPolicy::Contain);
+        let addr = runtime.bound_addr().unwrap();
+        let mut held = connect_all(addr, 16);
+        // An armed accept empties the kernel's queue during the iteration, so
+        // these reach the worker's ring or the steering, not `close_queued`.
+        for stream in &mut held {
+            stream.write_all(STALL).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        fault.panic_in_drain.store(true, Ordering::Release);
+        fault.error.store(true, Ordering::Release);
+        let mut streams: Vec<TcpStream> =
+            (0..16).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        wake_all(&runtime, WORKERS);
+        wait_for_exit(&handles, 1);
+        for stream in &mut streams {
+            let result = echo(stream);
+            assert_ne!(result, Echoed::Hung);
+        }
+        runtime.shutdown();
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_queued_closes_what_a_listening_socket_holds() {
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut queued = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        super::close_queued(listener.as_raw_fd());
+        assert_eq!(echo(&mut queued), Echoed::Closed);
+    }
+
+    /// A task panic under `Shutdown` is the worker's result on a failed drain
+    /// too.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_failed_drain_keeps_the_task_panic() {
+        struct Panicker;
+        static FAULT: std::sync::OnceLock<Arc<TestFault>> = std::sync::OnceLock::new();
+        impl AsyncEventHandler for Panicker {
+            fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+                std::future::ready(())
+            }
+            fn on_start(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + 'static>>> {
+                Some(Box::pin(async {
+                    let fault = FAULT.get().unwrap();
+                    fault.panic_in_drain.store(true, Ordering::Release);
+                    fault.panic.store(true, Ordering::Release);
+                    panic!("boom in task");
+                }))
+            }
+            fn create_for_worker(_id: usize) -> Self {
+                Panicker
+            }
+        }
+        let mut config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .sq_entries(64)
+            .max_connections(16)
+            .send_pool(16, 16384)
+            .task_panic_policy(TaskPanicPolicy::Shutdown)
+            .build()
+            .expect("valid config");
+        let fault = Arc::new(TestFault::default());
+        let _ = FAULT.set(fault.clone());
+        config.test_fault = Some(fault);
+        let (runtime, mut handles) = RinglineBuilder::new(config)
+            .launch::<Panicker>()
+            .expect("launch");
+        wait_for_exit(&handles, 1);
+        drop(runtime);
+        let result = handles
+            .remove(0)
+            .join()
+            .expect("no panic out of the worker");
+        assert!(
+            matches!(&result, Err(Error::TaskPanicked(e)) if e.panic_message() == Some("boom in task")),
+            "{result:?}"
+        );
+    }
+
+    /// A blocking result that cannot reach its stopped worker drops on the pool
+    /// thread, and a panic in its `Drop` leaves the pool working.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_result_for_a_stopped_worker_leaves_the_blocking_pool_working() {
+        struct PanicsWhenDropped;
+        impl Drop for PanicsWhenDropped {
+            fn drop(&mut self) {
+                panic!("boom in result drop");
+            }
+        }
+        static POOL_SERVED: AtomicBool = AtomicBool::new(false);
+        struct Blocks(usize);
+        impl AsyncEventHandler for Blocks {
+            fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+                std::future::ready(())
+            }
+            fn on_start(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + 'static>>> {
+                let id = self.0;
+                Some(Box::pin(async move {
+                    if id == 0 {
+                        let held = crate::spawn_blocking(|| {
+                            std::thread::sleep(Duration::from_millis(200));
+                            PanicsWhenDropped
+                        })
+                        .expect("spawn_blocking");
+                        crate::sleep(Duration::from_secs(3600)).await;
+                        drop(held);
+                    } else {
+                        crate::sleep(Duration::from_millis(500)).await;
+                        let served = crate::spawn_blocking(|| ())
+                            .expect("spawn_blocking")
+                            .await
+                            .is_ok();
+                        POOL_SERVED.store(served, Ordering::SeqCst);
+                    }
+                }))
+            }
+            fn create_for_worker(id: usize) -> Self {
+                Blocks(id)
+            }
+        }
+        let mut config = ConfigBuilder::new()
+            .workers(2)
+            .pin_to_core(false)
+            .sq_entries(64)
+            .max_connections(16)
+            .send_pool(16, 16384)
+            .blocking_threads(1)
+            .build()
+            .expect("valid config");
+        let fault = Arc::new(TestFault::default());
+        config.test_fault = Some(fault.clone());
+        let (runtime, handles) = RinglineBuilder::new(config)
+            .launch::<Blocks>()
+            .expect("launch");
+        std::thread::sleep(Duration::from_millis(50));
+        fault.error_on_worker.store(1, Ordering::Release);
+        wake_all(&runtime, 2);
+        wait_for_exit(&handles, 1);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !POOL_SERVED.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(POOL_SERVED.load(Ordering::SeqCst), "the pool thread died");
+        drop(runtime);
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    /// After a failed drain nothing waits on the stopped worker.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_failed_drain_does_not_block_a_region_update() {
+        let (runtime, handles, fault) = launch(2, AcceptMode::Pool, TaskPanicPolicy::Contain);
+        fault.panic_in_drain.store(true, Ordering::Release);
+        fault.panic.store(true, Ordering::Release);
+        wake_all(&runtime, 2);
+        wait_for_exit(&handles, 1);
+
+        let mut backing = vec![0u8; 4096];
+        let region = unsafe { crate::MemoryRegion::new(backing.as_mut_ptr(), 4096) };
+        let registrar = runtime.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(registrar.register_region(region).is_err());
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+        runtime.shutdown();
+        for handle in handles {
+            let _ = handle.join();
+        }
+        drop(backing);
+    }
+
+    /// A drain that panics leaves the ring to the kernel: its connections close
+    /// and the process carries on.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn a_failed_drain_still_closes_the_connections() {
+        let (runtime, handles, fault) = launch(2, AcceptMode::Pool, TaskPanicPolicy::Contain);
+        let mut streams = connect_all(runtime.bound_addr().unwrap(), 8);
+
+        fault.panic_in_drain.store(true, Ordering::Release);
+        fault.panic.store(true, Ordering::Release);
+        wake_all(&runtime, 2);
+        wait_for_exit(&handles, 1);
+        check_service_after_exit(&runtime, &mut streams, 2);
+
+        runtime.shutdown();
+        for handle in handles {
+            let _ = handle.join();
+        }
     }
 }

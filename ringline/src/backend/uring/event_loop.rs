@@ -144,6 +144,66 @@ fn choose_placement(loads: &[u32], accepting: &[bool], me: usize, mine: u32) -> 
 }
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
+    /// Report the panics caught in the `Drop` of removed futures.
+    fn report_drop_panics(&mut self) {
+        for payload in self.executor.take_drop_panics() {
+            self.driver.panic_reporter.report("task drop", &*payload);
+        }
+    }
+
+    /// Drop every task at worker exit and report panics in their `Drop`.
+    pub(crate) fn drop_tasks(&mut self) {
+        self.executor.drop_tasks();
+        // Results delivered after their futures went.
+        if let Some(rx) = self.driver.blocking_rx.take() {
+            for response in rx.try_iter() {
+                self.executor.task_slab.drop_noting_panic(response);
+            }
+            // Dropping it discards a response sent since the loop above.
+            self.executor.task_slab.drop_noting_panic(rx);
+        }
+        self.report_drop_panics();
+    }
+
+    /// Report that this worker stopped for `cause`.
+    pub(crate) fn report_worker_exit(&self, worker: usize, cause: &str) {
+        self.driver.panic_reporter.report_worker_exit(worker, cause);
+    }
+
+    /// Report that this worker's drain has ended.
+    pub(crate) fn report_worker_drained(&self, worker: usize) {
+        self.driver.panic_reporter.report_worker_drained(worker);
+    }
+
+    /// Close connections and wait for the kernel to finish with their memory,
+    /// after `run` ended with an error or a panic.
+    pub(crate) fn drain_after_failure(&mut self) {
+        #[cfg(test)]
+        if let Some(fault) = &self.driver.test_fault
+            && fault
+                .panic_in_drain
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            panic!("injected drain panic");
+        }
+        self.driver.run_shutdown();
+    }
+
+    /// Tear the ring down after
+    /// [`drain_after_failure`](Self::drain_after_failure) panicked. The kernel
+    /// ends the ring's operations and closes its sockets. Those operations can
+    /// use the heap memory this event loop owns until they end, so the caller
+    /// leaks it. What other threads are waiting on is released here.
+    ///
+    /// # Safety
+    /// The ring is dropped here, so the caller must leak this event loop.
+    pub(crate) unsafe fn close_ring(&mut self) {
+        self.driver.release_shared();
+        self.executor.wakes.deregister();
+        // Safety: the caller's contract.
+        unsafe { std::ptr::drop_in_place(&mut self.driver.ring) };
+    }
+
     /// The first task panic recorded under `TaskPanicPolicy::Shutdown`.
     pub(crate) fn take_task_panic(&mut self) -> Option<crate::JoinError> {
         self.driver.panic_reporter.take()
@@ -374,6 +434,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             } else {
                 None
             };
+            #[cfg(test)]
+            if let Some(fault) = &self.driver.test_fault {
+                fault.check()?;
+                if fault
+                    .error_on_worker
+                    .compare_exchange(
+                        self.driver.worker_index as u32 + 1,
+                        0,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Err(crate::error::Error::Io(std::io::Error::other(
+                        "injected event loop error",
+                    )));
+                }
+            }
             // Don't block while tasks are already runnable (self-wakes
             // collected after the last poll pass, tasks woken from
             // on_tick): submit SQEs but return immediately so the ready
@@ -597,6 +675,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // block, so a settled send is polled without a `submit_and_wait`
             // in between.
             self.drain_settled_sends();
+            self.report_drop_panics();
 
             // One send-capacity wake per iteration, last — same placement,
             // and for the same reason, as the mio loop (#381). Copy-pool
@@ -805,6 +884,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     match result {
                         Ok(std::task::Poll::Ready(())) => {
                             executor.standalone_slab.remove(task_idx);
+                            if let Some(payload) = crate::task_panic::drop_caught(fut) {
+                                driver.panic_reporter.report("standalone task", &*payload);
+                            }
                         }
                         Ok(std::task::Poll::Pending) => {
                             match executor.standalone_slab.park(task_idx, fut) {
@@ -814,11 +896,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                                 // It cancelled itself. `Drop` is user code, and a
                                 // panic in it must not end the worker.
                                 Park::Cancelled(fut) => {
-                                    let dropped = std::panic::catch_unwind(
-                                        std::panic::AssertUnwindSafe(|| drop(fut)),
-                                    );
+                                    let dropped = crate::task_panic::drop_caught(fut);
                                     executor.standalone_slab.remove(task_idx);
-                                    if let Err(payload) = dropped {
+                                    if let Some(payload) = dropped {
                                         driver.panic_reporter.report("standalone task", &*payload);
                                     }
                                 }
@@ -830,9 +910,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             // the policy whether the worker keeps running. An
                             // uncaught panic here would end the worker thread
                             // and every connection on it.
-                            drop(fut);
+                            let dropped = crate::task_panic::drop_caught(fut);
                             executor.standalone_slab.remove(task_idx);
                             driver.panic_reporter.report("standalone task", &*payload);
+                            if let Some(payload) = dropped {
+                                driver.panic_reporter.report("standalone task", &*payload);
+                            }
                         }
                     }
                 }
@@ -860,6 +943,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             // Task completed — connection handler is done.
                             driver.close_connection_graceful(conn_index);
                             executor.remove_connection(conn_index);
+                            if let Some(payload) = crate::task_panic::drop_caught(fut) {
+                                driver.panic_reporter.report(
+                                    &format!("connection task (connection {conn_index} closed)"),
+                                    &*payload,
+                                );
+                            }
                         }
                         Ok(std::task::Poll::Pending) => {
                             // Woken during the poll: its slot read `Polling`.
@@ -872,15 +961,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             // connection but must not take the worker
                             // thread with it.
                             // Close first: a half owned by a top-level `Select`
-                            // drops with `drop(fut)`, after `catch_unwind`
+                            // drops below, after `catch_unwind`
                             // returned, and would otherwise send close_notify.
                             driver.close_connection(conn_index);
-                            drop(fut);
+                            let dropped = crate::task_panic::drop_caught(fut);
                             executor.remove_connection(conn_index);
-                            driver.panic_reporter.report(
-                                &format!("connection task (connection {conn_index} closed)"),
-                                &*payload,
-                            );
+                            let site = format!("connection task (connection {conn_index} closed)");
+                            driver.panic_reporter.report(&site, &*payload);
+                            if let Some(payload) = dropped {
+                                driver.panic_reporter.report(&site, &*payload);
+                            }
                         }
                     }
                 }
@@ -922,6 +1012,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.udp_batch_recv_at = std::time::Instant::now();
         }
         self.driver.cqe_batch.clear();
+        self.driver.cqe_cursor = 0;
 
         self.driver.ring.reap(&mut self.driver.cqe_batch);
         // The completions just reaped are one batch: the receives among them
@@ -932,6 +1023,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let mut last_flush = Instant::now();
             for i in 0..self.driver.cqe_batch.len() {
                 let (user_data_raw, result, flags) = self.driver.cqe_batch[i];
+                #[cfg(test)]
+                if let Some(fault) = &self.driver.test_fault {
+                    fault.check_cqe(user_data_raw);
+                }
+                self.driver.cqe_cursor = i + 1;
                 self.dispatch_cqe(user_data_raw, result, flags);
                 // Check the clock every 16 CQEs to amortise Instant::now() cost.
                 if (i & 0xF) == 0xF {
@@ -946,6 +1042,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         } else {
             for i in 0..self.driver.cqe_batch.len() {
                 let (user_data_raw, result, flags) = self.driver.cqe_batch[i];
+                #[cfg(test)]
+                if let Some(fault) = &self.driver.test_fault {
+                    fault.check_cqe(user_data_raw);
+                }
+                self.driver.cqe_cursor = i + 1;
                 self.dispatch_cqe(user_data_raw, result, flags);
             }
         }

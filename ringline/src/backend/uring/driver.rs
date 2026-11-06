@@ -539,6 +539,8 @@ pub(crate) struct Driver {
     pub(crate) shutdown_local: bool,
     /// Handles task panics caught on this worker, under the runtime's policy.
     pub(crate) panic_reporter: crate::task_panic::PanicReporter,
+    #[cfg(test)]
+    pub(crate) test_fault: Option<std::sync::Arc<crate::config::TestFault>>,
     pub(crate) tls_table: Option<crate::tls::TlsTable>,
     /// Pre-allocated sockaddr storage for outbound connect SQEs.
     pub(crate) connect_addrs: Vec<libc::sockaddr_storage>,
@@ -547,6 +549,10 @@ pub(crate) struct Driver {
     /// Pre-allocated batch buffer for draining CQEs.
     /// Tuple: (user_data, result, flags).
     pub(crate) cqe_batch: Vec<(u64, i32, u32)>,
+    /// How many of `cqe_batch`'s completions have been dispatched. After a
+    /// panic in a handler, `run_shutdown` handles the ones after it. What the
+    /// panicking handler held, such as an accepted fd, is lost.
+    pub(crate) cqe_cursor: usize,
     /// Per-worker channel for DNS resolve responses from the resolver pool.
     pub(crate) resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
     /// Per-worker sender for resolve responses (cloned into each request).
@@ -1059,6 +1065,8 @@ impl Driver {
             eventfd_buf: [0u8; 8],
             wake_handle: crate::wakeup::WakeFd::from_raw_fd(eventfd),
             flush_interval,
+            #[cfg(test)]
+            test_fault: config.test_fault.clone(),
             panic_reporter: crate::task_panic::PanicReporter::new(
                 config.task_panic_policy,
                 shutdown_flag.clone(),
@@ -1070,6 +1078,7 @@ impl Driver {
             connect_addrs,
             connect_timespecs,
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),
+            cqe_cursor: 0,
             tcp_nodelay: config.tcp_nodelay,
             loop_diag: config.loop_diag,
             send_zc_threshold: config.send_zc_threshold,
@@ -2515,15 +2524,125 @@ impl Driver {
         self.send_slab.release(slab_idx);
     }
 
+    /// Handle one completion in `run_shutdown`.
+    fn handle_shutdown_cqe(
+        &mut self,
+        user_data_raw: u64,
+        result: i32,
+        flags: u32,
+        timeout_armed: &mut bool,
+    ) {
+        let ud = UserData(user_data_raw);
+        let Some(tag) = ud.tag() else {
+            return;
+        };
+        match tag {
+            OpTag::TickTimeout => *timeout_armed = false,
+            OpTag::Send | OpTag::TlsSend => {
+                self.release_slot_at_shutdown(UserData::send_payload_slot(ud.payload()));
+            }
+            // Nothing is resubmitted at shutdown, so a partial
+            // completion releases too.
+            OpTag::SendMsgCoalesced => {
+                self.release_coalesced_at_shutdown(ud.payload() as u16);
+            }
+            // A drain is a plain `send` on the same entry: its CQE
+            // carries no notification flags, so it releases like a
+            // main CQE that has no notification to wait for.
+            OpTag::SendMsgZc | OpTag::SendMsgZcDrain => {
+                let slab_idx = ud.payload() as u16;
+                if !self.send_slab.in_use(slab_idx) {
+                    return;
+                }
+                if cqueue::notif(flags) {
+                    self.send_slab.dec_pending_notifs(slab_idx);
+                    if self.send_slab.should_release(slab_idx) {
+                        let pool_slot = self.send_slab.release(slab_idx);
+                        if pool_slot != u16::MAX {
+                            self.send_copy_pool.release(pool_slot);
+                        }
+                    }
+                } else {
+                    // A notification follows exactly when the main CQE
+                    // carries IORING_CQE_F_MORE, error and zero results
+                    // included (#487).
+                    if cqueue::more(flags) {
+                        self.send_slab.inc_pending_notifs(slab_idx);
+                    }
+                    self.send_slab.mark_awaiting_notifications(slab_idx);
+                    if self.send_slab.should_release(slab_idx) {
+                        let pool_slot = self.send_slab.release(slab_idx);
+                        if pool_slot != u16::MAX {
+                            self.send_copy_pool.release(pool_slot);
+                        }
+                    }
+                }
+            }
+            // The cancel lead ended the receive; the kernel is done
+            // with the buffer. If the connection is still this
+            // generation and has TLS state, end the receive in that
+            // state (`tls_recv_cancel`), so the Close's
+            // `release_tls_state` finds none in flight. Otherwise the
+            // entry's buffer is freed here.
+            OpTag::RecvDirect => {
+                let slot = ud.payload() as usize;
+                let Some(entry) = self.direct_recvs.get_mut(slot).and_then(Option::take) else {
+                    return;
+                };
+                self.direct_recv_free.push(slot as u32);
+                if let Some(cs) = self.connections.get_mut(entry.conn_index)
+                    && cs.generation == entry.generation
+                {
+                    cs.recv_direct_armed = false;
+                    if let DirectRecvBuf::Tls(buf) = entry.buf
+                        && let Some(t) = self.tls_table.as_mut()
+                        && t.has(entry.conn_index)
+                    {
+                        crate::tls::tls_recv_cancel(t, entry.conn_index, buf);
+                    }
+                }
+            }
+            OpTag::Close => {
+                let conn_index = ud.conn_index();
+                self.release_tls_state(conn_index);
+                self.clear_conn_claims(conn_index);
+                self.connections.release(conn_index);
+            }
+            // Merged accept: nothing will serve the connection.
+            OpTag::AcceptMulti if result >= 0 => unsafe {
+                libc::close(result);
+            },
+            _ => {}
+        }
+    }
+
+    /// Close the connections queued for this worker.
+    fn close_queued_connections(&mut self) {
+        if let Some(rx) = self.accept_rx.take() {
+            rx.try_iter().for_each(drop);
+        }
+        if let Some(rx) = self.park_rx.take() {
+            rx.try_iter().for_each(drop);
+        }
+    }
+
+    /// Release what other threads wait on, for a worker that leaks this driver.
+    pub(crate) fn release_shared(&mut self) {
+        self.close_queued_connections();
+        let (_, closed) = crossbeam_channel::bounded(0);
+        let region_rx = std::mem::replace(&mut self.region_rx, closed);
+        // Each queued message holds an ack sender its registrar waits on.
+        region_rx.try_iter().for_each(drop);
+        self.merged_listeners.clear();
+    }
+
     /// Shutdown: close all connections and drain remaining CQEs. The eventfd
     /// is closed by `WakeHandle`, not here.
     pub(crate) fn run_shutdown(&mut self) {
         // Close connections still queued for this worker. Dropping the
         // receiver alone leaves them in the channel until every sender (the
         // acceptor threads, or in merged mode the other workers) has exited.
-        if let Some(rx) = self.accept_rx.take() {
-            rx.try_iter().for_each(drop);
-        }
+        self.close_queued_connections();
 
         // 1. Release entries parked on a retry list: their submit found the
         //    SQ full, so no operation is in flight and no CQE will release
@@ -2605,6 +2724,11 @@ impl Driver {
         let shutdown_ts = crate::backend::uring::abi::Timespec::new().nsec(100_000_000); // 100ms
         let started = std::time::Instant::now();
         let mut timeout_armed = false;
+        // A panic in a handler left these undispatched.
+        let cursor = self.cqe_cursor.min(self.cqe_batch.len());
+        for (user_data_raw, result, flags) in self.cqe_batch.split_off(cursor) {
+            self.handle_shutdown_cqe(user_data_raw, result, flags, &mut timeout_armed);
+        }
         while started.elapsed() < SHUTDOWN_BOUND {
             for i in std::mem::take(&mut cancels_to_retry) {
                 if self.ring.submit_cancel_all(i).is_err() {
@@ -2644,91 +2768,13 @@ impl Driver {
             }
 
             self.cqe_batch.clear();
+            self.cqe_cursor = 0;
             self.ring.reap(&mut self.cqe_batch);
 
             for i in 0..self.cqe_batch.len() {
-                let (user_data_raw, _, flags) = self.cqe_batch[i];
-                let ud = UserData(user_data_raw);
-                let tag = match ud.tag() {
-                    Some(t) => t,
-                    None => continue,
-                };
-
-                match tag {
-                    OpTag::TickTimeout => timeout_armed = false,
-                    OpTag::Send | OpTag::TlsSend => {
-                        self.release_slot_at_shutdown(UserData::send_payload_slot(ud.payload()));
-                    }
-                    // Nothing is resubmitted at shutdown, so a partial
-                    // completion releases too.
-                    OpTag::SendMsgCoalesced => {
-                        self.release_coalesced_at_shutdown(ud.payload() as u16);
-                    }
-                    // A drain is a plain `send` on the same entry: its CQE
-                    // carries no notification flags, so it releases like a
-                    // main CQE that has no notification to wait for.
-                    OpTag::SendMsgZc | OpTag::SendMsgZcDrain => {
-                        let slab_idx = ud.payload() as u16;
-                        if !self.send_slab.in_use(slab_idx) {
-                            continue;
-                        }
-                        if cqueue::notif(flags) {
-                            self.send_slab.dec_pending_notifs(slab_idx);
-                            if self.send_slab.should_release(slab_idx) {
-                                let pool_slot = self.send_slab.release(slab_idx);
-                                if pool_slot != u16::MAX {
-                                    self.send_copy_pool.release(pool_slot);
-                                }
-                            }
-                        } else {
-                            // A notification follows exactly when the main CQE
-                            // carries IORING_CQE_F_MORE, error and zero results
-                            // included (#487).
-                            if cqueue::more(flags) {
-                                self.send_slab.inc_pending_notifs(slab_idx);
-                            }
-                            self.send_slab.mark_awaiting_notifications(slab_idx);
-                            if self.send_slab.should_release(slab_idx) {
-                                let pool_slot = self.send_slab.release(slab_idx);
-                                if pool_slot != u16::MAX {
-                                    self.send_copy_pool.release(pool_slot);
-                                }
-                            }
-                        }
-                    }
-                    // The cancel lead ended the receive; the kernel is done
-                    // with the buffer. If the connection is still this
-                    // generation and has TLS state, end the receive in that
-                    // state (`tls_recv_cancel`), so the Close's
-                    // `release_tls_state` finds none in flight. Otherwise the
-                    // entry's buffer is freed here.
-                    OpTag::RecvDirect => {
-                        let slot = ud.payload() as usize;
-                        let Some(entry) = self.direct_recvs.get_mut(slot).and_then(Option::take)
-                        else {
-                            continue;
-                        };
-                        self.direct_recv_free.push(slot as u32);
-                        if let Some(cs) = self.connections.get_mut(entry.conn_index)
-                            && cs.generation == entry.generation
-                        {
-                            cs.recv_direct_armed = false;
-                            if let DirectRecvBuf::Tls(buf) = entry.buf
-                                && let Some(t) = self.tls_table.as_mut()
-                                && t.has(entry.conn_index)
-                            {
-                                crate::tls::tls_recv_cancel(t, entry.conn_index, buf);
-                            }
-                        }
-                    }
-                    OpTag::Close => {
-                        let conn_index = ud.conn_index();
-                        self.release_tls_state(conn_index);
-                        self.clear_conn_claims(conn_index);
-                        self.connections.release(conn_index);
-                    }
-                    _ => {}
-                }
+                let (user_data_raw, result, flags) = self.cqe_batch[i];
+                self.cqe_cursor = i + 1;
+                self.handle_shutdown_cqe(user_data_raw, result, flags, &mut timeout_armed);
             }
         }
 
@@ -2739,8 +2785,7 @@ impl Driver {
 
         // 4. Unregister the UDP provided buffer rings before Driver is dropped
         // (which munmaps the ring memory). Unregistering releases the
-        // kernel's pin on the ring pages; the error and panic exits skip it,
-        // which is safe for the reason given at `UringEngine::register_buf_ring`.
+        // kernel's pin on the ring pages.
         for udp_bufs in &self.udp_provided_bufs {
             if self.ring.unregister_buf_ring(udp_bufs.bgid()).is_err() {
                 crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
