@@ -5,8 +5,8 @@
 //!
 //! Most tests send more than loopback's socket buffers hold for a peer that does
 //! not read, check that the send has stalled, and count the process's `iou-wrk`
-//! threads. A send chain is the exception, and the control: its parts
-//! keep `MSG_WAITALL`.
+//! threads. A send chain's parts keep `MSG_WAITALL`, so its test is the control
+//! and expects a thread.
 //!
 //! The tests share counters, so they take a lock.
 
@@ -371,11 +371,10 @@ fn tls_sends_to_half_closed_peers_hold_no_thread() {
 }
 
 /// A zero-copy send to a half-closed peer, small enough to fit under
-/// `RLIMIT_MEMLOCK`, arrives intact. It checks delivery, and that the send stayed
-/// zero-copy under a limit of at least 64 MiB, which is CI's. It shows nothing
-/// about threads: `MSG_WAITALL` on `SendMsgZc` holds none here either.
+/// `RLIMIT_MEMLOCK`, stalls with no thread and arrives intact. Under a limit of at
+/// least 64 MiB, which is CI's, it also checks that the send stayed zero-copy.
 #[test]
-fn a_zero_copy_send_arrives_intact() {
+fn a_zero_copy_send_to_a_half_closed_peer_holds_no_thread() {
     use ringline::metrics::{POOL, pool};
     let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let len = 4 << 20;
@@ -390,6 +389,8 @@ fn a_zero_copy_send_arrives_intact() {
     peer.write_all(b"go").unwrap();
     peer.shutdown(Shutdown::Write).unwrap();
     std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(DONE.load(Ordering::SeqCst), 0, "the send must have stalled");
+    assert_eq!(iou_threads(), 0, "a stalled send holds a worker thread");
     read_payload(&mut peer, len, "zero-copy send");
     wait_for_done(1);
 

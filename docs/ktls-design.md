@@ -6,9 +6,11 @@
 > stream send, or that kTLS needs a second short-send strategy, there is now one
 > strategy. Its cost is paid with or without kTLS, so N5 is no longer a cost of
 > kTLS, and G2 asks whether the kTLS win holds with that cost in both arms. P-24
-> has not been repeated. `tls_sw_sendmsg` allows `MSG_DONTWAIT`, in the source at
-> Linux 6.1, 6.12 and 6.18. `tls_device_sendmsg` was not checked. A `send_chain`
-> part would still get `-EOPNOTSUPP`, so kTLS has to refuse `send_chain`.
+> has not been repeated. `tls_sw_sendmsg` and `tls_push_data`, which
+> `tls_device_sendmsg` calls, allow `MSG_DONTWAIT`, in the source at Linux 6.1,
+> 6.12 and 6.18. A `send_chain` part with `MSG_WAITALL` would still get
+> `-EOPNOTSUPP`, so kTLS has to refuse `send_chain` or gather its parts into one
+> queued send, as a TLS connection does today.
 
 Note (2026-10-25): `ConnCtx::forward_to` was removed.
 

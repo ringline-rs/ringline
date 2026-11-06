@@ -764,7 +764,6 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
-    /// Regression test for Z1: when no notification is expected (result == 0),
     /// A send that goes out in many short results owes one notification for
     /// each, past what a `u8` holds.
     #[test]
@@ -784,6 +783,7 @@ mod tests {
         assert!(!slab.should_release(idx));
     }
 
+    /// Regression test for Z1: when no notification is expected (result == 0),
     /// mark_awaiting with pending_notifs == 0 should make should_release return true.
     #[test]
     fn zero_notifs_mark_awaiting_releases_immediately() {

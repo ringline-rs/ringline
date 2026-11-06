@@ -323,10 +323,11 @@ mod tests {
 
     /// The send-family payload truncates the connection generation to 16
     /// bits, and the completion handlers compare the packed half against the
-    /// live generation masked the same way. Every event-loop test recycles a slot only a handful of times,
-    /// so none of them ever reaches a generation where the truncation actually
-    /// bites; reaching 0x8000 through `ConnectionTable` would take 32768
-    /// recycles. These pin the boundary directly.
+    /// live generation masked the same way. Every event-loop test recycles a
+    /// slot only a handful of times, so none of them ever reaches a generation
+    /// where the truncation actually bites; reaching 0x8000 through
+    /// `ConnectionTable` would take 32768 recycles. These pin the boundary
+    /// directly.
     ///
     /// Found because a mutation that narrowed `send_payload`'s mask from
     /// 0xFFFF to 0x7FFF failed no test at all: the generation those tests use
