@@ -25,12 +25,12 @@ follow):
 | Step | epoll loop (mio backend) | io_uring loop |
 |---|---|---|
 | Learn the request arrived | share of one `epoll_wait` | share of one `io_uring_enter` — the CQE is already in the completion ring when it returns |
-| Read the request bytes | 1 `read()` — **plus 1 more** `read()` returning `EAGAIN` to finish the edge-triggered drain | **0** — the recv CQE *delivers a filled buffer*; no read call exists |
+| Read the request bytes | 1 `read()` | **0** — the recv CQE *delivers a filled buffer*; no read call exists |
 | Send the response | 1 `writev()` | **0 dedicated** — a send SQE rides the iteration's shared enter |
 | Confirm the send completed | (return value of `writev`) | **0** — send CQE, drained in the same iteration |
 | Arm/fire a timeout | folded into the `epoll_wait` timeout | **0** — timeout SQE/CQE |
-| **Total, idle connection** | **~3–4 syscalls, every request** | **~2 enters** |
-| **Total, under load** | ~2–3 per request — the reads and writes never amortize, only the `epoll_wait` does | **(1–3 enters) ÷ requests in the batch** — *every* step amortizes |
+| **Total, idle connection** | **~3 syscalls, every request** | **~2 enters** |
+| **Total, under load** | ~2 per request — the reads and writes never amortize, only the `epoll_wait` does | **(1–3 enters) ÷ requests in the batch** — *every* step amortizes |
 
 That last row is the whole argument. In the epoll loop, only the wait is
 shared; each request still owns its `read` and `writev`, so the floor is ~2
@@ -109,17 +109,18 @@ loop can apply:
 | Step | Syscalls | Mechanism |
 |---|---:|---|
 | Wait | 1 per iteration | `poll.poll()` (`epoll_wait`/`kevent`) with a timer-heap-derived timeout. Amortizes over every ready connection in the batch. |
-| Drain a readable connection | N+1 per wake | mio registrations are edge-triggered: `handle_readable` calls `read()` until `WouldBlock`, so N successful reads plus one terminal `EAGAIN`. Pipelined requests arriving together share one read. |
+| Drain a readable connection | N per wake on Linux TCP when the last read is short; otherwise N+1 | mio registrations are edge-triggered, so `handle_readable` drains the socket. On Linux TCP a read that leaves its 8192-byte buffer unfilled ends the drain, and a later FIN or urgent mark raises its own event. The reads run on to `WouldBlock` or `0` when the event reports either of those, on TLS, on a Unix socket, on other platforms, and when the last read fills the buffer. Pipelined requests arriving together share one read. |
 | Flush sends | ≥1 per dirty connection per pass | `Driver::flush_sends` gathers the connection's whole pending queue into one `writev()` (up to 1024 iovecs), looping only if the queue didn't fit or until `WouldBlock`. |
 | Accept | 1 per connection | Same acceptor thread, which on macOS makes a `poll` before each `accept` and one `poll` every 100 ms while idle; the wake pipe's read end is registered in the poll, so the worker pays a `read()` to drain it per wake (coalescing any number of pending accepts). |
 
-A request-response exchange on an otherwise idle connection therefore costs
-about 3–4 syscalls (read, EAGAIN read, writev, plus a share of the
-`epoll_wait`) — the primer's `3R + ceil(R/B)` shape. Batching helps here too
-(one read can carry many pipelined requests, one writev many responses), but
-the floor is different: every drain ends in a wasted `EAGAIN` read and every
-flush is at least one syscall, whereas the io_uring loop's floor is the one
-blocking enter per iteration.
+A request-response exchange on an otherwise idle Linux TCP connection therefore
+costs 3 syscalls: a read, a writev and an `epoll_wait`, measured on Linux 7.2
+arm64 at one connection with 256 B messages. That is the primer's `2R + ceil(R/B)`
+shape. TLS, Unix sockets and other platforms have its `3R + ceil(R/B)` shape, one
+`EAGAIN` read more. Batching helps here too (one read
+can carry many pipelined requests, one writev many responses), but the floor is
+different: every wake is a read and every flush is at least one syscall, whereas
+the io_uring loop's floor is the one blocking enter per iteration.
 
 ## Measured: pipeline sweep, June 2026
 

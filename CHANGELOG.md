@@ -235,6 +235,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- mio: on Linux TCP, a drain no longer ends with a read that returns `EAGAIN`, which
+  takes an echo from 2 reads per operation to 1, as tokio does. A read that leaves
+  its buffer unfilled ends the drain, unless the event reports the read side closed
+  or urgent data. TLS, Unix sockets and other platforms still read to `EAGAIN`
+  (#395).
 - `connect_all` on the pools and sharded clients of `ringline-redis`,
   `ringline-memcache`, `ringline-ping` and `ringline-http`, and `ClusterClient`'s
   topology refresh, run up to 16 connects at a time, where they ran one. A failed

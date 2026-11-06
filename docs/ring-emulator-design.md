@@ -385,7 +385,7 @@ emulator removes that copy for guard parts.
 | Step | io_uring | Emulator | mio today |
 |---|---|---|---|
 | Learn the request arrived | share of one `io_uring_enter` | share of one `epoll_wait` (`kevent` on macOS) | share of one `epoll_wait` |
-| Read the request | 0 | 1 `read` per completion that carries data, EOF or a read error, plus the `read` returning `EAGAIN` that ends a pass (a readable edge, an arm, a re-arm, or a pass resumed from the cap list); a pass that stops at its cap, for lack of space, at EOF or on an error has none | N `read`s plus 1 `EAGAIN` per edge, into a scratch buffer |
+| Read the request | 0 | 1 `read` per completion that carries data, EOF or a read error, plus the `read` returning `EAGAIN` that ends a pass (a readable edge, an arm, a re-arm, or a pass resumed from the cap list); a pass that stops at its cap, for lack of space, at EOF or on an error has none | N `read`s per edge on Linux TCP, plus 1 `EAGAIN` otherwise, into a scratch buffer |
 | `SOCK_NONEMPTY` | 0 | 0, except one `ioctl(FIONREAD)` when a pass stops at its cap or the group runs out of space | — |
 | Send one response | 0 dedicated | 1 `write`, or 1 `writev` per 32 send-pool slots when the response spans more than one (2 operations when the send slab has no free entry) | share of one `writev` per connection per flush |
 | Send N pipelined responses on one connection | 1 + ⌈(N−1)/32⌉ SQEs: the first response, then one `SendMsgCoalesced` per 32 queued behind it (2 measured at depth 2–32), 0 dedicated syscalls | as many `write`/`writev`s as SQEs (derived, not measured) | 1 `writev` |

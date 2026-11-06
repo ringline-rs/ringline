@@ -2913,7 +2913,7 @@ impl<'a> DriverCtx<'a> {
         if let Err(e) = self.poll.registry().register(
             &mut mio_stream,
             token,
-            mio::Interest::READABLE | mio::Interest::WRITABLE,
+            crate::backend::mio::driver::STREAM_INTEREST,
         ) {
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));

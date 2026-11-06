@@ -721,7 +721,7 @@ impl RequestBackend {
     fn wait_label(self) -> &'static str {
         match self {
             Self::IoUring => "submit_and_wait + CQE",
-            Self::Mio => "poll readiness\nread until EAGAIN",
+            Self::Mio => "poll readiness\ndrain with read",
         }
     }
 
@@ -1128,7 +1128,7 @@ mod tests {
         let mio = diagram.find("Mio request flow").unwrap();
         assert!(uring < mio, "io_uring panel must be above Mio");
         assert_eq!(diagram.matches("submit_and_wait + CQE").count(), 1);
-        assert_eq!(diagram.matches("read until EAGAIN").count(), 1);
+        assert_eq!(diagram.matches("drain with read").count(), 1);
         assert_eq!(diagram.matches("schedule owner task").count(), 2);
         assert!(
             !diagram.contains("wake_recv + poll</text>"),
