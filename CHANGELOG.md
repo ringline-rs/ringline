@@ -258,6 +258,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `AsyncEventHandler::on_adopt` and `ParkState` need the `unstable-accept`
   feature. No released version has them, so this affects only callers tracking
   `main`: enable the feature, or remove the calls.
+- **Breaking:** `TaskId` is no longer `Send`. It is a slot in the task slab of
+  the worker that spawned the task, and `TaskId::cancel` called on another
+  worker cancelled the task in that slot on the calling worker. Cancel a task from the worker
+  that spawned it.
+- **Breaking:** `AsyncEventHandler` no longer requires `Send`. Each worker creates its
+  handler on its own thread with `create_for_worker` and never moves it, so a
+  handler can now keep `!Send` values in its fields: an `Rc`, a `SendHalf`, a
+  `UdpSocket` half, a `fs::File`. Code that relied on
+  `H: AsyncEventHandler` implying `H: Send` must add the bound itself.
+- **Breaking:** `fs::File`, `direct_io::DirectIoFile` and `nvme::NvmeDevice`
+  are no longer `Send`, and neither are `DirectIoCompletion` and
+  `NvmeCompletion`, which hold them. Each handle is a slot in the table of the
+  worker that opened it. Used on another worker it named that worker's slot:
+  a write through a `File` opened on worker 0 and used on worker 1 succeeded
+  and landed in worker 1's file. Use a handle on the worker that opened it, or
+  open the file on each worker that needs it. A handler can still keep a
+  handle in a field, since `AsyncEventHandler` no longer requires `Send`.
 - mio: on Linux TCP, a drain no longer ends with a read that returns `EAGAIN`, which
   takes an echo from 2 reads per operation to 1, as tokio does. A read that leaves
   its buffer unfilled ends the drain, unless the event reports the read side closed

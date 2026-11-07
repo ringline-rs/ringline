@@ -11,6 +11,8 @@
 //! - Linux 6.1+ already required by ringline for `SendMsgZc`
 //! - NVMe device accessible via `/dev/ng*` (requires `CAP_SYS_ADMIN` or udev rules)
 
+use std::marker::PhantomData;
+
 /// NVMe I/O command opcodes (NVM command set).
 pub const NVME_CMD_FLUSH: u8 = 0x00;
 pub const NVME_CMD_WRITE: u8 = 0x01;
@@ -184,13 +186,47 @@ impl NvmeUringCmd {
 /// Returned by [`crate::open_nvme_device`] and used to identify the
 /// device in subsequent read/write/close calls. The handle includes a
 /// generation counter for stale-handle detection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The handle names a slot in the table of the worker that opened it, so it is
+/// not `Send`: use it on that worker. Another worker's table can hold a
+/// different device in the same slot. A handler is created on its worker's
+/// thread and stays there, so it can keep a handle in a field.
+///
+/// ```
+/// fn assert_copy<T: Copy>() {}
+/// assert_copy::<ringline::nvme::NvmeDevice>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::nvme::NvmeDevice>();
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct NvmeDevice {
     pub(crate) index: u16,
     pub(crate) generation: u16,
+    /// Makes the handle `!Send`.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl std::fmt::Debug for NvmeDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NvmeDevice")
+            .field("index", &self.index)
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 impl NvmeDevice {
+    pub(crate) fn new(index: u16, generation: u16) -> Self {
+        NvmeDevice {
+            index,
+            generation,
+            _not_send: PhantomData,
+        }
+    }
+
     /// Returns the device slot index. Useful for indexing into per-device arrays.
     pub fn index(&self) -> usize {
         self.index as usize

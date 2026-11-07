@@ -21,6 +21,8 @@
 //! - Linux 5.6+ for basic io_uring read/write
 //! - Linux 6.1+ already required by ringline for `SendMsgZc`
 
+use std::marker::PhantomData;
+
 /// Operation type for tracking what kind of I/O was submitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectIoOp {
@@ -76,13 +78,47 @@ impl DirectIoOpenOptions {
 /// Returned by [`crate::open_direct_io_file`] and used to identify the
 /// file in subsequent read/write/fsync/close calls. The handle includes a
 /// generation counter for stale-handle detection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The handle names a slot in the table of the worker that opened it, so it is
+/// not `Send`: use it on that worker. Another worker's table can hold a
+/// different file in the same slot. A handler is created on its worker's
+/// thread and stays there, so it can keep a handle in a field.
+///
+/// ```
+/// fn assert_copy<T: Copy>() {}
+/// assert_copy::<ringline::direct_io::DirectIoFile>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::direct_io::DirectIoFile>();
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DirectIoFile {
     pub(crate) index: u16,
     pub(crate) generation: u16,
+    /// Makes the handle `!Send`.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl std::fmt::Debug for DirectIoFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectIoFile")
+            .field("index", &self.index)
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 impl DirectIoFile {
+    pub(crate) fn new(index: u16, generation: u16) -> Self {
+        DirectIoFile {
+            index,
+            generation,
+            _not_send: PhantomData,
+        }
+    }
+
     /// Returns the file slot index. Useful for indexing into per-file arrays.
     pub fn index(&self) -> usize {
         self.index as usize
@@ -370,10 +406,7 @@ mod tests {
     #[test]
     fn completion_bytes_transferred() {
         let success = DirectIoCompletion {
-            file: DirectIoFile {
-                index: 0,
-                generation: 0,
-            },
+            file: DirectIoFile::new(0, 0),
             op: DirectIoOp::Read,
             seq: 0,
             result: 4096,
@@ -382,10 +415,7 @@ mod tests {
         assert_eq!(success.bytes_transferred(), Some(4096));
 
         let failure = DirectIoCompletion {
-            file: DirectIoFile {
-                index: 0,
-                generation: 0,
-            },
+            file: DirectIoFile::new(0, 0),
             op: DirectIoOp::Write,
             seq: 1,
             result: -libc::EINVAL,
