@@ -105,6 +105,9 @@ impl Child {
 }
 
 /// Future that resolves when a child process exits.
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 pub struct WaitFuture {
     seq: u32,
     pid: u32,
@@ -139,6 +142,11 @@ impl Future for WaitFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         with_state(|_driver, executor| {
+            // On another worker `seq` names that worker's entry, and the
+            // result is not there.
+            if self.owner != crate::runtime::waker::current_worker() {
+                return pending(cx);
+            }
             if let Some(result) = executor.pidfd_results.remove(&self.seq) {
                 // pidfd is readable -- child has exited.
                 if result < 0 {

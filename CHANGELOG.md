@@ -923,6 +923,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   completion in its task (#641).
 - A blocked `mpsc` send no longer strands another sender when it takes a slot
   without its wake, or when a sibling send in its task is dropped (#641).
+- `Child::wait`'s future and the file and disk-I/O futures (`fs::open`,
+  `fs::create`, `fs::stat`, `fs::read_into`, `fs::write_from`, `fs::read`,
+  `fs::write`, `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, NVMe and
+  direct I/O) return pending when polled on a worker other than the one that
+  created them, as the timer, blocking, resolve, spawn and connect futures
+  do since #641. Before, such a poll used that worker's entry with the same
+  key: it could replace the waiter of that worker's operation, so the
+  operation's task was not woken when it completed, or take its result, so
+  that task never received it.
 - `forward_recv_buf` on a plaintext connection is throttled on io_uring. A
   connection holding `forward_hold_cap` send slab entries while the worker's slab
   is over half used stops receiving until that changes, so a peer that does not

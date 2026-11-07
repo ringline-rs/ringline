@@ -774,6 +774,229 @@ fn a_sleep_on_another_worker_leaves_a_fired_timer_alone() {
     assert_eq!(result, "kept");
 }
 
+/// A child wait polled on another worker must not take over the waiter with the
+/// same sequence number on that worker. Sequence numbers start at 0 per worker.
+#[cfg(has_io_uring)]
+#[test]
+fn a_wait_on_another_worker_leaves_its_owner_alone() {
+    static FOREIGN: Mutex<Option<ringline::process::WaitFuture>> = Mutex::new(None);
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let result = run_on_two_workers(|worker| {
+        Box::pin(async move {
+            if worker == 0 {
+                let child = ringline::process::Command::new("sleep")
+                    .arg("10")
+                    .spawn()
+                    .unwrap()
+                    .await
+                    .unwrap();
+                *FOREIGN.lock().unwrap() = Some(child.wait().unwrap());
+                while !DONE.load(Ordering::SeqCst) {
+                    ringline::sleep(Duration::from_millis(5)).await;
+                }
+                let _ = child.kill();
+                let _ = ringline::request_shutdown();
+                return;
+            }
+            let foreign = loop {
+                if let Some(wait) = FOREIGN.lock().unwrap().take() {
+                    break wait;
+                }
+                ringline::sleep(Duration::from_millis(1)).await;
+            };
+            let child = ringline::process::Command::new("sleep")
+                .arg("0.2")
+                .spawn()
+                .unwrap()
+                .await
+                .unwrap();
+            let mine = child.wait().unwrap();
+            ringline::spawn(async move {
+                ringline::sleep(Duration::from_millis(10)).await;
+                let _ = ringline::timeout(Duration::from_millis(100), foreign).await;
+            })
+            .unwrap();
+            let started = std::time::Instant::now();
+            let woken = matches!(ringline::timeout(LIMIT, mine).await, Ok(Ok(_)))
+                && started.elapsed() < Duration::from_secs(2);
+            *RESULT.lock().unwrap() = Some(if woken { "woken" } else { "not woken" });
+            DONE.store(true, Ordering::SeqCst);
+            let _ = ringline::request_shutdown();
+        })
+    });
+    assert_eq!(result, "woken");
+}
+
+/// A child wait polled on another worker must leave alone a delivered result
+/// with the same sequence number.
+#[cfg(has_io_uring)]
+#[test]
+fn a_wait_on_another_worker_leaves_a_delivered_result_alone() {
+    static FOREIGN: Mutex<Option<ringline::process::WaitFuture>> = Mutex::new(None);
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let result = run_on_two_workers(|worker| {
+        Box::pin(async move {
+            if worker == 0 {
+                // Short, so a foreign poll that takes worker 1's result and
+                // calls `waitid` on this child does not block for long.
+                let child = ringline::process::Command::new("sleep")
+                    .arg("1")
+                    .spawn()
+                    .unwrap()
+                    .await
+                    .unwrap();
+                *FOREIGN.lock().unwrap() = Some(child.wait().unwrap());
+                while !DONE.load(Ordering::SeqCst) {
+                    ringline::sleep(Duration::from_millis(5)).await;
+                }
+                let _ = child.kill();
+                let _ = ringline::request_shutdown();
+                return;
+            }
+            let mut foreign = loop {
+                if let Some(wait) = FOREIGN.lock().unwrap().take() {
+                    break wait;
+                }
+                ringline::sleep(Duration::from_millis(1)).await;
+            };
+            let child = ringline::process::Command::new("true")
+                .spawn()
+                .unwrap()
+                .await
+                .unwrap();
+            let mine = child.wait().unwrap();
+            // Long enough for the result to be delivered, unclaimed.
+            ringline::sleep(Duration::from_millis(200)).await;
+            let stayed_pending = poll_fn(|cx| Poll::Ready(Pin::new(&mut foreign).poll(cx)))
+                .await
+                .is_pending();
+            let outcome = ringline::timeout(LIMIT, mine).await;
+            *RESULT.lock().unwrap() = Some(if stayed_pending && matches!(outcome, Ok(Ok(_))) {
+                "kept"
+            } else {
+                "taken"
+            });
+            DONE.store(true, Ordering::SeqCst);
+            let _ = ringline::request_shutdown();
+        })
+    });
+    assert_eq!(result, "kept");
+}
+
+type SendFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Worker 0 starts a disk-I/O operation with `start` and hands its future to
+/// worker 1. Worker 1 starts the same operation after the same history, so the
+/// two share a key, lets its result arrive, polls worker 0's future, and then
+/// awaits its own. Records "kept" if worker 0's future stayed pending and
+/// worker 1's resolved and passed `ok`.
+async fn disk_result_kept<Fut>(
+    worker: usize,
+    foreign: &'static Mutex<Option<SendFuture>>,
+    done: &'static AtomicBool,
+    start: fn(ringline::fs::File, &std::path::Path) -> std::io::Result<Fut>,
+    ok: fn(&Fut::Output) -> bool,
+) where
+    Fut: Future + Send + 'static,
+{
+    let path = std::env::temp_dir().join(format!(
+        "ringline-combinators-foreign-{}-{worker}",
+        std::process::id()
+    ));
+    let flags = ringline::fs::OpenFlags::READ_WRITE
+        | ringline::fs::OpenFlags::CREATE
+        | ringline::fs::OpenFlags::TRUNCATE;
+    let file = ringline::fs::open(&path, flags, 0o644)
+        .unwrap()
+        .await
+        .unwrap();
+    if worker == 0 {
+        let theirs = start(file, &path).unwrap();
+        *foreign.lock().unwrap() = Some(Box::pin(async move {
+            let _ = theirs.await;
+        }));
+        while !done.load(Ordering::SeqCst) {
+            ringline::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = ringline::request_shutdown();
+        return;
+    }
+    let mut theirs = loop {
+        if let Some(theirs) = foreign.lock().unwrap().take() {
+            break theirs;
+        }
+        ringline::sleep(Duration::from_millis(1)).await;
+    };
+    let mut mine = Box::pin(start(file, &path).unwrap());
+    // Polled once, so this task is the operation's waiter when it completes.
+    let first = poll_fn(|cx| Poll::Ready(mine.as_mut().poll(cx))).await;
+    let kept = if first.is_ready() {
+        // Completed before a foreign poll could interfere: nothing tested.
+        "completed on the first poll"
+    } else {
+        // Long enough for the result to be delivered, unclaimed. An operation
+        // slower than this leaves no result to take, and the test passes
+        // whether or not the foreign poll is guarded.
+        ringline::sleep(Duration::from_millis(200)).await;
+        let stayed_pending = poll_fn(|cx| Poll::Ready(theirs.as_mut().poll(cx)))
+            .await
+            .is_pending();
+        let outcome = ringline::timeout(LIMIT, mine).await;
+        if stayed_pending && outcome.as_ref().is_ok_and(ok) {
+            "kept"
+        } else {
+            "taken"
+        }
+    };
+    *RESULT.lock().unwrap() = Some(kept);
+    done.store(true, Ordering::SeqCst);
+    let _ = std::fs::remove_file(&path);
+    let _ = ringline::request_shutdown();
+}
+
+/// Generates a test that a disk-I/O future polled on another worker leaves
+/// alone a delivered result with the same key there.
+macro_rules! disk_result_kept_test {
+    ($name:ident, $start:expr, $ok:expr) => {
+        #[test]
+        fn $name() {
+            static FOREIGN: Mutex<Option<SendFuture>> = Mutex::new(None);
+            static DONE: AtomicBool = AtomicBool::new(false);
+            let result = run_on_two_workers(|worker| {
+                Box::pin(disk_result_kept(worker, &FOREIGN, &DONE, $start, $ok))
+            });
+            assert_eq!(result, "kept");
+        }
+    };
+}
+
+disk_result_kept_test!(
+    an_open_on_another_worker_leaves_a_delivered_result_alone,
+    |_, path| ringline::fs::open(path, ringline::fs::OpenFlags::READ, 0),
+    |result| result.is_ok()
+);
+disk_result_kept_test!(
+    a_stat_on_another_worker_leaves_a_delivered_result_alone,
+    |_, path| ringline::fs::stat(path),
+    |result| result.is_ok()
+);
+disk_result_kept_test!(
+    an_fsync_on_another_worker_leaves_a_delivered_result_alone,
+    |file, _| ringline::fs::fsync(file),
+    |result| result.is_ok()
+);
+disk_result_kept_test!(
+    a_read_into_on_another_worker_leaves_a_delivered_result_alone,
+    |file, _| ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(16)),
+    |(result, _)| result.is_ok()
+);
+disk_result_kept_test!(
+    a_write_from_on_another_worker_leaves_a_delivered_result_alone,
+    |file, _| ringline::fs::write_from(file, 0, bytes::BytesMut::from(&b"ping"[..])),
+    |(result, _)| result.is_ok()
+);
+
 /// A task woken for another reason takes a slot while its entry is queued. The
 /// entry must leave with it, or the next receive spends its wake on it and the
 /// other senders hang.
