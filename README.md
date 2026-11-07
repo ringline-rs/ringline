@@ -116,7 +116,7 @@ handler instance. On the io_uring backend, each worker also owns:
 | `ConfigBuilder` | Discoverable builder: `ConfigBuilder::default().workers(4).build()` |
 | `RinglineBuilder` | Launch builder: `RinglineBuilder::new(config).bind(addr).launch::<H>()` |
 | `Config` | Runtime configuration (SQ size, buffer sizes, worker count, TLS, etc.) |
-| `Runtime` | Returned by `launch()`; controls shutdown, listener addresses, deferred listeners, accept steering and registered regions, and shuts the workers down when dropped |
+| `Runtime` | Returned by `launch()`; controls shutdown, listener addresses, deferred listeners and registered regions, and shuts the workers down when dropped |
 | `GuardBox` | Type-erased container for `SendGuard` (64-byte inline storage, no heap) |
 
 ## Additional Features

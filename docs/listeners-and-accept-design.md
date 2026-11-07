@@ -9,7 +9,9 @@ Note (2026-10-25): the TCP provided-buffer ring was removed, with the
 fallback receive and the `pool/recv_parked` and `pool/recv_fallback`
 counters.
 
-- **Status:** proposal — intent only, nothing implemented
+- **Status:** listener list and Pool are on main; merged accept, steering and
+  park are implemented behind the `unstable-accept` feature; steps 6 and 7 of
+  Staging are not implemented
 - **Motivated by:** the single-listener limit found while reviewing whether
   `Connection` should split per transport
 
@@ -498,8 +500,8 @@ empty gap rather than being a knob to turn afterwards.
 Spread and median match pool's within noise. Both arms throw the occasional
 high outlier (pool 53.3, merged 63.8), so that is the rig, not the mode.
 
-This clears the distribution half of the default-mode decision. Connect rate
-remains unmeasured, so `Pool` stays the default until that exists.
+This clears the distribution half of the default-mode decision. Connect rate was
+unmeasured at this point; see "Connect rate (2026-11-06)".
 
 ### Tier 3 park: converges a standing imbalance, ~free when balanced (2026-09-25)
 
@@ -1145,22 +1147,23 @@ microseconds, before any worker has published a load update. The optimistic
 claim added for bursts spreads work across many connections; it has nothing to
 work with when there are only eight.
 
-Connect rate is measured in the next section; at the time of this one, it was
-not — `bench-client` opens its pool once and holds
-it, so a connect storm needs load-generator work that has not been done.
+Connect rate is measured in the next section, with `connect-bench`.
+`bench-client` opens its pool once and holds it, so it cannot produce a connect
+storm.
 
 ### Connect rate (2026-11-06)
 
 Pool and merged accept, one request per connection, no reuse: `connect-bench`
 with 32 threads on hv01 against an 8-worker `bench-server --echo-mode copy` on
-hv02, Linux 6.12, X710 LAG. Five runs per cell in random order, 0 connect or I/O
-errors. Medians, with CPU taken from a recording scoped inside the client's
-measured window.
+hv02, Linux 6.12, X710 LAG. Five runs per cell, 0 connect or I/O errors. Nineteen
+ran in random order. The fifth merged TLS run was the smoke run of the same spec,
+just before them, and dropping it leaves that cell at -5.9%. Medians, with CPU
+taken from a recording scoped inside the client's measured window.
 
 | | Pool conns/s | Merged conns/s | Merged rate | Pool CPU/conn | Merged CPU/conn |
 |---|---|---|---|---|---|
-| no TLS | 32,945 | 33,190 | +0.8% | 232 µs | 198 µs |
-| TLS | 18,940 | 17,818 | -5.9% | 511 µs | 492 µs |
+| no TLS | 32,945 | 33,194 | +0.8% | 232 µs | 198 µs |
+| TLS | 18,940 | 17,818 | -5.9% | 509 µs | 492 µs |
 
 The rule set before the run was a median win of at least 10%, outside the arms'
 spread, with and without TLS, and p99 no worse. Merged does not meet it, so Pool

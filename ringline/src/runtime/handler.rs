@@ -78,6 +78,8 @@ pub trait AsyncEventHandler: Send + 'static {
     /// Returns a boxed future rather than `impl Future` for the same reason
     /// [`Self::on_udp_bind`] does: a defaulted method cannot return an opaque
     /// type.
+    ///
+    /// Requires the `unstable-accept` feature. Outside semver.
     #[cfg(any(feature = "unstable-accept", test))]
     fn on_adopt(
         &self,

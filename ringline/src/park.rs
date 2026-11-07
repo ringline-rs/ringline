@@ -69,9 +69,11 @@ pub(crate) struct ParkedFd {
 /// # }
 /// ```
 ///
-/// This example is deliberately a real doctest rather than `ignore`: it is
-/// what proves the type is actually reachable from outside the crate. It was
-/// not, and nothing noticed.
+/// This example is deliberately a real doctest rather than `ignore`: with the
+/// `unstable-accept` feature it is what proves the type is actually reachable
+/// from outside the crate. It was not, and nothing noticed.
+///
+/// Requires the `unstable-accept` feature. Outside semver.
 #[cfg_attr(not(feature = "unstable-accept"), allow(dead_code))]
 pub struct ParkState {
     value: Box<dyn std::any::Any + Send>,

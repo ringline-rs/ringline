@@ -1,5 +1,8 @@
 use std::net::SocketAddr;
 
+#[cfg(any(feature = "unstable-accept", test))]
+pub use crate::accept::AcceptMode;
+#[cfg(not(any(feature = "unstable-accept", test)))]
 use crate::accept::AcceptMode;
 use crate::buffer::fixed::MemoryRegion;
 
@@ -802,6 +805,8 @@ impl ConfigBuilder {
     ///
     /// [`AcceptMode::Merged`] is io_uring only; on the mio backend it is
     /// accepted and ignored, since mio has no multishot accept.
+    ///
+    /// Requires the `unstable-accept` feature. Outside semver.
     #[cfg(any(feature = "unstable-accept", test))]
     pub fn accept_mode(mut self, mode: AcceptMode) -> Self {
         self.config.accept_mode = mode;
