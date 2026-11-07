@@ -163,16 +163,14 @@ impl ProvidedBufRing {
         };
         let buf_offset = bid as usize * self.buf_size as usize;
         let buf_addr = unsafe { self.mem.as_ptr().add(buf_offset) };
+        // `resv` is not written: in entry 0 it is the tail the kernel reads
+        // (see `commit_tail`), and writing it would publish a tail before
+        // `commit_tail` does. liburing's `io_uring_buf_ring_add` writes the
+        // same three fields.
         unsafe {
-            ptr::write(
-                entry_ptr,
-                BufRingEntry {
-                    addr: buf_addr as u64,
-                    len: self.buf_size,
-                    bid,
-                    resv: 0,
-                },
-            );
+            ptr::addr_of_mut!((*entry_ptr).addr).write(buf_addr as u64);
+            ptr::addr_of_mut!((*entry_ptr).len).write(self.buf_size);
+            ptr::addr_of_mut!((*entry_ptr).bid).write(bid);
         }
         self.tail = self.tail.wrapping_add(1);
     }
@@ -250,6 +248,118 @@ mod tests {
         ring.replenish_batch(&[0, 1, 2]);
         assert_eq!(ring.free(), 4);
         assert_eq!(ring.ring_entries(), 4);
+    }
+
+    /// The tail the kernel reads, at offset 14 of ring entry 0.
+    fn committed_tail(ring: &ProvidedBufRing) -> u16 {
+        // Safety: the ring mapping is at least one entry long.
+        unsafe { (*ring.ring_ptr.add(14).cast::<AtomicU16>()).load(atomic::Ordering::Acquire) }
+    }
+
+    /// Writing ring entry 0 must leave the committed tail alone: it is the
+    /// same two bytes as that entry's `resv`, and the kernel reads it before
+    /// `commit_tail` runs whenever it selects a buffer on another thread
+    /// (SQPOLL).
+    #[test]
+    fn writing_entry_zero_leaves_the_committed_tail() {
+        let mut ring = ProvidedBufRing::new(0, 4, 4096).expect("ring");
+        assert_eq!(committed_tail(&ring), 4);
+        for _ in 0..4 {
+            ring.on_handout();
+        }
+        // The next entry written is ring index 4 & 3 = 0.
+        ring.push_entry(0);
+        assert_eq!(committed_tail(&ring), 4, "push_entry wrote the tail");
+        ring.commit_tail();
+        assert_eq!(committed_tail(&ring), 5);
+    }
+
+    /// The kernel acts on the tail `push_entry` leaves in ring entry 0. With
+    /// every buffer handed out and entry 0 written but not committed, a recv
+    /// that selects a buffer must find none; a tail of 0 read as 65532 free
+    /// entries would hand it entry 1, a buffer the application still holds.
+    #[cfg(uring_engine)]
+    #[test]
+    fn the_kernel_selects_no_buffer_before_commit_tail() {
+        use crate::backend::uring::engine::uring::{
+            IORING_REGISTER_PBUF_RING, pbuf_ring_register, retry_with_resv_set,
+        };
+        use crate::memlock::KernelVersion;
+        use io_uring::{IoUring, opcode, squeue, types};
+        use std::os::fd::AsRawFd;
+
+        const BGID: u16 = 9;
+        let mut provided = ProvidedBufRing::new(BGID, 4, 4096).expect("provided ring");
+        // Ring setup and registration are charged to the user's locked memory,
+        // shared with test processes running alongside, so ENOMEM is retried
+        // for up to 5 s as `make_test_loop` does (#589).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let retry = |e: &std::io::Error| {
+            let again =
+                e.raw_os_error() == Some(libc::ENOMEM) && std::time::Instant::now() < deadline;
+            if again {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            again
+        };
+        let mut ring = loop {
+            match IoUring::new(8) {
+                Ok(ring) => break ring,
+                Err(e) if retry(&e) => {}
+                Err(e) => panic!("io_uring: {e}"),
+            }
+        };
+        let (addr, entries) = (provided.ring_addr(), provided.ring_entries());
+        let fd = ring.as_raw_fd();
+        let mut resv0 = 0;
+        loop {
+            // Safety: `provided` outlives `ring`, which is dropped first.
+            let registered = unsafe {
+                pbuf_ring_register(fd, IORING_REGISTER_PBUF_RING, addr, entries, BGID, 0, resv0)
+            };
+            match registered {
+                Ok(()) => break,
+                Err(e) if resv0 == 0 && retry_with_resv_set(&e, KernelVersion::current()) => {
+                    resv0 = 1;
+                }
+                Err(e) if retry(&e) => {}
+                Err(e) => panic!("register: {e}"),
+            }
+        }
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(server.local_addr().unwrap()).unwrap();
+        let recv = |ring: &mut IoUring, n: usize| -> Vec<i32> {
+            for i in 0..n {
+                client.send(b"x").unwrap();
+                let sqe =
+                    opcode::Recv::new(types::Fd(server.as_raw_fd()), std::ptr::null_mut(), 4096)
+                        .buf_group(BGID)
+                        .build()
+                        .flags(squeue::Flags::BUFFER_SELECT)
+                        .user_data(i as u64);
+                // Safety: the recv selects its buffer from `provided`, which
+                // outlives the ring.
+                unsafe { ring.submission().push(&sqe).unwrap() };
+            }
+            ring.submit_and_wait(n).unwrap();
+            ring.completion().map(|c| c.result()).collect()
+        };
+        // Hand out every buffer.
+        let taken = recv(&mut ring, 4);
+        assert!(taken.iter().all(|&r| r == 1), "{taken:?}");
+        for _ in 0..4 {
+            provided.on_handout();
+        }
+        // Return bid 0 to ring index 0, without committing the tail.
+        provided.push_entry(0);
+        let results = recv(&mut ring, 2);
+        assert_eq!(
+            results,
+            vec![-libc::ENOBUFS, -libc::ENOBUFS],
+            "the kernel selected a buffer the committed tail does not offer"
+        );
+        drop(ring);
     }
 
     #[test]

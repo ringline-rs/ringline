@@ -908,6 +908,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring with `sqpoll` and a UDP bind: returning a buffer to ring entry 0
+  no longer writes 0 to the ring's tail, which shares those bytes, before
+  the new tail is published. The kernel's SQ thread could read that tail as
+  free buffers that had not been returned, and receive datagrams into
+  buffers the application still held. Without `sqpoll` the kernel reads the tail only inside this
+  thread's `io_uring_enter`, so the window was never seen.
 - A panic in a future's `Drop` no longer ends the worker, after the future
   returned `Ready`, after a panic in its poll, when its connection closed, or
   at worker exit. Nor does a panic in a `SendGuard`'s `Drop` on a worker's
