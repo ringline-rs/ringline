@@ -4844,6 +4844,9 @@ impl<F: Future> Future for TimeoutFuture<F> {
 /// `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, NVMe and direct
 /// I/O. The operation was submitted before this future was created;
 /// its completion stores the result and wakes the task.
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 pub struct DiskIoFuture {
     pub(crate) seq: u32,
     /// Set once `poll` has returned `Ready`: the result has been taken.
@@ -4868,6 +4871,11 @@ impl Future for DiskIoFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<i32>> {
         assert!(!self.done, "DiskIoFuture polled after completion");
         let poll = with_state(|_driver, executor| {
+            // On another worker `seq` names that worker's entry, and the
+            // result is not there.
+            if self.owner != crate::runtime::waker::current_worker() {
+                return pending(cx);
+            }
             match executor.take_disk_io_result(self.seq) {
                 Some(result) if result < 0 => {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))

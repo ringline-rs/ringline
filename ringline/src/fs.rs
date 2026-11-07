@@ -445,6 +445,9 @@ pub fn create(path: impl AsRef<std::path::Path>) -> io::Result<OpenFuture> {
 /// Dropping it before it resolves closes the file and frees its slot, on the
 /// event loop's next iteration if the open has completed, otherwise when it
 /// completes.
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 pub struct OpenFuture {
     seq: u32,
     file_index: u16,
@@ -460,8 +463,13 @@ impl Future for OpenFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<File>> {
         assert!(!self.done, "OpenFuture polled after completion");
-        let poll = with_state(
-            |_driver, executor| match executor.take_disk_io_result(self.seq) {
+        let poll = with_state(|_driver, executor| {
+            // On another worker `seq` names that worker's entry, and the
+            // result is not there.
+            if self.owner != crate::runtime::waker::current_worker() {
+                return pending(cx);
+            }
+            match executor.take_disk_io_result(self.seq) {
                 Some(result) if result < 0 => {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
                 }
@@ -474,8 +482,8 @@ impl Future for OpenFuture {
                     executor.wait_disk_io(self.seq, task_id);
                     pending(cx)
                 }
-            },
-        );
+            }
+        });
         if poll.is_ready() {
             self.done = true;
         }
@@ -770,6 +778,9 @@ pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFut
 ///
 /// Resolves to `(io::Result<usize>, BytesMut)`. On success `buf.len()` is
 /// extended by the number of bytes read.
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 pub struct ReadFuture {
     seq: u32,
     file_index: u16,
@@ -786,6 +797,11 @@ impl Future for ReadFuture {
         let me = self.get_mut();
         assert!(me.buf.is_some(), "ReadFuture polled after completion");
         with_state(|_driver, executor| {
+            // On another worker `seq` names that worker's entry, and the
+            // result is not there.
+            if me.owner != crate::runtime::waker::current_worker() {
+                return pending(cx);
+            }
             match executor.take_disk_io_result(me.seq) {
                 Some(result) if result < 0 => {
                     let buf = me.buf.take().expect("ReadFuture polled after completion");
@@ -822,6 +838,9 @@ impl Drop for ReadFuture {
 ///
 /// Resolves to `(io::Result<usize>, BytesMut)`. The buffer is returned
 /// unchanged regardless of success or failure.
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 pub struct WriteFuture {
     seq: u32,
     file_index: u16,
@@ -836,8 +855,13 @@ impl Future for WriteFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         assert!(me.buf.is_some(), "WriteFuture polled after completion");
-        with_state(
-            |_driver, executor| match executor.take_disk_io_result(me.seq) {
+        with_state(|_driver, executor| {
+            // On another worker `seq` names that worker's entry, and the
+            // result is not there.
+            if me.owner != crate::runtime::waker::current_worker() {
+                return pending(cx);
+            }
+            match executor.take_disk_io_result(me.seq) {
                 Some(result) if result < 0 => {
                     let buf = me.buf.take().expect("WriteFuture polled after completion");
                     Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
@@ -851,8 +875,8 @@ impl Future for WriteFuture {
                     executor.wait_disk_io(me.seq, task_id);
                     pending(cx)
                 }
-            },
-        )
+            }
+        })
     }
 }
 
@@ -1006,6 +1030,9 @@ pub fn stat(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
 
 /// Future that resolves to the file's [`Metadata`]. Dropping it before it
 /// resolves discards the result.
+///
+/// Polled on another worker it stays pending until a task on the owning worker
+/// drives it.
 // On io_uring the statx buffer is owned by the command slab entry, and on
 // completion the handler converts it to `Metadata` and stores it in
 // `Executor::fs_stat_results` before releasing the slab entry. On mio the
@@ -1024,6 +1051,11 @@ impl Future for StatFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Metadata>> {
         assert!(!self.done, "StatFuture polled after completion");
         let poll = with_state(|_driver, executor| {
+            // On another worker `seq` names that worker's entry, and the
+            // result is not there.
+            if self.owner != crate::runtime::waker::current_worker() {
+                return pending(cx);
+            }
             // First check if there's a normal error result (negative).
             match executor.take_disk_io_result(self.seq) {
                 Some(result) if result < 0 => {
