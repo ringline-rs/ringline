@@ -162,12 +162,16 @@ a `DiskIoFuture`, which needs a task to poll it. `on_tick` does not run in a tas
 
 Across the series:
 
-- Sending on a connection from `on_tick` by token has no direct replacement. The
+- Sending on a connection from `on_tick` by token is gone. The
   owning task does the send, usually by receiving from an `mpsc::channel`. This
   is the rule the ownership design chose for fan-in, and a tick that sends at an
   arbitrary point in a response stream has the ordering problem that design
-  describes. A handler is `Send` and `SendHalf` is not, so a handler cannot keep a
-  half in a field.
+  describes. Since 0.7.0 `AsyncEventHandler` does not require `Send`, so a
+  handler can keep a `SendHalf` in a field. `on_accept` takes `&self` and
+  returns a `'static` future, so the half reaches the field through shared
+  interior mutability, such as an `Rc<RefCell<Vec<SendHalf>>>` the task pushes
+  into. A send from `on_tick` this way has the ordering problem described
+  above.
 - A third task can no longer close a connection or check `is_alive` through a
   copied handle. It needs the `SendHalf`, or the owner has to `select` on a
   `CancellationToken`.
@@ -178,10 +182,10 @@ Across the series:
   the `Connection` before it goes to the client. `offer_for_park` cannot be called
   on a connection held by a client.
 - A dropped half cannot be taken again.
-- A handler is `Send` and `UdpSocket` and its halves are not, so a handler cannot
-  keep a UDP handle in a field. `on_tick`, an `on_accept` task, or a task for
-  another socket reaches a socket through a channel or a `thread_local!` holding
-  an `Rc<UdpSendHalf>`.
+- `UdpSocket` and its halves are not `Send`. While `AsyncEventHandler` required
+  `Send`, a handler reached a socket from `on_tick`, an `on_accept` task, or a
+  task for another socket through a channel or a `thread_local!` holding an
+  `Rc<UdpSendHalf>`. Since 0.7.0 the handler can keep that `Rc` in a field.
 - `ConfigBuilder::close_notify_timeout_ms` is removed, and the internal fatal
   closes keep a fixed 5 s bound. An application has no way to bound a TLS close
   against a peer that stops reading. See [Owner decisions](#owner-decisions).

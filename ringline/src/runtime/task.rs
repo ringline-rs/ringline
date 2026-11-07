@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 
 use crate::task_panic::{PanicPayload, drop_caught};
@@ -6,8 +7,34 @@ use crate::task_panic::{PanicPayload, drop_caught};
 pub(crate) type BoxFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
 /// Opaque handle for a standalone task spawned via [`spawn()`](crate::spawn).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TaskId(pub(crate) u32);
+///
+/// The id is a slot in the task slab of the worker that spawned the task, so
+/// it is not `Send`: use it on that worker. Another worker's slab can hold a
+/// different task in the same slot.
+///
+/// ```
+/// fn assert_copy<T: Copy>() {}
+/// assert_copy::<ringline::TaskId>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::TaskId>();
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TaskId(pub(crate) u32, PhantomData<*const ()>);
+
+impl TaskId {
+    pub(crate) fn new(index: u32) -> Self {
+        TaskId(index, PhantomData)
+    }
+}
+
+impl std::fmt::Debug for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TaskId").field(&self.0).finish()
+    }
+}
 
 /// State of a single task slot.
 enum TaskSlot {

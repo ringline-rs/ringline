@@ -240,7 +240,11 @@ fn a_resolved_futures_key_can_be_reused() {
 
 // ── A future dropped with its connection ───────────────────────────────
 
-static TD_FIFO_FILE: Mutex<Option<ringline::fs::File>> = Mutex::new(None);
+thread_local! {
+    // One worker, so the connection's task and `on_start` share its thread.
+    static TD_FIFO_FILE: std::cell::Cell<Option<ringline::fs::File>> =
+        const { std::cell::Cell::new(None) };
+}
 static TD_DROPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TD_GO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TD_OUTCOME: Mutex<Option<Result<usize, String>>> = Mutex::new(None);
@@ -266,7 +270,7 @@ impl AsyncEventHandler for StatDroppedWithConnection {
                 .unwrap()
                 .await
                 .unwrap();
-            *TD_FIFO_FILE.lock().unwrap() = Some(fifo);
+            TD_FIFO_FILE.set(Some(fifo));
             // Held unpolled; its result arrives with nothing to take it.
             let _stat = ringline::fs::stat(dir.join("file")).unwrap();
             // Close this connection: the task, and the stat with it, is
@@ -306,7 +310,7 @@ async fn cycle_then_drop_a_read() -> Result<usize, String> {
             .await
             .map_err(|e| e.to_string())?;
     }
-    let fifo = TD_FIFO_FILE.lock().unwrap().take().expect("fifo opened");
+    let fifo = TD_FIFO_FILE.take().expect("fifo opened");
     let before = BUF_FREES.load(Ordering::SeqCst);
     drop(
         ringline::fs::read_into(fifo, 0, BytesMut::with_capacity(BUF_SIZE))
