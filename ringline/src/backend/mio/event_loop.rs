@@ -223,8 +223,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.fire_expired_timers();
 
             // 2. Compute poll timeout from nearest timer deadline. Don't
-            // block at all while tasks are already runnable (self-wakes
-            // collected after the last poll pass, tasks woken from on_tick)
+            // block at all while tasks are already runnable (woken after the
+            // iteration's last poll of ready tasks: self-wakes it collected,
+            // tasks woken from on_tick or by step 8's teardown)
             // or while a writable connection has sends queued: a send
             // queued by a task re-polled after the last flush would
             // otherwise wait out the timeout. A connection whose socket is
@@ -375,7 +376,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // 6b. Finish teardown of connections closed during this
             // iteration: executor cleanup (parked futures, waiter flags)
             // before the slot is released for reuse.
-            self.drain_pending_closes();
+            self.finalize_closes();
 
             // 7. on_tick callback (synchronous). Set the executor's
             // driver_state thread-local so user code that calls
@@ -410,7 +411,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // completions, and finish any closes it triggered.
             self.flush_all_pending_sends();
             self.drain_send_completions();
-            self.drain_pending_closes();
+            self.finalize_closes();
 
             // 8a. One send-capacity wake per iteration. A copy-pool permit
             // can come back at many points above — `handle_writable`'s
@@ -430,10 +431,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // unsignalled until the next iteration's step 6a — which only
             // runs after a `poll` that may block indefinitely.
             //
-            // Nothing is lost by waking late: `poll_ready_tasks` (6) has
-            // already run, so a task woken anywhere from 6a onwards is
-            // polled in the next iteration either way, and step 2 sees a
-            // non-empty ready queue and polls with a zero timeout.
+            // Nothing is lost by waking late: the iteration's last poll of
+            // ready tasks (step 6, or `finalize_closes` at 6b and 8 when a
+            // close was pending) has already run, so the head woken here is
+            // polled in the next iteration, and step 2 sees a non-empty ready
+            // queue and polls with a zero timeout.
             self.wake_capacity_if_released();
 
             // 9. Check shutdown.
@@ -1338,6 +1340,34 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Steps 6b and 8: when a close is pending, poll the ready tasks, then
+    /// drain the pending closes.
+    ///
+    /// A close requested before step 6 — a peer FIN or a read error seen in
+    /// step 4 — gives its task the step-6 poll before the teardown below
+    /// (#371). A close requested after that poll — by the flush in 6a or 8
+    /// (a write error, `fail_connection_on_send_error`), or by a FIN or read
+    /// error the forward-resume reads of 6a-bis saw — comes too late for it,
+    /// and `drain_send_completions` polls only when it delivered a settled
+    /// send, which a connection with only unawaited sends queued never has.
+    /// So the task it woke is polled here, before `drain_pending_closes`
+    /// drops it.
+    ///
+    /// The poll takes the whole ready queue, not only that task: tasks the
+    /// step-6 pass's own `collect_wakeups` queued (one that woke itself
+    /// through its `Waker`) and, at step 8, tasks `on_tick` spawned or woke
+    /// through the executor are polled here too (a wake through a `Waker`
+    /// from `on_tick` reaches the thread-local queue and is collected at step
+    /// 2). Only in an iteration with a close pending: with none, this step
+    /// polls nothing, and those tasks are polled by `drain_send_completions`
+    /// if it delivers a settled send, otherwise in the next iteration.
+    fn finalize_closes(&mut self) {
+        if !self.driver.pending_closes.is_empty() && !self.executor.ready_queue.is_empty() {
+            self.poll_ready_tasks();
+        }
+        self.drain_pending_closes();
+    }
+
     /// Finish teardown for connections whose close was requested, once
     /// their queued sends have drained.
     ///
@@ -2011,7 +2041,7 @@ mod tests {
     ///
     /// This covers only that route.
     /// `Executor::remove_connection` has two other callers, both in
-    /// `poll_ready_tasks` — which runs *before* the flush; see
+    /// `poll_ready_tasks`, whose step-6 pass runs *before* the flush; see
     /// `bounded_send_owned_by_another_task_survives_its_connection_task_returning`.
     #[test]
     fn bounded_completion_is_delivered_before_teardown() {
@@ -2634,5 +2664,103 @@ mod tests {
         assert!(el.drain_forward_resumes(&mut buf));
         assert_eq!(el.driver.arrival[source as usize].delivered(), 2);
         assert_eq!(el.driver.arrival[source as usize].len(), 2);
+    }
+
+    /// A task woken by a write error that the flush pass found is polled
+    /// before `drain_pending_closes` drops it: the poll window a close
+    /// promises (#371) holds on this path too. With only unawaited sends
+    /// queued, `drain_send_completions` delivers nothing and so polls
+    /// nothing, so the finalize step has to poll the woken task itself.
+    #[test]
+    fn a_task_woken_by_a_flush_write_error_is_polled_before_its_close_finalizes() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let config = test_config();
+        let (mut event_loop, _wake) = test_loop(&config);
+        let (conn_index, client) = attach_conn(&mut event_loop.driver);
+        let idx = conn_index as usize;
+        let conn = token(&event_loop.driver, conn_index);
+
+        // The connection's task: park on a read and record what it resolves
+        // to. `None` after teardown means the task was dropped unpolled.
+        let seen: Rc<Cell<Option<Result<usize, io::ErrorKind>>>> = Rc::new(Cell::new(None));
+        let record = Rc::clone(&seen);
+        let ctx = ConnCtx::new(conn_index, conn.generation);
+        event_loop.executor.task_slab.spawn(
+            conn_index,
+            Box::pin(async move {
+                let result = ctx
+                    .with_data_result(|d| crate::ParseResult::Consumed(d.len()))
+                    .await;
+                record.set(Some(result.map_err(|e| e.kind())));
+            }),
+        );
+        event_loop.executor.ready_queue.push_back(conn_index);
+        event_loop.poll_ready_tasks();
+        assert!(
+            event_loop.executor.recv_waiters[idx],
+            "the task parked on its read"
+        );
+
+        // Abort the peer: SO_LINGER 0 makes the close an RST.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&client),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt: {}", io::Error::last_os_error());
+        drop(client);
+
+        // Step 6a: queue an unawaited send and flush, until the flush finds
+        // the write error (the RST is asynchronous, so the first write after
+        // it may still succeed). `flush_all_pending_sends` routes the error
+        // through `fail_connection_on_send_error`, which requests the close
+        // and wakes the parked task.
+        let mut closed = false;
+        for _ in 0..500 {
+            event_loop
+                .driver
+                .make_ctx()
+                .send(conn, b"x")
+                .expect("queued");
+            event_loop.driver.writable[idx] = true;
+            event_loop.flush_all_pending_sends();
+            if event_loop.driver.send_queues[idx].close_pending {
+                closed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(closed, "writing to an aborted peer must fail");
+        assert!(
+            event_loop.executor.ready_queue.contains(&conn_index),
+            "the write error woke the task"
+        );
+
+        // Steps 6a and 6b as the loop runs them.
+        event_loop.drain_send_completions();
+        event_loop.finalize_closes();
+
+        // `Ok(0)`, not `Err`: `fail_connection_on_send_error` wakes the reader
+        // without recording the write error, so the task sees a clean close.
+        // What this test pins is that the task is polled at all.
+        assert_eq!(
+            seen.get(),
+            Some(Ok(0)),
+            "the task was dropped before it could observe the close"
+        );
+        assert!(
+            !event_loop.executor.task_slab.has_task(conn_index),
+            "the close finalized"
+        );
     }
 }

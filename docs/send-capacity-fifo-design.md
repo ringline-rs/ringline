@@ -95,9 +95,9 @@ Semantics:
   `Aborted(ConnectionAborted)` (moved to `submitted` if it was waiting) and
   the owner is returned for waking. `Aborted` and not `Done` because this
   abort is **provisional** (series departure 4): `Executor::remove_connection`
-  is called from the mio loop's `poll_ready_tasks` (step 6) as well as from
-  `drain_pending_closes` (step 6b), and step 6 runs *before* the step-6a
-  flush that can still put the whole message on the socket. A driver result
+  is called from the mio loop's `poll_ready_tasks` as well as from
+  `drain_pending_closes` (step 6b), and the step-6 pass runs *before* the
+  step-6a flush that can still put the whole message on the socket. A driver result
   arriving after the abort overwrites it, so a delivered message is never
   reported as aborted. If the owner is the connection's
   own task (`task_id == conn_index`) nobody is left to read a result:

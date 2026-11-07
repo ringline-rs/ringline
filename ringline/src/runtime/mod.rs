@@ -761,7 +761,7 @@ impl Executor {
         // to ConnectionAborted; wake their owners (standalone or cross-index
         // tasks that outlive the connection) and the FIFO's new head. That
         // abort is provisional: this method is also called from the mio
-        // loop's `poll_ready_tasks` (step 6), *before* the step-6a flush
+        // loop's `poll_ready_tasks`, at step 6 *before* the step-6a flush
         // that can still deliver the message, so a driver result arriving
         // afterwards overwrites it (`send_completion`'s module docs). Runs
         // after `task_slab.remove` on purpose: the connection's own task is

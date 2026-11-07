@@ -914,6 +914,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   free buffers that had not been returned, and receive datagrams into
   buffers the application still held. Without `sqpoll` the kernel reads the tail only inside this
   thread's `io_uring_enter`, so the window was never seen.
+
+- mio: a task woken by a close requested after the iteration's task poll is
+  polled before that close finalizes. A connection with only unawaited sends
+  queued (`send_nowait`, a forward, TLS handshake output) whose write failed
+  in the flush — or whose peer's FIN or read error was seen by the
+  forward-resume reads that follow it — had its task woken and then dropped
+  by the same iteration's teardown, unpolled, so the code after the parked
+  read never ran. In an iteration with a close pending, the finalize step
+  now polls the ready tasks first. Awaited sends were not affected: their
+  settled result already re-polled the task.
+
 - A panic in a future's `Drop` no longer ends the worker, after the future
   returned `Ready`, after a panic in its poll, when its connection closed, or
   at worker exit. Nor does a panic in a `SendGuard`'s `Drop` on a worker's
