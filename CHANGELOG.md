@@ -925,6 +925,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   now polls the ready tasks first. Awaited sends were not affected: their
   settled result already re-polled the task.
 
+- `with_data_result` reports a connection the runtime aborted as an error,
+  not as a clean close. A write that failed (mio: the write's error, `EPIPE`
+  or `ECONNRESET`), a message on a plaintext connection that ran past
+  `recv_accumulator_max` (`io::ErrorKind::QuotaExceeded`), and on io_uring a
+  receive that could not be armed, all closed the connection with the read
+  half still `Open` and no error recorded, so the parked reader resolved
+  `Ok(0)` and could not tell "the peer hung up" from "ringline gave up". Each
+  site now records the error first. A TLS record-layer error, which is how a
+  TLS connection reports the cap overflow, still resolves `Ok(0)`, as
+  documented.
+
 - A panic in a future's `Drop` no longer ends the worker, after the future
   returned `Ready`, after a panic in its poll, when its connection closed, or
   at worker exit. Nor does a panic in a `SendGuard`'s `Drop` on a worker's

@@ -18,7 +18,7 @@ use crate::buffer::send_slab::InFlightSendSlab;
 use crate::chain::SendChainTable;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
-use crate::connection::{ConnectionTable, Lifecycle, WriteHalf};
+use crate::connection::{ConnectionTable, Lifecycle, ReadHalf, WriteHalf};
 use crate::handler::{BuiltSend, ConnSendState, DriverCtx, SendPoll};
 use crate::metrics;
 use crate::runtime::send_completion::SendId;
@@ -194,7 +194,13 @@ impl Driver {
                 .as_mut()
                 .and_then(|t| crate::tls::tls_recv_arm(t, conn_index, self.recv_direct_region))
             else {
-                self.close_connection(conn_index);
+                self.abort_recv(
+                    conn_index,
+                    io::Error::new(
+                        io::ErrorKind::QuotaExceeded,
+                        "TLS receive buffer full before the record was read",
+                    ),
+                );
                 return true;
             };
             (
@@ -209,7 +215,7 @@ impl Driver {
                 self.accumulators
                     .detach_for_recv(conn_index, self.recv_direct_region, need)
             else {
-                self.close_connection(conn_index);
+                self.abort_recv(conn_index, crate::accumulator::recv_cap_exceeded());
                 return true;
             };
             let held = buf.len();
@@ -242,7 +248,10 @@ impl Driver {
                 }
             }
             self.direct_recv_free.push(slot);
-            self.close_connection(conn_index);
+            self.abort_recv(
+                conn_index,
+                io::Error::other("the receive could not be submitted to the ring"),
+            );
             return true;
         }
         self.direct_recvs[slot as usize] = Some(DirectRecv {
@@ -331,6 +340,24 @@ impl Driver {
             cs.hangup_poll_armed = true;
             cs.hangup_poll_retry = false;
         }
+    }
+
+    /// Close `conn_index` because its receive cannot be armed, and record
+    /// `err` on `recv_aborts` for its reader. `read` is set first, so the
+    /// close reads as a failure and not as the peer's close.
+    fn abort_recv(&mut self, conn_index: u32, err: io::Error) {
+        let generation = self.connections.generation(conn_index);
+        if let Some(cs) = self.connections.get_mut(conn_index) {
+            cs.read = ReadHalf::Error;
+        }
+        self.recv_aborts.push_back((conn_index, generation, err));
+        self.close_connection(conn_index);
+    }
+
+    /// Take the aborts recorded by [`arm_direct_recv_or_close`](Self::arm_direct_recv_or_close)
+    /// since the last call, for the caller to hand to `Executor::fail_recv`.
+    pub(crate) fn take_recv_aborts(&mut self) -> VecDeque<(u32, u32, io::Error)> {
+        std::mem::take(&mut self.recv_aborts)
     }
 
     /// Whether a TLS connection's receive that completed should be re-armed
@@ -698,6 +725,13 @@ pub(crate) struct Driver {
     /// is correct: the executor is going away with the driver, exactly as
     /// mio's `Driver::drop` produces no completions.
     pub(crate) settled_sends: VecDeque<(SendId, io::Result<u32>)>,
+    /// Connections `arm_direct_recv_or_close` closed because it could not arm
+    /// their receive — no room under `recv_accumulator_max` or in the TLS
+    /// engine's buffer, or the SQE could not be pushed — with the error the
+    /// reader is owed, keyed by `(conn_index, generation)`. Drained by the
+    /// caller into `Executor::fail_recv` before the woken reader is polled;
+    /// the driver never touches the `Executor` itself.
+    pub(crate) recv_aborts: VecDeque<(u32, u32, io::Error)>,
     /// Set whenever a copy-pool slot goes back to the pool, so the event
     /// loop can call `Executor::wake_send_capacity` once per iteration
     /// instead of once per released slot. The event loop clears it.
@@ -1118,6 +1152,7 @@ impl Driver {
             pending_close_retries: Vec::new(),
             pending_send_retries: Vec::new(),
             settled_sends: VecDeque::new(),
+            recv_aborts: VecDeque::new(),
             capacity_released: false,
             pending_finalize_closes: Vec::new(),
             zc_retry_scratch: Vec::new(),
