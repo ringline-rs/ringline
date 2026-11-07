@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The `unstable-accept` feature, off by default and outside semver. It holds
+  `AcceptMode`, `ConfigBuilder::accept_mode`, `Runtime::set_worker_accepting`,
+  `offer_for_park`, `AsyncEventHandler::on_adopt` and `ParkState`. Without it
+  every connection is accepted by the acceptor thread and these items do not
+  exist, so a caller of any of them must enable the feature. Park runs only in
+  merged accept mode, so it moves with that mode. Across 5 runs per cell on
+  Linux 6.12, merged mode did not reach the 10% connect-rate win the default
+  would need: +0.8% without TLS, -5.9% with TLS (#443). The `connections`
+  counters for park and adoption stay in the metrics and read 0 without the
+  feature.
 - `Signal::WorkerExited`: `Runtime::wait_on_signal` returns it, and shuts the
   runtime down, when a worker stops on a panic in the runtime or an error from
   its ring or poll. Before, nothing woke `wait_on_signal` for a stopped worker,

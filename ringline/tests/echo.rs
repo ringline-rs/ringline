@@ -5776,7 +5776,7 @@ fn resolve_disabled_returns_error() {
 ///
 /// The unit tests in `reuseport_bpf` cover the instruction encoding; only a
 /// real kernel can say whether the attached program does what it encodes.
-#[cfg(has_io_uring)]
+#[cfg(all(has_io_uring, feature = "unstable-accept"))]
 #[test]
 fn an_excluded_worker_stops_receiving_connections() {
     use std::sync::Mutex;
@@ -5882,7 +5882,7 @@ fn an_excluded_worker_stops_receiving_connections() {
 ///
 /// Every other test runs the default `Pool` mode, so without this one the
 /// whole merged path could be a no-op and the suite would not notice.
-#[cfg(has_io_uring)]
+#[cfg(all(has_io_uring, feature = "unstable-accept"))]
 #[test]
 fn merged_accept_mode_serves_connections_across_workers() {
     static SERVED: AtomicU32 = AtomicU32::new(0);

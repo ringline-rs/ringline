@@ -38,7 +38,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # ringline-bench enables `unstable-accept`, and a workspace build unifies
+      # features, so only `-p ringline` builds the feature-off configuration.
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked -p ringline --all-targets -- -D warnings
 
   clippy-mio:
     name: Clippy (mio)
@@ -50,6 +53,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --all-targets --features force-mio -- -D warnings
+      - run: cargo clippy --locked -p ringline --all-targets --features force-mio -- -D warnings
 
   clippy-tls-buffered:
     name: Clippy (tls-buffered)
@@ -118,6 +122,7 @@ jobs:
       # --all-features turns on force-mio, so the first run is the only one that
       # renders the io_uring docs.
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ringline
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 
   audit:
@@ -151,6 +156,9 @@ jobs:
           sudo prlimit --pid $$ --memlock=67108864:67108864
           cargo nextest run --locked --workspace --profile ci
           cargo test --locked --workspace --doc
+          # Without `unstable-accept`: see the note in the clippy job.
+          cargo nextest run --locked -p ringline --profile ci
+          cargo test --locked -p ringline --doc
       # Resource state for an io_uring ENOMEM. On kernel 6.12 the uring suite
       # passes with RLIMIT_MEMLOCK at 8 KiB, so rings are not charged there; on
       # the 6.17 runners they are (#426), which is why the step above raises it.
@@ -291,6 +299,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-nextest
       - run: cargo nextest run --locked --workspace --profile ci --features force-mio
       - run: cargo test --locked --workspace --doc --features force-mio
+      - run: cargo nextest run --locked -p ringline --profile ci --features force-mio
       # No other step runs tests with the optional compression codecs; MSRV and
       # Doc only build them (--all-features).
       - run: cargo nextest run --locked -p ringline-http -p ringline-grpc --profile ci --features ringline-http/compression,ringline-grpc/compression,ringline-http/force-mio

@@ -58,7 +58,10 @@ level = "warn"
 check-cfg = ["cfg(has_io_uring)"]
 
 [dependencies]
-ringline = { workspace = true }
+# `bench-server --accept-mode` and `--park` drive the unstable accept API. This
+# turns the feature on for every build that includes this crate, `--workspace`
+# among them; `-p ringline` is the build that has it off.
+ringline = { workspace = true, features = ["unstable-accept"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

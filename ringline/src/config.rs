@@ -1,36 +1,7 @@
 use std::net::SocketAddr;
 
+use crate::accept::AcceptMode;
 use crate::buffer::fixed::MemoryRegion;
-
-/// Where connections are accepted.
-///
-/// See `docs/listeners-and-accept-design.md`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum AcceptMode {
-    /// One acceptor thread per listener, handing accepted fds to workers over
-    /// a channel with explicit round-robin placement. The default.
-    ///
-    /// Placement is deterministic, and a worker that is full or has exited is
-    /// skipped — properties the merged mode has to reconstruct.
-    #[default]
-    Pool,
-    /// Each worker owns a `SO_REUSEPORT` listener and accepts on its own ring
-    /// with multishot accept. No acceptor thread, no channel, no wake fd, and
-    /// no cross-thread handoff per connection.
-    ///
-    /// Placement falls to the kernel's 4-tuple hash unless steered, which is
-    /// uneven for a client that opens a pool of connections: at N connections
-    /// over N workers roughly 1/e of workers get none. That is why this is not
-    /// the default. io_uring only — the mio backend always uses [`Pool`].
-    ///
-    /// Not compatible with
-    /// [`RinglineBuilder::defer_listen`](crate::RinglineBuilder::defer_listen);
-    /// on the io_uring backend `launch()` refuses the combination.
-    ///
-    /// [`Pool`]: AcceptMode::Pool
-    Merged,
-}
 
 pub use ringline_tls_config::{TlsClientConfig, TlsConfig};
 
@@ -236,7 +207,8 @@ pub struct Config {
     pub(crate) tls_client: Option<TlsClientConfig>,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
     pub(crate) tcp_nodelay: bool,
-    /// Where connections are accepted. See [`AcceptMode`].
+    /// Where connections are accepted. Always `Pool` without the
+    /// `unstable-accept` feature.
     pub(crate) accept_mode: AcceptMode,
     /// What a worker does when a task panics.
     pub(crate) task_panic_policy: crate::TaskPanicPolicy,
@@ -830,6 +802,7 @@ impl ConfigBuilder {
     ///
     /// [`AcceptMode::Merged`] is io_uring only; on the mio backend it is
     /// accepted and ignored, since mio has no multishot accept.
+    #[cfg(any(feature = "unstable-accept", test))]
     pub fn accept_mode(mut self, mode: AcceptMode) -> Self {
         self.config.accept_mode = mode;
         self

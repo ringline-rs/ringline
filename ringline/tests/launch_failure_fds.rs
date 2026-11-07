@@ -8,7 +8,7 @@
 //! Its own test binary, because it counts the process's open fds. io_uring
 //! only: merged accept mode is.
 
-#![cfg(all(target_os = "linux", has_io_uring))]
+#![cfg(all(target_os = "linux", has_io_uring, feature = "unstable-accept"))]
 #![allow(clippy::manual_async_fn)]
 
 use std::future::Future;

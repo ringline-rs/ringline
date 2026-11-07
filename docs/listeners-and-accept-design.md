@@ -1145,8 +1145,37 @@ microseconds, before any worker has published a load update. The optimistic
 claim added for bursts spreads work across many connections; it has nothing to
 work with when there are only eight.
 
-Connect rate is still unmeasured — `bench-client` opens its pool once and holds
+Connect rate is measured in the next section; at the time of this one, it was
+not — `bench-client` opens its pool once and holds
 it, so a connect storm needs load-generator work that has not been done.
+
+### Connect rate (2026-11-06)
+
+Pool and merged accept, one request per connection, no reuse: `connect-bench`
+with 32 threads on hv01 against an 8-worker `bench-server --echo-mode copy` on
+hv02, Linux 6.12, X710 LAG. Five runs per cell in random order, 0 connect or I/O
+errors. Medians, with CPU taken from a recording scoped inside the client's
+measured window.
+
+| | Pool conns/s | Merged conns/s | Merged rate | Pool CPU/conn | Merged CPU/conn |
+|---|---|---|---|---|---|
+| no TLS | 32,945 | 33,190 | +0.8% | 232 µs | 198 µs |
+| TLS | 18,940 | 17,818 | -5.9% | 511 µs | 492 µs |
+
+The rule set before the run was a median win of at least 10%, outside the arms'
+spread, with and without TLS, and p99 no worse. Merged does not meet it, so Pool
+stays the default. `connect-bench` reports no p99, so that clause was not
+checked; the rate clause already fails.
+
+CPU did not bound the no-TLS rate: workers ran at about 0.65 of a core and the
+client peaked at 17.5 cores. Connection latency was about 950 µs in both modes,
+and what sets it is not known. So this cell does not give merged mode's maximum
+rate. With TLS, workers ran at about 0.98 of a core in Pool and 0.93 in merged.
+Why merged is slower there while using less CPU is not known.
+
+Merged accept, steering and park moved behind the `unstable-accept` feature
+after this run. Park runs only in merged mode, so the feature holds both until
+the policy work in `docs/journal/2026-09-two-phase-park.md` is finished.
 
 ## Staging
 

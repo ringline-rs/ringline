@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ringline::{AcceptMode, AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
 /// The tests count fds, so they run one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -32,8 +32,18 @@ impl AsyncEventHandler for Idle {
     }
 }
 
+#[cfg(feature = "unstable-accept")]
+use ringline::AcceptMode;
+
+/// The only mode without the `unstable-accept` feature.
+#[cfg(not(feature = "unstable-accept"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptMode {
+    Pool,
+}
+
 fn config(mode: AcceptMode) -> ringline::Config {
-    ConfigBuilder::new()
+    let builder = ConfigBuilder::new()
         .workers(2)
         .pin_to_core(false)
         .sq_entries(64)
@@ -41,10 +51,12 @@ fn config(mode: AcceptMode) -> ringline::Config {
         .send_pool(16, 16384)
         .blocking_threads(0)
         .resolver_threads(0)
-        .spawner_threads(0)
-        .accept_mode(mode)
-        .build()
-        .expect("valid config")
+        .spawner_threads(0);
+    #[cfg(feature = "unstable-accept")]
+    let builder = builder.accept_mode(mode);
+    #[cfg(not(feature = "unstable-accept"))]
+    let _ = mode;
+    builder.build().expect("valid config")
 }
 
 /// The `(accept mode, defer)` pairs `launch()` accepts. Merged mode needs
@@ -54,6 +66,7 @@ fn cases() -> Vec<(AcceptMode, bool)> {
     vec![
         (AcceptMode::Pool, false),
         (AcceptMode::Pool, true),
+        #[cfg(feature = "unstable-accept")]
         (AcceptMode::Merged, false),
     ]
 }
