@@ -180,6 +180,26 @@ fn connect_retry(addr: &str) -> TcpStream {
     panic!("server did not start on {addr}");
 }
 
+/// Wait up to 10 s for a handler to set `cell`, and return its value.
+///
+/// The handler records its result in a task the worker polls after the
+/// client's last action (a write or a close). The worker checks for shutdown
+/// before polling tasks, so a shutdown seen first drops that task unrun. Call
+/// this before `shutdown`.
+fn wait_for_result<'a, T>(cell: &'a std::sync::OnceLock<T>, what: &str) -> &'a T {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(v) = cell.get() {
+            return v;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: the handler did not record a result within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn echo_round_trip(addr: &str, msg: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
@@ -4450,8 +4470,8 @@ fn async_standalone_connect_refused() {
 
 // ── Peer close delivers EOF to accepted connection ──────────────────
 
-/// Server that accepts a connection, reads one message, echoes it, then
-/// waits for the client to disconnect. Verifies with_data returns 0 (EOF).
+/// Server that echoes until the client disconnects, then records whether
+/// `with_data` returned 0 (EOF) after receiving at least one byte.
 struct PeerCloseHandler;
 
 static PEER_CLOSE_RESULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -4461,6 +4481,7 @@ impl AsyncEventHandler for PeerCloseHandler {
         async move {
             let (mut tx, mut rx) = conn.split();
             // Read until EOF. Each chunk is echoed back.
+            let mut received = 0;
             loop {
                 let n = rx
                     .with_data(|data| {
@@ -4469,10 +4490,15 @@ impl AsyncEventHandler for PeerCloseHandler {
                     })
                     .await;
                 if n == 0 {
-                    // EOF — peer closed the connection. This is the success case.
-                    PEER_CLOSE_RESULT.set("OK".to_string()).ok();
+                    let result = if received > 0 {
+                        "OK".to_string()
+                    } else {
+                        "EOF before any data".to_string()
+                    };
+                    PEER_CLOSE_RESULT.set(result).ok();
                     return;
                 }
+                received += n;
             }
         }
     }
@@ -4488,11 +4514,12 @@ fn async_peer_close_delivers_eof() {
         .launch::<PeerCloseHandler>()
         .expect("launch failed");
     let addr = shutdown.bound_addr().expect("bound address").to_string();
-    wait_for_server(&addr);
 
-    // Connect with std TCP, send data, read echo, then close.
+    // Connect with std TCP, send data, read echo, then close. No readiness
+    // probe: its connection would close without sending and record a result
+    // first.
     {
-        let mut stream = TcpStream::connect(&addr).unwrap();
+        let mut stream = connect_retry(&addr);
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -4513,15 +4540,13 @@ fn async_peer_close_delivers_eof() {
         // stream drops here, closing the TCP connection
     }
 
-    // Give the server time to process the close.
-    std::thread::sleep(Duration::from_millis(200));
+    let result = wait_for_result(&PEER_CLOSE_RESULT, "peer close");
 
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();
     }
 
-    let result = PEER_CLOSE_RESULT.get().expect("handler did not set result");
     assert_eq!(result, "OK", "expected EOF after peer close, got: {result}");
 }
 
@@ -4539,25 +4564,31 @@ impl AsyncEventHandler for PoolExhaustionHandler {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             // Read one message to know the client is connected.
-            conn.with_data(|data| ParseResult::Consumed(data.len()))
+            let n = conn
+                .with_data(|data| ParseResult::Consumed(data.len()))
                 .await;
+            if n == 0 {
+                POOL_EXHAUSTION_RESULT
+                    .set("EOF before the trigger".to_string())
+                    .ok();
+                return;
+            }
 
             // Fire many send_nowait calls rapidly. With a tiny pool, this
-            // should eventually return Err (pool exhausted).
-            let mut got_error = false;
+            // should eventually return `Other`, the pool admission error.
             let payload = [0xABu8; 512];
+            let mut result = "NO_ERROR".to_string();
             for _ in 0..1000 {
-                if let Err(_e) = conn.send_nowait(&payload) {
-                    got_error = true;
+                if let Err(e) = conn.send_nowait(&payload) {
+                    result = if e.kind() == io::ErrorKind::Other {
+                        "OK".to_string()
+                    } else {
+                        format!("unexpected error: {e}")
+                    };
                     break;
                 }
             }
-
-            if got_error {
-                POOL_EXHAUSTION_RESULT.set("OK".to_string()).ok();
-            } else {
-                POOL_EXHAUSTION_RESULT.set("NO_ERROR".to_string()).ok();
-            }
+            POOL_EXHAUSTION_RESULT.set(result).ok();
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -4578,28 +4609,24 @@ fn async_send_pool_exhaustion() {
         .launch::<PoolExhaustionHandler>()
         .expect("launch failed");
     let addr = shutdown.bound_addr().expect("bound address").to_string();
-    wait_for_server(&addr);
 
     // Connect and send a trigger message. Don't read — let the server's
-    // sends queue up and exhaust the pool.
-    let mut stream = TcpStream::connect(&addr).unwrap();
+    // sends queue up and exhaust the pool. No readiness probe: its connection
+    // would close without sending and record a result first.
+    let mut stream = connect_retry(&addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     stream.write_all(b"go").unwrap();
     stream.flush().unwrap();
 
-    // Wait for the handler to complete.
-    std::thread::sleep(Duration::from_millis(500));
+    let result = wait_for_result(&POOL_EXHAUSTION_RESULT, "pool exhaustion");
 
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();
     }
 
-    let result = POOL_EXHAUSTION_RESULT
-        .get()
-        .expect("handler did not set result");
     assert_eq!(
         result, "OK",
         "expected pool exhaustion error, got: {result}"
