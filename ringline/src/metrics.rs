@@ -66,7 +66,10 @@ pub static RECV_ARRIVAL: ShardedCounterGroup = ShardedCounterGroup::new(recv_arr
 /// Incremented where `ConnectionState::established` is set (a plaintext
 /// accept or connect; a TLS handshake completing) and decremented at
 /// teardown only for a connection that was established, so a failed connect
-/// or handshake moves it neither way. Same rule on both backends.
+/// or handshake moves it neither way. Same rule on both backends. Two
+/// exceptions: a connection still open when its worker exits is not
+/// decremented, and a parked connection is decremented on the worker it
+/// leaves and incremented again on the worker that adopts it.
 #[metric(
     name = "ringline/connections/active",
     description = "Established connections not yet torn down"
@@ -78,11 +81,15 @@ pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 /// Counter slot indices for connection metrics.
 pub mod conn {
     /// Inbound connections that became established: a plaintext accept, or a
-    /// TLS handshake that completed. Outbound connections are not counted.
+    /// TLS handshake that completed. Outbound connections are not counted. A
+    /// parked connection counts again on the worker that adopts it
+    /// (`ADOPTED` counts those adoptions).
     pub const ACCEPTED: usize = 0;
     /// Teardowns of established connections, accepted or outbound. A failed
-    /// connect or TLS handshake is not a close. Same rule on both backends;
-    /// `CONNECTIONS_ACTIVE` decrements under the same condition.
+    /// connect or TLS handshake is not a close, and a connection still open
+    /// when its worker exits is not counted. A parked connection counts as a
+    /// close on the worker it leaves. Same rule on both backends;
+    /// `CONNECTIONS_ACTIVE` decrements under the same conditions.
     pub const CLOSED: usize = 1;
     /// Parks this worker started (tier 3, #443) — an imbalance it tried to
     /// repair by moving a connection to a less loaded worker.
