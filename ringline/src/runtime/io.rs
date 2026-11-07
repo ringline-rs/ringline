@@ -213,7 +213,7 @@ pub fn spawn(future: impl Future<Output = ()> + 'static) -> io::Result<TaskId> {
         |_driver, executor| match executor.standalone_slab.spawn(Box::pin(future)) {
             Some(idx) => {
                 executor.ready_queue.push_back(idx | STANDALONE_BIT);
-                Ok(TaskId(idx))
+                Ok(TaskId::new(idx))
             }
             None => Err(standalone_slab_full()),
         },
@@ -450,7 +450,7 @@ pub fn spawn_with_handle<T: 'static>(
                 executor.ready_queue.push_back(idx | STANDALONE_BIT);
                 Ok(JoinHandle {
                     state: Rc::clone(&state),
-                    task_id: TaskId(idx),
+                    task_id: TaskId::new(idx),
                 })
             }
             None => Err(standalone_slab_full()),

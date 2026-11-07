@@ -81,9 +81,8 @@ impl DirectIoOpenOptions {
 ///
 /// The handle names a slot in the table of the worker that opened it, so it is
 /// not `Send`: use it on that worker. Another worker's table can hold a
-/// different file in the same slot. A handler type must be `Send`, so it
-/// cannot hold a handle either; keep a handle the worker reuses in a
-/// `thread_local!`.
+/// different file in the same slot. A handler is created on its worker's
+/// thread and stays there, so it can keep a handle in a field.
 ///
 /// ```
 /// fn assert_copy<T: Copy>() {}

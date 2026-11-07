@@ -40,7 +40,38 @@ use crate::runtime::io::{Connection, UdpSocket};
 ///     }
 /// }
 /// ```
-pub trait AsyncEventHandler: Send + 'static {
+///
+/// Each worker creates its handler on its own thread with
+/// [`create_for_worker`](Self::create_for_worker), and the handler stays on
+/// that thread, so it need not be `Send`. It can keep worker-local values in
+/// its fields, such as an `Rc` or a [`File`](crate::fs::File):
+///
+/// ```no_run
+/// use std::cell::Cell;
+/// use std::future::Future;
+/// use std::rc::Rc;
+/// use ringline::{AsyncEventHandler, Connection};
+///
+/// struct Handler {
+///     log: Rc<Cell<Option<ringline::fs::File>>>,
+/// }
+///
+/// impl AsyncEventHandler for Handler {
+///     fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+///         let log = self.log.clone();
+///         async move {
+///             let _file = log.get();
+///         }
+///     }
+///
+///     fn create_for_worker(_worker_id: usize) -> Self {
+///         Handler {
+///             log: Rc::new(Cell::new(None)),
+///         }
+///     }
+/// }
+/// ```
+pub trait AsyncEventHandler: 'static {
     /// Handle an accepted connection. When the returned future completes, the
     /// connection is closed, even if a half moved to a spawned task.
     ///
