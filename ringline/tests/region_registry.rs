@@ -5,10 +5,11 @@
 #![allow(clippy::manual_async_fn)]
 
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, Connection, MemoryRegion, RinglineBuilder,
+    AsyncEventHandler, Config, ConfigBuilder, Connection, MemoryRegion, RegionId, RinglineBuilder,
+    Runtime,
 };
 
 struct Idle;
@@ -36,6 +37,32 @@ fn small_config() -> Config {
     small_config_builder().build().expect("valid config")
 }
 
+/// Register memory that can be pinned, retrying for up to 5 s while the
+/// kernel refuses it with ENOMEM or EFAULT.
+///
+/// io_uring charges registered buffers, and on Linux 6.14+ each ring, to the
+/// user's locked memory across all of the user's processes, so test processes
+/// running alongside this one can push a registration past `RLIMIT_MEMLOCK`
+/// until they release the charge (#589). Pinning a page the kernel must migrate first can
+/// fail with EFAULT, and registering again can succeed (#656).
+fn register(runtime: &Runtime, region: MemoryRegion) -> RegionId {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match runtime.register_region(region.clone()) {
+            Ok(id) => return id,
+            Err(e) => {
+                let msg = e.to_string();
+                let transient = msg.contains("(ENOMEM)") || msg.contains("(EFAULT)");
+                assert!(
+                    transient && Instant::now() < deadline,
+                    "register_region: {e}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 /// Register and unregister a region; subsequent register must reuse the slot.
 #[test]
 fn register_unregister_roundtrip() {
@@ -45,13 +72,13 @@ fn register_unregister_roundtrip() {
 
     let mut backing = vec![0u8; 4096];
     let region = unsafe { MemoryRegion::new(backing.as_mut_ptr(), 4096) };
-    let id = shutdown.register_region(region.clone()).unwrap();
+    let id = register(&shutdown, region.clone());
 
     shutdown.unregister_region(id).unwrap();
 
     // Slot 0 should be free again — re-register and confirm we get the
     // same RegionId back (free list is LIFO from the just-unregistered slot).
-    let id2 = shutdown.register_region(region).unwrap();
+    let id2 = register(&shutdown, region);
     assert_eq!(id, id2);
 
     shutdown.shutdown();
@@ -77,16 +104,17 @@ fn table_full_returns_error() {
     let r2 = unsafe { MemoryRegion::new(buf2.as_mut_ptr(), 1024) };
     let r3 = unsafe { MemoryRegion::new(buf3.as_mut_ptr(), 1024) };
 
-    let id1 = shutdown.register_region(r1).unwrap();
-    let _id2 = shutdown.register_region(r2).unwrap();
+    let id1 = register(&shutdown, r1);
+    let _id2 = register(&shutdown, r2);
+    let err = shutdown.register_region(r3.clone()).unwrap_err();
     assert!(
-        shutdown.register_region(r3.clone()).is_err(),
-        "expected table-full error",
+        err.to_string().contains("table is full"),
+        "expected table-full error, got: {err}"
     );
 
     // After unregistering one, register must succeed again.
     shutdown.unregister_region(id1).unwrap();
-    shutdown.register_region(r3).unwrap();
+    register(&shutdown, r3);
 
     shutdown.shutdown();
     for h in handles {
@@ -113,7 +141,7 @@ fn initial_regions_reserve_low_slots() {
     // Smoke test: dynamic registration succeeds even when the low slots
     // are already occupied by `Config::registered_regions`. The slot the
     // registrar hands out must come from above the reserved range.
-    let id = shutdown.register_region(dynamic).unwrap();
+    let id = register(&shutdown, dynamic);
     shutdown.unregister_region(id).unwrap();
 
     shutdown.shutdown();
@@ -136,7 +164,7 @@ fn failed_register_leaves_the_slot_reusable() {
     let mut backing = vec![0u8; len];
     let good = unsafe { MemoryRegion::new(backing.as_mut_ptr(), len) };
     // Register and unregister once, so the free list's top slot is known.
-    let id0 = shutdown.register_region(good.clone()).unwrap();
+    let id0 = register(&shutdown, good.clone());
     shutdown.unregister_region(id0).unwrap();
 
     // io_uring_register returns EFAULT for PROT_NONE pages, which cannot be
@@ -156,9 +184,7 @@ fn failed_register_leaves_the_slot_reusable() {
     let err = shutdown.register_region(bad).unwrap_err();
     assert!(err.to_string().contains("EFAULT"), "{err}");
 
-    let id = shutdown
-        .register_region(good)
-        .expect("register after a failed register");
+    let id = register(&shutdown, good);
     assert_eq!(id, id0, "the failed register's slot is reused");
 
     shutdown.shutdown();
