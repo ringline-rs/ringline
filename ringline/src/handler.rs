@@ -1507,7 +1507,7 @@ impl<'a> DriverCtx<'a> {
         }
 
         let generation = devices.get(index).map(|d| d.generation).unwrap_or(0);
-        Ok(crate::nvme::NvmeDevice { index, generation })
+        Ok(crate::nvme::NvmeDevice::new(index, generation))
     }
 
     /// Submit an NVMe read command.
@@ -1799,7 +1799,7 @@ impl<'a> DriverCtx<'a> {
         }
 
         let generation = files.get(index).map(|f| f.generation).unwrap_or(0);
-        Ok(crate::direct_io::DirectIoFile { index, generation })
+        Ok(crate::direct_io::DirectIoFile::new(index, generation))
     }
 
     /// Submit a direct I/O read.
@@ -3212,7 +3212,7 @@ impl<'a> DriverCtx<'a> {
         self.direct_io_fds[index as usize] = Some(std::sync::Arc::new(owned));
 
         let generation = files.get(index).map(|f| f.generation).unwrap_or(0);
-        Ok(crate::direct_io::DirectIoFile { index, generation })
+        Ok(crate::direct_io::DirectIoFile::new(index, generation))
     }
 
     /// Submit a direct I/O read via the disk I/O pool.

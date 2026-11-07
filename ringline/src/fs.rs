@@ -79,6 +79,7 @@
 use std::ffi::CString;
 use std::future::Future;
 use std::io;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -90,13 +91,48 @@ use crate::runtime::io::{CURRENT_DRIVER, DiskIoFuture, with_state};
 use crate::runtime::waker::pending;
 
 /// Opaque handle to an opened file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The handle names a slot in the table of the worker that opened it, so it is
+/// not `Send`: use it on that worker. Another worker's table can hold a
+/// different file in the same slot. A handler type must be `Send`, so it
+/// cannot hold a handle either; keep a handle the worker reuses in a
+/// `thread_local!`.
+///
+/// ```
+/// fn assert_copy<T: Copy>() {}
+/// assert_copy::<ringline::fs::File>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::fs::File>();
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct File {
     pub(crate) index: u16,
     pub(crate) generation: u16,
+    /// Makes the handle `!Send`.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl std::fmt::Debug for File {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("File")
+            .field("index", &self.index)
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 impl File {
+    pub(crate) fn new(index: u16, generation: u16) -> Self {
+        File {
+            index,
+            generation,
+            _not_send: PhantomData,
+        }
+    }
+
     /// Returns the file slot index.
     pub fn index(&self) -> usize {
         self.index as usize
@@ -473,10 +509,7 @@ impl Future for OpenFuture {
                 Some(result) if result < 0 => {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
                 }
-                Some(_) => Poll::Ready(Ok(File {
-                    index: self.file_index,
-                    generation: self.generation,
-                })),
+                Some(_) => Poll::Ready(Ok(File::new(self.file_index, self.generation))),
                 None => {
                     let task_id = CURRENT_TASK_ID.with(|c| c.get());
                     executor.wait_disk_io(self.seq, task_id);
@@ -591,7 +624,7 @@ pub(crate) fn release_orphans(
         executor.disk_io_waiters.remove(&seq);
         match executor.take_disk_io_result(seq) {
             Some(result) if result >= 0 => {
-                let _ = driver.make_ctx().fs_close(File { index, generation });
+                let _ = driver.make_ctx().fs_close(File::new(index, generation));
             }
             // The open failed, and its slot is already free.
             Some(_) => {}

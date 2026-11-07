@@ -258,6 +258,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `AsyncEventHandler::on_adopt` and `ParkState` need the `unstable-accept`
   feature. No released version has them, so this affects only callers tracking
   `main`: enable the feature, or remove the calls.
+- **Breaking:** `fs::File`, `direct_io::DirectIoFile` and `nvme::NvmeDevice`
+  are no longer `Send`, and neither are `DirectIoCompletion` and
+  `NvmeCompletion`, which hold them. Each handle is a slot in the table of the
+  worker that opened it. Used on another worker it named that worker's slot:
+  a write through a `File` opened on worker 0 and used on worker 1 succeeded
+  and landed in worker 1's file. Use a handle on the worker that opened it, or
+  open the file on each worker that needs it. A handler type must be `Send`,
+  so a handler that kept a handle in a field (in a `Mutex`, say) keeps it in a
+  `thread_local!` instead.
 - mio: on Linux TCP, a drain no longer ends with a read that returns `EAGAIN`, which
   takes an echo from 2 reads per operation to 1, as tokio does. A read that leaves
   its buffer unfilled ends the drain, unless the event reports the read side closed
