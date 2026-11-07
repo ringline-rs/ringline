@@ -738,25 +738,26 @@ fn async_request_shutdown_exits_cleanly() {
 
 static SPAWN_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Handler that spawns a standalone task from on_accept.
+/// Handler that echoes one message, then spawns a standalone task. A
+/// connection that closes without sending spawns nothing.
 struct SpawnTestHandler;
 
 impl AsyncEventHandler for SpawnTestHandler {
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
             let (mut tx, mut rx) = conn.split();
-            // Spawn a standalone task that increments the counter.
-            ringline::spawn(async {
-                SPAWN_COUNTER.fetch_add(1, Ordering::SeqCst);
-            })
-            .unwrap();
-
-            // Echo one message to signal readiness.
-            rx.with_data(|data| {
-                let _ = tx.send_nowait(data);
-                ParseResult::Consumed(data.len())
-            })
-            .await;
+            let n = rx
+                .with_data(|data| {
+                    let _ = tx.send_nowait(data);
+                    ParseResult::Consumed(data.len())
+                })
+                .await;
+            if n > 0 {
+                ringline::spawn(async {
+                    SPAWN_COUNTER.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            }
         }
     }
     fn create_for_worker(_id: usize) -> Self {
@@ -782,17 +783,19 @@ fn async_spawn_standalone_task() {
         echo_round_trip(&addr, b"spawn-test");
     }
 
-    // Give standalone tasks time to run.
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Verify the standalone tasks ran.
-    let count = SPAWN_COUNTER.load(Ordering::SeqCst);
-    assert!(count >= 3, "expected at least 3, got {count}");
+    // The tasks run after the echo is sent, so poll before shutdown.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while SPAWN_COUNTER.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();
     }
+
+    let count = SPAWN_COUNTER.load(Ordering::SeqCst);
+    assert_eq!(count, 3, "one standalone task per echoed connection");
 }
 
 // ── Sleep test ──────────────────────────────────────────────────────
@@ -6244,21 +6247,27 @@ fn peer_addr_unix_regression() {
     let _ = std::fs::remove_file(&sock_path);
 }
 
-/// peer_addr returns PeerAddr::Tcp for TCP connections (regression).
+/// peer_addr returns PeerAddr::Tcp, with the client's port, for TCP
+/// connections (regression).
 #[test]
 fn peer_addr_tcp_regression() {
-    static TCP_PEER: AtomicU32 = AtomicU32::new(0);
+    static TCP_PEER_PORT: AtomicU32 = AtomicU32::new(0);
 
     struct PeerAddrHandler;
     impl AsyncEventHandler for PeerAddrHandler {
         fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
             async move {
                 let (mut tx, mut rx) = conn.split();
-                if let Some(ringline::PeerAddr::Tcp(_)) = tx.peer_addr() {
-                    TCP_PEER.store(1, Ordering::SeqCst);
-                }
                 let _ = rx
                     .with_data(|data| {
+                        // The closure also runs once with empty data at EOF;
+                        // record only on data, so a connection that closes
+                        // without sending records nothing.
+                        if !data.is_empty()
+                            && let Some(ringline::PeerAddr::Tcp(peer)) = tx.peer_addr()
+                        {
+                            TCP_PEER_PORT.store(u32::from(peer.port()), Ordering::SeqCst);
+                        }
                         let _ = tx.send_nowait(data);
                         ParseResult::Consumed(data.len())
                     })
@@ -6270,7 +6279,7 @@ fn peer_addr_tcp_regression() {
         }
     }
 
-    TCP_PEER.store(0, Ordering::SeqCst);
+    TCP_PEER_PORT.store(0, Ordering::SeqCst);
 
     let (shutdown, handles) = RinglineBuilder::new(test_config())
         .bind("127.0.0.1:0".parse().unwrap())
@@ -6278,9 +6287,19 @@ fn peer_addr_tcp_regression() {
         .expect("launch failed");
     let addr = shutdown.bound_addr().expect("bound address").to_string();
 
-    wait_for_server(&addr);
-    let _ = echo_round_trip(&addr, b"x");
-    assert_eq!(TCP_PEER.load(Ordering::SeqCst), 1);
+    let mut stream = connect_retry(&addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"x").unwrap();
+    let mut buf = [0u8; 1];
+    stream.read_exact(&mut buf).unwrap();
+    // The handler stores the port before it sends the echo.
+    assert_eq!(
+        TCP_PEER_PORT.load(Ordering::SeqCst),
+        u32::from(stream.local_addr().unwrap().port()),
+        "peer_addr must be the client's address"
+    );
 
     shutdown.shutdown();
     for h in handles {
