@@ -89,7 +89,7 @@ fn launch_error(
 }
 
 /// Returned by `launch()` with the workers' join handles. Controls shutdown,
-/// listener addresses, deferred listeners, accept steering and registered
+/// listener addresses, deferred listeners and registered
 /// regions.
 ///
 /// Dropping it calls [`shutdown`](Self::shutdown); join the handles to wait
@@ -111,7 +111,10 @@ pub struct Runtime {
     ///
     /// Only read by `set_worker_accepting`, which is Linux-only because
     /// reuseport steering is.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(target_os = "linux", any(feature = "unstable-accept", test))),
+        allow(dead_code)
+    )]
     accepting: Arc<Vec<std::sync::atomic::AtomicBool>>,
     /// Read on the io_uring backend by `register_region` /
     /// `unregister_region`; on the mio backend it sits unused but is kept
@@ -194,7 +197,7 @@ impl Runtime {
 
     /// Take a worker out of the accept rotation, or put it back.
     ///
-    /// Only affects listeners in [`AcceptMode::Merged`](crate::AcceptMode):
+    /// Only affects listeners in `AcceptMode::Merged`:
     /// each worker owns a socket in a `SO_REUSEPORT` group, and this re-steers
     /// the group so the kernel stops choosing that worker's socket. The socket
     /// stays open, which is the point — closing one **resets** whatever is
@@ -219,7 +222,9 @@ impl Runtime {
     ///
     /// Otherwise a no-op when no listener is steerable (pool mode, Unix
     /// listeners, client-only, or a non-Linux build).
-    #[cfg(target_os = "linux")]
+    ///
+    /// Requires the `unstable-accept` feature. Outside semver.
+    #[cfg(all(target_os = "linux", any(feature = "unstable-accept", test)))]
     pub fn set_worker_accepting(&self, worker: usize, accepting: bool) -> io::Result<()> {
         use std::sync::atomic::Ordering;
         if worker >= self.accepting.len() {
@@ -403,8 +408,9 @@ impl Runtime {
     ///
     /// The listeners stop accepting at once on Linux, and within about 100 ms
     /// elsewhere. A listener's sockets close, and its port is free, once the
-    /// threads accepting on it have exited: its acceptor thread, or in merged
-    /// accept mode the workers. An acceptor exits at once on Linux. On other
+    /// threads accepting on it have exited: its acceptor thread, or with the
+    /// `unstable-accept` feature in merged accept mode the workers. An
+    /// acceptor exits at once on Linux. On other
     /// platforms, or holding a connection no worker has room for, it exits
     /// within about 100 ms. This `Runtime` does not hold the sockets open.
     pub fn shutdown(&self) {
@@ -590,7 +596,7 @@ impl RuntimeShutdown {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", any(feature = "unstable-accept", test)))]
     fn has_exited(&self, worker: usize) -> bool {
         self.exited
             .lock()
@@ -739,7 +745,10 @@ struct ListenerHandle {
     /// worker, all bound to the same address. Weak, so the sockets close once
     /// the threads accepting on them exit after a shutdown, while the
     /// `Runtime` is still alive.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(target_os = "linux", any(feature = "unstable-accept", test))),
+        allow(dead_code)
+    )]
     sockets: std::sync::Weak<ListenerSockets>,
     /// `Some` for a TCP listener (after zero-port resolution), `None` for Unix.
     bound_addr: Option<SocketAddr>,
@@ -749,7 +758,10 @@ struct ListenerHandle {
     ///
     /// Only read by `set_worker_accepting`, which is Linux-only because
     /// reuseport steering is.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(target_os = "linux", any(feature = "unstable-accept", test))),
+        allow(dead_code)
+    )]
     steerable: bool,
 }
 
@@ -1004,8 +1016,9 @@ impl RinglineBuilder {
     /// one. UDP binds are not listeners and are unaffected. Calling it before
     /// any of those three is a configuration error that `launch()` reports.
     ///
-    /// Not supported with [`AcceptMode::Merged`](crate::config::AcceptMode)
-    /// on the io_uring backend, where `launch()` refuses the combination.
+    /// With the `unstable-accept` feature, not supported with
+    /// `AcceptMode::Merged` on the io_uring backend, where `launch()` refuses
+    /// the combination.
     ///
     /// ```no_run
     /// # use ringline::{Config, RinglineBuilder};
@@ -1083,7 +1096,7 @@ impl RinglineBuilder {
         // flag it reads. Refused rather than ignored: a deferral that does not defer
         // would pass a readiness probe against a server that cannot serve.
         let merged =
-            self.config.accept_mode == crate::config::AcceptMode::Merged && cfg!(has_io_uring);
+            self.config.accept_mode == crate::accept::AcceptMode::Merged && cfg!(has_io_uring);
         if merged && self.listeners.iter().any(|spec| spec.defer_listen) {
             return Err(crate::error::Error::RingSetup(
                 "defer_listen() is not supported with AcceptMode::Merged; use the default \
@@ -1352,7 +1365,7 @@ impl RinglineBuilder {
         // hundreds of KiB per runtime at the default 1024 — in pool mode,
         // which is the default and can never park.
         let park_enabled =
-            self.config.accept_mode == crate::config::AcceptMode::Merged && cfg!(has_io_uring);
+            self.config.accept_mode == crate::accept::AcceptMode::Merged && cfg!(has_io_uring);
         let mut park_txs = Vec::new();
         let mut park_rxs = Vec::new();
         if park_enabled {
@@ -1488,7 +1501,7 @@ impl RinglineBuilder {
         // TCP only: SO_REUSEPORT does not apply to Unix sockets, so a Unix
         // listener keeps its acceptor thread even in merged mode.
         let merged_mode =
-            self.config.accept_mode == crate::config::AcceptMode::Merged && cfg!(has_io_uring);
+            self.config.accept_mode == crate::accept::AcceptMode::Merged && cfg!(has_io_uring);
         let mut merged_sockets: Vec<(u32, Arc<ListenerSockets>, Option<SocketAddr>)> = Vec::new();
         if merged_mode {
             for (idx, spec) in pending_listeners.iter().enumerate() {

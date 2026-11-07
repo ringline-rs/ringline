@@ -144,6 +144,7 @@
 #![cfg_attr(all(has_io_uring, not(uring_engine)), allow(dead_code))]
 
 // ── Internal modules ────────────────────────────────────────────────────
+pub(crate) mod accept;
 pub(crate) mod acceptor;
 pub(crate) mod accumulator;
 pub(crate) mod park;
@@ -239,7 +240,8 @@ pub use topology::physical_core_count;
 // ── Re-exports: Handler types ─────────────────────────────────────────
 
 /// Where connections are accepted.
-pub use config::AcceptMode;
+#[cfg(any(feature = "unstable-accept", test))]
+pub use accept::AcceptMode;
 /// Peer address for a connection — TCP or Unix domain socket.
 pub use connection::PeerAddr;
 /// Identifies a connection.
@@ -249,6 +251,7 @@ pub use handler::ListenerId;
 /// Pre-classified part for scatter-gather sends via `submit_batch`.
 pub use handler::SendPart;
 /// Handler state carried across a park (tier 3, #443).
+#[cfg(any(feature = "unstable-accept", test))]
 pub use park::ParkState;
 /// When the bytes a connection's most recent reader call consumed arrived.
 pub use recv::arrival::RecvArrival;

@@ -4325,7 +4325,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         };
         let future_result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match adopting {
+                #[cfg(any(feature = "unstable-accept", test))]
                 Some(state) => self.handler.on_adopt(conn, state),
+                #[cfg(not(any(feature = "unstable-accept", test)))]
+                Some(_) => unreachable!("park runs only in merged accept mode"),
                 None => Box::pin(self.handler.on_accept(conn))
                     as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>,
             }));

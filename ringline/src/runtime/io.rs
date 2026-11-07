@@ -1022,7 +1022,8 @@ impl ConnCtx {
         }
     }
 
-    /// See [`Connection::offer_for_park`].
+    /// See `Connection::offer_for_park`.
+    #[cfg_attr(not(feature = "unstable-accept"), allow(dead_code))]
     pub(crate) fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         let _ = try_with_state(|driver, _| {
             #[cfg(has_io_uring)]
@@ -2283,6 +2284,7 @@ impl RecvHalf {
 
     /// Offer this connection for rebalancing. See
     /// [`Connection::offer_for_park`].
+    #[cfg(any(feature = "unstable-accept", test))]
     pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         self.conn.offer_for_park(state);
     }
@@ -2836,10 +2838,13 @@ impl Connection {
     /// with it, with any ciphertext received but not yet decrypted, so the
     /// peer sees no new handshake.
     ///
-    /// Park also requires the io_uring backend and a kernel with
-    /// `IORING_OP_FIXED_FD_INSTALL` (mainline 6.8). On mio this does
-    /// nothing; on io_uring without that operation the offer is recorded
-    /// and never acted on.
+    /// Park also requires the io_uring backend, `AcceptMode::Merged` and a
+    /// kernel with `IORING_OP_FIXED_FD_INSTALL` (mainline 6.8). On mio this
+    /// does nothing; on io_uring without either of the other two the offer
+    /// is recorded and never acted on.
+    ///
+    /// Requires the `unstable-accept` feature. Outside semver.
+    #[cfg(any(feature = "unstable-accept", test))]
     pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         self.tx.offer_for_park(state);
     }
@@ -3227,6 +3232,7 @@ impl SendHalf {
 
     /// Offer this connection for rebalancing. See
     /// [`Connection::offer_for_park`].
+    #[cfg(any(feature = "unstable-accept", test))]
     pub fn offer_for_park(&self, state: Option<crate::park::ParkState>) {
         self.conn.offer_for_park(state);
     }

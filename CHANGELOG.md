@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The `unstable-accept` feature, off by default and outside semver. It holds
+  `AcceptMode`, `ConfigBuilder::accept_mode`, `Runtime::set_worker_accepting`,
+  `offer_for_park`, `AsyncEventHandler::on_adopt` and `ParkState`. Without it
+  every connection is accepted by the acceptor thread and these items do not
+  exist, so a caller of any of them must enable the feature. Park runs only in
+  merged accept mode, so it moves with that mode. Across 5 runs per cell on
+  Linux 6.12, merged mode did not reach the 10% connect-rate win the default
+  would need: +0.8% without TLS, -5.9% with TLS
+  (`docs/listeners-and-accept-design.md`, "Connect rate"). The park and adopt
+  counters stay in the metrics and read 0 without the feature: the `connections`
+  counters, `metrics::park_diag`, `park_abandon` and `park_drain_us`.
 - `Signal::WorkerExited`: `Runtime::wait_on_signal` returns it, and shuts the
   runtime down, when a worker stops on a panic in the runtime or an error from
   its ring or poll. Before, nothing woke `wait_on_signal` for a stopped worker,
@@ -37,7 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   expose a rustls config for what the builders do not cover, such as a
   custom verifier or client certificates. Design:
   `docs/rustls-quinn-forks-design.md`.
-- io_uring: an accepted TLS connection can be parked (connection
+- io_uring, with `unstable-accept`: an accepted TLS connection can be parked
+  (connection
   rebalancing, #443) once its handshake is done. Its TLS session moves to the
   adopting worker with it, including ciphertext received but not yet
   decrypted, and the handler there reads and sends without a new handshake.
@@ -197,7 +209,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
       .launch::<Handler>()?;
   ```
 
-  Not supported with `AcceptMode::Merged` on the io_uring backend, where
+  With `unstable-accept`, not supported with `AcceptMode::Merged` on the io_uring
+  backend, where
   `launch()` refuses the combination. On the mio backend `Merged` already runs
   as `Pool`, so the deferral applies there.
 
@@ -240,6 +253,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `AcceptMode`, `ConfigBuilder::accept_mode`,
+  `Runtime::set_worker_accepting`, `offer_for_park`,
+  `AsyncEventHandler::on_adopt` and `ParkState` need the `unstable-accept`
+  feature. No released version has them, so this affects only callers tracking
+  `main`: enable the feature, or remove the calls.
 - mio: on Linux TCP, a drain no longer ends with a read that returns `EAGAIN`, which
   takes an echo from 2 reads per operation to 1, as tokio does. A read that leaves
   its buffer unfilled ends the drain, unless the event reports the read side closed
@@ -460,7 +478,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   poll that cannot be submitted is submitted again before the worker next
   waits for completions, unless the connection is being parked; a peek, once
   nothing is buffered or in flight. A FIN closes the connection even when
-  the task only sends. A park (`offer_for_park`) cancels the connection's
+  the task only sends. With `unstable-accept`, a park (`offer_for_park`) cancels the connection's
   receive and poll before it moves the socket; the adopting worker arms the
   poll, and the reader's next parked read arms a receive.
 - ringline-http's HTTP/2 connection reads with `with_data` on every backend,
@@ -594,7 +612,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   unconnected bind has no way to get a port per worker.
 
 - **Breaking:** `ShutdownHandle` is renamed `Runtime`, with no alias. It
-  controls shutdown, listener addresses, deferred listeners, accept steering
+  controls shutdown, listener addresses, deferred listeners
   and registered regions, and dropping it shuts the workers down. Replace the
   type name; its methods are unchanged.
 
@@ -654,9 +672,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client opened about as many connections as there are workers the placement
   never ran at all — measured on the rack as 2 of 8 workers left idle in 3 of 3
   reps, now 0 in 9 of 9. The margin of two still applies between two non-empty
-  workers. Merged accept mode only (#457).
+  workers. Merged accept mode only, so `unstable-accept` only (#457).
 
-- `Runtime::set_worker_accepting()` takes a worker out of the accept
+- With `unstable-accept`, `Runtime::set_worker_accepting()` takes a worker out of
+  the accept
   rotation, or puts it back, for listeners in `AcceptMode::Merged`. It re-steers
   the `SO_REUSEPORT` group with an unprivileged classic-BPF program rather than
   closing the worker's socket, because closing one resets whatever is already
@@ -664,14 +683,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   worker are still accepted, and live connections stay where they are. Tier 2
   of `docs/listeners-and-accept-design.md` (#443).
 
-- Merged accept mode now places a connection at accept time instead of taking
+- With `unstable-accept`, merged accept mode now places a connection at accept
+  time instead of taking
   the kernel's 4-tuple hash: a worker that accepts while ahead of the quietest
   peer hands the raw fd over before the connection has any state. This is what
   makes `AcceptMode::Merged` viable for a pooled client, whose connections
   otherwise land by hash. Tier 1 of `docs/listeners-and-accept-design.md`
   (#443).
 
-- `ConfigBuilder::accept_mode(AcceptMode::Merged)` gives each worker its own
+- With `unstable-accept`, `ConfigBuilder::accept_mode(AcceptMode::Merged)` gives
+  each worker its own
   `SO_REUSEPORT` listener and a multishot accept on its own ring, removing the
   acceptor thread, the per-connection channel hop and the wake fd. Default
   stays `AcceptMode::Pool`, whose explicit round-robin placement the kernel's
@@ -750,7 +771,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   again. A task that closes a connection it does not otherwise own needs the
   `SendHalf`. `peer_addr`, `tls_info`, `listener`, `is_outbound` and
   `is_recv_direct` have to be read from the `Connection` before it goes to a
-  protocol client, and `offer_for_park` cannot be called on one a client holds.
+  protocol client, and with `unstable-accept`, `offer_for_park` cannot be called on one a client holds.
   Design:
   `docs/public-context-types-design.md`.
 - **Breaking:** `Connection::cancel` and `ConnCtx::cancel`. Neither had a
@@ -881,7 +902,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   no longer ends the worker.
 - A worker that stops closes its connections, on io_uring through
   `run_shutdown`, and stops receiving new ones. Before, it unwound past
-  `run_shutdown`, and in `AcceptMode::Merged` its socket kept taking connections
+  `run_shutdown`, and in merged accept mode (`unstable-accept`) its socket kept taking connections
   that were never served. `TaskPanicPolicy::Shutdown` now applies to it.
 - A task that cancels itself with `TaskId::cancel` or `JoinHandle::abort` no longer
   corrupts the standalone task slab. The slot was freed while the task's future was
@@ -1013,7 +1034,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ringline-memcache` `set_with_guard`) record a `CommandResult` when the
   send fails, the read fails, or the server replies with an error. They
   recorded none.
-- io_uring: a park offer made while the connection holds request bytes the
+- io_uring, with `unstable-accept`: a park offer made while the connection holds request bytes the
   handler has not read, or from inside one of its reader callbacks, is
   ignored. Such an offer stayed set, so once the handler read the request
   nothing refused the park. A handler that then awaited something other than
@@ -1304,7 +1325,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Listener sockets were created without close-on-exec, so a process spawned
   while the runtime ran inherited them and kept the port bound after the
   runtime shut down. They are now close-on-exec.
-  `Runtime::set_worker_accepting` called after `shutdown()` attached its
+  With `unstable-accept`, `Runtime::set_worker_accepting` called after `shutdown()` attached its
   steering program to a closed fd number, which another socket could have
   reused; it now acts only on sockets that are still open (#561).
 

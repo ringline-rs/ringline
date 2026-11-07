@@ -54,6 +54,7 @@ pub(crate) struct ParkedFd {
 /// adopting with no state.
 ///
 /// ```
+/// # #[cfg(feature = "unstable-accept")] {
 /// use ringline::ParkState;
 ///
 /// struct Session { db: u8 }
@@ -65,11 +66,15 @@ pub(crate) struct ParkedFd {
 /// // and on the worker that adopts it
 /// let session = deposited.take::<Session>().expect("same type");
 /// assert_eq!(session.db, 3);
+/// # }
 /// ```
 ///
-/// This example is deliberately a real doctest rather than `ignore`: it is
-/// what proves the type is actually reachable from outside the crate. It was
-/// not, and nothing noticed.
+/// This example is deliberately a real doctest rather than `ignore`: with the
+/// `unstable-accept` feature it is what proves the type is actually reachable
+/// from outside the crate. It was not, and nothing noticed.
+///
+/// Requires the `unstable-accept` feature. Outside semver.
+#[cfg_attr(not(feature = "unstable-accept"), allow(dead_code))]
 pub struct ParkState {
     value: Box<dyn std::any::Any + Send>,
     /// Captured at deposit so a mismatch can name both sides. A `dyn Any`
@@ -78,6 +83,7 @@ pub struct ParkState {
     deposited_as: &'static str,
 }
 
+#[cfg_attr(not(feature = "unstable-accept"), allow(dead_code))]
 impl ParkState {
     /// Deposit `value` to be carried to the adopting worker.
     pub fn new<T: std::any::Any + Send>(value: T) -> Self {

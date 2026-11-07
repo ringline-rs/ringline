@@ -294,8 +294,8 @@ not wake a blocked `accept`, so the acceptor polls a non-blocking listener. An
 acceptor polling or holding a connection sees the flag within about 100 ms. Each listener's sockets are owned
 by a shared `ListenerSockets`. Every thread that passes their fd numbers to a
 syscall holds it, and the sockets close when the last holder drops it: after
-shutdown, when the acceptor thread or, in merged accept mode, the workers
-exit. Dropping `Runtime` invokes the same idempotent path. io_uring workers
+shutdown, when the acceptor thread or, in merged accept mode
+(`unstable-accept`), the workers exit. Dropping `Runtime` invokes the same idempotent path. io_uring workers
 observe shutdown after draining a CQE batch and run backend shutdown drainage;
 Mio workers finish the current event/task/send/close cycle before returning.
 
@@ -311,7 +311,8 @@ is a task panic wherever the runtime drops the future.
 
 A worker stops on a panic in the runtime's own event loop, or on an error from
 its ring or poll, such as `EBADR` when the kernel dropped completions. A panic
-in the `Drop` of a `ParkState` the event loop discards stops it too. It leaves
+in the `Drop` of a `ParkState` (`unstable-accept`) the event loop discards stops
+it too. It leaves
 the accept rotation, closes its connections (on io_uring through
 `run_shutdown`), and wakes `Runtime::wait_on_signal` with
 `Signal::WorkerExited`, which shuts the runtime down so a supervisor can restart

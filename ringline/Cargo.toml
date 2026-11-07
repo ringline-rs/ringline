@@ -30,6 +30,12 @@ tls-buffered = []
 # The unbuffered engine is the default; this feature has no effect and is
 # kept so existing `features = ["tls-unbuffered"]` builds still resolve.
 tls-unbuffered = []
+# Unstable, outside semver. The merged accept mode (`AcceptMode`,
+# `ConfigBuilder::accept_mode`), reuseport steering
+# (`Runtime::set_worker_accepting`) and park and adopt (`offer_for_park`,
+# `on_adopt`, `ParkState`). Park only runs in merged mode. Without this feature
+# connections are accepted by the acceptor thread and none of these items exist.
+unstable-accept = []
 
 [dependencies]
 futures-io = "0.3"

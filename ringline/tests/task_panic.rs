@@ -662,33 +662,42 @@ fn a_non_string_panic_payload_is_kept_intact() {
 /// returns and the worker does.
 #[test]
 fn a_panic_during_launch_reports_the_panic() {
-    for mode in [ringline::AcceptMode::Pool, ringline::AcceptMode::Merged] {
+    type SetMode = fn(ConfigBuilder) -> ConfigBuilder;
+    #[cfg(feature = "unstable-accept")]
+    let modes: [(&str, SetMode); 2] = [
+        ("Pool", |b| b.accept_mode(ringline::AcceptMode::Pool)),
+        ("Merged", |b| b.accept_mode(ringline::AcceptMode::Merged)),
+    ];
+    #[cfg(not(feature = "unstable-accept"))]
+    let modes: [(&str, SetMode); 1] = [("Pool", |b| b)];
+    for (mode, set_mode) in modes {
         for _ in 0..20 {
-            let config = ConfigBuilder::new()
-                .workers(1)
-                .pin_to_core(false)
-                .sq_entries(64)
-                .max_connections(16)
-                .send_pool(16, 16384)
-                .blocking_threads(0)
-                .resolver_threads(0)
-                .spawner_threads(0)
-                .accept_mode(mode)
-                .task_panic_policy(TaskPanicPolicy::Shutdown)
-                .build()
-                .expect("valid config");
+            let config = set_mode(
+                ConfigBuilder::new()
+                    .workers(1)
+                    .pin_to_core(false)
+                    .sq_entries(64)
+                    .max_connections(16)
+                    .send_pool(16, 16384)
+                    .blocking_threads(0)
+                    .resolver_threads(0)
+                    .spawner_threads(0),
+            )
+            .task_panic_policy(TaskPanicPolicy::Shutdown)
+            .build()
+            .expect("valid config");
             let launched = RinglineBuilder::new(config)
                 .bind("127.0.0.1:0".parse().unwrap())
                 .launch::<OnStartCallPanics>();
             let reported = match launched {
                 Err(ringline::Error::TaskPanicked(e)) => e.panic_message().map(str::to_string),
-                Err(other) => panic!("{mode:?}: launch lost the panic: {other}"),
+                Err(other) => panic!("{mode}: launch lost the panic: {other}"),
                 Ok((_runtime, handles)) => {
                     match join_all(handles, Duration::from_secs(10)).remove(0) {
                         Err(ringline::Error::TaskPanicked(e)) => {
                             e.panic_message().map(str::to_string)
                         }
-                        other => panic!("{mode:?}: worker lost the panic: {other:?}"),
+                        other => panic!("{mode}: worker lost the panic: {other:?}"),
                     }
                 }
             };
