@@ -919,15 +919,20 @@ fn udp_oversized_send_does_not_corrupt_state() {
         "follow-up datagram must arrive after the oversized send is rejected"
     );
 
-    let oversized_err = OVER_ERR.get().unwrap().load(Ordering::SeqCst);
-    let follow_up_ok = OVER_OK.get().unwrap().load(Ordering::SeqCst);
-    assert_eq!(oversized_err, 1, "oversized send must return Err");
-    assert_eq!(follow_up_ok, 1, "follow-up send must succeed");
-
     shutdown.shutdown();
     for h in handles {
         h.join().unwrap().unwrap();
     }
+    // Read after the join. On io_uring the follow-up send's SQE reaches the
+    // kernel only after this poll returns, so the counters are already
+    // updated when the datagram arrives, unless a full SQ forced an inline
+    // submit. The join orders the handler's `fetch_add` before these reads
+    // either way, because the handler does not await between `send_to` and
+    // `fetch_add`.
+    let oversized_err = OVER_ERR.get().unwrap().load(Ordering::SeqCst);
+    let follow_up_ok = OVER_OK.get().unwrap().load(Ordering::SeqCst);
+    assert_eq!(oversized_err, 1, "oversized send must return Err");
+    assert_eq!(follow_up_ok, 1, "follow-up send must succeed");
 }
 
 // ── Recv buffer truncation: payload larger than UDP recv buffer ────────
