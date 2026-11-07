@@ -696,11 +696,11 @@ impl Driver {
             self.connections.release(conn_index);
         }
 
-        crate::metrics::CONNECTIONS.increment(crate::metrics::conn::CLOSED);
-        // Only decrement the active gauge for connections that were counted
-        // into it — failed connects and TLS-handshake failures never
-        // incremented, so unconditional decrement underflowed the gauge.
+        // Both counters follow `established` (`metrics::conn::CLOSED`,
+        // `CONNECTIONS_ACTIVE`): a connection never counted in is neither a
+        // close nor a decrement.
         if was_established {
+            crate::metrics::CONNECTIONS.increment(crate::metrics::conn::CLOSED);
             crate::metrics::CONNECTIONS_ACTIVE.decrement();
         }
     }

@@ -61,9 +61,15 @@ pub static RECV_ARRIVAL: ShardedCounterGroup = ShardedCounterGroup::new(recv_arr
 
 // ── Gauge (not sharded) ─────────────────────────────────────────
 
+/// Established connections, accepted or outbound, not yet torn down.
+///
+/// Incremented where `ConnectionState::established` is set (a plaintext
+/// accept or connect; a TLS handshake completing) and decremented at
+/// teardown only for a connection that was established, so a failed connect
+/// or handshake moves it neither way. Same rule on both backends.
 #[metric(
     name = "ringline/connections/active",
-    description = "Currently active connections"
+    description = "Established connections not yet torn down"
 )]
 pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 
@@ -71,7 +77,12 @@ pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 
 /// Counter slot indices for connection metrics.
 pub mod conn {
+    /// Inbound connections that became established: a plaintext accept, or a
+    /// TLS handshake that completed. Outbound connections are not counted.
     pub const ACCEPTED: usize = 0;
+    /// Teardowns of established connections, accepted or outbound. A failed
+    /// connect or TLS handshake is not a close. Same rule on both backends;
+    /// `CONNECTIONS_ACTIVE` decrements under the same condition.
     pub const CLOSED: usize = 1;
     /// Parks this worker started (tier 3, #443) — an imbalance it tried to
     /// repair by moving a connection to a less loaded worker.
