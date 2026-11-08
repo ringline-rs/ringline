@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
-- **Status:** open — 14 findings recorded; F1 and F2 fixed, the rest in progress in the owner's order (F3, F4, F5, F7, F13, then the docs findings F9, F12, F14)
-- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 this PR
+- **Status:** open — 14 findings recorded; F1, F2 and F3 fixed, the rest in progress in the owner's order (F4, F5, F7, F13, then the docs findings F9, F12, F14)
+- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 this PR
 
 ## Goal
 
@@ -578,6 +578,18 @@ deferred FIN already fires from `fire_chain_complete` → `submit_next_queued`
 → the empty-queue arm (`driver.rs:1813-1830`). Test: a chain of two parts
 larger than a small `SO_SNDBUF`, `shutdown_write` in the same poll, the peer
 reads to EOF and gets the full length.
+
+**Disposition: fixed** (this PR). `shutdown_write` defers on
+`chain_table.is_active` as well. Regression test
+`shutdown_write_defers_while_chain_active` (io_uring lib test: with a chain
+started, `shutdown_write` must leave the write half `ShutdownPending` with no
+Shutdown SQE, and `fire_chain_complete` must submit it). Red and green were
+run on Linux in a SystemsLab VM (`experiments/shutdown-write-chain-verify.toml`,
+result recorded in the PR); macOS cannot compile the test. The socket-level
+test the finding proposed (a chain larger than `SO_SNDBUF`, peer reads to
+EOF) was not written: the lib test pins the state machine the fix changes,
+and the FIN's ordering behind a deferred send is the existing
+`submit_next_queued_inner` path.
 
 ### F4 — mio leaves a TLS connection open after an encrypt failure; TLS 1.2 traffic-key exhaustion is a reachable trigger and the second of two encrypt calls can spend a sequence number (T1, F1). Confirmed by trace; rustls behaviour verified in the fork. (D1, C4)
 
