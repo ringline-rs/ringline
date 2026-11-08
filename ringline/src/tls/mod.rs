@@ -776,9 +776,7 @@ impl TlsTable {
         send_copy_pool: &mut SendCopyPool,
         out: &mut Vec<crate::handler::BuiltSend>,
     ) -> Option<Vec<u8>> {
-        let Some(tls_conn) = self.get_mut(conn_index) else {
-            return None;
-        };
+        let tls_conn = self.get_mut(conn_index)?;
         #[cfg(not(feature = "tls-buffered"))]
         {
             // `queue_close_notify` signals "nothing to queue" by leaving
@@ -812,9 +810,7 @@ impl TlsTable {
         // next line, and a value/module name collision here reads as a bug.
         #[cfg(feature = "tls-buffered")]
         {
-            let Some(b) = tls_conn.conn.as_buffered_mut() else {
-                return None;
-            };
+            let b = tls_conn.conn.as_buffered_mut()?;
             b.send_close_notify();
             tls_conn.close_notify_sent = true;
             // On failure `take_tls_output_sends` consumed nothing: the alert
