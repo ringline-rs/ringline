@@ -3082,7 +3082,9 @@ impl SendHalf {
     /// [`submit_batch`](AsyncSendBuilder::submit_batch) takes pre-classified
     /// `SendPart`s. Both are fire-and-forget;
     /// [`submit_batch_await`](AsyncSendBuilder::submit_batch_await) also returns
-    /// a [`SendFuture`]. On the mio backend every part is copied.
+    /// a [`SendFuture`]. On the mio backend every part is copied. A batch
+    /// whose parts carry no bytes queues nothing through `build` and
+    /// `submit_batch`; `submit_batch_await` rejects it with `InvalidInput`.
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.conn.send_parts()
     }
