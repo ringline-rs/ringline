@@ -908,6 +908,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- mio: a TLS encryption failure in `send`, `send_nowait` or
+  `send_backpressured` closes the connection, as it did on io_uring. The
+  error was returned and the connection left open and receiving. A record
+  rustls sealed before the failure has spent a sequence number with no
+  ciphertext queued for it, so the next send would be rejected by the peer
+  as `bad_record_mac`; the reachable failure is the traffic keys exhausted
+  on TLS 1.2 AES-GCM (on by default) after 2^24 records, which TLS 1.2
+  cannot rekey. `SendHalf::send` and `send_nowait` document the rule. Found
+  by the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F4).
+
 - io_uring: `shutdown_write` while a `send_chain` is active defers the FIN
   until the chain completes. It deferred only behind in-flight and queued
   sends, and a chain sets neither, so a `send_chain_nowait` of parts larger

@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
-- **Status:** open — 14 findings recorded; F1, F2 and F3 fixed, the rest in progress in the owner's order (F4, F5, F7, F13, then the docs findings F9, F12, F14)
-- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 this PR
+- **Status:** open — 14 findings recorded; F1 to F4 fixed, the rest in progress in the owner's order (F5, F7, F13, then the docs findings F9, F12, F14)
+- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 this PR
 
 ## Goal
 
@@ -629,6 +629,15 @@ Fix: in both mio TLS branches call `self.close(conn)` (mio
 `SendHalf::send` that a TLS encrypt error closes the connection and the
 buffer cannot be resent. Not reproduced (needs 2^24 records on one TLS 1.2
 connection).
+
+**Disposition: fixed** (this PR). Both mio TLS branches call
+`DriverCtx::close` before returning the error, as io_uring's
+`encrypt_tls_send` does for every error from `encrypt_to_sends`.
+Regression test `a_tls_encrypt_error_closes_the_connection` (mio driver,
+unbuffered engine): the trigger is a session that has not handshaked, which
+`encrypt_with` refuses with `WouldBlock`; key exhaustion is not reproducible
+in a test. On the unfixed tree the connection stayed `Open` after the error.
+The sequence-number claim rests on the fork reading above and is not tested.
 
 ### F5 — close_notify is dropped silently when the pool is exhausted at close, and the connection records it as sent (close_notify). Confirmed by trace; io_uring only. (D3)
 

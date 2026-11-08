@@ -2669,7 +2669,18 @@ impl<'a> DriverCtx<'a> {
         let tls = !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) };
         let bytes = if tls {
             let tls_table = unsafe { &mut *self.tls_table };
-            crate::tls::encrypt_for_send_mio(tls_table, conn.index, data)?
+            match crate::tls::encrypt_for_send_mio(tls_table, conn.index, data) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // The record layer is finished: a record rustls sealed
+                    // before the failure spent a sequence number with no
+                    // ciphertext queued for it, so the next record would be
+                    // `bad_record_mac` at the peer, and TLS 1.2 cannot
+                    // rekey. Same rule as io_uring's `encrypt_tls_send`.
+                    self.close(conn);
+                    return Err(e);
+                }
+            }
         } else {
             data.to_vec()
         };
@@ -2785,8 +2796,11 @@ impl<'a> DriverCtx<'a> {
                 Err(e) => {
                     // rustls has already advanced; nothing is queued, so
                     // give the permit back and let the caller see the
-                    // error (no completion for `id` is produced).
+                    // error (no completion for `id` is produced). The
+                    // connection is closed for the reason `send_inner`
+                    // gives: a sealed record's sequence number is spent.
                     self.release_permit(permit);
+                    self.close(conn);
                     return Err(e);
                 }
             };
