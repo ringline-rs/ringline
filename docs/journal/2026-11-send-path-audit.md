@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
-- **Status:** open — 14 findings recorded; F1 to F5 fixed, the rest in progress in the owner's order (F7, F13, then the docs findings F9, F12, F14)
-- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 this PR
+- **Status:** open — 14 findings recorded; F1 to F5 and F7 fixed, the rest in progress in the owner's order (F13, then the docs findings F9, F12, F14)
+- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 this PR
 
 ## Goal
 
@@ -722,6 +722,17 @@ prefix); it is reachable through the public API.
 Fix: in `SendBuilder::submit`, when `total_len == 0`, settle the id with
 `Ok(0)` and return without building (as the `part_count == 0` arm does), or
 refuse with `InvalidInput` as `submit_batch_await` does for an empty batch.
+
+**Disposition: fixed** (this PR). `SendBuilder::submit` treats
+`total_len == 0` as it treats `part_count == 0`: nothing is built or queued
+and an awaited id settles `Ok(0)`, which is what `send` does for an empty
+buffer and what mio does for the same batch. `InvalidInput` was not chosen:
+`submit_batch_await` refuses an empty batch before registering an id, but
+the builder's `copy(&[])` is accepted and a caller assembling parts from
+a parser cannot always avoid an empty one. Regression test
+`a_zero_length_send_parts_batch_queues_nothing` (io_uring lib test: no SQE,
+no slot, `Ok(0)` for the awaited form); red and green run in a SystemsLab
+VM (`experiments/zero-length-send-parts-verify.toml`, result in the PR).
 
 ### F8 — `run_shutdown` step 2 ignores a refused plain `Close`, holding exit for the full 10 s bound (F3). Plausible. (C3)
 

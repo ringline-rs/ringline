@@ -908,6 +908,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a `send_parts` batch whose parts carry no bytes queues nothing
+  and resolves an awaited batch with `Ok(0)`, as a `send` of an empty buffer
+  does. It took a send-pool slot and pushed a zero-length Send SQE, whose
+  result 0 the completion handler read as a failed send: every send queued
+  behind it on the connection was discarded with `ConnectionAborted`, the
+  connection stayed open, and later sends reached the peer after the gap.
+  mio sent nothing for such a batch already. Found by the send-path audit
+  (`docs/journal/2026-11-send-path-audit.md`, F7).
+
 - io_uring: a TLS close that finds the send pool exhausted no longer drops
   its close_notify and records it as sent. The alert needs one pool slot;
   when the pool had none at the close, the connection closed behind a bare

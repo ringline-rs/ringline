@@ -3802,12 +3802,17 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     }
 
     /// Submit the scatter-gather send.
+    ///
+    /// A batch with no parts, or whose parts carry no bytes, queues nothing
+    /// and settles an awaited id with `Ok(0)`: a zero-length Send SQE
+    /// completes with 0, which `handle_send` reads as a failed send and
+    /// drains the queue behind it.
     pub fn submit(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             return Err(e);
         }
 
-        if self.part_count == 0 {
+        if self.part_count == 0 || self.total_len == 0 {
             if let Some(id) = self.send_id {
                 self.ctx.attach_send_id(None, id, 0);
             }
