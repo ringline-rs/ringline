@@ -3509,10 +3509,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let conn_index = ud.conn_index();
 
         // The payload is the generation of the connection the Connect was
-        // submitted for. A close on a `Connecting` slot (the connect timeout)
-        // commits its Close at once, whose lead ends the Connect, so this CQE
-        // can arrive after the slot was freed and reused and must not touch
-        // the new occupant.
+        // submitted for. The connect timeout's close is committed by the
+        // end-of-iteration drain without waiting for this CQE, so it can
+        // arrive after the slot was freed and reused and must not touch the
+        // new occupant.
         let generation = match self.driver.connections.get(conn_index) {
             Some(conn) if conn.generation == ud.payload() => conn.generation,
             _ => return,
