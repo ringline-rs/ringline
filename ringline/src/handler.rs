@@ -1175,8 +1175,8 @@ impl<'a> DriverCtx<'a> {
             return;
         }
         // Idempotent: a second request while pending or after the FIN is a
-        // no-op.
-        if !matches!(cs.write, crate::connection::WriteHalf::Open) {
+        // no-op. A requested close owns the socket from here on.
+        if !matches!(cs.write, crate::connection::WriteHalf::Open) || cs.close_requested() {
             return;
         }
         let idx = conn.index as usize;

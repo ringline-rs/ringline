@@ -908,6 +908,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a forced close (the TLS close_notify deadline) of a connection
+  whose `Shutdown` is in the kernel no longer records the write half as
+  open, so a repeat `shutdown_write` in that window submits no second
+  `Shutdown`, which the first one's CQE would have committed the Close
+  ahead of. `shutdown_write` on a connection whose close is requested
+  submits nothing, as on mio.
 - io_uring: a Connect CQE is matched to the connection it was submitted
   for. The Connect SQE carried no generation, so after a connect timeout
   closed the slot, the cancelled Connect's CQE could run against the slot's
