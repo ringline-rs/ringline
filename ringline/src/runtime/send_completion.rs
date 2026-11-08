@@ -24,7 +24,8 @@
 //! enqueue ─▶ waiting ─mark_submitted─▶ InFlight ─complete─▶ Done ─take_result─▶ gone
 //!              │                          │                       ▲
 //!              │ cancel ─▶ gone           │ cancel ─▶ Abandoned   │ complete
-//!              │                          │             └complete─▶ gone
+//!              │                          │             ├complete─▶ gone
+//!              │                          │             └set_owner─▶ InFlight
 //!              │ remove_connection        │ remove_connection     │
 //!              ▼                          ▼                       │
 //!           Aborted ◀───────────────── Aborted ───────────────────┘
@@ -93,8 +94,11 @@ enum Completion {
     /// docs for why teardown can run before the flush that completes the
     /// send.
     Aborted(io::Error),
-    /// The future was dropped while the operation was in flight. The driver
-    /// still owns the operation; its completion frees the slot.
+    /// The future was dropped while the operation was in flight, or the
+    /// connection task that owned it was removed (it returned, panicked, or
+    /// its connection was torn down) while it was in flight. The driver
+    /// still owns the operation; its completion frees the slot. A poll of
+    /// the future (`set_owner`) returns the entry to `InFlight`.
     Abandoned,
 }
 
@@ -284,10 +288,23 @@ impl SendCompletions {
     /// Called by the send futures on every poll after the first, so that a
     /// future moved between tasks (or polled from a different task than the
     /// one that enqueued it) is woken where it now lives.
+    ///
+    /// A poll proves the future is alive, so an `Abandoned` entry becomes
+    /// `InFlight` again, whoever the owner was.
+    /// [`remove_connection`](Self::remove_connection) abandons every
+    /// in-flight entry the dead connection task owned, and cannot tell a
+    /// future that died with the task from one the task had handed to
+    /// another task that had not yet polled it. A completion on an
+    /// `Abandoned` entry frees it and wakes nobody, so a live future whose
+    /// entry stayed `Abandoned` would never resolve. A dropped future is
+    /// never polled again, so `cancel`'s `Abandoned` is not revived.
     pub(crate) fn set_owner(&mut self, id: SendId, task_id: u32) {
         let Some(e) = self.entry_mut(id) else {
             return;
         };
+        if matches!(e.state, Completion::Abandoned) {
+            e.state = Completion::InFlight;
+        }
         let old = std::mem::replace(&mut e.task_id, task_id);
         if old != task_id {
             if is_connection_task(old) {
@@ -483,7 +500,9 @@ impl SendCompletions {
     /// `take_result`. Parking a `Done` for it would leak one entry per
     /// closed connection. Those entries are instead treated as cancelled:
     /// waiting → removed, `InFlight` → `Abandoned` (the completion still
-    /// arrives and removes it), `Done` → removed.
+    /// arrives and removes it, unless a poll of a future the task had
+    /// handed to another task revives it first; see `set_owner`), `Done` →
+    /// removed.
     ///
     /// Visits only the entries indexed under `conn_index`, and allocates the
     /// returned `Vec` and a list of those entries; this is the teardown path.
@@ -1182,5 +1201,34 @@ mod tests {
         );
         assert_eq!(q.waiting_len(), 1);
         assert_eq!(q.submitted_len(), 0);
+    }
+
+    /// A poll proves the future is alive. An entry whose creator's
+    /// connection task returned before the future was first polled by the
+    /// task it was handed to is `Abandoned` by `remove_connection`; the new
+    /// owner's poll revives it, so the driver's completion wakes that owner
+    /// instead of freeing the entry and waking nobody.
+    #[test]
+    fn a_poll_from_a_live_task_revives_an_entry_its_dead_creator_abandoned() {
+        const N: u32 = 3;
+        let mut q = SendCompletions::new();
+        let id = q.register(N, N);
+        assert!(q.remove_connection(N).is_empty());
+        assert_eq!(
+            q.live(),
+            1,
+            "abandoned, not freed: the driver still owns the send"
+        );
+
+        // The task the future was handed to polls it.
+        q.set_owner(id, task(5));
+        assert!(q.take_result(id).is_none(), "no result yet: the task parks");
+        assert_eq!(
+            q.complete(id, Ok(5)),
+            Some(task(5)),
+            "the live owner is woken; `None` would park it forever"
+        );
+        assert_eq!(q.take_result(id).expect("resolved").expect("ok"), 5);
+        assert_eq!(q.live(), 0);
     }
 }

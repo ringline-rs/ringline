@@ -1967,10 +1967,20 @@ mod tests {
         config: &Config,
         accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
     ) -> (AsyncEventLoop<NoopHandler>, crate::wakeup::WakeHandle) {
+        test_loop_with_handler(config, NoopHandler, accept_rx)
+    }
+
+    /// [`test_loop_with_accept`] for a handler whose `on_accept` the test
+    /// drives through `spawn_accept_task`.
+    fn test_loop_with_handler<H: AsyncEventHandler>(
+        config: &Config,
+        handler: H,
+        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+    ) -> (AsyncEventLoop<H>, crate::wakeup::WakeHandle) {
         let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
         let event_loop = AsyncEventLoop::new(
             config,
-            NoopHandler,
+            handler,
             accept_rx,
             read_fd,
             handle.as_wake_fd(),
@@ -2781,6 +2791,74 @@ mod tests {
         assert!(
             !event_loop.executor.task_slab.has_task(conn_index),
             "the close finalized"
+        );
+    }
+
+    thread_local! {
+        /// Where the handed-off send's result lands, for the test to read.
+        static HANDOFF_RESULT: std::cell::RefCell<Option<io::Result<u32>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// `on_accept` queues an awaited send, hands the unpolled future to a
+    /// spawned task, and returns.
+    struct HandoffHandler;
+
+    impl AsyncEventHandler for HandoffHandler {
+        #[allow(clippy::manual_async_fn)]
+        fn on_accept(&self, conn: crate::Connection) -> impl Future<Output = ()> + 'static {
+            async move {
+                let (mut tx, _rx) = conn.split();
+                let fut = tx.send(b"hello").expect("queued");
+                crate::spawn(async move {
+                    let r = fut.await;
+                    HANDOFF_RESULT.with(|c| *c.borrow_mut() = Some(r));
+                })
+                .expect("spawned");
+            }
+        }
+
+        fn create_for_worker(_worker_id: usize) -> Self {
+            HandoffHandler
+        }
+    }
+
+    /// A `SendFuture` created by the connection task and first polled by the
+    /// spawned task it was handed to, after the connection task returned,
+    /// resolves with the delivered byte count. The connection task's return
+    /// abandons the entry (its recorded owner died); the spawned task's poll
+    /// revives it, and the flush's completion wakes that task.
+    #[test]
+    fn a_send_future_handed_to_a_spawned_task_resolves_after_its_creator_returns() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop_with_handler(&config, HandoffHandler, None);
+        let (conn_index, mut client) = attach_conn(&mut el.driver);
+        HANDOFF_RESULT.with(|c| *c.borrow_mut() = None);
+
+        el.spawn_accept_task(conn_index);
+        // The connection task queues the send, spawns, and returns; the
+        // spawned task polls the future in the same pass.
+        el.poll_ready_tasks();
+        assert!(
+            !el.driver.pending_sends[conn_index as usize].is_empty(),
+            "the send is still queued when the connection task returns"
+        );
+        for _ in 0..5 {
+            el.flush_all_pending_sends();
+            el.drain_send_completions();
+            el.drain_pending_closes();
+            el.executor.collect_wakeups();
+            el.poll_ready_tasks();
+        }
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).expect("the peer got the bytes");
+        assert_eq!(&buf, b"hello");
+        assert_eq!(el.executor.send_completions.live(), 0, "the entry is gone");
+        let result = HANDOFF_RESULT.with(|c| c.borrow_mut().take());
+        assert_eq!(
+            result.map(|r| r.map_err(|e| e.kind())),
+            Some(Ok(5)),
+            "the spawned task's send resolves with the delivered count"
         );
     }
 }
