@@ -1,6 +1,8 @@
 # Result-aware receives and backpressured sends, landed as a series
 
-- **Status:** open
+- **Status:** shipped (`docs/journal/2026-09-backpressured-sends.md`); the
+  follow-ups below are closed except (d), per
+  `docs/journal/2026-11-send-path-audit.md` X4
 - **Span:** 2026-09-10 → · PRs #367 (design), PR 1 of 9 (this PR) · unreleased (post-0.6.3)
 
 ## Goal
@@ -146,7 +148,12 @@ Open.
 
 ## Lessons / open questions
 
-- **PR 4 follow-ups (adversarial review, 2026-09-12).** (a)
+- **PR 4 follow-ups (adversarial review, 2026-09-12).** Closed since, except
+  (d): (a) by the removal of the recv-buffer ring, (b) by `send_inner`
+  settling `Ok(0)`, (c) by
+  `bounded_tls_send_parks_and_then_fails_rather_than_re_encrypting`, (e) by
+  `SendChainBuilder::finish` refusing while a send is in flight and
+  `submit_or_queue` queueing behind a chain. (a)
   `handle_send_recv_buf`'s partial-resubmit push failure still drops the
   remainder of a recv-buffer forward on an open connection — a pre-existing
   silent hole that the new Invariant 7 wording now contradicts; route it
@@ -162,7 +169,8 @@ Open.
   retry drain out of that race but does not fix the chain path itself.
 
 - **PR 8/9 follow-up (adversarial review, 2026-09-12): a TLS bounded send
-  reports two different lengths depending on which branch it takes.**
+  reports two different lengths depending on which branch it takes.** Closed
+  by #617: both branches report `data.len()`.
   `DriverCtx::send_bounded`'s empty-ciphertext early return completes the id
   with `Ok(plaintext_len)`, while a queued TLS entry completes with
   `Ok(ciphertext_len)` from `flush_sends` — two branches of one function

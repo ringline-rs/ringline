@@ -1,5 +1,9 @@
 # mio completion identity and bounded-send path (series PR 6)
 
+Note: identifiers in this document are those of the PR it describes;
+`docs/send-completion-slots-design.md` "What goes away" lists the renames
+since. Code: `ringline/src/runtime/send_completion.rs`.
+
 Sixth PR of the series that lands #318
 (`docs/backpressured-sends-series-design.md`, "PR 6"). Design origin:
 @thinkingfish in #318; re-derived on current `main` on top of PR 4

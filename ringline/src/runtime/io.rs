@@ -1576,7 +1576,8 @@ impl ConnCtx {
 ///
 /// From [`SendHalf::send_parts`]. [`build`](Self::build) takes a closure that
 /// chains `.copy()` and `.guard()` and ends with `.submit()`. This is a synchronous
-/// builder; the send is fire-and-forget (no future).
+/// builder: `build` and `submit_batch` are fire-and-forget, and
+/// `submit_batch_await` returns a [`SendFuture`].
 pub struct AsyncSendBuilder {
     token: ConnId,
 }
@@ -1615,11 +1616,12 @@ impl AsyncSendBuilder {
     /// allowing callers to mix copy and guard parts in a single SQE from borrowed data.
     ///
     /// All parts go into a single SQE. If the batch exceeds the internal
-    /// iovec or guard limits, the entire batch is rejected with `Err`
-    /// (nothing is sent, guard parts are dropped) — the call never consumes
-    /// a prefix. On success, returns the number of parts submitted (always
-    /// `parts.len()`); callers wanting larger batches should split them
-    /// (the protocol clients cap at 4 guards / 9 iovecs per flush).
+    /// iovec or guard limits, or on a plaintext connection its copy parts
+    /// together exceed one send-pool slot, the entire batch is rejected with
+    /// `Err` (`InvalidInput`; nothing is sent, guard parts are dropped): the
+    /// call never consumes a prefix. On success, returns the number of parts
+    /// submitted (always `parts.len()`); callers wanting larger batches
+    /// should split them (ringline-redis flushes at 8 guards or 17 iovecs).
     pub fn submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<usize> {
         use crate::handler::SendPart;
         with_state(|driver, _| {
@@ -3036,15 +3038,25 @@ impl SendHalf {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the send copy pool cannot admit the whole buffer
-    /// (`Other`, retryable once in-flight sends complete) or if the buffer
-    /// is wider than the entire pool (`InvalidInput`). Nothing was queued or
-    /// transmitted on `Err`, so the same buffer may be sent again later. On a
-    /// TLS connection the pool is checked against the ciphertext bound
-    /// before anything is encrypted, which is what keeps that true there.
-    /// Submission-queue pressure is not an error: the send is queued
-    /// and retried. Persistent submission-queue starvation is reported like
-    /// a write error: the awaited `SendFuture` resolves `Err` and the
+    /// `NotConnected` if this handle is stale (its connection closed and
+    /// the slot may hold another). On io_uring also `NotConnected` once the
+    /// connection's Close has been submitted and, on a TLS connection, once
+    /// its close_notify has been queued; on mio a send made after `close` is
+    /// queued and flushed or discarded with the connection. On io_uring,
+    /// `Other` if the send copy
+    /// pool cannot admit the whole buffer (retryable once in-flight sends
+    /// complete) and `InvalidInput` if the buffer is wider than the entire
+    /// pool; on a TLS connection the pool is checked against the ciphertext
+    /// bound before anything is encrypted. On mio a plaintext send never
+    /// fails for pool reasons. Nothing was queued or transmitted on those
+    /// errors, so the same buffer may be sent again later. A TLS encryption
+    /// failure (`Other`; on TLS 1.2, the traffic keys exhausted) closes the
+    /// connection on both backends, because the record layer is finished: a
+    /// record sealed before the failure has spent a sequence number, and
+    /// TLS 1.2 cannot rekey, so the buffer cannot be sent again on it.
+    /// Submission-queue pressure is not an error: the send is queued and
+    /// retried. Persistent submission-queue starvation is reported like a
+    /// write error: the awaited `SendFuture` resolves `Err` and the
     /// connection is closed.
     pub fn send(&mut self, data: &[u8]) -> io::Result<SendFuture> {
         self.conn.send(data)
@@ -3058,11 +3070,9 @@ impl SendHalf {
     ///
     /// # Errors
     ///
-    /// Same error contract as `send()`: pool admission errors
-    /// only (`Other` when the pool cannot admit the whole buffer,
-    /// `InvalidInput` when it never could), nothing committed on `Err`,
-    /// submission-queue pressure absorbed by the queue. With no future to resolve, persistent
-    /// submission-queue starvation surfaces only as the connection closing.
+    /// The errors of [`send`](Self::send). With no future to resolve,
+    /// persistent submission-queue starvation surfaces only as the connection
+    /// closing.
     ///
     /// For backpressure-aware sending, use `send()` instead.
     pub fn send_nowait(&mut self, data: &[u8]) -> io::Result<()> {
@@ -3077,7 +3087,22 @@ impl SendHalf {
     /// [`submit_batch`](AsyncSendBuilder::submit_batch) takes pre-classified
     /// `SendPart`s. Both are fire-and-forget;
     /// [`submit_batch_await`](AsyncSendBuilder::submit_batch_await) also returns
-    /// a [`SendFuture`]. On the mio backend every part is copied.
+    /// a [`SendFuture`]. On the mio backend every part is copied. A batch
+    /// whose parts carry no bytes queues nothing through `build` and
+    /// `submit_batch`; `submit_batch_await` rejects it with `InvalidInput`.
+    /// On an io_uring plaintext connection the copy parts of one batch are
+    /// gathered into one send-pool slot, so together they must fit the
+    /// `slot_size` given to [`ConfigBuilder::send_pool`](crate::ConfigBuilder::send_pool);
+    /// a wider batch is rejected with `InvalidInput`. Up to 32 parts and 8
+    /// guards; more is `InvalidInput`. A batch with guards whose parts
+    /// together total less than `send_zc_threshold` is gathered, guards
+    /// included, into one pool slot and sent as a plain send when a slot is
+    /// free and the gather fits it; otherwise, and at or above the
+    /// threshold, it goes out zero-copy through the send slab. `Other` when
+    /// the pool, or for a zero-copy batch the send slab, has no free entry;
+    /// `NotConnected` as for [`send`](Self::send). A TLS batch is gathered,
+    /// encrypted into as many slots as its ciphertext needs, and queued in
+    /// order, sent as one run when the send slab has a free entry.
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.conn.send_parts()
     }
@@ -3139,10 +3164,10 @@ impl SendHalf {
     /// (copied into the send pool below `send_zc_threshold`). Otherwise
     /// `data` is copied as by [`send_nowait`](Self::send_nowait).
     ///
-    /// On mio, `data` is always copied as by `send_nowait`. On a TLS
-    /// connection it is always encrypted into the send pool; when `data` is
-    /// the whole accumulator, the accumulator is detached first and gathered
-    /// into a temporary buffer.
+    /// On mio, `data` is always copied as by `send_nowait`, encrypted first
+    /// on a TLS connection. On io_uring a TLS connection is always encrypted
+    /// into the send pool; when `data` is the whole accumulator, the
+    /// accumulator is detached first and gathered into a temporary buffer.
     ///
     /// On io_uring, a connection holding
     /// [`forward_hold_cap`](crate::ConfigBuilder::forward_hold_cap) send slab
@@ -3202,6 +3227,11 @@ impl SendHalf {
     /// guard parts included, and `finish` encrypts them as one send and queues
     /// it behind the connection's other sends, so it does not refuse while
     /// earlier sends are in flight.
+    ///
+    /// On a plaintext connection each `copy` and each part's copy data
+    /// together must fit one send-pool slot (the `slot_size` given to
+    /// [`ConfigBuilder::send_pool`](crate::ConfigBuilder::send_pool));
+    /// `finish` rejects a wider one with `InvalidInput` and submits nothing.
     ///
     /// A chain that fails closes the connection, because an unknown part of it
     /// was sent and the sends queued behind it are lost, so later bytes would
