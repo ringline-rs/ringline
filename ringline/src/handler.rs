@@ -4208,8 +4208,9 @@ pub struct SendChainBuilder<'b, 'a> {
 
 #[cfg(has_io_uring)]
 impl<'b, 'a> SendChainBuilder<'b, 'a> {
-    /// Add a copy-only send to the chain. `data` must fit one send-pool
-    /// slot; a larger `data` fails `finish` with `InvalidInput`.
+    /// Add a copy-only send to the chain. On a plaintext connection `data`
+    /// must fit one send-pool slot, or `finish` fails with `InvalidInput`;
+    /// on a TLS connection it is appended to the chain's plaintext.
     pub fn copy(mut self, data: &[u8]) -> Self {
         if self.error.is_some() {
             return self;

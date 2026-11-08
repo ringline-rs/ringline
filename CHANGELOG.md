@@ -908,12 +908,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- io_uring: a copy-only `send_parts` batch, a `send_chain` copy, or a
-  copy-only chain part whose copy data is wider than one send-pool slot is
-  rejected with `InvalidInput`, as the same data beside a guard part already
-  was. It was reported as `Other("send copy pool exhausted")`, the error a
-  caller following the `send` contract retries, for a batch that can never
-  fit. `SendHalf::send_parts` and `send_chain` document the one-slot limit.
+- io_uring: on a plaintext connection, a copy-only `send_parts` batch, a
+  `send_chain` copy, or a copy-only chain part whose copy data is wider
+  than one send-pool slot is rejected with `InvalidInput`, as the same data
+  beside a guard part already was. It was reported as `Other("send copy
+  pool exhausted")`, the error a caller following the `send` contract
+  retries, for a batch that can never fit. A TLS batch is encrypted into as
+  many slots as it needs and is unaffected. `SendHalf::send_parts`,
+  `AsyncSendBuilder::submit_batch` and `send_chain` document the one-slot
+  limit.
   Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
   F13).
 

@@ -1615,11 +1615,12 @@ impl AsyncSendBuilder {
     /// allowing callers to mix copy and guard parts in a single SQE from borrowed data.
     ///
     /// All parts go into a single SQE. If the batch exceeds the internal
-    /// iovec or guard limits, the entire batch is rejected with `Err`
-    /// (nothing is sent, guard parts are dropped) — the call never consumes
-    /// a prefix. On success, returns the number of parts submitted (always
-    /// `parts.len()`); callers wanting larger batches should split them
-    /// (the protocol clients cap at 4 guards / 9 iovecs per flush).
+    /// iovec or guard limits, or on a plaintext connection its copy parts
+    /// together exceed one send-pool slot, the entire batch is rejected with
+    /// `Err` (`InvalidInput`; nothing is sent, guard parts are dropped): the
+    /// call never consumes a prefix. On success, returns the number of parts
+    /// submitted (always `parts.len()`); callers wanting larger batches
+    /// should split them (ringline-redis flushes at 8 guards or 17 iovecs).
     pub fn submit_batch(self, parts: Vec<crate::handler::SendPart<'_>>) -> io::Result<usize> {
         use crate::handler::SendPart;
         with_state(|driver, _| {
@@ -3085,9 +3086,11 @@ impl SendHalf {
     /// a [`SendFuture`]. On the mio backend every part is copied. A batch
     /// whose parts carry no bytes queues nothing through `build` and
     /// `submit_batch`; `submit_batch_await` rejects it with `InvalidInput`.
-    /// On io_uring the copy parts of one batch are gathered into one
-    /// send-pool slot, so together they must fit `send_copy_slot_size`; a
-    /// batch whose copy parts are wider is rejected with `InvalidInput`.
+    /// On an io_uring plaintext connection the copy parts of one batch are
+    /// gathered into one send-pool slot, so together they must fit the
+    /// `slot_size` given to [`ConfigBuilder::send_pool`](crate::ConfigBuilder::send_pool);
+    /// a wider batch is rejected with `InvalidInput`. A TLS batch is
+    /// encrypted into as many slots as its ciphertext needs.
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.conn.send_parts()
     }
@@ -3214,8 +3217,9 @@ impl SendHalf {
     /// earlier sends are in flight.
     ///
     /// On a plaintext connection each `copy` and each part's copy data
-    /// together must fit one send-pool slot (`send_copy_slot_size`); `finish`
-    /// rejects a wider one with `InvalidInput` and submits nothing.
+    /// together must fit one send-pool slot (the `slot_size` given to
+    /// [`ConfigBuilder::send_pool`](crate::ConfigBuilder::send_pool));
+    /// `finish` rejects a wider one with `InvalidInput` and submits nothing.
     ///
     /// A chain that fails closes the connection, because an unknown part of it
     /// was sent and the sends queued behind it are lost, so later bytes would

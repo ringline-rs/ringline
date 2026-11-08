@@ -819,8 +819,10 @@ of `add`, returning `InvalidInput`; document the one-slot limit on
 `send_parts` and `send_chain` (F14).
 
 **Disposition: fixed** (this PR). All three sites check the slot size
-before the gather and return `InvalidInput`; `SendHalf::send_parts` and
-`send_chain` state the one-slot limit (the F14 item for it closes here).
+before the gather and return `InvalidInput`; `SendHalf::send_parts`,
+`AsyncSendBuilder::submit_batch` and `send_chain` state the one-slot limit
+on a plaintext connection, and `submit_batch`'s stale "4 guards / 9 iovecs"
+figure is corrected (the F14 items for both close here).
 Regression test `copy_data_wider_than_a_slot_is_invalid_input_on_every_builder`
 (io_uring lib test, 64-byte slots); red and green run in a SystemsLab VM
 (`experiments/oversize-copy-batch-verify.toml`, result in the PR).
