@@ -694,6 +694,11 @@ pub(crate) struct Driver {
     pub(crate) pending_coalesced_retries: Vec<(u32, u32, u16, u8)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
+    /// `Shutdown` SQEs the ring refused: (conn_index, generation). The write
+    /// half already reads `Shutdown` and `shutdown_inflight` is set, so the
+    /// Close waits for the FIN; `drain_shutdown_retries` pushes each again
+    /// on the close-retry backoff and drops one whose slot was recycled.
+    pub(crate) pending_shutdown_retries: Vec<(u32, u32)>,
     /// Connections whose queued head send could not be pushed (SQ still
     /// full after submit): (conn_index, generation, attempts). Drained each
     /// tick by `drain_send_retries`; the entry stays at the queue head with
@@ -1153,6 +1158,7 @@ impl Driver {
             send_backstop_armed: false,
             pending_coalesced_retries: Vec::new(),
             pending_close_retries: Vec::new(),
+            pending_shutdown_retries: Vec::new(),
             pending_send_retries: Vec::new(),
             settled_sends: VecDeque::new(),
             recv_aborts: VecDeque::new(),
@@ -1269,6 +1275,7 @@ impl Driver {
             fs_cmd_slab: &mut self.fs_cmd_slab,
             fs_fd_base: self.fs_fd_base,
             pending_finalize_closes: &mut self.pending_finalize_closes,
+            pending_shutdown_retries: &mut self.pending_shutdown_retries,
             pending_send_retries: &mut self.pending_send_retries,
             settled_sends: &mut self.settled_sends,
             capacity_released: &mut self.capacity_released,
@@ -1884,17 +1891,16 @@ impl Driver {
         if let Some(cs) = self.connections.get_mut(conn_index)
             && matches!(cs.write, WriteHalf::ShutdownPending)
         {
-            // Refused (ring backpressure): fall back to `Open` so a
-            // repeat `shutdown_write` can re-request the FIN rather
-            // than stranding it as pending on an empty queue.
             let generation = cs.generation;
-            cs.write = if self.ring.submit_shutdown(conn_index, generation).is_ok() {
-                // The slot must now outlive the SQE: see `shutdown_inflight`.
-                self.send_queues[conn_index as usize].shutdown_inflight = true;
-                WriteHalf::Shutdown
-            } else {
-                WriteHalf::Open
-            };
+            cs.write = WriteHalf::Shutdown;
+            // The slot must now outlive the SQE, pushed or parked: see
+            // `shutdown_inflight`.
+            self.send_queues[conn_index as usize].shutdown_inflight = true;
+            if self.ring.submit_shutdown(conn_index, generation).is_err() {
+                // Refused (ring backpressure): parked, and pushed again by
+                // `drain_shutdown_retries`, as a refused send or Close is.
+                self.pending_shutdown_retries.push((conn_index, generation));
+            }
         }
         // Register a deferred close now that nothing is in flight and the
         // queue is empty. The ZC completion path reaches here without a
@@ -2775,6 +2781,9 @@ impl Driver {
         for (_, _, slab_idx, _) in std::mem::take(&mut self.pending_zc_retries) {
             self.release_zc_at_shutdown(slab_idx);
         }
+        // A parked `Shutdown` has nothing in the kernel either, and the
+        // Close below ends the socket.
+        self.pending_shutdown_retries.clear();
         // A send waiting for room has nothing in the kernel either.
         let max = self.connections.max_slots();
         for i in 0..max {

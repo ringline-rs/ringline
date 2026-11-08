@@ -67,8 +67,8 @@ pub enum WriteHalf {
     /// or, on io_uring, while a send chain was active; the FIN goes out once
     /// they drain.
     ShutdownPending,
-    /// Our FIN has been issued (io_uring: Shutdown SQE submitted; mio:
-    /// `shutdown(Write)` called). This does not refuse later sends — that is
+    /// Our FIN has been issued (io_uring: Shutdown SQE submitted, or parked
+    /// for retry while the ring is full; mio: `shutdown(Write)` called). This does not refuse later sends — that is
     /// a policy decision left open; today they fail at the socket.
     Shutdown,
 }

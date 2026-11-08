@@ -908,6 +908,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a `shutdown_write` whose Shutdown SQE the ring refused is
+  retried. The refusal set the write half back to `Open` and relied on the
+  application calling `shutdown_write` again, which nothing does, so the FIN
+  the public doc promises was dropped under submission-queue pressure while
+  every refused send and Close on the same path was retried. The write half
+  now reads `Shutdown` from the request on, the Close waits for the FIN's
+  completion as it does for an accepted one, and the SQE is pushed again
+  from the event loop on the close-retry backoff. Found by the send-path
+  audit (`docs/journal/2026-11-send-path-audit.md`, F10).
+
 - io_uring: a `send_parts` batch whose parts carry no bytes (through
   `build` or `submit_batch`; `submit_batch_await` already rejected it)
   queues nothing, as a `send` of an empty buffer does on a plaintext
