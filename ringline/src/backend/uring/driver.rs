@@ -797,8 +797,9 @@ pub(crate) struct Driver {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ParkInFlight {
     pub target: usize,
-    /// Generation at submit time. A CQE carrying a different one belongs to a
-    /// previous occupant of the slot.
+    /// Generation at submit time, the one the install CQE carries. The entry
+    /// is cleared with the slot (`clear_conn_claims`), so it is always the
+    /// slot's current occupant's.
     pub generation: u32,
 }
 
@@ -1336,7 +1337,8 @@ impl Driver {
         self.fail_send_ids(settles);
     }
 
-    /// Clear both half flags for a slot being recycled.
+    /// Clear both half flags, and the park in flight, for a slot being
+    /// recycled.
     ///
     /// `executor.remove_connection` drops a parked task's future with
     /// `CURRENT_DRIVER` unset, so a half's `Drop` queues an orphan that finds a
@@ -1346,6 +1348,12 @@ impl Driver {
     ///
     /// Clearing here, at the recycle point, makes that impossible regardless of
     /// how the previous occupant died.
+    ///
+    /// A park in flight is likewise indexed by slot. `begin_park` refuses a
+    /// slot with an entry, so one left by the previous occupant would hold
+    /// off the next occupant's park until its CQE lands; `handle_park_install`
+    /// checks the generation before it reads the entry, so a CQE that lands
+    /// after the clear touches nothing.
     pub(crate) fn clear_conn_claims(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
         if let Some(taken) = self.recv_half_taken.get_mut(idx) {
@@ -1353,6 +1361,9 @@ impl Driver {
         }
         if let Some(taken) = self.send_half_taken.get_mut(idx) {
             *taken = false;
+        }
+        if let Some(park) = self.park_in_flight.get_mut(idx) {
+            *park = None;
         }
     }
 
