@@ -910,11 +910,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Docs: `Runtime::shutdown` and `request_shutdown` did not say what happens to
   tasks. A worker that has seen the request polls no task again and drops
-  every task's future unpolled, so a task woken after the worker's last poll
-  pass (by a completion, a send result, released capacity, `on_tick` or
-  another thread) never runs the code after its `.await`. On io_uring the
-  check comes between draining completions and polling tasks, and on mio it
-  comes at the end of the iteration.
+  every task's future, so a task woken after the worker's last poll pass (on
+  io_uring by a completion; on both backends by a send result, released
+  capacity, `on_tick` or another thread) does not resume from the `.await` it
+  is suspended at. On io_uring the check comes between draining completions
+  and polling tasks, and on mio it comes at the end of the iteration.
 
 - io_uring with `sqpoll` and a UDP bind: returning a buffer to ring entry 0
   no longer writes 0 to the ring's tail, which shares those bytes, before
