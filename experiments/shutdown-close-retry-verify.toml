@@ -8,8 +8,8 @@
 # `red_ref` is the branch's tests-only commit, before the fix. Step 1 runs the
 # named test there and expects it to fail. Step 2 runs it at the branch
 # head and expects it to pass. Step 3 is `experiments/uring-gate.toml`'s
-# check list on the branch head, with rustdoc added because the change edits
-# doc comments behind `has_io_uring`.
+# check list on the branch head, plus rustdoc, as the other verify specs run
+# it.
 #
 #   systemslab submit experiments/shutdown-close-retry-verify.toml
 name = "ringline shutdown-close-retry verify ({branch})"

@@ -2824,9 +2824,10 @@ impl Driver {
                     .submit_close(i, super::ring::CloseLead::CancelAll)
                     .is_err()
                 {
-                    // A full SQ. The loop below submits the Close of a
-                    // connection on this list that holds no slab entry with
-                    // the same lead, and tries again on a refusal.
+                    // The push was refused (the SQ still full after a
+                    // submit, or the submit failed). The loop below submits
+                    // this connection's Close with the same lead, since it
+                    // holds no slab entry, and tries again on a refusal.
                     holding_sends.push(i);
                 }
             }
