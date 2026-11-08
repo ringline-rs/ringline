@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776) and F9 (#768) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779) and F9 (#768) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -337,7 +337,22 @@ Fix: decrement per established connection on both exit paths; document the
 mio abandonment or run one bounded `drain_pending_closes` pass before
 returning.
 
-Disposition: open.
+Disposition: fixed in #779: the io_uring `run_shutdown`
+Close arm and a mio `count_out_open_connections`, run at `run`'s shutdown
+return and in `drain_after_failure`, count each established connection into
+`CLOSED` and out of `CONNECTIONS_ACTIVE`, as `handle_close` and `finish_close`
+do. The mio abandonment is documented rather than replaced by a drain pass:
+`docs/mio-close-lifecycle-design.md`, "Worker exit", and the `metrics.rs` docs
+no longer list worker exit as an exception. Pinned by
+`worker_exit_counts_open_connections_out` in
+`ringline/tests/connection_metrics.rs`: on mio it fails at the tests-only
+commit 0ef26fb2 (gauge 3, expected 0) and passes at the fix; on io_uring,
+verified by `experiments/exit-closes-count-down-verify.toml` (SystemsLab
+experiment `01a1bc48-5b3e-718d-e469-71f2b93528e2`, Debian 13, Linux 6.12): 0
+passed, 1 failed at 0ef26fb2, 1 passed at the branch head 4ba14ccf, and the
+uring gate (fmt, clippy on three builds, rustdoc, `cargo test --all`) passes. A
+connection `run_shutdown` never closes (a zero-copy entry whose notification
+does not arrive within the 10 s bound, #607) is not counted out.
 
 ### F9 — mio: a close raised inside the step-6a/8 flush or `drain_forward_resumes` with only unawaited sends queued drops the task unpolled (invariant 5). Plausible.
 

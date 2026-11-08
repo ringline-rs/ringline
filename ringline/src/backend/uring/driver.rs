@@ -2733,9 +2733,18 @@ impl Driver {
             }
             OpTag::Close => {
                 let conn_index = ud.conn_index();
+                // Both counters follow `established`, as in `handle_close`.
+                let was_established = self
+                    .connections
+                    .get(conn_index)
+                    .is_some_and(|c| c.established);
                 self.release_tls_state(conn_index);
                 self.clear_conn_claims(conn_index);
                 self.connections.release(conn_index);
+                if was_established {
+                    metrics::CONNECTIONS.increment(metrics::conn::CLOSED);
+                    metrics::CONNECTIONS_ACTIVE.decrement();
+                }
             }
             // Merged accept: nothing will serve the connection.
             OpTag::AcceptMulti if result >= 0 => unsafe {
