@@ -10837,6 +10837,32 @@ mod tests {
         }
     }
 
+    /// A plain `Close` the ring refuses at exit is retried, as a refused
+    /// cancel or a refused close of a connection holding slab entries
+    /// already is; otherwise the connection never closes and exit waits out
+    /// its whole 10 s bound for it.
+    #[test]
+    fn shutdown_retries_a_close_the_ring_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert!(el.driver.connections.get(conn_index).is_some());
+
+        // Step 2's first push is this connection's Close.
+        el.driver.ring.force_push_failures(1);
+        let start = std::time::Instant::now();
+        el.driver.run_shutdown();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "shutdown waited {:?} for a close the ring refused",
+            start.elapsed()
+        );
+        assert_eq!(
+            el.driver.connections.active_count(),
+            0,
+            "the refused close was retried and completed"
+        );
+    }
+
     #[test]
     fn handle_tls_send_stale_slot_ignored() {
         let mut el = make_test_loop();

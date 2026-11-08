@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
 - **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; the design limitations L1 to L10 stand
-- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, docs this PR, F6 and F11 and F10 in their own PRs
+- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787 (this PR), docs #788, F6 and F11 and F10 in their own PRs
 
 ## Goal
 
@@ -749,6 +749,16 @@ push fails (a `make_sq_room` → `submit()` error) never closes,
 the worker. Fix: on `Err`, push `i` onto `holding_sends` (step 3 then
 submits a `CancelAll` close once `held_by == 0`), or add a
 `closes_to_retry` list.
+
+**Disposition: fixed** (this PR, owner's decision). A refused plain `Close`
+pushes the connection onto `holding_sends`; step 3 submits its Close with
+the `CancelAll` lead, since it holds no slab entry, and tries again on a
+refusal. Regression test `shutdown_retries_a_close_the_ring_refused`
+(io_uring lib test; `force_push_failures(1)` refuses the one Close step 2
+pushes, and the test asserts exit takes under 2 s and leaves no active
+connection; on the unfixed tree exit waits the 10 s bound). Red and green
+run in a SystemsLab VM (`experiments/shutdown-close-retry-verify.toml`,
+result in the PR).
 
 ### F9 — `pending_copy_retries` is not released at worker exit; the design doc says every retry list is (X2, S2). Confirmed by reading; no resource consequence. (C5, A caveat)
 
