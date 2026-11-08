@@ -8341,6 +8341,54 @@ mod tests {
         );
     }
 
+    /// A `send_parts` batch whose parts carry no bytes queues nothing: no
+    /// SQE, no pool slot, and an awaited one resolves `Ok(0)`, as a `send`
+    /// of an empty buffer does. A zero-length Send SQE would complete with
+    /// 0, which `handle_send` treats as a failed send and drains the queue
+    /// behind it.
+    #[test]
+    fn a_zero_length_send_parts_batch_queues_nothing() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        let free = el.driver.send_copy_pool.free_count();
+
+        el.driver
+            .make_ctx()
+            .send_parts(token)
+            .copy(b"")
+            .submit()
+            .expect("nothing to send is not an error");
+        assert!(!el.driver.send_queues[idx].in_flight, "no SQE was pushed");
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free,
+            "no slot was taken"
+        );
+
+        let id = el.executor.register_send(conn_index);
+        el.driver
+            .make_ctx()
+            .send_parts(token)
+            .copy(b"")
+            .copy(b"")
+            .submit_awaited(id)
+            .expect("nothing to send is not an error");
+        assert!(!el.driver.send_queues[idx].in_flight);
+        assert_eq!(el.driver.send_copy_pool.free_count(), free);
+        el.drain_settled_sends();
+        assert_eq!(
+            el.executor
+                .take_send_result(id)
+                .expect("settled")
+                .expect("ok"),
+            0,
+            "the awaited batch resolves with its length"
+        );
+    }
+
     /// `shutdown_write` while a send chain is active defers the FIN until
     /// the chain completes. The chain's parts are linked SQEs with
     /// `MSG_WAITALL` and set neither `in_flight` nor the queue, so a
