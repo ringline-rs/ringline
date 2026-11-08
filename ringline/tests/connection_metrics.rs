@@ -264,3 +264,45 @@ fn refused_connect_is_not_counted_as_a_close() {
         "a connection never established is not a close"
     );
 }
+
+/// Worker exit counts every connection still open out, on both backends:
+/// the gauge returns to its baseline and `CLOSED` grows by the number of
+/// connections the worker closed.
+#[test]
+fn worker_exit_counts_open_connections_out() {
+    let _serial = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    SERVER_ACCEPTED.store(false, Ordering::SeqCst);
+    BASELINE.store(CONNECTIONS_ACTIVE.value(), Ordering::SeqCst);
+    let closed_before = CONNECTIONS.value(conn::CLOSED).unwrap_or(0);
+
+    let (rt, handles) = RinglineBuilder::new(config().build().unwrap())
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<SinkHandler>()
+        .expect("server launch");
+    let addr = rt.bound_addr().expect("bound address");
+    let peers: Vec<std::net::TcpStream> = (0..3)
+        .map(|_| std::net::TcpStream::connect(addr).expect("connect"))
+        .collect();
+    let deadline = Instant::now() + WAIT;
+    while gauge_delta() < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(gauge_delta(), 3, "three accepted connections counted in");
+
+    // The peers stay open: the worker closes the connections on its way out.
+    rt.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert_eq!(
+        gauge_delta(),
+        0,
+        "worker exit counts its open connections out"
+    );
+    assert_eq!(
+        CONNECTIONS.value(conn::CLOSED).unwrap_or(0) - closed_before,
+        3,
+        "each connection the worker closed counts as a close"
+    );
+    drop(peers);
+}

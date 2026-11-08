@@ -125,6 +125,15 @@ check that nothing depends on the old linger-after-EOF behaviour. A test
 that does is a finding to bring back to this design, not something to
 patch around.
 
+## Worker exit
+
+A worker that exits, at runtime shutdown or after its own failure, does not
+run `drain_pending_closes` for the connections still open. It counts each established one out of
+`CONNECTIONS_ACTIVE` and into `conn::CLOSED` (`count_out_open_connections`),
+then drops the event loop, which closes every socket: sends still queued are
+not written and no close_notify is sent. io_uring closes each connection through
+the ring at exit (`run_shutdown`) and counts it the same way.
+
 ## Tests
 
 In `ringline/tests/echo.rs`, all run on both backends:
