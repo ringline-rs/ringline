@@ -400,23 +400,24 @@ impl Runtime {
 
     /// Signal all workers to shut down gracefully.
     ///
-    /// Workers will stop accepting new connections, close all active connections,
-    /// drain remaining completions, and exit their event loops returning
-    /// `Ok(())`, or [`Error::TaskPanicked`](crate::Error::TaskPanicked) under
+    /// Workers stop accepting new connections, close all active connections
+    /// (on io_uring, cancelling the operations in flight and waiting up to
+    /// 10 s for the kernel to finish them), and exit their event loops
+    /// returning `Ok(())`, or [`Error::TaskPanicked`](crate::Error::TaskPanicked) under
     /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) for a
     /// worker on which a task panicked.
     ///
     /// A worker checks for shutdown once per event-loop iteration. Once it
-    /// sees the request it polls no task again, and it drops every task's
-    /// future without polling it. A task woken after the worker's last poll
-    /// pass therefore never runs the code after its `.await`, even though the
-    /// operation it awaited has completed. On io_uring the check comes after
-    /// the iteration's completions are drained and before tasks are polled,
-    /// so any completion in that batch can wake a task that is never polled.
-    /// On mio the check comes at the end of the iteration, after the poll
-    /// pass. A task woken there by a send completion, by released send
-    /// capacity or from `on_tick` is never polled. Work that must finish
-    /// before exit has to complete before shutdown is requested.
+    /// sees the request it polls no task again and drops every task's
+    /// future. The futures' `Drop` implementations run; no code after an
+    /// `.await` does. A task woken after the worker's last poll pass is
+    /// dropped even when what it awaited is ready. On both backends a task
+    /// can be woken after the poll pass, for example from `on_tick`, by a
+    /// send result, by released send capacity or from another thread. On
+    /// io_uring the check also comes after the iteration's completions are
+    /// drained, so a task woken by one of those completions is dropped too.
+    /// Work that must finish before exit has to complete before shutdown is
+    /// requested.
     ///
     /// The listeners stop accepting at once on Linux, and within about 100 ms
     /// elsewhere. A listener's sockets close, and its port is free, once the

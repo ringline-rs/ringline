@@ -939,8 +939,8 @@ impl Future for ResolveFuture {
 ///
 /// Stops the calling worker only. Its tasks stop as described under
 /// [`Runtime::shutdown`](crate::Runtime::shutdown): once the worker sees the
-/// request it polls no task again, so a task woken after its last poll pass
-/// is dropped without running.
+/// request it polls no task again, so a task woken after the worker's last
+/// poll pass is dropped without running the code after its `.await`.
 ///
 /// Returns `Err` if called outside the ringline async executor.
 pub fn request_shutdown() -> io::Result<()> {

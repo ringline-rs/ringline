@@ -389,7 +389,9 @@ pub(crate) fn close_notify_sent_error() -> io::Error {
 #[cfg(has_io_uring)]
 impl<'a> DriverCtx<'a> {
     /// Request shutdown of this worker's event loop.
-    /// The worker will stop after the current iteration completes.
+    /// The worker stops at its next shutdown check, which comes in the next
+    /// iteration after that iteration's completions are drained and before
+    /// any task is polled.
     pub fn request_shutdown(&mut self) {
         *self.shutdown_requested = true;
     }
