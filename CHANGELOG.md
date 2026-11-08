@@ -908,6 +908,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a peer's FIN that lands in the same completion batch as the CQE
+  of the send that held the connection's close open no longer commits the
+  Close before the task woken by the FIN is polled. The send's completion
+  handler committed the Close inside the completion drain, so a reply the
+  task sent after reading the close was refused with `NotConnected`. A
+  completion handler now registers the connection for the end-of-iteration
+  finalize drain, as a close requested on an idle connection already was.
 - Docs: `Runtime::shutdown` and `request_shutdown` did not say what happens to
   tasks. A worker that has seen the request polls no task again and drops
   every task's future, so a task woken after the worker's last poll pass (on

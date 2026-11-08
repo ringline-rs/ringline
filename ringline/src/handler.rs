@@ -32,10 +32,12 @@ pub(crate) struct ConnSendState {
     ///
     /// io_uring: the `Close` SQE is submitted from `try_finalize_close`,
     /// driven from the event loop's end-of-iteration drain of
-    /// `pending_finalize_closes` (never synchronously inside the close
-    /// request, so the task gets its poll window — #371) and re-driven by
-    /// send CQEs until the serialized `submit_next_queued` cycle drains the
-    /// queue and the in-flight slot. mio: `drain_pending_closes` retains the entry
+    /// `pending_finalize_closes` (never inside the close request or a send,
+    /// chain or `Shutdown` completion, so the task gets its poll window —
+    /// #371; the park install commits at once, see `try_finalize_close`);
+    /// each send CQE registers the connection on that list again
+    /// until the serialized `submit_next_queued` cycle drains the queue and
+    /// the in-flight slot. mio: `drain_pending_closes` retains the entry
     /// until `pending_sends` is empty, then runs executor cleanup and
     /// `finish_close`. Without the deferral, queued bytes were silently
     /// truncated when the fd closed. The connection-level state is
@@ -1152,7 +1154,8 @@ impl<'a> DriverCtx<'a> {
 
             // Defer the Close behind whatever is outstanding; the event loop
             // re-drives try_finalize_close before the iteration ends, and
-            // each send CQE re-drives it via note_send_finalized.
+            // each send CQE registers the connection again for that drain
+            // (`defer_finalize_close`).
             self.send_queues[conn.index as usize].close_pending = true;
             if !self.pending_finalize_closes.contains(&conn.index) {
                 self.pending_finalize_closes.push(conn.index);
