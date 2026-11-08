@@ -2,9 +2,11 @@ use crate::runtime::send_completion::SendId;
 
 /// A promise of `remaining` free slots made by [`SendCopyPool::reserve_slots`].
 /// Filled with [`SendCopyPool::copy_in_reserved`]; the unfilled remainder must
-/// go back through [`SendCopyPool::release_reservation`]. Holding one across
-/// any other pool allocation is not needed today (a reservation lives inside
-/// one synchronous `DriverCtx::send`), but the pool honours it if it happens.
+/// go back through [`SendCopyPool::release_reservation`]. On io_uring a
+/// reservation lives inside one synchronous `DriverCtx::send`; on mio a
+/// `send_backpressured` permit is held, unfilled, until its entry flushes or
+/// is discarded. The pool honours a reservation held across other
+/// allocations either way.
 #[must_use = "an unfilled reservation must be returned with release_reservation"]
 pub struct SlotReservation {
     remaining: usize,

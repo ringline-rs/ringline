@@ -185,9 +185,15 @@ pub struct Config {
     /// Sends at or above the threshold, or that don't fit a send pool slot,
     /// use the zero-copy path as before. Default: `4096`.
     pub(crate) send_zc_threshold: u32,
-    /// Number of InFlightSendSlab slots for in-flight scatter-gather sends
-    /// (i.e., `send_parts()` calls that include at least one guard).
-    /// Each slot is held until all ZC notifications arrive.
+    /// Number of `InFlightSendSlab` entries. A zero-copy send (`send_parts`
+    /// with a guard, when the batch totals at least `send_zc_threshold`)
+    /// holds one until the
+    /// kernel's notification arrives. A run of two or more consecutive copy
+    /// sends queued on one connection, such as the slots of a `send` wider
+    /// than one slot or a TLS send's ciphertext, is sent as one `sendmsg`
+    /// and holds one until that CQE; with the slab full those slots go out
+    /// one per CQE instead. Guard sends fail with `Other("send slab
+    /// exhausted")` while it is full. Default: 512.
     pub(crate) send_slab_slots: u16,
     /// Deadline-based flush interval in microseconds during CQE processing.
     /// When non-SQPOLL, if this many microseconds elapse since the last submit
@@ -277,10 +283,10 @@ pub struct Config {
     /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
     /// iteration while enabled. io_uring backend only. Default: false.
     pub(crate) loop_diag: bool,
-    /// Maximum number of SQEs per IOSQE_IO_LINK chain. 0 disables chaining.
-    /// When disabled, sends exceeding MAX_IOVECS fall back to sequential
-    /// round-trips (one SQE at a time via on_send_complete).
-    /// Default: 16.
+    /// Maximum parts in one `send_chain` (`SendChainBuilder::copy` and
+    /// `ChainPartsBuilder::add` each count one). A chain that would exceed
+    /// it fails with `InvalidInput`. 0 refuses every chain. It does not
+    /// affect `send`, `send_nowait` or `send_parts`. Default: 16.
     pub(crate) max_chain_length: u16,
     /// Maximum number of standalone async tasks (not bound to connections)
     /// per worker. Used with [`spawn()`](crate::spawn).
