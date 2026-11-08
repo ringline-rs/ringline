@@ -918,7 +918,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   behind it. If the pool is still exhausted then, or the close_notify
   deadline forces the close first, the alert is dropped, the new
   `ringline/pool` counter `close_notify_dropped` counts it, and the
-  connection does not record it as sent. Found by the send-path audit
+  connection does not record it as sent. A retained alert is also dropped,
+  uncounted, at worker exit. Found by the send-path audit
   (`docs/journal/2026-11-send-path-audit.md`, F5).
 
 - mio: a TLS encryption failure in `send`, `send_nowait` or

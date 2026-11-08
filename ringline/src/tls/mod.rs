@@ -768,6 +768,13 @@ impl TlsTable {
     /// A connection that never reached traffic state has nothing to queue and
     /// leaves `out` untouched. That is not an error: the caller is tearing the
     /// connection down either way.
+    ///
+    /// Returns `None` when the alert was placed in `out`, or when there was
+    /// nothing to queue. Returns `Some(ciphertext)` when the pool had no slot
+    /// for it: the unbuffered engine's encrypted alert, or an empty `Vec`
+    /// from the buffered engine, where rustls still holds the alert. The
+    /// caller keeps it in `ConnSendState::close_notify_pending` and passes it
+    /// to [`retry_close_notify_queued`](Self::retry_close_notify_queued).
     #[cfg(has_io_uring)]
     pub fn send_close_notify_queued(
         &mut self,
@@ -813,8 +820,9 @@ impl TlsTable {
             let b = tls_conn.conn.as_buffered_mut()?;
             b.send_close_notify();
             tls_conn.close_notify_sent = true;
-            // On failure `take_tls_output_sends` consumed nothing: the alert
-            // is one record, and the writer refuses before taking a slot.
+            // On failure the alert is still in rustls' output buffer: with
+            // no free slot the writer refuses before copying, and
+            // `wants_write()` stays true for the retry.
             if buffered::take_tls_output_sends(
                 tls_conn,
                 send_copy_pool,
