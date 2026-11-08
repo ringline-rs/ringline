@@ -412,11 +412,12 @@ impl Runtime {
     /// futures' `Drop` implementations run, and a task does not resume from the
     /// `.await` it is suspended at. A task woken after the worker's last poll
     /// pass is dropped even when what it awaited is ready. On both backends a
-    /// task can be woken after the poll pass, for example from `on_tick`, by a
-    /// send result, by released send capacity or from another thread. On io_uring
-    /// the check also comes after the iteration's completions are drained, so a
-    /// task woken by one of those completions is dropped too. Work that must
-    /// finish before exit has to complete before shutdown is requested.
+    /// task can be woken after the iteration's last poll pass, for example from
+    /// `on_tick`, by a send result, by released send capacity or from another
+    /// thread. On io_uring the check also comes after the completions its wait
+    /// returned are drained, so a task woken by one of those completions is
+    /// dropped too. Work that must finish before exit has to complete before
+    /// shutdown is requested.
     ///
     /// The listeners stop accepting at once on Linux, and within about 100 ms
     /// elsewhere. A listener's sockets close, and its port is free, once the
