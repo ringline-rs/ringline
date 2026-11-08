@@ -4764,7 +4764,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Check close_notify deadlines on the armed set. If a connection
     /// has `close_pending` and the `close_notify_deadline` has elapsed,
-    /// force-close it by calling `try_finalize_close`.
+    /// force-close it with `force_finalize_close`.
     ///
     /// Iterates only the indices in `driver.close_notify_armed`, not
     /// every entry in `driver.send_queues`. For non-TLS workloads the
@@ -8347,6 +8347,116 @@ mod tests {
         );
     }
 
+    /// A copy-only batch, chain send or chain part wider than one send-pool
+    /// slot can never fit: it is refused with `InvalidInput`, as the same
+    /// data beside a guard part already is, not with the retryable `Other`
+    /// of an exhausted pool. Nothing is taken from the pool.
+    #[test]
+    fn copy_data_wider_than_a_slot_is_invalid_input_on_every_builder() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(4, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        let half = [0u8; 40];
+        let whole = [0u8; 100];
+
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_parts(token)
+                .copy(&half)
+                .copy(&half)
+                .submit()
+                .expect_err("80 bytes do not fit a 64-byte slot")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "send_parts: {err}");
+
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_chain(token)
+                .copy(&whole)
+                .finish()
+                .expect_err("100 bytes do not fit a 64-byte slot")
+        };
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidInput,
+            "send_chain copy: {err}"
+        );
+
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_chain(token)
+                .parts()
+                .copy(&half)
+                .copy(&half)
+                .add()
+                .finish()
+                .expect_err("80 bytes do not fit a 64-byte slot")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "chain part: {err}");
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            4,
+            "nothing was taken"
+        );
+        assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
+        assert!(!el.driver.chain_table.is_active(conn_index));
+    }
+
+    /// A `send_parts` batch whose parts carry no bytes queues nothing: no
+    /// SQE, no pool slot, and an awaited one resolves `Ok(0)`, as a `send`
+    /// of an empty buffer does. A zero-length Send SQE would complete with
+    /// 0, which `handle_send` treats as a failed send and drains the queue
+    /// behind it.
+    #[test]
+    fn a_zero_length_send_parts_batch_queues_nothing() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        let free = el.driver.send_copy_pool.free_count();
+
+        el.driver
+            .make_ctx()
+            .send_parts(token)
+            .copy(b"")
+            .submit()
+            .expect("nothing to send is not an error");
+        assert!(!el.driver.send_queues[idx].in_flight, "no SQE was pushed");
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free,
+            "no slot was taken"
+        );
+
+        let id = el.executor.register_send(conn_index);
+        el.driver
+            .make_ctx()
+            .send_parts(token)
+            .copy(b"")
+            .copy(b"")
+            .submit_awaited(id)
+            .expect("nothing to send is not an error");
+        assert!(!el.driver.send_queues[idx].in_flight);
+        assert_eq!(el.driver.send_copy_pool.free_count(), free);
+        el.drain_settled_sends();
+        assert_eq!(
+            el.executor
+                .take_send_result(id)
+                .expect("settled")
+                .expect("ok"),
+            0,
+            "the awaited batch resolves with its length"
+        );
+    }
+
     /// `shutdown_write` while a send chain is active defers the FIN until
     /// the chain completes. The chain's parts are linked SQEs with
     /// `MSG_WAITALL` and set neither `in_flight` nor the queue, so a
@@ -8472,6 +8582,85 @@ mod tests {
             el.driver.send_queues[conn_index as usize]
                 .close_notify_deadline
                 .is_none()
+        );
+    }
+
+    /// Take every free slot of the send pool and return them, so a test can
+    /// make a close find the pool exhausted and then hand slots back.
+    fn exhaust_send_pool(el: &mut AsyncEventLoop<NoopHandler>) -> Vec<u16> {
+        let mut held = Vec::new();
+        while let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"x") {
+            held.push(slot);
+        }
+        assert_eq!(el.driver.send_copy_pool.free_count(), 0);
+        held
+    }
+
+    /// A TLS close that finds the send pool exhausted keeps the close_notify
+    /// and queues it once a slot is free, when the close drain next runs,
+    /// instead of dropping it and committing the Close behind a bare FIN.
+    #[test]
+    fn close_notify_waits_for_a_pool_slot_when_the_pool_is_exhausted_at_close() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+        let mut held = exhaust_send_pool(&mut el);
+
+        el.driver.close_connection_graceful(conn_index);
+        assert!(
+            !el.driver.send_queues[idx].in_flight,
+            "test premise: nothing could be queued with the pool exhausted"
+        );
+        assert!(el.driver.send_queues[idx].close_pending);
+
+        // A slot comes back (another connection's send completed), and the
+        // end-of-iteration drain runs.
+        el.driver.send_copy_pool.release(held.pop().unwrap());
+        el.finalize_pending_closes();
+        assert!(
+            el.driver.send_queues[idx].in_flight,
+            "the close_notify went out once a slot was free"
+        );
+        assert!(
+            el.driver.send_queues[idx].close_pending && !el.driver.send_queues[idx].close_submitted,
+            "the Close waits behind the alert"
+        );
+        assert!(
+            el.driver
+                .tls_table
+                .as_ref()
+                .unwrap()
+                .close_notify_sent(conn_index),
+            "the alert is recorded as sent"
+        );
+    }
+
+    /// A close_notify that still finds no slot when the close drain runs is
+    /// dropped, and the connection does not record it as sent: the peer gets
+    /// a bare FIN and reads the stream as truncated, and the flag must say so.
+    #[test]
+    fn close_notify_dropped_for_lack_of_a_slot_is_not_recorded_as_sent() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+        let _held = exhaust_send_pool(&mut el);
+
+        el.driver.close_connection_graceful(conn_index);
+        el.finalize_pending_closes();
+        assert!(
+            el.driver.send_queues[idx].close_submitted,
+            "the Close is committed without the alert"
+        );
+        assert!(!el.driver.send_queues[idx].in_flight);
+        assert!(
+            !el.driver
+                .tls_table
+                .as_ref()
+                .unwrap()
+                .close_notify_sent(conn_index),
+            "a dropped alert is not recorded as sent"
         );
     }
 
@@ -10660,6 +10849,32 @@ mod tests {
                 "entry {slab_idx} not released"
             );
         }
+    }
+
+    /// A plain `Close` the ring refuses at exit is retried, as a refused
+    /// cancel or a refused close of a connection holding slab entries
+    /// already is; otherwise the connection never closes and exit waits out
+    /// its whole 10 s bound for it.
+    #[test]
+    fn shutdown_retries_a_close_the_ring_refused() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert!(el.driver.connections.get(conn_index).is_some());
+
+        // Step 2's first push is this connection's Close.
+        el.driver.ring.force_push_failures(1);
+        let start = std::time::Instant::now();
+        el.driver.run_shutdown();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "shutdown waited {:?} for a close the ring refused",
+            start.elapsed()
+        );
+        assert_eq!(
+            el.driver.connections.active_count(),
+            0,
+            "the refused close was retried and completed"
+        );
     }
 
     #[test]

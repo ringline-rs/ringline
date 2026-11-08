@@ -47,11 +47,14 @@ them cites this section.
    partial resubmits and `Close`; persistent starvation past the retry cap
    is terminal for the connection, with the waiter failed, never a silent
    drop.
-2. **The TLS ciphertext bound gates only bounded sends.** The bound is
-   conservative (record header plus rustls' maximum overhead per 16 KiB
-   record, rounded to whole slots). #318 applied it to `send`/`send_nowait`
-   too, which makes plain TLS sends fail in a band of pool occupancy where
-   they succeed today. Plain sends keep their current admission behaviour.
+2. **The TLS ciphertext bound was first applied to bounded sends only.** The
+   bound is conservative (record header plus rustls' maximum overhead per
+   16 KiB record, rounded to whole slots). On io_uring it now gates plain
+   TLS sends too: `DriverCtx::encrypt_tls_send` checks the bound before
+   rustls mutates, so `send`, `send_nowait`, `send_parts` and a TLS
+   `send_chain` fail with `Other` while the pool is short and `InvalidInput`
+   when it never could hold the message, with nothing encrypted. On mio
+   plain TLS sends are not admitted against the pool.
 3. **Transactional reservation without allocation.** #318 built a
    `Vec<(slot, ptr, len)>` and a `Vec<BuiltSend>` per copied send. The series
    reserves the slot count first and then streams `data.chunks()` into the

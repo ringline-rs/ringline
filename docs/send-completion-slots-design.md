@@ -67,7 +67,8 @@ together with the length the send reports on success.
 |---|---|
 | `send`, `send_backpressured`, copy-only batch (io_uring) | Final pool slot (`SendCopyPool`), lifted onto the coalesced slab entry when the run is coalesced |
 | TLS send (io_uring) | The final ciphertext chunk's pool slot (`OpTag::Send`), lifted onto the coalesced slab entry when the run is coalesced |
-| Zero-copy batch (io_uring) | The `SendMsgZc` slab entry |
+| Zero-copy batch (io_uring) | The `SendMsgZc` slab entry, or the pool slot the batch folded into below `send_zc_threshold` |
+| `forward_to_conn` chunk (io_uring) | Not in the table; `DirectForward` settles its own future |
 | `send_chain` (io_uring) | The chain's `ChainState`; on a TLS connection, the final ciphertext chunk's pool slot, lifted onto the coalesced slab entry when the run is coalesced |
 | Any awaited send (mio) | The last `PendingSend` the call queued |
 

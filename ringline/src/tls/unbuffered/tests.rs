@@ -106,6 +106,14 @@ fn conn_pair_with_fragment(max_fragment_size: Option<usize>) -> (TlsConn, TlsCon
     )
 }
 
+/// An unbuffered `(server, client)` pair that has not handshaked, for tests
+/// outside this module that need a session the record layer refuses to
+/// encrypt application data on. Used by the mio driver tests only.
+#[cfg_attr(has_io_uring, allow(dead_code))]
+pub(crate) fn fresh_pair() -> (TlsConn, TlsConn) {
+    conn_pair()
+}
+
 /// An already-handshaked unbuffered `(server, client)` pair, for tests
 /// outside this module that need real records from the engine this build
 /// compiled in, and a peer able to decrypt them. The buffered twin is

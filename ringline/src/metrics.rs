@@ -21,7 +21,7 @@ pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
 pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(6);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
-pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(6);
+pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(7);
 
 #[metric(
     name = "ringline/recv_ring",
@@ -393,6 +393,14 @@ pub mod pool {
     /// `spawn_with_handle` return `WouldBlock`, and an `on_start` or
     /// `on_udp_bind` task is dropped.
     pub const STANDALONE_TASKS_EXHAUSTED: usize = 5;
+    /// io_uring: a TLS connection closed without its close_notify because the
+    /// send pool had no slot for the alert when the close was requested and
+    /// still had none once the connection's own sends had drained, or the
+    /// close_notify deadline forced the close first. The peer reads the
+    /// stream as truncated (`eof_truncated`). The alert needs one slot. A
+    /// sustained count means the pool was full at the close drain;
+    /// `ConfigBuilder::send_pool` sets its size.
+    pub const CLOSE_NOTIFY_DROPPED: usize = 6;
 }
 
 /// Counter slot indices for UDP metrics.
@@ -570,6 +578,11 @@ pub fn init_metadata() {
     );
     POOL.insert_metadata(pool::SEND_EAGAIN, "op".into(), "send_eagain".into());
     POOL.insert_metadata(pool::SEND_ZC_ENOMEM, "op".into(), "send_zc_enomem".into());
+    POOL.insert_metadata(
+        pool::CLOSE_NOTIFY_DROPPED,
+        "op".into(),
+        "close_notify_dropped".into(),
+    );
 
     UDP.insert_metadata(
         udp::DATAGRAMS_RECEIVED,
@@ -630,6 +643,7 @@ mod tests {
             pool::BUFFER_RING_EMPTY,
             pool::SEND_EAGAIN,
             pool::SEND_ZC_ENOMEM,
+            pool::CLOSE_NOTIFY_DROPPED,
         ] {
             assert!(POOL.increment(idx), "POOL[{idx}] out of bounds");
         }

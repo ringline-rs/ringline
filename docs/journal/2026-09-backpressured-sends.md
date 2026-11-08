@@ -155,6 +155,9 @@ forever.
 **Open.** The QUIC `read_until_fin` change in #389 is reasoned, not measured —
 that flake is macOS-only and rare and was never reproduced. #386 was closed on
 the owner's call with that caveat recorded; reopen from there if
-`server should observe FIN` recurs. Also open from the series' own follow-up
-list: `handle_send_recv_buf`'s partial-resubmit drop, `ConnCtx::send(&[])`
-hanging, and send chains bypassing the admission queue.
+`server should observe FIN` recurs. The series' own follow-up list is closed
+except one item: `handle_send_recv_buf` was removed with the recv-buffer
+ring, `ConnCtx::send(&[])` settles `Ok(0)`, and `send_chain` refuses while a
+send is in flight and plain sends queue behind a chain; `drain_copy_retries`
+still does not wake the recv side on give-up where `drain_send_retries`
+does, which is harmless (`docs/journal/2026-11-send-path-audit.md`, X4).
