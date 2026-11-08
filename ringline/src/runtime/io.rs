@@ -3085,6 +3085,9 @@ impl SendHalf {
     /// a [`SendFuture`]. On the mio backend every part is copied. A batch
     /// whose parts carry no bytes queues nothing through `build` and
     /// `submit_batch`; `submit_batch_await` rejects it with `InvalidInput`.
+    /// On io_uring the copy parts of one batch are gathered into one
+    /// send-pool slot, so together they must fit `send_copy_slot_size`; a
+    /// batch whose copy parts are wider is rejected with `InvalidInput`.
     pub fn send_parts(&mut self) -> AsyncSendBuilder {
         self.conn.send_parts()
     }
@@ -3209,6 +3212,10 @@ impl SendHalf {
     /// guard parts included, and `finish` encrypts them as one send and queues
     /// it behind the connection's other sends, so it does not refuse while
     /// earlier sends are in flight.
+    ///
+    /// On a plaintext connection each `copy` and each part's copy data
+    /// together must fit one send-pool slot (`send_copy_slot_size`); `finish`
+    /// rejects a wider one with `InvalidInput` and submits nothing.
     ///
     /// A chain that fails closes the connection, because an unknown part of it
     /// was sent and the sends queued behind it are lost, so later bytes would

@@ -3902,6 +3902,14 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
 
     /// Copy-only path: gather all copy parts into one pool slot, return built SQE.
     fn build_copy_only(&mut self) -> io::Result<BuiltSend> {
+        // `copy_in_gather` returns `None` for an oversize gather as well as
+        // for an empty pool; only the second is retryable.
+        if self.total_copy_len > self.ctx.send_copy_pool.slot_size() as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "total copy data exceeds send pool slot size",
+            ));
+        }
         let (slot, ptr, len) = unsafe {
             self.ctx.send_copy_pool.copy_in_gather(
                 &self.copy_slices[..self.copy_count as usize],
@@ -4200,9 +4208,18 @@ pub struct SendChainBuilder<'b, 'a> {
 
 #[cfg(has_io_uring)]
 impl<'b, 'a> SendChainBuilder<'b, 'a> {
-    /// Add a copy-only send to the chain.
+    /// Add a copy-only send to the chain. `data` must fit one send-pool
+    /// slot; a larger `data` fails `finish` with `InvalidInput`.
     pub fn copy(mut self, data: &[u8]) -> Self {
         if self.error.is_some() {
+            return self;
+        }
+        if data.len() > self.ctx.send_copy_pool.slot_size() as usize && self.tls_plaintext.is_none()
+        {
+            self.error = Some(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "copy data exceeds send pool slot size",
+            ));
             return self;
         }
         if self.built.len() + self.tls_parts >= self.ctx.max_chain_length as usize {
@@ -4605,7 +4622,16 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         let built = if let Some(built) = folded {
             built
         } else if self.guard_count == 0 {
-            // Copy-only: gather into pool slot.
+            // Copy-only: gather into pool slot. An oversize gather is refused
+            // here, as the guard arm refuses it, so `copy_in_gather`'s `None`
+            // below means the pool is empty.
+            if self.total_copy_len > self.chain.ctx.send_copy_pool.slot_size() as usize {
+                self.chain.error = Some(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "total copy data exceeds send pool slot size",
+                ));
+                return self.chain;
+            }
             let result = unsafe {
                 self.chain.ctx.send_copy_pool.copy_in_gather(
                     &self.copy_slices[..self.copy_count as usize],

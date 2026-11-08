@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
-- **Status:** open — 14 findings recorded; F1 to F5 and F7 fixed, the rest in progress in the owner's order (F13, then the docs findings F9, F12, F14)
-- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 this PR
+- **Status:** open — 14 findings recorded; F1 to F5, F7 and F13 fixed, the docs findings F9, F12, F14 in progress
+- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 PR pending, F13 this PR
 
 ## Goal
 
@@ -817,6 +817,13 @@ batch that can never fit. Fix: check `total_len > slot_size` before the
 gather in `build_copy_only`, `SendChainBuilder::copy` and the copy-only arm
 of `add`, returning `InvalidInput`; document the one-slot limit on
 `send_parts` and `send_chain` (F14).
+
+**Disposition: fixed** (this PR). All three sites check the slot size
+before the gather and return `InvalidInput`; `SendHalf::send_parts` and
+`send_chain` state the one-slot limit (the F14 item for it closes here).
+Regression test `copy_data_wider_than_a_slot_is_invalid_input_on_every_builder`
+(io_uring lib test, 64-byte slots); red and green run in a SystemsLab VM
+(`experiments/oversize-copy-batch-verify.toml`, result in the PR).
 
 ### F14 — Documents and doc comments that do not state what the code does (X1, X2, X3, X4). Confirmed by quote and grep; every quote re-read by the auditor at HEAD. (E1-E18)
 
