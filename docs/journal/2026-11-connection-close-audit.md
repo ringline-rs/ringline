@@ -164,7 +164,16 @@ immediate commit needs an explicit bypass. Flip the parked test's last
 assertion; add `!close_submitted` to the batch test and rename it. Needs a
 Linux run.
 
-Disposition: open.
+Disposition: fixed in this PR, by a narrower change than proposed: the
+completion handlers call `defer_finalize_close`, which registers the
+connection on `pending_finalize_closes`, and only the end-of-iteration drain
+(`finalize_pending_closes`), `force_finalize_close` and the park install call
+`try_finalize_close`. Verified in a SystemsLab anvil VM (Linux 6.12,
+`experiments/close-commit-drain-verify.toml`): at the tests-only commit the
+five pinning tests fail, among them
+`a_fin_batched_with_the_last_send_cqe_leaves_the_close_to_the_drain`, whose
+task reads the FIN and has its reply refused; at the fix they pass, with the
+full io_uring suite.
 
 ### F2 — `CONNECTIONS_ACTIVE` never incremented for outbound connections on io_uring, or for TLS outbound on mio (invariant 15). Confirmed (mio run; io_uring read).
 
@@ -179,7 +188,7 @@ delta_after_close=0`; TLS outbound `delta_open=1 delta_after_close=-1`.
 Fix: increment at the three sites, or set `established` and the gauge in one
 helper.
 
-Disposition: fixed in this PR. `ringline/tests/connection_metrics.rs`
+Disposition: fixed in #767. `ringline/tests/connection_metrics.rs`
 (`outbound_plaintext_connection_balances_the_active_gauge`,
 `outbound_tls_connection_balances_the_active_gauge`) was red on a2e28073 for
 TLS (`open = 1`, expected 2) and is green with the increments at the three
@@ -195,7 +204,7 @@ no doc for `CLOSED`.
 
 Fix: gate mio on `was_established`; document `CLOSED` and `ACCEPTED`.
 
-Disposition: fixed in this PR (one change with F2: both counters now follow
+Disposition: fixed in #767 (one change with F2: both counters now follow
 `established` on both backends). `refused_connect_is_not_counted_as_a_close`
 was red on a2e28073 (`closed = 1`) and is green with the gate.
 
@@ -298,7 +307,9 @@ Fix: after a flush that requested a close, run `collect_wakeups` +
 `poll_ready_tasks` before `drain_pending_closes`, or retain the entry one
 pass while its task is on `ready_queue`.
 
-Disposition: open.
+Disposition: fixed in #768. In an iteration with a close pending, the mio
+finalize step polls the ready tasks first (`finalize_closes`). The F6 work
+made the trigger observable: its write-error test hung 1 run in 3 until #768.
 
 ### F10 — `handle_park_install` takes `park_in_flight[i]` and runs `abandon_park_drain(i)` before its generation check; `park_in_flight` is never reset at close or reuse (invariants 7, 8). Plausible, low.
 
@@ -334,15 +345,29 @@ Disposition: open.
 
 `uring/event_loop.rs:2775-2782`: `release_pool_slot`,
 `drain_conn_send_queue` (releases every queued `send_nowait` without
-submitting it), `note_send_finalized`, `settle_send(Err)`. No
+submitting it), `defer_finalize_close`, `settle_send(Err)`. No
 `close_connection`, unlike `handle_tls_send` (L3830-3832). The connection
 stays `Open` until the hangup poll reports the socket error. A caller of
 `send_nowait` is not told its bytes were dropped (fire-and-forget by
 contract), but a reader parked on the connection waits for the hangup poll
 rather than being failed now.
 
+`handle_send_msg_coalesced`'s terminal error arm (L3197-3212) has the same
+shape: it closes only a TLS run (`close_on_error`), so a plaintext run that
+fails leaves the connection `Open` too.
+
 Fix: decide whether a terminal plaintext send error should close (as TLS
-does) and set `read = Error`; or document the asymmetry.
+does) and set `read = Error`, in both arms; or document the asymmetry.
+
+Consequence, observed in #769's CI through the coalesced arm (an 8 MiB
+`send_nowait` goes out as coalesced runs of up to 32 pool slots): a peer that
+resets the connection while that unawaited response is draining is reported
+to the parked reader as an `Err` the test accepts in 3 of 6 io_uring jobs and
+as `Ok(0)` in the other 3; the test records no kind on a pass, so
+`ConnectionReset` is the kind the mechanism predicts, not one observed. The
+reading of the mechanism is that the failed send takes the socket's pending
+error and its CQE reports it, and the receive that follows then reports a
+plain EOF; not traced in a run. #769 runs its write-error test on mio only.
 
 Disposition: open.
 

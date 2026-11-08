@@ -528,7 +528,8 @@ pub(crate) struct Executor {
     waker_drain_scratch: VecDeque<u32>,
     /// Per-connection: task is awaiting recv data.
     pub(crate) recv_waiters: Vec<bool>,
-    /// Per-connection: the transport error that ended the stream, tagged
+    /// Per-connection: the error that ended the stream — a transport error,
+    /// or the reason the runtime closed the connection itself — tagged
     /// with the connection generation it belongs to. Written by
     /// [`fail_recv`](Self::fail_recv), read once by
     /// [`take_recv_error`](Self::take_recv_error). Only `with_data_result`
@@ -833,11 +834,13 @@ impl Executor {
         }
     }
 
-    /// Record the transport error that ended `conn_index`'s stream and wake
-    /// the recv waiter, exactly as [`wake_recv`](Self::wake_recv) would.
+    /// Record the error that ended `conn_index`'s stream and wake the recv
+    /// waiter, exactly as [`wake_recv`](Self::wake_recv) would.
     ///
     /// Backends call this instead of `wake_recv` at every site where a recv
-    /// failed with a real (non-`WouldBlock`) socket error. `with_data`
+    /// failed with a real (non-`WouldBlock`) socket error, and where the
+    /// runtime closes the connection on its own account (a failed write, the
+    /// accumulator cap on a plaintext connection). `with_data`
     /// callers still observe EOF; `with_data_result` callers observe the
     /// error via [`take_recv_error`](Self::take_recv_error).
     pub(crate) fn fail_recv(&mut self, conn_index: u32, generation: u32, error: stdio::Error) {

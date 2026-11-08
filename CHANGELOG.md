@@ -919,6 +919,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   spawn(async move { fut.await })` from `on_accept`, then returning. Found by
   the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F1).
 
+- io_uring: a peer's FIN that lands in the same completion batch as the CQE
+  of the send that held the connection's close open no longer commits the
+  Close before the task woken by the FIN is polled. The send's completion
+  handler committed the Close inside the completion drain, so a reply the
+  task sent after reading the close was refused with `NotConnected`. A
+  completion handler now registers the connection for the end-of-iteration
+  finalize drain, as a close requested on an idle connection already was.
+
 - Docs: `Runtime::shutdown` and `request_shutdown` did not say what happens to
   tasks. A worker that has seen the request polls no task again and drops
   every task's future, so a task woken after the worker's last poll pass (on
@@ -943,6 +951,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   read never ran. In an iteration with a close pending, the finalize step
   now polls the ready tasks first. Awaited sends were not affected: their
   settled result already re-polled the task.
+
+- `with_data_result` reports a connection the runtime aborted as an error,
+  not as a clean close. A write that failed (mio: the write's error, `EPIPE`
+  or `ECONNRESET`), a message on a plaintext connection that ran past
+  `recv_accumulator_max` (`io::ErrorKind::QuotaExceeded`), and on io_uring a
+  receive that could not be armed, all closed the connection with the read
+  half still `Open` and no error recorded, so the parked reader resolved
+  `Ok(0)` and could not tell "the peer hung up" from "ringline gave up". Each
+  site now records the error first. A TLS record-layer error, which is how a
+  TLS connection reports the cap overflow, still resolves `Ok(0)`, as
+  documented.
 - `CONNECTIONS_ACTIVE` counts outbound connections in. An outbound
   connection was decremented at close but never incremented when it became
   established: every outbound connection on io_uring, and every TLS outbound

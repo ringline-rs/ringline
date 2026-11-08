@@ -645,21 +645,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drive_park_drains();
             self.maybe_park_one();
 
-            // Finalize every close requested this iteration — by
-            // `close_connection` from a CQE handler or the task-exit arm, or
-            // by `DriverCtx::close` from a task. Deliberately after
-            // `poll_ready_tasks`, so a task woken by the peer's FIN gets its
-            // poll and a send it queues drains before the Close is committed
-            // (#371). try_finalize_close is guarded, so a connection with
-            // sends/chains still outstanding just waits for its CQEs to
-            // re-drive via note_send_finalized.
-            if !self.driver.pending_finalize_closes.is_empty() {
-                let mut pending = std::mem::take(&mut self.driver.pending_finalize_closes);
-                for conn_index in pending.drain(..) {
-                    self.driver.try_finalize_close(conn_index);
-                }
-                self.driver.pending_finalize_closes = pending;
-            }
+            self.finalize_pending_closes();
 
             // Hand the executor every send result that no CQE carried. Two
             // producers fill this queue and both of them have run by now:
@@ -1052,6 +1038,26 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Commit every close registered on `pending_finalize_closes` this
+    /// iteration: by `close_connection` from a CQE handler or the task-exit
+    /// arm, by `DriverCtx::close` from a task, or by `defer_finalize_close`
+    /// from the completion that drained the connection's sends, chain or
+    /// `Shutdown`. Runs after `poll_ready_tasks`, so a task woken by the
+    /// peer's FIN is polled, and a send it queues drains, before the Close is
+    /// committed (#371). `try_finalize_close` is guarded: a connection with
+    /// sends, a chain or a `Shutdown` still outstanding is dropped from the
+    /// list here and registered again by the completion that drains it.
+    fn finalize_pending_closes(&mut self) {
+        if self.driver.pending_finalize_closes.is_empty() {
+            return;
+        }
+        let mut pending = std::mem::take(&mut self.driver.pending_finalize_closes);
+        for conn_index in pending.drain(..) {
+            self.driver.try_finalize_close(conn_index);
+        }
+        self.driver.pending_finalize_closes = pending;
+    }
+
     /// Whether the run loop may block in `submit_and_wait(1)`. It may not while a
     /// task is runnable, while a close released by the orphan drain awaits the
     /// end-of-iteration drain, while a UDP re-arm is due, or once shutdown is
@@ -1373,11 +1379,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.tls_out_scratch = sends;
         }
         self.apply_tls_recv_result(conn_index, tls_result);
-        if self.driver.rearms_after_completion(conn_index)
-            && self.driver.arm_direct_recv_or_close(conn_index, None)
+        if self.driver.rearms_after_completion(conn_index) && self.arm_direct_recv(conn_index, None)
         {
             self.executor.wake_recv(conn_index);
         }
+    }
+
+    /// [`Driver::arm_direct_recv_or_close`], then hand any abort it recorded
+    /// to the executor, so the reader it woke finds the error when polled.
+    /// Every arm from the event loop goes through here; the one from a task
+    /// poll (`park_recv`) drains the aborts itself.
+    fn arm_direct_recv(&mut self, conn_index: u32, need: Option<usize>) -> bool {
+        let closed = self.driver.arm_direct_recv_or_close(conn_index, need);
+        if closed {
+            for (index, generation, err) in self.driver.take_recv_aborts() {
+                self.executor.fail_recv(index, generation, err);
+            }
+        }
+        closed
     }
 
     /// Completion of a direct or TLS connection's hangup poll
@@ -1408,7 +1427,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // receive: re-armed after every completion from here until it reads
             // the close_notify, returns 0 at the FIN, or fails.
             cs.hangup_seen = true;
-            if self.driver.arm_direct_recv_or_close(conn_index, None) {
+            if self.arm_direct_recv(conn_index, None) {
                 self.executor.wake_recv(conn_index);
             }
             return;
@@ -2331,7 +2350,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // The handshake's receives are armed after each completion; once
             // it is done, a parked read arms them. The hangup poll covers a
             // peer close while nothing reads.
-            let _ = self.driver.arm_direct_recv_or_close(conn_index, None);
+            let _ = self.arm_direct_recv(conn_index, None);
             self.driver.arm_hangup_poll(conn_index);
             return;
         }
@@ -2548,7 +2567,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         self.driver.send_queues[idx].shutdown_inflight = false;
-        self.driver.try_finalize_close(conn_index);
+        self.driver.defer_finalize_close(conn_index);
     }
 
     fn handle_eventfd_read(&mut self) {
@@ -2738,13 +2757,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.release_pool_slot(pool_slot);
 
-            // Pop the next queued send (if any) into the kernel,
-            // *then* check whether a deferred close should fire —
+            // Pop the next queued send (if any) into the kernel, then
+            // register a deferred close for the end-of-iteration drain:
             // submit_next_queued may have just emptied the queue and
-            // cleared `in_flight`, which is exactly when a
-            // close_pending connection is ready to actually close.
+            // cleared `in_flight`, which is when a close_pending connection
+            // is ready to close.
             self.driver.submit_next_queued(conn_index);
-            self.driver.note_send_finalized(conn_index);
+            self.driver.defer_finalize_close(conn_index);
 
             // Only a send's final slot carries its id, so the send
             // settles once, when its final chunk completes, with the
@@ -2777,7 +2796,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
         self.release_pool_slot(pool_slot);
         self.driver.drain_conn_send_queue(conn_index);
-        self.driver.note_send_finalized(conn_index);
+        self.driver.defer_finalize_close(conn_index);
 
         if let Some((id, _logical_len)) = settles {
             self.settle_send(id, Err(Self::send_error(result)));
@@ -3155,7 +3174,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.release_coalesced(slab_idx);
 
             self.driver.submit_next_queued(conn_index);
-            self.driver.note_send_finalized(conn_index);
+            self.driver.defer_finalize_close(conn_index);
             // The carried logical (plaintext) length, not `acked` — see
             // `handle_send`'s success path.
             for (id, logical_len) in settles {
@@ -3188,7 +3207,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let close = self.driver.send_slab.close_on_error(slab_idx);
         self.release_coalesced(slab_idx);
         self.driver.drain_conn_send_queue(conn_index);
-        self.driver.note_send_finalized(conn_index);
+        self.driver.defer_finalize_close(conn_index);
         if close {
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
@@ -3274,9 +3293,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue;
             }
             self.driver.forward_recv_held[ci] = false;
-            if self.executor.recv_waiters[ci]
-                && self.driver.arm_direct_recv_or_close(conn_index, None)
-            {
+            if self.executor.recv_waiters[ci] && self.arm_direct_recv(conn_index, None) {
                 self.executor.wake_recv(conn_index);
             }
         }
@@ -3632,7 +3649,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.mark_connected();
             }
-            if self.driver.arm_direct_recv_or_close(conn_index, None) {
+            if self.arm_direct_recv(conn_index, None) {
                 let err = std::io::Error::other("TLS receive could not be armed");
                 self.executor.wake_connect(conn_index, Err(err));
                 return;
@@ -3824,7 +3841,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // a deferred close finalize, exactly like handle_send.
         if result >= 0 {
             self.driver.submit_next_queued(conn_index);
-            self.driver.note_send_finalized(conn_index);
+            self.driver.defer_finalize_close(conn_index);
             return;
         }
 
@@ -3868,9 +3885,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // A close_connection that arrived while the chain was active deferred
-        // its Close on chain_drained — the chain state was just taken, so
-        // re-drive the finalize.
-        self.driver.note_send_finalized(conn_index);
+        // its Close on chain_drained. The chain state was just taken, so
+        // register the close for the end-of-iteration drain.
+        self.driver.defer_finalize_close(conn_index);
     }
 
     fn handle_timer(&mut self, ud: UserData, result: i32) {
@@ -7608,8 +7625,9 @@ mod tests {
 
     /// A parked send satisfies `in_flight` for the close-deferral machinery:
     /// a close requested while parked waits for the parked bytes to go out,
-    /// then finalizes on their CQE. Without this, the Close SQE would race
-    /// (or truncate) the parked send.
+    /// and their CQE registers it for the end-of-iteration drain, which
+    /// commits it. Without this, the Close SQE would race (or truncate) the
+    /// parked send.
     #[test]
     fn parked_send_defers_a_requested_close() {
         let mut el = make_test_loop_with_config(
@@ -7640,8 +7658,8 @@ mod tests {
                 "Close must not be submitted while a send is parked"
             );
         }
-        // Re-driving the finalize (as the loop's end-of-iteration drain and
-        // `note_send_finalized` do) must still hold off.
+        // Re-driving the finalize (as the loop's end-of-iteration drain does)
+        // must still hold off.
         el.driver.try_finalize_close(conn_index);
         assert!(
             !el.driver.send_queues[conn_index as usize].close_submitted,
@@ -7656,7 +7674,9 @@ mod tests {
             "Close must wait for the pushed send's CQE"
         );
 
-        // The send CQE drains the queue and finalizes the deferred close.
+        // The send CQE drains the queue. The Close is owed to the
+        // end-of-iteration drain, not committed inside the completion drain:
+        // a task woken in the same batch has not been polled yet.
         el.driver
             .ring
             .submit_and_wait(1)
@@ -7666,9 +7686,19 @@ mod tests {
             let state = &el.driver.send_queues[conn_index as usize];
             assert!(!state.in_flight);
             assert!(
-                !state.close_pending,
-                "the close must finalize after the CQE"
+                state.close_pending,
+                "the close stays pending until the drain"
             );
+            assert!(
+                !state.close_submitted,
+                "the completion drain must not commit the Close"
+            );
+        }
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+        el.finalize_pending_closes();
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert!(!state.close_pending, "the drain finalizes the close");
             assert!(
                 state.close_submitted,
                 "the deferred Close must be submitted once the parked send drained"
@@ -8299,10 +8329,12 @@ mod tests {
             "close must stay pending while the chain is active"
         );
 
-        // The chain's operation CQE arrives and completes it.
+        // The chain's operation CQE arrives and completes it; the
+        // end-of-iteration drain then commits the close.
         let event = el.driver.chain_table.on_operation_cqe(conn_index, 100);
         assert!(matches!(event, ChainEvent::Complete { .. }));
         el.fire_chain_complete(conn_index);
+        el.finalize_pending_closes();
         assert!(
             !el.driver.send_queues[conn_index as usize].close_pending,
             "close must finalize once the chain drains"
@@ -8425,13 +8457,15 @@ mod tests {
             "must not finalize with a send still in flight"
         );
 
-        // The in-flight send completes; its CQE drives the deferred Close.
+        // The in-flight send completes; its CQE registers the close again
+        // and the end-of-iteration drain commits it.
         let ud = UserData::encode(
             OpTag::Send,
             conn_index,
             UserData::send_payload(slot, generation),
         );
         el.test_dispatch_cqe(ud.raw(), b"in flight".len() as i32, 0);
+        el.finalize_pending_closes();
         assert!(
             !el.driver.send_queues[conn_index as usize].close_pending,
             "close must finalize after the in-flight send drains"
@@ -8839,6 +8873,108 @@ mod tests {
         let state = &el.driver.send_queues[conn_index as usize];
         assert!(state.close_submitted, "drain must commit the Close");
         assert!(!state.close_pending);
+    }
+
+    /// The peer's FIN and the CQE of the send that held the close open land
+    /// in one completion batch. The task woken by the FIN sends its reply in
+    /// the poll that follows the batch, so the Close must be left to the
+    /// end-of-iteration drain, after that poll, and the reply must reach the
+    /// peer.
+    #[test]
+    fn a_fin_batched_with_the_last_send_cqe_leaves_the_close_to_the_drain() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
+
+        // The connection's task: read to the peer's close, then reply, and
+        // record how the reply went. `None` after teardown means the task
+        // was dropped before it ran.
+        let seen: Rc<Cell<Option<Result<(), io::ErrorKind>>>> = Rc::new(Cell::new(None));
+        let record = Rc::clone(&seen);
+        let ctx = ConnCtx::new(conn_index, generation);
+        el.executor.task_slab.spawn(
+            conn_index,
+            Box::pin(async move {
+                let read = ctx
+                    .with_data_result(|d| crate::ParseResult::Consumed(d.len()))
+                    .await;
+                let sent = match read {
+                    Ok(0) => match ctx.send(b"bye") {
+                        Ok(fut) => fut.await.map(|_| ()),
+                        Err(e) => Err(e),
+                    },
+                    Ok(n) => Err(io::Error::other(format!("read {n} bytes"))),
+                    Err(e) => Err(e),
+                };
+                record.set(Some(sent.map_err(|e| e.kind())));
+            }),
+        );
+        el.executor.ready_queue.push_back(conn_index);
+        el.poll_ready_tasks();
+        assert!(
+            el.executor.recv_waiters[conn_index as usize],
+            "the task parked on its read"
+        );
+        let recv_slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        let recv_ud = UserData::encode(OpTag::RecvDirect, conn_index, recv_slot);
+
+        // A send is in the kernel when the FIN arrives, so the close waits
+        // on its CQE.
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
+        let send_ud = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot, generation),
+        );
+
+        // The FIN, then the send's CQE, in one batch.
+        el.inject_batch_and_dispatch(&[(recv_ud.raw(), 0), (send_ud.raw(), 4)]);
+        {
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert!(state.close_pending, "the FIN requested the close");
+            assert!(!state.in_flight, "the send's CQE drained the queue");
+            assert!(
+                !state.close_submitted,
+                "the Close must wait for the end-of-iteration drain"
+            );
+        }
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+
+        // The rest of the iteration: the woken task is polled and replies.
+        el.executor.collect_wakeups();
+        el.poll_ready_tasks();
+        assert_eq!(seen.get(), None, "the reply is in flight");
+        assert!(
+            el.driver.send_queues[conn_index as usize].in_flight,
+            "the reply was accepted and submitted"
+        );
+        el.finalize_pending_closes();
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_submitted,
+            "the Close waits for the reply"
+        );
+
+        // The reply's CQE lands; the drain commits the Close; the task
+        // sees its send resolve.
+        complete_one_cqe(&mut el);
+        el.finalize_pending_closes();
+        assert!(el.driver.send_queues[conn_index as usize].close_submitted);
+        el.executor.collect_wakeups();
+        el.poll_ready_tasks();
+        assert_eq!(seen.get(), Some(Ok(())), "the reply was refused");
+        let mut buf = [0u8; 16];
+        assert_eq!(drain_peer(&peer, &mut buf), 3);
+        assert_eq!(&buf[..3], b"bye");
     }
 
     // ── Recv data delivery tests ───────────────────────────────────
@@ -10050,8 +10186,11 @@ mod tests {
             "a send is in flight"
         );
 
+        // The send's CQE registers the close; the end-of-iteration drain
+        // commits it, cancelling the poll first.
         el.test_dispatch_cqe(ud.raw(), 60, 0);
         assert!(!el.driver.send_copy_pool.in_use(slot));
+        el.finalize_pending_closes();
         assert_eq!(el.driver.ring.pushed_cancels, vec![poll]);
         assert_eq!(
             el.driver.send_queues[conn_index as usize].send_poll,
@@ -11057,11 +11196,12 @@ mod tests {
     }
 
     #[test]
-    fn batch_recv_eof_then_stale_send_cqe() {
-        // Recv EOF closes the connection (sets Lifecycle::Closing, submits
-        // Close SQE), then a stale send CQE arrives for the same
-        // conn_index in the same batch. The send handler should not
-        // panic on the closing connection.
+    fn batch_recv_eof_then_send_cqe() {
+        // Recv EOF requests the close (sets Lifecycle::Closing, defers the
+        // Close behind the in-flight send), then that send's CQE arrives
+        // in the same batch. The send handler must not panic on the closing
+        // connection, and the Close must be left to the end-of-iteration
+        // drain, after the task woken by the EOF is polled.
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         el.driver.send_queues[conn_index as usize].in_flight = true;
@@ -11082,7 +11222,7 @@ mod tests {
 
         el.inject_batch_and_dispatch(&[
             (recv_ud.raw(), 0), // EOF → close_connection
-            (send_ud.raw(), 4), // stale send "completes" (4 bytes = b"data")
+            (send_ud.raw(), 4), // the in-flight send completes (4 bytes = b"data")
         ]);
 
         // Connection should be closing. Pool slot should be released
@@ -11090,6 +11230,16 @@ mod tests {
         let conn = el.driver.connections.get(conn_index);
         assert!(conn.is_none() || conn.unwrap().close_requested());
         assert!(!el.driver.send_copy_pool.in_use(slot));
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(
+            state.close_pending,
+            "the close stays pending until the drain"
+        );
+        assert!(
+            !state.close_submitted,
+            "the completion drain must not commit the Close"
+        );
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
     }
 
     #[test]
@@ -11413,10 +11563,10 @@ mod tests {
     }
 
     #[test]
-    fn submit_next_queued_empty_finalizes_deferred_close() {
-        // A close deferred behind an in-flight ZC send must finalize when
-        // the queue empties, even though that completion path never calls
-        // note_send_finalized.
+    fn submit_next_queued_empty_registers_deferred_close_for_the_drain() {
+        // A close deferred behind an in-flight ZC send is registered for the
+        // end-of-iteration drain when the queue empties, even though that
+        // completion path calls nothing else on the close.
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
@@ -11427,18 +11577,29 @@ mod tests {
             el.driver.send_queues[conn_index as usize].close_pending,
             "close must defer while a send is in flight"
         );
+        assert!(
+            !el.driver.pending_finalize_closes.contains(&conn_index),
+            "nothing to drain while the send is in flight"
+        );
 
         // The send's CQE path ends in submit_next_queued with an empty
-        // queue — this must fire the deferred close.
+        // queue — this registers the close; the drain commits it.
         el.driver.submit_next_queued(conn_index);
         assert!(
-            !el.driver.send_queues[conn_index as usize].close_pending,
-            "deferred close must finalize once the queue drains"
+            el.driver.send_queues[conn_index as usize].close_pending,
+            "the close stays pending until the drain"
         );
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+        el.finalize_pending_closes();
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_pending,
+            "deferred close must finalize in the drain once the queue drains"
+        );
+        assert!(el.driver.send_queues[conn_index as usize].close_submitted);
     }
 
     #[test]
-    fn drain_conn_send_queue_finalizes_deferred_close() {
+    fn drain_conn_send_queue_registers_deferred_close_for_the_drain() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
 
@@ -11448,8 +11609,14 @@ mod tests {
 
         el.driver.drain_conn_send_queue(conn_index);
         assert!(
+            el.driver.send_queues[conn_index as usize].close_pending,
+            "the close stays pending until the drain"
+        );
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+        el.finalize_pending_closes();
+        assert!(
             !el.driver.send_queues[conn_index as usize].close_pending,
-            "deferred close must finalize when the queue is force-drained"
+            "deferred close must finalize in the drain once the queue is force-drained"
         );
     }
 
@@ -13095,16 +13262,18 @@ mod tests {
             "re-driving the finalize must still hold off"
         );
 
-        // The Shutdown CQE lands: the flag clears and the close proceeds.
+        // The Shutdown CQE lands: the flag clears, the close is registered
+        // again, and the end-of-iteration drain commits it.
         let ud = UserData::encode(OpTag::Shutdown, conn_index, generation);
         el.test_dispatch_cqe(ud.raw(), 0, 0);
         assert!(
             !el.driver.send_queues[conn_index as usize].shutdown_inflight,
             "its own CQE clears the flag"
         );
+        el.finalize_pending_closes();
         assert!(
             el.driver.send_queues[conn_index as usize].close_submitted,
-            "the Shutdown CQE re-drives the finalize"
+            "the Shutdown CQE re-registers the close for the drain"
         );
     }
 
@@ -13882,8 +14051,10 @@ mod tests {
             "teardown ran with the send still in the kernel — the case under test"
         );
 
-        // The send's CQE lands in the next drain and must win.
+        // The send's CQE lands in the next drain and must win; that
+        // iteration's drain then commits the close.
         complete_one_cqe(&mut el);
+        el.finalize_pending_closes();
 
         let result = el
             .executor

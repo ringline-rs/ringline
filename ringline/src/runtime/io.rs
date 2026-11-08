@@ -1877,7 +1877,11 @@ pub(crate) fn park_recv(
     #[cfg(has_io_uring)]
     {
         if driver.arm_direct_recv_or_close(conn_index, need) {
-            // The connection closed instead: poll again to resolve the read.
+            // The connection closed instead. Record why for the reader, then
+            // poll again to resolve the read.
+            for (index, generation, err) in driver.take_recv_aborts() {
+                executor.fail_recv(index, generation, err);
+            }
             executor.wake_recv(conn_index);
         }
     }
@@ -2031,7 +2035,8 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<'_, F> {
 ///
 /// Wraps [`WithDataFuture`] and adds one thing: when the inner future
 /// reports `0`, this one checks the executor's per-connection recv error
-/// slot (written by the backends at every real socket-read failure) and
+/// slot (written by the backends at every real socket-read failure, and when
+/// the runtime closes the connection on its own account) and
 /// returns `Err(e)` if an error was recorded for this connection generation,
 /// `Ok(0)` otherwise. Data already buffered is delivered first, so a peer
 /// that sent bytes and then reset still gets its bytes parsed before the
@@ -2711,8 +2716,12 @@ impl Connection {
     ///   connection slot has been closed and reused) and no error was
     ///   recorded;
     /// - `Err(e)` — the socket read failed with a non-`WouldBlock` error
-    ///   (`ConnectionReset` after an RST, for example). Buffered bytes are
-    ///   always delivered before the error is surfaced.
+    ///   (`ConnectionReset` after an RST, for example), or the runtime closed
+    ///   the connection on its own account: a write to it failed (the write's
+    ///   error), a message on a plaintext connection ran past
+    ///   `recv_accumulator_max` (`QuotaExceeded`), or on io_uring a receive
+    ///   could not be armed. Buffered bytes are always delivered before the
+    ///   error is surfaced.
     ///
     /// The error is reported once: a later `with_data_result` on the same
     /// connection resolves to `Ok(0)`. And `Ok(n)` echoes whatever the
@@ -2721,8 +2730,9 @@ impl Connection {
     /// empty input will see `Ok(n)` there and the recorded error only on the
     /// following call.
     ///
-    /// Only a failed socket read is reported this way. A TLS record-layer
-    /// error (a bad record, a failed decrypt) still closes the connection
+    /// A TLS record-layer error (a bad record, a failed decrypt, and on a TLS
+    /// connection the `recv_accumulator_max` overflow, which the record layer
+    /// reports) is not reported this way: it still closes the connection
     /// through the EOF path and resolves to `Ok(0)`, indistinguishable from a
     /// clean close, exactly as with `with_data`.
     ///
