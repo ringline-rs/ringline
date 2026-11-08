@@ -3804,19 +3804,11 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     /// Submit the scatter-gather send.
     ///
     /// A batch with no parts, or whose parts carry no bytes, queues nothing
-    /// and settles an awaited id with `Ok(0)`: a zero-length Send SQE
-    /// completes with 0, which `handle_send` reads as a failed send and
-    /// drains the queue behind it.
+    /// and returns `Ok(())` on a live connection; a stale or closing
+    /// connection is reported as `NotConnected`, as for any batch.
     pub fn submit(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             return Err(e);
-        }
-
-        if self.part_count == 0 || self.total_len == 0 {
-            if let Some(id) = self.send_id {
-                self.ctx.attach_send_id(None, id, 0);
-            }
-            return Ok(());
         }
 
         // Validate connection + generation.
@@ -3837,6 +3829,16 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 io::ErrorKind::NotConnected,
                 "connection closing",
             ));
+        }
+
+        // Nothing to send: build no SQE. A zero-length Send SQE completes
+        // with 0, which `handle_send` reads as a failed send and drains the
+        // queue behind it. An awaited id (crate-internal) settles `Ok(0)`.
+        if self.part_count == 0 || self.total_len == 0 {
+            if let Some(id) = self.send_id {
+                self.ctx.attach_send_id(None, id, 0);
+            }
+            return Ok(());
         }
 
         // TLS path: gather all data, encrypt, copy-send. Drop guards immediately.

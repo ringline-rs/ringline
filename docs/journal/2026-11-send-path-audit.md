@@ -725,8 +725,11 @@ refuse with `InvalidInput` as `submit_batch_await` does for an empty batch.
 
 **Disposition: fixed** (this PR). `SendBuilder::submit` treats
 `total_len == 0` as it treats `part_count == 0`: nothing is built or queued
-and an awaited id settles `Ok(0)`, which is what `send` does for an empty
-buffer and what mio does for the same batch. `InvalidInput` was not chosen:
+and an awaited id (crate-internal; `submit_batch_await` refuses the batch
+before registering one) settles `Ok(0)`, which is what `send` does for an
+empty buffer on a plaintext connection and what mio does for the same
+batch. The check runs after the stale and closing-connection checks, so
+those still report `NotConnected`. `InvalidInput` was not chosen:
 `submit_batch_await` refuses an empty batch before registering an id, but
 the builder's `copy(&[])` is accepted and a caller assembling parts from
 a parser cannot always avoid an empty one. Regression test
