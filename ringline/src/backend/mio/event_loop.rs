@@ -60,8 +60,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.panic_reporter.report_worker_drained(worker);
     }
 
-    /// The mio backend has nothing in the kernel to wait for.
-    pub(crate) fn drain_after_failure(&mut self) {}
+    /// The mio backend has nothing in the kernel to wait for; the connections
+    /// still open are counted out before the event loop is dropped.
+    pub(crate) fn drain_after_failure(&mut self) {
+        self.driver.count_out_open_connections();
+    }
 
     /// The mio backend has no ring.
     ///
@@ -440,6 +443,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // 9. Check shutdown.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
+                self.driver.count_out_open_connections();
                 return Ok(());
             }
         }

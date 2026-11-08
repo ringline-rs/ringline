@@ -908,6 +908,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A worker that exits counts the connections it closes on its way out:
+  `CONNECTIONS_ACTIVE` falls to the connections the other workers hold, and
+  each one counts in `conn::CLOSED`. Before, the gauge kept them; under
+  `TaskPanicPolicy::Contain` it over-reported for the rest of the run by the
+  connections of every worker that had exited. On mio, a connection open at
+  exit is closed by dropping its socket: queued sends are not written and no
+  close_notify is sent. On io_uring the worker's shutdown closes each
+  connection through the ring, as before.
 - io_uring: a forced close (the TLS close_notify deadline) of a connection
   whose `Shutdown` is in the kernel no longer records the write half as
   open, so a repeat `shutdown_write` in that window submits no second
