@@ -908,6 +908,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `SendFuture` created by one task and first polled by another after the
+  creating connection task returned resolves. The creating task's return
+  abandoned the send's completion-table entry, since its recorded owner was
+  the dead task, and the poll from the task the future was handed to did not
+  revive it, so the completion freed the entry and woke nobody: the new owner
+  parked forever on a send the peer received. A poll now returns an
+  abandoned entry to in flight, on both backends (`set_owner` in
+  `runtime/send_completion.rs`). The shape is `let fut = tx.send(..)?;
+  spawn(async move { fut.await })` from `on_accept`, then returning. Found by
+  the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F1).
+
 - Docs: `Runtime::shutdown` and `request_shutdown` did not say what happens to
   tasks. A worker that has seen the request polls no task again and drops
   every task's future, so a task woken after the worker's last poll pass (on
