@@ -79,14 +79,6 @@ pub(crate) struct ConnSendState {
     /// `reset_send_state` at slot reactivation, like `close_submitted`.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub shutdown_inflight: bool,
-    /// A `Connect` SQE for the current occupant is still in the kernel. Set
-    /// when the SQE is accepted, cleared by its CQE in `handle_connect`, and
-    /// required clear by `try_finalize_close` before the `Close` that frees
-    /// the slot may be submitted: the CQE names this slot, and after the
-    /// slot is freed and reused it would be delivered against the next
-    /// occupant. Cleared by `reset_send_state` at slot reactivation.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
-    pub connect_inflight: bool,
     /// The raw user_data of the send whose rest waits for room, which names its
     /// pool slot or slab entry and its completion path. Nothing of it is in the
     /// kernel. `in_flight` stays true, so nothing else sends meanwhile.
@@ -129,7 +121,6 @@ impl ConnSendState {
             close_send_count: 0,
             close_notify_deadline: None,
             shutdown_inflight: false,
-            connect_inflight: false,
             #[cfg(has_io_uring)]
             waiting_send: None,
             #[cfg(has_io_uring)]
@@ -1289,7 +1280,6 @@ impl<'a> DriverCtx<'a> {
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
         }
-        self.send_queues[conn_index as usize].connect_inflight = true;
 
         Ok(ConnId::new(conn_index, generation))
     }
@@ -1354,7 +1344,6 @@ impl<'a> DriverCtx<'a> {
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
         }
-        self.send_queues[conn_index as usize].connect_inflight = true;
 
         Ok(ConnId::new(conn_index, generation))
     }
@@ -1470,7 +1459,6 @@ impl<'a> DriverCtx<'a> {
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
         }
-        self.send_queues[conn_index as usize].connect_inflight = true;
 
         Ok(ConnId::new(conn_index, generation))
     }

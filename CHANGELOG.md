@@ -908,13 +908,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- io_uring: a connect timeout no longer frees the connection's slot while the
-  cancelled Connect is still in the kernel. The Close was committed at once,
-  and a Connect CQE delivered after it ran against the slot's next occupant.
-  The Connect SQE now carries the connection's generation, which its handler
-  checks, and a close requested while a Connect is in the kernel waits for
-  its CQE. The cancel of the connect timeout after a connect completes names
-  the user_data the timeout carries; it named one no request carried, so the
+- io_uring: a Connect CQE is matched to the connection it was submitted
+  for. The Connect SQE carried no generation, so after a connect timeout
+  closed the slot, the cancelled Connect's CQE could run against the slot's
+  next occupant: opened or closed it, or woke a different connect's waiter.
+  The Connect SQE now carries the connection's generation, which its
+  handler checks first. The cancel of the connect timeout after a connect
+  completes names the user_data the timeout carries; it named payload 0,
+  which matched only a slot's first occupant, so for every later one the
   timeout stayed armed for its full duration and was then rejected by its
   handler.
 - io_uring: a peer's FIN that lands in the same completion batch as the CQE

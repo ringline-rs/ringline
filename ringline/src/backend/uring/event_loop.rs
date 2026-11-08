@@ -3509,16 +3509,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let conn_index = ud.conn_index();
 
         // The payload is the generation of the connection the Connect was
-        // submitted for. A CQE for a slot that has since been closed and
-        // reused must not touch the new occupant.
+        // submitted for. A close on a `Connecting` slot (the connect timeout)
+        // commits its Close at once, whose lead ends the Connect, so this CQE
+        // can arrive after the slot was freed and reused and must not touch
+        // the new occupant.
         let generation = match self.driver.connections.get(conn_index) {
             Some(conn) if conn.generation == ud.payload() => conn.generation,
             _ => return,
         };
-        // The Connect has left the kernel. A close requested while it was in
-        // flight waited on this; the end-of-iteration drain commits it.
-        self.driver.send_queues[conn_index as usize].connect_inflight = false;
-        self.driver.defer_finalize_close(conn_index);
 
         if result < 0 {
             let errno = -result;
@@ -11530,7 +11528,6 @@ mod tests {
         let cs = el.driver.connections.get_mut(conn_index).unwrap();
         cs.recv_direct = true;
         cs.connect_timeout_armed = true;
-        el.driver.send_queues[conn_index as usize].connect_inflight = true;
         el.executor.connect_waiters[conn_index as usize] = true;
         (conn_index, generation)
     }
@@ -11557,16 +11554,17 @@ mod tests {
             assert!(conn.connect_timeout_armed);
             assert!(el.executor.connect_waiters[conn_index as usize]);
             assert!(el.executor.io_results[conn_index as usize].is_none());
-            assert!(el.driver.send_queues[conn_index as usize].connect_inflight);
             assert!(el.driver.ring.pushed_cancels.is_empty());
         }
     }
 
     /// A close requested while the Connect is in the kernel (here by the
-    /// connect timeout) is not committed by the end-of-iteration drain until
-    /// the Connect's CQE has arrived.
+    /// connect timeout) is committed by the end-of-iteration drain without
+    /// waiting for the Connect's CQE. That CQE is matched to this occupant
+    /// by its generation when it lands before the Close CQE, and ignored
+    /// when it lands after.
     #[test]
-    fn a_close_on_a_connecting_slot_waits_for_the_connect_cqe() {
+    fn a_close_on_a_connecting_slot_commits_without_the_connect_cqe() {
         let mut el = make_test_loop();
         let (conn_index, generation) = connecting_slot(&mut el);
         let timeout = UserData::encode(OpTag::Timeout, conn_index, generation);
@@ -11577,33 +11575,29 @@ mod tests {
             "the Connect is cancelled"
         );
         assert!(!el.executor.connect_waiters[conn_index as usize]);
-        let state = &el.driver.send_queues[conn_index as usize];
-        assert!(state.close_pending);
-        assert!(state.connect_inflight);
+        assert!(el.driver.send_queues[conn_index as usize].close_pending);
 
-        el.finalize_pending_closes();
-        let state = &el.driver.send_queues[conn_index as usize];
-        assert!(
-            !state.close_submitted,
-            "the Close was committed with the Connect still in the kernel"
-        );
-        assert!(state.close_pending);
-        assert!(el.driver.connections.get(conn_index).is_some());
-
-        // The cancelled Connect's CQE lets the close commit.
-        let connect = UserData::encode(OpTag::Connect, conn_index, generation);
-        el.test_dispatch_cqe(connect.raw(), -libc::ECANCELED, 0);
-        let state = &el.driver.send_queues[conn_index as usize];
-        assert!(!state.connect_inflight);
-        assert!(
-            !state.close_submitted,
-            "committed inside the completion drain"
-        );
         el.finalize_pending_closes();
         assert!(el.driver.send_queues[conn_index as usize].close_submitted);
 
+        // Before the Close CQE: the slot is still this occupant's, and the
+        // CQE settles the timeout flag and nothing else.
+        let connect = UserData::encode(OpTag::Connect, conn_index, generation);
+        el.test_dispatch_cqe(connect.raw(), -libc::ECANCELED, 0);
+        let conn = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot is freed by the Close CQE, not before");
+        assert!(!conn.connect_timeout_armed);
+        assert!(conn.close_requested());
+
         let close = UserData::encode(OpTag::Close, conn_index, 0);
         el.test_dispatch_cqe(close.raw(), 0, 0);
+        assert!(el.driver.connections.get(conn_index).is_none());
+
+        // After it: the slot is inactive and the CQE is ignored.
+        el.test_dispatch_cqe(connect.raw(), -libc::ECANCELED, 0);
         assert!(el.driver.connections.get(conn_index).is_none());
     }
 
@@ -11633,7 +11627,6 @@ mod tests {
         let conn = el.driver.connections.get(conn_index).unwrap();
         assert!(matches!(conn.lifecycle, Lifecycle::Open));
         assert!(!conn.connect_timeout_armed);
-        assert!(!el.driver.send_queues[conn_index as usize].connect_inflight);
     }
 
     /// The same for a Connect that fails.
@@ -11647,7 +11640,6 @@ mod tests {
         assert_eq!(el.driver.ring.pushed_cancels, vec![timeout.raw()]);
         let conn = el.driver.connections.get(conn_index).unwrap();
         assert!(conn.close_requested());
-        assert!(!el.driver.send_queues[conn_index as usize].connect_inflight);
     }
 
     #[test]

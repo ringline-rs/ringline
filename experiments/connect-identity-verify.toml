@@ -6,10 +6,11 @@
 # by a login to a rig host (CLAUDE.md, "Verifying io_uring code").
 #
 # `red_ref` is the branch's tests-only commit, before the fix. Step 1 runs the
-# named tests there and expects five failures (the tests that pin the new
-# behaviour) and four passes (the connect tests that only changed their
-# payload). Step 2 runs the same names at the branch head and expects ten
-# passes: the nine plus the ring test the fix adds. Step 3 is
+# named tests there and expects four failures (the tests that pin the new
+# behaviour and exist there) and four passes (the connect tests that only
+# changed their payload). Step 2 runs the same names at the branch head and
+# expects ten passes: those eight, the ring test the fix adds, and the test
+# of the close committing without the Connect CQE. Step 3 is
 # `experiments/uring-gate.toml`'s check list on the branch head, with rustdoc
 # added because the change edits doc comments behind `has_io_uring`.
 #
@@ -20,7 +21,7 @@ name = "ringline connect-identity verify ({branch})"
 branch = "fix/uring-connect-identity"
 repo   = "https://github.com/brayniac/ringline"
 red_ref = "7b719b828758a35e104148d71284916e3addfe50"
-tests  = "a_stale_connect_cqe_leaves_the_reused_slot_alone a_close_on_a_connecting_slot_waits_for_the_connect_cqe the_connect_timeout_cancels_the_connect_by_its_generation a_completed_connect_cancels_its_timeout_by_its_generation a_failed_connect_cancels_its_timeout_by_its_generation handle_connect_success_wakes_waiter handle_connect_error_wakes_waiter_and_closes nop_inject_connect_success nop_inject_connect_error submit_connect_carries_the_generation"
+tests  = "a_stale_connect_cqe_leaves_the_reused_slot_alone a_close_on_a_connecting_slot_commits_without_the_connect_cqe the_connect_timeout_cancels_the_connect_by_its_generation a_completed_connect_cancels_its_timeout_by_its_generation a_failed_connect_cancels_its_timeout_by_its_generation handle_connect_success_wakes_waiter handle_connect_error_wakes_waiter_and_closes nop_inject_connect_success nop_inject_connect_error submit_connect_carries_the_generation"
 
 [[jobs]]
 name = "verify"
@@ -93,11 +94,11 @@ type = "shell"
 command = '''
 fail=0
 grep -q "^gate_backend=0" verify.log || { echo "FAIL gate_backend"; fail=1; }
-# Red: the run fails, with exactly the five pinning tests failing.
+# Red: the run fails, with exactly the four pinning tests failing.
 grep -q "^red_rc=[1-9]" verify.log || { echo "FAIL red: the tests passed on the unfixed code"; fail=1; }
 red=$(grep -oE "^red_summary=.*" verify.log)
 echo "$red"
-echo "$red" | grep -qE "4 passed; 5 failed" || { echo "FAIL red: expected 4 passed; 5 failed"; fail=1; }
+echo "$red" | grep -qE "4 passed; 4 failed" || { echo "FAIL red: expected 4 passed; 4 failed"; fail=1; }
 # Green: all ten pass.
 grep -q "^green_rc=0" verify.log || { echo "FAIL green"; fail=1; }
 green=$(grep -oE "^green_summary=.*" verify.log)

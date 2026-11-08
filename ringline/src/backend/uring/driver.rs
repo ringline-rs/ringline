@@ -1307,9 +1307,6 @@ impl Driver {
         // reactivated with a Shutdown still outstanding. If the gate ever leaks,
         // the next occupant must not inherit the block.
         state.shutdown_inflight = false;
-        // The same for a Connect: the CQE that clears it arrives before the
-        // slot can be closed and reactivated.
-        state.connect_inflight = false;
         state.close_notify_deadline = None;
         state.waiting_send = None;
         state.send_poll = SendPoll::None;
@@ -1671,8 +1668,8 @@ impl Driver {
         }
     }
 
-    /// Submit the deferred `Close` SQE once every pending send, send chain,
-    /// `Shutdown` and `Connect` for this connection has finished.
+    /// Submit the deferred `Close` SQE once every pending send, send chain and
+    /// `Shutdown` for this connection has finished.
     ///
     /// Called from the event loop's end-of-iteration drain of
     /// `pending_finalize_closes`, from `force_finalize_close`, and from the
@@ -1695,17 +1692,7 @@ impl Driver {
         // fails `EPIPE`. `handle_shutdown` registers the connection for the
         // drain once the CQE clears the flag.
         let shutdown_drained = !state.shutdown_inflight;
-        // A `Connect` SQE still in the kernel completes with this slot's
-        // index, and after the slot is freed and reused its CQE would be
-        // delivered against the next occupant. `handle_connect` clears the
-        // flag and registers the close again.
-        let connect_drained = !state.connect_inflight;
-        if !(state.close_pending
-            && sends_drained
-            && chain_drained
-            && shutdown_drained
-            && connect_drained)
-        {
+        if !(state.close_pending && sends_drained && chain_drained && shutdown_drained) {
             return;
         }
         let st = &mut self.send_queues[conn_index as usize];
