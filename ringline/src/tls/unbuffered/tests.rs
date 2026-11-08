@@ -49,7 +49,7 @@ fn unbuffered_connection_is_not_buffered() {
 #[test]
 fn fresh_conn_has_empty_buffers() {
     let mut conn = client_conn();
-    let (_kind, incoming, pending) = conn.split_mut();
+    let (_kind, incoming, pending, _) = conn.split_mut();
     assert!(incoming.is_empty());
     assert!(pending.is_empty());
 }
@@ -236,7 +236,7 @@ fn a_queued_key_update_reply_does_not_shrink_later_chunks() {
 /// application data.
 fn queue_key_update_reply(server: &mut TlsConn, client: &mut TlsConn, accs: &mut AccumulatorTable) {
     {
-        let (kind, incoming, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
+        let (kind, incoming, _, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
         let super::UnbufferedKind::Client(c) = kind else {
             panic!("the client side is a client connection");
         };
@@ -257,7 +257,7 @@ fn queue_key_update_reply(server: &mut TlsConn, client: &mut TlsConn, accs: &mut
 /// own output. Returns (outcome, output ciphertext).
 fn pump(to: &mut TlsConn, bytes: &[u8], accs: &mut AccumulatorTable) -> (DriveOutcome, Vec<u8>) {
     if !bytes.is_empty() {
-        let (_, incoming, _) = to.conn.as_unbuffered_mut().unwrap().split_mut();
+        let (_, incoming, _, _) = to.conn.as_unbuffered_mut().unwrap().split_mut();
         incoming
             .append(bytes)
             .expect("test appends stay under the cap");
@@ -350,7 +350,7 @@ fn plaintext_over_the_sink_bound_fails_the_connection() {
     let plaintext = vec![0x7Eu8; 32 * 1024];
     let cipher = encrypt_all(&mut client, &plaintext);
 
-    let (_, incoming, _) = server.conn.as_unbuffered_mut().unwrap().split_mut();
+    let (_, incoming, _, _) = server.conn.as_unbuffered_mut().unwrap().split_mut();
     incoming
         .append(&cipher)
         .expect("test append stays under the cap");
@@ -360,6 +360,35 @@ fn plaintext_over_the_sink_bound_fails_the_connection() {
         matches!(outcome, DriveOutcome::Error(_)),
         "over-bound plaintext must fail the connection, got {outcome:?}"
     );
+}
+
+// An overflow is the engine's error, not rustls': rustls consumed the record
+// and has nothing queued, so the connection is not marked failed and the
+// close that follows sends a close_notify (mio queues it from
+// `finish_close`). One record, so nothing unread stands between the close
+// path and `WriteTraffic`.
+#[test]
+fn an_accumulator_overflow_leaves_the_close_notify_to_send() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new_with_max(2, 1024, 4096);
+    handshake(&mut server, &mut client, &mut accs);
+    accs.reset(0);
+
+    let plaintext = vec![0x7Eu8; 8 * 1024];
+    let cipher = encrypt_all(&mut client, &plaintext);
+    let (outcome, _) = pump(&mut server, &cipher, &mut accs);
+    assert!(
+        matches!(outcome, DriveOutcome::Error(_)),
+        "over-bound plaintext must fail the connection, got {outcome:?}"
+    );
+
+    let mut out = Vec::new();
+    queue_close_notify(&mut server, &mut out).expect("the close path returns");
+    assert!(
+        !out.is_empty(),
+        "an overflow leaves rustls able to send its close_notify"
+    );
+    assert!(server.close_notify_sent);
 }
 
 // Handshake ciphertext delivered in one-byte pieces drives the machine
@@ -590,7 +619,7 @@ fn feed_retries_an_append_a_drive_can_relieve() {
     // Complete `held` without driving, so the refusing buffer is full of
     // data a drive *can* consume.
     {
-        let (_, incoming, _) = server.conn.as_unbuffered_mut().unwrap().split_mut();
+        let (_, incoming, _, _) = server.conn.as_unbuffered_mut().unwrap().split_mut();
         incoming
             .append(&held[split..])
             .expect("completing the held record fits under the cap");
@@ -922,7 +951,7 @@ fn drive_on_a_blocked_server_is_quiet() {
 /// call into the state machine — whichever path makes it — is the one that
 /// deframes it.
 fn stage_incoming(to: &mut TlsConn, ciphertext: &[u8]) {
-    let (_, incoming, _) = to.conn.as_unbuffered_mut().unwrap().split_mut();
+    let (_, incoming, _, _) = to.conn.as_unbuffered_mut().unwrap().split_mut();
     incoming
         .append(ciphertext)
         .expect("test appends stay under the cap");
@@ -1029,26 +1058,325 @@ fn encrypt_reports_a_dropped_queued_record() {
     );
 }
 
-// Same state, same hazard, through the close path — where it is worse: rustls
-// queues a close_notify into `sendable_tls` itself on TLS 1.2 traffic-key
-// exhaustion, so the record this arm refuses to swallow can be the very alert
-// the caller asked for.
+/// Without the `failed` guard, the close path would call into the state
+/// machine once more after a receive error. The record that failed is still
+/// in the buffer; a call into rustls would deframe it again and queue a
+/// second fatal alert, which rustls debug-asserts against, so the engine
+/// answers without entering the machine. mio takes this path on every
+/// receive error (`close_connection` → `finish_close` →
+/// `flush_tls_output_mio_direct`).
 #[test]
-fn close_notify_reports_a_dropped_queued_record() {
+fn a_close_after_a_receive_error_does_not_re_enter_the_deframer() {
+    let (mut server, mut client) = handshaked_pair();
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+    let mut record = vec![0u8; 4096];
+    let (_, used_ct) = encrypt_chunk(&mut client, b"hello", &mut record).expect("encrypt");
+    record.truncate(used_ct);
+    let last = record.len() - 1;
+    record[last] ^= 0xff;
+    let (outcome, _) = pump(&mut server, &record, &mut accs);
+    assert!(matches!(outcome, DriveOutcome::Error(_)));
+
+    let mut out = Vec::new();
+    queue_close_notify(&mut server, &mut out)
+        .expect("the close path returns, with no alert left to queue");
+    assert!(out.is_empty(), "the alert left with the drive that failed");
+}
+
+/// A send after a receive error, through the same guard. Both backends wake
+/// the connection's read with the error before the close finalizes, and
+/// neither `send_inner` checks for a pending close before encrypting, so a
+/// task that answers the read error with a send reaches `encrypt_chunk`
+/// while the failed record is still at the front of the buffer.
+#[test]
+fn a_send_after_a_receive_error_does_not_re_enter_the_deframer() {
+    let (mut server, mut client) = handshaked_pair();
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+    let mut record = vec![0u8; 4096];
+    let (_, used_ct) = encrypt_chunk(&mut client, b"hello", &mut record).expect("encrypt");
+    record.truncate(used_ct);
+    let last = record.len() - 1;
+    record[last] ^= 0xff;
+    let (outcome, _) = pump(&mut server, &record, &mut accs);
+    assert!(matches!(outcome, DriveOutcome::Error(_)));
+
+    let mut dst = vec![0u8; 4096];
+    let err = encrypt_chunk(&mut server, b"reply", &mut dst)
+        .expect_err("a send on a failed connection is refused");
+    assert!(
+        err.to_string().contains("failed on receive"),
+        "the error names the cause, got: {err}"
+    );
+}
+
+/// A failure the send path finds. An overflow returns before the records
+/// behind the overflowing one are deframed; a send on the connection (both
+/// backends accept one until the close finalizes) deframes the next one in
+/// `encrypt_with`, and when that record is bad rustls queues a fatal alert
+/// and reports the error. The connection is marked failed there, so the
+/// close that follows does not deframe the record again; the alert stays in
+/// rustls and the peer reads a FIN.
+#[test]
+fn a_send_that_finds_a_bad_record_behind_an_overflow_does_not_re_enter_the_deframer() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new_with_max(2, 1024, 4096);
+    handshake(&mut server, &mut client, &mut accs);
+    accs.reset(0);
+
+    let mut cipher = encrypt_all(&mut client, &vec![0x7Eu8; 8 * 1024]);
+    let mut bad = encrypt_all(&mut client, b"next");
+    let last = bad.len() - 1;
+    bad[last] ^= 0xff;
+    cipher.extend_from_slice(&bad);
+    let (outcome, _) = pump(&mut server, &cipher, &mut accs);
+    assert!(matches!(outcome, DriveOutcome::Error(_)), "the overflow");
+
+    let mut dst = vec![0u8; 4096];
+    let err =
+        encrypt_chunk(&mut server, b"reply", &mut dst).expect_err("the bad record fails the send");
+    assert!(
+        err.to_string().contains("decrypt"),
+        "the error is rustls' for the record, got: {err}"
+    );
+
+    let mut out = Vec::new();
+    queue_close_notify(&mut server, &mut out).expect("the close path returns");
+    assert!(out.is_empty(), "nothing is placed for a failed connection");
+    assert!(server.conn.as_unbuffered_mut().unwrap().failed);
+}
+
+/// The close path finds the bad record itself: after the overflow nothing
+/// has deframed it, so `queue_close_notify`'s `process` fails on it. The
+/// connection is marked failed there, so a send that follows (both backends
+/// accept one until the close finalizes) does not enter the machine; without
+/// the mark it would pop the alert and a second send would deframe the record
+/// again.
+#[test]
+fn a_close_that_finds_a_bad_record_behind_an_overflow_marks_the_connection_failed() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new_with_max(2, 1024, 4096);
+    handshake(&mut server, &mut client, &mut accs);
+    accs.reset(0);
+
+    let mut cipher = encrypt_all(&mut client, &vec![0x7Eu8; 8 * 1024]);
+    let mut bad = encrypt_all(&mut client, b"next");
+    let last = bad.len() - 1;
+    bad[last] ^= 0xff;
+    cipher.extend_from_slice(&bad);
+    let (outcome, _) = pump(&mut server, &cipher, &mut accs);
+    assert!(matches!(outcome, DriveOutcome::Error(_)), "the overflow");
+
+    let mut out = Vec::new();
+    queue_close_notify(&mut server, &mut out).expect_err("the bad record fails the close path");
+    assert!(out.is_empty());
+    assert!(server.conn.as_unbuffered_mut().unwrap().failed);
+
+    let mut dst = vec![0u8; 4096];
+    let err = encrypt_chunk(&mut server, b"reply", &mut dst).expect_err("refused");
+    assert!(
+        err.to_string().contains("failed on receive"),
+        "the send is refused by the mark, got: {err}"
+    );
+}
+
+/// A record rustls queued that is not its close_notify (a key_update) is not
+/// counted as the alert when the peer's close_notify is processed in the
+/// same call: after `PeerClosed` the loop reaches `WriteTraffic` and queues
+/// the alert behind the key_update.
+#[test]
+fn a_queued_key_update_is_not_counted_as_the_close_notify_after_a_peer_close() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new(2, 1024 * 1024);
+    handshake(&mut server, &mut client, &mut accs);
+    accs.reset(0);
+    {
+        let conn = server.conn.as_unbuffered_mut().unwrap();
+        let (kind, incoming, _, _) = conn.split_mut();
+        let super::UnbufferedKind::Server(c) = kind else {
+            panic!("server side");
+        };
+        let status = super::UnbufferedEngine::process(c, incoming.pending());
+        let Ok(ringline_tls::unbuffered::ConnectionState::WriteTraffic(wt)) = status.state else {
+            panic!("a handshaked server is in traffic state");
+        };
+        wt.refresh_traffic_keys().expect("a key_update is queued");
+    }
+    let mut alert = Vec::new();
+    queue_close_notify(&mut client, &mut alert).expect("queue close_notify");
+    stage_incoming(&mut server, &alert);
+
+    let mut out = Vec::new();
+    queue_close_notify(&mut server, &mut out).expect("the close path returns");
+    assert!(server.peer_sent_close_notify, "the edge is recorded");
+    assert!(
+        server.close_notify_sent,
+        "the alert went out behind the key_update"
+    );
+    let key_update_len = 5 + u16::from_be_bytes([out[3], out[4]]) as usize;
+    assert!(
+        out.len() > key_update_len,
+        "the alert follows the key_update ({key_update_len} bytes), got {} bytes",
+        out.len()
+    );
+
+    // The client reads a clean close, so the second record was the alert.
+    let (outcome, _) = pump(&mut client, &out, &mut accs);
+    assert!(matches!(outcome, DriveOutcome::Closed), "{outcome:?}");
+}
+
+/// A drive after a receive error answers with an error and does not enter
+/// the machine. No backend drives a connection after its Error arm ran;
+/// this pins the guard that holds the invariant where the field states it.
+#[test]
+fn a_drive_after_a_receive_error_reports_the_earlier_failure() {
+    let (mut server, mut client) = handshaked_pair();
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+    let mut record = vec![0u8; 4096];
+    let (_, used_ct) = encrypt_chunk(&mut client, b"hello", &mut record).expect("encrypt");
+    record.truncate(used_ct);
+    let last = record.len() - 1;
+    record[last] ^= 0xff;
+    let (outcome, _) = pump(&mut server, &record, &mut accs);
+    assert!(matches!(outcome, DriveOutcome::Error(_)));
+
+    let (outcome, out) = pump(&mut server, &[], &mut accs);
+    assert!(matches!(outcome, DriveOutcome::Error(_)), "{outcome:?}");
+    assert!(out.is_empty());
+}
+
+/// The same close with rustls holding a partial handshake message: it keeps
+/// an offset into the buffer for the message's first fragment, so emptying
+/// the buffer instead of staying out of the machine makes rustls index past
+/// the end. The server has half a ClientHello and then a record of an
+/// unknown content type.
+#[test]
+fn a_close_after_a_receive_error_mid_handshake_message_does_not_panic() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new(2, 1024 * 1024);
+    let (_, hello) = pump(&mut client, &[], &mut accs);
+    assert!(hello.len() > 5 && hello[0] == 22, "a ClientHello record");
+    let body = &hello[5..];
+    let half = &body[..body.len() / 2];
+    let mut first = vec![22, 3, 3, (half.len() >> 8) as u8, half.len() as u8];
+    first.extend_from_slice(half);
+    let bad = [0x99, 3, 3, 0, 1, 0];
+
+    let (outcome, _) = pump(&mut server, &first, &mut accs);
+    assert!(
+        !matches!(outcome, DriveOutcome::Error(_)),
+        "half a message is not an error yet"
+    );
+    let (outcome, out) = pump(&mut server, &bad, &mut accs);
+    assert!(
+        matches!(outcome, DriveOutcome::Error(_)),
+        "an unknown content type is fatal"
+    );
+    assert!(!out.is_empty(), "the alert left with the failing drive");
+
+    let mut out = Vec::new();
+    queue_close_notify(&mut server, &mut out).expect("the close path returns");
+    assert!(out.is_empty());
+}
+
+/// A handshaked server whose close_notify rustls has already queued into its
+/// output without encoding it: the state TLS 1.2 traffic-key exhaustion
+/// leaves behind, where `write_plaintext` calls `send_close_notify()` itself
+/// before returning `EncryptExhausted`. Reproduced here by asking
+/// `WriteTraffic::queue_close_notify` for the alert with no room, which
+/// queues it and reports the size it needs.
+fn server_with_queued_close_notify() -> (TlsConn, TlsConn) {
+    let (mut server, client) = handshaked_pair();
+    {
+        let conn = server.conn.as_unbuffered_mut().unwrap();
+        let (kind, incoming, _, _) = conn.split_mut();
+        let super::UnbufferedKind::Server(c) = kind else {
+            panic!("server side");
+        };
+        let status = super::UnbufferedEngine::process(c, incoming.pending());
+        let Ok(ringline_tls::unbuffered::ConnectionState::WriteTraffic(mut wt)) = status.state
+        else {
+            panic!("a handshaked server is in traffic state");
+        };
+        let mut none: [u8; 0] = [];
+        assert!(
+            matches!(
+                wt.queue_close_notify(&mut none),
+                Err(ringline_tls::unbuffered::EncryptError::InsufficientSize(_))
+            ),
+            "the alert is queued and reported as needing room"
+        );
+    }
+    (server, client)
+}
+
+/// The close path encodes a record rustls already queued instead of dropping
+/// it. On TLS 1.2 traffic-key exhaustion that record is the close_notify
+/// rustls queued itself, so the peer reads a clean close rather than a
+/// truncated stream, and `close_notify_sent` records what went out.
+#[test]
+fn close_notify_encodes_the_alert_rustls_already_queued() {
+    let (mut server, mut client) = server_with_queued_close_notify();
+
+    let mut out = Vec::new();
+    queue_close_notify(&mut server, &mut out).expect("the queued alert goes out");
+    assert!(!out.is_empty(), "the output holds the alert record");
+    assert!(server.close_notify_sent, "the alert went out");
+
+    let mut accs = AccumulatorTable::new(2, 1024 * 1024);
+    let (outcome, _) = pump(&mut client, &out, &mut accs);
+    assert!(
+        matches!(outcome, DriveOutcome::Closed),
+        "the peer reads a clean close, got {outcome:?}"
+    );
+    assert!(client.peer_sent_close_notify);
+}
+
+/// A server closed before its handshake finished has no alert to queue; the
+/// handshake records rustls had queued go out ahead of the FIN rather than
+/// being dropped, and no alert is recorded as sent.
+#[test]
+fn close_notify_before_the_handshake_sends_the_queued_flight_and_no_alert() {
     let mut server = server_with_undriven_peer_flight();
 
     let mut out = Vec::new();
-    let err = queue_close_notify(&mut server, &mut out)
-        .expect_err("dropping a queued record is not a silent no-op");
-
+    queue_close_notify(&mut server, &mut out).expect("nothing to queue is not an error");
     assert!(
-        err.to_string().contains("queued TLS record was dropped"),
-        "the error must name what was lost, got: {err}"
+        !out.is_empty() && out[0] == 22,
+        "the queued handshake flight is encoded, got {out:?}"
     );
-    assert!(out.is_empty(), "nothing may be handed to the caller");
     assert!(
         !server.close_notify_sent,
         "no alert was sent, so the close deadline must not be armed"
+    );
+}
+
+/// A receive error leaves the alert rustls generated for it in the engine's
+/// output, so the peer learns why the connection ended instead of reading a
+/// bare FIN. rustls appends the alert to its output while reporting the
+/// error and hands it back only on the next call into the state machine, so
+/// the engine has to make that call before it returns the error.
+#[test]
+fn a_receive_error_puts_the_fatal_alert_in_the_output() {
+    let (mut server, mut client) = handshaked_pair();
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+
+    let mut record = vec![0u8; 4096];
+    let (_, used_ct) = encrypt_chunk(&mut client, b"hello", &mut record).expect("encrypt");
+    record.truncate(used_ct);
+    // Flip a byte of the tag: the server reports bad_record_mac.
+    let last = record.len() - 1;
+    record[last] ^= 0xff;
+
+    let (outcome, out) = pump(&mut server, &record, &mut accs);
+    assert!(
+        matches!(outcome, DriveOutcome::Error(_)),
+        "a corrupted record is a fatal error, got {outcome:?}"
+    );
+    assert!(!out.is_empty(), "the output holds the alert record");
+    let err = decrypt_at(&mut client, &out).expect_err("the client reads a fatal alert");
+    assert!(
+        err.contains("alert"),
+        "the client sees the alert, got: {err}"
     );
 }
 
@@ -1079,7 +1407,7 @@ fn client_with_partial_ticket() -> TlsConn {
     );
     let (outcome, _) = pump(&mut client, records[0], &mut accs);
     assert!(!matches!(outcome, DriveOutcome::Error(_)), "{outcome:?}");
-    let (_, incoming, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
+    let (_, incoming, _, _) = client.conn.as_unbuffered_mut().unwrap().split_mut();
     assert!(
         !incoming.is_empty(),
         "rustls keeps the partial ticket's record"

@@ -49,7 +49,9 @@ use std::sync::Arc;
 use ringline_tls::client::{ClientConnectionData, UnbufferedClientConnection};
 use ringline_tls::pki_types::ServerName;
 use ringline_tls::server::{ServerConnectionData, UnbufferedServerConnection};
-use ringline_tls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedStatus};
+use ringline_tls::unbuffered::{
+    ConnectionState, EncodeError, EncodeTlsData, EncryptError, UnbufferedStatus,
+};
 
 use super::TlsConn;
 use super::ciphertext::{CiphertextBuf, INITIAL_SHRINK_TO, MAX_SINGLE_APPEND, MIN_CIPHERTEXT_CAP};
@@ -139,6 +141,19 @@ pub struct UnbufferedConn {
     /// remains. It exists so that a state machine that surprises us loses
     /// throughput, not bytes.
     pending_plaintext: VecDeque<Vec<u8>>,
+    /// Set once a call into rustls' state machine (`process`) returned an
+    /// error, left it in a state the drive does not service, or handed back
+    /// a record that could not be encoded. No later call may enter the state
+    /// machine: for an error rustls reported, the
+    /// record that failed is still at the front of `incoming` (rustls
+    /// advances past a record only on success) and rustls may hold an offset
+    /// into it for a partial handshake message, so the close path would
+    /// deframe the record again and queue a second fatal alert, which rustls
+    /// debug-asserts against, and emptying the buffer instead makes rustls
+    /// index past its end. An accumulator overflow does not set it: rustls
+    /// consumed that record, and the close that follows queues a
+    /// close_notify as it does for any open connection.
+    failed: bool,
     /// Largest plaintext slice known to encrypt into one output buffer of
     /// `chunk_basis` bytes. Learned from rustls' `required_size` and reused
     /// only when the output buffer cannot hold one whole record, which only
@@ -188,6 +203,7 @@ impl UnbufferedConn {
             max_plaintext_per_chunk: 0,
             chunk_basis: 0,
             sni: None,
+            failed: false,
         }
     }
 
@@ -259,11 +275,13 @@ impl UnbufferedConn {
         &mut UnbufferedKind,
         &mut CiphertextBuf,
         &mut VecDeque<Vec<u8>>,
+        &mut bool,
     ) {
         (
             &mut self.kind,
             &mut self.incoming,
             &mut self.pending_plaintext,
+            &mut self.failed,
         )
     }
 }
@@ -324,7 +342,8 @@ pub(crate) enum DriveOutcome {
 ///
 /// Application data is *not* encrypted here: that is the send path's
 /// `WriteTraffic::encrypt`, which writes straight into a pool slot. `out` only
-/// ever carries handshake records and alerts.
+/// ever carries handshake records and alerts, including the fatal alert
+/// rustls queues while reporting the error an `Error` outcome carries.
 ///
 /// When a handshake completion and a close land on the same call, this returns
 /// `HandshakeJustCompleted`. That is the same precedence [`fold_outcome`]
@@ -374,13 +393,25 @@ fn drive_records(
             "connection not driven by the unbuffered TLS engine".into(),
         ));
     };
-    let (kind, incoming, pending) = conn.split_mut();
+    if conn.failed {
+        // See `UnbufferedConn::failed`. No backend drives a connection after
+        // its Error arm ran; this keeps the invariant where the field states
+        // it.
+        return DriveOutcome::Error(ringline_tls::Error::General(
+            "TLS connection failed on an earlier receive".into(),
+        ));
+    }
+    let (kind, incoming, pending, failed) = conn.split_mut();
 
     // `sink` moves into whichever arm runs — the arms are exclusive, so no
     // reborrow is needed here.
     let (outcome, peer_closed) = match kind {
-        UnbufferedKind::Server(c) => drive_inner(c, incoming, pending, sink, out, conn_index),
-        UnbufferedKind::Client(c) => drive_inner(c, incoming, pending, sink, out, conn_index),
+        UnbufferedKind::Server(c) => {
+            drive_inner(c, incoming, pending, failed, sink, out, conn_index)
+        }
+        UnbufferedKind::Client(c) => {
+            drive_inner(c, incoming, pending, failed, sink, out, conn_index)
+        }
     };
 
     if peer_closed {
@@ -396,6 +427,32 @@ fn drive_records(
     outcome
 }
 
+/// Encode the record `enc` holds into `out`, growing `out` to the size rustls
+/// asks for. On an encode error `out` is left as it was.
+fn encode_record<D>(
+    mut enc: EncodeTlsData<'_, D>,
+    out: &mut Vec<u8>,
+) -> Result<(), ringline_tls::Error> {
+    let start = out.len();
+    let mut room = out.capacity().saturating_sub(start).max(1024);
+    loop {
+        out.resize(start + room, 0);
+        match enc.encode(&mut out[start..]) {
+            Ok(n) => {
+                out.truncate(start + n);
+                return Ok(());
+            }
+            Err(EncodeError::InsufficientSize(need)) => {
+                room = need.required_size;
+            }
+            Err(e) => {
+                out.truncate(start);
+                return Err(ringline_tls::Error::General(e.to_string()));
+            }
+        }
+    }
+}
+
 /// The state machine proper, monomorphized per connection role.
 ///
 /// Returns the outcome plus whether the peer's close_notify was observed (the
@@ -404,6 +461,7 @@ fn drive_inner<C: UnbufferedEngine>(
     conn: &mut C,
     incoming: &mut CiphertextBuf,
     pending: &mut VecDeque<Vec<u8>>,
+    failed: &mut bool,
     mut sink: Option<&mut AccumulatorTable>,
     out: &mut Vec<u8>,
     conn_index: u32,
@@ -460,29 +518,13 @@ fn drive_inner<C: UnbufferedEngine>(
                     }
                 }
             }
-            Ok(ConnectionState::EncodeTlsData(mut enc)) => {
+            Ok(ConnectionState::EncodeTlsData(enc)) => {
                 // `encode` is all-or-nothing on one contiguous buffer. The
                 // record goes into `out`, which io_uring copies into pool
                 // slots and mio queues as it is. Handshake-only; the data path
                 // never comes through here.
-                let start = out.len();
-                let mut room = out.capacity().saturating_sub(start).max(1024);
-                loop {
-                    out.resize(start + room, 0);
-                    match enc.encode(&mut out[start..]) {
-                        Ok(n) => {
-                            out.truncate(start + n);
-                            break;
-                        }
-                        Err(EncodeError::InsufficientSize(need)) => {
-                            room = need.required_size;
-                        }
-                        Err(e) => {
-                            out.truncate(start);
-                            error = Some(ringline_tls::Error::General(e.to_string()));
-                            break;
-                        }
-                    }
+                if let Err(e) = encode_record(enc, out) {
+                    error = Some(e);
                 }
             }
             Ok(ConnectionState::TransmitTlsData(mut transmit)) => {
@@ -525,6 +567,24 @@ fn drive_inner<C: UnbufferedEngine>(
         incoming.discard(discard);
 
         if let Some(e) = error {
+            // For an error rustls reported, it appends the fatal alert to its
+            // output while reporting it, and the state machine hands a queued
+            // record back only on the next call: make that call, so the alert
+            // leaves with the error and the peer does not read a bare FIN.
+            // For an error of this loop's own (an unserviced state, a failed
+            // encode) the call encodes whatever record rustls had queued
+            // next, or nothing. Both backends queue `out` whatever the
+            // outcome.
+            let status = conn.process(incoming.pending());
+            let discard = status.discard;
+            if let Ok(ConnectionState::EncodeTlsData(enc)) = status.state {
+                let _ = encode_record(enc, out);
+            }
+            incoming.discard(discard);
+            // No further call enters the machine for this connection:
+            // `drive`, `queue_close_notify` and `encrypt_chunk` return
+            // without processing once the flag is set.
+            *failed = true;
             return (DriveOutcome::Error(e), peer_closed);
         }
         if sink_overflow {
@@ -608,7 +668,7 @@ pub(crate) fn feed(
                     "connection not driven by the unbuffered TLS engine".into(),
                 ));
             };
-            let (_, incoming, _) = conn.split_mut();
+            let (_, incoming, _, _) = conn.split_mut();
             let before = incoming.len();
             match incoming.append(chunk) {
                 Ok(()) => break,
@@ -621,7 +681,7 @@ pub(crate) fn feed(
                     if let DriveOutcome::Error(err) = outcome {
                         return DriveOutcome::Error(err);
                     }
-                    let (_, incoming, _) = tls_conn
+                    let (_, incoming, _, _) = tls_conn
                         .conn
                         .as_unbuffered_mut()
                         .expect("engine checked above")
@@ -709,6 +769,12 @@ pub(crate) fn encrypt_chunk(
         .conn
         .as_unbuffered_mut()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    if conn.failed {
+        // See `UnbufferedConn::failed`; the connection is closing.
+        return Err(io::Error::other(
+            "TLS connection failed on receive; connection closing",
+        ));
+    }
 
     let record_wire_len = fragment_len + record_overhead;
     let whole = dst.len() / record_wire_len;
@@ -777,14 +843,26 @@ pub(crate) fn encrypt_chunk(
     // under-count.
     let mut learned: Option<usize> = None;
 
-    let (kind, incoming, _) = conn.split_mut();
+    let (kind, incoming, _, failed) = conn.split_mut();
     let (result, peer_closed) = match kind {
-        UnbufferedKind::Server(c) => {
-            encrypt_with(c, incoming, plaintext, dst, &mut chunk, &mut learned)
-        }
-        UnbufferedKind::Client(c) => {
-            encrypt_with(c, incoming, plaintext, dst, &mut chunk, &mut learned)
-        }
+        UnbufferedKind::Server(c) => encrypt_with(
+            c,
+            incoming,
+            failed,
+            plaintext,
+            dst,
+            &mut chunk,
+            &mut learned,
+        ),
+        UnbufferedKind::Client(c) => encrypt_with(
+            c,
+            incoming,
+            failed,
+            plaintext,
+            dst,
+            &mut chunk,
+            &mut learned,
+        ),
     };
     // Recorded before the `?`: the edge is consumed either way, and an
     // encrypt that fails on a closed connection still owes the flag.
@@ -820,6 +898,7 @@ pub(crate) fn encrypt_chunk(
 fn encrypt_with<C: UnbufferedEngine>(
     conn: &mut C,
     incoming: &mut CiphertextBuf,
+    failed: &mut bool,
     plaintext: &[u8],
     dst: &mut [u8],
     chunk: &mut usize,
@@ -896,7 +975,18 @@ fn encrypt_with<C: UnbufferedEngine>(
             io::ErrorKind::WouldBlock,
             "TLS connection not ready to encrypt application data",
         )),
-        Err(e) => Err(io::Error::other(e)),
+        // `process` deframed a record the drive that received it did not
+        // reach: an accumulator overflow returns before the records behind
+        // the overflowing one. A failure on one of them leaves the same
+        // state as a failed drive (`UnbufferedConn::failed`). The alert
+        // rustls queues for it is not encoded here (`dst` is an
+        // application-data slot, discarded on `Err`) and the close path does
+        // not enter the machine, so the peer reads a FIN, as it does after
+        // an overflow that leaves records unread.
+        Err(e) => {
+            *failed = true;
+            Err(io::Error::other(e))
+        }
     };
     incoming.discard(discard);
     (result, peer_closed)
@@ -979,19 +1069,26 @@ pub(crate) fn encrypt_to_vec(
 /// ("### close_notify").
 ///
 /// A connection that never reached traffic state, or that is already closed,
-/// has nothing to queue: `out` is left untouched and `close_notify_sent` stays
-/// false. That is not an error — the caller is tearing the connection down
-/// either way, and arming the close-notify deadline for an alert that was
-/// never sent would only invent a stall to time out on.
+/// has no alert to queue, and `close_notify_sent` stays false. Records rustls
+/// had queued, or generates while processing input it already holds, are
+/// still appended to `out`. That is not an error: the caller is tearing the
+/// connection down either way, and arming the close-notify deadline for an
+/// alert that was never sent would only invent a stall to time out on.
 pub(crate) fn queue_close_notify(tls_conn: &mut TlsConn, out: &mut Vec<u8>) -> io::Result<()> {
     let conn = tls_conn
         .conn
         .as_unbuffered_mut()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let (kind, incoming, _) = conn.split_mut();
+    if conn.failed {
+        // An alert rustls queued for a failure the drive reported left with
+        // that drive; one queued for a failure the send path or the close
+        // path reported stays in rustls. See `UnbufferedConn::failed`.
+        return Ok(());
+    }
+    let (kind, incoming, _, failed) = conn.split_mut();
     let (result, peer_closed) = match kind {
-        UnbufferedKind::Server(c) => close_notify_with(c, incoming, out),
-        UnbufferedKind::Client(c) => close_notify_with(c, incoming, out),
+        UnbufferedKind::Server(c) => close_notify_with(c, incoming, failed, out),
+        UnbufferedKind::Client(c) => close_notify_with(c, incoming, failed, out),
     };
     // Recorded before the `?`, as in `encrypt_chunk`: the edge is consumed
     // whatever the result, and a teardown that loses it makes the FIN it is
@@ -1006,8 +1103,12 @@ pub(crate) fn queue_close_notify(tls_conn: &mut TlsConn, out: &mut Vec<u8>) -> i
     Ok(())
 }
 
-/// Obtain `WriteTraffic` and queue a close_notify into `out`. Returns the
-/// bytes appended.
+/// Obtain `WriteTraffic` and queue a close_notify into `out`. Returns a
+/// non-zero count when a close_notify is in `out` and 0 when none is; the
+/// count is not an exact byte count of the alert (a queued `key_update`
+/// rides along, and a record encoded ahead of a `WriteTraffic` that then has
+/// nothing more to write is counted whole). Records rustls had queued, or
+/// generates from input it already holds, are appended to `out` either way.
 ///
 /// Like `encrypt`, `queue_close_notify` is all-or-nothing on its output: too
 /// small a buffer writes nothing and reports the exact `required_size`. So the
@@ -1027,65 +1128,127 @@ pub(crate) fn queue_close_notify(tls_conn: &mut TlsConn, out: &mut Vec<u8>) -> i
 /// `CommonState::eager_send_close_notify` and `process_tls_records_common`).
 ///
 /// Anything rustls had already queued for sending rides out in `out` ahead of
-/// the alert, because `write_fragments` drains `sendable_tls` into the front of
-/// the destination and `check_required_size` reserves the room for it. So `out`
-/// is transmitted as-is; there is nothing to flush afterwards, and driving the
+/// the alert: a record the state machine hands back as `EncodeTlsData` before
+/// it reaches `WriteTraffic` is encoded first, and once in `WriteTraffic`
+/// `write_fragments` drains `sendable_tls` into the front of the destination
+/// and `check_required_size` reserves the room for it. So `out` is
+/// transmitted as-is; there is nothing to flush afterwards, and driving the
 /// machine again to look would emit those records *after* the alert on the
 /// wire.
+///
+/// On TLS 1.2 traffic-key exhaustion `write_plaintext` calls
+/// `send_close_notify()` itself before returning `EncryptExhausted`
+/// (ringline-tls `common_state.rs`), so the alert this function exists to
+/// send is already queued when the close reaches here: it comes back as
+/// `EncodeTlsData` and is encoded; the machine then reaches `WriteTraffic`,
+/// where `queue_close_notify` writes nothing because `send_close_notify`
+/// returns early once `sent_fatal_alert` is set, so the encoded record is
+/// counted as the alert. `Closed` is reached instead only when the peer's
+/// close_notify has also been processed, and counts the encoded record the
+/// same way. `PeerClosed`, reported when that processing happens in this
+/// call, sets no count when a record was encoded: the loop calls `process`
+/// again and the next state, `Closed` or `WriteTraffic`, sets it. A
+/// server closed before its handshake finished encodes the flight it had
+/// queued, reaches `BlockedHandshake`, and has no alert to queue.
 fn close_notify_with<C: UnbufferedEngine>(
     conn: &mut C,
     incoming: &mut CiphertextBuf,
+    failed: &mut bool,
     out: &mut Vec<u8>,
 ) -> (io::Result<usize>, bool) {
     let mut peer_closed = false;
     let start = out.len();
-    let status = conn.process(incoming.pending());
-    let discard = status.discard;
-    let result = match status.state {
-        Ok(ConnectionState::WriteTraffic(mut wt)) => {
-            let mut room = 0;
-            loop {
-                out.resize(start + room, 0);
-                match wt.queue_close_notify(&mut out[start..]) {
-                    Ok(n) => break Ok(n),
-                    Err(EncryptError::InsufficientSize(need)) => room = need.required_size,
-                    Err(e) => break Err(io::Error::other(e.to_string())),
-                }
+    // Bytes of the close_notify alert in `out`. Other records rustls had
+    // queued are appended to `out` as well, but only the alert counts
+    // toward `close_notify_sent`.
+    let mut alert_bytes = 0;
+    let mut encoded_queued = false;
+    let result = loop {
+        let status = conn.process(incoming.pending());
+        let discard = status.discard;
+        let step = match status.state {
+            Ok(ConnectionState::WriteTraffic(mut wt)) => {
+                let alert_start = out.len();
+                let mut room = 0;
+                Some(loop {
+                    out.resize(alert_start + room, 0);
+                    match wt.queue_close_notify(&mut out[alert_start..]) {
+                        Ok(n) => {
+                            out.truncate(alert_start + n);
+                            // `queue_close_notify` writes nothing once rustls
+                            // has already queued the alert itself, so a
+                            // record encoded on the way here was that alert.
+                            alert_bytes = if n == 0 && encoded_queued {
+                                out.len() - start
+                            } else {
+                                n
+                            };
+                            break Ok(());
+                        }
+                        Err(EncryptError::InsufficientSize(need)) => room = need.required_size,
+                        Err(e) => break Err(io::Error::other(e.to_string())),
+                    }
+                })
             }
+            // A record rustls queued before this call. Destructive to
+            // construct (see the matching arm in [`encrypt_with`]), so it is
+            // encoded here rather than dropped; the loop then asks the
+            // machine for its next state.
+            Ok(ConnectionState::EncodeTlsData(enc)) => match encode_record(enc, out) {
+                Ok(()) => {
+                    encoded_queued = true;
+                    None
+                }
+                Err(e) => {
+                    *failed = true;
+                    Some(Err(io::Error::other(e)))
+                }
+            },
+            // Closed needs a close_notify sent as well as received, so a
+            // record encoded on the way here was rustls' own alert
+            // (traffic-key exhaustion queues it before reporting the error).
+            Ok(ConnectionState::Closed) => {
+                if encoded_queued {
+                    alert_bytes = out.len() - start;
+                }
+                Some(Ok(()))
+            }
+            Ok(ConnectionState::TransmitTlsData(mut transmit)) => {
+                let _ = transmit.may_encrypt_app_data();
+                transmit.done();
+                None
+            }
+            // Edge-triggered; see [`encrypt_with`]. Selected ahead of
+            // `Closed` and `WriteTraffic`. A record encoded on the way here
+            // may be rustls' own close_notify or another queued record (a
+            // key_update), so the next `process` sets the count: `Closed`
+            // counts it as the alert, `WriteTraffic` queues the alert behind
+            // it and sends one in reply. With nothing encoded the loop stops
+            // here, no alert is sent in reply, and the edge goes up.
+            Ok(ConnectionState::PeerClosed) => {
+                peer_closed = true;
+                if encoded_queued { None } else { Some(Ok(())) }
+            }
+            // Already closed, never reached traffic state, or `ReadTraffic`
+            // for an application-data record left undeframed behind an
+            // accumulator overflow: nothing is queued, and after the
+            // overflow the peer reads a FIN.
+            Ok(_) => Some(Ok(())),
+            // The record at the front failed to deframe: the state a failed
+            // drive leaves (`UnbufferedConn::failed`).
+            Err(e) => {
+                *failed = true;
+                Some(Err(io::Error::other(e)))
+            }
+        };
+        // `status` is dead here, so the ciphertext buffer is free again.
+        incoming.discard(discard);
+        if let Some(step) = step {
+            break step;
         }
-        // Destructive to construct, and dropping it discards the record for
-        // good — see the matching arm in [`encrypt_with`] for the rustls
-        // reference. It bites harder here: on TLS 1.2 traffic-key exhaustion
-        // `write_plaintext` calls `send_close_notify()` itself before returning
-        // `EncryptExhausted` (rustls 0.23.41 `common_state.rs`), so the alert
-        // this function exists to send can already be sitting in
-        // `sendable_tls`. The old catch-all popped it, dropped it and returned
-        // `Ok(0)`, leaving `close_notify_sent` false and the peer with a bare
-        // FIN. Encoding it into `out` is deliberately *not* the fix: this
-        // function enters the state machine exactly once on purpose (see
-        // above), so servicing an encode would mean re-entering it and
-        // stranding the alert — the failure this design already avoids.
-        // Named rather than swallowed; see the test.
-        Ok(ConnectionState::EncodeTlsData(_)) => Err(io::Error::other(
-            "a queued TLS record was dropped by the close_notify path",
-        )),
-        // Edge-triggered; see [`encrypt_with`]. Still "nothing to queue" —
-        // a closed connection has no alert to send — but the edge goes up.
-        Ok(ConnectionState::PeerClosed) => {
-            peer_closed = true;
-            Ok(0)
-        }
-        // Already closed, or never reached traffic state: nothing to queue.
-        Ok(_) => Ok(0),
-        Err(e) => Err(io::Error::other(e)),
     };
-    // `status` is dead here, so the ciphertext buffer is free again.
-    incoming.discard(discard);
     let result = match result {
-        Ok(n) => {
-            out.truncate(start + n);
-            Ok(n)
-        }
+        Ok(()) => Ok(alert_bytes),
         Err(e) => {
             out.truncate(start);
             Err(e)
@@ -1105,7 +1268,7 @@ fn drain_pending_plaintext(
     let Some(conn) = tls_conn.conn.as_unbuffered_mut() else {
         return true;
     };
-    let (_, _, pending) = conn.split_mut();
+    let (_, _, pending, _) = conn.split_mut();
     while let Some(chunk) = pending.front() {
         if !accumulators.append(conn_index, chunk) {
             return false;

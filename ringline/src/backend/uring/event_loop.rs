@@ -6180,7 +6180,7 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         el.driver.park_offered[conn_index as usize] = true;
         install_handshaked_tls(&mut el, conn_index);
-        let (_, _, stash) = el
+        let (_, _, stash, _) = el
             .driver
             .tls_table
             .as_mut()

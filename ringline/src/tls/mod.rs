@@ -768,9 +768,13 @@ impl TlsTable {
     /// alert into a caller buffer -- so that arm copies the result into pool
     /// slots itself, per `docs/tls-unbuffered-design.md` ("### close_notify").
     ///
-    /// A connection that never reached traffic state has nothing to queue and
-    /// leaves `out` untouched. That is not an error: the caller is tearing the
-    /// connection down either way.
+    /// A connection that never reached traffic state has no alert to queue;
+    /// records rustls had queued, or generates from input it already holds,
+    /// are placed in `out` all the same. That is not an error: the caller is
+    /// tearing the connection down either way. A connection marked failed
+    /// places nothing: an alert the drive's error path encoded has already
+    /// left, and a failure found on the send path leaves its alert in
+    /// rustls.
     ///
     /// Returns `None` when the alert was placed in `out`, or when there was
     /// nothing to queue. Returns `Some(ciphertext)` when the pool had no slot
@@ -789,13 +793,12 @@ impl TlsTable {
         let tls_conn = self.get_mut(conn_index)?;
         #[cfg(not(feature = "tls-buffered"))]
         {
-            // `queue_close_notify` signals "nothing to queue" by leaving
-            // `scratch` untouched, not by an error or a count. Anything rustls
-            // had already queued rides out inside `scratch` *ahead* of the
-            // alert (`write_fragments` drains `sendable_tls` into the front of
-            // the destination), so this transmits it as-is and does not drive
-            // the machine afterwards looking for leftovers -- that would put
-            // them after the alert on the wire.
+            // `queue_close_notify` appends anything rustls had already queued
+            // ahead of the alert, and the alert when the connection can send
+            // one; its count is non-zero only when an alert is in `scratch`.
+            // `scratch` is transmitted as-is, and the machine is not driven
+            // afterwards looking for leftovers -- that would put them after
+            // the alert on the wire.
             let mut scratch = Vec::new();
             if unbuffered::queue_close_notify(tls_conn, &mut scratch).is_err() {
                 return None;

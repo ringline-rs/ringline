@@ -108,9 +108,9 @@ pub fn flush_tls_output_mio_queued(
 /// `send_close_notify` first and this only drains rustls' output; the
 /// unbuffered engine has no such call (`CommonState::send_close_notify` is not
 /// reachable through `UnbufferedConnectionCommon`), so the alert is encrypted
-/// here via `WriteTraffic::queue_close_notify`. A connection that never
-/// reached traffic state has nothing to queue and leaves `write_buf` empty —
-/// not an error.
+/// here via `WriteTraffic::queue_close_notify`, behind any record rustls had
+/// queued before the close. A connection that never reached traffic state and
+/// has nothing queued leaves `write_buf` empty, which is not an error.
 pub fn flush_tls_output_mio_direct(
     tls_table: &mut TlsTable,
     stream: &mut mio::net::TcpStream,
