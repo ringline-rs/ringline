@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769) and F9 (#768) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776) and F9 (#768) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -309,7 +309,19 @@ Shutdown is in flight, and a repeat `shutdown_write` in that window.
 Fix: reset only `ShutdownPending` to `Open`; add `|| cs.close_requested()`
 to the io_uring guard, matching mio (`handler.rs:2915`).
 
-Disposition: open.
+Disposition: fixed in #776, as proposed:
+`force_finalize_close` resets the write half to `Open` only from
+`ShutdownPending`, whose queued sends it released, and the io_uring
+`shutdown_write` returns when `close_requested()`, as the mio one does. Pinned
+by `a_forced_close_keeps_an_in_flight_shutdown_recorded` and
+`shutdown_write_after_a_requested_close_submits_nothing`; verified by
+`experiments/force-close-write-half-verify.toml` (SystemsLab experiment
+`01a1bc3b-0b66-7125-1396-0547f875c73f`, Debian 13, Linux 6.12): at the
+tests-only commit 0bea7c16 both fail (1 passed; 2 failed), at the branch head
+8fd4e34d (the fix b8883058 plus the spec and the alpha bump) three pass, and the uring gate (fmt, clippy on three builds, rustdoc, `cargo test
+--all`, lib 780 passed) passes. The trigger (a repeat `shutdown_write` in the
+window between the deadline and the Shutdown CQE) was not reproduced from
+outside the event loop.
 
 ### F8 — worker exit leaves `CONNECTIONS_ACTIVE` inflated and abandons mio closing connections (invariants 15, 3). Traced.
 

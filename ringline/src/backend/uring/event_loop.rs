@@ -13644,6 +13644,71 @@ mod tests {
         );
     }
 
+    /// A forced close of a connection whose `Shutdown` is in the kernel keeps
+    /// `write = Shutdown`: a repeat `shutdown_write` submits no second
+    /// `Shutdown`, and the Close still waits for the first one's CQE.
+    #[test]
+    fn a_forced_close_keeps_an_in_flight_shutdown_recorded() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        // As `shutdown_write` leaves an idle connection once its SQE is
+        // accepted.
+        el.driver.connections.get_mut(conn_index).unwrap().write =
+            crate::connection::WriteHalf::Shutdown;
+        el.driver.send_queues[conn_index as usize].shutdown_inflight = true;
+
+        el.driver.close_connection(conn_index);
+        el.driver.force_finalize_close(conn_index);
+        let conn = el.driver.connections.get(conn_index).unwrap();
+        assert!(
+            matches!(conn.write, crate::connection::WriteHalf::Shutdown),
+            "the forced close dropped the record of the Shutdown in the kernel"
+        );
+        assert!(!el.driver.send_queues[conn_index as usize].close_submitted);
+
+        el.driver.ring.last_pushed = None;
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.shutdown_write(token);
+        }
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "a second Shutdown was submitted"
+        );
+        assert!(el.driver.send_queues[conn_index as usize].shutdown_inflight);
+
+        let ud = UserData::encode(OpTag::Shutdown, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        el.finalize_pending_closes();
+        assert!(el.driver.send_queues[conn_index as usize].close_submitted);
+    }
+
+    /// `shutdown_write` on a connection whose close is requested submits
+    /// nothing: the Close ends the write half, as on mio.
+    #[test]
+    fn shutdown_write_after_a_requested_close_submits_nothing() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        el.driver.close_connection(conn_index);
+
+        el.driver.ring.last_pushed = None;
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.shutdown_write(token);
+        }
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "a Shutdown was submitted behind a requested close"
+        );
+        let conn = el.driver.connections.get(conn_index).unwrap();
+        assert!(matches!(conn.write, crate::connection::WriteHalf::Open));
+        assert!(!el.driver.send_queues[conn_index as usize].shutdown_inflight);
+    }
+
     /// The #518 gate. `Shutdown` names its socket as the registered-file slot
     /// `Fixed(conn_index)`, so the `Close` that frees that slot for the next
     /// accept must not be submitted while the `Shutdown` is still in the kernel
