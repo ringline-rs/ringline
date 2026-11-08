@@ -937,6 +937,11 @@ impl Future for ResolveFuture {
 /// [`AsyncEventHandler::on_start()`](crate::AsyncEventHandler::on_start) futures,
 /// and from `on_tick` and `on_notify`.
 ///
+/// Stops the calling worker only. Its tasks stop as described under
+/// [`Runtime::shutdown`](crate::Runtime::shutdown): once the worker sees the
+/// request it polls no task again, so a task woken after the worker's last
+/// poll pass is dropped without running the code after its `.await`.
+///
 /// Returns `Err` if called outside the ringline async executor.
 pub fn request_shutdown() -> io::Result<()> {
     try_with_state(|driver, _| {
@@ -4306,7 +4311,8 @@ pub(crate) fn release_connect(
 /// The second poll can come later in the same loop iteration. On io_uring it
 /// follows the loop's flush of queued SQEs and its dispatch of the
 /// completions the kernel has posted. On mio it follows the write of queued
-/// sends, when that write completes an awaited send.
+/// sends, when that write completes an awaited send, and, in an iteration
+/// with a connection close pending, it precedes `drain_pending_closes`.
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
 }

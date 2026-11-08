@@ -915,6 +915,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   task sent after reading the close was refused with `NotConnected`. A
   completion handler now registers the connection for the end-of-iteration
   finalize drain, as a close requested on an idle connection already was.
+- Docs: `Runtime::shutdown` and `request_shutdown` did not say what happens to
+  tasks. A worker that has seen the request polls no task again and drops
+  every task's future, so a task woken after the worker's last poll pass (on
+  io_uring by a completion; on both backends by a send result, released
+  capacity, `on_tick` or another thread) does not resume from the `.await` it
+  is suspended at. On io_uring the check comes between draining completions
+  and polling tasks, and on mio it comes at the end of the iteration.
 
 - io_uring with `sqpoll` and a UDP bind: returning a buffer to ring entry 0
   no longer writes 0 to the ring's tail, which shares those bytes, before
@@ -923,6 +930,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   buffers the application still held. Without `sqpoll` the kernel reads the tail only inside this
   thread's `io_uring_enter`, so the window was never seen.
 
+- mio: a task woken by a close requested after the iteration's task poll is
+  polled before that close finalizes. A connection with only unawaited sends
+  queued (`send_nowait`, a forward, TLS handshake output) whose write failed
+  in the flush — or whose peer's FIN or read error was seen by the
+  forward-resume reads that follow it — had its task woken and then dropped
+  by the same iteration's teardown, unpolled, so the code after the parked
+  read never ran. In an iteration with a close pending, the finalize step
+  now polls the ready tasks first. Awaited sends were not affected: their
+  settled result already re-polled the task.
 - `CONNECTIONS_ACTIVE` counts outbound connections in. An outbound
   connection was decremented at close but never incremented when it became
   established: every outbound connection on io_uring, and every TLS outbound
