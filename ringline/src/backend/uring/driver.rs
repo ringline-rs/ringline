@@ -798,8 +798,11 @@ pub(crate) struct Driver {
 pub(crate) struct ParkInFlight {
     pub target: usize,
     /// Generation at submit time, the one the install CQE carries. The entry
-    /// is cleared with the slot (`clear_conn_claims`), so it is always the
-    /// slot's current occupant's.
+    /// is set for the slot's current generation and cleared by
+    /// `clear_conn_claims` when `handle_close` or `run_shutdown` releases the
+    /// slot; the other release sites free a slot allocated in the same call,
+    /// which no park has reached. So it is always the slot's current
+    /// occupant's.
     pub generation: u32,
 }
 
@@ -1353,7 +1356,7 @@ impl Driver {
     /// slot with an entry, so one left by the previous occupant would hold
     /// off the next occupant's park until its CQE lands; `handle_park_install`
     /// checks the generation before it reads the entry, so a CQE that lands
-    /// after the clear touches nothing.
+    /// after the clear touches nothing on the slot.
     pub(crate) fn clear_conn_claims(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
         if let Some(taken) = self.recv_half_taken.get_mut(idx) {

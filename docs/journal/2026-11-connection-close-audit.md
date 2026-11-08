@@ -386,8 +386,10 @@ Disposition: fixed in `fix/uring-park-install-identity`, as proposed but
 for where the clear runs: `handle_park_install` compares the CQE's
 generation with the slot's before it reads `park_in_flight` or the drain,
 and a CQE for a previous occupant closes the fd it carries and nothing
-else; `clear_conn_claims`, which every slot release runs, clears
-`park_in_flight`. A clear in `close_connection` would have sent the install
+else; `clear_conn_claims`, which `handle_close` and `run_shutdown` run
+before they release a slot, clears `park_in_flight` (the other release
+sites free a slot allocated in the same call, which no park has reached).
+A clear in `close_connection` would have sent the install
 CQE of a connection closed mid-park down the stray path, losing the
 `PARK_ABANDONED` count for it. Three tests pin the fix:
 `a_stale_install_leaves_the_next_occupants_park_in_flight` and

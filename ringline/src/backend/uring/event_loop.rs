@@ -5684,6 +5684,8 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let stale = generation.wrapping_sub(1);
+        // Written by hand: `clear_conn_claims` leaves no entry for a
+        // previous occupant.
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 1,
@@ -5715,6 +5717,8 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let stale = generation.wrapping_sub(1);
+        // Written by hand: `clear_conn_claims` leaves no entry for a
+        // previous occupant.
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 1,
