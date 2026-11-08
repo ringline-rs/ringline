@@ -344,6 +344,13 @@ rather than being failed now.
 Fix: decide whether a terminal plaintext send error should close (as TLS
 does) and set `read = Error`; or document the asymmetry.
 
+Consequence, observed in #769's CI: a peer that resets the connection while
+an unawaited 8 MiB response is draining is reported to the parked reader as
+`Err(ConnectionReset)` in some runs and `Ok(0)` in others (3 of 6 io_uring
+jobs). The reading of the mechanism is that the failed send's CQE takes the
+socket's pending error, and the receive that follows then reports a plain
+EOF; not traced in a run. #769 runs its write-error test on mio only.
+
 Disposition: open.
 
 ### F14 — docs and comments false or unresolvable at a2e28073. Confirmed by quote and grep.
