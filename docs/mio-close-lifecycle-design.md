@@ -127,12 +127,11 @@ patch around.
 
 ## Worker exit
 
-A worker that exits, at runtime shutdown or after its own failure under
-`TaskPanicPolicy::Contain`, does not run `drain_pending_closes` for the
-connections still open. It counts each established one out of
+A worker that exits, at runtime shutdown or after its own failure, does not
+run `drain_pending_closes` for the connections still open. It counts each established one out of
 `CONNECTIONS_ACTIVE` and into `conn::CLOSED` (`count_out_open_connections`),
-then drops the event loop, which closes every socket: queued sends are not
-written and no close_notify is sent. io_uring closes each connection through
+then drops the event loop, which closes every socket: sends still queued are
+not written and no close_notify is sent. io_uring closes each connection through
 the ring at exit (`run_shutdown`) and counts it the same way.
 
 ## Tests

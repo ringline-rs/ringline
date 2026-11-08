@@ -68,8 +68,10 @@ pub static RECV_ARRIVAL: ShardedCounterGroup = ShardedCounterGroup::new(recv_arr
 /// teardown only for a connection that was established, so a failed connect
 /// or handshake moves it neither way. Same rule on both backends. A
 /// connection still open when its worker exits is decremented as the worker
-/// closes it. One exception: a parked connection is decremented on the
-/// worker it leaves and incremented again on the worker that adopts it.
+/// closes it; on io_uring a connection whose Close has not completed when
+/// the worker's 10 s shutdown bound runs out (#607) is not. A parked
+/// connection is decremented on the worker it leaves and incremented again
+/// on the worker that adopts it.
 #[metric(
     name = "ringline/connections/active",
     description = "Established connections not yet torn down"
@@ -87,7 +89,8 @@ pub mod conn {
     pub const ACCEPTED: usize = 0;
     /// Teardowns of established connections, accepted or outbound. A failed
     /// connect or TLS handshake is not a close; a connection still open when
-    /// its worker exits is counted as the worker closes it. A parked
+    /// its worker exits is counted as the worker closes it, with the same
+    /// io_uring exception as the gauge. A parked
     /// connection counts as a close on the worker it leaves. Same rule on
     /// both backends;
     /// `CONNECTIONS_ACTIVE` decrements under the same conditions.

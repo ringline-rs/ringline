@@ -622,8 +622,8 @@ impl Driver {
     /// Count every connection still open out of `CONNECTIONS_ACTIVE` and
     /// into `conn::CLOSED`, at worker exit. Both counters follow
     /// `established`, as in `finish_close`. The worker then drops the event
-    /// loop, which closes each socket: queued sends are not written and no
-    /// close_notify is sent.
+    /// loop, which closes each socket: sends still queued are not written and
+    /// no close_notify is sent.
     pub(crate) fn count_out_open_connections(&mut self) {
         for idx in 0..self.connections.max_slots() {
             if self.connections.get(idx).is_some_and(|c| c.established) {
