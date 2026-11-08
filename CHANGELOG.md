@@ -919,6 +919,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   from the event loop on the close-retry backoff. Found by the send-path
   audit (`docs/journal/2026-11-send-path-audit.md`, F10).
 
+- io_uring: a Connect CQE is matched to the connection it was submitted
+  for. The Connect SQE carried no generation, so after a connect timeout
+  closed the slot, the cancelled Connect's CQE could run against the slot's
+  next occupant: opened or closed it, or woke a different connect's waiter.
+  The Connect SQE now carries the connection's generation, which its
+  handler checks first. The cancel of the connect timeout after a connect
+  completes names the user_data the timeout carries; it named payload 0,
+  which matched only a slot's first occupant, so for every later one the
+  timeout stayed armed for its full duration and was then rejected by its
+  handler.
+
 - io_uring: a plain `Close` the ring refuses at worker exit is retried. The
   exit path retried a refused cancel and a refused close of a connection
   holding send-slab entries, but discarded the error for every other

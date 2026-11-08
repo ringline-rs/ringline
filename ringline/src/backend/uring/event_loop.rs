@@ -3509,9 +3509,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn handle_connect(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
 
-        if self.driver.connections.get(conn_index).is_none() {
-            return;
-        }
+        // The payload is the generation of the connection the Connect was
+        // submitted for. The connect timeout's close is committed by the
+        // end-of-iteration drain without waiting for this CQE, so it can
+        // arrive after the slot was freed and reused and must not touch the
+        // new occupant.
+        let generation = match self.driver.connections.get(conn_index) {
+            Some(conn) if conn.generation == ud.payload() => conn.generation,
+            _ => return,
+        };
 
         if result < 0 {
             let errno = -result;
@@ -3545,7 +3551,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .map(|c| c.connect_timeout_armed)
                 .unwrap_or(false)
             {
-                let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, 0);
+                let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, generation);
                 let _ = self
                     .driver
                     .ring
@@ -3588,7 +3594,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 return;
             }
-            let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, 0);
+            let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, generation);
             let _ = self
                 .driver
                 .ring
@@ -3702,7 +3708,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        let connect_ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        let connect_ud = UserData::encode(OpTag::Connect, conn_index, ud.payload());
         let _ = self
             .driver
             .ring
@@ -10067,7 +10073,11 @@ mod tests {
         el.executor.connect_waiters[conn_index as usize] = true;
 
         // Simulate successful connect CQE (result == 0).
-        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::Connect,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), 0, 0);
 
         // Connect waiter should be cleared and result stored.
@@ -10102,7 +10112,11 @@ mod tests {
         el.executor.connect_waiters[conn_index as usize] = true;
 
         // Simulate ECONNREFUSED (errno 111).
-        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::Connect,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), -111, 0);
 
         // Connect waiter should be cleared with error result.
@@ -11408,7 +11422,11 @@ mod tests {
             .recv_direct = true;
         el.executor.connect_waiters[conn_index as usize] = true;
 
-        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::Connect,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.inject_and_dispatch(ud.raw(), 0);
 
         assert!(!el.executor.connect_waiters[conn_index as usize]);
@@ -11428,7 +11446,11 @@ mod tests {
             .expect("no free slots");
         el.executor.connect_waiters[conn_index as usize] = true;
 
-        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::Connect,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.inject_and_dispatch(ud.raw(), -111); // ECONNREFUSED
 
         assert!(!el.executor.connect_waiters[conn_index as usize]);
@@ -11829,6 +11851,142 @@ mod tests {
         assert_ne!(fs, dio, "fs and direct-I/O keys must differ");
         assert_ne!(fs, nvme, "fs and NVMe keys must differ");
         assert_ne!(dio, nvme, "direct-I/O and NVMe keys must differ");
+    }
+
+    /// An outbound slot whose Connect is in the kernel, with its timeout
+    /// armed as `arm_connect_timeout` leaves it and a task waiting on the
+    /// connect. The slot is used once first so its generation is not 0, the
+    /// value a payload that carries no generation would match by accident.
+    fn connecting_slot(el: &mut AsyncEventLoop<NoopHandler>) -> (u32, u32) {
+        let first = el
+            .driver
+            .connections
+            .allocate_outbound()
+            .expect("no free slots");
+        el.driver.connections.release(first);
+        let conn_index = el
+            .driver
+            .connections
+            .allocate_outbound()
+            .expect("no free slots");
+        assert_eq!(conn_index, first, "precondition: the slot is reused");
+        let generation = el.driver.connections.generation(conn_index);
+        assert_ne!(generation, 0);
+        let cs = el.driver.connections.get_mut(conn_index).unwrap();
+        cs.recv_direct = true;
+        cs.connect_timeout_armed = true;
+        el.executor.connect_waiters[conn_index as usize] = true;
+        (conn_index, generation)
+    }
+
+    /// A Connect CQE whose payload is not the slot's generation belongs to
+    /// an earlier occupant and changes nothing: the connect in progress keeps
+    /// its waiter, its state and its flag, and nothing is cancelled.
+    #[test]
+    fn a_stale_connect_cqe_leaves_the_reused_slot_alone() {
+        let mut el = make_test_loop();
+        let (conn_index, generation) = connecting_slot(&mut el);
+        let stale = UserData::encode(OpTag::Connect, conn_index, generation.wrapping_sub(1));
+        for result in [0, -libc::ECANCELED, -libc::ECONNREFUSED] {
+            el.test_dispatch_cqe(stale.raw(), result, 0);
+            let conn = el
+                .driver
+                .connections
+                .get(conn_index)
+                .expect("a stale Connect CQE closed the occupant");
+            assert!(
+                matches!(conn.lifecycle, Lifecycle::Connecting),
+                "result {result}: the occupant left Connecting"
+            );
+            assert!(conn.connect_timeout_armed);
+            assert!(el.executor.connect_waiters[conn_index as usize]);
+            assert!(el.executor.io_results[conn_index as usize].is_none());
+            assert!(el.driver.ring.pushed_cancels.is_empty());
+        }
+    }
+
+    /// A close requested while the Connect is in the kernel (here by the
+    /// connect timeout) is committed by the end-of-iteration drain without
+    /// waiting for the Connect's CQE. That CQE is matched to this occupant
+    /// by its generation when it lands before the Close CQE, and ignored
+    /// when it lands after.
+    #[test]
+    fn a_close_on_a_connecting_slot_commits_without_the_connect_cqe() {
+        let mut el = make_test_loop();
+        let (conn_index, generation) = connecting_slot(&mut el);
+        let timeout = UserData::encode(OpTag::Timeout, conn_index, generation);
+        el.test_dispatch_cqe(timeout.raw(), -libc::ETIME, 0);
+        assert_eq!(
+            el.driver.ring.pushed_cancels.len(),
+            1,
+            "the Connect is cancelled"
+        );
+        assert!(!el.executor.connect_waiters[conn_index as usize]);
+        assert!(el.driver.send_queues[conn_index as usize].close_pending);
+
+        el.finalize_pending_closes();
+        assert!(el.driver.send_queues[conn_index as usize].close_submitted);
+
+        // Before the Close CQE: the slot is still this occupant's, and the
+        // CQE settles the timeout flag and nothing else.
+        let connect = UserData::encode(OpTag::Connect, conn_index, generation);
+        el.test_dispatch_cqe(connect.raw(), -libc::ECANCELED, 0);
+        let conn = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot is freed by the Close CQE, not before");
+        assert!(!conn.connect_timeout_armed);
+        assert!(conn.close_requested());
+
+        let close = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(close.raw(), 0, 0);
+        assert!(el.driver.connections.get(conn_index).is_none());
+
+        // After it: the slot is inactive and the CQE is ignored.
+        el.test_dispatch_cqe(connect.raw(), -libc::ECANCELED, 0);
+        assert!(el.driver.connections.get(conn_index).is_none());
+    }
+
+    /// The connect timeout cancels the Connect by the user_data the Connect
+    /// was submitted with, which carries the slot's generation.
+    #[test]
+    fn the_connect_timeout_cancels_the_connect_by_its_generation() {
+        let mut el = make_test_loop();
+        let (conn_index, generation) = connecting_slot(&mut el);
+        let timeout = UserData::encode(OpTag::Timeout, conn_index, generation);
+        el.test_dispatch_cqe(timeout.raw(), -libc::ETIME, 0);
+        let connect = UserData::encode(OpTag::Connect, conn_index, generation);
+        assert_eq!(el.driver.ring.pushed_cancels, vec![connect.raw()]);
+    }
+
+    /// A Connect that completes with its timeout armed cancels the timeout
+    /// by the user_data `arm_connect_timeout` gave it, which carries the
+    /// slot's generation.
+    #[test]
+    fn a_completed_connect_cancels_its_timeout_by_its_generation() {
+        let mut el = make_test_loop();
+        let (conn_index, generation) = connecting_slot(&mut el);
+        let connect = UserData::encode(OpTag::Connect, conn_index, generation);
+        el.test_dispatch_cqe(connect.raw(), 0, 0);
+        let timeout = UserData::encode(OpTag::Timeout, conn_index, generation);
+        assert_eq!(el.driver.ring.pushed_cancels, vec![timeout.raw()]);
+        let conn = el.driver.connections.get(conn_index).unwrap();
+        assert!(matches!(conn.lifecycle, Lifecycle::Open));
+        assert!(!conn.connect_timeout_armed);
+    }
+
+    /// The same for a Connect that fails.
+    #[test]
+    fn a_failed_connect_cancels_its_timeout_by_its_generation() {
+        let mut el = make_test_loop();
+        let (conn_index, generation) = connecting_slot(&mut el);
+        let connect = UserData::encode(OpTag::Connect, conn_index, generation);
+        el.test_dispatch_cqe(connect.raw(), -libc::ECONNREFUSED, 0);
+        let timeout = UserData::encode(OpTag::Timeout, conn_index, generation);
+        assert_eq!(el.driver.ring.pushed_cancels, vec![timeout.raw()]);
+        let conn = el.driver.connections.get(conn_index).unwrap();
+        assert!(conn.close_requested());
     }
 
     #[test]
