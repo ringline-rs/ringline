@@ -1307,6 +1307,9 @@ impl Driver {
         // reactivated with a Shutdown still outstanding. If the gate ever leaks,
         // the next occupant must not inherit the block.
         state.shutdown_inflight = false;
+        // The same for a Connect: the CQE that clears it arrives before the
+        // slot can be closed and reactivated.
+        state.connect_inflight = false;
         state.close_notify_deadline = None;
         state.waiting_send = None;
         state.send_poll = SendPoll::None;
