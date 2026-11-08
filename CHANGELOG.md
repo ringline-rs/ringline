@@ -908,6 +908,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Docs: `SendHalf::send` and `send_nowait` name the `NotConnected` errors
+  and both backends' pool behaviour; `send_parts` states the 32-part and
+  8-guard limits, the small-guard fold, the send-slab error and the TLS
+  path; `ConfigBuilder::send_slab_slots` says coalesced copy runs hold an entry
+  too, and `max_chain_length` that it bounds `send_chain` only;
+  `WriteHalf::Shutdown` says `send_backpressured` refuses in that state.
+  The four backpressured-sends design docs say the TLS ciphertext bound
+  gates plain TLS sends on io_uring, the series design docs carry a note
+  pointing at the renames since, and the 2026-09 journal entries list their
+  closed follow-ups as closed. The dead `ConnSendState::close_send_count`
+  field is removed. Found by the send-path audit
+  (`docs/journal/2026-11-send-path-audit.md`, F9, F12, F14).
+
 - io_uring: on a plaintext connection, a copy-only `send_parts` batch, a
   `send_chain` copy, or a copy-only chain part whose copy data is wider
   than one send-pool slot is rejected with `InvalidInput`, as the same data
@@ -1329,9 +1342,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sends now answer `EAGAIN` with a plain `send` of the first unsent bytes,
   which waits for room, and then resubmit the rest. A guard
   send (`SendMsgZc`) outside `send_chain` failed with `WouldBlock` in the
-  same state; it now waits and delivers as well. While a send waits on a
-  half-closed socket it holds an io-wq kernel thread, as plain copy and TLS
-  sends already did; #605 tracks waiting without one (#603).
+  same state; it now waits and delivers as well. A send waiting on a
+  half-closed socket held an io-wq kernel thread until #605; see that entry
+  (#603).
 
 - On io_uring, a worker that shut down while a coalesced copy send was
   waiting for room took 10 s to exit: the shutdown
