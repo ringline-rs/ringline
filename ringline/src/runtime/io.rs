@@ -4306,7 +4306,8 @@ pub(crate) fn release_connect(
 /// The second poll can come later in the same loop iteration. On io_uring it
 /// follows the loop's flush of queued SQEs and its dispatch of the
 /// completions the kernel has posted. On mio it follows the write of queued
-/// sends, when that write completes an awaited send.
+/// sends, when that write completes an awaited send, and, in an iteration
+/// with a connection close pending, it precedes `drain_pending_closes`.
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
 }
