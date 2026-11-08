@@ -1222,6 +1222,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                         cs.established = true;
                     }
+                    // Counted in with `established`; `handle_close` counts out.
+                    metrics::CONNECTIONS_ACTIVE.increment();
                     // Wake connect waiter.
                     self.executor.wake_connect(conn_index, Ok(()));
                 } else {
@@ -3655,6 +3657,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             cs.established = true;
             cs.mark_connected();
         }
+        // Counted in with `established`; `handle_close` counts out.
+        metrics::CONNECTIONS_ACTIVE.increment();
         // The connection receives directly: its receive is armed by its first
         // parked read, and its hangup poll now.
         debug_assert!(
