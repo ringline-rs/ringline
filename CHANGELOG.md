@@ -919,6 +919,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   from the event loop on the close-retry backoff. Found by the send-path
   audit (`docs/journal/2026-11-send-path-audit.md`, F10).
 
+- io_uring: a plain `Close` the ring refuses at worker exit is retried. The
+  exit path retried a refused cancel and a refused close of a connection
+  holding send-slab entries, but discarded the error for every other
+  connection's `Close`, so that connection never counted as closed and exit
+  waited out its whole 10 s bound before the ring's drop closed the socket.
+  Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
+  F8).
+
 - Docs: `SendHalf::send` and `send_nowait` name the `NotConnected` errors
   and both backends' pool behaviour; `send_parts` states the 32-part and
   8-guard limits, the small-guard fold, the send-slab error and the TLS

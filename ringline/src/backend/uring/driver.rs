@@ -2833,8 +2833,16 @@ impl Driver {
                         cancels_to_retry.push(i);
                     }
                     holding_sends.push(i);
-                } else {
-                    let _ = self.ring.submit_close(i, super::ring::CloseLead::CancelAll);
+                } else if self
+                    .ring
+                    .submit_close(i, super::ring::CloseLead::CancelAll)
+                    .is_err()
+                {
+                    // The push was refused (the SQ still full after a
+                    // submit, or the submit failed). The loop below submits
+                    // this connection's Close with the same lead, since it
+                    // holds no slab entry, and tries again on a refusal.
+                    holding_sends.push(i);
                 }
             }
         }
