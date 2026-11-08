@@ -2071,4 +2071,70 @@ pub(crate) mod tests {
         assert_eq!(plain_fl & libc::O_DSYNC, 0);
         assert_eq!(synced_fl & libc::O_DSYNC, libc::O_DSYNC);
     }
+
+    /// A TLS encrypt failure closes the connection, as on io_uring: the
+    /// records rustls sealed before the failure spent sequence numbers, so a
+    /// later send would be `bad_record_mac` at the peer. Key exhaustion
+    /// takes 2^24 records; the trigger here is a session the record layer
+    /// refuses to encrypt on because it has not handshaked, which fails the
+    /// same call. A bounded send also gives its permit back.
+    #[cfg(not(feature = "tls-buffered"))]
+    #[test]
+    fn a_tls_encrypt_error_closes_the_connection() {
+        for bounded in [false, true] {
+            let config = ConfigBuilder::new()
+                .workers(1)
+                .pin_to_core(false)
+                .max_connections(16)
+                .send_pool(8, 16448)
+                .build()
+                .expect("valid test config");
+            let (mut driver, _wake) = test_driver(&config);
+            let (conn_index, _client) = attach_conn(&mut driver);
+            let conn = token(&driver, conn_index);
+
+            let mut table = crate::tls::TlsTable::with_listener_configs(
+                config.max_connections,
+                None,
+                None,
+                Vec::new(),
+            );
+            let tls_conn = crate::tls::unbuffered::tests::fresh_pair().0;
+            table.insert_for_test(conn_index, tls_conn);
+            driver.tls_table = Some(table);
+
+            let result = if bounded {
+                let id = bounded_ids(1)[0];
+                driver
+                    .make_ctx()
+                    .send_bounded(conn, b"after close_notify", id)
+            } else {
+                driver.make_ctx().send(conn, b"after close_notify")
+            };
+            assert!(
+                result.is_err(),
+                "bounded={bounded}: encrypting before the handshake fails"
+            );
+            assert!(
+                driver
+                    .connections
+                    .get(conn_index)
+                    .unwrap()
+                    .close_requested(),
+                "bounded={bounded}: the encrypt failure closes the connection"
+            );
+            assert!(driver.pending_closes.contains(&conn_index));
+            assert!(
+                driver.pending_sends[conn_index as usize].is_empty(),
+                "bounded={bounded}: nothing was queued"
+            );
+            if bounded {
+                assert_eq!(
+                    driver.send_copy_pool.free_count(),
+                    8,
+                    "the permit was released before the close"
+                );
+            }
+        }
+    }
 }

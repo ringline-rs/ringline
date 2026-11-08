@@ -3042,10 +3042,14 @@ impl SendHalf {
     /// transmitted on `Err`, so the same buffer may be sent again later. On a
     /// TLS connection the pool is checked against the ciphertext bound
     /// before anything is encrypted, which is what keeps that true there.
-    /// Submission-queue pressure is not an error: the send is queued
-    /// and retried. Persistent submission-queue starvation is reported like
-    /// a write error: the awaited `SendFuture` resolves `Err` and the
-    /// connection is closed.
+    /// A TLS encryption failure (`Other`; on TLS 1.2, the traffic keys
+    /// exhausted) closes the connection on both backends, because the record
+    /// layer is finished: a record sealed before the failure has spent a
+    /// sequence number, and TLS 1.2 cannot rekey, so the buffer cannot be
+    /// sent again on it. Submission-queue pressure is not an error: the
+    /// send is queued and retried. Persistent submission-queue starvation is
+    /// reported like a write error: the awaited `SendFuture` resolves `Err`
+    /// and the connection is closed.
     pub fn send(&mut self, data: &[u8]) -> io::Result<SendFuture> {
         self.conn.send(data)
     }
@@ -3058,10 +3062,11 @@ impl SendHalf {
     ///
     /// # Errors
     ///
-    /// Same error contract as `send()`: pool admission errors
-    /// only (`Other` when the pool cannot admit the whole buffer,
-    /// `InvalidInput` when it never could), nothing committed on `Err`,
-    /// submission-queue pressure absorbed by the queue. With no future to resolve, persistent
+    /// Same error contract as `send()`: pool admission errors (`Other` when
+    /// the pool cannot admit the whole buffer, `InvalidInput` when it never
+    /// could), with nothing committed on `Err`; and a TLS encryption
+    /// failure, which closes the connection (see `send`). Submission-queue
+    /// pressure is absorbed by the queue. With no future to resolve, persistent
     /// submission-queue starvation surfaces only as the connection closing.
     ///
     /// For backpressure-aware sending, use `send()` instead.

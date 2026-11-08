@@ -1308,6 +1308,7 @@ impl Driver {
         // the next occupant must not inherit the block.
         state.shutdown_inflight = false;
         state.close_notify_deadline = None;
+        state.close_notify_pending = None;
         state.waiting_send = None;
         state.send_poll = SendPoll::None;
         state.pollout_seen = false;
@@ -1695,6 +1696,12 @@ impl Driver {
         if !(state.close_pending && sends_drained && chain_drained && shutdown_drained) {
             return;
         }
+        // A close_notify the pool had no slot for at the close goes out now
+        // if it can; its completion registers the connection for the drain
+        // again, and the Close is committed then.
+        if self.place_retained_close_notify(conn_index) {
+            return;
+        }
         let st = &mut self.send_queues[conn_index as usize];
         st.close_pending = false;
         // From here the Close is committed (submitted below, or queued for
@@ -1770,6 +1777,15 @@ impl Driver {
     /// waiting for room has only its poll in the kernel: `try_finalize_close`
     /// cancels that, and the poll's CQE or `handle_close` fails the send.
     pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
+        // The drain is stuck, so a retained alert would stall the same way:
+        // drop it with the queued sends.
+        if self.send_queues[conn_index as usize]
+            .close_notify_pending
+            .take()
+            .is_some()
+        {
+            self.drop_retained_close_notify_flag(conn_index);
+        }
         let state = &mut self.send_queues[conn_index as usize];
         let settles = Self::release_queued_sends(
             &mut state.queue,
@@ -1964,7 +1980,7 @@ impl Driver {
         }
         let generation = self.connections.generation(conn_index);
         let mut sends = Vec::new();
-        match self.tls_table.as_mut() {
+        let retained = match self.tls_table.as_mut() {
             Some(tls) if tls.has(conn_index) => tls.send_close_notify_queued(
                 conn_index,
                 generation,
@@ -1972,9 +1988,60 @@ impl Driver {
                 &mut sends,
             ),
             _ => return,
-        }
+        };
         if !sends.is_empty() {
             self.queue_built_sends(conn_index, &mut sends);
+        }
+        // No slot for the alert now: `try_finalize_close` places it once this
+        // connection's own sends have drained and given their slots back.
+        self.send_queues[conn_index as usize].close_notify_pending = retained;
+    }
+
+    /// Place the close_notify a close found no pool slot for, now that the
+    /// connection's own sends have drained. Returns `true` when the alert was
+    /// queued, so the Close must wait for its completion. When the pool is
+    /// still exhausted the alert is dropped: the Close goes ahead behind a
+    /// bare FIN, `pool::CLOSE_NOTIFY_DROPPED` counts it, and the connection
+    /// no longer records the alert as sent.
+    fn place_retained_close_notify(&mut self, conn_index: u32) -> bool {
+        let Some(retained) = self.send_queues[conn_index as usize]
+            .close_notify_pending
+            .take()
+        else {
+            return false;
+        };
+        let generation = self.connections.generation(conn_index);
+        let mut sends = Vec::new();
+        let placed = match self.tls_table.as_mut() {
+            Some(tls) => tls.retry_close_notify_queued(
+                conn_index,
+                generation,
+                &mut self.send_copy_pool,
+                &retained,
+                &mut sends,
+            ),
+            None => false,
+        };
+        if placed {
+            if sends.is_empty() {
+                // Nothing left to place: on the buffered engine a receive's
+                // feed can drain rustls' output, the alert with it, between
+                // the close and this drain. The alert is not dropped, so it
+                // is not counted, and the Close goes ahead.
+                return false;
+            }
+            self.queue_built_sends(conn_index, &mut sends);
+            return true;
+        }
+        self.drop_retained_close_notify_flag(conn_index);
+        false
+    }
+
+    /// Count a dropped close_notify and clear the connection's sent flag.
+    fn drop_retained_close_notify_flag(&mut self, conn_index: u32) {
+        crate::metrics::POOL.increment(crate::metrics::pool::CLOSE_NOTIFY_DROPPED);
+        if let Some(tls) = self.tls_table.as_mut() {
+            tls.close_notify_dropped(conn_index);
         }
     }
 

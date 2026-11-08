@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
-- **Status:** open — 14 findings recorded; F1, F2 and F3 fixed, the rest in progress in the owner's order (F4, F5, F7, F13, then the docs findings F9, F12, F14)
-- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 this PR
+- **Status:** open — 14 findings recorded; F1 to F5 fixed, the rest in progress in the owner's order (F7, F13, then the docs findings F9, F12, F14)
+- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 this PR
 
 ## Goal
 
@@ -630,6 +630,15 @@ Fix: in both mio TLS branches call `self.close(conn)` (mio
 buffer cannot be resent. Not reproduced (needs 2^24 records on one TLS 1.2
 connection).
 
+**Disposition: fixed** (this PR). Both mio TLS branches call
+`DriverCtx::close` before returning the error, as io_uring's
+`encrypt_tls_send` does for every error from `encrypt_to_sends`.
+Regression test `a_tls_encrypt_error_closes_the_connection` (mio driver,
+unbuffered engine): the trigger is a session that has not handshaked, which
+`encrypt_with` refuses with `WouldBlock`; key exhaustion is not reproducible
+in a test. On the unfixed tree the connection stayed `Open` after the error.
+The sequence-number claim rests on the fork reading above and is not tested.
+
 ### F5 — close_notify is dropped silently when the pool is exhausted at close, and the connection records it as sent (close_notify). Confirmed by trace; io_uring only. (D3)
 
 `tls/mod.rs:791-804` (unbuffered arm of `send_close_notify_queued`):
@@ -652,6 +661,22 @@ Fix: keep the ciphertext when `ciphertext_to_sends` fails (an
 `try_finalize_close` before the Close SQE and from the capacity-release
 path; drop it at the close_notify deadline as queued sends are dropped. At
 minimum, count the drop in a metric and do not set `close_notify_sent`.
+
+**Disposition: fixed** (this PR). `TlsTable::send_close_notify_queued`
+returns the ciphertext it could not place (the buffered engine returns an
+empty marker, since rustls still holds the alert), both callers keep it in
+`ConnSendState::close_notify_pending`, and `try_finalize_close` places it
+once the connection's own sends have drained, deferring the Close behind
+it. Not retried from the capacity-release path: the slots the connection's
+own sends give back are the ones the alert competes for, and a retry at
+every pool release would hold the close open on a pool other connections
+keep full. If the pool is still exhausted at the drain, or the close_notify
+deadline forces the close, the alert is dropped, `pool::CLOSE_NOTIFY_DROPPED`
+counts it and `close_notify_sent` is cleared. Regression tests
+`close_notify_waits_for_a_pool_slot_when_the_pool_is_exhausted_at_close`
+and `close_notify_dropped_for_lack_of_a_slot_is_not_recorded_as_sent`
+(io_uring lib tests); red and green run in a SystemsLab VM
+(`experiments/close-notify-retry-verify.toml`, result in the PR).
 
 ### F6 — On TLS 1.2 key exhaustion the close_notify rustls queued is dropped by the `EncodeTlsData` arm; the peer gets a bare FIN (close_notify). Confirmed by trace; both backends. (D2)
 

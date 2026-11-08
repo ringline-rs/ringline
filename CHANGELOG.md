@@ -918,6 +918,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which matched only a slot's first occupant, so for every later one the
   timeout stayed armed for its full duration and was then rejected by its
   handler.
+
+- io_uring: a TLS close that finds the send pool exhausted no longer drops
+  its close_notify and records it as sent. The alert needs one pool slot;
+  when the pool had none at the close, the connection closed behind a bare
+  FIN, the peer read the stream as truncated, and `close_notify_sent` said
+  the alert had gone out. The alert's ciphertext is now kept on the
+  connection and queued from the close drain once the connection's own
+  sends have drained and given their slots back, with the Close waiting
+  behind it. If the pool is still exhausted then, or the close_notify
+  deadline forces the close first, the alert is dropped, the new
+  `ringline/pool` counter `close_notify_dropped` counts it, and the
+  connection does not record it as sent. A retained alert is also dropped,
+  uncounted, at worker exit. Found by the send-path audit
+  (`docs/journal/2026-11-send-path-audit.md`, F5).
+
+- mio: a TLS encryption failure in `send`, `send_nowait` or
+  `send_backpressured` closes the connection, as it did on io_uring. The
+  error was returned and the connection left open and receiving. A record
+  rustls sealed before the failure has spent a sequence number with no
+  ciphertext queued for it, so the next send would be rejected by the peer
+  as `bad_record_mac`; the reachable failure is the traffic keys exhausted
+  on TLS 1.2 AES-GCM (on by default) after 2^24 records, which TLS 1.2
+  cannot rekey. `SendHalf::send` and `send_nowait` document the rule. Found
+  by the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F4).
+
 - io_uring: `shutdown_write` while a `send_chain` is active defers the FIN
   until the chain completes. It deferred only behind in-flight and queued
   sends, and a chain sets neither, so a `send_chain_nowait` of parts larger

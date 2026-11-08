@@ -768,6 +768,13 @@ impl TlsTable {
     /// A connection that never reached traffic state has nothing to queue and
     /// leaves `out` untouched. That is not an error: the caller is tearing the
     /// connection down either way.
+    ///
+    /// Returns `None` when the alert was placed in `out`, or when there was
+    /// nothing to queue. Returns `Some(ciphertext)` when the pool had no slot
+    /// for it: the unbuffered engine's encrypted alert, or an empty `Vec`
+    /// from the buffered engine, where rustls still holds the alert. The
+    /// caller keeps it in `ConnSendState::close_notify_pending` and passes it
+    /// to [`retry_close_notify_queued`](Self::retry_close_notify_queued).
     #[cfg(has_io_uring)]
     pub fn send_close_notify_queued(
         &mut self,
@@ -775,10 +782,8 @@ impl TlsTable {
         generation: u32,
         send_copy_pool: &mut SendCopyPool,
         out: &mut Vec<crate::handler::BuiltSend>,
-    ) {
-        let Some(tls_conn) = self.get_mut(conn_index) else {
-            return;
-        };
+    ) -> Option<Vec<u8>> {
+        let tls_conn = self.get_mut(conn_index)?;
         #[cfg(not(feature = "tls-buffered"))]
         {
             // `queue_close_notify` signals "nothing to queue" by leaving
@@ -790,32 +795,93 @@ impl TlsTable {
             // them after the alert on the wire.
             let mut scratch = Vec::new();
             if unbuffered::queue_close_notify(tls_conn, &mut scratch).is_err() {
-                return;
+                return None;
             }
             // Shared with the recv/flush paths rather than re-chunked here, so
             // the all-or-nothing contract has one implementation: a truncated
             // alert on the wire is worse than none.
-            let _ = backend_uring::ciphertext_to_sends(
+            if backend_uring::ciphertext_to_sends(
                 send_copy_pool,
                 conn_index,
                 generation,
                 &scratch,
                 out,
-            );
+            ) || scratch.is_empty()
+            {
+                None
+            } else {
+                Some(scratch)
+            }
         }
         // Bound as `b`, not `buffered`: the module of that name is used on the
         // next line, and a value/module name collision here reads as a bug.
         #[cfg(feature = "tls-buffered")]
-        if let Some(b) = tls_conn.conn.as_buffered_mut() {
+        {
+            let b = tls_conn.conn.as_buffered_mut()?;
             b.send_close_notify();
             tls_conn.close_notify_sent = true;
-            let _ = buffered::take_tls_output_sends(
+            // On failure the alert is still in rustls' output buffer: with
+            // no free slot the writer refuses before copying, and
+            // `wants_write()` stays true for the retry.
+            if buffered::take_tls_output_sends(
                 tls_conn,
                 send_copy_pool,
                 conn_index,
                 generation,
                 out,
-            );
+            ) {
+                None
+            } else {
+                Some(Vec::new())
+            }
+        }
+    }
+
+    /// Place a close_notify that [`send_close_notify_queued`] could not:
+    /// `retained` is what it returned. Appends the sends to `out` and returns
+    /// `true`, or appends nothing and returns `false` if the pool still has
+    /// no slot. Called from `try_finalize_close` once the connection's own
+    /// sends have drained.
+    ///
+    /// [`send_close_notify_queued`]: Self::send_close_notify_queued
+    #[cfg(has_io_uring)]
+    pub fn retry_close_notify_queued(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        send_copy_pool: &mut SendCopyPool,
+        retained: &[u8],
+        out: &mut Vec<crate::handler::BuiltSend>,
+    ) -> bool {
+        #[cfg(not(feature = "tls-buffered"))]
+        {
+            if !self.has(conn_index) {
+                return false;
+            }
+            backend_uring::ciphertext_to_sends(
+                send_copy_pool,
+                conn_index,
+                generation,
+                retained,
+                out,
+            )
+        }
+        #[cfg(feature = "tls-buffered")]
+        {
+            let _ = retained;
+            let Some(tls_conn) = self.get_mut(conn_index) else {
+                return false;
+            };
+            buffered::take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out)
+        }
+    }
+
+    /// Record that a connection's close_notify was dropped: the peer will
+    /// read a bare FIN, so the connection must not say the alert went out.
+    #[cfg(has_io_uring)]
+    pub fn close_notify_dropped(&mut self, conn_index: u32) {
+        if let Some(c) = self.get_mut(conn_index) {
+            c.close_notify_sent = false;
         }
     }
 }

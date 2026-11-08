@@ -8475,6 +8475,85 @@ mod tests {
         );
     }
 
+    /// Take every free slot of the send pool and return them, so a test can
+    /// make a close find the pool exhausted and then hand slots back.
+    fn exhaust_send_pool(el: &mut AsyncEventLoop<NoopHandler>) -> Vec<u16> {
+        let mut held = Vec::new();
+        while let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"x") {
+            held.push(slot);
+        }
+        assert_eq!(el.driver.send_copy_pool.free_count(), 0);
+        held
+    }
+
+    /// A TLS close that finds the send pool exhausted keeps the close_notify
+    /// and queues it once a slot is free, when the close drain next runs,
+    /// instead of dropping it and committing the Close behind a bare FIN.
+    #[test]
+    fn close_notify_waits_for_a_pool_slot_when_the_pool_is_exhausted_at_close() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+        let mut held = exhaust_send_pool(&mut el);
+
+        el.driver.close_connection_graceful(conn_index);
+        assert!(
+            !el.driver.send_queues[idx].in_flight,
+            "test premise: nothing could be queued with the pool exhausted"
+        );
+        assert!(el.driver.send_queues[idx].close_pending);
+
+        // A slot comes back (another connection's send completed), and the
+        // end-of-iteration drain runs.
+        el.driver.send_copy_pool.release(held.pop().unwrap());
+        el.finalize_pending_closes();
+        assert!(
+            el.driver.send_queues[idx].in_flight,
+            "the close_notify went out once a slot was free"
+        );
+        assert!(
+            el.driver.send_queues[idx].close_pending && !el.driver.send_queues[idx].close_submitted,
+            "the Close waits behind the alert"
+        );
+        assert!(
+            el.driver
+                .tls_table
+                .as_ref()
+                .unwrap()
+                .close_notify_sent(conn_index),
+            "the alert is recorded as sent"
+        );
+    }
+
+    /// A close_notify that still finds no slot when the close drain runs is
+    /// dropped, and the connection does not record it as sent: the peer gets
+    /// a bare FIN and reads the stream as truncated, and the flag must say so.
+    #[test]
+    fn close_notify_dropped_for_lack_of_a_slot_is_not_recorded_as_sent() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+        let _held = exhaust_send_pool(&mut el);
+
+        el.driver.close_connection_graceful(conn_index);
+        el.finalize_pending_closes();
+        assert!(
+            el.driver.send_queues[idx].close_submitted,
+            "the Close is committed without the alert"
+        );
+        assert!(!el.driver.send_queues[idx].in_flight);
+        assert!(
+            !el.driver
+                .tls_table
+                .as_ref()
+                .unwrap()
+                .close_notify_sent(conn_index),
+            "a dropped alert is not recorded as sent"
+        );
+    }
+
     /// DriverCtx::close (the fatal-encrypt close) must defer behind an
     /// in-flight send instead of forcing in_flight=false and submitting
     /// Close directly (which orphaned the send's CQE).
