@@ -8389,6 +8389,34 @@ mod tests {
         );
     }
 
+    /// A `Shutdown` SQE the ring refuses is kept and pushed later, as a
+    /// refused send or Close is, so the write half reads `Shutdown` from the
+    /// request on and the Close waits for the FIN's completion. The old code
+    /// set the write half back to `Open` and relied on the application
+    /// calling `shutdown_write` again.
+    #[test]
+    fn a_refused_shutdown_sqe_still_requests_the_fin() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+
+        el.driver.ring.force_push_failures(1);
+        el.driver.make_ctx().shutdown_write(token);
+        assert!(
+            matches!(
+                el.driver.connections.get(conn_index).unwrap().write,
+                crate::connection::WriteHalf::Shutdown
+            ),
+            "the FIN is requested, not forgotten"
+        );
+        assert!(
+            el.driver.send_queues[idx].shutdown_inflight,
+            "the Close waits for the FIN"
+        );
+    }
+
     /// `shutdown_write` while a send chain is active defers the FIN until
     /// the chain completes. The chain's parts are linked SQEs with
     /// `MSG_WAITALL` and set neither `in_flight` nor the queue, so a
