@@ -1779,7 +1779,9 @@ impl Driver {
         state.in_flight = false;
         state.parked = false;
         // The sends a `ShutdownPending` waited behind were released above,
-        // so no `Shutdown` will be issued for it. A `Shutdown` already in
+        // so no `Shutdown` will be issued for it (`submit_next_queued`
+        // issues a pending one when the queue empties, and a late send CQE
+        // can reach it after the Close). A `Shutdown` already in
         // the kernel stays recorded: `try_finalize_close` waits for its CQE,
         // and a repeat `shutdown_write` must not submit a second one.
         if let Some(cs) = self.connections.get_mut(conn_index)

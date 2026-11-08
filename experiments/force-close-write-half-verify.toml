@@ -10,10 +10,10 @@
 # behaviour) and one pass (the existing Shutdown gate test). Step 2 runs the
 # same tests at the branch head and expects three passes. Step 3 is
 # `experiments/uring-gate.toml`'s check list on the branch head, with rustdoc
-# added because the change edits comments behind `has_io_uring`.
+# added as in the other verify specs.
 #
 #   systemslab submit experiments/force-close-write-half-verify.toml
-name = "ringline shutdown-write-guard verify ({branch})"
+name = "ringline force-close-write-half verify ({branch})"
 
 [params]
 branch = "fix/uring-force-close-write-half"

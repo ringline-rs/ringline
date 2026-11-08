@@ -13430,7 +13430,7 @@ mod tests {
     }
 
     /// `shutdown_write` on a connection whose close is requested submits
-    /// nothing: the close owns the socket from then on, as on mio.
+    /// nothing: the Close ends the write half, as on mio.
     #[test]
     fn shutdown_write_after_a_requested_close_submits_nothing() {
         let mut el = make_test_loop();

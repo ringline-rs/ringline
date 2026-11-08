@@ -1175,7 +1175,8 @@ impl<'a> DriverCtx<'a> {
             return;
         }
         // Idempotent: a second request while pending or after the FIN is a
-        // no-op. A requested close owns the socket from here on.
+        // no-op. Once a close is requested, the Close and its lead end the
+        // write half; no Shutdown is submitted.
         if !matches!(cs.write, crate::connection::WriteHalf::Open) || cs.close_requested() {
             return;
         }

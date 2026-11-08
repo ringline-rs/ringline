@@ -315,8 +315,8 @@ by `a_forced_close_keeps_an_in_flight_shutdown_recorded` and
 `shutdown_write_after_a_requested_close_submits_nothing`; verified by
 `experiments/force-close-write-half-verify.toml` (SystemsLab experiment
 `01a1bc3b-0b66-7125-1396-0547f875c73f`, Debian 13, Linux 6.12): at the
-tests-only commit 0bea7c16 both fail (1 passed; 2 failed), at b8883058 three
-pass, and the uring gate (fmt, clippy on three builds, rustdoc, `cargo test
+tests-only commit 0bea7c16 both fail (1 passed; 2 failed), at the branch head
+8fd4e34d (the fix b8883058 plus the spec and the alpha bump) three pass, and the uring gate (fmt, clippy on three builds, rustdoc, `cargo test
 --all`, lib 780 passed) passes. The trigger (a repeat `shutdown_write` in the
 window between the deadline and the Shutdown CQE) was not reproduced from
 outside the event loop.
