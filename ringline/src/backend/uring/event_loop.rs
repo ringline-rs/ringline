@@ -553,6 +553,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_copy_retries();
             self.drain_send_retries();
             self.drain_close_retries();
+            self.drain_shutdown_retries();
             self.drain_send_pollout_retries();
             self.driver.tick_count += 1;
 
@@ -4694,6 +4695,37 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Push the `Shutdown` SQEs the ring refused. The write half already
+    /// reads `Shutdown` and `shutdown_inflight` holds the Close, so an entry
+    /// is never dropped while its connection lives; one whose slot has been
+    /// released (its generation changed) is dropped, since nothing waits on
+    /// the flag for a released slot and `reset_send_state` clears it at
+    /// reactivation. Same backoff as `drain_close_retries`: every 4th tick.
+    fn drain_shutdown_retries(&mut self) {
+        if self.driver.pending_shutdown_retries.is_empty() {
+            return;
+        }
+        if !self.driver.tick_count.is_multiple_of(4) {
+            return;
+        }
+        let retries = std::mem::take(&mut self.driver.pending_shutdown_retries);
+        for (conn_index, generation) in retries {
+            if self.driver.connections.generation(conn_index) != generation {
+                continue;
+            }
+            if self
+                .driver
+                .ring
+                .submit_shutdown(conn_index, generation)
+                .is_err()
+            {
+                self.driver
+                    .pending_shutdown_retries
+                    .push((conn_index, generation));
+            }
+        }
+    }
+
     /// Arm the `SendPollOut`s the SQ had no room for. An entry is stale if its
     /// connection went, or if the wait ended without it.
     fn drain_send_pollout_retries(&mut self) {
@@ -8455,6 +8487,65 @@ mod tests {
             0,
             "the awaited batch resolves with its length"
         );
+    }
+
+    /// A `Shutdown` SQE the ring refuses is kept and pushed later, as a
+    /// refused send or Close is, so the write half reads `Shutdown` from the
+    /// request on and the Close waits for the FIN's completion. The old code
+    /// set the write half back to `Open` and relied on the application
+    /// calling `shutdown_write` again.
+    #[test]
+    fn a_refused_shutdown_sqe_still_requests_the_fin() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+
+        el.driver.ring.force_push_failures(1);
+        el.driver.make_ctx().shutdown_write(token);
+        assert!(
+            matches!(
+                el.driver.connections.get(conn_index).unwrap().write,
+                crate::connection::WriteHalf::Shutdown
+            ),
+            "the FIN is requested, not forgotten"
+        );
+        assert!(
+            el.driver.send_queues[idx].shutdown_inflight,
+            "the Close waits for the FIN"
+        );
+    }
+
+    /// The refused `Shutdown` SQE is pushed on a later tick by the shutdown
+    /// retry drain, on the same backoff as a refused Close.
+    #[test]
+    fn a_refused_shutdown_sqe_is_pushed_on_a_later_tick() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let idx = conn_index as usize;
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+
+        el.driver.ring.force_push_failures(1);
+        el.driver.make_ctx().shutdown_write(token);
+        assert_eq!(
+            el.driver.pending_shutdown_retries,
+            vec![(conn_index, generation)],
+            "the refused SQE is on the retry list"
+        );
+
+        el.driver.tick_count = 4;
+        el.drain_shutdown_retries();
+        assert!(
+            el.driver.pending_shutdown_retries.is_empty(),
+            "the retry pushed it"
+        );
+        assert!(el.driver.send_queues[idx].shutdown_inflight);
+        assert!(matches!(
+            el.driver.connections.get(conn_index).unwrap().write,
+            crate::connection::WriteHalf::Shutdown
+        ));
     }
 
     /// `shutdown_write` while a send chain is active defers the FIN until

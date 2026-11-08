@@ -908,6 +908,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a `shutdown_write` whose Shutdown SQE the ring refused is
+  retried. The refusal set the write half back to `Open` and relied on the
+  application calling `shutdown_write` again, which nothing does, so the FIN
+  the public doc promises was dropped under submission-queue pressure; every
+  other refused SQE on the send path is retried or returned to the caller as
+  an error (`send_chain`), and `shutdown_write` returns nothing. The write half
+  now reads `Shutdown` from the request on, the Close waits for the FIN's
+  completion as it does for an accepted one, and the SQE is pushed again
+  from the event loop on the close-retry backoff. Found by the send-path
+  audit (`docs/journal/2026-11-send-path-audit.md`, F10).
+
 - A worker that exits counts the connections it closes on its way out:
   `CONNECTIONS_ACTIVE` falls to the connections the other workers hold, and
   each one counts in `conn::CLOSED`. Before, the gauge kept them; under

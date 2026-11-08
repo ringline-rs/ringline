@@ -59,8 +59,9 @@ pub(crate) struct ConnSendState {
     /// true, the runtime force-closes the connection.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_notify_deadline: Option<std::time::Instant>,
-    /// Whether a deferred-or-immediate `Shutdown` SQE for the current occupant
-    /// is still in the kernel.
+    /// Whether a `Shutdown` for the current occupant has been requested and
+    /// its CQE has not arrived: the SQE is in the kernel, or parked on
+    /// `Driver::pending_shutdown_retries`.
     ///
     /// `Shutdown` names its socket as the *registered-file slot*
     /// `Fixed(conn_index)`, not as an fd, so it must not execute after that slot
@@ -68,10 +69,12 @@ pub(crate) struct ConnSendState {
     /// whoever now holds the slot, half-closing a live connection whose next
     /// send then fails `EPIPE` (#518). Nothing pinned it before: a `Shutdown` is
     /// not a queued send, so `try_finalize_close` could not see it, and its
-    /// completion was discarded (`OpTag::Shutdown => {}`). Set when the SQE is
-    /// accepted, cleared by its CQE, and required by `try_finalize_close` before
-    /// the `Close` that frees the slot may be submitted. Cleared by
-    /// `reset_send_state` at slot reactivation, like `close_submitted`.
+    /// completion was discarded (`OpTag::Shutdown => {}`). Set when the FIN is
+    /// requested, before the push, so it also covers an SQE parked on
+    /// `Driver::pending_shutdown_retries`; cleared by its CQE, and required by
+    /// `try_finalize_close` before the `Close` that frees the slot may be
+    /// submitted. Cleared by `reset_send_state` at slot reactivation, like
+    /// `close_submitted`.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub shutdown_inflight: bool,
     /// The raw user_data of the send whose rest waits for room, which names its
@@ -350,6 +353,8 @@ pub(crate) struct DriverCtx<'a> {
     /// on the same deferred path as `close_connection` — the Close SQE is
     /// only submitted once in-flight sends, queued sends, and chains drain.
     pub(crate) pending_finalize_closes: &'a mut Vec<u32>,
+    /// `Shutdown` SQEs the ring refused; see `Driver::pending_shutdown_retries`.
+    pub(crate) pending_shutdown_retries: &'a mut Vec<(u32, u32)>,
     /// Connections whose queued head send could not be pushed (SQ still
     /// full after submit); `submit_or_queue` parks the entry here instead of
     /// failing. Same list as `backend::uring::driver::Driver::pending_send_retries`,
@@ -1197,15 +1202,15 @@ impl<'a> DriverCtx<'a> {
             // Defer until the send queue drains (submit_next_queued issues it).
             cs.write = crate::connection::WriteHalf::ShutdownPending;
         } else {
-            // Record `Shutdown` only once the SQE is accepted: a refused
-            // submission (ring backpressure) leaves the write half `Open`
-            // so a repeat `shutdown_write` can re-request the FIN, as the
-            // flag-based code allowed.
             let generation = cs.generation;
-            if self.ring.submit_shutdown(conn.index, generation).is_ok() {
-                cs.write = crate::connection::WriteHalf::Shutdown;
-                // The slot must outlive the SQE: see `shutdown_inflight`.
-                self.send_queues[idx].shutdown_inflight = true;
+            cs.write = crate::connection::WriteHalf::Shutdown;
+            // The slot must outlive the SQE, pushed or parked: see
+            // `shutdown_inflight`.
+            self.send_queues[idx].shutdown_inflight = true;
+            if self.ring.submit_shutdown(conn.index, generation).is_err() {
+                // Refused (ring backpressure): parked, and pushed again by
+                // `drain_shutdown_retries`, as a refused send or Close is.
+                self.pending_shutdown_retries.push((conn.index, generation));
             }
         }
     }

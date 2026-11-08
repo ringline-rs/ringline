@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
 - **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; the design limitations L1 to L10 stand
-- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787 (this PR), docs #788, F6 and F11 and F10 in their own PRs
+- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, docs #788, F10 this PR, F6 and F11 in their own PR
 
 ## Goal
 
@@ -787,6 +787,17 @@ Shutdown whose push fails is dropped. The trigger (a failed `io_uring_enter`
 without `GETEVENTS`) was not shown. A question for the owner: a small retry
 list, or a doc sentence saying the FIN may be dropped under
 submission-queue pressure.
+
+**Disposition: fixed** (this PR, owner's decision: the retry list). Both
+sites record `Shutdown` and set `shutdown_inflight` before the push, and a
+refused push goes on `Driver::pending_shutdown_retries`, which
+`drain_shutdown_retries` pushes again every 4th tick, dropping an entry
+whose slot has been released; `run_shutdown` clears the list, since exit closes
+every socket. Regression tests `a_refused_shutdown_sqe_still_requests_the_fin`
+(fails on the unfixed tree: the write half read `Open`) and
+`a_refused_shutdown_sqe_is_pushed_on_a_later_tick`; red and green run in a
+SystemsLab VM (`experiments/shutdown-sqe-retry-verify.toml`, result in the
+PR). `docs/write-half-design.md`'s row records the replaced decision.
 
 ### F11 — The unbuffered engine never sends the fatal alert a receive error generates; the `feed_tls_received` doc says it does (close_notify adjacent, X3). Plausible; both backends. (D4)
 
