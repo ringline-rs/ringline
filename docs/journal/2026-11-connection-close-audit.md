@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (`fix/uring-force-close-write-half`) and F9 (#768) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776) and F9 (#768) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -307,7 +307,7 @@ Shutdown is in flight, and a repeat `shutdown_write` in that window.
 Fix: reset only `ShutdownPending` to `Open`; add `|| cs.close_requested()`
 to the io_uring guard, matching mio (`handler.rs:2915`).
 
-Disposition: fixed in `fix/uring-force-close-write-half`, as proposed:
+Disposition: fixed in #776, as proposed:
 `force_finalize_close` resets the write half to `Open` only from
 `ShutdownPending`, whose queued sends it released, and the io_uring
 `shutdown_write` returns when `close_requested()`, as the mio one does. Pinned
