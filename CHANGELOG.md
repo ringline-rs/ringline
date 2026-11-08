@@ -908,6 +908,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A send awaited by one task on a connection whose own task returns while
+  the send is queued resolves with the delivered count, not
+  `ConnectionAborted`. The task-exit path tore the whole connection down at
+  once, recording a provisional abort for every awaited send on it and
+  waking the owners, who were polled before the flush that delivered the
+  bytes, so the driver's result could never overwrite the abort. A returning
+  or panicking connection task now drops only its own awaited sends
+  (`Executor::remove_connection_task`); the sends other tasks await are
+  settled by the driver as the queue drains ahead of the close, and
+  `remove_connection` runs when the slot is released, as it did for a close
+  from the driver, on both backends. The await now lasts as long as the
+  drain: a peer that stops reading holds it until the write fails, as for a
+  close from the driver. A task parked on a receive for the connection is
+  woken once, at the release, instead of at the task's exit as well; its
+  result is unchanged. The shape is a writer task holding the
+  `SendHalf` that outlives the reader task on the same connection. Found by
+  the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F2).
+
 - A `SendFuture` created by one task and first polled by another after the
   creating connection task returned resolves. The creating task's return
   abandoned the send's completion-table entry, since its recorded owner was
