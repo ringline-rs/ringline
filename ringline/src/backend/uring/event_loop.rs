@@ -8341,6 +8341,47 @@ mod tests {
         );
     }
 
+    /// `shutdown_write` while a send chain is active defers the FIN until
+    /// the chain completes. The chain's parts are linked SQEs with
+    /// `MSG_WAITALL` and set neither `in_flight` nor the queue, so a
+    /// Shutdown SQE pushed beside them is not ordered behind them: the FIN
+    /// queues behind the bytes already in the socket buffer and the parts
+    /// still waiting for room fail `EPIPE`.
+    #[test]
+    fn shutdown_write_defers_while_chain_active() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+
+        el.driver.chain_table.start(conn_index, 1);
+        el.driver.make_ctx().shutdown_write(token);
+        assert!(
+            matches!(
+                el.driver.connections.get(conn_index).unwrap().write,
+                crate::connection::WriteHalf::ShutdownPending
+            ),
+            "the FIN must wait for the chain"
+        );
+        assert!(
+            !el.driver.send_queues[conn_index as usize].shutdown_inflight,
+            "no Shutdown SQE beside the chain's linked parts"
+        );
+
+        // The chain's operation CQE completes it; the FIN goes out then.
+        let event = el.driver.chain_table.on_operation_cqe(conn_index, 100);
+        assert!(matches!(event, ChainEvent::Complete { .. }));
+        el.fire_chain_complete(conn_index);
+        assert!(
+            matches!(
+                el.driver.connections.get(conn_index).unwrap().write,
+                crate::connection::WriteHalf::Shutdown
+            ),
+            "the deferred FIN is submitted once the chain drains"
+        );
+        assert!(el.driver.send_queues[conn_index as usize].shutdown_inflight);
+    }
+
     /// Dropping the last half closes gracefully, with a close_notify on TLS. An
     /// unwinding handler passes `abrupt`, so the peer sees a truncated stream.
     #[test]
