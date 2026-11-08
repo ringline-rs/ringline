@@ -341,8 +341,22 @@ stays `Open` until the hangup poll reports the socket error. A caller of
 contract), but a reader parked on the connection waits for the hangup poll
 rather than being failed now.
 
+`handle_send_msg_coalesced`'s terminal error arm (L3197-3212) has the same
+shape: it closes only a TLS run (`close_on_error`), so a plaintext run that
+fails leaves the connection `Open` too.
+
 Fix: decide whether a terminal plaintext send error should close (as TLS
-does) and set `read = Error`; or document the asymmetry.
+does) and set `read = Error`, in both arms; or document the asymmetry.
+
+Consequence, observed in #769's CI through the coalesced arm (an 8 MiB
+`send_nowait` goes out as coalesced runs of up to 32 pool slots): a peer that
+resets the connection while that unawaited response is draining is reported
+to the parked reader as an `Err` the test accepts in 3 of 6 io_uring jobs and
+as `Ok(0)` in the other 3; the test records no kind on a pass, so
+`ConnectionReset` is the kind the mechanism predicts, not one observed. The
+reading of the mechanism is that the failed send takes the socket's pending
+error and its CQE reports it, and the receive that follows then reports a
+plain EOF; not traced in a run. #769 runs its write-error test on mio only.
 
 Disposition: open.
 

@@ -1373,11 +1373,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.tls_out_scratch = sends;
         }
         self.apply_tls_recv_result(conn_index, tls_result);
-        if self.driver.rearms_after_completion(conn_index)
-            && self.driver.arm_direct_recv_or_close(conn_index, None)
+        if self.driver.rearms_after_completion(conn_index) && self.arm_direct_recv(conn_index, None)
         {
             self.executor.wake_recv(conn_index);
         }
+    }
+
+    /// [`Driver::arm_direct_recv_or_close`], then hand any abort it recorded
+    /// to the executor, so the reader it woke finds the error when polled.
+    /// Every arm from the event loop goes through here; the one from a task
+    /// poll (`park_recv`) drains the aborts itself.
+    fn arm_direct_recv(&mut self, conn_index: u32, need: Option<usize>) -> bool {
+        let closed = self.driver.arm_direct_recv_or_close(conn_index, need);
+        if closed {
+            for (index, generation, err) in self.driver.take_recv_aborts() {
+                self.executor.fail_recv(index, generation, err);
+            }
+        }
+        closed
     }
 
     /// Completion of a direct or TLS connection's hangup poll
@@ -1408,7 +1421,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // receive: re-armed after every completion from here until it reads
             // the close_notify, returns 0 at the FIN, or fails.
             cs.hangup_seen = true;
-            if self.driver.arm_direct_recv_or_close(conn_index, None) {
+            if self.arm_direct_recv(conn_index, None) {
                 self.executor.wake_recv(conn_index);
             }
             return;
@@ -2331,7 +2344,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // The handshake's receives are armed after each completion; once
             // it is done, a parked read arms them. The hangup poll covers a
             // peer close while nothing reads.
-            let _ = self.driver.arm_direct_recv_or_close(conn_index, None);
+            let _ = self.arm_direct_recv(conn_index, None);
             self.driver.arm_hangup_poll(conn_index);
             return;
         }
@@ -3274,9 +3287,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 continue;
             }
             self.driver.forward_recv_held[ci] = false;
-            if self.executor.recv_waiters[ci]
-                && self.driver.arm_direct_recv_or_close(conn_index, None)
-            {
+            if self.executor.recv_waiters[ci] && self.arm_direct_recv(conn_index, None) {
                 self.executor.wake_recv(conn_index);
             }
         }
@@ -3632,7 +3643,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.mark_connected();
             }
-            if self.driver.arm_direct_recv_or_close(conn_index, None) {
+            if self.arm_direct_recv(conn_index, None) {
                 let err = std::io::Error::other("TLS receive could not be armed");
                 self.executor.wake_connect(conn_index, Err(err));
                 return;
