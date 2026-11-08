@@ -928,7 +928,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         Ok(std::task::Poll::Ready(())) => {
                             // Task completed — connection handler is done.
                             driver.close_connection_graceful(conn_index);
-                            executor.remove_connection(conn_index);
+                            executor.remove_connection_task(conn_index);
                             if let Some(payload) = crate::task_panic::drop_caught(fut) {
                                 driver.panic_reporter.report(
                                     &format!("connection task (connection {conn_index} closed)"),
@@ -951,7 +951,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             // returned, and would otherwise send close_notify.
                             driver.close_connection(conn_index);
                             let dropped = crate::task_panic::drop_caught(fut);
-                            executor.remove_connection(conn_index);
+                            executor.remove_connection_task(conn_index);
                             let site = format!("connection task (connection {conn_index} closed)");
                             driver.panic_reporter.report(&site, &*payload);
                             if let Some(payload) = dropped {
