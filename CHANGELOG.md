@@ -908,6 +908,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: `shutdown_write` while a `send_chain` is active defers the FIN
+  until the chain completes. It deferred only behind in-flight and queued
+  sends, and a chain sets neither, so a `send_chain_nowait` of parts larger
+  than the socket's free send-buffer space followed by `shutdown_write` in
+  the same poll pushed the Shutdown SQE beside the chain's linked parts: the
+  FIN went out behind the bytes already in the buffer, the remaining parts
+  failed with `EPIPE`, and the peer read a prefix followed by a clean FIN.
+  The deferred FIN is submitted when the chain completes, as it already was
+  when the queue drained. Found by the send-path audit
+  (`docs/journal/2026-11-send-path-audit.md`, F3).
+
 - A send awaited by one task on a connection whose own task returns while
   the send is queued resolves with the delivered count, not
   `ConnectionAborted`. The task-exit path tore the whole connection down at

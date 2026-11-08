@@ -1437,9 +1437,10 @@ impl ConnCtx {
     /// Any `send_backpressured` still waiting for
     /// pool capacity on this connection fails with
     /// [`BrokenPipe`](io::ErrorKind::BrokenPipe) rather than waiting for a
-    /// turn it could no longer use. Already-submitted sends are left alone —
-    /// their bytes may already be on the way, and the FIN is ordered behind
-    /// them. Plain `send` is unaffected either way.
+    /// turn it could no longer use. Already-submitted sends, and the parts
+    /// of an active `send_chain`, are left alone: their bytes may already be
+    /// on the way, and the FIN is ordered behind them. Plain `send` is
+    /// unaffected either way.
     pub(crate) fn shutdown_write(&self) {
         with_state(|driver, executor| {
             let mut ctx = driver.make_ctx();
@@ -3170,8 +3171,9 @@ impl SendHalf {
     /// Any `send_backpressured` still waiting for pool capacity on this
     /// connection fails with [`BrokenPipe`](io::ErrorKind::BrokenPipe) rather
     /// than waiting for a turn it could no longer use. Already-submitted
-    /// sends are left alone: their bytes may already be on the way, and the
-    /// FIN is ordered behind them. Plain `send` is unaffected either way.
+    /// sends, and the parts of an active `send_chain`, are left alone: their
+    /// bytes may already be on the way, and the FIN is ordered behind them.
+    /// Plain `send` is unaffected either way.
     ///
     /// On io_uring the shutdown runs on the worker's io-wq pool, and a close
     /// issued before it finishes waits for it; see
