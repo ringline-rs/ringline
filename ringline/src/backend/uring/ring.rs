@@ -550,14 +550,17 @@ impl Ring {
         )
     }
 
-    /// Submit an async connect for a direct file descriptor.
+    /// Submit an async connect for a direct file descriptor. The payload
+    /// carries the connection's generation, which `handle_connect` checks
+    /// against the slot's, and the cancel from `handle_timeout` names.
     pub fn submit_connect(
         &mut self,
         conn_index: u32,
+        generation: u32,
         addr: *const libc::sockaddr,
         addrlen: libc::socklen_t,
     ) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::Connect, conn_index, 0);
+        let user_data = UserData::encode(OpTag::Connect, conn_index, generation);
         let entry = Sqe::new(
             Op::Connect {
                 fd: sqe::Fd::Fixed(conn_index),
@@ -1180,6 +1183,22 @@ mod tests {
             }
         }
         Ring::setup(&config).expect("ring")
+    }
+
+    /// The Connect SQE's user_data carries the connection's generation.
+    #[test]
+    fn submit_connect_carries_the_generation() {
+        let mut ring = ring_with(None);
+        let addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        ring.submit_connect(
+            3,
+            7,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+        .expect("push");
+        let pushed = ring.last_pushed.expect("an SQE was pushed").user_data;
+        assert_eq!(pushed, UserData::encode(OpTag::Connect, 3, 7).raw());
     }
 
     fn online_cpus() -> u32 {

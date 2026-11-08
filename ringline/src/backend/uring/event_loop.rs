@@ -3508,9 +3508,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn handle_connect(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
 
-        if self.driver.connections.get(conn_index).is_none() {
-            return;
-        }
+        // The payload is the generation of the connection the Connect was
+        // submitted for. A CQE for a slot that has since been closed and
+        // reused must not touch the new occupant.
+        let generation = match self.driver.connections.get(conn_index) {
+            Some(conn) if conn.generation == ud.payload() => conn.generation,
+            _ => return,
+        };
+        // The Connect has left the kernel. A close requested while it was in
+        // flight waited on this; the end-of-iteration drain commits it.
+        self.driver.send_queues[conn_index as usize].connect_inflight = false;
+        self.driver.defer_finalize_close(conn_index);
 
         if result < 0 {
             let errno = -result;
@@ -3544,7 +3552,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .map(|c| c.connect_timeout_armed)
                 .unwrap_or(false)
             {
-                let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, 0);
+                let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, generation);
                 let _ = self
                     .driver
                     .ring
@@ -3587,7 +3595,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 return;
             }
-            let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, 0);
+            let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, generation);
             let _ = self
                 .driver
                 .ring
@@ -3701,7 +3709,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        let connect_ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        let connect_ud = UserData::encode(OpTag::Connect, conn_index, ud.payload());
         let _ = self
             .driver
             .ring
@@ -9746,7 +9754,11 @@ mod tests {
         el.executor.connect_waiters[conn_index as usize] = true;
 
         // Simulate successful connect CQE (result == 0).
-        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::Connect,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), 0, 0);
 
         // Connect waiter should be cleared and result stored.
@@ -9781,7 +9793,11 @@ mod tests {
         el.executor.connect_waiters[conn_index as usize] = true;
 
         // Simulate ECONNREFUSED (errno 111).
-        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::Connect,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.test_dispatch_cqe(ud.raw(), -111, 0);
 
         // Connect waiter should be cleared with error result.
@@ -11061,7 +11077,11 @@ mod tests {
             .recv_direct = true;
         el.executor.connect_waiters[conn_index as usize] = true;
 
-        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::Connect,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.inject_and_dispatch(ud.raw(), 0);
 
         assert!(!el.executor.connect_waiters[conn_index as usize]);
@@ -11081,7 +11101,11 @@ mod tests {
             .expect("no free slots");
         el.executor.connect_waiters[conn_index as usize] = true;
 
-        let ud = UserData::encode(OpTag::Connect, conn_index, 0);
+        let ud = UserData::encode(
+            OpTag::Connect,
+            conn_index,
+            el.driver.connections.generation(conn_index),
+        );
         el.inject_and_dispatch(ud.raw(), -111); // ECONNREFUSED
 
         assert!(!el.executor.connect_waiters[conn_index as usize]);

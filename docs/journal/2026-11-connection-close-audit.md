@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F2 and F3 fixed in the PR that lands this entry; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (this PR), F6 (#769) and F9 (#768) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -164,7 +164,7 @@ immediate commit needs an explicit bypass. Flip the parked test's last
 assertion; add `!close_submitted` to the batch test and rename it. Needs a
 Linux run.
 
-Disposition: fixed in this PR, by a narrower change than proposed: the
+Disposition: fixed in #771, by a narrower change than proposed: the
 completion handlers call `defer_finalize_close`, which registers the
 connection on `pending_finalize_closes`, and only the end-of-iteration drain
 (`finalize_pending_closes`), `force_finalize_close` and the park install call
@@ -228,7 +228,18 @@ Fix: carry the generation in the Connect payload and check it first; build the
 cancel targets with the same payload; add a `connect_inflight` gate to
 `try_finalize_close` mirroring `shutdown_inflight`.
 
-Disposition: open.
+Disposition: fixed in this PR, as proposed: `submit_connect` encodes the
+slot's generation, `handle_connect` returns on a mismatch before touching the
+slot, and `ConnSendState::connect_inflight`, set at each connect submit and
+cleared by the Connect CQE, gates `try_finalize_close` as `shutdown_inflight`
+does. Verified in a SystemsLab anvil VM (Linux 6.12,
+`experiments/connect-identity-verify.toml`): at the tests-only commit
+`a_stale_connect_cqe_leaves_the_reused_slot_alone` (the success arm opens the
+new occupant) and `a_close_on_a_connecting_slot_waits_for_the_connect_cqe`
+(the drain commits the Close with the Connect in the kernel) fail; at the fix
+they pass, with the full io_uring suite. The trigger itself (a Connect CQE
+dispatched after the Close CQE) was not reproduced on a kernel; the gate
+removes the order it needs.
 
 ### F5 — connect-timeout cancels never match (invariant 14). Confirmed by reading; benign.
 
@@ -238,7 +249,13 @@ is `-ENOENT`; the Timeout stays armed for its full duration and is then
 rejected by `handle_timeout`'s generation/flag checks. One root cause with F4
 (user_data identity on the connect/timeout pair).
 
-Disposition: open.
+Disposition: fixed in this PR, with F4: the cancels of the Timeout in
+`handle_connect` name the generation `arm_connect_timeout` encoded, and the
+cancel of the Connect in `handle_timeout` names the generation the Connect
+now carries. Pinned by
+`a_completed_connect_cancels_its_timeout_by_its_generation`,
+`a_failed_connect_cancels_its_timeout_by_its_generation` and
+`the_connect_timeout_cancels_the_connect_by_its_generation`.
 
 ### F6 — local aborts are reported by `with_data_result` as a clean peer close (invariant 11). Confirmed (mio run 10/10 vs control 10/10; io_uring read).
 
@@ -258,7 +275,14 @@ Fix: `read = Error` + `fail_recv` with a descriptive error at each site (the
 write error; `InvalidData`/`OutOfMemory` for the cap), or extend the doc.
 Owner's call which; the auditor recommends the code change.
 
-Disposition: open.
+Disposition: fixed in #769, by the code change: each site records
+`read = Error` and fails the parked read first (mio: the write's error; the
+plaintext cap: `QuotaExceeded`; io_uring: a receive that could not be
+armed), so `with_data_result` resolves `Err`. A TLS record-layer error still
+resolves `Ok(0)`, as documented. Pinned by
+`ringline/tests/local_abort_errors.rs`; its write-error case runs on mio
+only, because on io_uring a failed plaintext send does not close the
+connection (F13).
 
 ### F7 — `force_finalize_close` sets `write = Open` under an in-flight Shutdown, and the io_uring `shutdown_write` lacks the `close_requested()` guard mio has (invariants 13, 4). Plausible, narrow.
 

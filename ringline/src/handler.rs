@@ -1280,6 +1280,7 @@ impl<'a> DriverCtx<'a> {
         // Submit the async connect.
         if let Err(e) = self.ring.submit_connect(
             conn_index,
+            generation,
             &self.connect_addrs[conn_index as usize] as *const _ as *const libc::sockaddr,
             addrlen,
         ) {
@@ -1288,6 +1289,7 @@ impl<'a> DriverCtx<'a> {
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
         }
+        self.send_queues[conn_index as usize].connect_inflight = true;
 
         Ok(ConnId::new(conn_index, generation))
     }
@@ -1343,6 +1345,7 @@ impl<'a> DriverCtx<'a> {
         // Submit the async connect.
         if let Err(e) = self.ring.submit_connect(
             conn_index,
+            generation,
             &self.connect_addrs[conn_index as usize] as *const _ as *const libc::sockaddr,
             addrlen,
         ) {
@@ -1351,6 +1354,7 @@ impl<'a> DriverCtx<'a> {
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
         }
+        self.send_queues[conn_index as usize].connect_inflight = true;
 
         Ok(ConnId::new(conn_index, generation))
     }
@@ -1456,6 +1460,7 @@ impl<'a> DriverCtx<'a> {
         // Submit the async connect.
         if let Err(e) = self.ring.submit_connect(
             conn_index,
+            generation,
             &self.connect_addrs[conn_index as usize] as *const _ as *const libc::sockaddr,
             addrlen,
         ) {
@@ -1465,6 +1470,7 @@ impl<'a> DriverCtx<'a> {
             self.connections.release(conn_index);
             return Err(crate::error::Error::Io(e));
         }
+        self.send_queues[conn_index as usize].connect_inflight = true;
 
         Ok(ConnId::new(conn_index, generation))
     }
