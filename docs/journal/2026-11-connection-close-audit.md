@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (this PR), F6 (#769) and F9 (#768) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (`fix/uring-connect-identity`), F6 (#769) and F9 (#768) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -228,18 +228,23 @@ Fix: carry the generation in the Connect payload and check it first; build the
 cancel targets with the same payload; add a `connect_inflight` gate to
 `try_finalize_close` mirroring `shutdown_inflight`.
 
-Disposition: fixed in this PR, as proposed: `submit_connect` encodes the
-slot's generation, `handle_connect` returns on a mismatch before touching the
-slot, and `ConnSendState::connect_inflight`, set at each connect submit and
-cleared by the Connect CQE, gates `try_finalize_close` as `shutdown_inflight`
-does. Verified in a SystemsLab anvil VM (Linux 6.12,
-`experiments/connect-identity-verify.toml`): at the tests-only commit
-`a_stale_connect_cqe_leaves_the_reused_slot_alone` (the success arm opens the
-new occupant) and `a_close_on_a_connecting_slot_waits_for_the_connect_cqe`
-(the drain commits the Close with the Connect in the kernel) fail; at the fix
-they pass, with the full io_uring suite. The trigger itself (a Connect CQE
-dispatched after the Close CQE) was not reproduced on a kernel; the gate
-removes the order it needs.
+Disposition: fixed in `fix/uring-connect-identity`, by the identity check
+alone: `submit_connect` encodes the slot's generation, `handle_connect`
+returns on a mismatch before touching the slot, and the cancel targets carry
+the same payload. The proposed `connect_inflight` gate was added and then
+removed on review: the Close's lead (an `ASYNC_CANCEL` of the fixed file from
+Linux 6.13, `shutdown(SHUT_RDWR)` before) ends a Connect still in the kernel,
+the kernel holds the Connect's own file reference so re-registering the slot
+does not redirect it, and a late CQE fails the generation check; with the
+gate, a cancel push refused by a full SQ left the slot `Closing` until the
+kernel's own connect timeout (about 127 s at the default `tcp_syn_retries`).
+Verified by `experiments/connect-identity-verify.toml` (SystemsLab experiment
+`01a1bc34-4f45-7153-842b-ffa04d3156c4`, Debian 13, Linux 6.12): at the tests-only commit 7b719b82 the four
+pinning tests that exist there fail (4 passed; 4 failed), among them
+`a_stale_connect_cqe_leaves_the_reused_slot_alone`, whose stale success CQE
+opens the new occupant; at 173cb83a ten pass, and the uring gate (fmt, clippy
+on three builds, rustdoc, `cargo test --all`) passes. The trigger itself (a
+Connect CQE dispatched after the Close CQE) was not reproduced on a kernel.
 
 ### F5 — connect-timeout cancels never match (invariant 14). Confirmed by reading; benign.
 
@@ -249,10 +254,12 @@ is `-ENOENT`; the Timeout stays armed for its full duration and is then
 rejected by `handle_timeout`'s generation/flag checks. One root cause with F4
 (user_data identity on the connect/timeout pair).
 
-Disposition: fixed in this PR, with F4: the cancels of the Timeout in
-`handle_connect` name the generation `arm_connect_timeout` encoded, and the
-cancel of the Connect in `handle_timeout` names the generation the Connect
-now carries. Pinned by
+Disposition: fixed in `fix/uring-connect-identity`, with F4: the cancels of
+the Timeout in `handle_connect` name the generation `arm_connect_timeout`
+encoded, and the cancel of the Connect in `handle_timeout` names the
+generation the Connect now carries. The heading's "never match" holds for
+every occupant after a slot's first: a fresh slot's generation is 0, which
+the payload-0 cancel matched. Pinned by
 `a_completed_connect_cancels_its_timeout_by_its_generation`,
 `a_failed_connect_cancels_its_timeout_by_its_generation` and
 `the_connect_timeout_cancels_the_connect_by_its_generation`.
@@ -281,8 +288,9 @@ plaintext cap: `QuotaExceeded`; io_uring: a receive that could not be
 armed), so `with_data_result` resolves `Err`. A TLS record-layer error still
 resolves `Ok(0)`, as documented. Pinned by
 `ringline/tests/local_abort_errors.rs`; its write-error case runs on mio
-only, because on io_uring a failed plaintext send does not close the
-connection (F13).
+only: on io_uring a failed plaintext send does not close the connection
+(F13), and the send and the receive race for the socket's pending error, so
+the case was intermittent there (3 of 6 CI jobs).
 
 ### F7 — `force_finalize_close` sets `write = Open` under an in-flight Shutdown, and the io_uring `shutdown_write` lacks the `close_requested()` guard mio has (invariants 13, 4). Plausible, narrow.
 
