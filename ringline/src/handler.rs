@@ -9,10 +9,10 @@ use crate::guard::GuardBox;
 
 /// Per-connection send queue state.
 ///
-/// Ensures at most one send SQE is in-flight per connection at a time.
-/// When a send is already in-flight, subsequent sends are queued and
-/// submitted immediately inside the CQE completion handler — before
-/// `on_send_complete`, before returning to the event loop.
+/// At most one stream send operation is in the kernel per connection: one
+/// SQE, one coalesced `sendmsg`, or the linked SQEs of one chain. While one
+/// is in flight, later sends are queued, and the next is pushed from the
+/// completion handler before control returns to the event loop.
 pub(crate) struct ConnSendState {
     pub in_flight: bool,
     pub queue: VecDeque<BuiltSend>,
@@ -54,11 +54,6 @@ pub(crate) struct ConnSendState {
     /// the Close SQE is committed.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_submitted: bool,
-    /// Count of queued sends pushed during close. Each CQE decrements
-    /// this; when it reaches zero, `try_finalize_close` fires.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
-    #[allow(dead_code)]
-    pub close_send_count: u32,
     /// Deadline for close_notify completion. Set when close_notify is
     /// queued by `DriverCtx::close`. If elapsed while `close_pending` is
     /// true, the runtime force-closes the connection.
@@ -125,7 +120,6 @@ impl ConnSendState {
             queue: VecDeque::new(),
             close_pending: false,
             close_submitted: false,
-            close_send_count: 0,
             close_notify_deadline: None,
             shutdown_inflight: false,
             #[cfg(has_io_uring)]
@@ -670,10 +664,11 @@ impl<'a> DriverCtx<'a> {
     /// travels because nothing downstream can recompute it: a TLS send's
     /// final `OpTag::Send` chunk is one ciphertext record.
     ///
-    /// Admission is the caller's: `Executor`'s send-capacity FIFO only lets
-    /// this id's turn come up when the pool can take the whole message
-    /// (series PR 9's future). The plaintext-sized budget is what both
-    /// backends use; bounding the ciphertext is series PR 8.
+    /// Admission is the caller's: the send-capacity FIFO admits this id only
+    /// when `free_count()` covers `bounded_send_slots`, and this function
+    /// checks the same number again before encrypting. For a TLS connection
+    /// that number is the ciphertext bound (`TlsTable::ciphertext_capacity`),
+    /// not the plaintext length.
     ///
     /// Unlike mio, the reservation is *not* the permit and is not held
     /// across the TLS branch. It cannot be: on io_uring `encrypt_to_sends`
@@ -1113,10 +1108,7 @@ impl<'a> DriverCtx<'a> {
     /// The close is serialized behind the connection's outstanding work:
     /// queued and in-flight sends drain first (their bytes still reach the
     /// wire), then the deferred Close SQE is submitted by the event loop's
-    /// `try_finalize_close`. An earlier version drained the queue without
-    /// submitting it, forced `in_flight = false` while a send SQE was still
-    /// in the kernel, and submitted Close directly — orphaning the send's
-    /// CQE past its connection slot's lifetime.
+    /// `try_finalize_close`.
     pub fn close(&mut self, conn: ConnId) {
         if let Some(conn_state) = self.connections.get_mut(conn.index) {
             if conn_state.generation != conn.generation {
@@ -2642,8 +2634,8 @@ impl<'a> DriverCtx<'a> {
     /// The data is buffered in the per-connection send queue. The event loop
     /// flushes it when the socket becomes writable.
     ///
-    /// For TLS connections, data is encrypted and written directly to the
-    /// TcpStream (bypassing the pending send queue).
+    /// On a TLS connection the data is encrypted into a `Vec` and queued the
+    /// same way; nothing is written in this call.
     pub fn send(&mut self, conn: ConnId, data: &[u8]) -> io::Result<()> {
         self.send_inner(conn, data, None)
     }
@@ -2734,8 +2726,8 @@ impl<'a> DriverCtx<'a> {
     /// reserved or queued and no completion for `id` will ever be produced,
     /// so the caller owns the failure.
     ///
-    /// Called by series PR 9's `send_backpressured` future once
-    /// `Executor`'s send-capacity FIFO says it is this id's turn.
+    /// Called by `BackpressuredSendFuture::poll_waiting` once the
+    /// send-capacity FIFO says it is this id's turn.
     pub(crate) fn send_bounded(
         &mut self,
         conn: ConnId,
@@ -2940,7 +2932,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Shut down the write half of a connection.
     ///
-    /// Flushes any buffered pending sends before issuing the TCP half-close.
+    /// Issues the half-close now if nothing is queued; otherwise records
+    /// `WriteHalf::ShutdownPending` and `flush_sends` issues it once the
+    /// queue drains.
     pub fn shutdown_write(&mut self, conn: ConnId) {
         let idx = conn.index as usize;
         let Some(cs) = self.connections.get_mut(conn.index) else {
@@ -3805,16 +3799,13 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     }
 
     /// Submit the scatter-gather send.
+    ///
+    /// A batch with no parts, or whose parts carry no bytes, queues nothing
+    /// and returns `Ok(())` on a live connection; a stale or closing
+    /// connection is reported as `NotConnected`, as for any batch.
     pub fn submit(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             return Err(e);
-        }
-
-        if self.part_count == 0 {
-            if let Some(id) = self.send_id {
-                self.ctx.attach_send_id(None, id, 0);
-            }
-            return Ok(());
         }
 
         // Validate connection + generation.
@@ -3835,6 +3826,16 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 io::ErrorKind::NotConnected,
                 "connection closing",
             ));
+        }
+
+        // Nothing to send: build no SQE. A zero-length Send SQE completes
+        // with 0, which `handle_send` reads as a failed send and drains the
+        // queue behind it. An awaited id (crate-internal) settles `Ok(0)`.
+        if self.part_count == 0 || self.total_len == 0 {
+            if let Some(id) = self.send_id {
+                self.ctx.attach_send_id(None, id, 0);
+            }
+            return Ok(());
         }
 
         // TLS path: gather all data, encrypt, copy-send. Drop guards immediately.
@@ -3898,6 +3899,14 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
 
     /// Copy-only path: gather all copy parts into one pool slot, return built SQE.
     fn build_copy_only(&mut self) -> io::Result<BuiltSend> {
+        // `copy_in_gather` returns `None` for an oversize gather as well as
+        // for an empty pool; only the second is retryable.
+        if self.total_copy_len > self.ctx.send_copy_pool.slot_size() as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "total copy data exceeds send pool slot size",
+            ));
+        }
         let (slot, ptr, len) = unsafe {
             self.ctx.send_copy_pool.copy_in_gather(
                 &self.copy_slices[..self.copy_count as usize],
@@ -4196,9 +4205,19 @@ pub struct SendChainBuilder<'b, 'a> {
 
 #[cfg(has_io_uring)]
 impl<'b, 'a> SendChainBuilder<'b, 'a> {
-    /// Add a copy-only send to the chain.
+    /// Add a copy-only send to the chain. On a plaintext connection `data`
+    /// must fit one send-pool slot, or `finish` fails with `InvalidInput`;
+    /// on a TLS connection it is appended to the chain's plaintext.
     pub fn copy(mut self, data: &[u8]) -> Self {
         if self.error.is_some() {
+            return self;
+        }
+        if data.len() > self.ctx.send_copy_pool.slot_size() as usize && self.tls_plaintext.is_none()
+        {
+            self.error = Some(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "copy data exceeds send pool slot size",
+            ));
             return self;
         }
         if self.built.len() + self.tls_parts >= self.ctx.max_chain_length as usize {
@@ -4601,7 +4620,16 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
         let built = if let Some(built) = folded {
             built
         } else if self.guard_count == 0 {
-            // Copy-only: gather into pool slot.
+            // Copy-only: gather into pool slot. An oversize gather is refused
+            // here, as the guard arm refuses it, so `copy_in_gather`'s `None`
+            // below means the pool is empty.
+            if self.total_copy_len > self.chain.ctx.send_copy_pool.slot_size() as usize {
+                self.chain.error = Some(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "total copy data exceeds send pool slot size",
+                ));
+                return self.chain;
+            }
             let result = unsafe {
                 self.chain.ctx.send_copy_pool.copy_in_gather(
                     &self.copy_slices[..self.copy_count as usize],

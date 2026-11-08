@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
-- **Status:** open — 14 findings recorded; F1 to F5 fixed, the rest in progress in the owner's order (F7, F13, then the docs findings F9, F12, F14)
-- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 this PR
+- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; the design limitations L1 to L10 stand
+- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787 (this PR), docs #788, F6 and F11 and F10 in their own PRs
 
 ## Goal
 
@@ -723,6 +723,20 @@ Fix: in `SendBuilder::submit`, when `total_len == 0`, settle the id with
 `Ok(0)` and return without building (as the `part_count == 0` arm does), or
 refuse with `InvalidInput` as `submit_batch_await` does for an empty batch.
 
+**Disposition: fixed** (this PR). `SendBuilder::submit` treats
+`total_len == 0` as it treats `part_count == 0`: nothing is built or queued
+and an awaited id (crate-internal; `submit_batch_await` refuses the batch
+before registering one) settles `Ok(0)`, which is what `send` does for an
+empty buffer on a plaintext connection and what mio does for the same
+batch. The check runs after the stale and closing-connection checks, so
+those still report `NotConnected`. `InvalidInput` was not chosen:
+`submit_batch_await` refuses an empty batch before registering an id, but
+the builder's `copy(&[])` is accepted and a caller assembling parts from
+a parser cannot always avoid an empty one. Regression test
+`a_zero_length_send_parts_batch_queues_nothing` (io_uring lib test: no SQE,
+no slot, `Ok(0)` for the awaited form); red and green run in a SystemsLab
+VM (`experiments/zero-length-send-parts-verify.toml`, result in the PR).
+
 ### F8 — `run_shutdown` step 2 ignores a refused plain `Close`, holding exit for the full 10 s bound (F3). Plausible. (C3)
 
 `driver.rs:2702`: `let _ = self.ring.submit_close(i, CloseLead::CancelAll)`.
@@ -736,6 +750,16 @@ the worker. Fix: on `Err`, push `i` onto `holding_sends` (step 3 then
 submits a `CancelAll` close once `held_by == 0`), or add a
 `closes_to_retry` list.
 
+**Disposition: fixed** (this PR, owner's decision). A refused plain `Close`
+pushes the connection onto `holding_sends`; step 3 submits its Close with
+the `CancelAll` lead, since it holds no slab entry, and tries again on a
+refusal. Regression test `shutdown_retries_a_close_the_ring_refused`
+(io_uring lib test; `force_push_failures(1)` refuses the one Close step 2
+pushes, and the test asserts exit takes under 2 s and leaves no active
+connection; on the unfixed tree exit waits the 10 s bound). Red and green
+run in a SystemsLab VM (`experiments/shutdown-close-retry-verify.toml`,
+result in the PR).
+
 ### F9 — `pending_copy_retries` is not released at worker exit; the design doc says every retry list is (X2, S2). Confirmed by reading; no resource consequence. (C5, A caveat)
 
 `docs/send-completion-design.md:120-121`: "Entries parked on a retry list,
@@ -745,6 +769,12 @@ send parked by `resubmit_waiting_send` (`uring/event_loop.rs:2861-2865`)
 keeps its pool slot `in_use` until the pool drops with the driver; nothing
 waits on it and nothing the kernel can read is freed. Fix: release it in
 step 1 through `release_slot_at_shutdown`, or correct the sentence.
+
+**Disposition: fixed, by correcting the sentence** (this PR).
+`docs/send-completion-design.md` now names the two lists `run_shutdown`
+releases and says a parked copy send keeps its slot until the pool drops.
+The code is unchanged: the slot is not in the kernel and the pool is freed
+with the driver.
 
 ### F10 — A refused `Shutdown` SQE is forgotten and the public doc promises a FIN (O4, X3). Plausible; a recorded decision. (C2)
 
@@ -790,6 +820,12 @@ the alert.
   (`uring/event_loop.rs:2953-2955`) arms a one-shot (`!multi`), which on a
   half-closed socket completes at once with `POLLRDHUP` and then re-arms
   the multishot. Two extra CQEs, no hang.
+
+**Disposition: fixed** (this PR). The `remove_connection` comment now says
+where the function runs (`handle_close`, `drain_pending_closes`, with no
+driver state installed), which is true again since #775 moved the task-exit
+arms to `remove_connection_task`; the half-closed-send-wait step 5 states
+the one-shot then multishot sequence.
 ### F13 — An oversize copy-only `send_parts` batch, and an oversize `SendChainBuilder::copy`, are refused as retryable pool exhaustion instead of `InvalidInput` (T2, X3). Confirmed by reading. (E2)
 
 `build_copy_only` (`handler.rs:3862-3870`) maps `copy_in_gather`'s `None`
@@ -803,6 +839,15 @@ batch that can never fit. Fix: check `total_len > slot_size` before the
 gather in `build_copy_only`, `SendChainBuilder::copy` and the copy-only arm
 of `add`, returning `InvalidInput`; document the one-slot limit on
 `send_parts` and `send_chain` (F14).
+
+**Disposition: fixed** (this PR). All three sites check the slot size
+before the gather and return `InvalidInput`; `SendHalf::send_parts`,
+`AsyncSendBuilder::submit_batch` and `send_chain` state the one-slot limit
+on a plaintext connection, and `submit_batch`'s stale "4 guards / 9 iovecs"
+figure is corrected (the F14 items for both close here).
+Regression test `copy_data_wider_than_a_slot_is_invalid_input_on_every_builder`
+(io_uring lib test, 64-byte slots); red and green run in a SystemsLab VM
+(`experiments/oversize-copy-batch-verify.toml`, result in the PR).
 
 ### F14 — Documents and doc comments that do not state what the code does (X1, X2, X3, X4). Confirmed by quote and grep; every quote re-read by the auditor at HEAD. (E1-E18)
 
@@ -923,9 +968,29 @@ open, harmless. `docs/journal/2026-09-backpressured-sends.md:158-160` and
 as open; the series entry's status is "open" for a series the later entry
 records as shipped.
 
-Replacement text for each item is in the review E report under the
-scratchpad; every replacement sentence was written against the code at
-6ea67e6c and has not been applied.
+**Disposition: fixed** (this PR, with the items closed earlier by #781 and
+the F13 change noted). Every item above is applied: the `send` and
+`send_nowait` error contracts name the `NotConnected` cases and both
+backends; `send_parts` states the part and guard limits, the small-guard
+fold, the slab error and the TLS path (the one-slot limit and
+ringline-redis's 8 guards and 17 iovecs landed with F13); `send_slab_slots`
+and `max_chain_length` describe
+what the code reads; the four design docs say the ciphertext bound gates
+plain TLS sends on io_uring; `WriteHalf::Shutdown` names
+`send_backpressured`'s refusal; CLAUDE.md's lifecycle sentence defers to
+Domain Invariant 8; the #603 CHANGELOG entry defers to #605;
+`close_send_count` is deleted and the four `on_send_complete` comments
+rewritten; the six series docs carry a superseded note, the capacity-FIFO
+doc a pointer to `SendCompletions`, the `forward_to` note names the live
+function, the retry-drain count is corrected, and the rustls version names
+the fork; the send-completion and slots design docs describe the
+`forward_recv_buf` guard and the folded batch; the remaining comments in
+`handler.rs`, `tls/mod.rs`, `tls/backend_uring.rs`, `send_copy.rs`,
+`uring/event_loop.rs`, `runtime/io.rs`, `write-half-design.md` and
+`send-writer-design.md` state the present; and both 2026-09 journal
+entries list the closed follow-ups as closed. `tls-premutation-bound-design.md:27-29`
+("the operation fails and the connection is closed") became true for mio
+with #781 and is left as written.
 
 ## Design limitations (questions for the owner, not fixes)
 

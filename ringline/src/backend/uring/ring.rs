@@ -441,8 +441,9 @@ impl Ring {
         unsafe { self.push_sqe(&entry) }
     }
 
-    /// Submit a TLS-internal send (handshake, alert). Uses OpTag::TlsSend
-    /// so the CQE handler releases the pool slot without calling on_send_complete.
+    /// Submit a TLS-internal send (handshake, alert). Uses OpTag::TlsSend:
+    /// no send id is attached to such a slot, the CQE handler releases it,
+    /// and the handler's settle arms are defensive.
     pub fn submit_tls_send(
         &mut self,
         conn_index: u32,
