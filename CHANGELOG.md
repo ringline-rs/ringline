@@ -926,7 +926,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   task sent after reading the close was refused with `NotConnected`. A
   completion handler now registers the connection for the end-of-iteration
   finalize drain, as a close requested on an idle connection already was.
-
 - Docs: `Runtime::shutdown` and `request_shutdown` did not say what happens to
   tasks. A worker that has seen the request polls no task again and drops
   every task's future, so a task woken after the worker's last poll pass (on

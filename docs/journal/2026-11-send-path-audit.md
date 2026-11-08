@@ -499,9 +499,9 @@ connection, so that poll resolves `ConnectionAborted` for delivered bytes
 once the slot is released (`SendFuture::poll`'s generation arm), or parks
 forever if it runs after the completion but before the release. On mio the
 spawned task is polled in the same `poll_ready_tasks` pass as the creator's
-return and the flush runs after it; on io_uring the CQE drains at the top of
-the next iteration. So the direct `spawn(async move { fut.await })` shape is
-outside the window on both backends; a spawned task that awaits something
+return and the flush runs after it; on io_uring the spawned task is polled in
+the same pass too, ahead of the flush that submits the send. So the direct
+`spawn(async move { fut.await })` shape is outside the window on both backends; a spawned task that awaits something
 else before polling the handed-off future is not. Recorded as L10.
 
 ### F2 — An awaited send owned by a live task on a connection whose own task returns resolves `ConnectionAborted` for bytes that reach the wire (C1, C3). Confirmed: mio test fails on a clean worktree; io_uring by reading. (B2)
