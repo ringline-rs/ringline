@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (`fix/uring-connect-identity`), F6 (#769) and F9 (#768) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (`fix/uring-force-close-write-half`) and F9 (#768) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -228,8 +228,7 @@ Fix: carry the generation in the Connect payload and check it first; build the
 cancel targets with the same payload; add a `connect_inflight` gate to
 `try_finalize_close` mirroring `shutdown_inflight`.
 
-Disposition: fixed in `fix/uring-connect-identity`, by the identity check
-alone: `submit_connect` encodes the slot's generation, `handle_connect` returns
+Disposition: fixed in #774, by the identity check alone: `submit_connect` encodes the slot's generation, `handle_connect` returns
 on a mismatch before touching the slot, and the cancel targets carry the same
 payload. The proposed `connect_inflight` gate was added and then removed on
 review: a late CQE fails the generation check, and, read from the kernel source
@@ -257,8 +256,7 @@ is `-ENOENT`; the Timeout stays armed for its full duration and is then
 rejected by `handle_timeout`'s generation/flag checks. One root cause with F4
 (user_data identity on the connect/timeout pair).
 
-Disposition: fixed in `fix/uring-connect-identity`, with F4: the cancels of
-the Timeout in `handle_connect` name the generation `arm_connect_timeout`
+Disposition: fixed in #774, with F4: the cancels of the Timeout in `handle_connect` name the generation `arm_connect_timeout`
 encoded, and the cancel of the Connect in `handle_timeout` names the
 generation the Connect now carries. The heading's "never match" holds for
 every occupant after a slot's first: a fresh slot's generation is 0, which
@@ -309,7 +307,19 @@ Shutdown is in flight, and a repeat `shutdown_write` in that window.
 Fix: reset only `ShutdownPending` to `Open`; add `|| cs.close_requested()`
 to the io_uring guard, matching mio (`handler.rs:2915`).
 
-Disposition: open.
+Disposition: fixed in `fix/uring-force-close-write-half`, as proposed:
+`force_finalize_close` resets the write half to `Open` only from
+`ShutdownPending`, whose queued sends it released, and the io_uring
+`shutdown_write` returns when `close_requested()`, as the mio one does. Pinned
+by `a_forced_close_keeps_an_in_flight_shutdown_recorded` and
+`shutdown_write_after_a_requested_close_submits_nothing`; verified by
+`experiments/force-close-write-half-verify.toml` (SystemsLab experiment
+`01a1bc3b-0b66-7125-1396-0547f875c73f`, Debian 13, Linux 6.12): at the
+tests-only commit 0bea7c16 both fail (1 passed; 2 failed), at b8883058 three
+pass, and the uring gate (fmt, clippy on three builds, rustdoc, `cargo test
+--all`, lib 780 passed) passes. The trigger (a repeat `shutdown_write` in the
+window between the deadline and the Shutdown CQE) was not reproduced from
+outside the event loop.
 
 ### F8 — worker exit leaves `CONNECTIONS_ACTIVE` inflated and abandons mio closing connections (invariants 15, 3). Traced.
 
