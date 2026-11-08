@@ -143,16 +143,24 @@ categorically ahead.
 | tokio-uring | 591,854 | 45,030 | 22.21 | 0.11 |
 | tokio-pc | 536,651 | 41,923 | 23.85 | 2.05 |
 | tokio-pc-splice | 455,828 | 38,321 | 26.10 | 3.04 |
-| mio | 451,482 | 38,423 | 26.03 | 3.04 |
+| mio (before #756) | 451,482 | 38,423 | 26.03 | 3.04 |
 | tokio | 425,486 | 37,262 | 26.84 | 2.08 |
 | tokio-splice | 361,576 | 32,915 | 30.38 | 3.16 |
 
 Two things worth reading off this:
 
-**Syscall count is not what separates the runtimes.** ringline's mio backend
-issues 3.04 syscalls per operation against tokio's 2.08 — *more* — and is
-faster. io_uring's 0.06 is a genuine ~35x amortization, but it buys about 20%
-CPU efficiency, not the 50%+ that separates the default configurations.
+**Syscall count is not what separates the runtimes.** `tokio-pc` and `tokio`
+issue 2.05 and 2.08 syscalls per operation and differ by 26% in throughput.
+io_uring's 0.06 is a ~35x amortization against tokio's 2.08, and `uring` uses
+21% less CPU per operation than `tokio` (21.26 against 26.84 µs), not the 50%+
+that separates the default configurations.
+
+The mio row was measured before #756. In this run mio read each socket until
+`EAGAIN`, so every operation cost one read that returned nothing. Since #756 a
+short read ends the drain on Linux TCP. An `LD_PRELOAD` syscall count on one
+host, at 64 connections, went from about 3.03 to 2.06 syscalls per operation.
+That count was not taken on this rig, and none of the mio row's columns have
+been re-measured.
 
 **splice costs syscalls to save copies**, which is only worth it when there are
 copies worth saving: it is the slowest arm here at 256 B and the fastest at
