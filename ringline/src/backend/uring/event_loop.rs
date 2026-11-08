@@ -10175,8 +10175,11 @@ mod tests {
             "a send is in flight"
         );
 
+        // The send's CQE registers the close; the end-of-iteration drain
+        // commits it, cancelling the poll first.
         el.test_dispatch_cqe(ud.raw(), 60, 0);
         assert!(!el.driver.send_copy_pool.in_use(slot));
+        el.finalize_pending_closes();
         assert_eq!(el.driver.ring.pushed_cancels, vec![poll]);
         assert_eq!(
             el.driver.send_queues[conn_index as usize].send_poll,

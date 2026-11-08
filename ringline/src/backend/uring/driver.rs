@@ -1646,15 +1646,15 @@ impl Driver {
         let state = &self.send_queues[conn_index as usize];
         let sends_drained = !state.in_flight && state.queue.is_empty();
         // An active send chain has SQEs in the kernel whose CQEs drive its
-        // accounting; the chain completion handlers re-drive this finalize
-        // once the chain drains.
+        // accounting; the chain completion handlers register the connection
+        // for the drain once the chain drains.
         let chain_drained = !self.chain_table.is_active(conn_index);
         // A `Shutdown` SQE still in the kernel names this slot as
         // `Fixed(conn_index)`. `Close` frees the slot for the next accept to
         // register, so submitting it now lets the FIN land on that next
         // connection instead — a live peer, cleanly half-closed, whose next send
-        // fails `EPIPE`. `handle_shutdown` re-drives this finalize once the CQE
-        // clears the flag.
+        // fails `EPIPE`. `handle_shutdown` registers the connection for the
+        // drain once the CQE clears the flag.
         let shutdown_drained = !state.shutdown_inflight;
         if !(state.close_pending && sends_drained && chain_drained && shutdown_drained) {
             return;
