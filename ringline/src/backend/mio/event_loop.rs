@@ -725,9 +725,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.executor.wake_recv(conn_index);
             return true;
         }
-        self.executor.wake_recv(conn_index);
-        self.driver.close_connection(conn_index);
+        self.abort_connection(conn_index, crate::accumulator::recv_cap_exceeded());
         false
+    }
+
+    /// Close `conn_index` because the runtime cannot go on with it — a write
+    /// failed, or a receive ran past `recv_accumulator_max` — and report
+    /// `err` to a reader parked on `with_data_result`, as a failed socket
+    /// read is reported. `read` is set first, so the close reads as a
+    /// failure and not as the peer's close.
+    fn abort_connection(&mut self, conn_index: u32, err: io::Error) {
+        let generation = self.driver.connections.generation(conn_index);
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.read = ReadHalf::Error;
+        }
+        self.executor.fail_recv(conn_index, generation, err);
+        self.driver.close_connection(conn_index);
     }
 
     /// Resume sources whose sink queue has drained below the cap.
@@ -1044,10 +1057,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         if !appended {
                             // Streamed past recv_accumulator_max. The bytes were
                             // already read off the socket, so the stream cannot
-                            // continue coherently — close rather than OOM,
-                            // matching the uring and mio-TLS overflow paths.
-                            self.executor.wake_recv(conn_index);
-                            self.driver.close_connection(conn_index);
+                            // continue coherently — close rather than OOM, as
+                            // the uring and mio-TLS overflow paths do (the TLS
+                            // one through a record-layer error, with no error
+                            // recorded for the reader).
+                            self.abort_connection(
+                                conn_index,
+                                crate::accumulator::recv_cap_exceeded(),
+                            );
                             break;
                         }
                         self.executor.wake_recv(conn_index);
@@ -1193,8 +1210,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.clear_pending_sends(conn_index as usize, || {
             crate::backend::mio::driver::clone_io_error(&e)
         });
-        self.executor.wake_recv(conn_index);
-        self.driver.close_connection(conn_index);
+        // The reader learns of the write error too: the connection is going
+        // away because of it, not because the peer closed.
+        self.abort_connection(conn_index, e);
     }
 
     /// Handle a UDP socket becoming readable: drain datagrams into the
@@ -2753,14 +2771,13 @@ mod tests {
         event_loop.drain_send_completions();
         event_loop.finalize_closes();
 
-        // `Ok(0)`, not `Err`: `fail_connection_on_send_error` wakes the reader
-        // without recording the write error, so the task sees a clean close.
-        // What this test pins is that the task is polled at all.
-        assert_eq!(
-            seen.get(),
-            Some(Ok(0)),
-            "the task was dropped before it could observe the close"
-        );
+        // The task was polled, and `fail_connection_on_send_error` recorded
+        // the write error for it. Which errno is not stable across platforms
+        // (Linux: `ECONNRESET` then `EPIPE`; macOS: `ECONNRESET`).
+        match seen.get() {
+            Some(Err(io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset)) => {}
+            other => panic!("the task must be polled and see the write error, got {other:?}"),
+        }
         assert!(
             !event_loop.executor.task_slab.has_task(conn_index),
             "the close finalized"
