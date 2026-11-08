@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (`fix/uring-connect-identity`), F6 (#769) and F9 (#768) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769) and F9 (#768) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -228,7 +228,7 @@ Fix: carry the generation in the Connect payload and check it first; build the
 cancel targets with the same payload; add a `connect_inflight` gate to
 `try_finalize_close` mirroring `shutdown_inflight`.
 
-Disposition: fixed in `fix/uring-connect-identity`, by the identity check
+Disposition: fixed in #774, by the identity check
 alone: `submit_connect` encodes the slot's generation, `handle_connect` returns
 on a mismatch before touching the slot, and the cancel targets carry the same
 payload. The proposed `connect_inflight` gate was added and then removed on
@@ -257,7 +257,7 @@ is `-ENOENT`; the Timeout stays armed for its full duration and is then
 rejected by `handle_timeout`'s generation/flag checks. One root cause with F4
 (user_data identity on the connect/timeout pair).
 
-Disposition: fixed in `fix/uring-connect-identity`, with F4: the cancels of
+Disposition: fixed in #774, with F4: the cancels of
 the Timeout in `handle_connect` name the generation `arm_connect_timeout`
 encoded, and the cancel of the Connect in `handle_timeout` names the
 generation the Connect now carries. The heading's "never match" holds for
