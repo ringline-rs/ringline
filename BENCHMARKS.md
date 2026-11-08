@@ -151,8 +151,9 @@ Two things worth reading off this:
 
 **Syscall count is not what separates the runtimes.** `tokio-pc` and `tokio`
 issue 2.05 and 2.08 syscalls per operation and differ by 26% in throughput.
-io_uring's 0.06 is a ~35x amortization, but it buys about 20% CPU efficiency,
-not the 50%+ that separates the default configurations.
+io_uring's 0.06 is a ~35x amortization against tokio's 2.08, and `uring` uses
+21% less CPU per operation than `tokio` (21.26 against 26.84 µs), not the 50%+
+that separates the default configurations.
 
 The mio row was measured before #756. In this run mio read each socket until
 `EAGAIN`, so every operation cost one read that returned nothing. Since #756 a
