@@ -1040,12 +1040,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Commit every close registered on `pending_finalize_closes` this
     /// iteration: by `close_connection` from a CQE handler or the task-exit
-    /// arm, or by `DriverCtx::close` from a task. Runs after
-    /// `poll_ready_tasks`, so a task woken by the peer's FIN is polled, and a
-    /// send it queues drains, before the Close is committed (#371).
-    /// `try_finalize_close` is guarded: a connection with sends, a chain or a
-    /// `Shutdown` still outstanding is dropped from the list here and
-    /// re-driven by the completion that drains it.
+    /// arm, by `DriverCtx::close` from a task, or by `defer_finalize_close`
+    /// from the completion that drained the connection's sends, chain or
+    /// `Shutdown`. Runs after `poll_ready_tasks`, so a task woken by the
+    /// peer's FIN is polled, and a send it queues drains, before the Close is
+    /// committed (#371). `try_finalize_close` is guarded: a connection with
+    /// sends, a chain or a `Shutdown` still outstanding is dropped from the
+    /// list here and registered again by the completion that drains it.
     fn finalize_pending_closes(&mut self) {
         if self.driver.pending_finalize_closes.is_empty() {
             return;
@@ -2553,7 +2554,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         self.driver.send_queues[idx].shutdown_inflight = false;
-        self.driver.try_finalize_close(conn_index);
+        self.driver.defer_finalize_close(conn_index);
     }
 
     fn handle_eventfd_read(&mut self) {
@@ -2743,13 +2744,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::BYTES.add(metrics::bytes::SENT, total as u64);
             self.release_pool_slot(pool_slot);
 
-            // Pop the next queued send (if any) into the kernel,
-            // *then* check whether a deferred close should fire —
+            // Pop the next queued send (if any) into the kernel, then
+            // register a deferred close for the end-of-iteration drain:
             // submit_next_queued may have just emptied the queue and
-            // cleared `in_flight`, which is exactly when a
-            // close_pending connection is ready to actually close.
+            // cleared `in_flight`, which is when a close_pending connection
+            // is ready to close.
             self.driver.submit_next_queued(conn_index);
-            self.driver.note_send_finalized(conn_index);
+            self.driver.defer_finalize_close(conn_index);
 
             // Only a send's final slot carries its id, so the send
             // settles once, when its final chunk completes, with the
@@ -2782,7 +2783,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
         self.release_pool_slot(pool_slot);
         self.driver.drain_conn_send_queue(conn_index);
-        self.driver.note_send_finalized(conn_index);
+        self.driver.defer_finalize_close(conn_index);
 
         if let Some((id, _logical_len)) = settles {
             self.settle_send(id, Err(Self::send_error(result)));
@@ -3160,7 +3161,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.release_coalesced(slab_idx);
 
             self.driver.submit_next_queued(conn_index);
-            self.driver.note_send_finalized(conn_index);
+            self.driver.defer_finalize_close(conn_index);
             // The carried logical (plaintext) length, not `acked` — see
             // `handle_send`'s success path.
             for (id, logical_len) in settles {
@@ -3193,7 +3194,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let close = self.driver.send_slab.close_on_error(slab_idx);
         self.release_coalesced(slab_idx);
         self.driver.drain_conn_send_queue(conn_index);
-        self.driver.note_send_finalized(conn_index);
+        self.driver.defer_finalize_close(conn_index);
         if close {
             self.executor.wake_recv(conn_index);
             self.driver.close_connection(conn_index);
@@ -3829,7 +3830,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // a deferred close finalize, exactly like handle_send.
         if result >= 0 {
             self.driver.submit_next_queued(conn_index);
-            self.driver.note_send_finalized(conn_index);
+            self.driver.defer_finalize_close(conn_index);
             return;
         }
 
@@ -3873,9 +3874,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // A close_connection that arrived while the chain was active deferred
-        // its Close on chain_drained — the chain state was just taken, so
-        // re-drive the finalize.
-        self.driver.note_send_finalized(conn_index);
+        // its Close on chain_drained. The chain state was just taken, so
+        // register the close for the end-of-iteration drain.
+        self.driver.defer_finalize_close(conn_index);
     }
 
     fn handle_timer(&mut self, ud: UserData, result: i32) {
@@ -7646,8 +7647,8 @@ mod tests {
                 "Close must not be submitted while a send is parked"
             );
         }
-        // Re-driving the finalize (as the loop's end-of-iteration drain and
-        // `note_send_finalized` do) must still hold off.
+        // Re-driving the finalize (as the loop's end-of-iteration drain does)
+        // must still hold off.
         el.driver.try_finalize_close(conn_index);
         assert!(
             !el.driver.send_queues[conn_index as usize].close_submitted,

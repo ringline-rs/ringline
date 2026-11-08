@@ -709,13 +709,15 @@ pub(crate) struct Driver {
     /// leave teardown's released slots unsignalled until after a
     /// `submit_and_wait` that can block.
     pub(crate) capacity_released: bool,
-    /// Connections whose close was requested this iteration — by
-    /// `close_connection` (peer FIN, read error, task exit, setup failure)
-    /// or by `DriverCtx::close` — and whose finalize is owed to the event
-    /// loop's end-of-iteration drain (after `poll_ready_tasks`, so the task
-    /// gets its poll window; #371). The drain re-drives
-    /// `try_finalize_close` for each; entries with sends still outstanding
-    /// are re-driven later by their CQEs via `note_send_finalized`.
+    /// Connections whose Close is owed to the event loop's end-of-iteration
+    /// drain, which runs `try_finalize_close` for each. `close_connection`
+    /// (peer FIN, read error, task exit, setup failure) and `DriverCtx::close`
+    /// register a connection when they request its close with nothing
+    /// outstanding, and `defer_finalize_close` registers it from the
+    /// completion that drains its sends, chain or `Shutdown`. The drain runs
+    /// after `poll_ready_tasks`, so a task woken in the same iteration is
+    /// polled, and a send it queues drains, before the Close is committed
+    /// (#371).
     pub(crate) pending_finalize_closes: Vec<u32>,
     /// Scratch buffers swapped with the corresponding `pending_*_retries`
     /// queue at drain time so the per-tick drain reuses a single allocation
@@ -1377,8 +1379,8 @@ impl Driver {
         //
         // The current strategy preserves the queue's serialized
         // drain: leave in_flight + queue alone, mark `close_pending`,
-        // and let `note_send_finalized` (called from the send handlers
-        // after each completion) submit the deferred `Close` once both
+        // and let the send handlers register the connection for the
+        // end-of-iteration drain (`defer_finalize_close`) once both
         // `in_flight` is false and the queue is empty.
         let state = &mut self.send_queues[conn_index as usize];
         state.close_pending = true;
@@ -1632,8 +1634,14 @@ impl Driver {
 
     /// Submit the deferred `Close` SQE once every pending send, send chain and
     /// `Shutdown` for this connection has finished.
-    /// Re-driven from each of those completions and from the
-    /// end-of-iteration `pending_finalize_closes` drain.
+    ///
+    /// Called from the event loop's end-of-iteration drain of
+    /// `pending_finalize_closes`, from `force_finalize_close`, and from the
+    /// park install, which commits the Close of a handed-off socket at once.
+    /// A completion handler does not call this: it calls
+    /// `defer_finalize_close`, so that when the last gating CQE lands in the
+    /// same batch as the peer's FIN, the Close is committed after the task
+    /// woken by the FIN has been polled.
     pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
         let state = &self.send_queues[conn_index as usize];
         let sends_drained = !state.in_flight && state.queue.is_empty();
@@ -1696,11 +1704,19 @@ impl Driver {
         self.ring.submit_close(conn_index, lead)
     }
 
-    /// Hook called from the send-path CQE handlers after the queue
-    /// state has been updated — submits a deferred `Close` if the
-    /// connection was waiting and the queue is now drained.
-    pub(crate) fn note_send_finalized(&mut self, conn_index: u32) {
-        self.try_finalize_close(conn_index);
+    /// Register a connection whose close is pending on
+    /// `pending_finalize_closes`, so the event loop's end-of-iteration drain
+    /// runs `try_finalize_close` for it after this iteration's task poll.
+    /// Called from the completion handlers once the queue state has been
+    /// updated. Does nothing for a connection whose close is not pending or
+    /// is already committed.
+    pub(crate) fn defer_finalize_close(&mut self, conn_index: u32) {
+        if !self.send_queues[conn_index as usize].close_pending {
+            return;
+        }
+        if !self.pending_finalize_closes.contains(&conn_index) {
+            self.pending_finalize_closes.push(conn_index);
+        }
     }
 
     /// Force a deferred close whose drain will never finish (close_notify
@@ -1828,11 +1844,11 @@ impl Driver {
                 WriteHalf::Open
             };
         }
-        // Fire a deferred close now that nothing is in flight and the
-        // queue is empty. The ZC completion path
-        // reaches here without a note_send_finalized call, so without
-        // this a close_pending connection would leak its fd and slot.
-        self.try_finalize_close(conn_index);
+        // Register a deferred close now that nothing is in flight and the
+        // queue is empty. The ZC completion path reaches here without a
+        // `defer_finalize_close` call of its own, so without this a
+        // close_pending connection would leak its fd and slot.
+        self.defer_finalize_close(conn_index);
         false
     }
 
@@ -1953,9 +1969,11 @@ impl Driver {
         state.parked = false;
         // Fail the awaited sends the drained entries carried.
         self.fail_send_ids(settles);
-        // The queue is now empty and nothing is in flight — fire a deferred
-        // close if one was pending so the connection can't leak.
-        self.try_finalize_close(conn_index);
+        // The queue is now empty and nothing is in flight: register a
+        // deferred close, if one is pending, for the end-of-iteration drain,
+        // so the connection does not leak. Worker exit clears
+        // `close_pending` before calling this and submits its own Close.
+        self.defer_finalize_close(conn_index);
     }
 
     /// Release all entries from a send queue, returning the awaited sends
