@@ -229,20 +229,21 @@ cancel targets with the same payload; add a `connect_inflight` gate to
 `try_finalize_close` mirroring `shutdown_inflight`.
 
 Disposition: fixed in `fix/uring-connect-identity`, by the identity check
-alone: `submit_connect` encodes the slot's generation, `handle_connect`
-returns on a mismatch before touching the slot, and the cancel targets carry
-the same payload. The proposed `connect_inflight` gate was added and then
-removed on review: a late CQE fails the generation check, the kernel holds
-the Connect's own file reference so re-registering the slot does not redirect
-it, and the Close's lead ends a Connect still in the kernel (from Linux 6.13
-an `ASYNC_CANCEL` of the fixed file, which cancels a poll-armed Connect;
-before 6.13 a `shutdown(SHUT_RDWR)`, which disconnects a `SYN_SENT` socket
-and wakes the poll; both read from the kernel source, not tested); with the
-gate, a cancel push refused by a full SQ left the slot `Closing` until the
-kernel's own connect timeout (about 127 s at the default `tcp_syn_retries`).
-Verified by `experiments/connect-identity-verify.toml` (SystemsLab experiment
-`01a1bc34-4f45-7153-842b-ffa04d3156c4`, Debian 13, Linux 6.12): at the tests-only commit 7b719b82 the four
-pinning tests that exist there fail (4 passed; 4 failed), among them
+alone: `submit_connect` encodes the slot's generation, `handle_connect` returns
+on a mismatch before touching the slot, and the cancel targets carry the same
+payload. The proposed `connect_inflight` gate was added and then removed on
+review: a late CQE fails the generation check, and, read from the kernel source
+and not tested, the kernel holds the Connect's own file reference so
+re-registering the slot does not redirect it, and the Close's lead ends a
+Connect still in the kernel (from Linux 6.13 an `ASYNC_CANCEL` of the fixed
+file, which cancels a poll-armed Connect; before 6.13 a `shutdown(SHUT_RDWR)`,
+which disconnects a `SYN_SENT` socket and wakes the poll); with the gate, a
+cancel push refused by a full SQ left the slot `Closing` until the kernel's own
+connect timeout (about 127 s at the default `tcp_syn_retries`). Verified by
+`experiments/connect-identity-verify.toml` (SystemsLab experiment
+`01a1bc34-4f45-7153-842b-ffa04d3156c4`, Debian 13, Linux 6.12): at the
+tests-only commit 7b719b82 the four pinning tests that exist there fail (4
+passed; 4 failed), among them
 `a_stale_connect_cqe_leaves_the_reused_slot_alone`, whose stale success CQE
 opens the new occupant; at 173cb83a ten pass, and the uring gate (fmt, clippy
 on three builds, rustdoc, `cargo test --all`) passes. The trigger itself (a
