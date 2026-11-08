@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779) and F9 (#768) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768) and F10 (`fix/uring-park-install-identity`) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -382,7 +382,21 @@ abandons N+1's park. The trace could not construct a stale install CQE
 
 Fix: generation check first; clear `park_in_flight[i]` in `close_connection`.
 
-Disposition: open.
+Disposition: fixed in `fix/uring-park-install-identity`, as proposed but
+for where the clear runs: `handle_park_install` compares the CQE's
+generation with the slot's before it reads `park_in_flight` or the drain,
+and a CQE for a previous occupant closes the fd it carries and nothing
+else; `clear_conn_claims`, which every slot release runs, clears
+`park_in_flight`. A clear in `close_connection` would have sent the install
+CQE of a connection closed mid-park down the stray path, losing the
+`PARK_ABANDONED` count for it. Three tests pin the fix:
+`a_stale_install_leaves_the_next_occupants_park_in_flight` and
+`a_stale_install_leaves_the_next_occupants_park_drain_alone` inject the
+stale CQE over the next occupant's park, and
+`a_recycled_slot_does_not_inherit_a_park_in_flight` recycles a slot with an
+install in flight. The stale CQE was still not constructed on a kernel:
+`FixedFdInstall` completes inline at submit, so its CQE is in the ring
+ahead of any Close CQE for the slot.
 
 ### F11 — `check_close_notify_deadlines` re-runs `force_finalize_close` every tick while the finalize is blocked; `fail_send_ids` sets `capacity_released` unconditionally (invariant 18). Traced, low.
 
