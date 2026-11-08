@@ -62,7 +62,6 @@ pub(crate) struct ConnSendState {
     /// Whether a `Shutdown` for the current occupant has been requested and
     /// its CQE has not arrived: the SQE is in the kernel, or parked on
     /// `Driver::pending_shutdown_retries`.
-    /// is still in the kernel.
     ///
     /// `Shutdown` names its socket as the *registered-file slot*
     /// `Fixed(conn_index)`, not as an fd, so it must not execute after that slot

@@ -72,8 +72,9 @@ pub enum WriteHalf {
     /// mio: `shutdown(Write)` called). `send_backpressured` refuses with
     /// `BrokenPipe` in this state and in `ShutdownPending`; `send`,
     /// `send_nowait` and `send_parts` are accepted: after an accepted Shutdown
-    /// they fail at the socket, and one pushed while the SQE is parked reaches
-    /// the peer before the FIN.
+    /// they fail at the socket, and one pushed while the SQE is parked is
+    /// submitted ahead of the FIN; a short send's remainder can still fail at
+    /// the socket behind it.
     Shutdown,
 }
 
