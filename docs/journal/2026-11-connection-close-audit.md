@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (`fix/exit-closes-count-down`) and F9 (#768) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779) and F9 (#768) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -335,7 +335,7 @@ Fix: decrement per established connection on both exit paths; document the
 mio abandonment or run one bounded `drain_pending_closes` pass before
 returning.
 
-Disposition: fixed in `fix/exit-closes-count-down`: the io_uring `run_shutdown`
+Disposition: fixed in #779: the io_uring `run_shutdown`
 Close arm and a mio `count_out_open_connections`, run at `run`'s shutdown
 return and in `drain_after_failure`, count each established connection into
 `CLOSED` and out of `CONNECTIONS_ACTIVE`, as `handle_close` and `finish_close`
