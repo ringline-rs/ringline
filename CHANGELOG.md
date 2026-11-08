@@ -908,6 +908,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- TLS, unbuffered engine (the default): a receive error now sends the fatal
+  alert rustls generated for it before the connection closes, on both
+  backends. rustls queues the alert while reporting the error and hands it
+  back only on the next call into its state machine; the engine returned on
+  the error without that call, so the peer read a bare FIN where the buffered
+  engine sent the alert. Found by the send-path audit
+  (`docs/journal/2026-11-send-path-audit.md`, F11).
+
+- TLS, unbuffered engine: a close no longer drops a record rustls had queued
+  before it. On TLS 1.2 traffic-key exhaustion rustls queues the close_notify
+  itself, so the close path found that alert waiting as `EncodeTlsData` and
+  dropped it with an error; the peer read the stream as truncated. The close
+  path now encodes a queued record before queueing the alert, records the
+  alert as sent when the queued record was the alert (including when the
+  peer's own close_notify is processed in the same call), and sends the
+  queued handshake flight ahead of the FIN for a connection closed before
+  its handshake finished. A connection whose receive failed in rustls makes
+  no further call into its state machine, so the close that follows does
+  not deframe the failed record again. Both backends. Found by the send-path
+  audit (F6).
+
 - io_uring: a `shutdown_write` whose Shutdown SQE the ring refused is
   retried. The refusal set the write half back to `Open` and relied on the
   application calling `shutdown_write` again, which nothing does, so the FIN

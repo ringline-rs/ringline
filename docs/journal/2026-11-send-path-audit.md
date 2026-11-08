@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
 - **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; the design limitations L1 to L10 stand
-- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, docs #788, F10 this PR, F6 and F11 in their own PR
+- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, docs #788, F10 #789, F6 and F11 this PR
 
 ## Goal
 
@@ -700,6 +700,52 @@ an `EncodeTlsData` before the first `queue_close_notify` call is what
 `sent_fatal_alert` guard (fork `common_state.rs:675-677`) would make the
 second queue a no-op when the drained record was the alert.
 
+**Disposition: fixed** (this PR, owner's decision). `close_notify_with`
+now loops: a record the machine hands back as `EncodeTlsData` is encoded
+into the output, `TransmitTlsData` is acknowledged, and the alert is queued
+once the machine reaches `WriteTraffic`. When rustls had queued the alert
+itself, `queue_close_notify` then writes nothing (or the machine reports
+`Closed`) and the encoded record is counted as the alert, so
+`close_notify_sent` is set. A connection closed before its handshake
+finished encodes its queued flight and sets no flag. The review of this
+change found that the F11 fix's second `process` call left the failed record
+in the receive buffer, so mio's close path deframed it again and tripped
+rustls' `sent_fatal_alert` debug assertion. The first correction emptied the
+buffer, and the second review showed that panics rustls' handshake deframer
+when it holds a partial message (it keeps an offset into the buffer); the
+engine now records the failure on the connection where rustls reports it
+(a receive error from `process`; an accumulator overflow, where rustls
+consumed the record, does not set it), and `drive`, `queue_close_notify` and
+`encrypt_chunk` return without entering the machine, pinned by
+`a_close_after_a_receive_error_does_not_re_enter_the_deframer`,
+`a_send_after_a_receive_error_does_not_re_enter_the_deframer`,
+`a_close_after_a_receive_error_mid_handshake_message_does_not_panic`,
+`a_drive_after_a_receive_error_reports_the_earlier_failure` and
+`an_accumulator_overflow_leaves_the_close_notify_to_send`. The fourth review
+found one path on which the alert still does not leave: an overflow returns
+before the records behind the overflowing one are deframed, a send on the
+closing connection deframes the next one in `encrypt_with`, and when that
+record is bad the alert rustls queues stays in rustls (the send's
+destination is an application-data slot, discarded on the error) while the
+flag keeps the close path out of the machine. The peer reads a FIN, as it
+does after any overflow that leaves records unread; left as is, pinned by
+`a_send_that_finds_a_bad_record_behind_an_overflow_does_not_re_enter_the_deframer`.
+The fifth review found the close path's own `process` could meet the same
+record first without setting the flag, and that the `PeerClosed` arm counted
+any record encoded ahead of it as the alert, where a queued key_update is
+not. The second is not reachable through a backend; the first needs two
+sends on the closing connection after the overflow error on io_uring, where
+the close request runs `queue_close_notify` before the connection
+finalizes. `close_notify_with` now sets the flag on its own errors and,
+after `PeerClosed` with a record encoded, calls `process` again so the next
+state sets the count, pinned by
+`a_close_that_finds_a_bad_record_behind_an_overflow_marks_the_connection_failed`
+and `a_queued_key_update_is_not_counted_as_the_close_notify_after_a_peer_close`.
+Engine tests `close_notify_encodes_the_alert_rustls_already_queued` (the
+exhaustion state reproduced by queueing the alert with no room) and
+`close_notify_before_the_handshake_sends_the_queued_flight_and_no_alert`
+replace the test that pinned the drop; both fail on the unfixed engine.
+
 ### F7 — A zero-length `send_parts` copy send on io_uring is pushed as a zero-length SQE, whose result 0 the handler treats as a failed send; every send queued behind it is discarded and the connection stays open (O2, S2 adjacent). Confirmed by trace; io_uring only. (auditor)
 
 `SendBuilder::submit` (`handler.rs:3770-3781`) returns early only for
@@ -815,6 +861,14 @@ once more and encode an `EncodeTlsData` into `out` before returning. Not
 run against the fork; the pop at `conn/unbuffered.rs:77` precedes the
 deframe that re-reports the error, so a second call is expected to return
 the alert.
+
+**Disposition: fixed** (this PR, owner's decision). `drive_inner` makes one
+more `process` call on an error and encodes the `EncodeTlsData` it returns
+into the output, which both backends queue whatever the outcome. Engine test
+`a_receive_error_puts_the_fatal_alert_in_the_output` (a client record with a
+flipped tag byte; the client then reads a fatal alert from the server's
+output) fails on the unfixed engine with an empty output, which confirms
+the fork hands the alert back on the second call.
 
 ### F12 — Comments and design text that do not match the code (X2, X3). Confirmed by quote.
 
