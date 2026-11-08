@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
-- **Status:** open — 14 findings recorded; F1 fixed, the rest in progress in the owner's order (F1, F2, F3, F4, F5, F7, F13, then the docs findings F9, F12, F14)
-- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 this PR
+- **Status:** open — 14 findings recorded; F1 and F2 fixed, the rest in progress in the owner's order (F3, F4, F5, F7, F13, then the docs findings F9, F12, F14)
+- **Span:** 2026-11-07 → · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 this PR
 
 ## Goal
 
@@ -536,6 +536,26 @@ and `drain_pending_closes` (mio) keep the full `remove_connection` as the
 backstop. The reviewer applied this on mio in a scratch copy
 (`SendCompletions::remove_task_owner`, `Executor::remove_connection_task`);
 the io_uring arms at `uring/event_loop.rs:945` and `:968` need the same.
+
+**Disposition: fixed** (this PR). `SendCompletions::remove_task` drops only
+the entries the dead connection task owns; `Executor::remove_connection_task`
+calls it from the four task-exit arms (mio and io_uring, return and panic).
+`remove_connection` runs only at the slot's release (`handle_close`,
+`drain_pending_closes`). Regression tests:
+`a_send_another_task_awaits_resolves_delivered_when_the_connection_task_returns`
+(mio event loop; fails on the unfixed tree with `Err(ConnectionAborted)`
+against `Ok(5)`) and two `remove_task` unit tests:
+`remove_task_leaves_entries_other_tasks_own_on_the_connection` fails when
+`remove_task` is made to behave as `remove_connection`;
+`remove_task_drops_the_task_s_entries_on_other_connections` passes under
+either and pins that the narrower rule still follows the task across
+connections. The io_uring arms
+were changed by the same edit and compile only in CI. The provisional-abort
+rule (departure 4) stays: in the current loops no driver result reaches
+`complete` after the release (mio finalizes only with `pending_sends` empty;
+io_uring commits the Close only with the queue empty and nothing in flight;
+a CQE that outlives the slot goes to `forget`), so the rule has no effect
+today and keeps `remove_connection` correct from any call site.
 
 ### F3 — `shutdown_write` pushes the FIN while a send chain is active (O4, X3). Confirmed by trace; io_uring only. (A1, C1)
 
