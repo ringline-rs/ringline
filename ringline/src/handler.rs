@@ -1165,8 +1165,11 @@ impl<'a> DriverCtx<'a> {
 
     /// Shutdown the write side of a connection.
     ///
-    /// If sends are in-flight or queued, the shutdown is deferred until the
-    /// send queue drains to avoid racing with pending Send SQEs.
+    /// If a send is in flight or queued, or a send chain is active, the
+    /// shutdown is deferred until the send queue drains
+    /// (`submit_next_queued_inner`'s empty-queue arm submits it, which
+    /// `fire_chain_complete` reaches too): io_uring does not order an
+    /// independent Shutdown SQE behind those sends.
     pub fn shutdown_write(&mut self, conn: ConnId) {
         let Some(cs) = self.connections.get_mut(conn.index) else {
             return;
@@ -1184,7 +1187,10 @@ impl<'a> DriverCtx<'a> {
         if self.send_queues[idx].close_submitted {
             return;
         }
-        if self.send_queues[idx].in_flight || !self.send_queues[idx].queue.is_empty() {
+        if self.send_queues[idx].in_flight
+            || !self.send_queues[idx].queue.is_empty()
+            || self.chain_table.is_active(conn.index)
+        {
             // Defer until the send queue drains (submit_next_queued issues it).
             cs.write = crate::connection::WriteHalf::ShutdownPending;
         } else {
