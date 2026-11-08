@@ -46,7 +46,7 @@ Tests that open a socket bind port 0 and read the address back:
 choose a port and bind it later. Ringline binds with `SO_REUSEPORT`, so two test
 processes given the same port both bind it and the kernel splits traffic between
 their servers. A test that needs a port with nothing listening uses `refusing_port` in
-`tests/echo.rs`, which holds the client end of an established loopback
+`tests/common/mod.rs`, which holds the client end of an established loopback
 connection. A bound socket that never listens refuses on Linux but not on macOS.
 
 A test whose handler requests its own shutdown joins the workers with

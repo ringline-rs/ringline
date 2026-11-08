@@ -914,6 +914,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   free buffers that had not been returned, and receive datagrams into
   buffers the application still held. Without `sqpoll` the kernel reads the tail only inside this
   thread's `io_uring_enter`, so the window was never seen.
+
+- `CONNECTIONS_ACTIVE` counts outbound connections in. An outbound
+  connection was decremented at close but never incremented when it became
+  established: every outbound connection on io_uring, and every TLS outbound
+  connection on mio, moved the gauge by −1 over its lifetime, so a client
+  workload read a negative value. The increment now sits at each site that
+  sets `established`. `conn::CLOSED` counts only established connections on
+  mio, as it already did on io_uring, so a refused connect is not a close;
+  both counters are documented in `metrics.rs`.
+
 - A panic in a future's `Drop` no longer ends the worker, after the future
   returned `Ready`, after a panic in its poll, when its connection closed, or
   at worker exit. Nor does a panic in a `SendGuard`'s `Drop` on a worker's

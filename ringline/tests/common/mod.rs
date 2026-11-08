@@ -2,8 +2,25 @@
 
 #![allow(dead_code)]
 
+use std::net::TcpStream;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// A loopback port that refuses connections, held by the client end of an
+/// established loopback connection. Nothing listens on it, so a connect to it
+/// fails with `ConnectionRefused` on Linux and macOS, and the port stays in
+/// use until the returned streams are dropped, so a port-0 bind is never
+/// given it.
+///
+/// A bound socket that never listens does not work here: macOS drops a SYN
+/// to it instead of refusing, so the connect times out.
+pub fn refusing_port() -> ((TcpStream, TcpStream), u16) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let port = client.local_addr().unwrap().port();
+    ((client, server), port)
+}
 
 /// How long [`join_workers`] waits for the workers to exit before it shuts
 /// the runtime down and fails the test.

@@ -916,6 +916,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                                 cs.established = true;
                             }
+                            // Counted in with `established`; `finish_close`
+                            // counts out.
+                            metrics::CONNECTIONS_ACTIVE.increment();
                             // Wake connect waiter.
                             self.executor.wake_connect(conn_index, Ok(()));
                         } else {
