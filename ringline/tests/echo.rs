@@ -126,22 +126,6 @@ fn test_config() -> Config {
     test_config_builder().build().expect("valid config")
 }
 
-/// A loopback TCP port that refuses connections, and the sockets that hold
-/// it. The port is the local port of the client end of an established
-/// loopback connection. Nothing listens on it, so a connect to it fails with
-/// `ConnectionRefused` on Linux and macOS, and the port stays in use until
-/// the returned streams are dropped, so a port-0 bind is never given it.
-///
-/// A bound socket that never listens does not work here: macOS drops a SYN
-/// to it instead of refusing, so the connect times out.
-fn refusing_port() -> ((TcpStream, TcpStream), u16) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (server, _) = listener.accept().unwrap();
-    let port = client.local_addr().unwrap().port();
-    ((client, server), port)
-}
-
 fn wait_for_server(addr: &str) {
     for _ in 0..200 {
         if TcpStream::connect(addr).is_ok() {
@@ -1185,7 +1169,7 @@ impl AsyncEventHandler for ConnectRefusedHandler {
 fn async_outbound_connect_refused() {
     // A port held by a socket that never listens, so a connect is refused and
     // nothing else can take the port while the test runs.
-    let (_dead_guard, dead_port) = refusing_port();
+    let (_dead_guard, dead_port) = common::refusing_port();
 
     CONNECT_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
 
@@ -4419,7 +4403,7 @@ impl AsyncEventHandler for StandaloneConnectRefusedHandler {
 fn async_standalone_connect_refused() {
     // A port held by a socket that never listens, so a connect is refused and
     // nothing else can take the port while the test runs.
-    let (_dead_guard, dead_port) = refusing_port();
+    let (_dead_guard, dead_port) = common::refusing_port();
 
     STANDALONE_REFUSED_PORT.store(dead_port as u32, Ordering::SeqCst);
 
