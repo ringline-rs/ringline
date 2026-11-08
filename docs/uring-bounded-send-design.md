@@ -1,6 +1,12 @@
 # io_uring bounded-send completion identity (series PR 7b)
 
-Note (2026-10-25): `forward_to` was removed.
+Note: identifiers in this document are those of the PR it describes;
+`docs/send-completion-slots-design.md` "What goes away" lists the renames
+since. Code: `ringline/src/runtime/send_completion.rs`.
+
+Note (2026-10-25): the recv-buffer forward (`handle_send_recv_buf`, and
+`forward_to` as it then was) was removed; `ConnCtx::forward_to` today is the
+body of `RecvHalf::forward_to_conn`.
 
 Note (2026-10-25): `OpTag::RecvMulti` was removed with the TCP
 provided-buffer ring.
@@ -110,7 +116,9 @@ and settle `Err`. Those three TLS returns are today's "a TLS send error
 hangs `send().await`" hole; this PR does not fix that for `SendFuture`, but
 it must not reproduce it for bounded sends.
 
-**Failure with no completion** (the six retry drains' give-up arms): settle
+**Failure with no completion** (the retry drains' give-up arms; today four
+drains give up, and `drain_send_retries` settles through
+`drain_conn_send_queue`): settle
 beside the existing `wake_send(Err(..))`.
 
 **Teardown** (`release_queued_sends`, reached from `drain_conn_send_queue`,

@@ -4758,7 +4758,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Check close_notify deadlines on the armed set. If a connection
     /// has `close_pending` and the `close_notify_deadline` has elapsed,
-    /// force-close it by calling `try_finalize_close`.
+    /// force-close it with `force_finalize_close`.
     ///
     /// Iterates only the indices in `driver.close_notify_armed`, not
     /// every entry in `driver.send_queues`. For non-TLS workloads the

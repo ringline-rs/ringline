@@ -361,8 +361,8 @@ pub fn flush_tls_output(
 /// queue. It is *not* retryable, though: records encrypted before the failure
 /// consumed TLS sequence numbers that no longer have ciphertext on the wire, so
 /// the connection is finished. Treat an error here as fatal for the connection
-/// and close it — the same rule `DriverCtx::send` documents for its own
-/// mid-buffer failures, and the same behaviour the buffered engine has.
+/// and close it, as `encrypt_tls_send` and `send_bounded` do; the buffered
+/// engine behaves the same.
 pub fn encrypt_to_sends(
     tls_table: &mut TlsTable,
     send_copy_pool: &mut SendCopyPool,

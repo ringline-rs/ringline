@@ -1,5 +1,9 @@
 # Transactional copied sends: pool reservation and SQ-pressure parking (series PR 4)
 
+Note: identifiers in this document are those of the PR it describes;
+`docs/send-completion-slots-design.md` "What goes away" lists the renames
+since. Code: `ringline/src/runtime/send_completion.rs`.
+
 Fourth PR of the series that lands #318
 (`docs/backpressured-sends-series-design.md`, "PR 4"). Design origin:
 @thinkingfish in #318; re-derived on current `main`.
@@ -208,10 +212,11 @@ on the next loop iteration. Concretely:
 After this, `DriverCtx::send` on io_uring can fail only before it has
 committed anything: stale token, or pool admission (Hole 1, now reserved
 up front). Its `# Errors` sections drop "or the submission queue is full".
-The one exception that remains is TLS pool exhaustion *during* encryption
-(`encrypt_to_sends` releases the staged ciphertext but rustls has advanced);
-that is series PR 8's pre-mutation bound, and the `ConnCtx::send` /
-`DriverCtx::send` docs name it.
+TLS pool exhaustion *during* encryption (`encrypt_to_sends` releases the
+staged ciphertext but rustls has advanced) is closed on io_uring:
+`encrypt_tls_send` admits against the ciphertext bound before encrypting. A
+failure after rustls has sealed a record still fails the operation and
+closes the connection.
 
 **Series departure 1, refined.** Departure 1 says a full SQ is terminal so
 that nothing parks and re-runs a logical send after rustls mutation. Parking

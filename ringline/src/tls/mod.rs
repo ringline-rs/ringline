@@ -375,7 +375,8 @@ pub struct CiphertextCapacity {
     unbuffered: bool,
 }
 
-// Same rationale as the `allow` on the struct: PR 8's call-site task removes it.
+// `records` has no caller outside tests; the other methods are reached
+// through `slots`, `bytes` and `min_slot_size`.
 #[cfg_attr(not(test), allow(dead_code))]
 impl CiphertextCapacity {
     /// Records the bound covers, including the slack record — so this is never
@@ -483,8 +484,8 @@ pub struct TlsTable {
     client_config: Option<Arc<ringline_tls::ClientConfig>>,
     /// Single shared ciphertext scratch buffer (one per worker thread).
     /// Only used synchronously — we process one connection at a time.
-    /// io_uring builds write ciphertext directly into pool slots via
-    /// `PoolWriter` and don't need it.
+    /// io_uring builds write ciphertext directly into pool slots
+    /// (`encrypt_to_sends`) and do not need it.
     #[cfg(not(has_io_uring))]
     write_buf: Vec<u8>,
     /// Free buffers for direct receives on the buffered engine, which reads
@@ -638,10 +639,12 @@ impl TlsTable {
     /// bound carries headroom for it unconditionally rather than pretending it
     /// can be predicted.
     ///
-    /// **This is the single source of that number.** PR 9's bounded-send
-    /// future must compute the `required_slots` it hands
-    /// `SendCompletions::enqueue` with this same function, and its
-    /// oversize-rejection test must use it too. If the FIFO admits on a
+    /// **This is the single source of that number.** Every admission
+    /// computes through it: `handler::bounded_send_slots` for the
+    /// bounded-send future and both `send_bounded`s, which hand the
+    /// `required_slots` to `SendCompletions::enqueue`, and
+    /// `encrypt_tls_send` for plain TLS sends on io_uring; the
+    /// oversize-rejection test uses it too. If the FIFO admits on a
     /// different number than the backend checks, the queue will admit a
     /// message the backend then refuses — which is the failure this bound
     /// exists to prevent.

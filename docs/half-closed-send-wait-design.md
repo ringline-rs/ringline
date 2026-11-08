@@ -78,7 +78,8 @@ cannot finish waits in ringline:
 5. Each multishot CQE with `POLLOUT`, `POLLERR` or `POLLHUP` resubmits the rest. A
    `POLLOUT` that arrives while the resubmit is in flight is recorded, and acts if
    that resubmit returns short or `-EAGAIN`. A multishot poll that ends with the send
-   still waiting is armed again.
+   still waiting is followed by a one-shot poll, which arms a multishot
+   again if it completes without `POLLOUT`.
 6. The poll stays armed until the connection closes, when `try_finalize_close`, or
    worker exit, cancels it. A half-closed connection is always closing, and a poll
    armed for step 2 costs one ignored CQE per edge. Cancelling when each send finishes

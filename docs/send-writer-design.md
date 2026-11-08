@@ -175,9 +175,6 @@ none of them:
   needs are ones it holds. A task that holds a writer and awaits a message
   from another task, while that task is the FIFO head waiting for capacity,
   waits forever, and every sender behind that head stalls.
-- A writer carrying only a connection token can be committed after its
-  `SendHalf` is dropped and the write side is taken by another owner
-  (`take_send`), for example one running a forward.
 
 Inside the closure the application cannot `.await`, so none of these can
 happen to `send_with` or `send_with_awaited`. `send_with_backpressured`

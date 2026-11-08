@@ -1,5 +1,9 @@
 # Public `send_backpressured` (series PR 9)
 
+Note: identifiers in this document are those of the PR it describes;
+`docs/send-completion-slots-design.md` "What goes away" lists the renames
+since. Code: `ringline/src/runtime/send_completion.rs`.
+
 Ninth and final PR of the series that lands #318
 (`docs/backpressured-sends-series-design.md`, "PR 9"). Origin: @thinkingfish
 in #318. Sits on every prior PR in the series; #385 in particular.
