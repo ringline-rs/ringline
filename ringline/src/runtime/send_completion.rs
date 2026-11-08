@@ -518,12 +518,14 @@ impl SendCompletions {
         // whose entries must be aborted, and the *task* that owns entries
         // possibly targeting other connections. The second is not a corner
         // case — it is the shape the public API advertises, a proxy task on
-        // connection C with a bounded send outstanding on connection D. When
-        // C's task is dropped its futures' `Drop` does not run (teardown is
-        // not inside a driver-state guard on either backend), so nothing
-        // else will ever take those entries off the queue. Left behind, an
-        // entry whose owner can never be woken sits at the head and stalls
-        // every bounded send on the worker.
+        // connection C with a bounded send outstanding on connection D. This
+        // runs from `handle_close` (io_uring) and `drain_pending_closes`
+        // (mio), with no driver state installed, so when C's task is dropped
+        // there its futures' `Drop` cannot reach `cancel`, and nothing else
+        // would ever take those entries off the queue. (A `cancel` that ran
+        // earlier, from a task-exit arm under a guard, left nothing for this
+        // to find.) Left behind, an entry whose owner can never be woken
+        // sits at the head and stalls every bounded send on the worker.
         let dead_owner = |e: &Entry| {
             e.conn_index == conn_index
                 || (e.task_id & crate::runtime::waker::STANDALONE_BIT == 0

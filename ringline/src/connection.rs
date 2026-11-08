@@ -68,8 +68,12 @@ pub enum WriteHalf {
     /// they drain.
     ShutdownPending,
     /// Our FIN has been issued (io_uring: Shutdown SQE submitted, or parked
-    /// for retry while the ring is full; mio: `shutdown(Write)` called). This does not refuse later sends — that is
-    /// a policy decision left open; today they fail at the socket.
+    /// on `pending_shutdown_retries` when the submission queue refused it;
+    /// mio: `shutdown(Write)` called). `send_backpressured` refuses with
+    /// `BrokenPipe` in this state and in `ShutdownPending`; `send`,
+    /// `send_nowait` and `send_parts` are accepted: after an accepted Shutdown
+    /// they fail at the socket, and one pushed while the SQE is parked reaches
+    /// the peer before the FIN.
     Shutdown,
 }
 

@@ -8,8 +8,8 @@ obvious-looking fix — `IOSQE_CQE_SKIP_SUCCESS` on fire-and-forget sends —
 is unsound here, for two independent reasons:
 
 1. **Slot lifecycle runs on the CQE.** Every send references ringline-owned
-   memory (SendCopyPool slot, InFlightSendSlab entry, the provided buffer
-   a `forward_recv_buf` send lends). The completion CQE is the *only*
+   memory (a `SendCopyPool` slot, or an `InFlightSendSlab` entry whose guards
+   keep the caller's or the accumulator's bytes alive). The completion CQE is the *only*
    signal that the kernel is done with that memory; skipping it leaks the
    slot. There is no send path with no resource to release.
 2. **Partial sends are silent with skip.** CQE_SKIP_SUCCESS suppresses all
@@ -117,7 +117,10 @@ is in the kernel. It closes every connection with the `CancelAll` lead, on every
 kernel, so a send in the kernel is cancelled, and a coalesced send's slab entry
 is released on its completion. A connection holding
 slab entries gets the cancel alone, and its `Close` waits for them, as below. Entries parked on
-a retry list, with no operation in flight, are released first. It then waits,
+the coalesced and zero-copy retry lists, with no operation in flight, are
+released first; a copy send parked on `pending_copy_retries` keeps its pool
+slot until the pool drops with the driver, since nothing in the kernel can
+read it. It then waits,
 for at most 10 s (`SHUTDOWN_BOUND`), until every connection's `Close` has completed and
 every send-slab entry is released. A zero-copy entry is
 released only once its notifications land, and the kernel posts them when the
@@ -152,7 +155,7 @@ does for a partial-write resubmit, so a starved connection is never left open
 with a hole in its byte stream.
 
 Consequence: on io_uring `DriverCtx::send` fails only before it has committed
-anything (stale token, or pool admission). The one remaining exception is TLS
-pool exhaustion mid-encryption — rustls has advanced its record sequence but
-the pool refused the ciphertext — which series PR 8's pre-mutation bound
-closes.
+anything (stale token, or pool admission). TLS pool exhaustion during
+encryption is closed on io_uring: `encrypt_tls_send` admits against
+`TlsTable::ciphertext_capacity` before encrypting. A failure after rustls has
+sealed a record still fails the operation and closes the connection.

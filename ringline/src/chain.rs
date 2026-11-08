@@ -2,8 +2,8 @@
 //!
 //! When multiple SQEs are linked with IO_LINK, the kernel executes them
 //! sequentially. Each SQE produces its own CQE. This module tracks the
-//! aggregate result across all CQEs in a chain and fires a single
-//! `on_send_complete` when the entire chain is done.
+//! aggregate result across all CQEs in a chain; the event loop fires
+//! `fire_chain_complete` once when the entire chain is done.
 
 /// Events returned by chain state updates.
 #[derive(Debug, PartialEq, Eq)]

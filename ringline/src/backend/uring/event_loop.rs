@@ -4691,9 +4691,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Push the `Shutdown` SQEs the ring refused. The write half already
     /// reads `Shutdown` and `shutdown_inflight` holds the Close, so an entry
-    /// is never dropped while its connection lives; one whose slot was
-    /// recycled is dropped, since `reset_send_state` cleared the flag. Same
-    /// backoff as `drain_close_retries`: every 4th tick.
+    /// is never dropped while its connection lives; one whose slot has been
+    /// released (its generation changed) is dropped, since nothing waits on
+    /// the flag for a released slot and `reset_send_state` clears it at
+    /// reactivation. Same backoff as `drain_close_retries`: every 4th tick.
     fn drain_shutdown_retries(&mut self) {
         if self.driver.pending_shutdown_retries.is_empty() {
             return;
@@ -4789,7 +4790,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Check close_notify deadlines on the armed set. If a connection
     /// has `close_pending` and the `close_notify_deadline` has elapsed,
-    /// force-close it by calling `try_finalize_close`.
+    /// force-close it with `force_finalize_close`.
     ///
     /// Iterates only the indices in `driver.close_notify_armed`, not
     /// every entry in `driver.send_queues`. For non-TLS workloads the
@@ -8370,6 +8371,68 @@ mod tests {
             !el.driver.send_queues[conn_index as usize].close_pending,
             "close must finalize once the chain drains"
         );
+    }
+
+    /// A copy-only batch, chain send or chain part wider than one send-pool
+    /// slot can never fit: it is refused with `InvalidInput`, as the same
+    /// data beside a guard part already is, not with the retryable `Other`
+    /// of an exhausted pool. Nothing is taken from the pool.
+    #[test]
+    fn copy_data_wider_than_a_slot_is_invalid_input_on_every_builder() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(4, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        let half = [0u8; 40];
+        let whole = [0u8; 100];
+
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_parts(token)
+                .copy(&half)
+                .copy(&half)
+                .submit()
+                .expect_err("80 bytes do not fit a 64-byte slot")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "send_parts: {err}");
+
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_chain(token)
+                .copy(&whole)
+                .finish()
+                .expect_err("100 bytes do not fit a 64-byte slot")
+        };
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidInput,
+            "send_chain copy: {err}"
+        );
+
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_chain(token)
+                .parts()
+                .copy(&half)
+                .copy(&half)
+                .add()
+                .finish()
+                .expect_err("80 bytes do not fit a 64-byte slot")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "chain part: {err}");
+
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            4,
+            "nothing was taken"
+        );
+        assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
+        assert!(!el.driver.chain_table.is_active(conn_index));
     }
 
     /// A `send_parts` batch whose parts carry no bytes queues nothing: no

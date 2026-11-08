@@ -1,5 +1,11 @@
 # Executor send-capacity FIFO (series PR 5)
 
+Superseded by `docs/send-completion-slots-design.md`: `SendCapacityQueue`
+became the waiting half of `SendCompletions`
+(`ringline/src/runtime/send_completion.rs`), and `runtime/send_capacity.rs`
+does not exist. The admission rule below survives there (`turn` admits the
+head only when `free_slots >= required_slots`).
+
 Fifth PR of the series that lands #318
 (`docs/backpressured-sends-series-design.md`, "PR 5"). Design origin:
 @thinkingfish in #318; re-derived on current `main`. No callers land here;

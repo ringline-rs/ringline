@@ -31,7 +31,9 @@ asserts the bound was never beaten.
 
 ## What the bound actually is
 
-Measured against rustls 0.23.41 (`Cargo.lock`), whose relevant constants are
+Measured against rustls 0.23.41 (`Cargo.lock` at the time; ringline-tls 0.1.2,
+the fork ringline uses today, carries the same constants), whose relevant
+constants are
 all `pub(crate)` and therefore unreachable — ringline already keeps its own
 copies and says why (`tls/unbuffered/mod.rs`).
 
@@ -140,10 +142,12 @@ against a bound that is too small.
 
 ## Where the check goes
 
-**Departure 2 holds with no signature changes.** Both bounded call sites are
-distinct functions from their plain twins, so `encrypt_to_sends` and
-`encrypt_for_send_mio` are untouched and plain `send` / `send_nowait` /
-`send_parts` keep today's admission behaviour exactly.
+**Departure 2 held when this landed.** Both bounded call sites are distinct
+functions from their plain twins, so `encrypt_to_sends` and
+`encrypt_for_send_mio` were untouched. `encrypt_tls_send` later applied the
+same bound to plain TLS sends on io_uring; see the CHANGELOG entry "io_uring:
+a TLS `send`, `send_nowait` or `send_parts` that ran out of send pool partway
+through encryption corrupted the connection".
 
 **io_uring** (`DriverCtx::send_bounded`, TLS branch): check
 `send_copy_pool.free_count() >= capacity_slots` immediately before

@@ -697,7 +697,9 @@ pub(crate) struct Driver {
     /// `Shutdown` SQEs the ring refused: (conn_index, generation). The write
     /// half already reads `Shutdown` and `shutdown_inflight` is set, so the
     /// Close waits for the FIN; `drain_shutdown_retries` pushes each again
-    /// on the close-retry backoff and drops one whose slot was recycled.
+    /// on the close-retry backoff and drops one whose slot has been released
+    /// (its generation changed): nothing waits on the flag for a released
+    /// slot, and `reset_send_state` clears it at reactivation.
     pub(crate) pending_shutdown_retries: Vec<(u32, u32)>,
     /// Connections whose queued head send could not be pushed (SQ still
     /// full after submit): (conn_index, generation, attempts). Drained each
@@ -1782,7 +1784,10 @@ impl Driver {
     /// fails the generation check and releases only its own slot. The next
     /// occupant is protected by `reset_send_state` at reactivation. A send
     /// waiting for room has only its poll in the kernel: `try_finalize_close`
-    /// cancels that, and the poll's CQE or `handle_close` fails the send.
+    /// cancels that, and the poll's CQE or `handle_close` fails the send. A
+    /// `Shutdown` in the kernel, or parked on `pending_shutdown_retries`,
+    /// still holds the Close until its CQE lands, so the deadline check
+    /// calls this again on each tick until then.
     pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
         // The drain is stuck, so a retained alert would stall the same way:
         // drop it with the queued sends.
