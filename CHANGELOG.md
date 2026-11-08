@@ -924,6 +924,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which matched only a slot's first occupant, so for every later one the
   timeout stayed armed for its full duration and was then rejected by its
   handler.
+- A send awaited by one task on a connection whose own task returns while
+  the send is queued resolves with the delivered count, not
+  `ConnectionAborted`. The task-exit path tore the whole connection down at
+  once, recording a provisional abort for every awaited send on it and
+  waking the owners, who were polled before the flush that delivered the
+  bytes, so the driver's result could never overwrite the abort. A returning
+  or panicking connection task now drops only its own awaited sends
+  (`Executor::remove_connection_task`); the sends other tasks await are
+  settled by the driver as the queue drains ahead of the close, and
+  `remove_connection` runs when the slot is released, as it did for a close
+  from the driver, on both backends. The await now lasts as long as the
+  drain: a peer that stops reading holds it until the write fails, as for a
+  close from the driver. A task parked on a receive for the connection is
+  woken once, at the release, instead of at the task's exit as well; its
+  result is unchanged. The shape is a writer task holding the
+  `SendHalf` that outlives the reader task on the same connection. Found by
+  the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F2).
+
+- A `SendFuture` created by one task and first polled by another after the
+  creating connection task returned resolves. The creating task's return
+  abandoned the send's completion-table entry, since its recorded owner was
+  the dead task, and the poll from the task the future was handed to did not
+  revive it, so the completion freed the entry and woke nobody: the new owner
+  parked forever on a send the peer received. A poll now returns an
+  abandoned entry to in flight, on both backends (`set_owner` in
+  `runtime/send_completion.rs`). The shape is `let fut = tx.send(..)?;
+  spawn(async move { fut.await })` from `on_accept`, then returning. Found by
+  the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F1).
+
 - io_uring: a peer's FIN that lands in the same completion batch as the CQE
   of the send that held the connection's close open no longer commits the
   Close before the task woken by the FIN is polled. The send's completion
