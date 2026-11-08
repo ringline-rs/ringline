@@ -1,12 +1,14 @@
-//! A connection the runtime aborts on its own account — a write that failed,
-//! a receive that ran past `recv_accumulator_max` — reports the abort to a
-//! reader parked on `with_data_result`, as a socket read error does. Only a
-//! peer that closed cleanly resolves `Ok(0)`.
+//! A connection the runtime aborts on its own account — a write that failed
+//! (on mio; on io_uring a failed plaintext send does not close the
+//! connection, audit finding F13), a receive that ran past
+//! `recv_accumulator_max` — reports the abort to a reader parked on
+//! `with_data_result`, as a socket read error does. Only a peer that closed
+//! cleanly resolves `Ok(0)`.
 
 mod common;
 
 use std::future::Future;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,13 +138,16 @@ impl AsyncEventHandler for RespondThenRead {
 /// a clean close.
 ///
 /// mio only: there the write error is what closes the connection. On io_uring
-/// a failed send does not close the connection, and whichever of the send and
-/// the receive the kernel completes first takes the socket's pending error:
-/// when the send takes it, the receive then reports a plain EOF and the read
-/// resolves `Ok(0)` (audit finding F13), so the outcome there is not fixed.
+/// a failed plaintext send does not close the connection, and whichever of
+/// the send and the receive the kernel runs first takes the socket's pending
+/// error: when the send takes it, the receive then reports a plain EOF and
+/// the read resolves `Ok(0)` (audit finding F13), so the outcome there is not
+/// fixed.
 #[cfg(not(has_io_uring))]
 #[test]
 fn write_error_teardown_is_reported_to_the_reader() {
+    use std::io::Read;
+
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     reset();
     let (rt, handles, addr) = launch::<RespondThenRead>(config());
