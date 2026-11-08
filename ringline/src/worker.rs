@@ -406,6 +406,18 @@ impl Runtime {
     /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) for a
     /// worker on which a task panicked.
     ///
+    /// A worker checks for shutdown once per event-loop iteration. Once it
+    /// sees the request it polls no task again, and it drops every task's
+    /// future without polling it. A task woken after the worker's last poll
+    /// pass therefore never runs the code after its `.await`, even though the
+    /// operation it awaited has completed. On io_uring the check comes after
+    /// the iteration's completions are drained and before tasks are polled,
+    /// so any completion in that batch can wake a task that is never polled.
+    /// On mio the check comes at the end of the iteration, after the poll
+    /// pass. A task woken there by a send completion, by released send
+    /// capacity or from `on_tick` is never polled. Work that must finish
+    /// before exit has to complete before shutdown is requested.
+    ///
     /// The listeners stop accepting at once on Linux, and within about 100 ms
     /// elsewhere. A listener's sockets close, and its port is free, once the
     /// threads accepting on it have exited: its acceptor thread, or with the

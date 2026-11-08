@@ -937,6 +937,11 @@ impl Future for ResolveFuture {
 /// [`AsyncEventHandler::on_start()`](crate::AsyncEventHandler::on_start) futures,
 /// and from `on_tick` and `on_notify`.
 ///
+/// Stops the calling worker only. Its tasks stop as described under
+/// [`Runtime::shutdown`](crate::Runtime::shutdown): once the worker sees the
+/// request it polls no task again, so a task woken after its last poll pass
+/// is dropped without running.
+///
 /// Returns `Err` if called outside the ringline async executor.
 pub fn request_shutdown() -> io::Result<()> {
     try_with_state(|driver, _| {
