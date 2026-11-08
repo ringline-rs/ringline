@@ -914,9 +914,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   pass (by a completion, a send result, released capacity, `on_tick` or
   another thread) never runs the code after its `.await`. On io_uring the
   check comes between draining completions and polling tasks, and on mio it
-  comes at the end of the iteration. `DriverCtx::request_shutdown` on
-  io_uring said the worker stops after the current iteration; it stops at
-  the next iteration's check.
+  comes at the end of the iteration.
 
 - io_uring with `sqpoll` and a UDP bind: returning a buffer to ring entry 0
   no longer writes 0 to the ring's tail, which shares those bytes, before
