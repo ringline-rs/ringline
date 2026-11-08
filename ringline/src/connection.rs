@@ -73,8 +73,9 @@ pub enum WriteHalf {
     /// `BrokenPipe` in this state and in `ShutdownPending`; `send`,
     /// `send_nowait` and `send_parts` are accepted: after an accepted Shutdown
     /// they fail at the socket, and one pushed while the SQE is parked is
-    /// submitted ahead of the FIN; a short send's remainder can still fail at
-    /// the socket behind it.
+    /// usually submitted ahead of the FIN (both are refused by the same full
+    /// queue and retried on different ticks); a short send's remainder can
+    /// still fail at the socket behind it.
     Shutdown,
 }
 
