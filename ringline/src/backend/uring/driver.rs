@@ -711,10 +711,11 @@ pub(crate) struct Driver {
     pub(crate) capacity_released: bool,
     /// Connections whose Close is owed to the event loop's end-of-iteration
     /// drain, which runs `try_finalize_close` for each. `close_connection`
-    /// (peer FIN, read error, task exit, setup failure) and `DriverCtx::close`
-    /// register a connection when they request its close with nothing
-    /// outstanding, and `defer_finalize_close` registers it from the
-    /// completion that drains its sends, chain or `Shutdown`. The drain runs
+    /// (peer FIN, read error, task exit, setup failure) registers a
+    /// connection when it requests its close with nothing outstanding,
+    /// `DriverCtx::close` whenever it requests one, and
+    /// `defer_finalize_close` registers it from the completion that drains
+    /// its sends, chain or `Shutdown`. The drain runs
     /// after `poll_ready_tasks`, so a task woken in the same iteration is
     /// polled, and a send it queues drains, before the Close is committed
     /// (#371).
@@ -1638,10 +1639,10 @@ impl Driver {
     /// Called from the event loop's end-of-iteration drain of
     /// `pending_finalize_closes`, from `force_finalize_close`, and from the
     /// park install, which commits the Close of a handed-off socket at once.
-    /// A completion handler does not call this: it calls
-    /// `defer_finalize_close`, so that when the last gating CQE lands in the
-    /// same batch as the peer's FIN, the Close is committed after the task
-    /// woken by the FIN has been polled.
+    /// The send, chain and `Shutdown` completion handlers do not call this:
+    /// they call `defer_finalize_close`, so that when the last gating CQE
+    /// lands in the same batch as the peer's FIN, the Close is committed
+    /// after the task woken by the FIN has been polled.
     pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
         let state = &self.send_queues[conn_index as usize];
         let sends_drained = !state.in_flight && state.queue.is_empty();

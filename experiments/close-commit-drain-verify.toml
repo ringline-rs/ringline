@@ -5,10 +5,10 @@
 # are both checked here, in an ephemeral VM on the `validation` agent, never by
 # a login to a rig host (CLAUDE.md, "Verifying io_uring code").
 #
-# `red_ref` is the branch's tests-only commit, ahead of the fix. Step 1 runs
-# the named tests there and expects five failures (the tests that pin the new
-# behaviour) and four passes (the tests that only gained a drain call).
-# Step 2 runs the same tests at the branch head and expects nine passes. Step 3
+# `red_ref` is the branch's tests-only commit, before the fix. Step 1 runs the
+# named tests there and expects five failures (the tests that pin the new
+# behaviour) and five passes (the tests that only gained a drain call). Step 2
+# runs the same tests at the branch head and expects ten passes. Step 3
 # is `experiments/uring-gate.toml`'s check list on the branch head, with
 # rustdoc added because the change edits doc comments behind `has_io_uring`.
 #
@@ -19,7 +19,7 @@ name = "ringline close-commit-drain verify ({branch})"
 branch = "fix/uring-close-committed-in-drain"
 repo   = "https://github.com/brayniac/ringline"
 red_ref = "55ceb9a8f8bff9d443f10151257889e1b3e53ad5"
-tests  = "a_fin_batched_with_the_last_send_cqe_leaves_the_close_to_the_drain parked_send_defers_a_requested_close batch_recv_eof_then_send_cqe submit_next_queued_empty_registers_deferred_close_for_the_drain drain_conn_send_queue_registers_deferred_close_for_the_drain ctx_close_defers_behind_in_flight_send close_defers_while_chain_active close_waits_for_the_shutdown_cqe_before_freeing_the_slot bounded_send_owned_by_another_task_survives_its_connection_task_returning"
+tests  = "a_fin_batched_with_the_last_send_cqe_leaves_the_close_to_the_drain parked_send_defers_a_requested_close batch_recv_eof_then_send_cqe submit_next_queued_empty_registers_deferred_close_for_the_drain drain_conn_send_queue_registers_deferred_close_for_the_drain ctx_close_defers_behind_in_flight_send close_defers_while_chain_active close_waits_for_the_shutdown_cqe_before_freeing_the_slot bounded_send_owned_by_another_task_survives_its_connection_task_returning close_cancels_an_armed_poll"
 
 [[jobs]]
 name = "verify"
@@ -94,12 +94,12 @@ grep -q "^gate_backend=0" verify.log || { echo "FAIL gate_backend"; fail=1; }
 grep -q "^red_rc=[1-9]" verify.log || { echo "FAIL red: the tests passed on the unfixed code"; fail=1; }
 red=$(grep -oE "^red_summary=.*" verify.log)
 echo "$red"
-echo "$red" | grep -qE "4 passed; 5 failed" || { echo "FAIL red: expected 4 passed; 5 failed"; fail=1; }
-# Green: all nine pass.
+echo "$red" | grep -qE "5 passed; 5 failed" || { echo "FAIL red: expected 5 passed; 5 failed"; fail=1; }
+# Green: all ten pass.
 grep -q "^green_rc=0" verify.log || { echo "FAIL green"; fail=1; }
 green=$(grep -oE "^green_summary=.*" verify.log)
 echo "$green"
-echo "$green" | grep -qE "9 passed; 0 failed" || { echo "FAIL green: expected 9 passed; 0 failed"; fail=1; }
+echo "$green" | grep -qE "10 passed; 0 failed" || { echo "FAIL green: expected 10 passed; 0 failed"; fail=1; }
 for gate in gate_fmt gate_clippy_uring gate_clippy_mio gate_clippy_tls gate_doc gate_test_uring; do
   if ! grep -q "^${gate}=0" verify.log; then
     got=$(grep -oE "^${gate}=[0-9]+" verify.log | head -1)

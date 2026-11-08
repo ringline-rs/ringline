@@ -32,9 +32,10 @@ pub(crate) struct ConnSendState {
     ///
     /// io_uring: the `Close` SQE is submitted from `try_finalize_close`,
     /// driven from the event loop's end-of-iteration drain of
-    /// `pending_finalize_closes` (never synchronously inside the close
-    /// request or a completion handler, so the task gets its poll window —
-    /// #371); each send CQE registers the connection on that list again
+    /// `pending_finalize_closes` (never inside the close request or a send,
+    /// chain or `Shutdown` completion, so the task gets its poll window —
+    /// #371; the park install commits at once, see `try_finalize_close`);
+    /// each send CQE registers the connection on that list again
     /// until the serialized `submit_next_queued` cycle drains the queue and
     /// the in-flight slot. mio: `drain_pending_closes` retains the entry
     /// until `pending_sends` is empty, then runs executor cleanup and
