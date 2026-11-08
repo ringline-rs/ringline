@@ -1029,26 +1029,111 @@ fn encrypt_reports_a_dropped_queued_record() {
     );
 }
 
-// Same state, same hazard, through the close path — where it is worse: rustls
-// queues a close_notify into `sendable_tls` itself on TLS 1.2 traffic-key
-// exhaustion, so the record this arm refuses to swallow can be the very alert
-// the caller asked for.
+/// A handshaked server whose close_notify rustls has already queued into its
+/// output without encoding it: the state TLS 1.2 traffic-key exhaustion
+/// leaves behind, where `write_plaintext` calls `send_close_notify()` itself
+/// before returning `EncryptExhausted`. Reproduced here by asking
+/// `WriteTraffic::queue_close_notify` for the alert with no room, which
+/// queues it and reports the size it needs.
+fn server_with_queued_close_notify() -> (TlsConn, TlsConn) {
+    let (mut server, client) = handshaked_pair();
+    {
+        let conn = server.conn.as_unbuffered_mut().unwrap();
+        let (kind, incoming, _) = conn.split_mut();
+        let super::UnbufferedKind::Server(c) = kind else {
+            panic!("server side");
+        };
+        let status = super::UnbufferedEngine::process(c, incoming.pending());
+        let Ok(ringline_tls::unbuffered::ConnectionState::WriteTraffic(mut wt)) = status.state
+        else {
+            panic!("a handshaked server is in traffic state");
+        };
+        let mut none: [u8; 0] = [];
+        assert!(
+            matches!(
+                wt.queue_close_notify(&mut none),
+                Err(ringline_tls::unbuffered::EncryptError::InsufficientSize(_))
+            ),
+            "the alert is queued and reported as needing room"
+        );
+    }
+    (server, client)
+}
+
+/// The close path encodes a record rustls already queued instead of dropping
+/// it. On TLS 1.2 traffic-key exhaustion that record is the close_notify
+/// rustls queued itself, so the peer reads a clean close rather than a
+/// truncated stream, and `close_notify_sent` records what went out.
 #[test]
-fn close_notify_reports_a_dropped_queued_record() {
+fn close_notify_encodes_the_alert_rustls_already_queued() {
+    let (mut server, mut client) = server_with_queued_close_notify();
+
+    let mut out = Vec::new();
+    queue_close_notify(&mut server, &mut out).expect("the queued alert goes out");
+    assert!(
+        !out.is_empty() && out[0] == 21,
+        "the output holds the alert record, got {out:?}"
+    );
+    assert!(server.close_notify_sent, "the alert went out");
+
+    let mut accs = AccumulatorTable::new(2, 1024 * 1024);
+    let (outcome, _) = pump(&mut client, &out, &mut accs);
+    assert!(
+        matches!(outcome, DriveOutcome::Closed),
+        "the peer reads a clean close, got {outcome:?}"
+    );
+    assert!(client.peer_sent_close_notify);
+}
+
+/// A server closed before its handshake finished has no alert to queue; the
+/// handshake records rustls had queued go out ahead of the FIN rather than
+/// being dropped, and no alert is recorded as sent.
+#[test]
+fn close_notify_before_the_handshake_sends_the_queued_flight_and_no_alert() {
     let mut server = server_with_undriven_peer_flight();
 
     let mut out = Vec::new();
-    let err = queue_close_notify(&mut server, &mut out)
-        .expect_err("dropping a queued record is not a silent no-op");
-
+    queue_close_notify(&mut server, &mut out).expect("nothing to queue is not an error");
     assert!(
-        err.to_string().contains("queued TLS record was dropped"),
-        "the error must name what was lost, got: {err}"
+        !out.is_empty() && out[0] == 22,
+        "the queued handshake flight is encoded, got {out:?}"
     );
-    assert!(out.is_empty(), "nothing may be handed to the caller");
     assert!(
         !server.close_notify_sent,
         "no alert was sent, so the close deadline must not be armed"
+    );
+}
+
+/// A receive error leaves the alert rustls generated for it in the engine's
+/// output, so the peer learns why the connection ended instead of reading a
+/// bare FIN. rustls appends the alert to its output while reporting the
+/// error and hands it back only on the next call into the state machine, so
+/// the engine has to make that call before it returns the error.
+#[test]
+fn a_receive_error_puts_the_fatal_alert_in_the_output() {
+    let (mut server, mut client) = handshaked_pair();
+    let mut accs = AccumulatorTable::new_with_max(4, 64 * 1024, 1 << 20);
+
+    let mut record = vec![0u8; 4096];
+    let (_, used_ct) = encrypt_chunk(&mut client, b"hello", &mut record).expect("encrypt");
+    record.truncate(used_ct);
+    // Flip a byte of the tag: the server reports bad_record_mac.
+    let last = record.len() - 1;
+    record[last] ^= 0xff;
+
+    let (outcome, out) = pump(&mut server, &record, &mut accs);
+    assert!(
+        matches!(outcome, DriveOutcome::Error(_)),
+        "a corrupted record is a fatal error, got {outcome:?}"
+    );
+    assert!(
+        !out.is_empty() && out[0] == 21,
+        "the output holds the alert record (content type 21), got {out:?}"
+    );
+    let err = decrypt_at(&mut client, &out).expect_err("the client reads a fatal alert");
+    assert!(
+        err.contains("alert"),
+        "the client sees the alert, got: {err}"
     );
 }
 
