@@ -2819,8 +2819,15 @@ impl Driver {
                         cancels_to_retry.push(i);
                     }
                     holding_sends.push(i);
-                } else {
-                    let _ = self.ring.submit_close(i, super::ring::CloseLead::CancelAll);
+                } else if self
+                    .ring
+                    .submit_close(i, super::ring::CloseLead::CancelAll)
+                    .is_err()
+                {
+                    // A full SQ. The loop below submits the Close of a
+                    // connection on this list that holds no slab entry with
+                    // the same lead, and tries again on a refusal.
+                    holding_sends.push(i);
                 }
             }
         }

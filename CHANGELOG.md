@@ -908,6 +908,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a plain `Close` the ring refuses at worker exit is retried. The
+  exit path retried a refused cancel and a refused close of a connection
+  holding send-slab entries, but discarded the error for every other
+  connection's `Close`, so that connection never counted as closed and exit
+  waited out its whole 10 s bound before the ring's drop closed the socket.
+  Found by the send-path audit (`docs/journal/2026-11-send-path-audit.md`,
+  F8).
+
 - io_uring: a `send_parts` batch whose parts carry no bytes (through
   `build` or `submit_batch`; `submit_batch_await` already rejected it)
   queues nothing, as a `send` of an empty buffer does on a plaintext
