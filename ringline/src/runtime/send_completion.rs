@@ -24,27 +24,38 @@
 //! enqueue ─▶ waiting ─mark_submitted─▶ InFlight ─complete─▶ Done ─take_result─▶ gone
 //!              │                          │                       ▲
 //!              │ cancel ─▶ gone           │ cancel ─▶ Abandoned   │ complete
-//!              │                          │             └complete─▶ gone
+//!              │                          │             ├complete─▶ gone
+//!              │                          │             └set_owner─▶ InFlight
 //!              │ remove_connection        │ remove_connection     │
 //!              ▼                          ▼                       │
 //!           Aborted ◀───────────────── Aborted ───────────────────┘
 //!              └─ take_result ─▶ gone
 //! ```
 //!
-//! **A synthetic teardown abort is provisional.** `remove_connection` runs
-//! from [`Executor::remove_connection`], and on mio that has three callers,
-//! not one: `drain_pending_closes` (step 6b of the run loop, after the
-//! flush) *and* `poll_ready_tasks` (step 6, before it) for a connection task
-//! that returned `Poll::Ready` or panicked. So an awaited send owned by a
-//! task that outlives the connection can be aborted by teardown at step 6
-//! and then written to the socket in full by step 6a's flush, in the same
-//! iteration. Teardown therefore records `Aborted`, not `Done`, and
-//! [`complete`](SendCompletions::complete) overwrites it with the driver's
-//! result: a message that was fully delivered must never be reported to its
-//! caller as aborted. An `Aborted` that nothing overwrites still resolves
-//! the future ([`take_result`](SendCompletions::take_result) takes it), so
-//! a genuinely torn-down send does not hang. "First result wins" survives
-//! only between two *driver* results for one id.
+//! **A connection task's exit and its connection's release are separate
+//! steps.** When a
+//! connection task returns or panics, the backend's task-exit arm calls
+//! [`Executor::remove_connection_task`], which drops only the entries that
+//! task owned (`remove_task`); the connection is then closing, and the
+//! driver delivers or fails every queued send on it, waking the live owners
+//! through [`complete`](SendCompletions::complete), before the slot is
+//! released. `remove_connection` runs at the release
+//! ([`Executor::remove_connection`], from io_uring's `handle_close` and
+//! mio's `drain_pending_closes`) and aborts whatever is still outstanding.
+//!
+//! **A synthetic teardown abort is provisional.** `remove_connection`
+//! records `Aborted`, not `Done`, and `complete` overwrites it with the
+//! driver's result: a message that was fully delivered must never be
+//! reported to its caller as aborted. In the current run loops no driver
+//! result reaches `complete` after the release: mio finalizes a close only
+//! once `pending_sends` is empty, io_uring commits the Close only once the
+//! queue is empty and nothing is in flight, and a CQE that outlives the slot
+//! goes to `forget`. The rule has no effect today and stays so that
+//! `remove_connection` is correct from any call site. An `Aborted` that
+//! nothing overwrites still
+//! resolves the future ([`take_result`](SendCompletions::take_result) takes
+//! it), so a genuinely torn-down send does not hang. "First result wins"
+//! survives only between two *driver* results for one id.
 //!
 //! Every entry records the task id that owns it. The owner is refreshed on
 //! each poll of its future (`set_owner`), and the `Executor` wrappers call `wake_task` immediately on
@@ -90,11 +101,13 @@ enum Completion {
     /// Teardown recorded this before the driver reported. Provisional: a
     /// real driver result overwrites it (`complete`), and if none ever
     /// arrives `take_result` hands this error to the future. See the module
-    /// docs for why teardown can run before the flush that completes the
-    /// send.
+    /// docs for the provisional-abort rule.
     Aborted(io::Error),
-    /// The future was dropped while the operation was in flight. The driver
-    /// still owns the operation; its completion frees the slot.
+    /// The future was dropped while the operation was in flight, or the
+    /// connection task that owned it was removed (it returned, panicked, or
+    /// its connection was torn down) while it was in flight. The driver
+    /// still owns the operation; its completion frees the slot. A poll of
+    /// the future (`set_owner`) returns the entry to `InFlight`.
     Abandoned,
 }
 
@@ -284,10 +297,23 @@ impl SendCompletions {
     /// Called by the send futures on every poll after the first, so that a
     /// future moved between tasks (or polled from a different task than the
     /// one that enqueued it) is woken where it now lives.
+    ///
+    /// A poll proves the future is alive, so an `Abandoned` entry becomes
+    /// `InFlight` again, whoever the owner was. [`remove_task`](Self::remove_task)
+    /// and [`remove_connection`](Self::remove_connection) abandon every
+    /// in-flight entry the dead connection task owned, and cannot tell a
+    /// future that died with the task from one the task had handed to
+    /// another task that had not yet polled it. A completion on an
+    /// `Abandoned` entry frees it and wakes nobody, so a live future whose
+    /// entry stayed `Abandoned` would never resolve. A dropped future is
+    /// never polled again, so `cancel`'s `Abandoned` is not revived.
     pub(crate) fn set_owner(&mut self, id: SendId, task_id: u32) {
         let Some(e) = self.entry_mut(id) else {
             return;
         };
+        if matches!(e.state, Completion::Abandoned) {
+            e.state = Completion::InFlight;
+        }
         let old = std::mem::replace(&mut e.task_id, task_id);
         if old != task_id {
             if is_connection_task(old) {
@@ -357,11 +383,9 @@ impl SendCompletions {
     /// Deliver the driver's completion of `id` — the authoritative result.
     ///
     /// `InFlight` becomes `Done(result)` and the owner's task id is returned
-    /// for waking. `Aborted` does the same: a teardown's synthetic abort is
-    /// provisional, and on mio it can be recorded *before* the flush that
-    /// puts the send's last byte on the socket (see the module docs), so a
-    /// fully delivered message would otherwise be reported to its caller as
-    /// `ConnectionAborted`. `Abandoned` entries are removed and `result` is
+    /// for waking. `Aborted` does the same: a teardown abort is provisional,
+    /// and a driver result that arrives after it is authoritative (module
+    /// docs). `Abandoned` entries are removed and `result` is
     /// discarded (the future is gone). An entry that is already `Done` keeps
     /// its result — between two *driver* results for one id the first wins.
     /// A waiting entry is not in flight and ignores it. An unknown id is
@@ -458,7 +482,8 @@ impl SendCompletions {
         }
     }
 
-    /// The connection at `conn_index` is being torn down (any generation).
+    /// The connection at `conn_index` is released (any generation): the
+    /// backend has closed its socket and is about to free the slot.
     ///
     /// Every waiting and in-flight entry for the connection becomes
     /// `Aborted(ConnectionAborted)` (waiting ones leave the FIFO) and its
@@ -467,14 +492,12 @@ impl SendCompletions {
     /// outlives this connection. Abandoned entries are removed. If the head
     /// was removed, the new head's task id is appended as well.
     ///
-    /// `Aborted` rather than `Done` because this abort is *provisional*: on
-    /// mio `Executor::remove_connection` is also called from
-    /// `poll_ready_tasks` (step 6), before the step-6a flush that can still
-    /// put the whole message on the socket, and the driver's `Ok(n)` must
-    /// win over the abort recorded here. See the module docs. (An entry
-    /// still waiting was never submitted, so no driver result can arrive for
-    /// it; it is recorded the same way so teardown has one rule, and
-    /// `take_result` resolves both alike.)
+    /// `Aborted` rather than `Done` because this abort is *provisional*: a
+    /// driver's `Ok(n)` that arrives after it wins over the abort recorded
+    /// here. See the module docs. (An entry still waiting was never
+    /// submitted, so no driver result can arrive for it; it is recorded the
+    /// same way so teardown has one rule, and `take_result` resolves both
+    /// alike.)
     ///
     /// Entries owned by *this* connection's own task (`task_id ==
     /// conn_index`) are the exception: `Executor::remove_connection` calls
@@ -483,7 +506,9 @@ impl SendCompletions {
     /// `take_result`. Parking a `Done` for it would leak one entry per
     /// closed connection. Those entries are instead treated as cancelled:
     /// waiting → removed, `InFlight` → `Abandoned` (the completion still
-    /// arrives and removes it), `Done` → removed.
+    /// arrives and removes it, unless a poll of a future the task had
+    /// handed to another task revives it first; see `set_owner`), `Done` →
+    /// removed.
     ///
     /// Visits only the entries indexed under `conn_index`, and allocates the
     /// returned `Vec` and a list of those entries; this is the teardown path.
@@ -545,7 +570,54 @@ impl SendCompletions {
                 self.free_index(index);
             }
         }
-        // Every waiting entry this touched is now aborted or freed.
+        self.prune_waiting(old_head, &mut wakes);
+        wakes
+    }
+
+    /// The connection task `conn_index` returned or panicked while its
+    /// connection is still being closed. Drop the entries that task owns,
+    /// whichever connection they target: a waiting one is removed, since
+    /// nothing can take its result; an in-flight one becomes `Abandoned`,
+    /// and the driver's completion frees it unless a poll of a future the
+    /// task had handed to another task revives it first (`set_owner`); a
+    /// resolved one is removed. Entries other tasks own on this connection
+    /// are left as they are: the close is deferred behind the queued sends,
+    /// so the driver delivers or fails each of them before
+    /// [`remove_connection`](Self::remove_connection) runs at the slot's
+    /// release. Returns the task to wake if the FIFO head changed.
+    ///
+    /// Called from [`Executor::remove_connection_task`], the task-exit arms
+    /// of both backends' `poll_ready_tasks`.
+    pub(crate) fn remove_task(&mut self, conn_index: u32) -> Vec<u32> {
+        let mut wakes = Vec::new();
+        let old_head = self.waiting.front().copied();
+        let candidates: Vec<u32> = self
+            .by_task
+            .get(conn_index as usize)
+            .cloned()
+            .unwrap_or_default();
+        for index in candidates {
+            let Some(e) = self.slots[index as usize].entry.as_mut() else {
+                continue;
+            };
+            if e.task_id != conn_index {
+                continue;
+            }
+            match e.state {
+                Completion::InFlight => e.state = Completion::Abandoned,
+                Completion::Abandoned => {}
+                Completion::Waiting { .. } | Completion::Done(_) | Completion::Aborted(_) => {
+                    self.free_index(index);
+                }
+            }
+        }
+        self.prune_waiting(old_head, &mut wakes);
+        wakes
+    }
+
+    /// Drop freed and no-longer-waiting ids from the FIFO, and if the head
+    /// changed from `old_head`, push the new head's task onto `wakes`.
+    fn prune_waiting(&mut self, old_head: Option<SendId>, wakes: &mut Vec<u32>) {
         let slots = &self.slots;
         self.waiting.retain(|&id| {
             slots[id.index as usize].generation == id.generation
@@ -557,13 +629,11 @@ impl SendCompletions {
                     })
                 )
         });
-
         if self.waiting.front().copied() != old_head
             && let Some(next) = self.head_task()
         {
             wakes.push(next);
         }
-        wakes
     }
 
     /// Fail every *waiting* entry for exactly (`conn_index`, `generation`)
@@ -921,10 +991,8 @@ mod tests {
 
     #[test]
     fn a_real_result_overwrites_a_teardown_abort_but_not_another_result() {
-        // The mio loop tears a connection down in `poll_ready_tasks`
-        // (step 6) and flushes its queued sends in step 6a, so a send that
-        // reached the socket is completed *after* teardown aborted it. The
-        // driver's result is the authoritative one.
+        // A teardown abort is provisional: a driver result that follows it
+        // is the authoritative one, whatever order a run loop produces.
         const A: u32 = 7;
         let mut q = SendCompletions::new();
         let id = q.enqueue(A, 0, 1, task(1));
@@ -1182,5 +1250,90 @@ mod tests {
         );
         assert_eq!(q.waiting_len(), 1);
         assert_eq!(q.submitted_len(), 0);
+    }
+
+    /// A poll proves the future is alive. An entry whose creator's
+    /// connection task returned before the future was first polled by the
+    /// task it was handed to is `Abandoned` by `remove_connection`; the new
+    /// owner's poll revives it, so the driver's completion wakes that owner
+    /// instead of freeing the entry and waking nobody.
+    #[test]
+    fn a_poll_from_a_live_task_revives_an_entry_its_dead_creator_abandoned() {
+        const N: u32 = 3;
+        let mut q = SendCompletions::new();
+        let id = q.register(N, N);
+        assert!(q.remove_connection(N).is_empty());
+        assert_eq!(
+            q.live(),
+            1,
+            "abandoned, not freed: the driver still owns the send"
+        );
+
+        // The task the future was handed to polls it.
+        q.set_owner(id, task(5));
+        assert!(q.take_result(id).is_none(), "no result yet: the task parks");
+        assert_eq!(
+            q.complete(id, Ok(5)),
+            Some(task(5)),
+            "the live owner is woken; `None` would park it forever"
+        );
+        assert_eq!(q.take_result(id).expect("resolved").expect("ok"), 5);
+        assert_eq!(q.live(), 0);
+    }
+
+    /// `remove_task` drops only what the dead connection task owned: its
+    /// waiting entry (promoting the next head), its in-flight entry (to
+    /// `Abandoned`) and its resolved entry. Entries on the same connection
+    /// that other tasks own are left as they are, in flight or waiting, for
+    /// the driver to settle.
+    #[test]
+    fn remove_task_leaves_entries_other_tasks_own_on_the_connection() {
+        const A: u32 = 3;
+        let mut q = SendCompletions::new();
+        // A's own entries.
+        let own_in_flight = q.enqueue(A, 0, 1, A);
+        q.mark_submitted(own_in_flight);
+        let own_done = q.enqueue(A, 0, 1, A);
+        q.mark_submitted(own_done);
+        assert_eq!(q.complete(own_done, Ok(1)), Some(A));
+        let own_waiting = q.enqueue(A, 0, 1, A);
+        // Entries on A owned by a standalone task and by connection task 4.
+        let other_in_flight = q.register(A, task(40));
+        let other_waiting = q.enqueue(A, 0, 1, 4);
+
+        let wakes = q.remove_task(A);
+        assert_eq!(wakes, vec![4], "the head moved from A's waiter to task 4's");
+        assert_eq!(q.waiting_len(), 1);
+        assert!(q.take_result(own_waiting).is_none());
+        assert!(q.take_result(own_done).is_none());
+        assert_eq!(q.complete(own_in_flight, Ok(1)), None, "abandoned: no wake");
+
+        assert!(q.take_result(other_in_flight).is_none(), "still in flight");
+        assert_eq!(
+            q.complete(other_in_flight, Ok(5)),
+            Some(task(40)),
+            "the driver's result reaches the live owner"
+        );
+        assert_eq!(q.take_result(other_in_flight).unwrap().unwrap(), 5);
+        assert!(q.turn(other_waiting, 1), "task 4's waiter is the head");
+        assert_eq!(q.live(), 1);
+    }
+
+    /// A connection task's own entries on *another* connection (a proxy's
+    /// bounded send to upstream) go with the task too.
+    #[test]
+    fn remove_task_drops_the_task_s_entries_on_other_connections() {
+        const C: u32 = 3;
+        const D: u32 = 7;
+        let mut q = SendCompletions::new();
+        let waiting = q.enqueue(D, 0, 1, C);
+        let in_flight = q.register(D, C);
+        let unrelated = q.enqueue(D, 0, 1, task(9));
+
+        assert_eq!(q.remove_task(C), vec![task(9)]);
+        assert!(q.take_result(waiting).is_none());
+        assert_eq!(q.complete(in_flight, Ok(1)), None);
+        assert!(q.turn(unrelated, 1));
+        assert_eq!(q.live(), 1);
     }
 }

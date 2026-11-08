@@ -754,6 +754,20 @@ impl Executor {
         panics
     }
 
+    /// The connection task `conn_index` returned or panicked. Drop the task
+    /// and the awaited sends it owned, and nothing else: the connection is
+    /// closing, not closed, and the sends other tasks await on it are
+    /// settled by the driver as the queue drains ahead of the close.
+    /// [`remove_connection`](Self::remove_connection) runs when the backend
+    /// releases the slot. Called from the task-exit arms of
+    /// `poll_ready_tasks` on both backends.
+    pub(crate) fn remove_connection_task(&mut self, conn_index: u32) {
+        self.task_slab.remove(conn_index);
+        for task_id in self.send_completions.remove_task(conn_index) {
+            let _ = self.wake_task(task_id);
+        }
+    }
+
     /// Reset all per-connection state for a connection that was closed.
     pub(crate) fn remove_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
@@ -761,11 +775,9 @@ impl Executor {
         // Awaited sends waiting on or in flight for this connection resolve
         // to ConnectionAborted; wake their owners (standalone or cross-index
         // tasks that outlive the connection) and the FIFO's new head. That
-        // abort is provisional: this method is also called from the mio
-        // loop's `poll_ready_tasks`, at step 6 *before* the step-6a flush
-        // that can still deliver the message, so a driver result arriving
-        // afterwards overwrites it (`send_completion`'s module docs). Runs
-        // after `task_slab.remove` on purpose: the connection's own task is
+        // abort is provisional: a driver result arriving afterwards
+        // overwrites it (`send_completion`'s module docs). Runs after
+        // `task_slab.remove` on purpose: the connection's own task is
         // already gone, and the queue drops its entries rather than parking
         // results nobody can take.
         for task_id in self.send_completions.remove_connection(conn_index) {

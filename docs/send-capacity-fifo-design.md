@@ -63,6 +63,7 @@ impl SendCapacityQueue {
     fn cancel(&mut self, id) -> Option<u32 /*next head's task*/>;
     fn head_ready(&self, free_slots) -> Option<u32 /*head's task*/>;
     fn remove_connection(&mut self, conn_index) -> impl Iterator<Item = u32 /*tasks to wake*/>;
+    fn remove_task(&mut self, conn_index) -> impl Iterator<Item = u32 /*next head's task*/>;
     fn fail_waiting(&mut self, conn_index, generation, kind: io::ErrorKind, msg) -> ...;
 }
 ```
@@ -94,20 +95,30 @@ Semantics:
   standalone task, or another connection's task) the entry becomes
   `Aborted(ConnectionAborted)` (moved to `submitted` if it was waiting) and
   the owner is returned for waking. `Aborted` and not `Done` because this
-  abort is **provisional** (series departure 4): `Executor::remove_connection`
-  is called from the mio loop's `poll_ready_tasks` as well as from
-  `drain_pending_closes` (step 6b), and the step-6 pass runs *before* the
-  step-6a flush that can still put the whole message on the socket. A driver result
-  arriving after the abort overwrites it, so a delivered message is never
-  reported as aborted. If the owner is the connection's
+  abort is **provisional** (series departure 4): a driver result arriving
+  after the abort overwrites it, so a delivered message is never reported
+  as aborted. `Executor::remove_connection` runs when the backend releases
+  the slot (io_uring `handle_close`, mio `drain_pending_closes`), after the
+  queued sends drained. If the owner is the connection's
   own task (`task_id == conn_index`) nobody is left to read a result:
-  `task_slab.remove` has already dropped that future outside a poll, so its
-  `Drop` → `cancel` could not run. Those entries are cancelled instead —
+  `task_slab.remove` has already dropped that future. Those entries are
+  cancelled instead:
   waiting removed, `InFlight` → `Abandoned` (the completion removes it),
   `Done` removed — so a closed connection never leaves a `Done` entry
   behind. Abandoned entries are removed. If the head was removed, the new
   head's task is also returned. Called from `Executor::remove_connection`
   after `task_slab.remove`.
+- `remove_task(conn)`: the connection task `conn` returned or panicked
+  while its connection is still closing. Only the entries that task owns
+  are touched, on whichever connection: waiting removed, `InFlight` →
+  `Abandoned` (the completion removes it, unless a poll of a future the
+  task had handed to another task revives it; see `set_owner`), `Done` or
+  `Aborted` removed. Entries other tasks own on the connection are left
+  for the driver, which delivers or fails each queued send before the
+  slot is released and `remove_connection` runs. If the head was removed,
+  the new head's task is returned. Called from
+  `Executor::remove_connection_task`, the task-exit arms of both backends'
+  `poll_ready_tasks`.
 - `fail_waiting(conn, generation, kind, msg)`: waiting entries for that
   connection generation become `Done(Err(kind))` — final, not the
   provisional `Aborted`, since they were never submitted and no driver
@@ -121,7 +132,8 @@ call `wake_task` on whatever the queue returns:
 `enqueue_send_capacity`, `set_bounded_send_owner`, `send_capacity_turn`,
 `mark_bounded_send_submitted`, `complete_bounded_send`,
 `take_bounded_send_result`, `cancel_bounded_send`, `wake_send_capacity`,
-`fail_waiting_bounded_sends`; `Executor::remove_connection` calls the
+`fail_waiting_bounded_sends`; `Executor::remove_connection_task` calls
+`remove_task` and wakes what it returns; `Executor::remove_connection` calls the
 queue's `remove_connection`.
 
 Dead code: nothing outside tests calls the wrappers until PRs 6–9, and the
