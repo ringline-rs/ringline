@@ -3185,18 +3185,18 @@ impl SendHalf {
     /// because it would follow the alert. On mio it is queued and sent ahead of
     /// the alert, which mio writes once the queue drains.
     ///
-    /// The connection's task is dropped when the close completes: on mio in
-    /// the same event-loop iteration, on io_uring when the Close CQE lands,
-    /// usually the next. Code after `close()` is guaranteed to run only until
+    /// The connection's task is dropped when the close completes, once the
+    /// queued sends have drained: on mio in that event-loop iteration, on
+    /// io_uring when the Close CQE lands, usually the next. Code after
+    /// `close()` is guaranteed to run only until
     /// its next `.await`; the task may be dropped there without another poll.
     /// A `close()` from another task or from `on_tick` against a task parked
     /// in an `.await` drops that task without another poll.
     ///
     /// Closing a socket with unread inbound bytes makes the kernel send an
     /// RST (Linux and macOS), and bytes of the drained sends still in the
-    /// socket's send buffer are discarded, so a peer that was still sending
-    /// can lose the tail of the response. Read to EOF before closing when
-    /// that matters.
+    /// socket's send buffer are discarded, so the peer can lose the tail of
+    /// the last message. Read to EOF before closing when that matters.
     ///
     /// Does nothing if the connection has already been released (its slot may
     /// now hold another connection), or when called outside the worker's
