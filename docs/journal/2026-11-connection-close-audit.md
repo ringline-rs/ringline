@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F13 (`fix/uring-send-error-closes`) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F13 (#795) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -450,7 +450,7 @@ reading of the mechanism is that the failed send takes the socket's pending
 error and its CQE reports it, and the receive that follows then reports a
 plain EOF; not traced in a run. #769 runs its write-error test on mio only.
 
-Disposition: fixed in `fix/uring-send-error-closes`, the first way: a
+Disposition: fixed in #795, the first way: a
 terminal send error closes the connection and records the error, in both
 arms, in `handle_send_msg_zc`'s and in `handle_tls_send`'s, through one
 `fail_connection_on_send_error` on the io_uring event loop that sets

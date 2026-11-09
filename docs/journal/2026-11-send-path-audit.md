@@ -1070,7 +1070,9 @@ with #781 and is left as written.
   does not close the connection (previous audit F13, unchanged at 6ea67e6c);
   a TLS chunk or TLS run error closes; mio closes on any write error. The
   same peer RST therefore gives a different connection lifecycle per send
-  kind and per backend (table in review C). F7 is one consequence.
+  kind and per backend (table in review C). F7 is one consequence. Fixed in #795 for
+  `Send`, zero-copy, coalesced and TLS chunk sends: a terminal error
+  closes the connection and records the error for the reader.
 - **L3** `handle_send_msg_zc` with `-EAGAIN` or `-ENOMEM` after
   `close_submitted` (`uring/event_loop.rs:3404`, `:3418`) settles the awaited
   send `WouldBlock` or `OutOfMemory`; the other three handlers settle the
