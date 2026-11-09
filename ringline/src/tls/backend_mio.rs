@@ -68,7 +68,12 @@ pub fn feed_tls_recv_mio(
                 }
             }
             unbuffered::DriveOutcome::Closed => TlsRecvResult::Closed,
-            unbuffered::DriveOutcome::Error(e) => TlsRecvResult::Error(e),
+            unbuffered::DriveOutcome::Error(e) => {
+                TlsRecvResult::Error(super::record_layer_error(e))
+            }
+            unbuffered::DriveOutcome::Overflow => {
+                TlsRecvResult::Error(crate::accumulator::recv_cap_exceeded())
+            }
         }
     }
     #[cfg(feature = "tls-buffered")]

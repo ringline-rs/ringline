@@ -331,6 +331,9 @@ pub(crate) enum DriveOutcome {
     Closed,
     /// Fatal: the connection must be torn down.
     Error(ringline_tls::Error),
+    /// A decrypted record ran past `recv_accumulator_max`. The connection
+    /// must be torn down; the reader is told `QuotaExceeded`.
+    Overflow,
 }
 
 /// Drive the unbuffered state machine until it blocks.
@@ -383,9 +386,7 @@ fn drive_records(
     if let Some(s) = sink.as_deref_mut()
         && !drain_pending_plaintext(tls_conn, s, conn_index)
     {
-        return DriveOutcome::Error(ringline_tls::Error::General(
-            "recv accumulator limit exceeded".into(),
-        ));
+        return DriveOutcome::Overflow;
     }
 
     let Some(conn) = tls_conn.conn.as_unbuffered_mut() else {
@@ -417,7 +418,7 @@ fn drive_records(
     if peer_closed {
         tls_conn.peer_sent_close_notify = true;
     }
-    if matches!(outcome, DriveOutcome::Error(_)) {
+    if matches!(outcome, DriveOutcome::Error(_) | DriveOutcome::Overflow) {
         return outcome;
     }
     if was_handshaking && !tls_conn.conn.is_handshaking() {
@@ -588,12 +589,7 @@ fn drive_inner<C: UnbufferedEngine>(
             return (DriveOutcome::Error(e), peer_closed);
         }
         if sink_overflow {
-            return (
-                DriveOutcome::Error(ringline_tls::Error::General(
-                    "recv accumulator limit exceeded".into(),
-                )),
-                peer_closed,
-            );
+            return (DriveOutcome::Overflow, peer_closed);
         }
         if blocked {
             break;
@@ -629,7 +625,7 @@ fn fold_outcome(last: DriveOutcome, next: DriveOutcome) -> DriveOutcome {
             DriveOutcome::Ok => 0,
             DriveOutcome::Closed => 1,
             DriveOutcome::HandshakeJustCompleted => 2,
-            DriveOutcome::Error(_) => 3,
+            DriveOutcome::Error(_) | DriveOutcome::Overflow => 3,
         }
     }
     if rank(&next) >= rank(&last) {
@@ -678,8 +674,8 @@ pub(crate) fn feed(
                     // drive that frees nothing means the buffer is full of data
                     // rustls will not consume.
                     let outcome = drive(tls_conn, sink.as_deref_mut(), out, conn_index);
-                    if let DriveOutcome::Error(err) = outcome {
-                        return DriveOutcome::Error(err);
+                    if matches!(outcome, DriveOutcome::Error(_) | DriveOutcome::Overflow) {
+                        return outcome;
                     }
                     let (_, incoming, _, _) = tls_conn
                         .conn
@@ -699,7 +695,7 @@ pub(crate) fn feed(
             }
         }
         let outcome = drive(tls_conn, sink.as_deref_mut(), out, conn_index);
-        if matches!(outcome, DriveOutcome::Error(_)) {
+        if matches!(outcome, DriveOutcome::Error(_) | DriveOutcome::Overflow) {
             return outcome;
         }
         last = fold_outcome(last, outcome);

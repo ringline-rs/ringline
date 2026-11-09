@@ -1260,8 +1260,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             crate::tls::TlsRecvResult::Ok => {
                 self.executor.wake_recv(conn_index);
             }
-            crate::tls::TlsRecvResult::Error(e) => {
-                // Wake connect waiter if handshake hasn't completed yet.
+            crate::tls::TlsRecvResult::Error(err) => {
                 let established = self
                     .driver
                     .connections
@@ -1269,11 +1268,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .map(|c| c.established)
                     .unwrap_or(false);
                 if !established {
-                    let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, e);
+                    // No task reads yet: an outbound connect takes the
+                    // failure; a failed inbound handshake has nobody to tell.
+                    let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, err);
                     self.executor.wake_connect(conn_index, Err(err));
+                    self.driver.close_connection(conn_index);
+                } else {
+                    self.abort_connection(conn_index, err);
                 }
-                self.executor.wake_recv(conn_index);
-                self.driver.close_connection(conn_index);
             }
             crate::tls::TlsRecvResult::Closed => {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
@@ -3070,7 +3072,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Close `conn_index` because a send on it failed, and report `err` to a
+    /// Close `conn_index` because a send on it failed or the TLS engine
+    /// rejected a received record, and report `err` to a
     /// reader parked on `with_data_result`, as a failed socket read is
     /// reported (mio's `abort_connection` is the same step). `read` is set
     /// first, so the close reads as a failure and not as the peer's close.
@@ -6548,7 +6551,11 @@ mod tests {
             adopted,
         );
         assert!(
-            !matches!(outcome, crate::tls::unbuffered::DriveOutcome::Error(_)),
+            !matches!(
+                outcome,
+                crate::tls::unbuffered::DriveOutcome::Error(_)
+                    | crate::tls::unbuffered::DriveOutcome::Overflow
+            ),
             "{outcome:?}"
         );
         assert_eq!(el.driver.accumulators.data(adopted), b"hello");
