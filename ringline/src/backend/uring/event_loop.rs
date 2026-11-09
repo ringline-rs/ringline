@@ -558,8 +558,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.tick_count += 1;
 
             // Check close_notify deadlines: force-close a TLS connection whose
-            // close_notify was queued and whose sends have not drained by the
-            // deadline, so its Close has not been committed.
+            // close requested a close_notify and whose Close is still not
+            // committed (`close_pending`) when the deadline elapses.
             self.check_close_notify_deadlines();
 
             // Drain waker-based ready queue (from wakers fired during poll).

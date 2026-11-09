@@ -105,8 +105,8 @@ pub struct ConnectionState {
     pub outbound: bool,
     /// Whether the connection has been fully established (TCP+TLS handshake done).
     /// `conn::CLOSED` and `CONNECTIONS_ACTIVE` move at teardown only when this
-    /// is set, on both backends; a receive error before it is set fails the
-    /// connect waiter instead of a reader.
+    /// is set, on both backends; a receive error before it is set also fails
+    /// the connect waiter.
     pub established: bool,
     /// Peer address (set on accept or connect).
     pub peer_addr: Option<PeerAddr>,

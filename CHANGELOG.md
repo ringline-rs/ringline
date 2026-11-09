@@ -750,8 +750,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   teardown finalizes once queued sends have drained — a response sent after
   the peer's FIN is delivered in full — after which the connection task is
   dropped. Previously a mio task could keep running indefinitely after
-  EOF. `Lifecycle::Closing` is entered only through `close_connection` on
-  both backends. The deferral is unbounded on mio. Design: `docs/mio-close-lifecycle-design.md`.
+  EOF. `Lifecycle::Closing` is entered only through `close_connection` and
+  the `DriverCtx` close on both backends. The deferral is unbounded on mio. Design: `docs/mio-close-lifecycle-design.md`.
 
 - Internal: connection lifecycle state is now explicit fields on
   `ConnectionState` (`read`, `lifecycle` and `write`; a `recv_arm` field was

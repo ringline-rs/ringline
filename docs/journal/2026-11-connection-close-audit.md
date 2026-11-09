@@ -325,7 +325,7 @@ outside the event loop.
 
 ### F8 — worker exit leaves `CONNECTIONS_ACTIVE` inflated and abandons mio closing connections (invariants 15, 3). Traced.
 
-the `OpTag::Close` arm of io_uring's `handle_shutdown_cqe`
+The `OpTag::Close` arm of io_uring's `handle_shutdown_cqe`
 (`uring/driver.rs:2605-2610`), which `run_shutdown` runs for each CQE of its
 drain, releases
 TLS state, claims and the slot without decrementing the gauge. mio `run()`

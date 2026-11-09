@@ -1395,11 +1395,13 @@ impl Driver {
 
     /// Request the close of `conn_index`: mark it `Closing`, set
     /// `close_pending`, and leave its send queue to drain through
-    /// `submit_next_queued`; the send handlers register the connection for
-    /// the end-of-iteration drain (`defer_finalize_close`), which commits
-    /// the Close once nothing is in flight and the queue is empty. Park
-    /// state is released here, since a slot that is never reused would
-    /// hold a `ParkState` for the life of the process.
+    /// `submit_next_queued`. The send handlers register the connection for
+    /// the end-of-iteration drain (`defer_finalize_close`); with nothing
+    /// queued, this method registers it itself. The drain's
+    /// `try_finalize_close` commits the Close once no send, chain or
+    /// `Shutdown` is outstanding. Park state is released here, since a slot
+    /// that is never reused would hold a `ParkState` for the life of the
+    /// process.
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         if let Some(conn) = self.connections.get_mut(conn_index) {
             if conn.close_requested() {
@@ -1435,7 +1437,8 @@ impl Driver {
         // Nothing in-flight but queue has items — start the serialized drain:
         // submit only the queue head (submit_next_queued coalesces a safe
         // run) and let each CQE pull the next entry. Pushing the whole queue
-        // as parallel SQEs here would repeat "mistake (b)" above.
+        // as parallel SQEs here would let the kernel reorder them (Domain
+        // Invariant 2).
         if !state.queue.is_empty() {
             state.in_flight = true;
             // A `false` here means the head was parked (SQ still full):
