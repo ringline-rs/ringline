@@ -1595,9 +1595,12 @@ impl AsyncEventHandler for ResetThenReadOnce {
                 if got != 1000 {
                     return Err(format!("read {got} bytes"));
                 }
+                // The reset closes the connection, and the Close can release
+                // the slot before this task next looks, after which
+                // `peer_closed` is false: either observation is the end.
                 let mut closed = false;
                 for _ in 0..200 {
-                    if conn.peer_closed() {
+                    if conn.peer_closed() || !conn.is_alive() {
                         closed = true;
                         break;
                     }
