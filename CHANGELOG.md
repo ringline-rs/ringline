@@ -908,6 +908,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `shutdown_write` whose `shutdown(SHUT_WR)` fails at the socket is now
+  counted, in `connections{op="shutdown_failed"}`, on both backends. On
+  io_uring the Shutdown CQE's result was dropped at dispatch; on mio the
+  call's result was discarded. The `WriteHalf::Shutdown` doc said the FIN
+  "has been issued"; it says "requested", which is what the state records.
+  Audit finding F12 of `docs/journal/2026-11-connection-close-audit.md`.
+
 - io_uring, merged accept mode: a park install CQE for a slot's previous
   occupant no longer takes the current occupant's park. `handle_park_install`
   checked the generation after it had taken the slot's `park_in_flight`

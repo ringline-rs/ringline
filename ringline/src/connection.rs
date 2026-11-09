@@ -67,9 +67,12 @@ pub enum WriteHalf {
     /// or, on io_uring, while a send chain was active; the FIN goes out once
     /// they drain.
     ShutdownPending,
-    /// Our FIN has been issued (io_uring: Shutdown SQE submitted, or parked
-    /// on `pending_shutdown_retries` when the submission queue refused it;
-    /// mio: `shutdown(Write)` called). `send_backpressured` refuses with
+    /// Our FIN has been requested (io_uring: Shutdown SQE submitted, or
+    /// parked on `pending_shutdown_retries` when the submission queue refused
+    /// it; mio: `shutdown(Write)` called). A request the socket refuses,
+    /// `ENOTCONN` on a socket already closed, is counted in
+    /// `connections{op="shutdown_failed"}` and leaves this state as it is.
+    /// `send_backpressured` refuses with
     /// `BrokenPipe` in this state and in `ShutdownPending`; `send`,
     /// `send_nowait` and `send_parts` are accepted: after an accepted Shutdown
     /// they fail at the socket, and one pushed while the SQE is parked is

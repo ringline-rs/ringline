@@ -955,8 +955,10 @@ impl Driver {
             && matches!(cs.write, WriteHalf::ShutdownPending)
         {
             cs.write = WriteHalf::Shutdown;
-            if let Some(stream) = self.tcp_streams[idx].as_mut() {
-                let _ = stream.shutdown(std::net::Shutdown::Write);
+            if let Some(stream) = self.tcp_streams[idx].as_mut()
+                && stream.shutdown(std::net::Shutdown::Write).is_err()
+            {
+                crate::metrics::CONNECTIONS.increment(crate::metrics::conn::SHUTDOWN_FAILED);
             }
         }
 
