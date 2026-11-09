@@ -910,7 +910,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - io_uring: a send that fails (`EPIPE`, `ECONNRESET`, a resubmit the ring
   refused twice) closes the connection and reports the error to a reader
-  parked on `with_data_result`, as mio does. A plaintext send, a zero-copy
+  parked on `with_data_result`, as mio does for an established connection.
+  This includes a `send` made after `shutdown_write`, which fails at the
+  socket with `EPIPE` and before left the connection open on io_uring, its
+  reader still reading the peer's reply. A plaintext send, a zero-copy
   send and a plaintext coalesced run left the connection open after
   draining the queue behind the failed send, so a later send reached the
   peer after a gap; a TLS chunk, a TLS run and a chain closed it without

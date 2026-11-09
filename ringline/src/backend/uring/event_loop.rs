@@ -2921,8 +2921,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Fail the send `ud` names, through the completion path it would have
-    /// taken, and so with what that path does for its kind of send: a TLS send
-    /// closes the connection, and a zero-copy entry stays for its notifications.
+    /// taken, and so with what that path does: the connection closes and the
+    /// reader is handed the error (`abort_connection`); a zero-copy entry
+    /// stays for its notifications.
     fn fail_waiting_send(&mut self, ud: UserData, result: i32) {
         match ud.tag() {
             Some(OpTag::Send) => self.handle_send(ud, result),
