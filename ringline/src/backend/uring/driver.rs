@@ -1397,7 +1397,7 @@ impl Driver {
     /// `close_pending`, and leave its send queue to drain through
     /// `submit_next_queued`. The send handlers register the connection for
     /// the end-of-iteration drain (`defer_finalize_close`); with nothing
-    /// queued, this method registers it itself. The drain's
+    /// queued or in flight, this method registers it itself. The drain's
     /// `try_finalize_close` commits the Close once no send, chain or
     /// `Shutdown` is outstanding. Park state is released here, since a slot
     /// that is never reused would hold a `ParkState` for the life of the
