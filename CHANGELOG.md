@@ -912,6 +912,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring, TLS: the close the runtime makes after an encryption failure
+  (`DriverCtx::close`) queues no close_notify once the write half is shut
+  down, as the application's close does; the alert followed the FIN and
+  failed with `EPIPE`. Send-path audit L8
+  (`docs/journal/2026-11-send-path-audit.md`).
+
 - A `shutdown_write` whose `shutdown(SHUT_WR)` the socket refuses is now
   counted, in `connections{op="shutdown_failed"}`, on both backends. On
   io_uring the Shutdown CQE's result was dropped at dispatch; on mio the
