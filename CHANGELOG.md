@@ -912,11 +912,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring, TLS: the close the runtime makes after an encryption failure
+  (`DriverCtx::close`) queues no close_notify once a write shutdown has been
+  requested, as the application's close does. After a shutdown whose FIN had
+  been issued the alert followed the FIN and failed with `EPIPE`; after one
+  still waiting behind queued sends it went out ahead of the FIN, which the
+  application's close does not do. Send-path audit L8
+  (`docs/journal/2026-11-send-path-audit.md`).
+
 - io_uring: a zero-copy send refused with `EAGAIN` or `ENOMEM` after the
   connection's Close was submitted settles its awaiter `ECANCELED`, as the
   plain, coalesced and TLS send handlers settle a send they would otherwise
-  have retried; it settled `WouldBlock` or `OutOfMemory`. The case needs a forced close past an in-flight zero-copy
-  send, which no path takes today. Send-path audit L3
+  have retried; it settled `WouldBlock` or `OutOfMemory`. The case needs a
+  forced close past an in-flight zero-copy send, which no path takes today.
+  Send-path audit L3
   (`docs/journal/2026-11-send-path-audit.md`).
 
 - A `shutdown_write` whose `shutdown(SHUT_WR)` the socket refuses is now

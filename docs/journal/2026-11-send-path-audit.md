@@ -1100,7 +1100,10 @@ with #781 and is left as written.
 - **L8** io_uring `DriverCtx::close` (`handler.rs:1125-1148`) queues
   close_notify without the `write != Open` check `queue_tls_close_notify`
   applies. An encrypt failure after `shutdown_write` queues an alert onto a
-  shut-down write side, which fails `EPIPE`; no visible effect.
+  shut-down write side, which fails `EPIPE`; no visible effect. Fixed in
+  #806: the alert is queued only while the write half is open, as
+  `queue_tls_close_notify` does. The status line above is corrected once
+  the parallel fixes have merged.
 - **L9** On mio `SendCopyPool` memory is allocated and never written; the
   pool's count is the bounded-send admission budget only
   (`docs/mio-bounded-send-design.md`). Still true at 6ea67e6c.

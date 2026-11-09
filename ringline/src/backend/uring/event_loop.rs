@@ -8789,6 +8789,40 @@ mod tests {
         );
     }
 
+    /// `DriverCtx::close` after a write shutdown queues no close_notify: the
+    /// FIN has been issued, and `queue_tls_close_notify` applies the same
+    /// rule to the application's close. The deadline is still armed.
+    #[test]
+    fn ctx_close_after_a_write_shutdown_queues_no_close_notify() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let _peer = install_handshaked_tls_with_peer(&mut el, conn_index);
+        el.driver.connections.get_mut(conn_index).unwrap().write =
+            crate::connection::WriteHalf::Shutdown;
+
+        el.driver
+            .make_ctx()
+            .close(crate::handler::ConnId::new(conn_index, generation));
+
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.close_pending, "the close was requested");
+        assert!(!state.in_flight, "no alert was queued behind the FIN");
+        assert!(state.close_notify_pending.is_none());
+        assert!(
+            state.close_notify_deadline.is_some(),
+            "the drain is still bounded"
+        );
+        assert!(
+            !el.driver
+                .tls_table
+                .as_ref()
+                .unwrap()
+                .close_notify_sent(conn_index),
+            "no alert is recorded as sent"
+        );
+    }
+
     /// The application's close arms no deadline: a TLS drain takes as long as
     /// the peer takes, as a plaintext one does.
     #[test]
