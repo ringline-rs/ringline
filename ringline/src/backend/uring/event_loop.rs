@@ -7177,6 +7177,98 @@ mod tests {
         );
     }
 
+    /// A send CQE with a terminal error closes the connection and records
+    /// the error for its reader, as a receive error does: the connection is
+    /// going away because of the write, not because the peer closed.
+    #[test]
+    fn a_terminal_send_error_closes_the_connection_with_the_error() {
+        let mut el = make_test_loop();
+        let (conn_index, slot, ud) = stage_send(&mut el, b"hello");
+        let generation = el.driver.connections.generation(conn_index);
+
+        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
+
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "the slot stayed in use"
+        );
+        let conn = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot is live");
+        assert!(conn.close_requested(), "the connection stayed open");
+        assert_eq!(
+            conn.read,
+            ReadHalf::Error,
+            "the read half does not record the error"
+        );
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader was not told");
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+    }
+
+    /// The same for a coalesced plaintext run.
+    #[test]
+    fn a_terminal_coalesced_send_error_closes_the_connection_with_the_error() {
+        let mut el = make_test_loop();
+        let conn_index = stage_coalesced(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+
+        let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), -libc::EPIPE, 0);
+
+        assert!(!el.driver.send_slab.in_use(0), "the entry stayed in use");
+        let conn = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot is live");
+        assert!(conn.close_requested(), "the connection stayed open");
+        assert_eq!(
+            conn.read,
+            ReadHalf::Error,
+            "the read half does not record the error"
+        );
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader was not told");
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
+    }
+
+    /// A TLS chunk's terminal send error already closed the connection; it
+    /// records the error for the reader too.
+    #[test]
+    fn a_terminal_tls_send_error_records_the_read_error() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"ciphertext").unwrap();
+
+        let ud = UserData::encode(OpTag::TlsSend, conn_index, slot as u32);
+        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
+
+        let conn = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot is live");
+        assert!(conn.close_requested(), "the connection stayed open");
+        assert_eq!(
+            conn.read,
+            ReadHalf::Error,
+            "the read half does not record the error"
+        );
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader was not told");
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+    }
+
     #[test]
     fn handle_send_settles_the_awaited_send() {
         let mut el = make_test_loop();
