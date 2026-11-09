@@ -1836,8 +1836,8 @@ impl Driver {
         if let Some(id) = self.chain_table.cancel(conn_index) {
             self.fail_send_ids(vec![id], false);
         }
-        // The deadline has done its work whether or not the Close commits
-        // now: the queue is abandoned, and a `Shutdown` CQE commits the rest.
+        // Disarm whether or not the Close commits now: the queue is
+        // abandoned, and if a `Shutdown` holds the Close its CQE commits it.
         self.disarm_close_notify_deadline(conn_index);
         self.try_finalize_close(conn_index);
     }
@@ -2175,9 +2175,11 @@ impl Driver {
     ///
     /// The tail of each `release_queued_sends` call site, which passes
     /// whether the queue had entries: an unawaited entry holds a slot and
-    /// carries no id, so `ids` alone does not say. `ConnectionAborted` is the
-    /// failure every teardown reports: the send was accepted, never reached
-    /// the wire, and its connection is going away.
+    /// carries no id, so an empty `ids` does not mean no slot was released.
+    /// A queue of guard-only zero-copy entries sets the flag without
+    /// returning a pool slot. `ConnectionAborted` is the failure every
+    /// teardown reports: the send was accepted, never reached the wire, and
+    /// its connection is going away.
     fn fail_send_ids(&mut self, ids: Vec<SendId>, released_capacity: bool) {
         for id in ids {
             self.settled_sends.push_back((

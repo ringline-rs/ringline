@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F11 (`fix/uring-force-finalize-per-tick`) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F11 (#792) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -406,13 +406,14 @@ for the rest of the process.
 ### F11 — `check_close_notify_deadlines` re-runs `force_finalize_close` every tick while the finalize is blocked; `fail_send_ids` sets `capacity_released` unconditionally (invariant 18). Traced, low.
 
 `uring/event_loop.rs:4753-4790`, `uring/driver.rs:2020-2034`. One spurious
-`wake_send_capacity` per tick until the Shutdown or chain CQE lands.
+`wake_send_capacity` per tick until the Shutdown CQE lands (the force
+cancels a chain, so only a Shutdown holds the commit).
 
 Fix: skip the force while `shutdown_inflight` or a chain is active; clear
 the deadline in `force_finalize_close`; set `capacity_released` only when
 `ids` is non-empty.
 
-Disposition: fixed in `fix/uring-force-finalize-per-tick`, by the
+Disposition: fixed in #792, by the
 deadline clear alone: `force_finalize_close` disarms the deadline before
 it calls `try_finalize_close`, so it runs once per close, and
 `handle_shutdown`'s `defer_finalize_close` commits the Close when the
