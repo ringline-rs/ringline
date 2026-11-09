@@ -2793,10 +2793,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
+        // A terminal error: release the slot, drain the queue and fail the
+        // connection with the error.
         let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
         self.release_pool_slot(pool_slot);
         self.driver.drain_conn_send_queue(conn_index);
-        self.driver.defer_finalize_close(conn_index);
+        self.fail_connection_on_send_error(conn_index, Self::send_error(result));
 
         if let Some((id, _logical_len)) = settles {
             self.settle_send(id, Err(Self::send_error(result)));
@@ -3056,6 +3058,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Fail a connection on a terminal send error: record the error for the
+    /// reader, as a receive error is recorded, and request the close. The
+    /// connection is going away because of the write, not because the peer
+    /// closed, so a `with_data_result` reader sees the error instead of EOF.
+    /// The caller has drained the send queue, so `close_connection` registers
+    /// the connection for the end-of-iteration drain. Mirrors mio's
+    /// `fail_connection_on_send_error`.
+    fn fail_connection_on_send_error(&mut self, conn_index: u32, err: io::Error) {
+        let generation = self.driver.connections.generation(conn_index);
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.read = ReadHalf::Error;
+        }
+        self.executor.fail_recv(conn_index, generation, err);
+        self.driver.close_connection(conn_index);
+    }
+
     /// Return a copy-pool slot and note that send capacity came back.
     ///
     /// Every copy-pool release in this file goes through here. The
@@ -3200,18 +3218,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        // Real error — release everything and drain the connection's queue.
-        // A run with TLS ciphertext also closes the connection: its record
-        // stream has a hole (as `handle_tls_send` does for a chunk).
+        // A terminal error: release everything, drain the connection's queue
+        // and fail the connection with the error.
         let settles = self.driver.send_slab.take_sends(slab_idx);
-        let close = self.driver.send_slab.close_on_error(slab_idx);
         self.release_coalesced(slab_idx);
         self.driver.drain_conn_send_queue(conn_index);
-        self.driver.defer_finalize_close(conn_index);
-        if close {
-            self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
-        }
+        self.fail_connection_on_send_error(conn_index, Self::send_error(result));
         for (id, _logical_len) in settles {
             self.settle_send(id, Err(Self::send_error(result)));
         }
@@ -3852,11 +3864,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // On error, fail the connection so the owning task unblocks: drain
-        // the queued sibling chunks (their slots are released by the drain)
-        // and close.
+        // the queued sibling chunks (their slots are released by the drain),
+        // record the error for the reader and close.
         if result < 0 {
             self.driver.drain_conn_send_queue(conn_index);
-            self.driver.close_connection(conn_index);
+            self.fail_connection_on_send_error(conn_index, Self::send_error(result));
         }
     }
 
@@ -8045,7 +8057,7 @@ mod tests {
     }
 
     /// Two TLS ciphertext slots from one send go to the kernel as one
-    /// `sendmsg` whose entry closes the connection on a send error.
+    /// `sendmsg`.
     #[test]
     fn queue_built_sends_submits_two_tls_slots_as_one_sendmsg() {
         let mut el = make_test_loop_with_config(
@@ -8080,10 +8092,6 @@ mod tests {
         assert!(state.in_flight);
         let pushed = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
         assert_eq!(pushed.tag(), Some(OpTag::SendMsgCoalesced));
-        assert!(
-            el.driver.send_slab.close_on_error(pushed.payload() as u16),
-            "a TLS run closes the connection on a send error"
-        );
     }
 
     /// A multi-slot send that finds the SQ full parks its whole run, with
@@ -10520,7 +10528,7 @@ mod tests {
         let (idx, _) = el
             .driver
             .send_slab
-            .allocate_coalesced(conn_index, generation, &iovecs, &slots, 8192, [], false)
+            .allocate_coalesced(conn_index, generation, &iovecs, &slots, 8192, [])
             .unwrap();
         assert_eq!(idx, 0, "the send uses slab entry 0");
         el.driver.send_queues[conn_index as usize].in_flight = true;
@@ -14558,7 +14566,6 @@ mod tests {
                 &[s0, s1],
                 l0 + l1,
                 Some((id, 99, l0 + l1)),
-                false,
             )
             .expect("slab room");
         el.driver
@@ -15211,7 +15218,6 @@ mod tests {
                 // Neither chunk's length and not the run's 5 wire bytes: the
                 // carried number is the only one a handler cannot recompute.
                 Some((id, 99, l0 + l1)),
-                false,
             )
             .expect("slab room");
 
@@ -15279,7 +15285,6 @@ mod tests {
                 &[s0, s1],
                 l0 + l1,
                 Some((id, 99, l0 + l1)),
-                false,
             )
             .expect("slab room");
 
