@@ -1658,10 +1658,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Send => self.handle_send(ud, result),
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
             OpTag::Close => self.handle_close(ud),
-            OpTag::Shutdown => self.handle_shutdown(ud),
-            // The `Close` CQE releases the slot. A shutdown failure changes
-            // nothing: `ENOTCONN` when the socket is already in `TCP_CLOSE`
-            // (reset, failed connect, or both FINs exchanged).
+            OpTag::Shutdown => self.handle_shutdown(ud, result),
+            // The `Close` CQE releases the slot. A failure of this lead
+            // changes nothing and is not counted: `ENOTCONN` when the socket
+            // is already in `TCP_CLOSE` (reset, failed connect, or both FINs
+            // exchanged).
             OpTag::CloseShutdown => {}
             // Ignored likewise: the `Close` CQE releases the slot. The
             // cancelled requests' own CQEs arrive with `-ECANCELED`, usually
@@ -2545,18 +2546,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// A deferred `shutdown(SHUT_WR)` has completed.
     ///
-    /// Its only job is to release the slot: `Shutdown` names its socket as the
+    /// It releases the hold on the Close: `Shutdown` names its socket as the
     /// registered-file slot `Fixed(conn_index)`, so `try_finalize_close` holds
     /// the `Close` that frees the slot until this CQE lands. Without that, the
     /// `Close` could complete first, the next accept could register the slot,
     /// and the kernel could then run the FIN against *that* connection — a live
-    /// peer whose next send fails with `EPIPE` (#518).
+    /// peer whose next send fails with `EPIPE` (#518). A failed result is
+    /// counted (`connections{op="shutdown_failed"}`) and changes nothing else:
+    /// the socket refused the FIN because it is already closed, and the Close
+    /// goes ahead.
     ///
     /// The generation in the payload is checked for form's sake and for the
     /// counter: because the close now waits on this flag, a stale one should be
     /// unreachable, and `shutdown_stale` existing at all would mean the gate
     /// leaked somewhere.
-    fn handle_shutdown(&mut self, ud: UserData) {
+    fn handle_shutdown(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
         let idx = conn_index as usize;
         if idx >= self.driver.send_queues.len() {
@@ -2565,6 +2569,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.connections.generation(conn_index) != ud.payload() {
             crate::metrics::RING.increment(crate::metrics::ring::SHUTDOWN_STALE);
             return;
+        }
+        if result < 0 {
+            metrics::CONNECTIONS.increment(metrics::conn::SHUTDOWN_FAILED);
         }
         self.driver.send_queues[idx].shutdown_inflight = false;
         self.driver.defer_finalize_close(conn_index);
@@ -14162,6 +14169,52 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), 0, 0);
         el.finalize_pending_closes();
         assert!(el.driver.send_queues[conn_index as usize].close_submitted);
+    }
+
+    /// A `Shutdown` CQE that reports an error (here `ENOTCONN`, the socket
+    /// already closed) is counted under `shutdown_failed`, and still
+    /// releases the Close it held. A successful one is not counted.
+    #[test]
+    fn a_failed_shutdown_is_counted_and_releases_the_close() {
+        let mut el = make_test_loop();
+        let first = accept_connection(&mut el);
+        let second = accept_connection(&mut el);
+        for &c in &[first, second] {
+            let state = &mut el.driver.send_queues[c as usize];
+            state.close_pending = true;
+            state.shutdown_inflight = true;
+        }
+        let count = || {
+            metrics::CONNECTIONS
+                .value(metrics::conn::SHUTDOWN_FAILED)
+                .unwrap_or(0)
+        };
+
+        let before = count();
+        let generation = el.driver.connections.generation(first);
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::Shutdown, first, generation).raw(),
+            0,
+            0,
+        );
+        assert_eq!(count(), before, "a successful Shutdown was counted");
+
+        let generation = el.driver.connections.generation(second);
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::Shutdown, second, generation).raw(),
+            -libc::ENOTCONN,
+            0,
+        );
+        assert!(count() > before, "the failed Shutdown was not counted");
+        assert!(
+            !el.driver.send_queues[second as usize].shutdown_inflight,
+            "the failed Shutdown still holds the Close"
+        );
+        el.finalize_pending_closes();
+        assert!(
+            el.driver.send_queues[second as usize].close_submitted,
+            "the Close was never committed"
+        );
     }
 
     /// `shutdown_write` on a connection whose close is requested submits
