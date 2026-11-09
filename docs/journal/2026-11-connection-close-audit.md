@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768) and F10 (#791) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F13 (this PR) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -450,7 +450,22 @@ reading of the mechanism is that the failed send takes the socket's pending
 error and its CQE reports it, and the receive that follows then reports a
 plain EOF; not traced in a run. #769 runs its write-error test on mio only.
 
-Disposition: open.
+Disposition: fixed (this PR). Every send-failure arm on io_uring
+(`handle_send`, `handle_send_msg_zc`, `handle_send_msg_coalesced` for a
+plaintext or TLS run, `handle_tls_send`, `fire_chain_complete`, and the
+three retry give-up arms) runs `AsyncEventLoop::abort_connection`, the
+backend's counterpart of mio's: `read = Error`, `fail_recv` with the send's
+error, `close_connection`. A connection whose close is already requested is
+left alone, so a send the close's lead cancelled does not mark the read
+half. The slab's `close_on_error` flag went with the TLS/plaintext
+distinction. Pinned by six io_uring unit tests
+(`*_send_error_aborts_the_connection`,
+`a_send_error_after_a_requested_close_does_not_mark_the_read_as_an_error`)
+and by `write_error_teardown_is_reported_to_the_reader`, run on both
+backends from this change. Red-then-green on an anvil VM
+(`experiments/send-error-abort-verify.toml`): on the tests-only commit the
+five arm tests fail and the integration test fails in RED_N of 10 runs with
+`Ok(0)`; on the fix all pass, 10 of 10.
 
 ### F14 — docs and comments false or unresolvable at a2e28073. Confirmed by quote and grep.
 
