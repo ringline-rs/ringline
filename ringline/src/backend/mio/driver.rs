@@ -643,7 +643,9 @@ impl Driver {
     pub(crate) fn finish_close(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
-        let _ = self.flush_sends(conn_index);
+        // A write error here is why the sends still queued below did not
+        // go, and they report it.
+        let flush_error = self.flush_sends(conn_index).err();
 
         if let Some(ref mut stream) = self.tcp_streams[idx] {
             use std::io::Write;
@@ -683,11 +685,12 @@ impl Driver {
             .map(|c| c.established)
             .unwrap_or(false);
 
-        self.clear_pending_sends(idx, || {
-            io::Error::new(
+        self.clear_pending_sends(idx, || match &flush_error {
+            Some(e) => clone_io_error(e),
+            None => io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "connection closed before the send reached the socket",
-            )
+            ),
         });
         self.writable[idx] = false;
         if self.connect_deadlines[idx].take().is_some() {
@@ -728,9 +731,10 @@ impl Driver {
     /// `Clone` and one call may have to fail several ids — see
     /// [`clone_io_error`].
     ///
-    /// Callers pass `ConnectionAborted` at the teardown and slot-reuse
-    /// sites and the real write error at
-    /// `EventLoop::fail_connection_on_send_error`.
+    /// Callers pass the write error where there is one
+    /// (`EventLoop::fail_connection_on_send_error`, and `finish_close` when
+    /// its own flush fails) and `ConnectionAborted` at the slot-reuse sites
+    /// and when teardown finds bytes queued with no error.
     pub(crate) fn clear_pending_sends(&mut self, idx: usize, err: impl Fn() -> io::Error) {
         clear_pending_sends_into(
             &mut self.pending_sends[idx],
@@ -1980,6 +1984,52 @@ pub(crate) mod tests {
             err.to_string()
                 .contains("closed before the send reached the socket"),
             "unexpected message: {err}"
+        );
+    }
+
+    /// A write error in `finish_close`'s own flush is why the sends still
+    /// queued did not go, so they report it, as
+    /// `fail_connection_on_send_error` reports a flush error before the
+    /// close. The event loop reaches `finish_close` only once the queue has
+    /// drained or the stream is gone, so this arm is for a direct caller.
+    #[test]
+    fn finish_close_reports_its_flush_error_to_the_sends_left_queued() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+
+        // A socket whose write side is shut down refuses `writev` with
+        // `EPIPE` at once, and `send_bounded` writes nothing itself, so the
+        // flush in `finish_close` is the first and only write attempt.
+        driver.tcp_streams[idx]
+            .as_ref()
+            .unwrap()
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+        driver
+            .make_ctx()
+            .send_bounded(conn, b"never sent", id)
+            .expect("admitted");
+        assert!(
+            !driver.pending_sends[idx].is_empty(),
+            "test premise: the send is queued"
+        );
+
+        driver.close_connection(conn_index);
+        driver.finish_close(conn_index);
+
+        assert!(driver.pending_sends[idx].is_empty());
+        let completions = take_completions(&mut driver);
+        assert_eq!(completions.len(), 1, "the queued send was told");
+        assert_eq!(completions[0].0, id);
+        let err = completions[0].1.as_ref().expect_err("the send never went");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::BrokenPipe,
+            "unexpected error: {err}"
         );
     }
 

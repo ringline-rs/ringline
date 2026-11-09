@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** closed — 14 findings recorded, every one fixed: F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (#798); the design limitations L1 to L7 stand, checked against fdbb101a
+- **Status:** closed — 14 findings recorded, every one fixed: F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (#798); the design limitations L1 to L6 stand, L2 and L3 stated on `SendHalf::close` by #803, and L7 was changed in #807; checked against 5b92399a
 - **Span:** 2026-11-07 → 2026-11-08 · tree a2e28073 (`main`) · PRs: F2 and F3 #767, F9 #768, F6 #769, F1 #771, F4 and F5 #774, F7 #776, F8 #779, F10 #791, F11 #792, F12 #793, F13 #794, F14 #798
 
 ## Goal
@@ -605,11 +605,12 @@ and this entry's span line named a branch.
 - **L2** `close()` followed by any `.await` drops the task at the same
   iteration's finalize: code after `close()` runs only to its next await
   (mio run: `ran_after=0 dropped=1`; io_uring same shape). Matches the Drop
-  contract; `SendHalf::close` does not say so. A `close()` from another task
-  or `on_tick` against a parked task gives it no poll at all.
+  contract; stated on `SendHalf::close` since #803. A `close()` from another
+  task or `on_tick` against a parked task gives it no poll at all.
 - **L3** "Reach the wire" means the socket: closing with unread inbound bytes
   makes the kernel RST, and a peer that kept sending lost 1.07 MiB of an
-  8 MiB response in one run. TCP behaviour; a line in the `close` doc.
+  8 MiB response in one run. TCP behaviour; stated on `SendHalf::close`
+  since #803.
 - **L4** The close deferral has no time bound on either backend for
   `Connection::close`; `CLOSE_NOTIFY_TIMEOUT` (5 s) applies only to the
   io_uring `DriverCtx::close`, reachable from the TLS encrypt-failure paths.
@@ -621,8 +622,10 @@ and this entry's span line named a branch.
   (`SendPollOut` included, so the earlier 15-bit concern is moot). A
   `MSG_DONTWAIT` send never sits in the kernel, so no Send CQE is long-lived.
 - **L7** TLS record-layer errors resolve `Ok(0)` by documented choice
-  (`runtime/io.rs:2719-2722` at a2e28073; the `with_data_result` doc at
-  fdbb101a).
+  (`runtime/io.rs:2719-2722` at a2e28073). Changed in #807 on the owner's
+  decision: a record the engine cannot process is `Err(InvalidData)` to
+  `with_data_result`, and a TLS overflow `Err(QuotaExceeded)`, on both
+  backends.
 
 ## Seeds from the stale pass (f19c31e8), re-established or dropped
 
@@ -668,7 +671,7 @@ and this entry's span line named a branch.
   clean under the mio cfg and `--all-features`).
 - `run_shutdown`'s CQE drain has no `ParkInstall` arm, so an install CQE
   drained at worker exit leaves its fd open (found by the review of #791,
-  recorded under F10); open at fdbb101a, issue #800.
+  recorded under F10); open at 5b92399a, issue #800.
 
 ## Reproductions
 

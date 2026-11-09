@@ -1975,8 +1975,8 @@ impl Driver {
     /// the peer can tell the close from a truncation. A close the backend makes
     /// after a receive error, a reset or a failed send CQE goes through
     /// [`close_connection`](Self::close_connection) and sends no alert; an
-    /// encryption failure closes through `DriverCtx::close`, which still queues
-    /// one.
+    /// encryption failure closes through `DriverCtx::close`, which queues one
+    /// while the write half is open.
     pub(crate) fn close_connection_graceful(&mut self, conn_index: u32) {
         if self
             .connections

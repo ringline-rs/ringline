@@ -257,6 +257,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `with_data_result` reports a TLS record the engine cannot process (a bad
+  record, a failed decrypt) as `Err(InvalidData)`, with rustls' error as the
+  source, and a TLS message that runs past `recv_accumulator_max` as
+  `Err(QuotaExceeded)`, as on a plaintext connection. Both resolved `Ok(0)`,
+  indistinguishable from the peer's close_notify. `with_data` and
+  `with_bytes` still resolve `0`. A TLS handshake that fails on an outbound
+  `connect` still reports `ConnectionReset`. Connection-close audit L7
+  (`docs/journal/2026-11-connection-close-audit.md`).
+
 - **Breaking:** `AcceptMode`, `ConfigBuilder::accept_mode`,
   `Runtime::set_worker_accepting`, `offer_for_park`,
   `AsyncEventHandler::on_adopt` and `ParkState` need the `unstable-accept`
@@ -911,6 +920,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the `timestamps` feature from `Cargo.toml`.
 
 ### Fixed
+
+- io_uring, TLS: the close the runtime makes after an encryption failure
+  (`DriverCtx::close`) queues no close_notify once a write shutdown has been
+  requested, as the application's close does. After a shutdown whose FIN had
+  been issued the alert followed the FIN and failed with `EPIPE`; after one
+  still waiting behind queued sends it went out ahead of the FIN, which the
+  application's close does not do. Send-path audit L8
+  (`docs/journal/2026-11-send-path-audit.md`).
+
+- io_uring: a zero-copy send refused with `EAGAIN` or `ENOMEM` after the
+  connection's Close was submitted settles its awaiter `ECANCELED`, as the
+  plain, coalesced and TLS send handlers settle a send they would otherwise
+  have retried; it settled `WouldBlock` or `OutOfMemory`. The case needs a
+  forced close past an in-flight zero-copy send, which no path takes today.
+  Send-path audit L3
+  (`docs/journal/2026-11-send-path-audit.md`).
 
 - A `shutdown_write` whose `shutdown(SHUT_WR)` the socket refuses is now
   counted, in `connections{op="shutdown_failed"}`, on both backends. On

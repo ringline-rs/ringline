@@ -892,6 +892,11 @@ impl TlsTable {
     }
 }
 
+/// The error a reader sees for a record the TLS engine could not process.
+pub(crate) fn record_layer_error(e: ringline_tls::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
 /// Result of feeding ciphertext into a TLS connection.
 pub enum TlsRecvResult {
     /// Data processed successfully.
@@ -901,9 +906,16 @@ pub enum TlsRecvResult {
     /// carried the peer's close_notify; the caller then handles the close as
     /// it handles [`Closed`](Self::Closed), after the completion.
     HandshakeJustCompleted { peer_closed: bool },
-    /// TLS error occurred.
-    #[allow(dead_code)] // variant matched; inner value reserved for future error reporting
-    Error(ringline_tls::Error),
+    /// The connection cannot go on: a record the engine could not process
+    /// (`InvalidData`, with rustls' error as the source), a decrypted record
+    /// that ran past `recv_accumulator_max` (`QuotaExceeded`), the buffered
+    /// engine's `read_tls` refusing ciphertext (its `io::Error`), or no
+    /// send-pool slot for the engine's output (`Other`). The backend closes
+    /// the connection and reports the error to a reader on
+    /// `with_data_result`; before the connection is established, an outbound
+    /// connect waiter gets it wrapped in `ConnectionReset`, and a failed
+    /// inbound handshake has no task to tell.
+    Error(io::Error),
     /// Peer sent close_notify or connection is cleanly closed.
     Closed,
 }

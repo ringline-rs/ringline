@@ -136,6 +136,7 @@ pub(crate) fn decrypt_at(to: &mut TlsConn, ciphertext: &[u8]) -> Result<Vec<u8>,
     let mut out = Vec::new();
     match feed(to, Some(&mut accs), &mut out, ciphertext, 0) {
         DriveOutcome::Error(e) => Err(e.to_string()),
+        DriveOutcome::Overflow => Err("recv accumulator limit exceeded".into()),
         _ => Ok(accs.data(0).to_vec()),
     }
 }
@@ -333,7 +334,7 @@ fn drive_completes_a_handshake() {
 
 // A plaintext flood that overruns the accumulator's bound must fail the
 // connection, not silently drop bytes: the caller's contract for
-// `DriveOutcome::Error` is "tear this connection down". Mirrors
+// `DriveOutcome::Overflow` is "tear this connection down". Mirrors
 // `drain_tls_plaintext`'s `false` return in the buffered engine.
 #[test]
 fn plaintext_over_the_sink_bound_fails_the_connection() {
@@ -357,7 +358,7 @@ fn plaintext_over_the_sink_bound_fails_the_connection() {
     let mut out = Vec::new();
     let outcome = drive(&mut server, Some(&mut accs), &mut out, 0);
     assert!(
-        matches!(outcome, DriveOutcome::Error(_)),
+        matches!(outcome, DriveOutcome::Overflow),
         "over-bound plaintext must fail the connection, got {outcome:?}"
     );
 }
@@ -378,7 +379,7 @@ fn an_accumulator_overflow_leaves_the_close_notify_to_send() {
     let cipher = encrypt_all(&mut client, &plaintext);
     let (outcome, _) = pump(&mut server, &cipher, &mut accs);
     assert!(
-        matches!(outcome, DriveOutcome::Error(_)),
+        matches!(outcome, DriveOutcome::Overflow),
         "over-bound plaintext must fail the connection, got {outcome:?}"
     );
 
@@ -1129,7 +1130,7 @@ fn a_send_that_finds_a_bad_record_behind_an_overflow_does_not_re_enter_the_defra
     bad[last] ^= 0xff;
     cipher.extend_from_slice(&bad);
     let (outcome, _) = pump(&mut server, &cipher, &mut accs);
-    assert!(matches!(outcome, DriveOutcome::Error(_)), "the overflow");
+    assert!(matches!(outcome, DriveOutcome::Overflow), "the overflow");
 
     let mut dst = vec![0u8; 4096];
     let err =
@@ -1164,7 +1165,7 @@ fn a_close_that_finds_a_bad_record_behind_an_overflow_marks_the_connection_faile
     bad[last] ^= 0xff;
     cipher.extend_from_slice(&bad);
     let (outcome, _) = pump(&mut server, &cipher, &mut accs);
-    assert!(matches!(outcome, DriveOutcome::Error(_)), "the overflow");
+    assert!(matches!(outcome, DriveOutcome::Overflow), "the overflow");
 
     let mut out = Vec::new();
     queue_close_notify(&mut server, &mut out).expect_err("the bad record fails the close path");
