@@ -1,7 +1,7 @@
 # Half-close: a peer's FIN finishes the read half and nothing else
 
 Connection-close audit design limitation L1
-(`docs/journal/2026-11-connection-close-audit.md`). Decided 2026-11-09: no
+(`docs/journal/2026-11-connection-close-audit.md`), changed in #809. Decided 2026-11-09: no
 configuration knob, the accessor is `peer_closed()`, and the multishot
 `POLLOUT` poll stays armed for the connection's life.
 
