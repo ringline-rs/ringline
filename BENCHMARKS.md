@@ -5,8 +5,8 @@ tokio reference. Checked in so future changes have a baseline to beat (or to
 flag a regression against).
 
 Two runs are recorded here, on different rigs and different workloads, and one
-cell of the first was rerun in November 2026. Both are two-machine (client and server on separate physical hosts); neither is
-co-located.
+cell of the first was rerun in November 2026. Both are two-machine (client and
+server on separate physical hosts); neither is co-located.
 
 | | workload | rig | date / commit |
 |---|---|---|---|
@@ -15,10 +15,10 @@ co-located.
 
 ### Read this first
 
-**In the September grid, ringline was faster than the best tokio
-configuration in 13 of 16 cells, by 1.5–8.9%.** It was slower in the other
-three, by up to 10.3% (16 KiB, 64 connections). This file used to lead with
-27–71%. That larger number is real, but it is measured against tokio's *default* runtime, and an
+**In the September grid, ringline was faster than the best tokio configuration
+in 13 of 16 cells, by 1.5–8.9%.** It was slower in the other three, by up to
+10.3% (16 KiB, 64 connections). This file used to lead with 27–71%. That larger
+number is real, but it is measured against tokio's *default* runtime, and an
 earlier version of this file quoted it while implying the stronger claim. Both
 figures are in the echo section, labelled.
 
@@ -110,8 +110,8 @@ exists to catch.
 ### Headline: it depends entirely on which tokio you mean
 
 Both tables below are the September grid (ringline at `a685e16`; the tokio arms
-built from #406, `5c1037e9`, tokio 1.52.3). The one cell rerun in November, 256 B at 512 connections, no longer
-shows ringline ahead of the best tokio configuration;
+built from #406, tokio 1.52.3). The one cell rerun in November, 256 B at 512
+connections, no longer shows ringline ahead of the best tokio configuration;
 [Mechanism](#mechanism--512-connections-256-b) has that run.
 
 **Against the best of the five tokio configurations**, ringline leads in 13 of
@@ -200,12 +200,12 @@ receive in the same submission as the response it sends, so the receive finds
 the socket empty. The kernel arms a poll and completes the receive later from
 DEFER_TASKRUN task work (`__io_arm_poll_handler`, `io_queue_async`,
 `__io_run_local_work`; perf run `01a1bee6`). The multishot receive that #699
-replaced shows the same poll arm and task work in that profile. The same profile shows
-tokio-uring's reads completing inline, with no poll arm. The likely reason,
-not measured directly, is that tokio-uring submits its read one loop iteration
-later, when at saturation the next request has usually arrived. Offered a
-fixed rate below saturation, tokio-uring costs more per operation (open-loop
-run `01a1bef1`, 3 reps; every cell delivered its offered rate):
+replaced shows the same poll arm and task work in that profile. That profile
+also shows tokio-uring's reads completing inline, with no poll arm. The likely
+reason, not measured directly, is that tokio-uring submits its read one loop
+iteration later, when at saturation the next request has usually arrived.
+Offered a fixed rate below saturation, tokio-uring costs more per operation
+(open-loop run `01a1bef1`, 3 reps; every cell delivered its offered rate):
 
 | offered ops/s | uring-fwd µs-CPU/op | tokio-uring µs-CPU/op |
 |---:|---:|---:|
@@ -251,8 +251,9 @@ configuration.
 instead of reading until `EAGAIN`. The row before it, built at #756's parent,
 pays one more read per operation (3.01 syscalls) and 5.4% more CPU.
 
-**splice adds a syscall per operation and saves the user-space copy.** At
-256 B both splice arms are slower than their copy counterparts; in the September grid splice was fastest at 16 KiB.
+**splice adds a syscall per operation and saves the user-space copy.** At 256 B
+both splice arms are slower than their copy counterparts; in the September grid
+splice was fastest at 16 KiB.
 
 ### 16 KiB: where ringline lost in the September grid
 
