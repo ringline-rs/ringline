@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768) and F10 (#791) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F13 (`fix/uring-send-error-closes`) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -450,7 +450,20 @@ reading of the mechanism is that the failed send takes the socket's pending
 error and its CQE reports it, and the receive that follows then reports a
 plain EOF; not traced in a run. #769 runs its write-error test on mio only.
 
-Disposition: open.
+Disposition: fixed in `fix/uring-send-error-closes`, the first way: a
+terminal send error closes the connection and records the error, in both
+arms and in `handle_tls_send`'s, through one
+`fail_connection_on_send_error` on the io_uring event loop that sets
+`read = Error`, hands the error to `fail_recv` and requests the close, as
+mio's `abort_connection` does after a flush error. A `with_data` reader
+still sees EOF; a `with_data_result` reader sees the error. The
+`close_on_error` flag that marked a run with TLS ciphertext as the one
+kind whose error closed is removed: every terminal error closes. Tests:
+`a_terminal_send_error_closes_the_connection_with_the_error`,
+`a_terminal_coalesced_send_error_closes_the_connection_with_the_error`
+and `a_terminal_tls_send_error_records_the_read_error`, each a CQE with
+`ECONNRESET` or `EPIPE` injected into the handler. The #769 observation
+above was not re-run on a kernel.
 
 ### F14 — docs and comments false or unresolvable at a2e28073. Confirmed by quote and grep.
 
