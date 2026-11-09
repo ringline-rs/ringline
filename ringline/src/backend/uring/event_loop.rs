@@ -1260,8 +1260,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             crate::tls::TlsRecvResult::Ok => {
                 self.executor.wake_recv(conn_index);
             }
-            crate::tls::TlsRecvResult::Error(e) => {
-                // Wake connect waiter if handshake hasn't completed yet.
+            crate::tls::TlsRecvResult::Error(err) => {
                 let established = self
                     .driver
                     .connections
@@ -1269,11 +1268,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .map(|c| c.established)
                     .unwrap_or(false);
                 if !established {
-                    let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, e);
+                    // No task reads yet: an outbound connect takes the
+                    // failure; a failed inbound handshake has nobody to tell.
+                    let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, err);
                     self.executor.wake_connect(conn_index, Err(err));
+                    self.driver.close_connection(conn_index);
+                } else {
+                    self.abort_connection(conn_index, err);
                 }
-                self.executor.wake_recv(conn_index);
-                self.driver.close_connection(conn_index);
             }
             crate::tls::TlsRecvResult::Closed => {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {

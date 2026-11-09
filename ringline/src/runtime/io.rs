@@ -2754,8 +2754,8 @@ impl Connection {
     /// - `Err(e)` — the socket read failed with a non-`WouldBlock` error
     ///   (`ConnectionReset` after an RST, for example), or the runtime closed
     ///   the connection on its own account: a write to it failed (the write's
-    ///   error), a message on a plaintext connection ran past
-    ///   `recv_accumulator_max` (`QuotaExceeded`), or on io_uring a receive
+    ///   error), a message ran past `recv_accumulator_max`
+    ///   (`QuotaExceeded`), or on io_uring a receive
     ///   could not be armed. Buffered bytes are always delivered before the
     ///   error is surfaced.
     ///
@@ -2766,11 +2766,11 @@ impl Connection {
     /// empty input will see `Ok(n)` there and the recorded error only on the
     /// following call.
     ///
-    /// A TLS record-layer error (a bad record, a failed decrypt, and on a TLS
-    /// connection the `recv_accumulator_max` overflow, which the record layer
-    /// reports) is not reported this way: it still closes the connection
-    /// through the EOF path and resolves to `Ok(0)`, indistinguishable from a
-    /// clean close, exactly as with `with_data`.
+    /// A TLS record the engine cannot process (a bad record, a failed
+    /// decrypt) closes the connection and is reported as `InvalidData`, with
+    /// rustls' error as the source; a decrypted record that runs past
+    /// `recv_accumulator_max` is `QuotaExceeded`, as on a plaintext
+    /// connection. The peer's close_notify is a clean close, `Ok(0)`.
     ///
     /// `with_data` keeps returning `0` for both cases; nothing about it
     /// changes. Use this variant when a protocol handler must tell "the peer

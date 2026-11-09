@@ -191,7 +191,7 @@ pub(super) fn feed_tls_recv_buffered(
             Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
-                return TlsRecvResult::Error(ringline_tls::Error::General(e.to_string()));
+                return TlsRecvResult::Error(super::record_layer_error(e));
             }
         }
         // Drive the state machine after each chunk so rustls can
@@ -209,7 +209,7 @@ pub(super) fn feed_tls_recv_buffered(
                         out_sends,
                     );
                 }
-                return TlsRecvResult::Error(e);
+                return TlsRecvResult::Error(super::record_layer_error(e));
             }
         };
 
@@ -218,9 +218,7 @@ pub(super) fn feed_tls_recv_buffered(
         if state.plaintext_bytes_to_read() > 0
             && !drain_tls_plaintext(tls_conn, accumulators, conn_index)
         {
-            return TlsRecvResult::Error(ringline_tls::Error::General(
-                "recv accumulator limit exceeded".into(),
-            ));
+            return TlsRecvResult::Error(crate::accumulator::recv_cap_exceeded());
         }
     }
 
@@ -248,17 +246,15 @@ pub(super) fn feed_tls_recv_buffered(
     if state.plaintext_bytes_to_read() > 0
         && !drain_tls_plaintext(tls_conn, accumulators, conn_index)
     {
-        return TlsRecvResult::Error(ringline_tls::Error::General(
-            "recv accumulator limit exceeded".into(),
-        ));
+        return TlsRecvResult::Error(crate::accumulator::recv_cap_exceeded());
     }
 
     // Collect any TLS output (handshake messages, alerts, etc.).
     if tls_conn.conn.wants_write()
         && !take_tls_output_sends(tls_conn, send_copy_pool, conn_index, generation, out_sends)
     {
-        return TlsRecvResult::Error(ringline_tls::Error::General(
-            "send pool exhausted during TLS output flush".into(),
+        return TlsRecvResult::Error(io::Error::other(
+            "send pool exhausted during TLS output flush",
         ));
     }
 
@@ -544,7 +540,7 @@ pub(super) fn feed_tls_recv_mio_buffered(
     while !remaining.is_empty() {
         let mut cursor = io::Cursor::new(remaining);
         if let Err(e) = buffered_mut(tls_conn).read_tls(&mut cursor) {
-            return TlsRecvResult::Error(ringline_tls::Error::General(e.to_string()));
+            return TlsRecvResult::Error(e);
         }
         let consumed = cursor.position() as usize;
         if consumed == 0 {
@@ -562,7 +558,7 @@ pub(super) fn feed_tls_recv_mio_buffered(
                 if tls_conn.conn.wants_write() {
                     flush_tls_output_mio_inner(tls_conn, &mut tls_table.write_buf, pending);
                 }
-                return TlsRecvResult::Error(e);
+                return TlsRecvResult::Error(super::record_layer_error(e));
             }
         };
 
@@ -570,9 +566,7 @@ pub(super) fn feed_tls_recv_mio_buffered(
         if state.plaintext_bytes_to_read() > 0
             && !drain_tls_plaintext(tls_conn, accumulators, conn_index)
         {
-            return TlsRecvResult::Error(ringline_tls::Error::General(
-                "recv accumulator limit exceeded".into(),
-            ));
+            return TlsRecvResult::Error(crate::accumulator::recv_cap_exceeded());
         }
 
         // Queue any TLS output (handshake messages, alerts, etc.).

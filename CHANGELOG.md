@@ -257,6 +257,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `with_data_result` reports a TLS record the engine cannot process (a bad
+  record, a failed decrypt) as `Err(InvalidData)`, with rustls' error as the
+  source, and a TLS message that runs past `recv_accumulator_max` as
+  `Err(QuotaExceeded)`, as on a plaintext connection. Both resolved `Ok(0)`,
+  indistinguishable from the peer's close_notify. `with_data` and
+  `with_bytes` still resolve `0`. A TLS handshake that fails on an outbound
+  `connect` still reports `ConnectionReset`. Connection-close audit L7
+  (`docs/journal/2026-11-connection-close-audit.md`).
+
 - **Breaking:** `AcceptMode`, `ConfigBuilder::accept_mode`,
   `Runtime::set_worker_accepting`, `offer_for_park`,
   `AsyncEventHandler::on_adopt` and `ParkState` need the `unstable-accept`

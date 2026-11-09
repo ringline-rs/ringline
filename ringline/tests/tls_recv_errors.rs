@@ -13,7 +13,9 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, TlsConfig};
+use ringline::{
+    AsyncEventHandler, ConfigBuilder, Connection, ParseResult, RinglineBuilder, TlsConfig,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 
 /// What the handler's last `with_data_result` resolved with: `Ok(0)` or the
@@ -98,7 +100,12 @@ fn a_record_the_engine_cannot_decrypt_is_an_error_to_the_reader() {
         .max_connections(64)
         // One whole TLS record per slot, which the unbuffered engine needs.
         .send_pool(64, 16448)
-        .tls(TlsConfig::builder().cert(certs.clone(), key).build().unwrap())
+        .tls(
+            TlsConfig::builder()
+                .cert(certs.clone(), key)
+                .build()
+                .unwrap(),
+        )
         .build()
         .expect("valid config");
     let (shutdown, handles) = RinglineBuilder::new(config)
