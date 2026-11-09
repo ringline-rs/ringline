@@ -11573,7 +11573,10 @@ mod tests {
             .submit_park_install(conn_index, generation)
             .expect("submit_park_install failed");
         el.driver.park_in_flight[conn_index as usize] =
-            Some(crate::backend::uring::driver::ParkInFlight { target: 1, generation });
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation,
+            });
         // The install completes inline at submit, so its CQE is in the ring
         // before the exit drain starts.
         el.driver.ring.flush().unwrap();
