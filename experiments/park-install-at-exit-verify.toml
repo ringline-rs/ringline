@@ -5,8 +5,8 @@
 # are both checked here, in an ephemeral VM on the `validation` agent, never
 # by a login to a rig host (CLAUDE.md, "Verifying io_uring code").
 #
-# `red_ref` is the tests-only commit: `shutdown_closes_the_fd_of_an_install_it_drains`
-# on the unfixed drain. Step 1 runs it there and expects `1 failed` (the peer
+# `red_ref` is the head of `park-install-at-exit-red`: the test commits on the
+# unfixed drain. Step 1 runs the test there and expects `1 failed` (the peer
 # reads no EOF: `left: None, right: Some(0)`). Step 2 runs it at the branch
 # head and expects `0 failed`. Step 3 is the uring gate, as the other verify
 # specs run it. The test returns early on a kernel without `FixedFdInstall`
@@ -22,7 +22,7 @@ name = "ringline park-install-at-exit verify ({branch})"
 [params]
 branch = "park-install-at-exit"
 repo   = "https://github.com/brayniac/ringline"
-red_ref = "ba2919de271d6edc3d68e26b4bf14f240c0c2ae7"
+red_ref = "190a3861e00a5260cd18302f08ee9c8a1f59d092"
 tests  = "shutdown_closes_the_fd_of_an_install_it_drains"
 
 [[jobs]]
