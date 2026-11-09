@@ -919,6 +919,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reports none. Audit finding F11 of
   `docs/journal/2026-11-connection-close-audit.md`.
 
+- io_uring: a send that fails (`EPIPE`, `ECONNRESET`, a resubmit the ring
+  refused twice) closes the connection and reports the error to a reader
+  parked on `with_data_result`, as mio does for an established connection.
+  This includes a plaintext `send` made after `shutdown_write`, which fails
+  at the socket with `EPIPE` and before left the connection open on io_uring, its
+  reader still reading the peer's reply. A plaintext send, a zero-copy
+  send and a plaintext coalesced run left the connection open after
+  draining the queue behind the failed send, so a later send reached the
+  peer after a gap; a TLS chunk, a TLS run and a chain closed it without
+  recording why. Whichever of a send and a receive on a reset socket the
+  kernel runs first takes the socket's error and the other reports a plain
+  end of stream, so a reader whose connection's send took the error
+  resolved `Ok(0)`, documented as a clean peer close. Found by the
+  connection-close audit (`docs/journal/2026-11-connection-close-audit.md`,
+  F13).
 - io_uring, merged accept mode: a park install CQE for a slot's previous
   occupant no longer takes the current occupant's park. `handle_park_install`
   checked the generation after it had taken the slot's `park_in_flight`
