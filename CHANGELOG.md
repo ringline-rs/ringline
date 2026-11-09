@@ -914,8 +914,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - io_uring: a zero-copy send refused with `EAGAIN` or `ENOMEM` after the
   connection's Close was submitted settles its awaiter `ECANCELED`, as the
-  plain, coalesced and TLS send handlers do; it settled `WouldBlock` or
-  `OutOfMemory`. The case needs a forced close past an in-flight zero-copy
+  plain, coalesced and TLS send handlers settle a send they would otherwise
+  have retried; it settled `WouldBlock` or `OutOfMemory`. The case needs a forced close past an in-flight zero-copy
   send, which no path takes today. Send-path audit L3
   (`docs/journal/2026-11-send-path-audit.md`).
 

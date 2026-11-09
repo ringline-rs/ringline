@@ -3516,10 +3516,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         } else if self.close_submitted(conn_index)
             && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOMEM)
         {
-            // Backpressure, or a memlock refusal, after the Close was
-            // submitted: the send is not retried (the arms above skip it),
-            // so it settles as the plain, coalesced and TLS handlers settle a
-            // send the close cut short.
+            // Backpressure, or `ENOMEM` from a zero-copy send (a memlock
+            // refusal) or its drain, after the Close was submitted: the send
+            // is not retried (the arms above skip it), so it settles as the
+            // plain, coalesced and TLS handlers settle a send the close cut
+            // short.
             self.settle_slab_err(slab_idx, io::Error::from_raw_os_error(libc::ECANCELED));
         } else {
             self.settle_slab_err(slab_idx, Self::send_error(result));
@@ -11090,9 +11091,10 @@ mod tests {
             el.driver.send_slab.set_send_id(slab_idx, id, 100);
             el.driver.send_queues[conn_index as usize].in_flight = true;
 
-            // The close is forced past the in-flight send (the deadline
-            // path), which submits the Close.
-            el.driver.send_queues[conn_index as usize].close_pending = true;
+            // The close waits behind the in-flight send, and is then forced
+            // past it (the close_notify deadline path), which submits the
+            // Close.
+            el.driver.close_connection(conn_index);
             el.driver.force_finalize_close(conn_index);
             assert!(el.driver.send_queues[conn_index as usize].close_submitted);
 
