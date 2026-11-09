@@ -193,11 +193,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// [`drain_after_failure`](Self::drain_after_failure) panicked. The kernel
     /// ends the ring's operations and closes its sockets. Those operations can
     /// use the heap memory this event loop owns until they end, so the caller
-    /// leaks it. What other threads are waiting on is released here.
+    /// leaks it. What other threads are waiting on is released here, and the
+    /// fds that completions this loop never handled delivered are closed: an
+    /// accepted connection is an ordinary fd, which closing the ring leaves
+    /// open.
     ///
     /// # Safety
     /// The ring is dropped here, so the caller must leak this event loop.
     pub(crate) unsafe fn close_ring(&mut self) {
+        self.driver.close_fds_in_unhandled_completions();
         self.driver.release_shared();
         self.executor.wakes.deregister();
         // Safety: the caller's contract.

@@ -962,6 +962,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a worker that stops on an error or a panic, and whose exit drain
+  then panics, closes the connections its multishot accept delivered but it
+  never handled. Their fds are ordinary descriptors the kernel installed when
+  the accept completed, which closing the ring leaves open, so the peer saw
+  neither a reply nor a close. Seen as `Hung` in
+  `connections_arriving_as_a_worker_stops_do_not_hang`, 4 of 900 runs on
+  Linux 6.12, each hung connection's server side an open fd of the test
+  process (#780).
 - The channels that hand an accepted or parked connection to a worker are
   `std::sync::mpsc` channels. A worker that stopped drained its channel and
   dropped the receiver; a connection a peer queued between the two stayed in
