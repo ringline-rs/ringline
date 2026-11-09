@@ -168,9 +168,12 @@ cargo run --example echo_tls_server
 
 ## Benchmarks
 
-Two-machine ringline-vs-tokio cache-server numbers, with methodology and
-caveats, are in [BENCHMARKS.md](BENCHMARKS.md). They were measured in June
-2026 on ringline 0.1.3 and have not yet been re-run on the current release.
+Two-machine ringline-vs-tokio numbers, with methodology and caveats, are in
+[BENCHMARKS.md](BENCHMARKS.md). It holds two runs: a TCP echo comparison
+measured in September 2026 at commit `a685e16` (pre-0.7), and a segcache
+cache-server comparison measured in June 2026 on ringline 0.1.3. Neither run
+has been repeated on the current code; BENCHMARKS.md says which rows no longer
+match it.
 The benchmark tooling lives in `ringline-bench` (distributed load generator)
 and `ringline-benchmarks` (single-machine matrix), with experiment specs under
 `experiments/`.
