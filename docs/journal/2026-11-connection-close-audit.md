@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F12 (#793) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F12 (#793) and F13 (#794) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -461,7 +461,28 @@ reading of the mechanism is that the failed send takes the socket's pending
 error and its CQE reports it, and the receive that follows then reports a
 plain EOF; not traced in a run. #769 runs its write-error test on mio only.
 
-Disposition: open.
+Disposition: fixed (this PR). Every send-failure arm on io_uring
+(`handle_send`, `handle_send_msg_zc`, `handle_send_msg_coalesced` for a
+plaintext or TLS run, `handle_tls_send`, `fire_chain_complete`, and the
+three retry give-up arms) runs `AsyncEventLoop::abort_connection`, the
+backend's counterpart of mio's: `read = Error`, `fail_recv` with the send's
+error, `close_connection`. A connection whose close is already requested is
+left alone, so a send the close's lead cancelled does not mark the read
+half. The slab's `close_on_error` flag went with the TLS/plaintext
+distinction. Pinned by six io_uring unit tests
+(`*_send_error_aborts_the_connection`,
+`a_send_error_after_a_requested_close_does_not_mark_the_read_as_an_error`)
+and by `write_error_teardown_is_reported_to_the_reader`, run on both
+backends from this change. Red-then-green on an anvil VM
+(`experiments/send-error-abort-verify.toml`, Debian 13, kernel 6.12): on the
+tests-only commit the five arm tests fail; the integration test passed 10 of
+10 there, so the reader got an error in every run, which by the mechanism
+above is the receive taking the socket's error ahead of the send (not
+traced; #769's CI saw the other order in 3 of 6 jobs), so on io_uring the
+unit tests are the evidence. That run also failed two existing tests that
+encoded the old behaviour (`plaintext_run_error_does_not_close` and the
+mixed-operations CQE proptest, which armed a receive on the connection a
+failed send had closed); both were updated. On the fix all pass, 10 of 10.
 
 ### F14 — docs and comments false or unresolvable at a2e28073. Confirmed by quote and grep.
 

@@ -1021,8 +1021,6 @@ impl<'a> DriverCtx<'a> {
         }
         state.in_flight = true;
         let generation = self.connections.generation(conn_index);
-        // SAFETY: see the `tls_table` field.
-        let conn_is_tls = !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn_index) };
         let pushed = crate::backend::uring::driver::submit_coalesced_run(
             crate::backend::uring::driver::RunParts {
                 ring: self.ring,
@@ -1033,7 +1031,6 @@ impl<'a> DriverCtx<'a> {
             },
             conn_index,
             generation,
-            conn_is_tls,
             0,
         );
         if pushed.is_some() {
