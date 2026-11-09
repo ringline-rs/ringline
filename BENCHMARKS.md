@@ -16,23 +16,25 @@ co-located.
 ### Read this first
 
 **In the September grid, ringline was faster than the best tokio
-configuration in 13 of 16 cells, by up to 9%, and slower by up to 10% at 16
-KiB; not the 27–71% this file used to lead with.** That larger
+configuration in 13 of 16 cells, by up to 9%, and slower in the other three,
+by up to 10% (16 KiB, 64 connections); not the 27–71% this file used to lead
+with.** That larger
 number is real, but it is measured against tokio's *default* runtime, and an
 earlier version of this file quoted it while implying the stronger claim. Both
 figures are in the echo section, labelled.
 
 **A November rerun of one of those cells does not reproduce ringline's lead.**
 At 512 connections x 256 B, closed loop, ringline's default path (`uring-fwd`)
-did 585,635 ops/s against tokio-uring's 641,809, and used 21.21 µs of server
-CPU per operation against 20.85 for `tokio-pc` and 19.94 for tokio-uring.
-Below saturation the order reverses: at 200k operations per second offered,
+did 585,635 ops/s against tokio-uring's 641,809, and used 21.21 µs of server CPU
+per operation against 20.85 for `tokio-pc` and 19.94 for tokio-uring. Below
+saturation the order reverses: at 200k operations per second offered,
 tokio-uring costs 40.18 µs and `uring-fwd` 34.17.
 `ConfigBuilder::defer_recv_arm` (#814, off by default) cut ringline's
 closed-loop cost from 21.11 to 19.10 µs per operation in run `01a1c104`, which
 had no tokio-uring arm. An earlier variant of the option measured 19.34 against
-tokio-uring's 20.08 in one run. Below saturation the option costs up to 2%
-more. The other 15 cells have not been rerun. See [Mechanism](#mechanism--512-connections-256-b).
+tokio-uring's 20.08 in one run. Below saturation the option costs up to 2% more.
+The other 15 cells have not been rerun. See
+[Mechanism](#mechanism--512-connections-256-b).
 
 **Neither run measures a protocol server.** Echo is a byte pipe: no parsing, no
 response building, no application work. Segcache is the closer proxy and has
@@ -83,12 +85,12 @@ server one.
 | Load | closed loop, 20 s steady window after 5 s warmup |
 | Reps | 3 per cell in September, 4 in the November rerun; tables report the median |
 
-The server and client are different CPU generations. hv01's X710 sits on a
-PCIe 3.0 x4 link, about 31.5 Gb/s per direction before protocol overhead, so
-the client cannot reach 40G. Only the 16 KiB cells, at about 22 Gb/s per
-direction, come near it; whether it limited them was not measured. The September run's logs
-do not record the bond state, so whether all four of hv02's ports were up is
-not known.
+The server and client are different CPU generations. hv01's X710 sits on a PCIe
+3.0 x4 link, about 31.5 Gb/s per direction before protocol overhead, so the
+client cannot reach 40G. Only the 16 KiB cells, at about 22 Gb/s per direction,
+come near it; whether it limited them was not measured. The September run's logs
+do not record the bond state, so whether all four of hv02's ports were up is not
+known.
 
 ### Validity gates
 
@@ -107,10 +109,10 @@ exists to catch.
 
 ### Headline: it depends entirely on which tokio you mean
 
-Both tables below are the September grid (ringline at `a685e16`; the tokio arms from #406). The one cell rerun in
-November, 256 B at 512 connections, no longer shows ringline ahead of the best
-tokio configuration; [Mechanism](#mechanism--512-connections-256-b) has that
-run.
+Both tables below are the September grid (ringline at `a685e16`; the tokio arms
+from #406). The one cell rerun in November, 256 B at 512 connections, no longer
+shows ringline ahead of the best tokio configuration;
+[Mechanism](#mechanism--512-connections-256-b) has that run.
 
 **Against the best of the five tokio configurations**, ringline leads in 13 of
 16 cells, by roughly 0–10%:
@@ -212,7 +214,7 @@ run `01a1bef1`, 3 reps; every cell delivered its offered rate):
 **`defer_recv_arm` takes the poll path out at saturation.** With
 `ConfigBuilder::defer_recv_arm(true)` (#814) a parked reader's receive is armed
 after the worker's next wait. Two runs measured it, each with one binary,
-`52d6ad57` plus an unmerged patch, run with and without the flag. In run
+`52d6ad57` plus unmerged patches, run with and without the flag. In run
 `01a1c070` the patch deferred past every wait. #814 merged a second variant,
 which arms before a wait that would block; run `01a1c104` measured both
 variants at 19.10 µs/op in closed loop, against 21.11 without the flag. Run
@@ -251,7 +253,6 @@ counterparts; in the September grid splice was fastest at 16 KiB.
 
 This section is the September grid; the November rerun of the 256 B cell is in
 [Mechanism](#mechanism--512-connections-256-b).
-
 
 At 16 KiB and moderate concurrency a zero-copy tokio beats every ringline
 configuration — `tokio-pc-splice` 165,699 against ringline's best 148,659 at 64
@@ -307,7 +308,7 @@ loop and `forward` is `with_data` + `forward_recv_buf`; `direct` and
 connection receives into its accumulator and `forward_recv_buf` sends the
 accumulator under a guard, so a rerun of `--echo-mode forward` measures that
 path. The September `uring-fwd` figure (20.95 µs/op) measured the
-provided-buffer receive that #699 removed.
+provided-buffer receive that #699 replaced.
 
 Client: `bench-client --clients <n> --msg-size <bytes> --threads 16 --warmup 5
 --duration 20`.
