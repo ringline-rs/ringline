@@ -1703,9 +1703,11 @@ pub(crate) mod tests {
         // two slots and cannot fit in any plausible socket buffer, shrunk or
         // not. The drain below is single-threaded, reads only bytes it
         // already knows were written, and waits for the socket to become
-        // writable after a flush that wrote nothing, so the host's scheduling
-        // can only slow the drain, inside the 5 s and 30 s bounds below, and
-        // what a kernel does with `SO_SNDBUF` cannot make a read block.
+        // writable after a flush that wrote nothing. A read waits for the
+        // kernel to deliver bytes already written, bounded by `attach_conn`'s
+        // 5 s read timeout; a writability wait is bounded at 5 s, and the
+        // whole drain at 90 s. On Linux the drain takes about 20 s: each
+        // read of the small receive window waits about 600 ms.
         // Three earlier shapes failed on one or the other: a reader-thread
         // race that never drained 2 MiB, a 64 KiB payload that Linux
         // swallowed whole in the first flush, and a 10,000-flush budget that
@@ -1777,13 +1779,11 @@ pub(crate) mod tests {
 
         // Drain and flush alternately on this one thread. Each read asks for
         // exactly the bytes the driver has already reported writing, so it
-        // can never block on bytes that are not there. A flush that writes
+        // can never be short of bytes that were written. A flush that writes
         // nothing found the send buffer still full: the read opens the
-        // peer's 4 KiB window, and the window update, the segments it admits
-        // and their ACKs are processed off this thread, so the buffer frees
-        // later. The loop waits for `POLLOUT` rather than retrying at once;
-        // retried at once, about 3,000 of a run's 3,300 flushes wrote
-        // nothing.
+        // peer's small receive window, and the window update, the segments it
+        // admits and their ACKs are processed off this thread, so the buffer
+        // frees later. The loop waits for `POLLOUT` before flushing again.
         let fd = driver.tcp_streams[idx]
             .as_ref()
             .expect("attached stream")
@@ -1793,7 +1793,7 @@ pub(crate) mod tests {
         let mut buf = vec![0u8; 64 * 1024];
         let mut written_total = written as usize;
         let mut drained = 0usize;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
 
         loop {
             while drained < written_total {
@@ -1818,6 +1818,15 @@ pub(crate) mod tests {
                 }
                 break;
             }
+            assert_eq!(
+                driver.send_copy_pool.free_count(),
+                reserved_free,
+                "the permit is not released mid-message"
+            );
+            assert!(
+                driver.settled_sends.is_empty(),
+                "no completion before the last byte"
+            );
             if w == 0 {
                 assert!(
                     wait_writable(fd, std::time::Duration::from_secs(5)),
@@ -1826,7 +1835,7 @@ pub(crate) mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the message did not drain within 30 s"
+                "the message did not drain within 90 s"
             );
         }
         assert_eq!(
