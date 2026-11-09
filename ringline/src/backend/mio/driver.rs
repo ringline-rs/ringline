@@ -634,9 +634,9 @@ impl Driver {
     }
 
     /// Tear down a closed connection's driver-side state: best-effort
-    /// nonblocking flush of pending sends, TLS close_notify, socket
-    /// deregistration, buffer cleanup, and slot release. Called by the
-    /// event loop after `Executor::remove_connection`.
+    /// nonblocking flush of pending sends, TLS close_notify while the write
+    /// half is open, socket deregistration, buffer cleanup, and slot
+    /// release. Called by the event loop after `Executor::remove_connection`.
     ///
     /// The flush is a single nonblocking attempt: a blocking write here
     /// would let one zero-window peer stall the worker.
@@ -647,12 +647,22 @@ impl Driver {
         // go, and they report it.
         let flush_error = self.flush_sends(conn_index).err();
 
+        // No alert once a write shutdown has been requested: the FIN has been
+        // issued, or is ordered behind the queued sends, and the alert would
+        // follow it. `queue_tls_close_notify` and `DriverCtx::close` apply
+        // the rule on io_uring.
+        let alert_allowed = self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.write, WriteHalf::Open));
+
         if let Some(ref mut stream) = self.tcp_streams[idx] {
             use std::io::Write;
             // Send TLS close_notify if this is a TLS connection
             // (best-effort, nonblocking).
             if let Some(ref mut tls_table) = self.tls_table
                 && tls_table.has(conn_index)
+                && alert_allowed
             {
                 // close_notify generation is engine-specific: the buffered
                 // engine queues the alert on the rustls connection here (see
@@ -668,9 +678,11 @@ impl Driver {
                     buffered.send_close_notify();
                 }
                 crate::tls::flush_tls_output_mio_direct(tls_table, stream, conn_index);
-                tls_table.remove(conn_index);
             }
             let _ = stream.flush();
+        }
+        if let Some(ref mut tls_table) = self.tls_table {
+            tls_table.remove(conn_index);
         }
 
         // Deregister from poll and drop the TcpStream.
@@ -2031,6 +2043,36 @@ pub(crate) mod tests {
             io::ErrorKind::BrokenPipe,
             "unexpected error: {err}"
         );
+    }
+
+    /// A close after a write shutdown sends no close_notify: the FIN has been
+    /// issued, or is ordered behind the queued sends, and the alert would
+    /// follow it. io_uring applies the rule in `queue_tls_close_notify` and
+    /// `DriverCtx::close`. The write half is marked shut down without
+    /// shutting the socket, so an alert written here reaches the peer
+    /// instead of failing with `EPIPE`.
+    #[test]
+    fn finish_close_after_a_write_shutdown_writes_no_close_notify() {
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, mut client) = attach_conn(&mut driver);
+
+        let mut table = crate::tls::TlsTable::with_listener_configs(
+            config.max_connections,
+            None,
+            None,
+            Vec::new(),
+        );
+        table.insert_for_test(conn_index, handshaked_tls_conn());
+        driver.tls_table = Some(table);
+        driver.connections.get_mut(conn_index).unwrap().write = WriteHalf::Shutdown;
+
+        driver.close_connection(conn_index);
+        driver.finish_close(conn_index);
+
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).expect("read to the server's FIN");
+        assert_eq!(n, 0, "the peer read {n} bytes after the write shutdown");
     }
 
     /// The connect-time slot-reuse clear (`start_connect`) disposes of

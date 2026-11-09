@@ -956,7 +956,6 @@ fn server_close_sends_close_notify<H: AsyncEventHandler>() {
 #[cfg(has_io_uring)]
 struct TlsBigReplyThenReturn;
 
-#[cfg(has_io_uring)]
 const BIG_REPLY: usize = 8 << 20;
 
 #[cfg(has_io_uring)]
@@ -1071,10 +1070,8 @@ fn a_slow_reader_gets_the_whole_reply_before_close_notify() {
 
 /// Read one byte, queue an 8 MiB reply, shut the write side down while the
 /// reply is still queued, and return.
-#[cfg(has_io_uring)]
 struct TlsBigReplyShutdownThenReturn;
 
-#[cfg(has_io_uring)]
 impl AsyncEventHandler for TlsBigReplyShutdownThenReturn {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
@@ -1107,7 +1104,6 @@ impl AsyncEventHandler for TlsBigReplyShutdownThenReturn {
 /// Connect to `addr` with a 64 KiB receive buffer, send one byte, wait
 /// `delay`, then read until the server's close. Returns the plaintext and
 /// whether a close_notify arrived.
-#[cfg(has_io_uring)]
 fn read_reply_until_close(
     addr: &str,
     certs: &[rustls::pki_types::CertificateDer<'static>],
@@ -1164,7 +1160,6 @@ fn read_reply_until_close(
 /// A handler that shuts its write side down while sends are still queued and
 /// then returns sends no close_notify: the FIN is already ordered behind the
 /// queue, and an alert after it would never be read.
-#[cfg(has_io_uring)]
 #[test]
 fn no_close_notify_after_a_pending_write_shutdown() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());

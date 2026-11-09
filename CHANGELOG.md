@@ -921,6 +921,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- mio, TLS: `finish_close` sends no close_notify once a write shutdown has
+  been requested, as the io_uring close paths do. The alert was encrypted
+  and written to a socket whose write side was shut, where `EPIPE` discarded
+  it.
+
 - io_uring, TLS: the close the runtime makes after an encryption failure
   (`DriverCtx::close`) queues no close_notify once a write shutdown has been
   requested, as the application's close does. After a shutdown whose FIN had
