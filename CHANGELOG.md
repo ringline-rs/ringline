@@ -908,6 +908,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a terminal send error (a `Send`, coalesced send or TLS chunk CQE
+  with an errno other than `EAGAIN`) now closes the connection and records
+  the error for its reader, as a receive error and mio's flush error do.
+  Before, a plaintext send error drained the queue and left the connection
+  open until the hangup poll reported the socket's error, and a TLS chunk's
+  error closed the connection without recording it, so a `with_data_result`
+  reader saw EOF in both cases. `with_data` readers still see EOF. Audit
+  finding F13 of `docs/journal/2026-11-connection-close-audit.md`.
+
 - io_uring, merged accept mode: a park install CQE for a slot's previous
   occupant no longer takes the current occupant's park. `handle_park_install`
   checked the generation after it had taken the slot's `park_in_flight`
