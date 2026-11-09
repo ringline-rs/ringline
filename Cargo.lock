@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.7.0-alpha.43"
+version = "0.7.0-alpha.44"
 dependencies = [
  "bytes",
  "criterion",

@@ -2049,17 +2049,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         true
     }
 
-    /// The `FixedFdInstall` CQE: decide whether the park still makes sense.
-    ///
-    /// The connection was quiescent when the install was submitted, but it
-    /// stayed fully live across the round trip — data can have arrived, the
-    /// peer can have sent FIN, the handler can have queued a send, and the
-    /// slot can even have been recycled. So the gate is re-checked here, and
-    /// anything short of "still parkable" abandons the move.
-    ///
-    /// `result` is a real fd on success. Every abandon path must close it:
-    /// it is a second reference to the socket, and leaking it would keep the
-    /// peer from ever seeing a FIN.
     /// Give up on a draining park: clear the flag and put the recv back.
     ///
     /// The `ECANCELED` branch skips its re-arms while `park_drain` is set, so
@@ -2080,8 +2069,33 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.rearm_direct_after_park(conn_index);
     }
 
+    /// The `FixedFdInstall` CQE: decide whether the park still makes sense.
+    ///
+    /// The connection was quiescent when the install was submitted, but it
+    /// stayed fully live across the round trip — data can have arrived, the
+    /// peer can have sent FIN, the handler can have queued a send, and the
+    /// slot can even have been recycled. So the gate is re-checked here, and
+    /// anything short of "still parkable" abandons the move.
+    ///
+    /// `result` is a real fd on success. Every abandon path must close it:
+    /// it is a second reference to the socket, and leaking it would keep the
+    /// peer from ever seeing a FIN.
     fn handle_park_install(&mut self, ud: crate::completion::UserData, result: i32) {
         let conn_index = ud.conn_index();
+        let generation = ud.payload();
+        // The slot may have been recycled while the install was in flight.
+        // The payload is the generation at submit, checked before anything on
+        // the slot is touched (Domain Invariant 3): a park in flight, a drain
+        // or an armed poll found here belongs to the slot's current occupant,
+        // not to the connection this CQE answers.
+        if self.driver.connections.generation(conn_index) != generation {
+            metrics::PARK_ABANDONED.increment(metrics::park_abandon::SLOT_RECYCLED);
+            // A second reference to the previous occupant's socket.
+            if result >= 0 {
+                unsafe { libc::close(result) };
+            }
+            return;
+        }
         let Some(in_flight) = self.driver.park_in_flight[conn_index as usize].take() else {
             // No park outstanding: a stray or duplicated CQE. Still close the
             // fd, or the socket reference leaks.
@@ -2094,16 +2108,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         };
 
+        // An entry is set for the slot's current generation and cleared when
+        // the slot is released, so it is the one this CQE answers.
+        debug_assert_eq!(in_flight.generation, generation);
+
         // A failed install. Not an error: park is best-effort and policy can
-        // try again later.
+        // try again later. Re-arm the hangup poll and wake the reader.
         if result < 0 {
             metrics::PARK_ABANDONED.increment(metrics::park_abandon::INSTALL_FAILED);
-            // Re-arm the hangup poll and wake the reader, unless the slot now
-            // holds another connection, whose own paths arm its receive and
-            // poll.
-            if self.driver.connections.generation(conn_index) == ud.payload() {
-                self.rearm_direct_after_park(conn_index);
-            }
+            self.rearm_direct_after_park(conn_index);
             return;
         }
         // SAFETY: a non-negative `FixedFdInstall` result is a fresh fd owned
@@ -2113,20 +2126,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             unsafe { std::os::fd::OwnedFd::from_raw_fd(result) }
         };
 
-        // The slot may have been recycled while the install was in flight.
-        // Checked against the arm-time generation carried in the payload,
-        // like every other completion handler (Domain Invariant 3); the copy
-        // in `in_flight` is only there to carry the target.
-        if self.driver.connections.generation(conn_index) != ud.payload()
-            || ud.payload() != in_flight.generation
-        {
-            metrics::PARK_ABANDONED.increment(metrics::park_abandon::SLOT_RECYCLED);
-            // Clear without re-arming: the slot belongs to a different
-            // connection now, and that occupant armed its own recv at accept.
-            // Re-arming here would submit against the new generation.
-            self.driver.set_park_drain(conn_index, None);
-            return; // `fd` drops, closing this reference.
-        }
         // Quiesce can have broken across the round trip. Record *which* gate
         // closed: `park_started` minus `park_completed` is a large number under
         // load and on its own it cannot say why, which left the dominant cause
@@ -5685,6 +5684,8 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let stale = generation.wrapping_sub(1);
+        // Written by hand: `clear_conn_claims` leaves no entry for a
+        // previous occupant.
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 1,
@@ -5716,6 +5717,8 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let stale = generation.wrapping_sub(1);
+        // Written by hand: `clear_conn_claims` leaves no entry for a
+        // previous occupant.
         el.driver.park_in_flight[conn_index as usize] =
             Some(crate::backend::uring::driver::ParkInFlight {
                 target: 1,
@@ -5725,6 +5728,91 @@ mod tests {
         assert!(
             !poll_armed(&el, conn_index),
             "armed the new occupant's hangup poll"
+        );
+    }
+
+    /// An install CQE for a slot's previous occupant lands while the next
+    /// occupant has its own install in flight. The next occupant's park stays
+    /// in flight, and the stale fd is closed.
+    #[test]
+    fn a_stale_install_leaves_the_next_occupants_park_in_flight() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = generation.wrapping_sub(1);
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation,
+            });
+
+        let probe = FdProbe::new();
+        el.handle_park_install(park_install_ud(conn_index, stale), probe.installed);
+        assert!(probe.was_closed(), "the stale fd was kept");
+        assert_eq!(
+            el.driver.park_in_flight[conn_index as usize].map(|p| p.generation),
+            Some(generation),
+            "the stale install took the next occupant's park"
+        );
+        assert!(el.driver.park_ready.is_empty(), "and must not park");
+
+        // A failed stale install, the same.
+        el.handle_park_install(park_install_ud(conn_index, stale), -libc::ECANCELED);
+        assert_eq!(
+            el.driver.park_in_flight[conn_index as usize].map(|p| p.generation),
+            Some(generation),
+            "the stale failed install took the next occupant's park"
+        );
+        assert!(
+            !poll_armed(&el, conn_index),
+            "armed a poll while the next occupant's install is in flight"
+        );
+    }
+
+    /// An install CQE for a slot's previous occupant lands while the next
+    /// occupant's park is draining. The drain stays, and no poll is armed
+    /// behind the cancel the drain sent.
+    #[test]
+    fn a_stale_install_leaves_the_next_occupants_park_drain_alone() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let stale = generation.wrapping_sub(1);
+        el.driver.set_park_drain(conn_index, test_drain(generation));
+
+        let probe = FdProbe::new();
+        el.handle_park_install(park_install_ud(conn_index, stale), probe.installed);
+        assert!(probe.was_closed(), "the stale fd was kept");
+        assert_eq!(
+            el.driver.park_drain[conn_index as usize].map(|d| d.generation),
+            Some(generation),
+            "the stale install abandoned the next occupant's drain"
+        );
+        assert!(
+            !poll_armed(&el, conn_index),
+            "armed a poll behind the drain's cancel"
+        );
+    }
+
+    /// Releasing a slot clears the park in flight for its occupant, so the
+    /// next occupant can start a park of its own. `begin_park` refuses while
+    /// an entry is present, whatever generation it carries.
+    #[test]
+    fn a_recycled_slot_does_not_inherit_a_park_in_flight() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation,
+            });
+
+        recycle_connection(&mut el, conn_index);
+
+        assert!(
+            el.driver.park_in_flight[conn_index as usize].is_none(),
+            "the next occupant inherited a park in flight"
         );
     }
 

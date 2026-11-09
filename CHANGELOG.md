@@ -908,6 +908,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring, merged accept mode: a park install CQE for a slot's previous
+  occupant no longer takes the current occupant's park. `handle_park_install`
+  checked the generation after it had taken the slot's `park_in_flight`
+  entry and, with no entry, abandoned the slot's park drain, so a stale CQE
+  could end a park the next occupant had begun; it now checks the generation
+  first and touches nothing of a recycled slot but the fd it carries. A slot
+  release also clears its `park_in_flight` entry, which nothing cleared
+  before. Audit finding F10 of
+  `docs/journal/2026-11-connection-close-audit.md`.
+
 - TLS, unbuffered engine (the default): a receive error now sends the fatal
   alert rustls generated for it before the connection closes, on both
   backends. rustls queues the alert while reporting the error and hands it
