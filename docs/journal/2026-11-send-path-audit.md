@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
-- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; L2 (#794), L3 (#805), L5 (#792) and L10 (#797) closed by later PRs; the design limitations L1, L4 and L6 to L9 stand
-- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, F9, F12 and F14 (docs) #788, F10 #789, F6 and F11 #790, L5 #792, L2 #794, L10 #797
+- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; L2 (#794), L3 (#805), L5 (#792), L7 (#804), L8 (#806) and L10 (#797) closed by later PRs; the design limitations L1, L4, L6 and L9 stand
+- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, F9, F12 and F14 (docs) #788, F10 #789, F6 and F11 #790, L5 #792, L2 #794, L10 #797, L7 #804, L3 #805, L8 #806
 
 ## Goal
 
@@ -1096,14 +1096,21 @@ with #781 and is left as written.
   (`mio/driver.rs:633`); the still-queued awaited sends then fail
   `ConnectionAborted` from `clear_pending_sends`, where the same error one
   iteration earlier from `handle_writable` reports the real errno. Permits
-  and ids are released either way.
+  and ids are released either way. Fixed in #804: `finish_close` keeps the
+  flush's error and `clear_pending_sends` reports it. The review of #804
+  found that the event loop reaches `finish_close` only once the queue has
+  drained or the stream is gone (`drain_pending_closes`), and that a write
+  error before that is reported with its errno by
+  `fail_connection_on_send_error`, so no caller through the runtime saw the
+  discarded error. The change is that `finish_close` no longer discards a
+  result; at HEAD the only callers that reach it with sends queued on a
+  live stream are the driver's unit tests.
 - **L8** io_uring `DriverCtx::close` (`handler.rs:1125-1148`) queues
   close_notify without the `write != Open` check `queue_tls_close_notify`
   applies. An encrypt failure after `shutdown_write` queues an alert onto a
   shut-down write side, which fails `EPIPE`; no visible effect. Fixed in
   #806: the alert is queued only while the write half is open, as
-  `queue_tls_close_notify` does. The status line above is corrected once
-  the parallel fixes have merged.
+  `queue_tls_close_notify` does.
 - **L9** On mio `SendCopyPool` memory is allocated and never written; the
   pool's count is the bounded-send admission budget only
   (`docs/mio-bounded-send-design.md`). Still true at 6ea67e6c.
