@@ -8,7 +8,7 @@
 #
 # `red_ref` is the branch's tests-only commit, before the fix. Step 1 runs the
 # named tests there and expects three failures (the tests that pin the new
-# behaviour) and eight passes (the eight park tests already in the module).
+# behaviour) and eight passes (the eight pre-existing tests the list names).
 # Step 2 runs the same names at the branch head and expects eleven passes.
 # Step 3 is `experiments/uring-gate.toml`'s check list on the branch head,
 # with rustdoc added because the change edits doc comments behind
