@@ -54,8 +54,8 @@ pub(crate) struct ConnSendState {
     /// the Close SQE is committed.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_submitted: bool,
-    /// Deadline for close_notify completion. Set when close_notify is
-    /// queued by `DriverCtx::close`. If elapsed while `close_pending` is
+    /// Set by `DriverCtx::close` on a TLS connection, whether or not it
+    /// queued an alert. When the deadline passes with `close_pending` still
     /// true, the runtime force-closes the connection.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_notify_deadline: Option<std::time::Instant>,
@@ -1122,11 +1122,10 @@ impl<'a> DriverCtx<'a> {
                 return;
             }
             conn_state.lifecycle = crate::connection::Lifecycle::Closing;
-            // No alert follows a write shutdown, and none goes to a socket
-            // handed to another worker: the rule `Driver::queue_tls_close_notify`
-            // applies to the application's close.
-            let alert_allowed = !conn_state.socket_handed_off
-                && matches!(conn_state.write, crate::connection::WriteHalf::Open);
+            // No alert once a write shutdown has been requested: the rule
+            // `Driver::queue_tls_close_notify` applies to the application's
+            // close.
+            let alert_allowed = matches!(conn_state.write, crate::connection::WriteHalf::Open);
 
             // Graceful TLS shutdown: queue close_notify ciphertext through
             // the per-connection send queue so it serializes behind any

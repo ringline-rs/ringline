@@ -8781,8 +8781,7 @@ mod tests {
 
     /// `DriverCtx::close` after a write shutdown queues no close_notify: the
     /// FIN has been issued, and `queue_tls_close_notify` applies the same
-    /// rule to the application's close. The deadline still bounds the drain
-    /// of whatever the shutdown waited behind.
+    /// rule to the application's close. The deadline is still armed.
     #[test]
     fn ctx_close_after_a_write_shutdown_queues_no_close_notify() {
         let mut el = make_test_loop();
