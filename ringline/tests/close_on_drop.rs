@@ -49,6 +49,28 @@ fn listen() -> TcpListener {
 
 /// Reads until the connection ends, and panics if it does not within 5 s. A close
 /// with unread bytes in its receive buffer ends in a reset, not a FIN.
+/// Close `client` with a reset: `SO_LINGER` with a zero timeout turns the
+/// close into an RST. A FIN alone finishes the connection's read half and
+/// leaves its task in place (`docs/half-close-design.md`).
+fn reset(client: TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            client.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
+    drop(client);
+}
+
 fn expect_eof(stream: &mut TcpStream) {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -192,7 +214,7 @@ fn a_connection_the_handler_drops_closes_while_its_task_runs() {
 struct HoldsBackend;
 
 impl AsyncEventHandler for HoldsBackend {
-    /// Parks holding both connections. The client's close drops this task
+    /// Parks holding both connections. The client's reset drops this task
     /// outside any task poll, with the backend's halves in it.
     fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
@@ -218,7 +240,7 @@ fn a_task_dropped_at_teardown_closes_the_connections_it_held() {
     let client = TcpStream::connect(addr).unwrap();
     let (mut backend, _) = listener.accept().unwrap();
     let started = Instant::now();
-    drop(client);
+    reset(client);
     expect_eof(&mut backend);
     assert!(started.elapsed() < Duration::from_secs(5));
     runtime.shutdown();

@@ -356,16 +356,18 @@ the runtime submits a non-blocking one-byte `recv` with `MSG_PEEK`
 - A positive result means bytes are queued ahead of the end. They stay in
   the socket, and the connection goes on `Driver::hangup_rechecks`: after a
   receive has delivered bytes, and once nothing is buffered and nothing is
-  armed, `recheck_hangups` peeks again, so the end closes the connection
-  even if no read parks after the bytes are consumed.
+  armed, `recheck_hangups` peeks again, so the end is recorded even if no
+  read parks after the bytes are consumed.
 - A result of 0 or an error means the stream has ended with nothing queued.
   If no receive is in flight and nothing is buffered in the accumulator, the
-  connection closes as under a parked read. Otherwise it stays open and goes
-  on `hangup_rechecks`, so the end closes it once the buffered bytes are
-  read, whether or not a read parks. A peek that returns an error has
-  cleared the socket's pending error, so the error is kept in
-  `ConnectionState::hangup_error`, and the receive or recheck peek that
-  later finds the end reports it.
+  end is recorded on the read half as under a parked read: a FIN finishes
+  the read half (`peer_closed()` turns true, the connection stays open for
+  its task; `docs/half-close-design.md`), and an error also closes the
+  connection. Otherwise the connection goes on `hangup_rechecks`, so the end
+  is recorded once the buffered bytes are read, whether or not a read parks.
+  A peek that returns an error has cleared the socket's pending error, so
+  the error is kept in `ConnectionState::hangup_error`, and the receive or
+  recheck peek that later finds the end reports it.
 
 No receive is armed on the hangup path, so the accumulator does not take
 more than a parked read would. A poll or peek that cannot be pushed is
@@ -375,8 +377,9 @@ each wait for completions, submits it again while no park is pending. A
 peek goes on `hangup_rechecks`, and `recheck_hangups` submits it once
 nothing is buffered, armed or parking. Until the poll is armed, a FIN or
 reset is seen by the next receive to complete, which a read arms when it
-parks. TCP does not tell a half-close from a close, so a FIN closes a
-connection whose task only sends.
+parks. A FIN closes nothing: a connection whose task only sends stays open
+until the task ends, and a peer that closed fully answers the next send with
+a reset, which the send reports.
 
 Cost: one `POLL_ADD` SQE per connection, its completion at a hangup or at
 the close's lead (`shutdown` before 6.13 completes it with `POLLHUP`, the

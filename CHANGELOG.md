@@ -257,6 +257,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** a peer's FIN or close_notify finishes the read half and
+  closes nothing. Before, every read EOF requested a close, deferred behind
+  queued sends and one poll of the task, and the task was then dropped
+  wherever it was parked: a handler awaiting an upstream reply or a timer
+  when its client half-closed lost the request. Now the connection stays
+  open while the task holds it, the task may keep sending, and the
+  connection closes when the task returns, drops its last half or calls
+  `close`, or on a reset, a read or write error or a TLS failure. Readers
+  still resolve `0` at the end, after the buffered bytes; a task that loops
+  on `0` spins instead of being dropped. `is_alive` no longer turns false at
+  the peer's end; the new `Connection::peer_closed` and
+  `RecvHalf::peer_closed` report it, and a client reusing a connection
+  checks both. The client crates' `is_alive` (ringline-redis,
+  ringline-memcache, ringline-ping, ringline-http) include that check, so
+  their pools reconnect a slot whose server closed, as before. On TLS, a
+  send after the peer's close_notify is encrypted and sent, including one
+  whose encrypt deframes the alert; the task's return then sends this side's
+  close_notify and the FIN. Connection-close audit L1
+  (`docs/half-close-design.md`,
+  `docs/journal/2026-11-connection-close-audit.md`).
+
 - `with_data_result` reports a TLS record the engine cannot process (a bad
   record, a failed decrypt) as `Err(InvalidData)`, with rustls' error as the
   source, and a TLS message that runs past `recv_accumulator_max` as

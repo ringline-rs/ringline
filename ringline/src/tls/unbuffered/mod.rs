@@ -901,90 +901,101 @@ fn encrypt_with<C: UnbufferedEngine>(
     learned: &mut Option<usize>,
 ) -> (io::Result<usize>, bool) {
     let mut peer_closed = false;
-    let status = conn.process(incoming.pending());
-    let discard = status.discard;
-    let result = match status.state {
-        Ok(ConnectionState::WriteTraffic(mut wt)) => loop {
-            match wt.encrypt(&plaintext[..*chunk], dst) {
-                Ok(n) => break Ok(n),
-                Err(EncryptError::InsufficientSize(need)) => {
-                    // Scale down proportionally, and always shrink by at least
-                    // one byte so the loop cannot stall.
-                    let scaled = chunk
-                        .saturating_mul(dst.len())
-                        .checked_div(need.required_size.max(1))
-                        .unwrap_or(0);
-                    let next = scaled.min(chunk.saturating_sub(1));
-                    if next == 0 {
+    let result = loop {
+        let status = conn.process(incoming.pending());
+        let discard = status.discard;
+        let mut again = false;
+        let result = match status.state {
+            Ok(ConnectionState::WriteTraffic(mut wt)) => loop {
+                match wt.encrypt(&plaintext[..*chunk], dst) {
+                    Ok(n) => break Ok(n),
+                    Err(EncryptError::InsufficientSize(need)) => {
+                        // Scale down proportionally, and always shrink by at least
+                        // one byte so the loop cannot stall.
+                        let scaled = chunk
+                            .saturating_mul(dst.len())
+                            .checked_div(need.required_size.max(1))
+                            .unwrap_or(0);
+                        let next = scaled.min(chunk.saturating_sub(1));
+                        if next == 0 {
+                            break Err(io::Error::other(
+                                "TLS destination buffer too small to hold one record",
+                            ));
+                        }
+                        *chunk = next;
+                        *learned = Some(next);
+                    }
+                    // Narrower than it looks: TLS 1.3 key exhaustion queues a
+                    // `key_update` and keeps going, so this is only reached when
+                    // the record layer refuses outright (or on TLS 1.2, which
+                    // cannot rekey). Either way the connection is finished — there
+                    // is no smaller payload that would succeed.
+                    Err(EncryptError::EncryptExhausted) => {
                         break Err(io::Error::other(
-                            "TLS destination buffer too small to hold one record",
+                            "TLS traffic keys exhausted; connection must close",
                         ));
                     }
-                    *chunk = next;
-                    *learned = Some(next);
                 }
-                // Narrower than it looks: TLS 1.3 key exhaustion queues a
-                // `key_update` and keeps going, so this is only reached when
-                // the record layer refuses outright (or on TLS 1.2, which
-                // cannot rekey). Either way the connection is finished — there
-                // is no smaller payload that would succeed.
-                Err(EncryptError::EncryptExhausted) => {
-                    break Err(io::Error::other(
-                        "TLS traffic keys exhausted; connection must close",
-                    ));
-                }
+            },
+            // `EncodeTlsData` is destructive to *construct*: `process_tls_records`
+            // pops the record out of `sendable_tls` and moves it into this value
+            // (rustls 0.23.41 `conn/unbuffered.rs`), and never puts it back. So
+            // letting it fall into the catch-all below would drop a queued TLS
+            // record permanently while reporting a bland `WouldBlock`. Encoding it
+            // into `dst` is not the alternative: `dst` is an application-data pool
+            // slot mid-stream, and a handshake record written there reorders the
+            // wire. ringline's own call sites cannot reach this — a `Connection` is
+            // only handed out once the handshake completes, and any successful
+            // `drive` leaves `sendable_tls` empty — but the engine is one direct
+            // call away from it, so the arm is explicit rather than
+            // assumed-unreachable. The catch-all is what made the hazard invisible.
+            Ok(ConnectionState::EncodeTlsData(_)) => Err(io::Error::other(
+                "a queued TLS record was dropped by the encrypt path",
+            )),
+            // `PeerClosed` is edge-triggered (`emitted_peer_closed_state`): if this
+            // `process` is the call that deframes the peer's close_notify, nothing
+            // else will ever report it. It is recorded here so the caller can set
+            // `peer_sent_close_notify`; losing it would make the following FIN a
+            // spurious truncation report. The machine is then asked again: until
+            // this side sends its own close_notify it answers `WriteTraffic`,
+            // and the send goes out after the peer's close, as TLS 1.3 allows.
+            // Once per call: a second `PeerClosed` is not reported.
+            Ok(ConnectionState::PeerClosed) => {
+                again = !peer_closed;
+                peer_closed = true;
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "TLS connection not ready to encrypt application data",
+                ))
             }
-        },
-        // `EncodeTlsData` is destructive to *construct*: `process_tls_records`
-        // pops the record out of `sendable_tls` and moves it into this value
-        // (rustls 0.23.41 `conn/unbuffered.rs`), and never puts it back. So
-        // letting it fall into the catch-all below would drop a queued TLS
-        // record permanently while reporting a bland `WouldBlock`. Encoding it
-        // into `dst` is not the alternative: `dst` is an application-data pool
-        // slot mid-stream, and a handshake record written there reorders the
-        // wire. ringline's own call sites cannot reach this — a `Connection` is
-        // only handed out once the handshake completes, and any successful
-        // `drive` leaves `sendable_tls` empty — but the engine is one direct
-        // call away from it, so the arm is explicit rather than
-        // assumed-unreachable. The catch-all is what made the hazard invisible.
-        Ok(ConnectionState::EncodeTlsData(_)) => Err(io::Error::other(
-            "a queued TLS record was dropped by the encrypt path",
-        )),
-        // `PeerClosed` is edge-triggered (`emitted_peer_closed_state`): if this
-        // `process` is the call that deframes the peer's close_notify, nothing
-        // else will ever report it. Hand it up so the caller can set
-        // `peer_sent_close_notify` — swallowing it turns the following FIN into
-        // a spurious truncation report, a false security signal.
-        Ok(ConnectionState::PeerClosed) => {
-            peer_closed = true;
-            Err(io::Error::new(
+            // Genuinely benign for this path: `BlockedHandshake`,
+            // `TransmitTlsData`, `ReadTraffic`, `Closed`, `ReadEarlyData`, and
+            // whatever `#[non_exhaustive]` adds next. The send path never sees
+            // these for a handshaked connection (ringline only hands out a `Connection`
+            // after the handshake completes), so this is a guard, not a workflow.
+            Ok(_) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "TLS connection not ready to encrypt application data",
-            ))
+            )),
+            // `process` deframed a record the drive that received it did not
+            // reach: an accumulator overflow returns before the records behind
+            // the overflowing one. A failure on one of them leaves the same
+            // state as a failed drive (`UnbufferedConn::failed`). The alert
+            // rustls queues for it is not encoded here (`dst` is an
+            // application-data slot, discarded on `Err`) and the close path does
+            // not enter the machine, so the peer reads a FIN, as it does after
+            // an overflow that leaves records unread.
+            Err(e) => {
+                *failed = true;
+                Err(io::Error::other(e))
+            }
+        };
+        incoming.discard(discard);
+        if again {
+            continue;
         }
-        // Genuinely benign for this path: `BlockedHandshake`,
-        // `TransmitTlsData`, `ReadTraffic`, `Closed`, `ReadEarlyData`, and
-        // whatever `#[non_exhaustive]` adds next. The send path never sees
-        // these for a handshaked connection (ringline only hands out a `Connection`
-        // after the handshake completes), so this is a guard, not a workflow.
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "TLS connection not ready to encrypt application data",
-        )),
-        // `process` deframed a record the drive that received it did not
-        // reach: an accumulator overflow returns before the records behind
-        // the overflowing one. A failure on one of them leaves the same
-        // state as a failed drive (`UnbufferedConn::failed`). The alert
-        // rustls queues for it is not encoded here (`dst` is an
-        // application-data slot, discarded on `Err`) and the close path does
-        // not enter the machine, so the peer reads a FIN, as it does after
-        // an overflow that leaves records unread.
-        Err(e) => {
-            *failed = true;
-            Err(io::Error::other(e))
-        }
+        break result;
     };
-    incoming.discard(discard);
     (result, peer_closed)
 }
 
@@ -1215,15 +1226,20 @@ fn close_notify_with<C: UnbufferedEngine>(
                 None
             }
             // Edge-triggered; see [`encrypt_with`]. Selected ahead of
-            // `Closed` and `WriteTraffic`. A record encoded on the way here
-            // may be rustls' own close_notify or another queued record (a
-            // key_update), so the next `process` sets the count: `Closed`
-            // counts it as the alert, `WriteTraffic` queues the alert behind
-            // it and sends one in reply. With nothing encoded the loop stops
-            // here, no alert is sent in reply, and the edge goes up.
+            // `Closed` and `WriteTraffic`. The loop asks the machine again:
+            // `Closed` counts a record encoded on the way here (rustls' own
+            // close_notify) as the alert, and `WriteTraffic` queues this
+            // side's alert in reply, behind any record encoded on the way
+            // here (a key_update), as it does when the receive path deframed
+            // the peer's alert. A second `PeerClosed` is not reported; the
+            // guard keeps a machine that did report one from looping.
             Ok(ConnectionState::PeerClosed) => {
-                peer_closed = true;
-                if encoded_queued { None } else { Some(Ok(())) }
+                if peer_closed {
+                    Some(Ok(()))
+                } else {
+                    peer_closed = true;
+                    None
+                }
             }
             // Already closed, never reached traffic state, or `ReadTraffic`
             // for an application-data record left undeframed behind an

@@ -8,6 +8,11 @@ Note (2026-10-25): `ConnectionState::recv_arm` was removed.
 `shutdown_write` deferral) and PR 6 (mio completion identity) build on the
 mio close path.
 
+> Policy superseded in part by `docs/half-close-design.md` (2026-11): a peer
+> FIN now finishes the read half and requests no close on either backend; a
+> read error still closes. The invariant below, that only `close_connection`
+> and the `DriverCtx` close mark a connection closing, is unchanged.
+
 ## The bug
 
 On mio, a connection whose peer closes first (FIN) or whose read fails

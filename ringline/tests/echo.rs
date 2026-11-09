@@ -7117,9 +7117,9 @@ impl AsyncEventHandler for RespondAfterEof {
     }
 }
 
-/// A response sent after the peer's FIN must still be delivered in full:
-/// teardown waits for queued sends to drain (on mio, `finish_close` is
-/// deferred; on io_uring the Close SQE already is).
+/// A response sent after the peer's FIN is delivered in full: the FIN closes
+/// nothing, and the close at the task's return waits for the queued send to
+/// drain (on mio, `finish_close` is deferred; on io_uring the Close SQE is).
 #[test]
 fn response_after_peer_fin_is_delivered() {
     RESPONSE_AFTER_EOF_SEND.store(0, Ordering::Release);
@@ -7251,7 +7251,7 @@ fn deferred_close_does_not_spin_on_half_closed_peer() {
     let bound = baseline.max(200) * 4;
     assert!(
         ticks < bound,
-        "event loop spun while a close was deferred: {ticks} ticks in 500 ms \
+        "event loop spun while a send waited on a half-closed peer: {ticks} ticks in 500 ms \
          (idle baseline {baseline}, bound {bound})"
     );
 }

@@ -828,9 +828,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        // The receive side is finished; the stream is only still registered
-        // because queued sends are draining (see `drain_pending_closes`).
-        // Nothing to read.
+        // The read half is finished: the peer's end was read, or a close is
+        // pending (`docs/half-close-design.md`). Nothing to read.
         if self
             .driver
             .connections
@@ -875,7 +874,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             cs.note_eof(!close_notify_seen);
                         }
                         self.executor.wake_recv(conn_index);
-                        self.driver.close_connection(conn_index);
                         break;
                     }
                     Ok(n) => {
@@ -962,7 +960,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                                 cs.note_eof(false);
                             }
-                            self.driver.close_connection(conn_index);
                             break;
                         }
                     }
@@ -1004,12 +1001,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         break;
                     }
                     crate::tls::TlsRecvResult::Closed => {
+                        // The peer's close_notify ends the read half; the
+                        // connection stays open for its task.
                         self.finish_forward_at_eof(conn_index);
                         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                             cs.note_eof(false);
                         }
                         self.executor.wake_recv(conn_index);
-                        self.driver.close_connection(conn_index);
                         break;
                     }
                 }
@@ -1033,13 +1031,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             match stream.read(recv_buf) {
                 Ok(0) => {
                     self.finish_forward_at_eof(conn_index);
-                    // EOF. Wake any recv waiter so it sees `0`, then request
-                    // teardown; finalize waits for queued sends to drain.
+                    // Peer FIN: the read half is finished and the connection
+                    // stays open for its task. A parked read sees `0`.
                     if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                         cs.note_eof(false);
                     }
                     self.executor.wake_recv(conn_index);
-                    self.driver.close_connection(conn_index);
                     break;
                 }
                 Ok(n) => {
@@ -2944,6 +2941,136 @@ mod tests {
         assert_eq!(el.executor.send_completions.live(), 0, "the entry is gone");
     }
 
+    /// The read half is finished and nothing is closing: the peer's end
+    /// requested no close (`docs/half-close-design.md`). `truncated` is a TLS
+    /// FIN without the peer's close_notify.
+    fn assert_half_open(el: &AsyncEventLoop<NoopHandler>, conn_index: u32, truncated: bool) {
+        let cs = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot is held");
+        assert_eq!(cs.read, ReadHalf::Eof { truncated });
+        assert_eq!(cs.lifecycle, Lifecycle::Open);
+        assert!(
+            !el.driver.send_queues[conn_index as usize].close_pending,
+            "the end requested a close"
+        );
+        assert!(!el.driver.pending_closes.contains(&conn_index));
+        assert!(
+            el.driver.tcp_streams[conn_index as usize].is_some(),
+            "the stream is still held"
+        );
+    }
+
+    /// The peer's FIN finishes the read half and requests no close.
+    #[test]
+    fn a_fin_finishes_the_read_half_and_requests_no_close() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, client) = attach_conn(&mut el.driver);
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("peer half-close");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut recv_buf = vec![0u8; 4096];
+        el.handle_readable(conn_index, &mut recv_buf, false);
+        assert_half_open(&el, conn_index, false);
+    }
+
+    /// The client end of an already-handshaked TLS session whose server end
+    /// is installed on a connection.
+    enum TlsPeer {
+        #[cfg(not(feature = "tls-buffered"))]
+        Unbuffered(crate::tls::TlsConn),
+        #[cfg(feature = "tls-buffered")]
+        Buffered(crate::tls::buffered::BufferedKind),
+    }
+
+    impl TlsPeer {
+        /// The ciphertext of this end's close_notify.
+        fn close_notify(&mut self) -> Vec<u8> {
+            let mut out = Vec::new();
+            match self {
+                #[cfg(not(feature = "tls-buffered"))]
+                TlsPeer::Unbuffered(conn) => {
+                    crate::tls::unbuffered::queue_close_notify(conn, &mut out)
+                        .expect("queue close_notify");
+                }
+                #[cfg(feature = "tls-buffered")]
+                TlsPeer::Buffered(conn) => {
+                    conn.send_close_notify();
+                    while conn.wants_write() {
+                        conn.write_tls(&mut out).expect("write close_notify");
+                    }
+                }
+            }
+            assert!(!out.is_empty(), "close_notify must produce ciphertext");
+            out
+        }
+    }
+
+    /// Install an already-handshaked TLS server session on `conn_index` and
+    /// return its client end.
+    fn install_handshaked_tls(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) -> TlsPeer {
+        let max = el.driver.connections.max_slots();
+        let mut table = crate::tls::TlsTable::with_listener_configs(max, None, None, Vec::new());
+        #[cfg(not(feature = "tls-buffered"))]
+        let peer = {
+            let (server, client) = crate::tls::unbuffered::tests::handshaked_pair();
+            table.insert_for_test(conn_index, server);
+            TlsPeer::Unbuffered(client)
+        };
+        #[cfg(feature = "tls-buffered")]
+        let peer = {
+            let (server, client) = crate::tls::buffered::test_support::handshaked();
+            table.insert_for_test(
+                conn_index,
+                crate::tls::buffered::test_support::wrap_server(server),
+            );
+            TlsPeer::Buffered(client)
+        };
+        el.driver.tls_table = Some(table);
+        peer
+    }
+
+    /// The peer's close_notify, read by the receive path, finishes the read
+    /// half cleanly and requests no close; the TLS state stays for the
+    /// task's sends.
+    #[test]
+    fn the_peers_close_notify_finishes_the_read_half_and_requests_no_close() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, mut client) = attach_conn(&mut el.driver);
+        let mut peer = install_handshaked_tls(&mut el, conn_index);
+        std::io::Write::write_all(&mut client, &peer.close_notify()).expect("send the alert");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut recv_buf = vec![0u8; 4096];
+        el.handle_readable(conn_index, &mut recv_buf, false);
+        assert_half_open(&el, conn_index, false);
+        assert!(
+            el.driver.tls_table.as_ref().unwrap().has(conn_index),
+            "the TLS state stays for the task's sends"
+        );
+    }
+
+    /// A FIN on a TLS connection without the peer's close_notify finishes the
+    /// read half as a truncation and requests no close.
+    #[test]
+    fn a_tls_fin_finishes_the_read_half_as_a_truncation_and_requests_no_close() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (conn_index, client) = attach_conn(&mut el.driver);
+        let _peer = install_handshaked_tls(&mut el, conn_index);
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("peer half-close");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut recv_buf = vec![0u8; 4096];
+        el.handle_readable(conn_index, &mut recv_buf, false);
+        assert_half_open(&el, conn_index, true);
+    }
+
     /// `on_accept` queues an awaited send, hands the unpolled future to a
     /// spawned task that awaits a timer before polling it, and stays parked
     /// on a timer of its own.
@@ -2971,10 +3098,10 @@ mod tests {
         }
     }
 
-    /// The peer closes while the connection task is alive, so the release
-    /// drops that task with the send half and its timer still held. The
-    /// future it handed off, polled after the release, resolves with the
-    /// delivered count.
+    /// The peer resets the connection while the connection task is alive, so
+    /// the release drops that task with the send half and its timer still
+    /// held. The future it handed off, polled after the release, resolves
+    /// with the delivered count.
     #[test]
     fn a_send_future_handed_off_by_a_task_alive_at_the_release_resolves_delivered() {
         let config = test_config();
@@ -2990,18 +3117,31 @@ mod tests {
         client.read_exact(&mut buf).expect("the peer got the bytes");
         assert_eq!(&buf, b"hello");
 
-        // The peer's FIN closes the connection; the task is parked on its
+        // The peer's reset closes the connection (a FIN would finish the
+        // read half and leave the task in place); the task is parked on its
         // hour-long timer.
-        client
-            .shutdown(std::net::Shutdown::Write)
-            .expect("peer half-close");
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&client),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt: {}", io::Error::last_os_error());
+        drop(client);
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut recv_buf = vec![0u8; 4096];
         el.handle_readable(conn_index, &mut recv_buf, false);
         el.drain_pending_closes();
         assert!(
             el.driver.tcp_streams[conn_index as usize].is_none(),
-            "the FIN closed the connection and the close finalized"
+            "the reset closed the connection and the close finalized"
         );
         assert!(
             HANDOFF_RESULT.with(|c| c.borrow().is_none()),
