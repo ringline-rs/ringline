@@ -3061,10 +3061,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Fail a connection on a terminal send error: record the error for the
     /// reader, as a receive error is recorded, and request the close. The
     /// connection is going away because of the write, not because the peer
-    /// closed, so a `with_data_result` reader sees the error instead of EOF.
-    /// The caller has drained the send queue, so `close_connection` registers
-    /// the connection for the end-of-iteration drain. Mirrors mio's
-    /// `fail_connection_on_send_error`.
+    /// closed, so a `with_data_result` reader sees the error instead of EOF;
+    /// an EOF observed in the same batch is overwritten, as on mio. The
+    /// caller has drained the send queue, so the close is registered for the
+    /// end-of-iteration drain: by `close_connection` here, or by
+    /// `drain_conn_send_queue` when the close was already pending. Mirrors
+    /// mio's `abort_connection`; the caller does what mio's
+    /// `fail_connection_on_send_error` does first, draining the queue.
     fn fail_connection_on_send_error(&mut self, conn_index: u32, err: io::Error) {
         let generation = self.driver.connections.generation(conn_index);
         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
@@ -3513,7 +3516,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::BYTES.add(metrics::bytes::SENT, total_len as u64);
             self.driver.submit_next_queued(conn_index);
         } else {
+            // A terminal error: drain the queue and fail the connection with
+            // the error. The entry's notification accounting above is
+            // unaffected.
             self.driver.drain_conn_send_queue(conn_index);
+            self.fail_connection_on_send_error(conn_index, Self::send_error(result));
         }
     }
 
@@ -14477,6 +14484,9 @@ mod tests {
     }
 
     /// The same run on a plaintext connection closes with the error too.
+    /// Unlike `a_terminal_coalesced_send_error_closes_the_connection_with_the_error`,
+    /// the run here is built by `submit_next_queued` from two queued sends,
+    /// not staged in the slab by hand.
     #[test]
     fn plaintext_run_error_closes_with_the_error() {
         let mut el = make_test_loop();
@@ -15896,7 +15906,9 @@ mod tests {
                             }
                         }
 
-                        // ZC send error on a live connection.
+                        // ZC send error on a live connection. A terminal
+                        // send error closes the connection, so its Close CQE
+                        // follows and the connection leaves the live set.
                         4 if !live_conns.is_empty() => {
                             let ci = live_conns[0];
                             let iovecs = [libc::iovec {
@@ -15915,6 +15927,9 @@ mod tests {
                                 {
                                     el.driver.send_slab.release(slab_idx);
                                 }
+                                live_conns.remove(0);
+                                let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                                el.test_dispatch_cqe(close_ud.raw(), 0, 0);
                             }
                         }
 
