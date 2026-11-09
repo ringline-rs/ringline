@@ -77,8 +77,11 @@ fn time_to_close(open: usize, which: usize) -> Option<Duration> {
     wait_accepted(open);
 
     let mut conn = conns.remove(which);
-    conn.shutdown(Shutdown::Write).expect("shutdown");
+    // Set before the write shutdown: macOS refuses `setsockopt` once both
+    // directions are shut, and the server's FIN can arrive before this
+    // call (#778).
     conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    conn.shutdown(Shutdown::Write).expect("shutdown");
     let start = Instant::now();
     let closed = matches!(conn.read(&mut [0u8; 16]), Ok(0));
     let elapsed = start.elapsed();
