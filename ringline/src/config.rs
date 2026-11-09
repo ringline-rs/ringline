@@ -134,6 +134,9 @@ pub struct Config {
     /// Size of a direct connection's own receive buffer. See
     /// `ConfigBuilder::recv_direct_region`.
     pub(crate) recv_direct_region: usize,
+    /// Arm a parked reader's direct receive after the worker's next wait. See
+    /// `ConfigBuilder::defer_recv_arm`.
+    pub(crate) defer_recv_arm: bool,
     /// Most bytes of free buffers a worker keeps for direct connections to
     /// borrow. See `ConfigBuilder::recv_direct_pool_max`.
     pub(crate) recv_direct_pool_max: usize,
@@ -410,6 +413,7 @@ impl Default for Config {
             recv_accumulator_capacity: 4096,
             recv_accumulator_max: 1024 * 1024 * 1024,
             recv_direct_region: 32 * 1024,
+            defer_recv_arm: false,
             recv_direct_pool_max: 16 << 20,
             forward_hold_cap: 64,
             // Off by default while the trade is being measured: prefaulting
@@ -945,6 +949,32 @@ impl ConfigBuilder {
     /// Defaults to 32 KiB; must be at least 1.
     pub fn recv_direct_region(mut self, n: usize) -> Self {
         self.config.recv_direct_region = n;
+        self
+    }
+
+    /// Arm the receive of a plaintext connection whose reader parks after the
+    /// worker's next wait returns, instead of in the same submission as the
+    /// sends the task queued before parking.
+    ///
+    /// A receive submitted before the peer's next bytes arrive finds the
+    /// socket empty, and the kernel arms a poll and completes the receive
+    /// later from task work. Submitted after the wait, the receive more often
+    /// finds the bytes already queued and completes inline. That happens
+    /// when the server is saturated: on a two-machine echo benchmark (512
+    /// connections, 256-byte messages, 8 workers) server CPU per operation
+    /// fell 9% in closed loop, and at 200k and 400k operations per second
+    /// offered it did not fall.
+    ///
+    /// Deferring is skipped when the wait would block: if no completion is
+    /// ready and the kernel holds no task work, the worker arms the deferred
+    /// receives first and the blocking wait submits them. To tell, the ring
+    /// is set up with `IORING_SETUP_TASKRUN_FLAG`. Under
+    /// [`sqpoll`](Self::sqpoll), which cannot use that flag, the worker
+    /// always defers and does not block while a deferred receive is waiting.
+    ///
+    /// Defaults to `false`. io_uring only; the mio backend ignores it.
+    pub fn defer_recv_arm(mut self, on: bool) -> Self {
+        self.config.defer_recv_arm = on;
         self
     }
 

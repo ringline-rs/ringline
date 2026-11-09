@@ -1928,6 +1928,16 @@ pub(crate) fn park_recv(
     executor.recv_waiters[conn_index as usize] = true;
     #[cfg(has_io_uring)]
     {
+        if driver.defer_recv_arm
+            && let Some(cs) = driver.connections.get(conn_index)
+            && cs.recv_direct
+        {
+            let generation = cs.generation;
+            driver
+                .deferred_recv_arms
+                .push((conn_index, generation, need));
+            return;
+        }
         if driver.arm_direct_recv_or_close(conn_index, need) {
             // The connection closed instead. Record why for the reader, then
             // poll again to resolve the read.

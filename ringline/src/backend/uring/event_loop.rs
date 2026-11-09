@@ -479,6 +479,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // flowing while a task is runnable — otherwise a task that stays
             // runnable without queueing SQEs (so `flush()` takes its empty-SQ
             // shortcut) starves the whole worker of completions.
+            // Under `defer_recv_arm`, a wait with no completion pending would
+            // block, and arming the deferred receives after it would take a
+            // second, non-blocking pass. Arm them now instead; this enter
+            // submits them.
+            if self.driver.defer_recv_arm
+                && !self.driver.deferred_recv_arms.is_empty()
+                && !self.driver.ring.completion_pending()
+            {
+                self.arm_deferred_recvs();
+            }
             if self.may_block() {
                 self.driver.ring.submit_and_wait(1)?;
             } else {
@@ -503,6 +513,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             self.drain_completions();
             diag_cqes_1st += self.driver.cqe_batch.len() as u64;
+            self.arm_deferred_recvs();
             // `handle_park_install` fills `park_ready` from the completions
             // just drained. Hand those over in the same iteration: the
             // connections have already left this worker and only the
@@ -1085,8 +1096,33 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
         self.executor.ready_queue.is_empty()
             && self.driver.pending_finalize_closes.is_empty()
+            && self.driver.deferred_recv_arms.is_empty()
             && !self.driver.udp_rearm_due()
             && !shutting_down
+    }
+
+    /// Arm the receives `park_recv` deferred (`Config::defer_recv_arm`), for
+    /// connections still in the slot they were deferred in whose reader is
+    /// still parked. An arm that closes the connection wakes the reader.
+    fn arm_deferred_recvs(&mut self) {
+        if self.driver.deferred_recv_arms.is_empty() {
+            return;
+        }
+        let mut arms = std::mem::take(&mut self.driver.deferred_recv_arms);
+        for &(conn_index, generation, need) in &arms {
+            if self.driver.connections.generation(conn_index) != generation
+                || !self.executor.recv_waiters[conn_index as usize]
+            {
+                continue;
+            }
+            if self.arm_direct_recv(conn_index, need) {
+                self.executor.wake_recv(conn_index);
+            }
+        }
+        arms.clear();
+        if self.driver.deferred_recv_arms.is_empty() {
+            self.driver.deferred_recv_arms = arms;
+        }
     }
 
     /// Completion of a direct receive (`OpTag::RecvDirect`).

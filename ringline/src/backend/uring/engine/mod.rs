@@ -71,6 +71,11 @@ pub(crate) trait Engine: Sized {
     /// produce at once reapable.
     fn flush(&self) -> io::Result<()>;
 
+    /// Whether a completion is ready to reap or the kernel holds work that
+    /// the next enter will turn into one, so a wait for one completion would
+    /// return without blocking. `true` when the engine cannot tell.
+    fn completion_pending(&self) -> bool;
+
     /// Append every ready completion to `out`, consuming them.
     fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>);
 
