@@ -3772,11 +3772,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::CONNECTIONS_ACTIVE.decrement();
         }
 
-        // Remove the async task (drops the future).
-        self.executor.remove_connection(conn_index);
-        // The future just dropped may have owned a half, whose `Drop` queues
-        // an orphan that finds a changed generation. Clear the flags before
-        // the slot is reused, or the next occupant inherits them.
+        // Remove the async task (drops the future), with the driver state
+        // installed so the futures it holds clean up as inside a poll.
+        crate::runtime::io::with_driver_state(
+            &mut self.driver,
+            &mut self.executor,
+            |_, executor| {
+                executor.remove_connection(conn_index);
+            },
+        );
+        // The future just dropped may have owned a half, whose `Drop` finds
+        // the close already requested. Clear the claim flags before the slot
+        // is reused, or the next occupant inherits them.
         self.driver.clear_conn_claims(conn_index);
         self.driver.accumulators.release(conn_index);
         self.driver.arrival[conn_index as usize].release();

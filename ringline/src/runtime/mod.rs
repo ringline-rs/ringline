@@ -755,12 +755,13 @@ impl Executor {
     }
 
     /// The connection task `conn_index` returned or panicked. Drop the task
-    /// and the awaited sends it owned, and nothing else: the connection is
-    /// closing, not closed, and the sends other tasks await on it are
-    /// settled by the driver as the queue drains ahead of the close.
-    /// [`remove_connection`](Self::remove_connection) runs when the backend
-    /// releases the slot. Called from the task-exit arms of
-    /// `poll_ready_tasks` on both backends.
+    /// and the ownership of the awaited sends it created, and nothing else:
+    /// the connection is closing, not closed, and the sends other tasks
+    /// await on it are settled by the driver as the queue drains ahead of
+    /// the close. [`remove_connection`](Self::remove_connection) runs when
+    /// the backend releases the slot. Called from the task-exit arms of
+    /// `poll_ready_tasks` on both backends, with the driver state
+    /// installed.
     pub(crate) fn remove_connection_task(&mut self, conn_index: u32) {
         self.task_slab.remove(conn_index);
         for task_id in self.send_completions.remove_task(conn_index) {
@@ -769,6 +770,11 @@ impl Executor {
     }
 
     /// Reset all per-connection state for a connection that was closed.
+    ///
+    /// Drops the connection's task if it is still alive. The backends call
+    /// this under `with_driver_state`, so the futures that task holds clean
+    /// up as they do inside a poll (a `SendFuture` cancels its entry, a
+    /// `SleepFuture` its timer).
     pub(crate) fn remove_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
         self.task_slab.remove(conn_index);

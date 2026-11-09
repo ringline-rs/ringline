@@ -908,6 +908,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `SendFuture` handed to another task resolves with the send's own result
+  however late that task first polls it. The creating connection task's
+  return, and its connection's release, treated every completion-table
+  entry the task owned as dead with the task, so an entry whose future was
+  alive in another task was abandoned or freed; if the send completed
+  before that task's first poll, the completion freed the entry and the
+  poll found nothing, resolving `ConnectionAborted` for bytes the peer
+  received, or parking forever when it ran before the slot's release. An
+  entry now leaves the table only through its future's drop: a connection
+  task is dropped with the driver state installed at its connection's
+  release too (`with_driver_state`), so its own futures cancel their
+  entries, and an entry the dead task still owns is kept, without an owner
+  until the next poll records one. The shape is `let fut = tx.send(..)?;
+  spawn(async move { other.await; fut.await })` from `on_accept`, then
+  returning, on either backend. Found by the send-path audit
+  (`docs/journal/2026-11-send-path-audit.md`, L10).
 - io_uring: a send that fails (`EPIPE`, `ECONNRESET`, a resubmit the ring
   refused twice) closes the connection and reports the error to a reader
   parked on `with_data_result`, as mio does for an established connection.

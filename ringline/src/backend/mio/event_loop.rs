@@ -1449,7 +1449,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             self.driver.forward_resume_flag[idx] = false;
 
-            self.executor.remove_connection(conn_index);
+            // Drops the connection's task if it is still alive, with the
+            // driver state installed so the futures it holds clean up as
+            // inside a poll.
+            crate::runtime::io::with_driver_state(
+                &mut self.driver,
+                &mut self.executor,
+                |_, executor| executor.remove_connection(conn_index),
+            );
             self.driver.finish_close(conn_index);
         }
     }
@@ -2830,8 +2837,8 @@ mod tests {
     /// A `SendFuture` created by the connection task and first polled by the
     /// spawned task it was handed to, after the connection task returned,
     /// resolves with the delivered byte count. The connection task's return
-    /// abandons the entry (its recorded owner died); the spawned task's poll
-    /// revives it, and the flush's completion wakes that task.
+    /// leaves the entry without an owner; the spawned task's poll records
+    /// itself as the owner, and the flush's completion wakes that task.
     #[test]
     fn a_send_future_handed_to_a_spawned_task_resolves_after_its_creator_returns() {
         let config = test_config();

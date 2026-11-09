@@ -24,24 +24,36 @@
 //! enqueue ─▶ waiting ─mark_submitted─▶ InFlight ─complete─▶ Done ─take_result─▶ gone
 //!              │                          │                       ▲
 //!              │ cancel ─▶ gone           │ cancel ─▶ Abandoned   │ complete
-//!              │                          │             ├complete─▶ gone
-//!              │                          │             └set_owner─▶ InFlight
+//!              │                          │             └complete─▶ gone
 //!              │ remove_connection        │ remove_connection     │
 //!              ▼                          ▼                       │
 //!           Aborted ◀───────────────── Aborted ───────────────────┘
 //!              └─ take_result ─▶ gone
 //! ```
 //!
+//! **An entry leaves the table through its future, never through its
+//! owner.** The future's `Drop` cancels the entry (`cancel`): a waiting one
+//! goes, an in-flight one becomes `Abandoned` and its completion frees it,
+//! a resolved one goes with its result. The owning task's death changes no
+//! entry's state. A connection task is dropped with the driver state
+//! installed, in its task-exit arm and at its connection's release
+//! ([`Executor::remove_connection`] runs under `with_driver_state`), so
+//! every future that died with it has cancelled its entry by the time the
+//! table is told about the task. An entry still owned by the dead task is
+//! therefore held by a future the task handed to another task that has not
+//! polled it yet: it is re-owned to [`NO_OWNER`] and kept, resolved or in
+//! flight, and that task's first poll (`set_owner`) claims it.
+//!
 //! **A connection task's exit and its connection's release are separate
-//! steps.** When a
-//! connection task returns or panics, the backend's task-exit arm calls
-//! [`Executor::remove_connection_task`], which drops only the entries that
-//! task owned (`remove_task`); the connection is then closing, and the
-//! driver delivers or fails every queued send on it, waking the live owners
-//! through [`complete`](SendCompletions::complete), before the slot is
-//! released. `remove_connection` runs at the release
+//! steps.** When a connection task returns or panics, the backend's
+//! task-exit arm calls [`Executor::remove_connection_task`], which re-owns
+//! the entries the task owned (`remove_task`); the connection is then
+//! closing, and the driver delivers or fails every queued send on it, waking
+//! the live owners through [`complete`](SendCompletions::complete), before
+//! the slot is released. `remove_connection` runs at the release
 //! ([`Executor::remove_connection`], from io_uring's `handle_close` and
-//! mio's `drain_pending_closes`) and aborts whatever is still outstanding.
+//! mio's `drain_pending_closes`) and aborts whatever is still outstanding on
+//! the connection.
 //!
 //! **A synthetic teardown abort is provisional.** `remove_connection`
 //! records `Aborted`, not `Done`, and `complete` overwrites it with the
@@ -109,11 +121,10 @@ enum Completion {
     /// arrives `take_result` hands this error to the future. See the module
     /// docs for the provisional-abort rule.
     Aborted(io::Error),
-    /// The future was dropped while the operation was in flight, or the
-    /// connection task that owned it was removed (it returned, panicked, or
-    /// its connection was torn down) while it was in flight. The driver
-    /// still owns the operation; its completion frees the slot. A poll of
-    /// the future (`set_owner`) returns the entry to `InFlight`.
+    /// The future was dropped while the operation was in flight. The driver
+    /// still owns the operation; its completion frees the slot. Nothing
+    /// polls a dropped future, so nothing leaves this state but that
+    /// completion.
     Abandoned,
 }
 
@@ -152,8 +163,9 @@ pub(crate) struct SendCompletions {
     /// indexed by connection index.
     by_conn: Vec<Vec<u32>>,
     /// Slot indices of the live operations owned by each connection task,
-    /// indexed by task id. Standalone tasks are not indexed:
-    /// [`remove_connection`](Self::remove_connection) never looks them up.
+    /// indexed by task id. Standalone tasks and [`NO_OWNER`] are not indexed:
+    /// [`remove_task`](Self::remove_task) and
+    /// [`remove_connection`](Self::remove_connection) never look them up.
     by_task: Vec<Vec<u32>>,
 }
 
@@ -302,24 +314,12 @@ impl SendCompletions {
     ///
     /// Called by the send futures on every poll after the first, so that a
     /// future moved between tasks (or polled from a different task than the
-    /// one that enqueued it) is woken where it now lives.
-    ///
-    /// A poll proves the future is alive, so an `Abandoned` entry becomes
-    /// `InFlight` again, whoever the owner was. [`remove_task`](Self::remove_task)
-    /// and [`remove_connection`](Self::remove_connection) abandon every
-    /// in-flight entry the dead connection task owned, and cannot tell a
-    /// future that died with the task from one the task had handed to
-    /// another task that had not yet polled it. A completion on an
-    /// `Abandoned` entry frees it and wakes nobody, so a live future whose
-    /// entry stayed `Abandoned` would never resolve. A dropped future is
-    /// never polled again, so `cancel`'s `Abandoned` is not revived.
+    /// one that enqueued it) is woken where it now lives, and so that an
+    /// entry its creator's exit left with [`NO_OWNER`] has one again.
     pub(crate) fn set_owner(&mut self, id: SendId, task_id: u32) {
         let Some(e) = self.entry_mut(id) else {
             return;
         };
-        if matches!(e.state, Completion::Abandoned) {
-            e.state = Completion::InFlight;
-        }
         let old = std::mem::replace(&mut e.task_id, task_id);
         if old != task_id {
             if is_connection_task(old) {
@@ -495,8 +495,9 @@ impl SendCompletions {
     /// `Aborted(ConnectionAborted)` (waiting ones leave the FIFO) and its
     /// owner's task id is in the returned list — the owner may be a
     /// standalone task, or a connection task on another index, that
-    /// outlives this connection. Abandoned entries are removed. If the head
-    /// was removed, the new head's task id is appended as well.
+    /// outlives this connection. A resolved entry keeps its result for the
+    /// future that holds it. Abandoned entries are removed. If the head was
+    /// removed, the new head's task id is appended as well.
     ///
     /// `Aborted` rather than `Done` because this abort is *provisional*: a
     /// driver's `Ok(n)` that arrives after it wins over the abort recorded
@@ -505,42 +506,21 @@ impl SendCompletions {
     /// same way so teardown has one rule, and `take_result` resolves both
     /// alike.)
     ///
-    /// Entries owned by *this* connection's own task (`task_id ==
-    /// conn_index`) are the exception: `Executor::remove_connection` calls
-    /// this after `task_slab.remove` has dropped that task's future outside
-    /// any poll, so its `cancel` never ran and nothing can ever
-    /// `take_result`. Parking a `Done` for it would leak one entry per
-    /// closed connection. Those entries are instead treated as cancelled:
-    /// waiting → removed, `InFlight` → `Abandoned` (the completion still
-    /// arrives and removes it, unless a poll of a future the task had
-    /// handed to another task revives it first; see `set_owner`), `Done` →
-    /// removed.
+    /// The connection's own task dies here too, if it was still alive, and
+    /// so does its ownership of entries on any connection: `Executor::remove_connection`
+    /// drops the task with the driver state installed, so the futures that
+    /// died with it have already cancelled their entries, and an entry
+    /// still owned by the task is held by a future the task handed off. It
+    /// is re-owned to [`NO_OWNER`] and otherwise treated as any other entry.
     ///
     /// Visits only the entries indexed under `conn_index`, and allocates the
     /// returned `Vec` and a list of those entries; this is the teardown path.
     pub(crate) fn remove_connection(&mut self, conn_index: u32) -> Vec<u32> {
         let mut wakes = Vec::new();
-        // `conn_index` names two things that both die here: the connection
-        // whose entries must be aborted, and the *task* that owns entries
-        // possibly targeting other connections. The second is not a corner
-        // case — it is the shape the public API advertises, a proxy task on
-        // connection C with a bounded send outstanding on connection D. This
-        // runs from `handle_close` (io_uring) and `drain_pending_closes`
-        // (mio), with no driver state installed, so when C's task is dropped
-        // there its futures' `Drop` cannot reach `cancel`, and nothing else
-        // would ever take those entries off the queue. (A `cancel` that ran
-        // earlier, from a task-exit arm under a guard, left nothing for this
-        // to find.) Left behind, an entry whose owner can never be woken
-        // sits at the head and stalls every bounded send on the worker.
-        let dead_owner = |e: &Entry| {
-            e.conn_index == conn_index
-                || (e.task_id & crate::runtime::waker::STANDALONE_BIT == 0
-                    && e.task_id == conn_index)
-        };
         let old_head = self.waiting.front().copied();
 
-        // Every entry `dead_owner` matches is indexed under `conn_index`,
-        // as its target or as its connection-task owner.
+        // Every entry this touches is indexed under `conn_index`, as its
+        // target or as its connection-task owner.
         let mut candidates: Vec<u32> = Vec::new();
         for lists in [&self.by_conn, &self.by_task] {
             if let Some(list) = lists.get(conn_index as usize) {
@@ -551,27 +531,26 @@ impl SendCompletions {
         candidates.dedup();
 
         for index in candidates {
+            if self.owned_by_connection_task(index, conn_index) {
+                self.disown(index);
+            }
             let Some(e) = self.slots[index as usize].entry.as_mut() else {
                 continue;
             };
-            if !dead_owner(e) {
+            if e.conn_index != conn_index {
                 continue;
             }
-            let owner_gone = e.task_id == conn_index;
             let keep = match e.state {
-                Completion::Waiting { .. } | Completion::InFlight if !owner_gone => {
+                Completion::Waiting { .. } | Completion::InFlight => {
                     e.state = Completion::Aborted(connection_aborted());
-                    wakes.push(e.task_id);
+                    if e.task_id != NO_OWNER {
+                        wakes.push(e.task_id);
+                    }
                     true
                 }
-                Completion::Waiting { .. } => false,
-                Completion::InFlight => {
-                    e.state = Completion::Abandoned;
-                    true
-                }
-                // Already resolved (including by an earlier teardown of the
-                // same slot): keep it only while someone can still take it.
-                Completion::Done(_) | Completion::Aborted(_) => !owner_gone,
+                // Resolved, by the driver or by an earlier teardown of the
+                // same slot: the future that holds it takes it.
+                Completion::Done(_) | Completion::Aborted(_) => true,
                 Completion::Abandoned => false,
             };
             if !keep {
@@ -582,45 +561,54 @@ impl SendCompletions {
         wakes
     }
 
+    /// Whether slot `index` holds an entry owned by connection task
+    /// `conn_index`.
+    fn owned_by_connection_task(&self, index: u32, conn_index: u32) -> bool {
+        self.slots[index as usize]
+            .entry
+            .as_ref()
+            .is_some_and(|e| is_connection_task(e.task_id) && e.task_id == conn_index)
+    }
+
+    /// Re-own the entry in slot `index` to [`NO_OWNER`]: its owning
+    /// connection task is gone and the future that holds it has not been
+    /// polled since.
+    fn disown(&mut self, index: u32) {
+        let Some(e) = self.slots[index as usize].entry.as_mut() else {
+            return;
+        };
+        let old = std::mem::replace(&mut e.task_id, NO_OWNER);
+        if is_connection_task(old) {
+            index_remove(&mut self.by_task, old, index);
+        }
+    }
+
     /// The connection task `conn_index` returned or panicked while its
-    /// connection is still being closed. Drop the entries that task owns,
-    /// whichever connection they target: a waiting one is removed, since
-    /// nothing can take its result; an in-flight one becomes `Abandoned`,
-    /// and the driver's completion frees it unless a poll of a future the
-    /// task had handed to another task revives it first (`set_owner`); a
-    /// resolved one is removed. Entries other tasks own on this connection
-    /// are left as they are: the close is deferred behind the queued sends,
-    /// so the driver delivers or fails each of them before
+    /// connection is still being closed. The task's own futures cancelled
+    /// their entries when the task was dropped, so an entry it still owns,
+    /// whichever connection it targets, is held by a future the task handed
+    /// to another task that has not polled it yet: it is re-owned to
+    /// [`NO_OWNER`] and left in its state, waiting, in flight or resolved,
+    /// for that poll. Entries other tasks own on this connection are left
+    /// as they are: the close is deferred behind the queued sends, so the
+    /// driver delivers or fails each of them before
     /// [`remove_connection`](Self::remove_connection) runs at the slot's
-    /// release. Returns the task to wake if the FIFO head changed.
+    /// release. Returns nothing to wake: no entry changes state.
     ///
     /// Called from [`Executor::remove_connection_task`], the task-exit arms
     /// of both backends' `poll_ready_tasks`.
     pub(crate) fn remove_task(&mut self, conn_index: u32) -> Vec<u32> {
-        let mut wakes = Vec::new();
-        let old_head = self.waiting.front().copied();
         let candidates: Vec<u32> = self
             .by_task
             .get(conn_index as usize)
             .cloned()
             .unwrap_or_default();
         for index in candidates {
-            let Some(e) = self.slots[index as usize].entry.as_mut() else {
-                continue;
-            };
-            if e.task_id != conn_index {
-                continue;
-            }
-            match e.state {
-                Completion::InFlight => e.state = Completion::Abandoned,
-                Completion::Abandoned => {}
-                Completion::Waiting { .. } | Completion::Done(_) | Completion::Aborted(_) => {
-                    self.free_index(index);
-                }
+            if self.owned_by_connection_task(index, conn_index) {
+                self.disown(index);
             }
         }
-        self.prune_waiting(old_head, &mut wakes);
-        wakes
+        Vec::new()
     }
 
     /// Drop freed and no-longer-waiting ids from the FIFO, and if the head
