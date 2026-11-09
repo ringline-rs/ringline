@@ -125,7 +125,8 @@ pub mod conn {
     pub const ACCEPT_QUEUE_FULL: usize = 7;
     /// A `shutdown_write` whose `shutdown(SHUT_WR)` failed at the socket:
     /// the Shutdown SQE's CQE on io_uring, the call's result on mio. Usually
-    /// `ENOTCONN`, the socket already closed by a reset or a failed connect.
+    /// `ENOTCONN`: the socket is already in `TCP_CLOSE`, after a reset or a
+    /// retransmission timeout.
     /// Nothing else changes: the write half stays `Shutdown`, and on
     /// io_uring the Close it held goes ahead.
     pub const SHUTDOWN_FAILED: usize = 8;

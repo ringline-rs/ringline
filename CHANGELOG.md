@@ -68,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `metrics::park_abandon::RECEIVE_ARMED` (14, `op=receive_armed` on
   `ringline/park_abandoned`): a park whose install found a receive, hangup
   poll or hangup peek armed.
+- `metrics::conn::SHUTDOWN_FAILED` (8, `op=shutdown_failed` on
+  `ringline/connections`): a `shutdown_write` whose `shutdown(SHUT_WR)` the
+  socket refused, usually `ENOTCONN` on a socket already in `TCP_CLOSE`
+  after a reset or a retransmission timeout.
 - `yield_now()` wakes the calling task and returns `Pending` once, so a task
   that makes many `send_nowait` calls without awaiting anything lets the
   worker poll its other queued tasks and process I/O between batches. Callers
@@ -908,12 +912,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- A `shutdown_write` whose `shutdown(SHUT_WR)` fails at the socket is now
+- A `shutdown_write` whose `shutdown(SHUT_WR)` the socket refuses is now
   counted, in `connections{op="shutdown_failed"}`, on both backends. On
   io_uring the Shutdown CQE's result was dropped at dispatch; on mio the
-  call's result was discarded. The `WriteHalf::Shutdown` doc said the FIN
-  "has been issued"; it says "requested", which is what the state records.
-  Audit finding F12 of `docs/journal/2026-11-connection-close-audit.md`.
+  call's result was discarded. Nothing else changes: the socket is already
+  closed. Audit finding F12 of
+  `docs/journal/2026-11-connection-close-audit.md`.
 
 - io_uring, merged accept mode: a park install CQE for a slot's previous
   occupant no longer takes the current occupant's park. `handle_park_install`

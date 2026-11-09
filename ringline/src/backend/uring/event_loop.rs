@@ -1659,9 +1659,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
             OpTag::Close => self.handle_close(ud),
             OpTag::Shutdown => self.handle_shutdown(ud, result),
-            // The `Close` CQE releases the slot. A shutdown failure changes
-            // nothing: `ENOTCONN` when the socket is already in `TCP_CLOSE`
-            // (reset, failed connect, or both FINs exchanged).
+            // The `Close` CQE releases the slot. A failure of this lead
+            // changes nothing and is not counted: `ENOTCONN` when the socket
+            // is already in `TCP_CLOSE` (reset, failed connect, or both FINs
+            // exchanged).
             OpTag::CloseShutdown => {}
             // Ignored likewise: the `Close` CQE releases the slot. The
             // cancelled requests' own CQEs arrive with `-ECANCELED`, usually
@@ -2545,7 +2546,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// A deferred `shutdown(SHUT_WR)` has completed.
     ///
-    /// It releases the slot: `Shutdown` names its socket as the
+    /// It releases the hold on the Close: `Shutdown` names its socket as the
     /// registered-file slot `Fixed(conn_index)`, so `try_finalize_close` holds
     /// the `Close` that frees the slot until this CQE lands. Without that, the
     /// `Close` could complete first, the next accept could register the slot,
