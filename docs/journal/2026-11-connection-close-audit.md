@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768) and F10 (#791) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F12 (`fix/shutdown-result-recorded`) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -420,7 +420,17 @@ Disposition: open.
 After `-ENOTCONN` the write half still reads `Shutdown`. Doc fix ("requested")
 or record the failure.
 
-Disposition: open.
+Disposition: fixed in `fix/shutdown-result-recorded`, both ways: the
+`WriteHalf::Shutdown` doc says the FIN has been requested, and a
+`shutdown(SHUT_WR)` the socket refuses is counted in
+`connections{op="shutdown_failed"}` on both backends (`handle_shutdown`
+now takes the CQE result; mio's two `shutdown(Write)` calls check theirs).
+The write half stays `Shutdown`: the refusal means the socket is already
+closed, so sends fail at the socket either way, and on io_uring the Close
+the Shutdown held goes ahead. `a_failed_shutdown_is_counted_and_releases_the_close`
+dispatches a Shutdown CQE with `-ENOTCONN`. No mio test: producing
+`ENOTCONN` needs a socket reset by its peer before the shutdown, which is
+a race against the RST; the mio change is read, not run.
 
 ### F13 — `handle_send`'s terminal error arm drains the queue and fails the awaited send but does not close the connection or record a read error (invariants 11, 12). Confirmed by reading; consequence unassessed.
 
