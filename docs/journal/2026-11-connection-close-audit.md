@@ -1,7 +1,7 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (`docs/connection-close-audit-f14`) fixed; every finding fixed, the seven design limitations recorded
-- **Span:** 2026-11-07 → 2026-11-08 · tree a2e28073 (`main`) · PRs: F2 and F3 #767, F9 #768, F6 #769, F1 #771, F4 and F5 #774, F7 #776, F8 #779, F10 #791, F11 #792, F12 #793, F13 #794, F14 `docs/connection-close-audit-f14`
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (#798) fixed; every finding fixed, the seven design limitations recorded
+- **Span:** 2026-11-07 → 2026-11-08 · tree a2e28073 (`main`) · PRs: F2 and F3 #767, F9 #768, F6 #769, F1 #771, F4 and F5 #774, F7 #776, F8 #779, F10 #791, F11 #792, F12 #793, F13 #794, F14 #798
 
 ## Goal
 
@@ -569,7 +569,7 @@ Style: "load-bearing" at `uring/driver.rs:376`, `mio/event_loop.rs:1112`
 design.md`, `ktls-design.md`, three journal entries); personification at
 `handler.rs:68`.
 
-Disposition: fixed in `docs/connection-close-audit-f14`, checked item by
+Disposition: fixed in #798, checked item by
 item against ad2c6b23. Already fixed before it: `close_send_count`, the
 `CLAUDE.md` lead sentence, the deadline check's `try_finalize_close`,
 `WriteHalf::Shutdown`'s "does not refuse later sends", the four
