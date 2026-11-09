@@ -39,7 +39,7 @@ mechanism to every awaited send.
 | `InFlight` | Submitted; the driver owns the operation. |
 | `Done(result)` | The driver reported. Waits for the future to take it. |
 | `Aborted(err)` | Teardown recorded this before the driver reported. A driver result overwrites it. |
-| `Abandoned` | The future was dropped while the operation was in flight. The driver's completion frees the slot. |
+| `Abandoned` | The future was dropped while the operation was in flight. The driver's completion frees the slot; nothing else leaves this state. |
 
 Lookups are by index, so `register`, `complete`, `take_result`,
 `set_owner` and the cancel of an admitted operation are O(1);
@@ -97,10 +97,20 @@ length, as a TLS send does.
   nothing (teardown already recorded the abort); it frees an `Abandoned`
   entry (`forget`).
 - Connection teardown: `Executor::remove_connection` records a provisional
-  `Aborted(ConnectionAborted)` for every entry on that connection, except
-  entries owned by the connection's own task, which are dropped (in
-  flight: `Abandoned`).
+  `Aborted(ConnectionAborted)` for every waiting or in-flight entry on that
+  connection and keeps a resolved one for the future that holds it.
 - Worker shutdown: the table is dropped with the executor.
+
+An entry leaves the table through its future, never through its owner's
+task. The future's `Drop` cancels it, and a connection task is dropped with
+the driver state installed, in its task-exit arm and at its connection's
+release (`with_driver_state`), so the futures that die with it cancel their
+entries first. An entry a dead task still owns is held by a future the task
+handed to another task that has not polled it yet: `remove_task` (at the
+task's exit) and `remove_connection` (at the release) re-own it to
+`NO_OWNER`, a wake target no task answers to, and leave its state alone;
+that task's first poll records itself as the owner (`set_owner`) and takes
+the result if one has landed.
 
 Every disposal path that releases a carrier must take its id first. The
 copy pool's `release` debug-asserts that the slot no longer carries one.
@@ -113,7 +123,10 @@ The slab entry's `release` clears the id without a check, and
 `send_chain` whose closure submitted nothing resolves `Ok(0)` without a
 send). Polling takes the result or records the polling task as the owner.
 Dropping it cancels the id: the entry becomes `Abandoned`, and the send
-itself continues.
+itself continues. A future handed to another task resolves there with the
+send's own result, however late that task first polls it: after the
+creating task returned, after the send completed, and after the connection
+was released.
 
 Two awaited sends on one connection each resolve with their own result.
 

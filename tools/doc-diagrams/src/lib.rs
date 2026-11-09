@@ -296,7 +296,7 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     require_order_after(
         &uring_loop,
         "fn handle_close",
-        "self.executor.remove_connection(conn_index)",
+        "executor.remove_connection(conn_index)",
         "self.driver.connections.release(conn_index)",
         "io_uring removes the task before recycling the connection slot",
     )?;
@@ -310,7 +310,7 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     require_order_after(
         &mio_loop,
         "fn drain_pending_closes",
-        "self.executor.remove_connection(conn_index)",
+        "executor.remove_connection(conn_index)",
         "self.driver.finish_close(conn_index)",
         "Mio removes the task before backend close and slot recycling",
     )?;
