@@ -11555,7 +11555,7 @@ mod tests {
         );
     }
 
-    /// An install CQE drained at worker exit closes the fd it carries. The
+    /// The exit drain closes the fd carried by an install CQE it reaps. The
     /// fd is a second reference to the socket; the connection's Close
     /// releases the fixed file, and while that fd stays open the peer sees
     /// no FIN (#800).
@@ -11577,9 +11577,20 @@ mod tests {
                 target: 1,
                 generation,
             });
-        // The install completes inline at submit, so its CQE is in the ring
-        // before the exit drain starts.
+        // The install completes inline at submit. Take its CQE, check that
+        // it carries an fd (a failed install would leave `ours` the last
+        // reference and the assertion below true without the drain's arm),
+        // and post it again for the exit drain to reap.
         el.driver.ring.flush().unwrap();
+        let mut cqes = Vec::new();
+        el.driver.ring.reap(&mut cqes);
+        let ud = UserData::encode(OpTag::ParkInstall, conn_index, generation).raw();
+        let (_, installed, _) = *cqes
+            .iter()
+            .find(|(u, _, _)| *u == ud)
+            .expect("no ParkInstall CQE after the flush");
+        assert!(installed >= 0, "the install failed: {installed}");
+        el.driver.ring.submit_nop_inject(ud, installed).unwrap();
 
         el.driver.run_shutdown();
         assert!(el.driver.connections.get(conn_index).is_none());
