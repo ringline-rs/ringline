@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F12 (`fix/shutdown-result-recorded`) fixed; the rest recorded, unfixed
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F12 (#793) fixed; the rest recorded, unfixed
 - **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
 
 ## Goal
@@ -420,7 +420,7 @@ Disposition: open.
 After `-ENOTCONN` the write half still reads `Shutdown`. Doc fix ("requested")
 or record the failure.
 
-Disposition: fixed in `fix/shutdown-result-recorded`, by both changes the
+Disposition: fixed in #793, by both changes the
 finding offered: the
 `WriteHalf::Shutdown` doc says the FIN has been requested, and a
 `shutdown(SHUT_WR)` the socket refuses is counted in
