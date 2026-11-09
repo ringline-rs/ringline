@@ -14618,6 +14618,113 @@ mod tests {
         );
     }
 
+    /// A forced close that `try_finalize_close` cannot commit, because a
+    /// `Shutdown` is still in the kernel, disarms its deadline: the force
+    /// runs once, and the Shutdown CQE commits the Close.
+    #[test]
+    fn a_forced_close_blocked_on_a_shutdown_runs_once() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        {
+            let state = &mut el.driver.send_queues[conn_index as usize];
+            state.close_pending = true;
+            state.shutdown_inflight = true;
+            state.close_notify_deadline = Some(std::time::Instant::now());
+        }
+        el.driver.close_notify_armed.push(conn_index);
+
+        el.check_close_notify_deadlines();
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(
+            state.close_pending && !state.close_submitted,
+            "the Shutdown holds the Close"
+        );
+        assert!(
+            state.close_notify_deadline.is_none(),
+            "the deadline stayed armed after the force"
+        );
+        assert!(
+            !el.driver.close_notify_armed.contains(&conn_index),
+            "the connection stayed on the armed set after the force"
+        );
+
+        // The next tick runs no second force.
+        el.driver.capacity_released = false;
+        el.check_close_notify_deadlines();
+        assert!(
+            !el.driver.capacity_released,
+            "a second force reported released capacity"
+        );
+
+        // The Shutdown CQE registers the connection for the end-of-iteration
+        // drain, which commits the Close.
+        let ud = UserData::encode(OpTag::Shutdown, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+        for c in std::mem::take(&mut el.driver.pending_finalize_closes) {
+            el.driver.try_finalize_close(c);
+        }
+        assert!(
+            el.driver.send_queues[conn_index as usize].close_submitted,
+            "the Close was never committed"
+        );
+    }
+
+    /// Reactivating a slot whose queue is empty returns no slot to the pool,
+    /// and reports none.
+    #[test]
+    fn resetting_an_empty_send_queue_releases_no_capacity() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.capacity_released = false;
+
+        el.driver.reset_send_state(conn_index);
+
+        assert!(
+            !el.driver.capacity_released,
+            "an empty queue reported released capacity"
+        );
+    }
+
+    /// A forced close that abandons a queued send no caller waits on
+    /// (`send_nowait`) still reports the slot it returned to the pool, or a
+    /// bounded send parked on the pool waits for an unrelated release.
+    #[test]
+    fn a_forced_close_abandoning_an_unawaited_send_releases_capacity() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(b"unawaited").unwrap();
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        let entry = crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw());
+        {
+            let state = &mut el.driver.send_queues[conn_index as usize];
+            state.queue.push_back(crate::handler::BuiltSend {
+                entry,
+                pool_slot: slot,
+                slab_idx: u16::MAX,
+            });
+            state.in_flight = true;
+            state.close_pending = true;
+        }
+        el.driver.capacity_released = false;
+
+        el.driver.force_finalize_close(conn_index);
+
+        assert!(
+            el.driver.settled_sends.is_empty(),
+            "nothing awaited the send"
+        );
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "the slot stayed in use"
+        );
+        assert!(
+            el.driver.capacity_released,
+            "the returned slot was not reported"
+        );
+    }
+
     /// A send CQE that outlived its connection slot settles nothing: the
     /// operation belonged to the dead occupant, whose teardown already
     /// recorded a provisional abort that a driver result would override
