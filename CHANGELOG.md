@@ -912,6 +912,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a zero-copy send refused with `EAGAIN` or `ENOMEM` after the
+  connection's Close was submitted settles its awaiter `ECANCELED`, as the
+  plain, coalesced and TLS send handlers settle a send they would otherwise
+  have retried; it settled `WouldBlock` or `OutOfMemory`. The case needs a forced close past an in-flight zero-copy
+  send, which no path takes today. Send-path audit L3
+  (`docs/journal/2026-11-send-path-audit.md`).
+
 - A `shutdown_write` whose `shutdown(SHUT_WR)` the socket refuses is now
   counted, in `connections{op="shutdown_failed"}`, on both backends. On
   io_uring the Shutdown CQE's result was dropped at dispatch; on mio the
