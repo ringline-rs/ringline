@@ -638,9 +638,8 @@ impl Driver {
     /// deregistration, buffer cleanup, and slot release. Called by the
     /// event loop after `Executor::remove_connection`.
     ///
-    /// The flush is a single nonblocking attempt — the previous behavior
-    /// flipped the fd to blocking and `write_all`'d, which let one
-    /// zero-window peer stall the entire worker indefinitely.
+    /// The flush is a single nonblocking attempt: a blocking write here
+    /// would let one zero-window peer stall the worker.
     pub(crate) fn finish_close(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
@@ -962,18 +961,12 @@ impl Driver {
             }
         }
 
-        // All sends flushed. Switch back to read-only interest — unless the
-        // receive side is already closed (peer FIN, read error, or a
-        // requested close), in which case re-adding READABLE would just
-        // No re-arm here any more. Interest is registered once, as
+        // All sends flushed. Interest is registered once, as
         // READABLE|WRITABLE, and never modified: dropping WRITABLE after each
         // drain and re-adding it on the next send cost two `epoll_ctl(MOD)`
-        // per operation, because an echo workload makes that queue transition
-        // on every single request (#395).
-        //
-        // It also removes the hazard this code used to work around: it was a
-        // `reregister` that re-reported EOF on a half-closed socket and span
-        // the loop at 100% CPU. Not re-registering cannot re-report anything.
+        // per operation on an echo workload (#395), and a `reregister` here
+        // re-reported EOF on a half-closed socket and spun the loop at 100%
+        // CPU.
         Ok((true, total_written))
     }
 }

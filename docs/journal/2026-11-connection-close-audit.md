@@ -1,7 +1,7 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793) and F13 (#794) fixed; the rest recorded, unfixed
-- **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (#798) fixed; every finding fixed, the seven design limitations recorded
+- **Span:** 2026-11-07 → 2026-11-08 · tree a2e28073 (`main`) · PRs: F2 and F3 #767, F9 #768, F6 #769, F1 #771, F4 and F5 #774, F7 #776, F8 #779, F10 #791, F11 #792, F12 #793, F13 #794, F14 #798
 
 ## Goal
 
@@ -325,7 +325,9 @@ outside the event loop.
 
 ### F8 — worker exit leaves `CONNECTIONS_ACTIVE` inflated and abandons mio closing connections (invariants 15, 3). Traced.
 
-io_uring `run_shutdown`'s Close arm (`uring/driver.rs:2605-2610`) releases
+The `OpTag::Close` arm of io_uring's `handle_shutdown_cqe`
+(`uring/driver.rs:2605-2610`), which `run_shutdown` runs for each CQE of its
+drain, releases
 TLS state, claims and the slot without decrementing the gauge. mio `run()`
 returns; `worker.rs:1235-1245` drops tasks and the event loop, so streams
 close on drop: no `finish_close`, no `CLOSED`, no decrement, queued bytes
@@ -337,8 +339,8 @@ Fix: decrement per established connection on both exit paths; document the
 mio abandonment or run one bounded `drain_pending_closes` pass before
 returning.
 
-Disposition: fixed in #779: the io_uring `run_shutdown`
-Close arm and a mio `count_out_open_connections`, run at `run`'s shutdown
+Disposition: fixed in #779: the `OpTag::Close` arm of io_uring's
+`handle_shutdown_cqe` and a mio `count_out_open_connections`, run at `run`'s shutdown
 return and in `drain_after_failure`, count each established connection into
 `CLOSED` and out of `CONNECTIONS_ACTIVE`, as `handle_close` and `finish_close`
 do. The mio abandonment is documented rather than replaced by a drain pass:
@@ -351,8 +353,10 @@ verified by `experiments/exit-closes-count-down-verify.toml` (SystemsLab
 experiment `01a1bc48-5b3e-718d-e469-71f2b93528e2`, Debian 13, Linux 6.12): 0
 passed, 1 failed at 0ef26fb2, 1 passed at the branch head 4ba14ccf, and the
 uring gate (fmt, clippy on three builds, rustdoc, `cargo test --all`) passes. A
-connection `run_shutdown` never closes (a zero-copy entry whose notification
-does not arrive within the 10 s bound, #607) is not counted out.
+connection whose Close has not completed when `run_shutdown`'s 10 s bound
+runs out is not counted out: one holding a zero-copy entry whose
+notification does not arrive (#607), or one whose Close the ring refused on
+every pass (#787).
 
 ### F9 — mio: a close raised inside the step-6a/8 flush or `drain_forward_resumes` with only unawaited sends queued drops the task unpolled (invariant 5). Plausible.
 
@@ -565,7 +569,30 @@ Style: "load-bearing" at `uring/driver.rs:376`, `mio/event_loop.rs:1112`
 design.md`, `ktls-design.md`, three journal entries); personification at
 `handler.rs:68`.
 
-Disposition: open.
+Disposition: fixed in #798, checked item by
+item against ad2c6b23. Already fixed before it: `close_send_count`, the
+`CLAUDE.md` lead sentence, the deadline check's `try_finalize_close`,
+`WriteHalf::Shutdown`'s "does not refuse later sends", the four
+`on_send_complete` comments and the io_uring `DriverCtx::close` history
+(#788); `conn::CLOSED`'s doc (#767). Still false and corrected there: the
+`on_close` sentence; the multishot cancel in `docs/recv-direct-design.md`;
+the mio design's test and TLS-table claims; the deadline check's call-site
+comment; the three "registers writable interest" sites; the four CHANGELOG
+sentences; the state-model note; "Marks it Closed"; `push_sqe_pair`; the
+truncated `flush_sends` sentence. `docs/recv-multi-identity-design.md`
+carries a superseded line. The five history paragraphs are rewritten as
+behaviour; `close_connection` gains a doc comment. "load-bearing" is
+replaced at the two code sites and in the three design docs; the dated
+journal entries keep it as records. Three of this finding's own citations
+were imprecise: the `mio/driver.rs` history is `finish_close`'s doc, nine
+lines above the cited ones; four journal entries carry "load-bearing", not
+three; and "direct file descriptor" is io_uring's own name for a fixed-file
+entry, so only the `push_sqe_pair` half of that item was false. The mio
+`DriverCtx::close` gained callers in #781, so "no mio caller" no longer
+holds. Also corrected: F8's disposition named `run_shutdown` for the arm in
+`handle_shutdown_cqe`, the gauge doc named #607 alone for a connection
+uncounted at the exit bound (#787's refused Close reaches the same state),
+and this entry's span line named a branch.
 
 ## Design limitations (questions for the owner, not fixes)
 

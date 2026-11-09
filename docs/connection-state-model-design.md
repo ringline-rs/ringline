@@ -1,8 +1,12 @@
 # Connection state model: name the read half, the arming, and the lifetime
 
 Note (2026-10-25): `ConnectionState::recv_arm` (`RecvArm`) and
-`recv_multishot_armed` were removed with the TCP provided-buffer ring.
-Connection state is `read`, `lifecycle` and `write`.
+`recv_multishot_armed` were removed with the TCP provided-buffer ring
+(#716), so the `recv_multishot_armed` follow-up below is moot.
+`ReadHalf::Cancelled` and `DriverCtx::cancel` were removed in #739;
+`ConnSendState::shutdown_pending` became `WriteHalf::ShutdownPending`
+(#374, `docs/write-half-design.md`). Connection state is `read`,
+`lifecycle` and `write`.
 
 **Status:** approved design, 2026-09-11. Behaviour-preserving refactor.
 **Motivation:** #368 (mio leaked slots) and #371 (io_uring dropped post-FIN
