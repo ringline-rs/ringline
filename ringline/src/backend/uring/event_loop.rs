@@ -11555,6 +11555,58 @@ mod tests {
         );
     }
 
+    /// The exit drain closes the fd carried by an install CQE it reaps. The
+    /// fd is a second reference to the socket; the connection's Close
+    /// releases the fixed file, and while that fd stays open the peer sees
+    /// no FIN (#800).
+    #[test]
+    fn shutdown_closes_the_fd_of_an_install_it_drains() {
+        let mut el = make_test_loop();
+        if !el.driver.ring.supports_park() {
+            return; // pre-6.8: no install can be in flight
+        }
+        let conn_index = accept_connection(&mut el);
+        let (ours, peer) = attach_socketpair(&mut el, conn_index);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver
+            .ring
+            .submit_park_install(conn_index, generation)
+            .expect("submit_park_install failed");
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation,
+            });
+        // The install completes inline at submit. Take its CQE, check that
+        // it carries an fd (a failed install would leave `ours` the last
+        // reference and the assertion below true without the drain's arm),
+        // and post it again for the exit drain to reap.
+        el.driver.ring.flush().unwrap();
+        let mut cqes = Vec::new();
+        el.driver.ring.reap(&mut cqes);
+        let ud = UserData::encode(OpTag::ParkInstall, conn_index, generation).raw();
+        let (_, installed, _) = *cqes
+            .iter()
+            .find(|(u, _, _)| *u == ud)
+            .expect("no ParkInstall CQE after the flush");
+        assert!(installed >= 0, "the install failed: {installed}");
+        el.driver.ring.submit_nop_inject(ud, installed).unwrap();
+
+        el.driver.run_shutdown();
+        assert!(el.driver.connections.get(conn_index).is_none());
+
+        // The Close released the fixed file and `ours` is dropped here, so
+        // the installed fd is the last reference to the socket. The peer
+        // reads EOF once it is closed too.
+        drop(ours);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            try_recv(&peer, &mut buf),
+            Some(0),
+            "the peer saw no FIN: the installed fd is still open"
+        );
+    }
+
     #[test]
     fn handle_tls_send_stale_slot_ignored() {
         let mut el = make_test_loop();

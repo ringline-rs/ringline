@@ -675,9 +675,10 @@ and this entry's span line named a branch.
   `socket_handed_off`; `run_shutdown` beyond F8; UDP; disk I/O.
 - Rustdoc under `cfg(has_io_uring)` was read, not rendered (`-D warnings`
   clean under the mio cfg and `--all-features`).
-- `run_shutdown`'s CQE drain has no `ParkInstall` arm, so an install CQE
-  drained at worker exit leaves its fd open (found by the review of #791,
-  recorded under F10); open at 5b92399a, issue #800.
+- `run_shutdown`'s CQE drain had no `ParkInstall` arm, so an install CQE
+  drained at worker exit left its fd open (found by the review of #791,
+  recorded under F10). Issue #800; fixed after this record: the drain
+  closes the fd, pinned by `shutdown_closes_the_fd_of_an_install_it_drains`.
 
 ## Reproductions
 

@@ -2769,6 +2769,13 @@ impl Driver {
             OpTag::AcceptMulti if result >= 0 => unsafe {
                 libc::close(result);
             },
+            // A park's install: the fd is a second reference to a socket
+            // whose Close `run_shutdown` submits, and no worker adopts it
+            // at exit. Left open it holds the socket past the Close, so the
+            // peer sees no FIN (#800).
+            OpTag::ParkInstall if result >= 0 => unsafe {
+                libc::close(result);
+            },
             _ => {}
         }
     }

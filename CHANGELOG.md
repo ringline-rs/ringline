@@ -947,6 +947,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: the worker's exit drain closes the fd carried by a park's
+  `FixedFdInstall` CQE. Before, the drain had no arm for it, and the fd of an
+  install whose CQE reached the drain (after a panic in a handler earlier in
+  the same batch, or when the loop stopped on an error with the install still
+  queued) stayed open for the rest of the process, holding the socket open
+  past the connection's Close (#800).
 - mio, TLS: `finish_close` sends no close_notify once a write shutdown has
   been requested, as the io_uring close paths do. The alert was encrypted
   and written to a socket whose write side was shut, where `EPIPE` discarded
