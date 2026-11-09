@@ -3080,7 +3080,10 @@ impl SendHalf {
     /// pool cannot admit the whole buffer (retryable once in-flight sends
     /// complete) and `InvalidInput` if the buffer is wider than the entire
     /// pool; on a TLS connection the pool is checked against the ciphertext
-    /// bound before anything is encrypted. On mio a plaintext send never
+    /// bound before anything is encrypted, and that bound includes one
+    /// record of headroom for a record rustls may have queued ahead of the
+    /// data (a key update or an alert), so a message whose ciphertext alone
+    /// would exactly fill the pool is refused too. On mio a plaintext send never
     /// fails for pool reasons. Nothing was queued or transmitted on those
     /// errors, so the same buffer may be sent again later. A TLS encryption
     /// failure (`Other`; on TLS 1.2, the traffic keys exhausted) closes the
@@ -3181,6 +3184,16 @@ impl SendHalf {
     /// On io_uring a TLS send made after `close()` returns `NotConnected`,
     /// because it would follow the alert. On mio it is queued and sent ahead of
     /// the alert, which mio writes once the queue drains.
+    ///
+    /// The connection's task is dropped when the close finalizes, which can
+    /// be in the same event-loop iteration, so a task that closes its own
+    /// connection is sure to run only up to its next `.await`. A `close()`
+    /// from another task or from `on_tick` against a task parked in an
+    /// `.await` drops that task without another poll.
+    ///
+    /// Closing a socket with unread inbound bytes makes the kernel send an
+    /// RST in place of the FIN, and a peer still sending sees a reset rather
+    /// than a clean close. Read to EOF before closing when that matters.
     ///
     /// Does nothing if the connection has already been released (its slot may
     /// now hold another connection), or when called outside the worker's
@@ -3783,6 +3796,11 @@ enum BackpressuredState {
 /// the FIFO; it is released when it reaches the head *and* the pool can cover
 /// that cost. Admission is strictly first-come-first-served per worker, so a
 /// large message cannot be starved by a stream of small ones.
+///
+/// The entry at the head submits only when its task polls the future, so a
+/// head entry whose task is woken but does not poll holds every bounded send
+/// on the worker behind it. Poll or drop the future promptly; dropping it
+/// hands the head to the next waiter.
 ///
 /// A message that could never fit the pool — even empty — is rejected with
 /// [`io::ErrorKind::InvalidInput`] before it joins the queue, because no
