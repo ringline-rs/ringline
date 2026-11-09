@@ -7,8 +7,11 @@
 #
 # `red_ref` is the branch's tests-only commit, before the fix. Step 1 runs the
 # named tests there and expects three failures (the tests that pin the new
-# behaviour) and five passes (the five pre-existing tests the list names).
-# Step 2 runs the same names at the branch head and expects eight passes.
+# behaviour) and five passes (the five pre-existing tests the list names);
+# the zero-copy test does not exist there. Step 1b runs the zero-copy test
+# at `red2_ref`, the commit that adds it, before its arm was fixed, and
+# expects it to fail. Step 2 runs every name at the branch head and expects
+# nine passes.
 # Step 3 is `experiments/uring-gate.toml`'s check list on the branch head,
 # with rustdoc added because the change edits doc comments behind
 # `has_io_uring`.
@@ -20,7 +23,9 @@ name = "ringline send-error-closes verify ({branch})"
 branch = "fix/uring-send-error-closes"
 repo   = "https://github.com/brayniac/ringline"
 red_ref = "bcb4be22066c63865e4aa4adf139a5ae6f979906"
-tests  = "a_terminal_send_error_closes_the_connection_with_the_error a_terminal_coalesced_send_error_closes_the_connection_with_the_error a_terminal_tls_send_error_records_the_read_error handle_send_error_releases_pool_slot handle_tls_send_error_closes_connection coalesced_eagain_waits_for_room a_failed_poll_fails_the_waiting_send queue_built_sends_submits_two_tls_slots_as_one_sendmsg"
+red2_ref = "713aecb9543ffbc682f3b17c71b9749f7d73018c"
+zc_test = "a_terminal_zero_copy_send_error_closes_the_connection_with_the_error"
+tests  = "a_terminal_send_error_closes_the_connection_with_the_error a_terminal_coalesced_send_error_closes_the_connection_with_the_error a_terminal_tls_send_error_records_the_read_error handle_send_error_releases_pool_slot handle_tls_send_error_closes_connection coalesced_eagain_waits_for_room a_failed_poll_fails_the_waiting_send queue_built_sends_submits_two_tls_slots_as_one_sendmsg a_terminal_zero_copy_send_error_closes_the_connection_with_the_error"
 
 [[jobs]]
 name = "verify"
@@ -69,6 +74,12 @@ cd /home/anvil
   echo "red_rc=$?"
   grep -E '^test |^test result' /home/anvil/red.out
   echo "red_summary=$(grep -E '^test result' /home/anvil/red.out | head -1)"
+  # Step 1b: the zero-copy test at the commit that adds it, before its fix.
+  git checkout -q {red2_ref} && git log --oneline -1
+  cargo test --locked -p ringline --lib -- {zc_test} > /home/anvil/red2.out 2>&1
+  echo "red2_rc=$?"
+  grep -E '^test |^test result' /home/anvil/red2.out
+  echo "red2_summary=$(grep -E '^test result' /home/anvil/red2.out | head -1)"
   git checkout -q {branch} && git log --oneline -1
 
   # Step 2: the same tests on the fix.
@@ -98,11 +109,16 @@ grep -q "^red_rc=[1-9]" verify.log || { echo "FAIL red: the tests passed on the 
 red=$(grep -oE "^red_summary=.*" verify.log)
 echo "$red"
 echo "$red" | grep -qE "5 passed; 3 failed" || { echo "FAIL red: expected 5 passed; 3 failed"; fail=1; }
-# Green: all eight pass.
+# Red 2: the zero-copy test fails before its arm was fixed.
+grep -q "^red2_rc=[1-9]" verify.log || { echo "FAIL red2: the zero-copy test passed before its fix"; fail=1; }
+red2=$(grep -oE "^red2_summary=.*" verify.log)
+echo "$red2"
+echo "$red2" | grep -qE "0 passed; 1 failed" || { echo "FAIL red2: expected 0 passed; 1 failed"; fail=1; }
+# Green: all nine pass.
 grep -q "^green_rc=0" verify.log || { echo "FAIL green"; fail=1; }
 green=$(grep -oE "^green_summary=.*" verify.log)
 echo "$green"
-echo "$green" | grep -qE "8 passed; 0 failed" || { echo "FAIL green: expected 8 passed; 0 failed"; fail=1; }
+echo "$green" | grep -qE "9 passed; 0 failed" || { echo "FAIL green: expected 9 passed; 0 failed"; fail=1; }
 for gate in gate_fmt gate_clippy_uring gate_clippy_mio gate_clippy_tls gate_doc gate_test_uring; do
   if ! grep -q "^${gate}=0" verify.log; then
     got=$(grep -oE "^${gate}=[0-9]+" verify.log | head -1)
