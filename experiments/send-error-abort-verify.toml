@@ -1,0 +1,147 @@
+# Red-then-green run for a failed send on io_uring closing the connection and
+# reporting its error to the reader, plus the uring gate on the result.
+#
+# macOS cannot type-check the io_uring path, so the failing tests and the fix
+# are both checked here, in an ephemeral VM on the `validation` agent, never by
+# a login to a rig host (CLAUDE.md, "Verifying io_uring code").
+#
+# `red_ref` is the branch's tests-only commit, before the fix. Step 1 runs the
+# six unit tests there: the five arm tests fail and the requested-close guard
+# passes, so the expected summary is `1 passed; 5 failed`. It then runs the
+# integration test `write_error_teardown_is_reported_to_the_reader` ten times:
+# on the unfixed tree the reader resolves `Ok(0)` when the send, not the
+# receive, takes the socket's error, so some of the ten fail; which ones is
+# the kernel's ordering. Step 2 runs both at the branch head and expects six
+# passes and ten of ten. Step 3 is the uring gate, as the other verify specs
+# run it.
+#
+# Prediction: red_rc non-zero with `1 passed; 5 failed`, red_it_fails >= 1;
+# green_rc 0 with `6 passed; 0 failed`, green_it_fails = 0. A red_it_fails of 0
+# means the integration test does not reach the race here and pins nothing on
+# this backend; the unit tests still do.
+#
+#   systemslab submit experiments/send-error-abort-verify.toml
+name = "ringline send-error-abort verify ({branch})"
+
+[params]
+branch = "fix/uring-send-error-aborts-the-connection"
+repo   = "https://github.com/brayniac/ringline"
+red_ref = "2712a41594ade1db02ed1581a5e32f571858b069"
+unit_tests = "send_error_aborts_the_connection after_a_requested_close_does_not_mark"
+it_test = "write_error_teardown_is_reported_to_the_reader"
+
+[[jobs]]
+name = "verify"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "debian-13-6.12"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/verify.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cat /etc/anvil-instance.json 2>/dev/null; echo
+rustc -V 2>/dev/null; uname -r
+cd /home/anvil
+{
+  uname -srm
+  echo "io_uring_disabled=$(sysctl -n kernel.io_uring_disabled 2>/dev/null || echo unset)"
+  cargo --version
+
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -3
+
+  ulimit -Sn 65536
+  echo "nofile_soft=$(ulimit -Sn)"
+
+  # This must be the io_uring build; a mio build would run none of the code
+  # under test and report green for it.
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  got=$(./target/debug/bench-server --print-backend)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; echo "gate_backend=1"; exit 1; }
+  echo "gate_backend=0 (backend=$got)"
+
+  # Ten runs of the integration test; prints how many failed and how many
+  # of those resolved Ok(0).
+  it_loop() {
+    fails=0; okzero=0
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      cargo test --locked -q -p ringline --test local_abort_errors -- {it_test} > /home/anvil/it.out 2>&1
+      rc=$?
+      if [ $rc -ne 0 ]; then
+        fails=$((fails + 1))
+        grep -q "got Ok(0)" /home/anvil/it.out && okzero=$((okzero + 1))
+        echo "  run $i: rc=$rc $(grep -E 'got Ok|got Err|panicked' /home/anvil/it.out | head -1)"
+      else
+        echo "  run $i: rc=0"
+      fi
+    done
+    echo "$1_it_fails=$fails"
+    echo "$1_it_okzero=$okzero"
+  }
+
+  # Step 1: the tests at the tests-only commit, on the unfixed code. Not
+  # piped: a piped cargo reports the pipe's status.
+  git checkout -q {red_ref} && git log --oneline -1
+  cargo test --locked -p ringline --lib -- {unit_tests} > /home/anvil/red.out 2>&1
+  echo "red_rc=$?"
+  grep -E '^test |^test result|panicked|left:|right:' /home/anvil/red.out
+  echo "red_summary=$(grep -E '^test result' /home/anvil/red.out | head -1)"
+  it_loop red
+  git checkout -q {branch} && git log --oneline -1
+
+  # Step 2: the same tests on the fix.
+  cargo test --locked -p ringline --lib -- {unit_tests} > /home/anvil/green.out 2>&1
+  echo "green_rc=$?"
+  grep -E '^test |^test result' /home/anvil/green.out
+  echo "green_summary=$(grep -E '^test result' /home/anvil/green.out | head -1)"
+  it_loop green
+
+  # Step 3: the uring gate.
+  cargo fmt --all --check; echo "gate_fmt=$?"
+  cargo clippy --locked --all-targets -- -D warnings; echo "gate_clippy_uring=$?"
+  cargo clippy --locked --all-targets --features force-mio -- -D warnings; echo "gate_clippy_mio=$?"
+  cargo clippy --locked --all-targets --features tls-buffered -- -D warnings; echo "gate_clippy_tls=$?"
+  RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ringline; echo "gate_doc=$?"
+  cargo test --locked --all; echo "gate_test_uring=$?"
+} 2>&1 | tee /home/anvil/verify.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+fail=0
+grep -q "^gate_backend=0" verify.log || { echo "FAIL gate_backend"; fail=1; }
+# Red: the five arm tests fail, the guard passes.
+grep -q "^red_rc=[1-9]" verify.log || { echo "FAIL red: the tests passed on the unfixed code"; fail=1; }
+red=$(grep -oE "^red_summary=.*" verify.log)
+echo "$red"
+echo "$red" | grep -qE "1 passed; 5 failed" || { echo "FAIL red: expected 1 passed; 5 failed"; fail=1; }
+grep -E "^red_it_(fails|okzero)=" verify.log
+grep -qE "^red_it_fails=([1-9]|10)$" verify.log || { echo "WARN red: the integration test did not fail on the unfixed code here"; }
+# Green: all six pass, and the integration test ten of ten.
+grep -q "^green_rc=0" verify.log || { echo "FAIL green"; fail=1; }
+green=$(grep -oE "^green_summary=.*" verify.log)
+echo "$green"
+echo "$green" | grep -qE "6 passed; 0 failed" || { echo "FAIL green: expected 6 passed; 0 failed"; fail=1; }
+grep -E "^green_it_(fails|okzero)=" verify.log
+grep -q "^green_it_fails=0$" verify.log || { echo "FAIL green: the integration test failed on the fix"; fail=1; }
+for gate in gate_fmt gate_clippy_uring gate_clippy_mio gate_clippy_tls gate_doc gate_test_uring; do
+  if ! grep -q "^${gate}=0" verify.log; then
+    got=$(grep -oE "^${gate}=[0-9]+" verify.log | head -1)
+    echo "FAIL ${gate}: ${got:-never reached}"
+    fail=1
+  else
+    echo "ok   ${gate}"
+  fi
+done
+exit $fail
+'''

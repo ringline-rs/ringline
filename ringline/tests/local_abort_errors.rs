@@ -1,9 +1,7 @@
-//! A connection the runtime aborts on its own account — a write that failed
-//! (on mio; on io_uring a failed plaintext send does not close the
-//! connection, audit finding F13), a receive that ran past
-//! `recv_accumulator_max` — reports the abort to a reader parked on
-//! `with_data_result`, as a socket read error does. Only a peer that closed
-//! cleanly resolves `Ok(0)`.
+//! A connection the runtime aborts on its own account (a write that failed,
+//! a receive that ran past `recv_accumulator_max`) reports the abort to a
+//! reader parked on `with_data_result`, as a socket read error does. Only a
+//! peer that closed cleanly resolves `Ok(0)`.
 
 mod common;
 
@@ -85,7 +83,6 @@ fn stop(rt: ringline::Runtime, handles: Vec<std::thread::JoinHandle<Result<(), r
     }
 }
 
-#[cfg(not(has_io_uring))]
 fn set_linger_zero(stream: &TcpStream) {
     use std::os::fd::AsRawFd;
     let linger = libc::linger {
@@ -107,13 +104,10 @@ fn set_linger_zero(stream: &TcpStream) {
 
 /// Reads one request, queues a response far larger than the socket buffers
 /// without awaiting it, then parks on `with_data_result`.
-#[cfg(not(has_io_uring))]
 struct RespondThenRead;
 
-#[cfg(not(has_io_uring))]
 const RESPONSE: usize = 8 * 1024 * 1024;
 
-#[cfg(not(has_io_uring))]
 impl AsyncEventHandler for RespondThenRead {
     #[allow(clippy::manual_async_fn)]
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
@@ -135,15 +129,11 @@ impl AsyncEventHandler for RespondThenRead {
 
 /// The peer resets the connection while the response is still draining, so
 /// the runtime's next write fails. The parked read reports that failure, not
-/// a clean close.
-///
-/// mio only: there the write error is what closes the connection. On io_uring
-/// a failed plaintext send does not close the connection, and whichever of
-/// the send and the receive the kernel runs first takes the socket's pending
-/// error: when the send takes it, the receive then reports a plain EOF and
-/// the read resolves `Ok(0)` (audit finding F13), so the outcome there is not
-/// fixed.
-#[cfg(not(has_io_uring))]
+/// a clean close, on both backends. On io_uring whichever of the send and the
+/// receive the kernel runs first takes the socket's pending error and the
+/// other reports a plain end of stream; the failed send closes the connection
+/// and records its error for the reader, so that order does not decide the
+/// outcome.
 #[test]
 fn write_error_teardown_is_reported_to_the_reader() {
     use std::io::Read;

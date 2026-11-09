@@ -58,10 +58,6 @@ struct InFlightSendEntry {
     sends: SendRun,
     /// Bytes of the entry the kernel has sent so far (`try_advance`).
     sent: u32,
-    /// The run includes TLS ciphertext, whose loss breaks the record
-    /// stream: a send error closes the connection (as `handle_tls_send`
-    /// does), where a plaintext run's error only drains the queue.
-    close_on_error: bool,
     /// A `SendMsgZc` of this entry returned `-ENOMEM`: the rest of the entry
     /// is sent with plain `send`s, which pin no pages.
     plain_send: bool,
@@ -94,7 +90,6 @@ impl InFlightSendSlab {
                 total_len: 0,
                 sends: SendRun::EMPTY,
                 sent: 0,
-                close_on_error: false,
                 plain_send: false,
                 pending_notifs: 0,
                 awaiting_notifications: false,
@@ -147,7 +142,6 @@ impl InFlightSendSlab {
         // attaches its id afterwards (`set_send_id`).
         entry.sends.clear();
         entry.sent = 0;
-        entry.close_on_error = false;
         entry.plain_send = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
@@ -167,7 +161,6 @@ impl InFlightSendSlab {
     /// point into `pool_slots` (one per gathered message). No guards, no ZC
     /// notifications — the pool slots are released together on the operation CQE.
     /// `iovecs_slice` and `pool_slots` must be the same length and <= MAX_IOVECS.
-    #[allow(clippy::too_many_arguments)]
     pub fn allocate_coalesced(
         &mut self,
         conn_index: u32,
@@ -176,7 +169,6 @@ impl InFlightSendSlab {
         pool_slots: &[u16],
         total_len: u32,
         sends: impl IntoIterator<Item = (SendId, u32, u32)>,
-        close_on_error: bool,
     ) -> Option<(u16, *const libc::msghdr)> {
         debug_assert!(iovecs_slice.len() <= MAX_IOVECS);
         debug_assert_eq!(iovecs_slice.len(), pool_slots.len());
@@ -202,7 +194,6 @@ impl InFlightSendSlab {
             entry.sends.push(id, len, end);
         }
         entry.sent = 0;
-        entry.close_on_error = close_on_error;
         entry.plain_send = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
@@ -399,12 +390,6 @@ impl InFlightSendSlab {
         self.free_list.len() * 2 < self.entries.len()
     }
 
-    /// Whether a send error on this coalesced entry closes its connection:
-    /// the run includes TLS ciphertext.
-    pub fn close_on_error(&self, idx: u16) -> bool {
-        self.entries[idx as usize].close_on_error
-    }
-
     /// Get the total original send length for an entry.
     pub fn total_len(&self, idx: u16) -> u32 {
         self.entries[idx as usize].total_len
@@ -574,9 +559,7 @@ mod tests {
         assert!(!slab.plain_send(idx), "allocate");
         mark_and_release(&mut slab, idx);
 
-        let (idx, _) = slab
-            .allocate_coalesced(0, 0, &iov, &[0], 4, [], false)
-            .unwrap();
+        let (idx, _) = slab.allocate_coalesced(0, 0, &iov, &[0], 4, []).unwrap();
         assert!(!slab.plain_send(idx), "allocate_coalesced");
     }
 
@@ -882,7 +865,7 @@ mod tests {
         for round in 0..(MAX_IOVECS as u32 + 4) {
             let id = completions.register(0, round);
             let (idx, _) = slab
-                .allocate_coalesced(0, 0, &iov, &[0], 4, [(id, 4, 4)], false)
+                .allocate_coalesced(0, 0, &iov, &[0], 4, [(id, 4, 4)])
                 .expect("slab room");
             if round % 2 == 0 {
                 let mut taken = slab.take_sends(idx);

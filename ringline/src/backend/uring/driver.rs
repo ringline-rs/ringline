@@ -1868,7 +1868,6 @@ impl Driver {
         let ci = conn_index as usize;
 
         let generation = self.connections.generation(conn_index);
-        let conn_is_tls = self.tls_table.as_ref().is_some_and(|t| t.has(conn_index));
         if let Some(pushed) = submit_coalesced_run(
             RunParts {
                 ring: &mut self.ring,
@@ -1879,7 +1878,6 @@ impl Driver {
             },
             conn_index,
             generation,
-            conn_is_tls,
             attempts,
         ) {
             return pushed;
@@ -2994,7 +2992,6 @@ pub(crate) fn submit_coalesced_run(
     p: RunParts<'_>,
     conn_index: u32,
     generation: u32,
-    conn_is_tls: bool,
     attempts: u8,
 ) -> Option<bool> {
     use crate::buffer::send_slab::MAX_IOVECS;
@@ -3047,11 +3044,6 @@ pub(crate) fn submit_coalesced_run(
                 send_count += 1;
             }
         }
-        // A run with TLS ciphertext closes the connection on a send error.
-        let tls_run = conn_is_tls
-            || p.send_queues[ci].queue.iter().take(n).any(|b| {
-                crate::completion::UserData(b.entry.user_data).tag() == Some(OpTag::TlsSend)
-            });
         // Put every lifted id back on its slot, for the paths that leave
         // the run queued and still owning its slots.
         let restore = |pool: &mut crate::buffer::send_copy::SendCopyPool| {
@@ -3080,7 +3072,6 @@ pub(crate) fn submit_coalesced_run(
                 .iter()
                 .flatten()
                 .map(|&(_, id, logical_len, end)| (id, logical_len, end)),
-            tls_run,
         ) {
             match p
                 .ring
