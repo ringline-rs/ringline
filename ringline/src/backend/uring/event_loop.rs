@@ -3072,7 +3072,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Close `conn_index` because a send on it failed, and report `err` to a
+    /// Close `conn_index` because a send on it failed or the TLS engine
+    /// rejected a received record, and report `err` to a
     /// reader parked on `with_data_result`, as a failed socket read is
     /// reported (mio's `abort_connection` is the same step). `read` is set
     /// first, so the close reads as a failure and not as the peer's close.
@@ -6540,7 +6541,11 @@ mod tests {
             adopted,
         );
         assert!(
-            !matches!(outcome, crate::tls::unbuffered::DriveOutcome::Error(_)),
+            !matches!(
+                outcome,
+                crate::tls::unbuffered::DriveOutcome::Error(_)
+                    | crate::tls::unbuffered::DriveOutcome::Overflow
+            ),
             "{outcome:?}"
         );
         assert_eq!(el.driver.accumulators.data(adopted), b"hello");

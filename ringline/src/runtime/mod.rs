@@ -859,7 +859,7 @@ impl Executor {
     /// Backends call this instead of `wake_recv` at every site where a recv
     /// failed with a real (non-`WouldBlock`) socket error, and where the
     /// runtime closes the connection on its own account (a failed write, the
-    /// accumulator cap on a plaintext connection). `with_data`
+    /// accumulator cap, a TLS record the engine could not process). `with_data`
     /// callers still observe EOF; `with_data_result` callers observe the
     /// error via [`take_recv_error`](Self::take_recv_error).
     pub(crate) fn fail_recv(&mut self, conn_index: u32, generation: u32, error: stdio::Error) {

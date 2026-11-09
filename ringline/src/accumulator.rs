@@ -459,11 +459,10 @@ impl DirectPool {
 
 use bytes::Buf;
 
-/// The error a reader parked on `with_data_result` gets when its plaintext
-/// connection is closed for running past `recv_accumulator_max`. One
-/// constructor, so both backends report the same kind. On a TLS connection
-/// the overflow is reported by the record layer as a `TlsRecvResult::Error`
-/// and the reader gets `Ok(0)`.
+/// The error a reader parked on `with_data_result` gets when its connection
+/// is closed for running past `recv_accumulator_max`. One constructor, used
+/// by both backends and by the plaintext and TLS paths, so the reader sees
+/// one kind.
 pub(crate) fn recv_cap_exceeded() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::QuotaExceeded,

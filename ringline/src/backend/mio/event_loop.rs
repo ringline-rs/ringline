@@ -734,7 +734,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Close `conn_index` because the runtime cannot go on with it — a write
-    /// failed, or a receive ran past `recv_accumulator_max` — and report
+    /// failed, a receive ran past `recv_accumulator_max`, or the TLS engine
+    /// rejected a received record — and report
     /// `err` to a reader parked on `with_data_result`, as a failed socket
     /// read is reported. `read` is set first, so the close reads as a
     /// failure and not as the peer's close.
@@ -1065,9 +1066,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             // Streamed past recv_accumulator_max. The bytes were
                             // already read off the socket, so the stream cannot
                             // continue coherently — close rather than OOM, as
-                            // the uring and mio-TLS overflow paths do (the TLS
-                            // one through a record-layer error, with no error
-                            // recorded for the reader).
+                            // the uring and TLS overflow paths do.
                             self.abort_connection(
                                 conn_index,
                                 crate::accumulator::recv_cap_exceeded(),

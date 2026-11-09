@@ -908,10 +908,13 @@ pub enum TlsRecvResult {
     HandshakeJustCompleted { peer_closed: bool },
     /// The connection cannot go on: a record the engine could not process
     /// (`InvalidData`, with rustls' error as the source), a decrypted record
-    /// that ran past `recv_accumulator_max` (`QuotaExceeded`), a failed read
-    /// of ciphertext (that read's error), or no send-pool slot for the
-    /// engine's output (`Other`). The backend closes the connection and
-    /// reports the error to a reader on `with_data_result`.
+    /// that ran past `recv_accumulator_max` (`QuotaExceeded`), the buffered
+    /// engine's `read_tls` refusing ciphertext (its `io::Error`), or no
+    /// send-pool slot for the engine's output (`Other`). The backend closes
+    /// the connection and reports the error to a reader on
+    /// `with_data_result`; before the connection is established, an outbound
+    /// connect waiter gets it wrapped in `ConnectionReset`, and a failed
+    /// inbound handshake has no task to tell.
     Error(io::Error),
     /// Peer sent close_notify or connection is cleanly closed.
     Closed,
