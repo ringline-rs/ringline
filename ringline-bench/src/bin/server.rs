@@ -54,6 +54,7 @@ struct EchoCfg {
     conn_chunk_size: usize,
     pin_to_core: bool,
     prefault_buffers: bool,
+    defer_recv_arm: bool,
     iowq_max_workers: Option<u32>,
     accept_mode: AcceptModeArg,
     /// Offer every connection for park after each response.
@@ -329,6 +330,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     prefault_buffers: bool,
 
+    /// (ringline echo) Arm a parked reader's receive after the worker's next
+    /// wait (`ConfigBuilder::defer_recv_arm`).
+    #[arg(long, default_value_t = false)]
+    defer_recv_arm: bool,
+
     /// (ringline echo) Cap each worker's bounded io-wq pool
     /// (`ConfigBuilder::iowq_max_workers`; 0 leaves the kernel default).
     /// Omitted, ringline's default applies. The knob under measurement in
@@ -474,6 +480,7 @@ fn main() {
             msg_size: args.msg_size,
             metrics_out: args.metrics_out.clone(),
             prefault_buffers: args.prefault_buffers,
+            defer_recv_arm: args.defer_recv_arm,
             iowq_max_workers: args.iowq_max_workers,
             echo_mode: args.echo_mode.unwrap_or_else(|| {
                 // No default: a spec must name the loop it measures.
@@ -624,6 +631,7 @@ fn run_ringline(cfg: EchoCfg) {
         conn_chunk_size,
         pin_to_core,
         prefault_buffers,
+        defer_recv_arm,
         iowq_max_workers,
         accept_mode,
         park,
@@ -731,6 +739,7 @@ fn run_ringline(cfg: EchoCfg) {
         .pin_to_core(pin_to_core)
         .sq_entries(256)
         .prefault_buffers(prefault_buffers)
+        .defer_recv_arm(defer_recv_arm)
         .max_connections(16384)
         // With --tls the slot must hold one whole TLS record (16413 bytes at
         // the default fragment size), which the unbuffered engine requires.

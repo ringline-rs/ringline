@@ -3141,7 +3141,9 @@ mod worker_exit_tests {
         }
     }
 
-    /// `launch()` ends when a worker has stopped before the listeners exist.
+    /// `launch()` returns when a worker stops while `launch()` runs, before or
+    /// after it listens, and once the worker has stopped every connection
+    /// reaches the other one.
     #[cfg(has_io_uring)]
     #[test]
     fn a_worker_stopping_during_launch_does_not_hang_it() {
@@ -3163,8 +3165,14 @@ mod worker_exit_tests {
                 .bind("127.0.0.1:0".parse().unwrap())
                 .launch::<Echo>()
                 .expect("launch");
-            // The listener went live after the worker stopped, so these reach
-            // the other worker only if `launch()` steered it around.
+            // The worker stops on its first loop iteration, before or after
+            // `launch()` listens: nothing orders the two. Once it has
+            // stopped, its socket is out of the steering and what the
+            // socket queued is closed, so every later connection reaches
+            // the other worker. A connection made before that can hash to
+            // the stopping worker's socket, or be handed to it by placement,
+            // and be closed (#783).
+            wait_for_exit(&handles, 1);
             let addr = runtime.bound_addr().unwrap();
             let results: Vec<Echoed> = (0..16)
                 .map(|_| echo(&mut TcpStream::connect(addr).unwrap()))

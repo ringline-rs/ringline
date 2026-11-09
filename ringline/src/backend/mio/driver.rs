@@ -1297,6 +1297,22 @@ pub(crate) mod tests {
         (0..n).map(|i| queue.enqueue(0, 0, 1, i as u32)).collect()
     }
 
+    /// Wait until `fd` polls writable, for at most `timeout`.
+    fn wait_writable(fd: RawFd, timeout: std::time::Duration) -> bool {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            let n = unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as libc::c_int) };
+            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return n > 0;
+        }
+    }
+
     /// Set `SO_SNDBUF`/`SO_RCVBUF` on a raw fd.
     fn set_socket_buf(fd: RawFd, option: libc::c_int, bytes: libc::c_int) {
         let rc = unsafe {
@@ -1682,12 +1698,17 @@ pub(crate) mod tests {
         // bytes, which no socket buffer is small enough to split, so this
         // test builds its own pool: 1 MiB over four 512 KiB slots reserves
         // two slots and cannot fit in any plausible socket buffer, shrunk or
-        // not. The drain below is single-threaded and reads only bytes it
-        // already knows were written, so nothing here depends on the host's
-        // scheduling or on what a kernel does with `SO_SNDBUF` — two earlier
-        // shapes did, and disagreed between macOS and a Linux CI guest: a
-        // reader-thread race that never drained 2 MiB, then a 64 KiB payload
-        // that Linux swallowed whole in the first flush.
+        // not. The drain below is single-threaded, reads only bytes it
+        // already knows were written, and waits for the socket to become
+        // writable after a flush that wrote nothing. A read waits for the
+        // kernel to deliver bytes already written, bounded by `attach_conn`'s
+        // 5 s read timeout; a writability wait is bounded at 5 s, and the
+        // whole drain at 90 s. On Linux the drain takes about 20 s: each
+        // read of the ~32 KiB a flush wrote waits about 600 ms.
+        // Three earlier shapes failed on one or the other: a reader-thread
+        // race that never drained 2 MiB, a 64 KiB payload that Linux
+        // swallowed whole in the first flush, and a 10,000-flush budget that
+        // a busy host spent on would-block flushes (#785).
         const PAYLOAD: usize = 1024 * 1024;
         let config = ConfigBuilder::new()
             .workers(1)
@@ -1755,17 +1776,23 @@ pub(crate) mod tests {
 
         // Drain and flush alternately on this one thread. Each read asks for
         // exactly the bytes the driver has already reported writing, so it
-        // can never block on bytes that are not there, and no sleep or
-        // timeout is involved: the loop is bounded by the socket buffer, not
-        // by the clock.
+        // never waits for a byte the driver has not written. A flush that writes
+        // nothing found the send buffer still full: the read opens the
+        // peer's small receive window, and the window update, the segments it
+        // admits and their ACKs are processed off this thread, so the buffer
+        // frees later. The loop waits for `POLLOUT` before flushing again.
+        let fd = driver.tcp_streams[idx]
+            .as_ref()
+            .expect("attached stream")
+            .as_raw_fd();
         let mut client = client;
         let mut sink: Vec<u8> = Vec::with_capacity(PAYLOAD);
         let mut buf = vec![0u8; 64 * 1024];
         let mut written_total = written as usize;
         let mut drained = 0usize;
-        let mut finished = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
 
-        for _ in 0..10_000 {
+        loop {
             while drained < written_total {
                 let want = (written_total - drained).min(buf.len());
                 client
@@ -1774,15 +1801,40 @@ pub(crate) mod tests {
                 sink.extend_from_slice(&buf[..want]);
                 drained += want;
             }
-            if finished {
-                break;
-            }
             let (done, w) = driver.flush_sends(conn_index).expect("flush");
             written_total += w as usize;
-            // Drain once more before leaving, so `sink` holds every byte.
-            finished = done;
+            if done {
+                // Drain once more before leaving, so `sink` holds every byte.
+                while drained < written_total {
+                    let want = (written_total - drained).min(buf.len());
+                    client
+                        .read_exact(&mut buf[..want])
+                        .expect("the peer reads bytes the driver already wrote");
+                    sink.extend_from_slice(&buf[..want]);
+                    drained += want;
+                }
+                break;
+            }
+            assert_eq!(
+                driver.send_copy_pool.free_count(),
+                reserved_free,
+                "the permit is not released mid-message"
+            );
+            assert!(
+                driver.settled_sends.is_empty(),
+                "no completion before the last byte"
+            );
+            if w == 0 {
+                assert!(
+                    wait_writable(fd, std::time::Duration::from_secs(5)),
+                    "the socket did not become writable within 5 s"
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the message did not drain within 90 s"
+            );
         }
-        assert!(finished, "the message never drained to the peer");
         assert_eq!(
             written_total, PAYLOAD,
             "every byte was written exactly once"
@@ -1806,9 +1858,6 @@ pub(crate) mod tests {
             "the completion reports the whole message, not the last chunk"
         );
         assert_eq!(driver.send_copy_pool.free_count(), 4, "permit returned");
-
-        // Closing the socket ends the reader's `read_to_end`.
-        driver.tcp_streams[idx] = None;
     }
 
     /// A refused admission reserves nothing, queues nothing, and produces no

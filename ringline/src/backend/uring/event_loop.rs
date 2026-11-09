@@ -474,6 +474,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // ahead of a hangup; peek before blocking rather than at the next
             // completion.
             self.recheck_hangups();
+            // Under `defer_recv_arm`, a wait with no completion pending would
+            // block, and arming the deferred receives after it would take a
+            // second, non-blocking pass. Arm them now instead; this enter
+            // submits them.
+            if self.driver.defer_recv_arm
+                && !self.driver.deferred_recv_arms.is_empty()
+                && !self.driver.ring.completion_pending()
+            {
+                self.arm_deferred_recvs();
+            }
             // Declining to block still has to reap: under DEFER_TASKRUN the
             // kernel runs task_work only on a GETEVENTS enter, and
             // `submit_and_wait(0)` carries no such flag. Going through
@@ -505,6 +515,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             self.drain_completions();
             diag_cqes_1st += self.driver.cqe_batch.len() as u64;
+            self.arm_deferred_recvs();
             // `handle_park_install` fills `park_ready` from the completions
             // just drained. Hand those over in the same iteration: the
             // connections have already left this worker and only the
@@ -1082,13 +1093,45 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// UDP re-arms: `return_udp_buffers` retries a re-arm that could not be
     /// submitted, and with no tick timeout a blocking wait could outlast every
     /// other completion.
+    ///
+    /// Deferred receives: the pre-wait arm skips them when
+    /// `completion_pending()` is true, which can mean task work that posts no
+    /// completion, so a blocking wait could hold an unarmed deferred receive
+    /// until an unrelated completion arrives.
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
         self.executor.ready_queue.is_empty()
             && self.driver.pending_finalize_closes.is_empty()
+            && self.driver.deferred_recv_arms.is_empty()
             && !self.driver.udp_rearm_due()
             && !shutting_down
+    }
+
+    /// Arm the receives `park_recv` deferred (`Config::defer_recv_arm`), for
+    /// connections still in the slot they were deferred in whose reader is
+    /// still parked. An arm that closes the connection wakes the reader.
+    fn arm_deferred_recvs(&mut self) {
+        if self.driver.deferred_recv_arms.is_empty() {
+            return;
+        }
+        let mut arms = std::mem::take(&mut self.driver.deferred_recv_arms);
+        // Newest first: a reader that parked twice arms with its latest
+        // `need`, and the older entry finds the receive armed.
+        for &(conn_index, generation, need) in arms.iter().rev() {
+            if self.driver.connections.generation(conn_index) != generation
+                || !self.executor.recv_waiters[conn_index as usize]
+            {
+                continue;
+            }
+            if self.arm_direct_recv(conn_index, need) {
+                self.executor.wake_recv(conn_index);
+            }
+        }
+        arms.clear();
+        if self.driver.deferred_recv_arms.is_empty() {
+            self.driver.deferred_recv_arms = arms;
+        }
     }
 
     /// Completion of a direct receive (`OpTag::RecvDirect`).
@@ -5682,6 +5725,25 @@ mod tests {
         el.driver.udp_pending_replenish.push((0, 0));
         el.driver.return_udp_buffers();
         assert!(el.driver.udp_awaiting_buffers.is_empty());
+    }
+
+    /// A queued deferred receive keeps the worker from blocking until
+    /// `arm_deferred_recvs` takes it.
+    #[test]
+    fn a_deferred_recv_arm_keeps_the_worker_from_blocking() {
+        let mut cfg = test_config();
+        cfg.defer_recv_arm = true;
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        el.driver.ring.flush().unwrap();
+        assert!(el.may_block());
+
+        // Slot 0 holds no connection, so the arm drops the entry.
+        el.driver.deferred_recv_arms.push((0, 0, None));
+        assert!(!el.may_block());
+        el.arm_deferred_recvs();
+        assert!(el.driver.deferred_recv_arms.is_empty());
+        assert!(el.may_block());
     }
 
     /// A hangup poll that cannot be submitted puts the connection on the
