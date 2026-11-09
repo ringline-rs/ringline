@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (#798) fixed; every finding fixed, the seven design limitations recorded
+- **Status:** closed — 14 findings recorded, every one fixed: F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (#798); the design limitations L1 to L6 stand, L2 and L3 stated on `SendHalf::close` by #803, and L7 was changed in #807; checked against 5b92399a
 - **Span:** 2026-11-07 → 2026-11-08 · tree a2e28073 (`main`) · PRs: F2 and F3 #767, F9 #768, F6 #769, F1 #771, F4 and F5 #774, F7 #776, F8 #779, F10 #791, F11 #792, F12 #793, F13 #794, F14 #798
 
 ## Goal
@@ -598,18 +598,20 @@ and this entry's span line named a branch.
 
 - **L1** A peer FIN tears the connection down unless a send is in flight, so
   a task awaiting an upstream reply or a timer at that moment is dropped once
-  the Close commits. Stated on the `recv_direct` module doc,
-  `docs/recv-direct-design.md:380-381` and `docs/connection-state-model-
+  the Close commits. Stated on the `connect` doc in `runtime/io.rs` ("TCP
+  does not tell a half-close from a close"), on `Connection::is_alive`, in
+  `docs/recv-direct-design.md:378-379` and `docs/connection-state-model-
   design.md` Follow-ups ("Half-close policy"); not on `with_data`,
-  `with_data_result` or `Connection::close`. A proxy author will hit it.
+  `with_data_result` or `SendHalf::close`. A proxy author will hit it.
 - **L2** `close()` followed by any `.await` drops the task at the same
   iteration's finalize: code after `close()` runs only to its next await
   (mio run: `ran_after=0 dropped=1`; io_uring same shape). Matches the Drop
-  contract; `SendHalf::close` does not say so. A `close()` from another task
-  or `on_tick` against a parked task gives it no poll at all.
+  contract; stated on `SendHalf::close` since #803. A `close()` from another
+  task or `on_tick` against a parked task gives it no poll at all.
 - **L3** "Reach the wire" means the socket: closing with unread inbound bytes
   makes the kernel RST, and a peer that kept sending lost 1.07 MiB of an
-  8 MiB response in one run. TCP behaviour; a line in the `close` doc.
+  8 MiB response in one run. TCP behaviour; stated on `SendHalf::close`
+  since #803.
 - **L4** The close deferral has no time bound on either backend for
   `Connection::close`; `CLOSE_NOTIFY_TIMEOUT` (5 s) applies only to the
   io_uring `DriverCtx::close`, reachable from the TLS encrypt-failure paths.
@@ -621,8 +623,8 @@ and this entry's span line named a branch.
   (`SendPollOut` included, so the earlier 15-bit concern is moot). A
   `MSG_DONTWAIT` send never sits in the kernel, so no Send CQE is long-lived.
 - **L7** TLS record-layer errors resolve `Ok(0)` by documented choice
-  (`runtime/io.rs:2719-2722`). Changed in #807 on the owner's decision: a
-  record the engine cannot process is `Err(InvalidData)` to
+  (`runtime/io.rs:2719-2722` at a2e28073). Changed in #807 on the owner's
+  decision: a record the engine cannot process is `Err(InvalidData)` to
   `with_data_result`, and a TLS overflow `Err(QuotaExceeded)`, on both
   backends.
 
@@ -668,12 +670,14 @@ and this entry's span line named a branch.
   `socket_handed_off`; `run_shutdown` beyond F8; UDP; disk I/O.
 - Rustdoc under `cfg(has_io_uring)` was read, not rendered (`-D warnings`
   clean under the mio cfg and `--all-features`).
+- `run_shutdown`'s CQE drain has no `ParkInstall` arm, so an install CQE
+  drained at worker exit leaves its fd open (found by the review of #791,
+  recorded under F10); open at 5b92399a, issue #800.
 
 ## Reproductions
 
-Scratch material, not checked in, under the session scratchpad
-(`/private/tmp/claude-501/-Users-brian-workspace-brayniac-ringline-review/522add12-21dd-43eb-99cb-5680d05bd0e4/scratchpad/`):
-`mio-wt/ringline/tests/audit_mio.rs` (F6, L2, L3, D1 slot hold, no-spin check);
-`err-repro/audit_gauge_repro.rs` (F2, F3) and
-`err-repro/mio_event_loop_s14_tests.patch` (F6 unit form). Each is a usable
-draft for the regression test its finding needs.
+The reproductions were scratch drafts, never checked in: an integration test
+on mio for F6, L2, L3 and the D1 slot hold with a no-spin check; a gauge
+reproduction for F2 and F3; a unit-test patch for F6. They were discarded on
+2026-11-08 after the last fix merged. Each code fix (F1 to F13) landed with
+a test that failed before it; F14 is documentation.
