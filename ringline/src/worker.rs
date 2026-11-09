@@ -3135,8 +3135,9 @@ mod worker_exit_tests {
         }
     }
 
-    /// `launch()` ends when a worker has stopped before the listeners exist,
-    /// and once that worker has exited every connection reaches the other.
+    /// `launch()` ends when a worker has stopped before it records the
+    /// listeners, and once that worker has exited every connection reaches
+    /// the other.
     #[cfg(has_io_uring)]
     #[test]
     fn a_worker_stopping_during_launch_does_not_hang_it() {
@@ -3158,12 +3159,12 @@ mod worker_exit_tests {
                 .bind("127.0.0.1:0".parse().unwrap())
                 .launch::<Echo>()
                 .expect("launch");
-            // `launch()` does not wait for the stopped worker. Its exit is
-            // steered around by `launch()` when it comes before the listeners
-            // exist, and by the worker itself when it comes after `launch()`
-            // has returned. A connection made before either has run can land
-            // on its socket and be closed with what is queued there (#783),
-            // so the connections wait for the exit.
+            // `launch()` does not wait for the stopped worker. If it exits
+            // before `launch()` records the listener (`add_listener`),
+            // `reapply_exits` steers around it; after that, the worker's own
+            // `stop_accepting` does. A connection made before whichever of
+            // those runs can land on its socket and be closed with that
+            // socket's queue (#783), so the connections wait for the exit.
             wait_for_exit(&handles, 1);
             let addr = runtime.bound_addr().unwrap();
             let results: Vec<Echoed> = (0..16)
@@ -3177,7 +3178,7 @@ mod worker_exit_tests {
         });
         let results = rx
             .recv_timeout(Duration::from_secs(90))
-            .expect("launch hung");
+            .expect("the launch thread hung or panicked");
         assert!(results.iter().all(|r| *r == Echoed::Yes), "{results:?}");
     }
 
@@ -3219,7 +3220,7 @@ mod worker_exit_tests {
     /// listener is added, as `launch()` runs it.
     #[cfg(target_os = "linux")]
     #[test]
-    fn an_exit_before_the_listener_exists_is_applied_once_it_does() {
+    fn an_exit_before_the_listener_is_added_is_applied_once_it_is() {
         use std::os::fd::AsRawFd;
         // A listening `SO_REUSEPORT` group of two sockets, one per worker, as
         // merged mode binds them.
