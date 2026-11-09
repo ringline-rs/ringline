@@ -658,6 +658,12 @@ pub(crate) struct Driver {
     pub(crate) hangup_poll_retries: Vec<(u32, u32)>,
     /// `Config::recv_direct_region`.
     pub(crate) recv_direct_region: usize,
+    /// `Config::defer_recv_arm`.
+    pub(crate) defer_recv_arm: bool,
+    /// Receives `park_recv` deferred under `defer_recv_arm`, as
+    /// `(conn_index, generation, need)`. `arm_deferred_recvs` arms them before
+    /// a wait that would block, or after the next wait.
+    pub(crate) deferred_recv_arms: Vec<(u32, u32, Option<usize>)>,
     /// Arrival timestamp shared by all UDP datagrams queued in one CQE
     /// drain batch. One clock read per batch instead of one per datagram;
     /// precision loss is bounded by the drain duration (microseconds).
@@ -1143,6 +1149,8 @@ impl Driver {
             hangup_rechecks: Vec::new(),
             hangup_poll_retries: Vec::new(),
             recv_direct_region: config.recv_direct_region,
+            defer_recv_arm: config.defer_recv_arm,
+            deferred_recv_arms: Vec::new(),
             udp_batch_recv_at: std::time::Instant::now(),
             tick_timeout_ts: if config.tick_timeout_us > 0 {
                 Some(
@@ -2767,6 +2775,13 @@ impl Driver {
             }
             // Merged accept: nothing will serve the connection.
             OpTag::AcceptMulti if result >= 0 => unsafe {
+                libc::close(result);
+            },
+            // A park's install: the fd is a second reference to a socket
+            // whose Close `run_shutdown` submits, and no worker adopts it
+            // at exit. Left open it holds the socket past the Close, so the
+            // peer sees no FIN (#800).
+            OpTag::ParkInstall if result >= 0 => unsafe {
                 libc::close(result);
             },
             _ => {}
