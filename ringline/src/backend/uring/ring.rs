@@ -186,6 +186,11 @@ impl Ring {
         self.engine.flush()
     }
 
+    /// See [`Engine::completion_pending`].
+    pub fn completion_pending(&self) -> bool {
+        self.engine.completion_pending()
+    }
+
     /// See [`Engine::reap`].
     pub(crate) fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>) {
         self.engine.reap(out);
