@@ -69,7 +69,9 @@ pub static RECV_ARRIVAL: ShardedCounterGroup = ShardedCounterGroup::new(recv_arr
 /// or handshake moves it neither way. Same rule on both backends. A
 /// connection still open when its worker exits is decremented as the worker
 /// closes it; on io_uring a connection whose Close has not completed when
-/// the worker's 10 s shutdown bound runs out (#607) is not. A parked
+/// the worker's 10 s shutdown bound runs out is not: one holding a zero-copy
+/// entry whose notification has not landed (#607), or one whose Close the
+/// ring refused on every pass of the exit drain (#787). A parked
 /// connection is decremented on the worker it leaves and incremented again
 /// on the worker that adopts it.
 #[metric(

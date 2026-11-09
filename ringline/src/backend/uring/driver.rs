@@ -400,7 +400,7 @@ impl Driver {
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
 ///
-/// # Drop order (load-bearing)
+/// # Drop order
 ///
 /// `ring` MUST be declared first so it drops *last*. `ProvidedBufRing` and
 /// `InFlightSendSlab` reference kernel-pinned memory whose lifetime is tied
@@ -1295,11 +1295,8 @@ impl Driver {
     /// A previous occupant's close can leave `in_flight`/`close_pending` set:
     /// its final send CQE can arrive after the slot was released, and the
     /// CQE's identity check correctly refuses to touch the slot's state —
-    /// so nothing else clears it. (Before the identity checks, the stale
-    /// CQE's error path *was* what cleared these flags — misattributed
-    /// cleanup the next occupant accidentally depended on.) Without this
-    /// reset the next occupant's first send parks behind a completion that
-    /// will never come.
+    /// so nothing else clears it. Without this reset the next occupant's
+    /// first send parks behind a completion that will never come.
     pub(crate) fn reset_send_state(&mut self, conn_index: u32) {
         self.forwards_recv_buf[conn_index as usize] = false;
         self.forward_recv_held[conn_index as usize] = false;
@@ -1396,6 +1393,13 @@ impl Driver {
         *slot = drain;
     }
 
+    /// Request the close of `conn_index`: mark it `Closing`, set
+    /// `close_pending`, and leave its send queue to drain through
+    /// `submit_next_queued`; the send handlers register the connection for
+    /// the end-of-iteration drain (`defer_finalize_close`), which commits
+    /// the Close once nothing is in flight and the queue is empty. Park
+    /// state is released here, since a slot that is never reused would
+    /// hold a `ParkState` for the life of the process.
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         if let Some(conn) = self.connections.get_mut(conn_index) {
             if conn.close_requested() {
@@ -1413,35 +1417,15 @@ impl Driver {
         self.set_park_drain(conn_index, None);
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
-        // An active chain keeps its state: its SQEs are already in the kernel
-        // and their CQEs drive the chain accounting to completion (an error
-        // in one linked op cancels the rest — still CQEs). `close_pending`
-        // is set below and `try_finalize_close` defers the Close until the
-        // chain drains, so the Close cannot recycle the slot while chain
-        // CQEs are outstanding. (An earlier version called
-        // `chain_table.cancel` here, which *dropped* the accounting and let
-        // the Close race the still-in-flight chain sends.)
-        // Defer the actual `Close` SQE until every queued send has
-        // drained through the regular `submit_next_queued` cycle and
-        // its CQE has been handled. Two earlier mistakes are worth
-        // calling out:
-        //
-        //   (a) The original code called `drain_conn_send_queue`,
-        //       which freed slab/pool resources for queued sends
-        //       *without ever submitting them* — silently dropping
-        //       every byte queued behind the in-flight send.
-        //
-        //   (b) An interim attempt pushed all queued SQEs in parallel
-        //       at close time, but io_uring doesn't strictly order
-        //       independent SQEs, so the kernel could process them
-        //       out of order and scramble the byte stream. (Visible
-        //       in release mode where the SQEs land close together.)
-        //
-        // The current strategy preserves the queue's serialized
-        // drain: leave in_flight + queue alone, mark `close_pending`,
-        // and let the send handlers register the connection for the
-        // end-of-iteration drain (`defer_finalize_close`) once both
-        // `in_flight` is false and the queue is empty.
+        // An active chain keeps its state: its SQEs are in the kernel and
+        // their CQEs drive the chain accounting (an error in one linked op
+        // cancels the rest, still with CQEs); `try_finalize_close` waits for
+        // it, so the Close cannot recycle the slot under them. Cancelling
+        // the chain here would drop that accounting.
+        // The queue is neither released nor submitted here: entries not yet
+        // submitted carry bytes the peer is owed, and io_uring does not
+        // order independent SQEs (Domain Invariant 2), so they go out one
+        // at a time through `submit_next_queued`.
         let state = &mut self.send_queues[conn_index as usize];
         state.close_pending = true;
         if state.in_flight {

@@ -749,14 +749,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a read error requests teardown immediately (`close_connection`), and
   teardown finalizes once queued sends have drained — a response sent after
   the peer's FIN is delivered in full — after which the connection task is
-  dropped. (io_uring itself commits the Close before the task can respond
-  when nothing was queued at the FIN; tracked as #371.) Previously a mio task could keep running indefinitely after
-  EOF. `RecvMode::Closed` is now set only by `close_connection` on both
-  backends. The deferral is unbounded on mio. Design: `docs/mio-close-lifecycle-design.md`.
+  dropped. Previously a mio task could keep running indefinitely after
+  EOF. `Lifecycle::Closing` is entered only through `close_connection` on
+  both backends. The deferral is unbounded on mio. Design: `docs/mio-close-lifecycle-design.md`.
 
-- Internal: connection lifecycle state is now three explicit fields on
-  `ConnectionState` (`recv_arm`, `read`, `lifecycle`) instead of
-  `RecvMode` doing triple duty; readers use `recv_finished()` and
+- Internal: connection lifecycle state is now explicit fields on
+  `ConnectionState` (`read`, `lifecycle` and `write`; a `recv_arm` field was
+  removed with the TCP provided-buffer ring, #716) instead of `RecvMode`
+  doing triple duty; readers use `recv_finished()` and
   `close_requested()`. No observable change. Design:
   `docs/connection-state-model-design.md`.
 
@@ -1720,8 +1720,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - mio: while queued sends drained to a peer that had half-closed, the event
   loop re-registered READABLE interest on every iteration, which re-reported
   the peer's EOF and spun the worker at 100% CPU until the peer read.
-  Interest is WRITABLE-only once the receive side is closed, and a closed
-  receive side is no longer read. (found while fixing #368)
+  Interest is registered once, as READABLE|WRITABLE, and never modified
+  (#395), and a closed receive side is no longer read. (found while fixing
+  #368)
 - io_uring: a response sent after the peer's FIN was never delivered when
   the send queue was empty at the FIN — `close_connection` committed the
   Close SQE synchronously, before the task was polled, so the task's send

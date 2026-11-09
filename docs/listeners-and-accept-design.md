@@ -184,7 +184,7 @@ So tier 2 attaches **`SKF_AD_RANDOM % live_count`**, unprivileged CBPF, with a
 jump chain mapping the result to the live socket's index. No packet parsing, no
 map, no privileges.
 
-Not yet measured, and load-bearing before tier 2 ships: what happens to
+Not yet measured, and decisive before tier 2 ships: what happens to
 connections **already queued** on a socket when it leaves the rotation. They
 stay where they landed, so exclusion stops new arrivals but does not empty the
 queue — taking a worker out still needs a drain before its listener closes.
@@ -804,7 +804,7 @@ This has to be applied to every claim in this section:
 
 - **Survives.** The worker-count shape in CQE/op and CPU: 0.47 / 0.91 / 1.88 /
   1.86 spans 4x against an 18.6% floor, and CPU 4.83 → 18.04 cores spans 3.7x.
-  These are the load-bearing results of this section.
+  These are the results this section rests on.
 - **Survives.** The p50 trend, 3206.9 → 1530.8 → 767.4us across `w2` → `w4` →
   `w8`: 2x steps against a 32.8% floor.
 - **ESTABLISHED: the p99 advantage at `w4`.** Five `w4` replicates against six

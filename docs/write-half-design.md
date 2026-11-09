@@ -52,7 +52,7 @@ without a named state after #373 gave the read half one.
 | Event | io_uring | mio |
 |---|---|---|
 | `shutdown_write`, queue empty and nothing in flight | `submit_shutdown`; `write = Shutdown` | `stream.shutdown(Write)`; `write = Shutdown` |
-| `shutdown_write`, sends outstanding | `write = ShutdownPending` | `write = ShutdownPending`; `mark_send_dirty(idx)` so the flush pass registers writable interest |
+| `shutdown_write`, sends outstanding | `write = ShutdownPending` | `write = ShutdownPending`; `mark_send_dirty(idx)` so the flush pass visits the queue |
 | `shutdown_write` when `write != Open` | no-op (idempotent) | no-op |
 | `shutdown_write` after the Close is committed (`close_submitted`) | no-op, as today | after `close_requested()`: no-op; the deferred finalize's `close(fd)` emits the FIN once the drain completes. Observable difference only for `close()` followed by `shutdown_write()` with the peer still sending: unread bytes at `close(fd)` produce an RST without a preceding FIN, where the old code FIN'd first. io_uring already behaves this way. |
 | queue drains with `ShutdownPending` | `None` arm of `submit_next_queued`: `submit_shutdown`; `write = Shutdown` and `shutdown_inflight` set before the push; a refused SQE goes on `pending_shutdown_retries`, which `drain_shutdown_retries` pushes again every 4th tick. `SendHalf::shutdown_write` promises a FIN and returns nothing, so a refusal is not reported | `flush_sends` tail, once `pending_sends` is empty: `shutdown(Write)`; `write = Shutdown` |

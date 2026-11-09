@@ -107,8 +107,7 @@ of these rules; backend code comments point at them.
    finalize is now deferred until `pending_sends` is empty, it runs on a
    drained socket and the write succeeds in practice, and keeping it there
    avoids duplicating TLS logic between `Driver::close_connection` and the
-   `DriverCtx` close (which cannot reach the TLS table). Decided during
-   planning.
+   `DriverCtx` close. Decided during planning.
 
 ## io_uring
 
@@ -153,10 +152,11 @@ In `ringline/tests/echo.rs`, all run on both backends:
   iterations while the response drains to a peer that does not read;
   guards against the READABLE re-report spin. Runs on both backends.
 
-The mio driver has no unit-test harness (no `#[cfg(test)]` module in
-`backend/mio/`), so the `close_connection`/`finish_close` flag behaviour is
-covered by the integration tests above plus a `debug_assert!` in
-`drain_pending_closes` that every entry carries `close_pending`.
+The `close_connection`/`finish_close` flag behaviour is covered by the
+integration tests above plus a `debug_assert!` in `drain_pending_closes` that
+every entry carries `close_pending`. (`backend/mio/driver.rs` and
+`backend/mio/event_loop.rs` have `#[cfg(test)]` modules now; they were added
+after this design.)
 
 ## Docs
 

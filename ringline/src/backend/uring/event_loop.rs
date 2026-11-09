@@ -557,8 +557,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_send_pollout_retries();
             self.driver.tick_count += 1;
 
-            // Check close_notify deadlines — force-close connections where
-            // close_notify was sent but the close CQE never arrived.
+            // Check close_notify deadlines: force-close a TLS connection whose
+            // close_notify was queued and whose sends have not drained by the
+            // deadline, so its Close has not been committed.
             self.check_close_notify_deadlines();
 
             // Drain waker-based ready queue (from wakers fired during poll).
@@ -4834,12 +4835,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// armed set is permanently empty and this method is a single
     /// `Vec::is_empty()` check; for TLS workloads the set is bounded
     /// by the number of concurrent in-flight TLS graceful shutdowns
-    /// (typically 0 or single digits).
-    ///
-    /// Profiling the redis bench at 1 client × 64 B (i.e. plain TCP)
-    /// showed the previous O(N over all slots) walk at ~25 % of
-    /// worker CPU because it ran on every event-loop iteration; the
-    /// armed-set version drops that to noise.
+    /// (typically 0 or single digits). A walk over every slot here cost
+    /// about 25 % of worker CPU in the redis bench at 1 client × 64 B,
+    /// because this runs on every iteration.
     fn check_close_notify_deadlines(&mut self) {
         if self.driver.close_notify_armed.is_empty() {
             return;

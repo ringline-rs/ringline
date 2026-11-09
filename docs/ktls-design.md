@@ -22,7 +22,7 @@ Note (2026-10-25): the TCP provided-buffer ring was removed, with
 `OpTag::RecvMulti` and the fallback receive.
 
 **Status:** Scoping only. No code, no plan of tasks, no commitment. Every
-load-bearing premise below carries a verification record; the ones that could
+premise below that the design rests on carries a verification record; the ones that could
 not be verified are labelled, not smoothed over.
 **Date:** 2026-09-05
 **Related:** [`tls-unbuffered-design.md`](tls-unbuffered-design.md),
@@ -240,7 +240,7 @@ own [P-7] and cannot be a gate on work we could validate.
 
 ## Premise register
 
-Every load-bearing claim, its verification status, and where to check it.
+Every claim the design rests on, its verification status, and where to check it.
 "Verified" means the primary source was opened and the cited lines read, or the
 probe was run and its output is in the experiment log.
 
@@ -388,7 +388,7 @@ gracefully to the 2-pass path: exceeding `MAX_MSG_FRAGS` scatter entries
 (`= MAX_SKB_FRAGS`, `include/linux/skmsg.h:16`), and any `-EFAULT` from the
 page pin (`goto fallback_to_reg_send` at `:1109`, label at `:1134`).
 
-**This was the load-bearing unverified step, and it is now measured.** [P-21]
+**This was the unverified step the design rested on, and it is now measured.** [P-21]
 When this section was first written the source said the pinned-pages branch
 *should* be taken, but nothing had confirmed io_uring actually lands there
 rather than in the copy path — and io-wq offload plausibly runs in a different
@@ -553,7 +553,7 @@ reference point.
 The prior effort's *only* surviving justification for the unbuffered engine is
 that `dangerous_extract_secrets` lives on `UnbufferedConnectionCommon`. The
 conclusion holds; **the stated reason never did**, and that is worth recording,
-because it was the load-bearing sentence under a merged feature. That method is
+because it was the sentence a merged feature rested on. That method is
 implemented on the *buffered* types too — `ClientConnection` (`client_conn.rs:777`),
 `ServerConnection` (`server_conn.rs:736`), `ConnectionCommon<Data>` (`conn.rs:472`)
 and `Connection` (`conn.rs:125`) — so it never distinguished the two engines at
@@ -811,7 +811,7 @@ mechanism. Under kTLS, ringline must:
   open* in the kernel (`pending_open_record_frags`), so anything that
   interleaves on that socket corrupts the record stream. Invariant 2's
   per-connection send queue already guarantees this, but the coupling is new
-  and now load-bearing.
+  and now relied on.
 
 It also interacts with the coalescing interlock the unbuffered effort found by
 accident (journal, "an accidental interlock"): `submit_next_queued` coalesces

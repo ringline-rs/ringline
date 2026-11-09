@@ -490,7 +490,8 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a close for a direct file descriptor.
+    /// Submit the `Close` of a connection's fixed (direct) descriptor,
+    /// hard-linked behind `lead` unless it is `Nothing`.
     pub fn submit_close(&mut self, conn_index: u32, lead: CloseLead) -> io::Result<()> {
         let user_data = UserData::encode(OpTag::Close, conn_index, 0);
         let close = Sqe::new(
@@ -503,7 +504,7 @@ impl Ring {
         // requests holding it complete: before Linux 6.13, earlier requests
         // on any registered file or buffer; from 6.13, this connection's own
         // requests. See `CloseLead`. The lead is hard-linked, so the Close
-        // runs after it even when it fails. `push_sqe_pair` pushes both
+        // runs after it even when it fails. `Engine::push_pair` pushes both
         // together, so a submit cannot separate them. Config validation
         // guarantees an SQ of at least two entries.
         let first = match lead {

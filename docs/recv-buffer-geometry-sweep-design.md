@@ -68,7 +68,7 @@ workloads.
 > 256 KiB becomes *worse* than the default. Treat the forwarding rows below as a
 > record of the pre-gathering runtime; the arms should be re-run on a gathered
 > build before they are cited. `forward_to`'s sizing note is
-therefore load-bearing rather than advisory. Note the recommendation itself is
+therefore binding rather than advisory. Note the recommendation itself is
 fan-in dependent — 1 MiB × 4 is best at c64 (17.07 Gbit/s vs 11.32) while 256
 KiB × 16 is best at c1024 (11.96 vs 9.82) — so the note should give a range and
 say why, not a number.

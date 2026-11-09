@@ -1135,7 +1135,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // Re-arm interest exactly once, here, when the outbound
                 // connection becomes established.
                 //
-                // This is load-bearing and was found by deleting it: mio
+                // Required, and found by deleting it: mio
                 // registers the stream while the connect is still in flight,
                 // and with edge-triggered epoll the readiness that matters
                 // arrives around establishment. Without a MOD at this point
@@ -1399,7 +1399,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// An entry whose `pending_sends` is still non-empty (and whose stream
     /// is still registered) is retained for a later pass: the task stays
     /// alive so its awaited sends can complete, `flush_all_pending_sends`
-    /// registers writable interest for it, and the writable event brings
+    /// writes what the socket takes, and the next writable event brings
     /// the loop back here. A write error clears `pending_sends`
     /// (`fail_connection_on_send_error`), which ends the deferral.
     ///
