@@ -908,6 +908,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring, TLS: a forced close now runs once. When the close_notify
+  deadline fires while a `Shutdown` is still in the kernel,
+  `force_finalize_close` abandons the queue and `try_finalize_close` waits
+  for the Shutdown CQE; the deadline stayed armed, so the force ran again on
+  every tick until then, each run reporting send capacity it had not
+  released. The force now disarms the deadline, and the Shutdown CQE commits
+  the Close. `fail_send_ids` reports released send capacity only when the
+  queue it drained had entries, so reactivating a slot with an empty queue
+  reports none. Audit finding F11 of
+  `docs/journal/2026-11-connection-close-audit.md`.
+
 - io_uring, merged accept mode: a park install CQE for a slot's previous
   occupant no longer takes the current occupant's park. `handle_park_install`
   checked the generation after it had taken the slot's `park_in_flight`
