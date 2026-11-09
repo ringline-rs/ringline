@@ -1092,9 +1092,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// submitted, and with no tick timeout a blocking wait could outlast every
     /// other completion.
     ///
-    /// Deferred receives: `completion_pending()` also reports task work that
-    /// posts no completion, so a blocking wait could hold an unarmed deferred
-    /// receive until an unrelated completion arrives.
+    /// Deferred receives: the pre-wait arm skips them when
+    /// `completion_pending()` is true, which can mean task work that posts no
+    /// completion, so a blocking wait could hold an unarmed deferred receive
+    /// until an unrelated completion arrives.
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);

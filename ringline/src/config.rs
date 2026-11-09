@@ -963,7 +963,7 @@ impl ConfigBuilder {
     /// echo benchmark (512 connections, 256-byte messages, 8 workers), server
     /// CPU per operation fell from 21.11 to 19.10 µs in closed loop. At 200k
     /// and 400k operations per second offered it did not fall, and syscalls
-    /// per operation at 200k rose from 0.81–0.85 to 0.96–0.99.
+    /// per operation at 200k rose from 0.81-0.85 to 0.96-0.99.
     ///
     /// Deferring is skipped when the wait would block: if no completion is
     /// ready and the kernel holds no task work, the worker arms the deferred
