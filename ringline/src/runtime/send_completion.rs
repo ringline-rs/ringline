@@ -82,6 +82,12 @@ pub(crate) struct SendId {
     generation: u32,
 }
 
+/// The owner of an entry whose owning task is gone while the future that
+/// holds it is alive, handed to a task that has not polled it yet. A wake
+/// for it reaches no task ([`Executor::wake_task`] finds no slot); the next
+/// poll records the polling task as the owner.
+pub(crate) const NO_OWNER: u32 = u32::MAX;
+
 /// Where one operation stands.
 enum Completion {
     /// Waiting for admission, in the FIFO. `generation` is the target
@@ -965,11 +971,14 @@ mod tests {
         assert_eq!(q.submitted_len(), 0);
     }
 
+    /// Entries on A that A's own task owns at A's release are held by
+    /// futures the task handed off (its own cancelled themselves when it was
+    /// dropped). The release treats them as any other entry on A: the open
+    /// ones record the provisional abort and a resolved one keeps its
+    /// result; none is woken, since the owner is gone and the holder has
+    /// not polled.
     #[test]
-    fn remove_connection_drops_entries_owned_by_the_dead_connection_task() {
-        // Owner task id == conn index: the connection's own task, whose
-        // future task_slab.remove already dropped. Nothing can take a
-        // result for it, so no Done entry may be left behind.
+    fn remove_connection_keeps_entries_the_dead_task_handed_off() {
         const A: u32 = 3;
         let mut q = SendCompletions::new();
         let in_flight = q.enqueue(A, 0, 1, A);
@@ -982,12 +991,21 @@ mod tests {
 
         let wakes = q.remove_connection(A);
         assert_eq!(wakes, vec![task(40)], "only the new head is woken");
-        assert_eq!(q.waiting_len(), 1);
-        assert_eq!(q.submitted_len(), 1, "only the in-flight op remains");
-        assert!(q.take_result(waiting).is_none());
-        assert!(q.take_result(done).is_none());
-        assert_eq!(q.complete(in_flight, Ok(1)), None, "abandoned: no wake");
-        assert_eq!(q.submitted_len(), 0, "its completion removed it");
+        assert_eq!(q.waiting_len(), 1, "A's waiter left the FIFO");
+        assert_eq!(q.submitted_len(), 3, "all three of A's entries are kept");
+        assert_eq!(
+            kind_of(q.take_result(waiting)),
+            io::ErrorKind::ConnectionAborted,
+            "never submitted: the abort stands"
+        );
+        assert_eq!(
+            q.take_result(done).expect("kept").expect("ok"),
+            1,
+            "a delivered send keeps its result"
+        );
+        assert_eq!(q.complete(in_flight, Ok(1)), Some(NO_OWNER));
+        assert_eq!(q.take_result(in_flight).expect("resolved").expect("ok"), 1);
+        assert_eq!(q.submitted_len(), 0);
         assert!(q.turn(other, 1));
     }
 
@@ -1137,8 +1155,13 @@ mod tests {
     /// `remove_connection` finds an entry through its current owner: after
     /// `set_owner` moves it to connection task `C`, tearing `C` down drops
     /// it, and tearing down its first owner does not.
+    /// An entry on D that C's task owns is left in flight when C is
+    /// released: C's own futures cancelled themselves when C's task was
+    /// dropped, so an entry still owned by C is held by a future handed to
+    /// a task that has not polled it yet. The entry has no owner to wake
+    /// until that poll.
     #[test]
-    fn remove_connection_follows_an_entry_s_current_owner() {
+    fn remove_connection_leaves_an_entry_its_dead_task_handed_off_in_flight() {
         const B: u32 = 2;
         const C: u32 = 3;
         const D: u32 = 7;
@@ -1148,9 +1171,15 @@ mod tests {
 
         assert!(q.remove_connection(B).is_empty(), "B no longer owns it");
         assert_eq!(q.live(), 1);
-        q.remove_connection(C);
-        assert_eq!(q.complete(id, Ok(1)), None, "C's teardown abandoned it");
-        assert_eq!(q.live(), 0, "and its completion freed it");
+        assert!(q.remove_connection(C).is_empty(), "nobody to wake yet");
+        assert_eq!(q.live(), 1, "kept for the future that holds it");
+        assert_eq!(
+            q.complete(id, Ok(1)),
+            Some(NO_OWNER),
+            "the driver's result lands with no owner to wake"
+        );
+        assert_eq!(q.take_result(id).expect("resolved").expect("ok"), 1);
+        assert_eq!(q.live(), 0);
     }
 
     /// A slot freed by one operation is reused by the next, and an id the
@@ -1222,77 +1251,94 @@ mod tests {
         );
         assert_eq!(q.head_ready(1), Some(task(6)));
     }
-    // A proxy task on connection C with a bounded send outstanding on
-    // connection D — the shape `send_backpressured`'s own docs advertise.
-    // When C is torn down its future's `Drop` does not run (teardown is not
-    // inside a driver-state guard on either backend), so the queue has to
-    // recognise that the *owner* died even though the entry names a
-    // different connection. Left behind, the entry's task id can never be
-    // woken, and at the head it stalls every bounded send on the worker.
+    /// A proxy task on connection C with a bounded send waiting on
+    /// connection D, handed with its `SendHalf` to a task that has not
+    /// polled it when C is released. The entry keeps its place in the FIFO:
+    /// a waiting entry leaves the FIFO only through its future's drop
+    /// (`cancel`), and the future is alive. Its wake goes to no task until
+    /// that poll records an owner.
     #[test]
-    fn removing_a_connection_clears_entries_its_task_owned_on_other_connections() {
+    fn removing_a_connection_keeps_a_waiting_entry_its_task_handed_off_at_the_head() {
         let mut q = SendCompletions::new();
         const C: u32 = 3;
         const D: u32 = 7;
 
-        // Owned by C's task, targeting D, and at the head.
-        let stranded = q.enqueue(D, 1, 1, C);
-        // A healthy entry behind it, owned by a standalone task.
+        let handed_off = q.enqueue(D, 1, 1, C);
         let behind = q.enqueue(D, 1, 1, 9 | STANDALONE_BIT);
 
-        q.remove_connection(C);
+        assert!(q.remove_connection(C).is_empty(), "the head did not move");
 
-        assert!(
-            q.turn(behind, 1),
-            "the entry behind must reach the head once its dead-owner blocker is gone"
+        assert!(q.turn(handed_off, 1), "still the head");
+        assert!(!q.turn(behind, 1));
+        assert_eq!(
+            q.head_ready(1),
+            Some(NO_OWNER),
+            "a wake for it reaches nobody"
         );
-        assert!(
-            q.take_result(stranded).is_none(),
-            "the stranded entry is cancelled outright, not parked for an owner that cannot run"
-        );
-        assert_eq!(q.waiting_len(), 1);
-        assert_eq!(q.submitted_len(), 0);
+        assert_eq!(q.waiting_len(), 2);
+
+        // The holder polls it: it owns the head and admission proceeds.
+        q.set_owner(handed_off, task(5));
+        assert_eq!(q.head_ready(1), Some(task(5)));
+        assert_eq!(q.mark_submitted(handed_off), Some(9 | STANDALONE_BIT));
+        assert_eq!(q.complete(handed_off, Ok(1)), Some(task(5)));
+        assert_eq!(q.take_result(handed_off).expect("resolved").expect("ok"), 1);
     }
 
-    /// A poll proves the future is alive. An entry whose creator's
-    /// connection task returned before the future was first polled by the
-    /// task it was handed to is `Abandoned` by `remove_connection`; the new
-    /// owner's poll revives it, so the driver's completion wakes that owner
-    /// instead of freeing the entry and waking nobody.
+    /// The result of a send whose creator task returned, and whose
+    /// connection was then released, is still there for the future the task
+    /// handed off: the send completed before the release (a close finalizes
+    /// only once the connection's sends have drained), and the release
+    /// keeps a resolved entry.
     #[test]
-    fn a_poll_from_a_live_task_revives_an_entry_its_dead_creator_abandoned() {
+    fn a_result_that_landed_before_the_release_waits_for_the_handed_off_future() {
         const N: u32 = 3;
         let mut q = SendCompletions::new();
         let id = q.register(N, N);
-        assert!(q.remove_connection(N).is_empty());
+        assert!(q.remove_task(N).is_empty(), "the task returned");
         assert_eq!(
-            q.live(),
-            1,
-            "abandoned, not freed: the driver still owns the send"
+            q.complete(id, Ok(5)),
+            Some(NO_OWNER),
+            "delivered, nobody to wake"
         );
+        assert!(q.remove_connection(N).is_empty(), "released");
+        assert_eq!(q.live(), 1, "the result waits for the future");
 
         // The task the future was handed to polls it.
         q.set_owner(id, task(5));
-        assert!(q.take_result(id).is_none(), "no result yet: the task parks");
-        assert_eq!(
-            q.complete(id, Ok(5)),
-            Some(task(5)),
-            "the live owner is woken; `None` would park it forever"
-        );
         assert_eq!(q.take_result(id).expect("resolved").expect("ok"), 5);
         assert_eq!(q.live(), 0);
     }
 
-    /// `remove_task` drops only what the dead connection task owned: its
-    /// waiting entry (promoting the next head), its in-flight entry (to
-    /// `Abandoned`) and its resolved entry. Entries on the same connection
-    /// that other tasks own are left as they are, in flight or waiting, for
-    /// the driver to settle.
+    /// An entry still in flight when its creator task returns stays in
+    /// flight: the task's own futures cancelled themselves when the task was
+    /// dropped, so this one is held by a future handed to another task. The
+    /// completion, landing before that task's first poll, is kept for it.
     #[test]
-    fn remove_task_leaves_entries_other_tasks_own_on_the_connection() {
+    fn remove_task_leaves_an_in_flight_entry_for_the_future_that_holds_it() {
+        const N: u32 = 3;
+        let mut q = SendCompletions::new();
+        let id = q.register(N, N);
+        assert!(q.remove_task(N).is_empty());
+        assert_eq!(q.live(), 1, "kept, not abandoned");
+        assert_eq!(
+            q.complete(id, Ok(5)),
+            Some(NO_OWNER),
+            "the result is recorded; the wake reaches nobody"
+        );
+        q.set_owner(id, task(5));
+        assert_eq!(q.take_result(id).expect("resolved").expect("ok"), 5);
+        assert_eq!(q.live(), 0);
+    }
+
+    /// `remove_task` changes no entry's state. The entries the dead task
+    /// owned are held by futures it handed off and lose their owner until
+    /// polled; entries other tasks own are untouched.
+    #[test]
+    fn remove_task_leaves_every_entry_where_it_is() {
         const A: u32 = 3;
         let mut q = SendCompletions::new();
-        // A's own entries.
+        // Entries A's task owned, now held elsewhere.
         let own_in_flight = q.enqueue(A, 0, 1, A);
         q.mark_submitted(own_in_flight);
         let own_done = q.enqueue(A, 0, 1, A);
@@ -1303,12 +1349,20 @@ mod tests {
         let other_in_flight = q.register(A, task(40));
         let other_waiting = q.enqueue(A, 0, 1, 4);
 
-        let wakes = q.remove_task(A);
-        assert_eq!(wakes, vec![4], "the head moved from A's waiter to task 4's");
-        assert_eq!(q.waiting_len(), 1);
-        assert!(q.take_result(own_waiting).is_none());
-        assert!(q.take_result(own_done).is_none());
-        assert_eq!(q.complete(own_in_flight, Ok(1)), None, "abandoned: no wake");
+        assert!(q.remove_task(A).is_empty(), "the head did not move");
+        assert_eq!(q.waiting_len(), 2);
+        assert_eq!(q.live(), 5);
+        assert!(
+            q.turn(own_waiting, 1),
+            "still the head, for its holder's poll"
+        );
+        assert_eq!(q.head_ready(1), Some(NO_OWNER));
+        assert_eq!(q.take_result(own_done).expect("kept").expect("ok"), 1);
+        assert_eq!(q.complete(own_in_flight, Ok(1)), Some(NO_OWNER));
+        assert_eq!(
+            q.take_result(own_in_flight).expect("resolved").expect("ok"),
+            1
+        );
 
         assert!(q.take_result(other_in_flight).is_none(), "still in flight");
         assert_eq!(
@@ -1317,14 +1371,14 @@ mod tests {
             "the driver's result reaches the live owner"
         );
         assert_eq!(q.take_result(other_in_flight).unwrap().unwrap(), 5);
-        assert!(q.turn(other_waiting, 1), "task 4's waiter is the head");
-        assert_eq!(q.live(), 1);
+        assert!(!q.turn(other_waiting, 1), "behind the handed-off waiter");
+        assert_eq!(q.live(), 2);
     }
 
-    /// A connection task's own entries on *another* connection (a proxy's
-    /// bounded send to upstream) go with the task too.
+    /// A connection task's entries on *another* connection (a proxy's
+    /// bounded send to upstream) are kept the same way.
     #[test]
-    fn remove_task_drops_the_task_s_entries_on_other_connections() {
+    fn remove_task_keeps_the_task_s_entries_on_other_connections() {
         const C: u32 = 3;
         const D: u32 = 7;
         let mut q = SendCompletions::new();
@@ -1332,10 +1386,11 @@ mod tests {
         let in_flight = q.register(D, C);
         let unrelated = q.enqueue(D, 0, 1, task(9));
 
-        assert_eq!(q.remove_task(C), vec![task(9)]);
-        assert!(q.take_result(waiting).is_none());
-        assert_eq!(q.complete(in_flight, Ok(1)), None);
-        assert!(q.turn(unrelated, 1));
-        assert_eq!(q.live(), 1);
+        assert!(q.remove_task(C).is_empty());
+        assert!(q.turn(waiting, 1), "still the head");
+        assert_eq!(q.complete(in_flight, Ok(1)), Some(NO_OWNER));
+        assert_eq!(q.take_result(in_flight).expect("resolved").expect("ok"), 1);
+        assert!(!q.turn(unrelated, 1));
+        assert_eq!(q.live(), 2);
     }
 }

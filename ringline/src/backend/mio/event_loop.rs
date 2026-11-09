@@ -2866,6 +2866,205 @@ mod tests {
         );
     }
 
+    /// `on_accept` queues an awaited send, hands the unpolled future to a
+    /// spawned task that awaits a timer before polling it, and returns.
+    struct LateHandoffHandler;
+
+    impl AsyncEventHandler for LateHandoffHandler {
+        #[allow(clippy::manual_async_fn)]
+        fn on_accept(&self, conn: crate::Connection) -> impl Future<Output = ()> + 'static {
+            async move {
+                let (mut tx, _rx) = conn.split();
+                let fut = tx.send(b"hello").expect("queued");
+                crate::spawn(async move {
+                    crate::sleep(std::time::Duration::from_millis(5)).await;
+                    let r = fut.await;
+                    HANDOFF_RESULT.with(|c| *c.borrow_mut() = Some(r));
+                })
+                .expect("spawned");
+            }
+        }
+
+        fn create_for_worker(_worker_id: usize) -> Self {
+            LateHandoffHandler
+        }
+    }
+
+    /// The handed-off future is first polled after the send completed and
+    /// after the connection task returned and its connection was released.
+    /// It resolves with the delivered count: the entry outlives its creator
+    /// and the release, and the result waits for the poll.
+    #[test]
+    fn a_send_future_first_polled_after_its_completion_and_its_creator_s_release_resolves_delivered()
+     {
+        let config = test_config();
+        let (mut el, _wake) = test_loop_with_handler(&config, LateHandoffHandler, None);
+        let (conn_index, mut client) = attach_conn(&mut el.driver);
+        HANDOFF_RESULT.with(|c| *c.borrow_mut() = None);
+
+        el.spawn_accept_task(conn_index);
+        // The connection task queues the send, spawns, and returns; the
+        // spawned task parks on its timer.
+        el.poll_ready_tasks();
+        // The send completes and the close finalizes before the timer fires.
+        el.flush_all_pending_sends();
+        el.drain_send_completions();
+        el.drain_pending_closes();
+        assert!(
+            el.driver.tcp_streams[conn_index as usize].is_none(),
+            "the close finalized"
+        );
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).expect("the peer got the bytes");
+        assert_eq!(&buf, b"hello");
+        assert!(
+            HANDOFF_RESULT.with(|c| c.borrow().is_none()),
+            "the spawned task has not polled the send yet"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        el.fire_expired_timers();
+        el.executor.collect_wakeups();
+        el.poll_ready_tasks();
+        let result = HANDOFF_RESULT.with(|c| c.borrow_mut().take());
+        assert_eq!(
+            result.map(|r| r.map_err(|e| e.kind())),
+            Some(Ok(5)),
+            "the handed-off send resolves with the delivered count"
+        );
+        assert_eq!(el.executor.send_completions.live(), 0, "the entry is gone");
+    }
+
+    /// `on_accept` queues an awaited send, hands the unpolled future to a
+    /// spawned task that awaits a timer before polling it, and stays parked
+    /// on a timer of its own.
+    struct AliveHandoffHandler;
+
+    impl AsyncEventHandler for AliveHandoffHandler {
+        #[allow(clippy::manual_async_fn)]
+        fn on_accept(&self, conn: crate::Connection) -> impl Future<Output = ()> + 'static {
+            async move {
+                let (mut tx, _rx) = conn.split();
+                let fut = tx.send(b"hello").expect("queued");
+                crate::spawn(async move {
+                    crate::sleep(std::time::Duration::from_millis(5)).await;
+                    let r = fut.await;
+                    HANDOFF_RESULT.with(|c| *c.borrow_mut() = Some(r));
+                })
+                .expect("spawned");
+                crate::sleep(std::time::Duration::from_secs(3600)).await;
+                drop(tx);
+            }
+        }
+
+        fn create_for_worker(_worker_id: usize) -> Self {
+            AliveHandoffHandler
+        }
+    }
+
+    /// The peer closes while the connection task is alive, so the release
+    /// drops that task with the send half and its timer still held. The
+    /// future it handed off, polled after the release, resolves with the
+    /// delivered count.
+    #[test]
+    fn a_send_future_handed_off_by_a_task_alive_at_the_release_resolves_delivered() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop_with_handler(&config, AliveHandoffHandler, None);
+        let (conn_index, mut client) = attach_conn(&mut el.driver);
+        HANDOFF_RESULT.with(|c| *c.borrow_mut() = None);
+
+        el.spawn_accept_task(conn_index);
+        el.poll_ready_tasks();
+        el.flush_all_pending_sends();
+        el.drain_send_completions();
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).expect("the peer got the bytes");
+        assert_eq!(&buf, b"hello");
+
+        // The peer's FIN closes the connection; the task is parked on its
+        // hour-long timer.
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("peer half-close");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut recv_buf = vec![0u8; 4096];
+        el.handle_readable(conn_index, &mut recv_buf, false);
+        el.drain_pending_closes();
+        assert!(
+            el.driver.tcp_streams[conn_index as usize].is_none(),
+            "the FIN closed the connection and the close finalized"
+        );
+        assert!(
+            HANDOFF_RESULT.with(|c| c.borrow().is_none()),
+            "the spawned task has not polled the send yet"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        el.fire_expired_timers();
+        el.executor.collect_wakeups();
+        el.poll_ready_tasks();
+        let result = HANDOFF_RESULT.with(|c| c.borrow_mut().take());
+        assert_eq!(
+            result.map(|r| r.map_err(|e| e.kind())),
+            Some(Ok(5)),
+            "the handed-off send resolves with the delivered count"
+        );
+        assert_eq!(el.executor.send_completions.live(), 0, "the entry is gone");
+    }
+
+    thread_local! {
+        /// Whether the probe's `Drop` ran with the driver state installed.
+        static DROPPED_IN_EXECUTOR: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Records, when dropped, whether the executor was reachable.
+    struct DropProbe;
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let inside = crate::runtime::io::try_with_state(|_, _| ()).is_some();
+            DROPPED_IN_EXECUTOR.with(|c| c.set(Some(inside)));
+        }
+    }
+
+    /// A connection task dropped at its slot's release is dropped with the
+    /// driver state installed, so the futures it holds clean up as they do
+    /// inside a poll.
+    #[test]
+    fn a_connection_task_dropped_at_the_release_is_dropped_inside_the_executor() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop_with_handler(&config, NoopHandler, None);
+        let (conn_index, _client) = attach_conn(&mut el.driver);
+        DROPPED_IN_EXECUTOR.with(|c| c.set(None));
+
+        el.executor.task_slab.spawn(
+            conn_index,
+            Box::pin(async move {
+                let _probe = DropProbe;
+                std::future::pending::<()>().await;
+            }),
+        );
+        el.executor.ready_queue.push_back(conn_index);
+        el.poll_ready_tasks();
+        assert!(
+            DROPPED_IN_EXECUTOR.with(|c| c.get()).is_none(),
+            "the task is parked with the probe alive"
+        );
+
+        el.driver.close_connection(conn_index);
+        el.drain_pending_closes();
+        assert!(
+            el.driver.tcp_streams[conn_index as usize].is_none(),
+            "the close finalized"
+        );
+        assert_eq!(
+            DROPPED_IN_EXECUTOR.with(|c| c.get()),
+            Some(true),
+            "the task's futures see the executor when they drop"
+        );
+    }
+
     /// `on_accept` moves the send half to a spawned task that sends and
     /// awaits at once, then yields once and returns.
     struct WriterTaskHandler;
