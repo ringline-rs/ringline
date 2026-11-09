@@ -48,7 +48,9 @@ cd /home/anvil
 {
   uname -srm; nproc; cargo --version
   git clone -q {repo} src && cd src && git checkout -q {branch} && git log --oneline -1
-  ulimit -Sn 65536; echo "nofile_soft=$(ulimit -Sn)"
+  ulimit -Sn 65536
+  [ "$(ulimit -Sn)" -ge 65536 ] || { echo "gate_nofile=1 (soft=$(ulimit -Sn))"; exit 1; }
+  echo "gate_nofile=0"
 
   # This must be the io_uring build; a mio build would run none of the code
   # under test and report green for it.
@@ -57,10 +59,17 @@ cd /home/anvil
   [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; echo "gate_backend=1"; exit 1; }
   echo "gate_backend=0 (backend=$got)"
 
-  bin() { cargo test --locked -p ringline --lib --no-run 2>&1 | grep -oE 'target/debug/deps/ringline-[0-9a-f]+' | head -1; }
+  # cargo's status is taken before the grep, so a failed build is not read
+  # as an empty path and every run counted as a test failure.
+  bin() {
+    local o
+    o=$(cargo test --locked -p ringline --lib --no-run 2>&1) || { echo "$o" | tail -20 >&2; return 1; }
+    echo "$o" | grep -oE 'target/debug/deps/ringline-[0-9a-f]+' | head -1
+  }
   loop() {
     local label=$1 B fails=0 i out
-    B=$(bin)
+    B=$(bin) && [ -n "$B" ] || { echo "gate_build_${label}=1"; return 1; }
+    echo "gate_build_${label}=0"
     for i in $(seq 1 {n}); do
       out=$(./$B {test} --test-threads=1 2>&1)
       if ! echo "$out" | grep -q 'test result: ok. 1 passed'; then
@@ -84,7 +93,10 @@ type = "shell"
 command = '''
 fail=0
 grep -E '^(gate_|main |fix )' verify.log
+grep -q "^gate_nofile=0" verify.log || { echo "FAIL gate_nofile"; fail=1; }
 grep -q "^gate_backend=0" verify.log || { echo "FAIL gate_backend"; fail=1; }
+grep -q "^gate_build_main=0" verify.log || { echo "FAIL: the test binary did not build at main_ref"; fail=1; }
+grep -q "^gate_build_fix=0" verify.log || { echo "FAIL: the test binary did not build at the fix"; fail=1; }
 grep -q "^fix runs=.* fails=0$" verify.log || { echo "FAIL: the fix still fails"; fail=1; }
 grep -q "^main runs=.* fails=0$" verify.log && echo "PREDICTION NOT MET: no failure at main_ref in this run"
 grep -q "^gate_clippy_uring=0" verify.log || { echo "FAIL clippy"; fail=1; }

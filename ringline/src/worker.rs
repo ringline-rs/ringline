@@ -3135,8 +3135,8 @@ mod worker_exit_tests {
         }
     }
 
-    /// `launch()` returns when a worker stops while it runs, before or after
-    /// `launch()` listens, and once the worker has stopped every connection
+    /// `launch()` returns when a worker stops while `launch()` runs, before or
+    /// after it listens, and once the worker has stopped every connection
     /// reaches the other one.
     #[cfg(has_io_uring)]
     #[test]
@@ -3164,7 +3164,7 @@ mod worker_exit_tests {
             // stopped, its socket is out of the steering and what the
             // socket queued is closed, so every later connection reaches
             // the other worker. A connection made before that can hash to
-            // the stopped worker's socket, or be handed to it by placement,
+            // the stopping worker's socket, or be handed to it by placement,
             // and be closed (#783).
             wait_for_exit(&handles, 1);
             let addr = runtime.bound_addr().unwrap();
