@@ -954,8 +954,10 @@ impl Driver {
             && matches!(cs.write, WriteHalf::ShutdownPending)
         {
             cs.write = WriteHalf::Shutdown;
-            if let Some(stream) = self.tcp_streams[idx].as_mut() {
-                let _ = stream.shutdown(std::net::Shutdown::Write);
+            if let Some(stream) = self.tcp_streams[idx].as_mut()
+                && stream.shutdown(std::net::Shutdown::Write).is_err()
+            {
+                crate::metrics::CONNECTIONS.increment(crate::metrics::conn::SHUTDOWN_FAILED);
             }
         }
 
@@ -1616,6 +1618,47 @@ pub(crate) mod tests {
         let mut buf = vec![0u8; 200];
         client.read_exact(&mut buf).expect("read the whole message");
         assert!(buf.iter().all(|&b| b == b'a'));
+    }
+
+    /// A `shutdown_write` whose `shutdown(SHUT_WR)` the socket refuses is
+    /// counted under `shutdown_failed`, and the write half still reads
+    /// `Shutdown`. The socket was never connected, which `shutdown(2)`
+    /// refuses with `ENOTCONN` on Linux and macOS.
+    #[test]
+    fn a_refused_shutdown_is_counted() {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .build()
+            .expect("valid test config");
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = ConnId::new(conn_index, driver.connections.generation(conn_index));
+        let unconnected = {
+            use std::os::fd::FromRawFd;
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            assert!(fd >= 0, "socket");
+            // SAFETY: a fresh fd this test owns and nothing else holds.
+            unsafe { std::net::TcpStream::from_raw_fd(fd) }
+        };
+        driver.tcp_streams[idx] = Some(mio::net::TcpStream::from_std(unconnected));
+        let count = || {
+            crate::metrics::CONNECTIONS
+                .value(crate::metrics::conn::SHUTDOWN_FAILED)
+                .unwrap_or(0)
+        };
+
+        let before = count();
+        driver.make_ctx().shutdown_write(conn);
+
+        assert!(count() > before, "the refused shutdown was not counted");
+        assert_eq!(
+            driver.connections.get(conn_index).map(|c| c.write),
+            Some(WriteHalf::Shutdown),
+            "the write half does not record the request"
+        );
     }
 
     /// A message split across flushes keeps its id and its permit until the

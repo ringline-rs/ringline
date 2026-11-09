@@ -1,7 +1,7 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F13 (#794) and F14 (`docs/connection-close-audit-f14`) fixed; the rest recorded, unfixed
-- **Span:** 2026-11-07 → 2026-11-08 · tree a2e28073 (`main`) · PRs: F2 and F3 #767, F9 #768, F6 #769, F1 #771, F4 and F5 #774, F7 #776, F8 #779, F10 #791, F13 #794, F14 `docs/connection-close-audit-f14`
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (`docs/connection-close-audit-f14`) fixed; every finding fixed, the seven design limitations recorded
+- **Span:** 2026-11-07 → 2026-11-08 · tree a2e28073 (`main`) · PRs: F2 and F3 #767, F9 #768, F6 #769, F1 #771, F4 and F5 #774, F7 #776, F8 #779, F10 #791, F11 #792, F12 #793, F13 #794, F14 `docs/connection-close-audit-f14`
 
 ## Goal
 
@@ -410,13 +410,29 @@ for the rest of the process.
 ### F11 — `check_close_notify_deadlines` re-runs `force_finalize_close` every tick while the finalize is blocked; `fail_send_ids` sets `capacity_released` unconditionally (invariant 18). Traced, low.
 
 `uring/event_loop.rs:4753-4790`, `uring/driver.rs:2020-2034`. One spurious
-`wake_send_capacity` per tick until the Shutdown or chain CQE lands.
+`wake_send_capacity` per tick until the Shutdown CQE lands (the force
+cancels a chain, so only a Shutdown holds the commit).
 
 Fix: skip the force while `shutdown_inflight` or a chain is active; clear
 the deadline in `force_finalize_close`; set `capacity_released` only when
 `ids` is non-empty.
 
-Disposition: open.
+Disposition: fixed in #792, by the
+deadline clear alone: `force_finalize_close` disarms the deadline before
+it calls `try_finalize_close`, so it runs once per close, and
+`handle_shutdown`'s `defer_finalize_close` commits the Close when the
+Shutdown CQE lands (`drain_shutdown_retries` keeps a parked Shutdown
+until its push succeeds, so the CQE comes). No skip is needed: with the
+deadline disarmed there is no second call to skip. The `capacity_released`
+part as proposed would have been wrong: an unawaited send holds a pool
+slot and carries no `SendId`, so an empty `ids` does not mean nothing was
+released. `fail_send_ids` now takes whether the drained queue had
+entries, from each caller. Tests:
+`a_forced_close_blocked_on_a_shutdown_runs_once` (the deadline is
+disarmed by the force, a second tick reports no capacity, the Shutdown
+CQE commits the Close), `resetting_an_empty_send_queue_releases_no_capacity`,
+and the control `a_forced_close_abandoning_an_unawaited_send_releases_capacity`,
+which passes before and after.
 
 ### F12 — `handle_shutdown` ignores the Shutdown result; `WriteHalf::Shutdown` doc says "Our FIN has been issued" (invariant 13, docs). Traced, low.
 
@@ -424,7 +440,18 @@ Disposition: open.
 After `-ENOTCONN` the write half still reads `Shutdown`. Doc fix ("requested")
 or record the failure.
 
-Disposition: open.
+Disposition: fixed in #793, by both changes the
+finding offered: the
+`WriteHalf::Shutdown` doc says the FIN has been requested, and a
+`shutdown(SHUT_WR)` the socket refuses is counted in
+`connections{op="shutdown_failed"}` on both backends (`handle_shutdown`
+now takes the CQE result; mio's two `shutdown(Write)` calls check theirs).
+The write half stays `Shutdown`: the refusal means the socket is already
+closed, so sends fail at the socket either way, and on io_uring the Close
+the Shutdown held goes ahead. `a_failed_shutdown_is_counted_and_releases_the_close`
+dispatches a Shutdown CQE with `-ENOTCONN`; `a_refused_shutdown_is_counted`
+(mio) calls `shutdown_write` on a socket that was never connected, which
+`shutdown(2)` refuses with `ENOTCONN` on Linux and macOS.
 
 ### F13 — `handle_send`'s terminal error arm drains the queue and fails the awaited send but does not close the connection or record a read error (invariants 11, 12). Confirmed by reading; consequence unassessed.
 
@@ -454,7 +481,7 @@ reading of the mechanism is that the failed send takes the socket's pending
 error and its CQE reports it, and the receive that follows then reports a
 plain EOF; not traced in a run. #769 runs its write-error test on mio only.
 
-Disposition: fixed (this PR). Every send-failure arm on io_uring
+Disposition: fixed in #794. Every send-failure arm on io_uring
 (`handle_send`, `handle_send_msg_zc`, `handle_send_msg_coalesced` for a
 plaintext or TLS run, `handle_tls_send`, `fire_chain_complete`, and the
 three retry give-up arms) runs `AsyncEventLoop::abort_connection`, the
