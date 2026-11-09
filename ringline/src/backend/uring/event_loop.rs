@@ -14434,8 +14434,8 @@ mod tests {
         ud
     }
 
-    /// Two single-record TLS sends: every chunk is tagged `Send`, so only the
-    /// connection's TLS state marks the run, and an error still closes.
+    /// Two single-record TLS sends: every chunk is tagged `Send`, and an
+    /// error closes.
     #[test]
     fn tls_connection_run_of_final_chunks_closes_on_error() {
         let mut el = make_test_loop();
@@ -14447,15 +14447,26 @@ mod tests {
         assert!(conn.is_none() || conn.unwrap().close_requested());
     }
 
-    /// The same run on a plaintext connection drains without closing.
+    /// The same run on a plaintext connection closes with the error too.
     #[test]
-    fn plaintext_run_error_does_not_close() {
+    fn plaintext_run_error_closes_with_the_error() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
         let ud = two_send_tagged_chunks(&mut el, conn_index);
-        el.test_dispatch_cqe(ud.raw(), -104, 0);
-        let conn = el.driver.connections.get(conn_index).expect("still open");
-        assert!(!conn.close_requested());
+        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
+        let conn = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot is live");
+        assert!(conn.close_requested(), "the connection stayed open");
+        assert_eq!(conn.read, ReadHalf::Error);
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader was not told");
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
     }
 
     /// With the close already submitted, a partial write settles the sends it
@@ -15816,7 +15827,9 @@ mod tests {
                             }
                         }
 
-                        // Send error on a random live connection.
+                        // Send error on a random live connection. A terminal
+                        // send error closes the connection, so its Close CQE
+                        // follows and the connection leaves the live set.
                         2 if !live_conns.is_empty() => {
                             let ci = live_conns[0];
                             if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
@@ -15829,6 +15842,9 @@ mod tests {
                                     ),
                                 );
                                 el.test_dispatch_cqe(ud.raw(), -104, 0);
+                                live_conns.remove(0);
+                                let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                                el.test_dispatch_cqe(close_ud.raw(), 0, 0);
                             }
                         }
 
