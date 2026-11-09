@@ -1085,7 +1085,8 @@ with #781 and is left as written.
   CQE is outstanding on a dead occupant.
 - **L5** `force_finalize_close` with `shutdown_inflight` set re-runs every
   tick from `check_close_notify_deadlines` until the Shutdown CQE lands
-  (previous audit F11). Harmless churn.
+  (previous audit F11). Harmless churn. Fixed in #792: the force disarms
+  the deadline and runs once.
 - **L6** A bounded send whose owner task is woken but does not poll its
   future holds the admission FIFO head and stalls every bounded send on the
   worker. Inherent to a FIFO with task-owned entries; not documented.
