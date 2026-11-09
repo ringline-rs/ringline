@@ -1,7 +1,9 @@
 name = "ringline-benchmarks single-machine tcp (real ringline server)"
 
-# Regenerates the single-machine "TCP echo" table in BENCHMARKS.md after the
-# server fix: `ringline-benchmarks`' TCP `start_ringline_server` is now a native
+# Runs the single-machine TCP echo matrix. BENCHMARKS.md has had no
+# single-machine table since #205, and no current host carries the z1.n.small
+# tag, so this spec does not schedule as written. Written after the server
+# fix: `ringline-benchmarks`' TCP `start_ringline_server` is now a native
 # RinglineBuilder echo server (forward_recv_buf), not a tokio io::copy. Runs the
 # full client×server combo matrix on one z1.n.small so the `ringline → ringline`
 # column is a real full ringline stack vs the `tokio → tokio` full tokio stack.
