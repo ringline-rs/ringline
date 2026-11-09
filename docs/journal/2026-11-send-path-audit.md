@@ -1,6 +1,6 @@
 # 2026-11: Audit of the send path
 
-- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; the design limitations L1 to L10 stand
+- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; L2 and L10 closed by later PRs (#794, the L10 PR); the design limitations L1, L3 to L9 stand
 - **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, docs #788, F10 #789, F6 and F11 this PR
 
 ## Goal
@@ -1128,6 +1128,20 @@ is a change to the teardown order the module docs and
 for the owner. Reopened by: a hang, or a `ConnectionAborted` for delivered
 bytes, in a task that awaits a `SendFuture` it did not create, after
 awaiting something else first.
+
+Closed after this record (the L10 PR): the table no longer infers a
+future's death from its owner's. `remove_task` and `remove_connection`
+re-own the entries a dead task still holds to `NO_OWNER` and leave their
+state; the connection task is dropped under the driver state at the release
+as well as at its exit, so the futures that die with it cancel their own
+entries (`SendFuture::drop`). `set_owner` no longer revives an `Abandoned`
+entry, since only a drop produces one. Reproduced on mio before the fix by
+`a_send_future_first_polled_after_its_completion_and_its_creator_s_release_resolves_delivered`
+(`Err(ConnectionAborted)` for five delivered bytes) and
+`a_send_future_handed_off_by_a_task_alive_at_the_release_resolves_delivered`;
+both pass on the fix, with the table's own tests and a per-backend check
+that the task's futures drop inside the executor
+(`a_connection_task_dropped_*_is_dropped_inside_the_executor`).
 
 ## What the audit did not cover
 
