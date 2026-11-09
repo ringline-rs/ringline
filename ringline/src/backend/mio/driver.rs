@@ -647,9 +647,10 @@ impl Driver {
         // go, and they report it.
         let flush_error = self.flush_sends(conn_index).err();
 
-        // No alert once a write shutdown has been requested: the FIN has been
-        // issued, or is ordered behind the queued sends, and the alert would
-        // follow it. `queue_tls_close_notify` and `DriverCtx::close` apply
+        // No alert once a write shutdown has been requested: `flush_sends`
+        // above issued the FIN when it drained the queue, and a write after
+        // it fails with `EPIPE`. A shutdown still pending here has no stream
+        // to write to. `queue_tls_close_notify` and `DriverCtx::close` apply
         // the rule on io_uring.
         let alert_allowed = self
             .connections
@@ -2046,8 +2047,8 @@ pub(crate) mod tests {
     }
 
     /// A close after a write shutdown sends no close_notify: the FIN has been
-    /// issued, or is ordered behind the queued sends, and the alert would
-    /// follow it. io_uring applies the rule in `queue_tls_close_notify` and
+    /// issued, and the alert would follow it. io_uring applies the rule in
+    /// `queue_tls_close_notify` and
     /// `DriverCtx::close`. The write half is marked shut down without
     /// shutting the socket, so an alert written here reaches the peer
     /// instead of failing with `EPIPE`.
