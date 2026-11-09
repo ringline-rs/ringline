@@ -10316,6 +10316,217 @@ mod tests {
         );
     }
 
+    /// What every failed send leaves for the reader: the read half records
+    /// the failure, the reader parked on `with_data_result` is handed the
+    /// send's error, and the connection is closing.
+    fn assert_send_error_aborted(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+        generation: u32,
+        errno: i32,
+    ) {
+        let cs = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot stays occupied until the Close commits");
+        assert!(cs.close_requested(), "the connection is closing");
+        assert_eq!(
+            cs.read,
+            crate::connection::ReadHalf::Error,
+            "the read half records the failure"
+        );
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader is handed the send's error");
+        assert_eq!(err.raw_os_error(), Some(errno), "the send's own errno");
+    }
+
+    /// A plaintext send that fails ends the connection and tells the reader
+    /// why. Left open, the connection reported a peer reset as a clean close
+    /// whenever the send, not the parked receive, took the socket's error
+    /// (connection-close audit F13).
+    #[test]
+    fn a_plaintext_send_error_aborts_the_connection() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"reply").unwrap();
+        let ud = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot, generation),
+        );
+
+        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
+
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "the error path returns the slot"
+        );
+        assert_send_error_aborted(&mut el, conn_index, generation, libc::ECONNRESET);
+    }
+
+    #[test]
+    fn a_zero_copy_send_error_aborts_the_connection() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 100,
+        }];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _ptr) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, generation, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+
+        el.test_dispatch_cqe(ud.raw(), -libc::EPIPE, 0);
+
+        assert!(
+            !el.driver.send_slab.in_use(slab_idx),
+            "the error path returns the slab entry"
+        );
+        assert_send_error_aborted(&mut el, conn_index, generation, libc::EPIPE);
+    }
+
+    /// Two plaintext slots coalesced into one `sendmsg`: its failure ends the
+    /// connection as a TLS run's does.
+    #[test]
+    fn a_plaintext_run_send_error_aborts_the_connection() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 64)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let plain_send = |el: &mut AsyncEventLoop<NoopHandler>, data: &[u8]| {
+            let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(data).unwrap();
+            let ud = UserData::encode(
+                OpTag::Send,
+                conn_index,
+                UserData::send_payload(slot, generation),
+            );
+            crate::handler::BuiltSend {
+                entry: crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw()),
+                pool_slot: slot,
+                slab_idx: u16::MAX,
+            }
+        };
+        let first = plain_send(&mut el, b"part one");
+        let second = plain_send(&mut el, b"part two");
+        {
+            let mut ctx = el.driver.make_ctx();
+            ctx.queue_built_sends(conn_index, vec![first, second]);
+        }
+        let pushed = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        assert_eq!(
+            pushed.tag(),
+            Some(OpTag::SendMsgCoalesced),
+            "both slots went out as one run"
+        );
+        let slab_idx = pushed.payload() as u16;
+
+        el.test_dispatch_cqe(pushed.raw(), -libc::ECONNRESET, 0);
+
+        assert!(
+            !el.driver.send_slab.in_use(slab_idx),
+            "the error path returns the run's entry"
+        );
+        assert_send_error_aborted(&mut el, conn_index, generation, libc::ECONNRESET);
+    }
+
+    /// A failed TLS chunk closed the connection before; the reader is now
+    /// told why as well.
+    #[test]
+    fn a_tls_send_error_aborts_the_connection() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"ciphertext").unwrap();
+        let ud = UserData::encode(
+            OpTag::TlsSend,
+            conn_index,
+            UserData::send_payload(slot, generation),
+        );
+
+        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
+
+        assert_send_error_aborted(&mut el, conn_index, generation, libc::ECONNRESET);
+    }
+
+    /// A chain whose first send fails closed the connection before; the
+    /// reader is now told why as well.
+    #[test]
+    fn a_chain_send_error_aborts_the_connection() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (s1, _, _) = el.driver.send_copy_pool.copy_in(b"aaa").unwrap();
+        let (s2, _, _) = el.driver.send_copy_pool.copy_in(b"bbb").unwrap();
+        el.driver.chain_table.start(conn_index, 2);
+        let ud1 = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(s1, generation),
+        );
+        let ud2 = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(s2, generation),
+        );
+
+        el.inject_linked_chain_and_dispatch(&[(ud1.raw(), -libc::ECONNRESET), (ud2.raw(), 0)]);
+
+        assert!(
+            !el.driver.chain_table.is_active(conn_index),
+            "the chain completed"
+        );
+        assert_send_error_aborted(&mut el, conn_index, generation, libc::ECONNRESET);
+    }
+
+    /// A send the close's lead cancelled is not a failure of the connection:
+    /// the read half stays as the requested close left it, and no error is
+    /// recorded for the reader.
+    #[test]
+    fn a_send_error_after_a_requested_close_does_not_mark_the_read_as_an_error() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"reply").unwrap();
+        let ud = UserData::encode(
+            OpTag::Send,
+            conn_index,
+            UserData::send_payload(slot, generation),
+        );
+        el.driver.close_connection(conn_index);
+
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+
+        let cs = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot stays occupied until the Close commits");
+        assert_eq!(
+            cs.read,
+            crate::connection::ReadHalf::Open,
+            "a requested close is not a read failure"
+        );
+        assert!(
+            el.executor
+                .take_recv_error(conn_index, generation)
+                .is_none(),
+            "nothing is recorded for the reader"
+        );
+    }
+
     #[test]
     fn handle_tls_send_eagain_arms_pollout() {
         // EAGAIN is ordinary socket backpressure: keep the slot (the unsent
