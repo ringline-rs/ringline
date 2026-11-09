@@ -1,6 +1,6 @@
 # 2026-11: Audit of the send path
 
-- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; L2 (#794), L5 (#792) and L10 (#797) closed by later PRs; the design limitations L1, L3, L4 and L6 to L9 stand
+- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; L2 (#794), L3 (#805), L5 (#792) and L10 (#797) closed by later PRs; the design limitations L1, L4 and L6 to L9 stand
 - **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, F9, F12 and F14 (docs) #788, F10 #789, F6 and F11 #790, L5 #792, L2 #794, L10 #797
 
 ## Goal
@@ -1079,7 +1079,9 @@ with #781 and is left as written.
   send `WouldBlock` or `OutOfMemory`; the other three handlers settle the
   same situation `ECANCELED`. Unreachable today: `close_submitted` with a
   send in flight needs `force_finalize_close`, which only the TLS deadline
-  calls, and a TLS connection never holds a ZC entry.
+  calls, and a TLS connection never holds a ZC entry. Fixed in #805: the
+  handler settles `ECANCELED` for `-EAGAIN` and `-ENOMEM` after
+  `close_submitted`, as the other three do.
 - **L4** `Send`/`TlsSend` CQEs carry a 16-bit truncated generation (previous
   audit L6). A false match needs 65536 reuses of one index while one Send
   CQE is outstanding on a dead occupant.
