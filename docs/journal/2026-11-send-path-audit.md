@@ -1,6 +1,6 @@
 # 2026-11: Audit of the send path
 
-- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; the design limitations L1 to L10 stand
+- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; the design limitations L1 and L3 to L10 stand; L2 is fixed in #795
 - **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, docs #788, F10 #789, F6 and F11 this PR
 
 ## Goal

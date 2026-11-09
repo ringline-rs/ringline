@@ -291,9 +291,10 @@ plaintext cap: `QuotaExceeded`; io_uring: a receive that could not be
 armed), so `with_data_result` resolves `Err`. A TLS record-layer error still
 resolves `Ok(0)`, as documented. Pinned by
 `ringline/tests/local_abort_errors.rs`; its write-error case runs on mio
-only: on io_uring a failed plaintext send does not close the connection
-(F13), and the send and the receive race for the socket's pending error, so
-the case was intermittent there (3 of 6 CI jobs).
+only: on io_uring a failed plaintext send did not close the connection
+until #795 (F13), and the send and the receive raced for the socket's
+pending error, so the case was intermittent there (3 of 6 CI jobs); it
+still runs on mio only.
 
 ### F7 — `force_finalize_close` sets `write = Open` under an in-flight Shutdown, and the io_uring `shutdown_write` lacks the `close_requested()` guard mio has (invariants 13, 4). Plausible, narrow.
 
