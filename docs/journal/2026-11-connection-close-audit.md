@@ -598,10 +598,11 @@ and this entry's span line named a branch.
 
 - **L1** A peer FIN tears the connection down unless a send is in flight, so
   a task awaiting an upstream reply or a timer at that moment is dropped once
-  the Close commits. Stated on the `recv_direct` module doc,
-  `docs/recv-direct-design.md:380-381` and `docs/connection-state-model-
+  the Close commits. Stated on the `connect` doc in `runtime/io.rs` ("TCP
+  does not tell a half-close from a close"), on `Connection::is_alive`, in
+  `docs/recv-direct-design.md:378-379` and `docs/connection-state-model-
   design.md` Follow-ups ("Half-close policy"); not on `with_data`,
-  `with_data_result` or `Connection::close`. A proxy author will hit it.
+  `with_data_result` or `SendHalf::close`. A proxy author will hit it.
 - **L2** `close()` followed by any `.await` drops the task at the same
   iteration's finalize: code after `close()` runs only to its next await
   (mio run: `ran_after=0 dropped=1`; io_uring same shape). Matches the Drop
