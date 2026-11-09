@@ -1,6 +1,6 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** closed — 14 findings recorded, every one fixed: F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (#798); the design limitations L1 to L6 stand, L2 and L3 stated on `SendHalf::close` by #803, and L7 was changed in #807; checked against 5b92399a
+- **Status:** closed — 14 findings recorded, every one fixed: F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (#798); the design limitations L2 to L6 stand, L2 and L3 stated on `SendHalf::close` by #803, L7 was changed in #807, and L1 was changed in #809 (`docs/half-close-design.md`); checked against 5b92399a
 - **Span:** 2026-11-07 → 2026-11-08 · tree a2e28073 (`main`) · PRs: F2 and F3 #767, F9 #768, F6 #769, F1 #771, F4 and F5 #774, F7 #776, F8 #779, F10 #791, F11 #792, F12 #793, F13 #794, F14 #798
 
 ## Goal
@@ -603,6 +603,11 @@ and this entry's span line named a branch.
   `docs/recv-direct-design.md:378-379` and `docs/connection-state-model-
   design.md` Follow-ups ("Half-close policy"); not on `with_data`,
   `with_data_result` or `SendHalf::close`. A proxy author will hit it.
+  Changed in #809 on the owner's decision (`docs/half-close-design.md`): a peer's
+  FIN or close_notify finishes the read half and requests no close on
+  either backend; the connection closes when the task returns, drops its
+  last half or calls `close`, or on an error. `Connection::peer_closed`
+  reports the end; `is_alive` no longer turns false at it.
 - **L2** `close()` followed by any `.await` drops the task at the same
   iteration's finalize: code after `close()` runs only to its next await
   (mio run: `ran_after=0 dropped=1`; io_uring same shape). Matches the Drop

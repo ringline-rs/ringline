@@ -905,7 +905,7 @@ static HANGUP_SERVERS: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
 const HANGUP_TAIL: usize = 100_000;
 
 /// Connects to each server and does not read. The first server closes at
-/// once: that connection must stop being alive. The second writes
+/// once: the end of that connection must be seen. The second writes
 /// `HANGUP_TAIL` bytes and then closes: that connection stays alive while
 /// its bytes are unread, then reads every byte and the end of the stream.
 struct IdleClient;
@@ -923,14 +923,16 @@ impl AsyncEventHandler for IdleClient {
                     .map_err(|e| format!("connect: {e}"))?;
                 let mut closed = false;
                 for _ in 0..500 {
-                    if !empty.is_alive() {
+                    if empty.peer_closed() {
                         closed = true;
                         break;
                     }
                     ringline::sleep(Duration::from_millis(10)).await;
                 }
                 if !closed {
-                    return Err("the empty connection is alive 5 s after the peer closed".into());
+                    return Err(
+                        "the empty connection's end was not seen 5 s after the peer closed".into(),
+                    );
                 }
                 // The tail's peer closed long ago; its bytes are still unread.
                 ringline::sleep(Duration::from_millis(200)).await;
@@ -1330,7 +1332,7 @@ fn a_reset_after_buffered_bytes_is_reported_as_a_reset() {
 
 /// The peer writes 5 bytes and closes while the client does not read, so
 /// the hangup peek finds them queued. The client reads them once and never
-/// reads again; the connection must still stop being alive.
+/// reads again; the end must still be seen.
 struct ReadOnceThenIdle;
 
 impl AsyncEventHandler for ReadOnceThenIdle {
@@ -1352,12 +1354,12 @@ impl AsyncEventHandler for ReadOnceThenIdle {
                     return Err(format!("read {got:?}"));
                 }
                 for _ in 0..200 {
-                    if !conn.is_alive() {
+                    if conn.peer_closed() {
                         return Ok(());
                     }
                     ringline::sleep(Duration::from_millis(10)).await;
                 }
-                Err("alive 2 s after the last byte was read".into())
+                Err("the end was not seen 2 s after the last byte was read".into())
             }
             .await;
             *READ_ONCE.lock().unwrap() = Some(r);
@@ -1410,7 +1412,7 @@ static TICKLESS_READ_ONCE: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 
 /// Consumes 2 of the peer's 5 bytes, sleeps while the peer closes (so the
 /// hangup peek finds the other 3 buffered and nothing queued), reads the 3
-/// once and never reads again. The connection must still stop being alive.
+/// once and never reads again. The end must still be seen.
 struct BufferedReadOnce;
 
 impl AsyncEventHandler for BufferedReadOnce {
@@ -1440,12 +1442,12 @@ impl AsyncEventHandler for BufferedReadOnce {
                     return Err(format!("read {got:?}"));
                 }
                 for _ in 0..200 {
-                    if !conn.is_alive() {
+                    if conn.peer_closed() {
                         return Ok(());
                     }
                     ringline::sleep(Duration::from_millis(10)).await;
                 }
-                Err("alive 2 s after the last byte was read".into())
+                Err("the end was not seen 2 s after the last byte was read".into())
             }
             .await;
             *BUFFERED_READ_ONCE.lock().unwrap() = Some(r);
@@ -1509,8 +1511,8 @@ impl AsyncEventHandler for TicklessReadOnce {
                 ringline::sleep(Duration::from_millis(200)).await;
                 conn.with_data(|b| ParseResult::Consumed(b.len())).await;
                 ringline::sleep(Duration::from_millis(500)).await;
-                if conn.is_alive() {
-                    return Err("alive 500 ms after the read".into());
+                if !conn.peer_closed() {
+                    return Err("the end was not seen 500 ms after the read".into());
                 }
                 Ok(())
             }
@@ -1593,16 +1595,19 @@ impl AsyncEventHandler for ResetThenReadOnce {
                 if got != 1000 {
                     return Err(format!("read {got} bytes"));
                 }
+                // The reset closes the connection, and the Close can release
+                // the slot before this task next looks, after which
+                // `peer_closed` is false: either observation is the end.
                 let mut closed = false;
                 for _ in 0..200 {
-                    if !conn.is_alive() {
+                    if conn.peer_closed() || !conn.is_alive() {
                         closed = true;
                         break;
                     }
                     ringline::sleep(Duration::from_millis(10)).await;
                 }
                 if !closed {
-                    return Err("alive 2 s after the last byte was read".into());
+                    return Err("the end was not seen 2 s after the last byte was read".into());
                 }
                 match conn.with_data_result(|_| ParseResult::NeedMore).await {
                     Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => Ok(()),

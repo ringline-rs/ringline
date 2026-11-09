@@ -115,7 +115,7 @@ pub fn close_requested(&self) -> bool {
 | outbound connect (`activate_outbound`) | `recv_mode = Connecting` | `lifecycle = Connecting`, `recv_arm = Idle` |
 | connect completes | `recv_mode = Multi` | `lifecycle = Open`, `recv_arm = Multi` |
 | multishot (re)armed / self-terminated | `Multi` / `MsgMulti` set | `recv_arm` set / `Idle` |
-| peer FIN | `close_connection` → `Closed` | `read = Eof { truncated }` then `close_connection` → `lifecycle = Closing` |
+| peer FIN | `close_connection` → `Closed` | `read = Eof { truncated }` then `close_connection` → `lifecycle = Closing` (since `docs/half-close-design.md`: `read = Eof` only, no close) |
 | read error | `fail_recv` + `close_connection` | `read = Error`, `fail_recv`, `close_connection` |
 | `DriverCtx::cancel` | `Closed` after cancelling | `read = Cancelled`, `recv_arm = Idle` (lifecycle unchanged) |
 | `close_connection` / ctx close | guard on `Closed`, set `Closed` | guard on `close_requested()`, set `lifecycle = Closing` |
@@ -123,8 +123,9 @@ pub fn close_requested(&self) -> bool {
 
 Every reader maps to one of: `recv_finished()`, `close_requested()`,
 `matches!(lifecycle, Connecting)`, or a `recv_arm` match. The policy "peer
-FIN implies Closing" is unchanged; the refactor makes it two visible steps
-so it can be reconsidered separately (see Follow-ups).
+FIN implies Closing" was unchanged by this refactor, which made it two
+visible steps; `docs/half-close-design.md` later dropped the second step,
+so `Eof` with `Open` is now a steady state.
 
 ## What does not change
 
@@ -188,10 +189,9 @@ so it can be reconsidered separately (see Follow-ups).
 
 ## Follow-ups (not this PR)
 
-- **Half-close policy.** With `read` and `lifecycle` separate, decide
-  whether a peer FIN should request teardown at all, or leave the task
-  free to keep writing until it closes (true TCP half-close). That is a
-  behaviour change with its own design and tests.
+- **Done (`docs/half-close-design.md`, 2026-11):** a peer FIN finishes the
+  read half and requests no teardown; the task keeps writing until it
+  closes.
 - **Done (series PR 3, `docs/write-half-design.md`):** `WriteHalf { Open, ShutdownPending, Shutdown }` when series PR 3 touches
   `shutdown_write`; `shutdown_pending` moves there.
 - Fold `active` into `Lifecycle::Inactive` and reconcile

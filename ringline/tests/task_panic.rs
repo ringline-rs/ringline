@@ -1195,8 +1195,10 @@ async fn hold_a_delivered_result() {
     ringline::sleep(Duration::from_secs(3600)).await;
 }
 
-/// The peer's close drops the task from a completion handler, and the event
-/// loop releases the result outside any task.
+/// The peer's reset closes the connection from a completion handler, which
+/// drops the task, and the event loop releases the result outside any task.
+/// A FIN would finish the read half and leave the task in place
+/// (`docs/half-close-design.md`).
 #[test]
 fn a_panic_in_a_delivered_blocking_results_drop_costs_no_worker() {
     let _lock = DROP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1225,6 +1227,24 @@ fn a_panic_in_a_delivered_blocking_results_drop_costs_no_worker() {
         .expect("launch");
     let peer = std::net::TcpStream::connect(runtime.bound_addr().unwrap()).expect("connect");
     std::thread::sleep(Duration::from_millis(100));
+    {
+        use std::os::fd::AsRawFd;
+        // `SO_LINGER` with a zero timeout turns the close into an RST.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                peer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
+    }
     drop(peer);
     let deadline = Instant::now() + Duration::from_secs(5);
     while !RESULT_DROPPED.load(Ordering::SeqCst) && Instant::now() < deadline {

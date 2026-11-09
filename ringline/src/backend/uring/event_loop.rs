@@ -1044,8 +1044,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// iteration: by `close_connection` from a CQE handler or the task-exit
     /// arm, by `DriverCtx::close` from a task, or by `defer_finalize_close`
     /// from the completion that drained the connection's sends, chain or
-    /// `Shutdown`. Runs after `poll_ready_tasks`, so a task woken by the
-    /// peer's FIN is polled, and a send it queues drains, before the Close is
+    /// `Shutdown`. Runs after `poll_ready_tasks`, so a task woken by a read
+    /// error is polled, and a send it queues drains, before the Close is
     /// committed (#371). `try_finalize_close` is guarded: a connection with
     /// sends, a chain or a `Shutdown` still outstanding is dropped from the
     /// list here and registered again by the completion that drains it.
@@ -1186,13 +1186,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             _ => result,
         };
         if result == 0 {
-            // Peer FIN. `truncated` is the TLS case, which a direct
-            // connection is not.
+            // Peer FIN: the read half is finished and the connection stays
+            // open for its task (`docs/half-close-design.md`). `truncated`
+            // is the TLS case, which a direct connection is not.
             if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                 cs.note_eof(false);
             }
             self.executor.wake_recv(conn_index);
-            self.driver.close_connection(conn_index);
             return;
         }
         if -result == libc::ECANCELED {
@@ -1214,8 +1214,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Act on what feeding received ciphertext to a TLS connection
     /// produced: finish the handshake (wake the connect waiter or spawn the
-    /// accept task), wake the reader, or close the connection on an error or
-    /// the peer's close_notify.
+    /// accept task), wake the reader, record the peer's close_notify as the
+    /// end of the read half, or close the connection on an error.
     fn apply_tls_recv_result(&mut self, conn_index: u32, result: crate::tls::TlsRecvResult) {
         match result {
             crate::tls::TlsRecvResult::HandshakeJustCompleted { peer_closed } => {
@@ -1250,11 +1250,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // The peer's close_notify came in the same feed as its
                 // last handshake flight. Handle it as the `Closed` arm
                 // does: the task reads what arrived, then EOF.
-                if peer_closed {
-                    if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                        cs.note_eof(false);
-                    }
-                    self.driver.close_connection(conn_index);
+                if peer_closed && let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                    cs.note_eof(false);
                 }
             }
             crate::tls::TlsRecvResult::Ok => {
@@ -1278,11 +1275,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
             }
             crate::tls::TlsRecvResult::Closed => {
+                // The peer's close_notify ends the read half; the
+                // connection stays open for its task.
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.note_eof(false);
                 }
                 self.executor.wake_recv(conn_index);
-                self.driver.close_connection(conn_index);
             }
         }
     }
@@ -1318,7 +1316,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     cs.note_eof(close_notify_seen == Some(false));
                 }
                 self.executor.wake_recv(conn_index);
-                self.driver.close_connection(conn_index);
                 return;
             }
             if -result == libc::ECANCELED {
@@ -1476,9 +1473,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// reader's receives deliver the bytes and then the end. Otherwise (0,
     /// the FIN alone, or an error) the stream has ended with nothing left in
     /// the socket. If no receive is in flight and nothing is buffered, the
-    /// connection closes as it would under a parked read. Otherwise it stays
-    /// open and goes on `hangup_rechecks`: buffered bytes stay readable, and
-    /// once they are read the recheck peeks again. A peek error is kept in
+    /// end is recorded on the read half, as a parked read would record it,
+    /// and an error also closes the connection. Otherwise the connection
+    /// goes on `hangup_rechecks`: buffered bytes stay readable, and once
+    /// they are read the recheck peeks again. A peek error is kept in
     /// `hangup_error`, because the peek cleared the socket's pending error
     /// and whatever later finds the end has to report it.
     fn handle_hangup_peek(&mut self, ud: UserData, result: i32) {
@@ -1540,9 +1538,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 ud.payload(),
                 io::Error::from_raw_os_error(-result),
             );
+            self.driver.close_connection(conn_index);
         }
         self.executor.wake_recv(conn_index);
-        self.driver.close_connection(conn_index);
     }
 
     /// Submit the hangup polls that could not be submitted
@@ -1585,9 +1583,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Submit owed hangup polls (`retry_hangup_polls`), then peek again on
     /// the connections in `hangup_rechecks` whose `hangup_recheck_due` is
     /// set, once nothing is buffered, armed or parking. The end of the
-    /// stream behind bytes already delivered then closes the connection
-    /// even if no read parks after they are consumed. Drops connections that
-    /// closed, were recycled or finished reading.
+    /// stream behind bytes already delivered is then recorded on the read
+    /// half even if no read parks after they are consumed. Drops connections
+    /// that closed, were recycled or finished reading.
     fn recheck_hangups(&mut self) {
         self.retry_hangup_polls();
         if self.driver.hangup_rechecks.is_empty() {
@@ -5095,6 +5093,140 @@ mod tests {
         conn_index
     }
 
+    /// The read half is finished and nothing is closing: the peer's end
+    /// requested no close (`docs/half-close-design.md`). `truncated` is a TLS
+    /// FIN without the peer's close_notify.
+    fn assert_half_open(el: &AsyncEventLoop<NoopHandler>, conn_index: u32, truncated: bool) {
+        let cs = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot is held");
+        assert_eq!(cs.read, ReadHalf::Eof { truncated });
+        assert_eq!(cs.lifecycle, Lifecycle::Open);
+        assert!(!cs.close_requested());
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(!state.close_pending, "the end requested a close");
+        assert!(!state.close_submitted);
+        assert!(!el.driver.pending_finalize_closes.contains(&conn_index));
+    }
+
+    /// The peer's FIN, read by a direct receive, finishes the read half and
+    /// requests no close.
+    #[test]
+    fn a_fin_finishes_the_read_half_and_requests_no_close() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            0,
+            0,
+        );
+        assert_half_open(&el, conn_index, false);
+    }
+
+    /// A hangup peek that finds the stream ended with nothing queued or
+    /// buffered finishes the read half and requests no close.
+    #[test]
+    fn a_hangup_peek_that_finds_the_end_finishes_the_read_half() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::HangupPeek, conn_index, generation).raw(),
+            0,
+            0,
+        );
+        assert_half_open(&el, conn_index, false);
+    }
+
+    /// A hangup peek that returns the socket's error still closes the
+    /// connection, with the read half in error.
+    #[test]
+    fn a_hangup_peek_error_still_closes() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::HangupPeek, conn_index, generation).raw(),
+            -libc::ECONNRESET,
+            0,
+        );
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert_eq!(cs.read, ReadHalf::Error);
+        assert!(cs.close_requested(), "a reset closes the connection");
+    }
+
+    /// A FIN on a TLS connection without the peer's close_notify finishes the
+    /// read half as a truncation and requests no close; the TLS state stays
+    /// for the task's sends.
+    #[test]
+    fn a_tls_fin_finishes_the_read_half_as_a_truncation_and_requests_no_close() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            0,
+            0,
+        );
+        assert_half_open(&el, conn_index, true);
+        assert!(
+            el.driver.tls_table.as_ref().unwrap().has(conn_index),
+            "the TLS state stays for the task's sends"
+        );
+    }
+
+    /// The peer's close_notify, reported by the receive path, finishes the
+    /// read half cleanly and requests no close.
+    #[test]
+    fn the_peers_close_notify_finishes_the_read_half_and_requests_no_close() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        install_handshaked_tls(&mut el, conn_index);
+        el.apply_tls_recv_result(conn_index, crate::tls::TlsRecvResult::Closed);
+        assert_half_open(&el, conn_index, false);
+    }
+
+    /// A close_notify that arrives with the client's last handshake flight
+    /// completes the handshake and finishes the read half, and requests no
+    /// close: the task reads what arrived, then `0`.
+    #[test]
+    fn a_close_notify_with_the_handshake_finishes_the_read_half_and_requests_no_close() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        install_handshaked_tls(&mut el, conn_index);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .established = false;
+        el.apply_tls_recv_result(
+            conn_index,
+            crate::tls::TlsRecvResult::HandshakeJustCompleted { peer_closed: true },
+        );
+        assert!(
+            el.driver.connections.get(conn_index).unwrap().established,
+            "the handshake completed"
+        );
+        assert_half_open(&el, conn_index, false);
+    }
+
     /// A hangup poll that completes while a direct receive is in flight puts
     /// the connection on the recheck list, so if that receive returns bytes
     /// the end behind them is found after they are read, without a read
@@ -5429,7 +5561,8 @@ mod tests {
     }
 
     /// No park starts while a hangup peek is in flight, and a peek that
-    /// finds the stream ended closes the connection instead.
+    /// finds the stream ended finishes the read half, which refuses the park
+    /// too.
     #[test]
     fn a_hangup_peek_in_flight_holds_off_the_park() {
         let mut el = make_test_loop();
@@ -5444,17 +5577,16 @@ mod tests {
         assert!(el.driver.park_in_flight[conn_index as usize].is_none());
         let ud = UserData::encode(OpTag::HangupPeek, conn_index, generation);
         el.test_dispatch_cqe(ud.raw(), 0, 0);
-        assert!(
-            el.driver
-                .connections
-                .get(conn_index)
-                .unwrap()
-                .close_requested(),
-            "the peek found the end and closed the connection"
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert_eq!(
+            cs.read,
+            ReadHalf::Eof { truncated: false },
+            "the peek found the end"
         );
+        assert!(!cs.close_requested(), "the end requested a close");
         assert!(
             !el.begin_park(conn_index, 1),
-            "a closing connection is not parked"
+            "a connection whose read half is finished is not parked"
         );
     }
 
@@ -8318,8 +8450,9 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
 
         if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            // Peer FIN with the close requested but not yet committed: the
-            // deferred-close drain window this test exists to cover.
+            // The read half finished and a close requested (the task returned
+            // after the peer's FIN) but not yet committed: the deferred-close
+            // drain window this test exists to cover.
             cs.note_eof(false);
             cs.lifecycle = Lifecycle::Closing;
         }
@@ -9341,9 +9474,9 @@ mod tests {
         );
     }
 
-    /// #371: a close requested by the driver (peer FIN, read error, task
-    /// exit) must not commit the Close SQE synchronously — the task gets its
-    /// poll window first. The event loop's end-of-iteration drain of
+    /// #371: a close requested by the driver (read error, task exit) must
+    /// not commit the Close SQE synchronously — the task gets its poll
+    /// window first. The event loop's end-of-iteration drain of
     /// `pending_finalize_closes` commits it.
     #[test]
     fn close_connection_on_idle_connection_defers_finalize_to_the_drain() {
@@ -9381,13 +9514,13 @@ mod tests {
         assert!(!state.close_pending);
     }
 
-    /// The peer's FIN and the CQE of the send that held the close open land
-    /// in one completion batch. The task woken by the FIN sends its reply in
-    /// the poll that follows the batch, so the Close must be left to the
-    /// end-of-iteration drain, after that poll, and the reply must reach the
-    /// peer.
+    /// The peer's FIN and the CQE of an in-flight send land in one completion
+    /// batch. The FIN requests no close; the task woken by it sends its reply
+    /// in the poll that follows the batch and returns once the reply is
+    /// delivered, and that return closes the connection behind the reply,
+    /// which reaches the peer.
     #[test]
-    fn a_fin_batched_with_the_last_send_cqe_leaves_the_close_to_the_drain() {
+    fn a_fin_batched_with_the_last_send_cqe_leaves_the_close_to_the_task() {
         use std::cell::Cell;
         use std::rc::Rc;
 
@@ -9447,14 +9580,14 @@ mod tests {
         el.inject_batch_and_dispatch(&[(recv_ud.raw(), 0), (send_ud.raw(), 4)]);
         {
             let state = &el.driver.send_queues[conn_index as usize];
-            assert!(state.close_pending, "the FIN requested the close");
+            assert!(!state.close_pending, "the FIN requested a close");
             assert!(!state.in_flight, "the send's CQE drained the queue");
-            assert!(
-                !state.close_submitted,
-                "the Close must wait for the end-of-iteration drain"
-            );
         }
-        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+        assert!(!el.driver.pending_finalize_closes.contains(&conn_index));
+        assert_eq!(
+            el.driver.connections.get(conn_index).unwrap().read,
+            ReadHalf::Eof { truncated: false }
+        );
 
         // The rest of the iteration: the woken task is polled and replies.
         el.executor.collect_wakeups();
@@ -9466,18 +9599,25 @@ mod tests {
         );
         el.finalize_pending_closes();
         assert!(
-            !el.driver.send_queues[conn_index as usize].close_submitted,
-            "the Close waits for the reply"
+            !el.driver.send_queues[conn_index as usize].close_pending,
+            "nothing closes while the task runs"
         );
 
-        // The reply's CQE lands; the drain commits the Close; the task
-        // sees its send resolve.
+        // The reply's CQE lands; the task sees its send resolve and returns,
+        // which closes the connection; the drain commits the Close.
         complete_one_cqe(&mut el);
-        el.finalize_pending_closes();
-        assert!(el.driver.send_queues[conn_index as usize].close_submitted);
         el.executor.collect_wakeups();
         el.poll_ready_tasks();
         assert_eq!(seen.get(), Some(Ok(())), "the reply was refused");
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .is_none_or(|c| c.close_requested()),
+            "the task's return closes the connection"
+        );
+        el.finalize_pending_closes();
+        assert!(el.driver.send_queues[conn_index as usize].close_submitted);
         let mut buf = [0u8; 16];
         assert_eq!(drain_peer(&peer, &mut buf), 3);
         assert_eq!(&buf[..3], b"bye");
@@ -12013,19 +12153,21 @@ mod tests {
 
     #[test]
     fn batch_recv_eof_then_send_cqe() {
-        // Recv EOF requests the close (sets Lifecycle::Closing, defers the
-        // Close behind the in-flight send), then that send's CQE arrives
-        // in the same batch. The send handler must not panic on the closing
-        // connection, and the Close must be left to the end-of-iteration
-        // drain, after the task woken by the EOF is polled.
+        // Recv EOF finishes the read half and requests no close, then the
+        // in-flight send's CQE arrives in the same batch. The send handler
+        // releases its slot on the open connection, and nothing is left for
+        // the end-of-iteration drain.
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
+        // A real socket behind the fixed file: the receive armed below stays
+        // in the kernel instead of failing with `EBADF`, which would land as
+        // a read error on the connection the injected EOF leaves open.
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
         let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
 
         // Recv EOF + stale send in the same batch.
-        // The EOF handler calls close_connection internally.
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
         let recv_slot = el
             .driver
@@ -12037,25 +12179,12 @@ mod tests {
         let send_ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
 
         el.inject_batch_and_dispatch(&[
-            (recv_ud.raw(), 0), // EOF → close_connection
+            (recv_ud.raw(), 0), // EOF: the read half is finished
             (send_ud.raw(), 4), // the in-flight send completes (4 bytes = b"data")
         ]);
 
-        // Connection should be closing. Pool slot should be released
-        // cleanly (no panic).
-        let conn = el.driver.connections.get(conn_index);
-        assert!(conn.is_none() || conn.unwrap().close_requested());
         assert!(!el.driver.send_copy_pool.in_use(slot));
-        let state = &el.driver.send_queues[conn_index as usize];
-        assert!(
-            state.close_pending,
-            "the close stays pending until the drain"
-        );
-        assert!(
-            !state.close_submitted,
-            "the completion drain must not commit the Close"
-        );
-        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+        assert_half_open(&el, conn_index, false);
     }
 
     #[test]
@@ -16215,12 +16344,13 @@ mod tests {
                 let conn_index = accept_connection(&mut el);
 
                 for action in &actions {
-                    // Skip if connection already closed.
+                    // Stop once the connection is closed or its read half is
+                    // finished: nothing arms a receive after the end.
                     if el
                         .driver
                         .connections
                         .get(conn_index)
-                        .is_none_or(|c| c.close_requested())
+                        .is_none_or(|c| c.close_requested() || c.recv_finished())
                     {
                         break;
                     }
@@ -16350,11 +16480,13 @@ mod tests {
                             }
                         }
 
-                        // Recv EOF — closes the connection.
+                        // Recv EOF finishes the read half; the task's return
+                        // closes the connection.
                         5 if !live_conns.is_empty() => {
                             let ci = live_conns.remove(0);
                             let ud = armed_recv_ud(&mut el, ci);
                             el.test_dispatch_cqe(ud.raw(), 0, 0);
+                            el.driver.close_connection(ci);
                             // Simulate Close CQE.
                             let close_ud = UserData::encode(OpTag::Close, ci, 0);
                             el.test_dispatch_cqe(close_ud.raw(), 0, 0);
@@ -16383,7 +16515,8 @@ mod tests {
                                 // EOF first, then stale send — the bug pattern.
                                 el.test_dispatch_cqe(recv_ud.raw(), 0, 0);
                                 el.test_dispatch_cqe(send_ud.raw(), 4, 0);
-                                // Close CQE.
+                                // The task's return closes; then the Close CQE.
+                                el.driver.close_connection(ci);
                                 let close_ud = UserData::encode(OpTag::Close, ci, 0);
                                 el.test_dispatch_cqe(close_ud.raw(), 0, 0);
                             } else {

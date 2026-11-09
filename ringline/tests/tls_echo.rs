@@ -1931,20 +1931,21 @@ fn a_tls_reader_that_does_not_read_stops_its_peer() {
     );
 }
 
-/// Acks the handshake with one byte, then watches `is_alive` without reading.
+/// Acks the handshake with one byte, then watches `peer_closed` without
+/// reading.
 struct TlsCloseWatcher;
 
 static TLS_CLOSE_SEEN: Mutex<Option<bool>> = Mutex::new(None);
 
-/// Reports the close if the runtime drops the watcher's task when the
-/// connection closes, before the watcher sees `is_alive` turn false.
+/// Reports a failure if the runtime drops the watcher's task before it sees
+/// the end: the peer's close finishes the read half and drops nothing.
 struct ReportCloseOnDrop;
 
 impl Drop for ReportCloseOnDrop {
     fn drop(&mut self) {
         let mut seen = TLS_CLOSE_SEEN.lock().unwrap();
         if seen.is_none() {
-            *seen = Some(true);
+            *seen = Some(false);
         }
     }
 }
@@ -1957,8 +1958,8 @@ impl AsyncEventHandler for TlsCloseWatcher {
             let _ = conn.send_nowait(b"a");
             let started = Instant::now();
             while started.elapsed() < Duration::from_secs(5) {
-                if !conn.is_alive() {
-                    *TLS_CLOSE_SEEN.lock().unwrap() = Some(true);
+                if conn.peer_closed() {
+                    *TLS_CLOSE_SEEN.lock().unwrap() = Some(conn.is_alive());
                     return;
                 }
                 ringline::sleep(Duration::from_millis(10)).await;
@@ -1973,7 +1974,8 @@ impl AsyncEventHandler for TlsCloseWatcher {
 }
 
 /// A TLS connection that nothing reads sees its peer's close_notify and FIN:
-/// the hangup poll arms a receive, so `is_alive` turns false.
+/// the hangup poll arms a receive, so `peer_closed` turns true while the
+/// task runs on and the connection stays alive.
 #[test]
 fn a_tls_peer_close_is_seen_while_nothing_reads() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2018,7 +2020,10 @@ fn a_tls_peer_close_is_seen_while_nothing_reads() {
     for h in handles {
         h.join().expect("worker panicked").expect("worker failed");
     }
-    assert!(seen, "the TLS connection did not see its peer close");
+    assert!(
+        seen,
+        "the TLS connection did not see its peer close with the task alive"
+    );
 }
 
 // ── A TLS connection may not be a forward sink (EPROTOTYPE, both backends) ──
@@ -2600,4 +2605,129 @@ fn a_send_during_a_read_with_a_partial_handshake_message() {
 fn a_close_during_a_read_with_a_partial_handshake_message() {
     let (_, closed) = partial_ticket_exchange(false);
     assert!(closed, "the server did not read a close_notify");
+}
+
+// ── A reply after the peer's close_notify ────────────────────────────
+
+/// `(peer_closed, is_alive, eof_truncated)` after the timer, and the last
+/// read's result.
+static TLS_AFTER_PEER_CLOSE: Mutex<Option<(bool, bool, bool, usize)>> = Mutex::new(None);
+
+/// Reads one byte, waits on a timer, sends a reply, reads to the end and
+/// returns.
+struct TlsReplyAfterTimer;
+
+impl AsyncEventHandler for TlsReplyAfterTimer {
+    #[allow(clippy::manual_async_fn)]
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let n = conn
+                .with_data(|d| {
+                    if d.is_empty() {
+                        ParseResult::NeedMore
+                    } else {
+                        ParseResult::Consumed(d.len())
+                    }
+                })
+                .await;
+            if n == 0 {
+                return;
+            }
+            ringline::sleep(Duration::from_millis(300)).await;
+            let flags = (conn.peer_closed(), conn.is_alive(), conn.eof_truncated());
+            if let Ok(fut) = conn.send(b"reply") {
+                let _ = fut.await;
+            }
+            let last = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
+            *TLS_AFTER_PEER_CLOSE.lock().unwrap() = Some((flags.0, flags.1, flags.2, last));
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        TlsReplyAfterTimer
+    }
+}
+
+/// The client sends its request and a close_notify, and keeps TCP open. The
+/// server's task, asleep on a timer, is not dropped: it sees the peer's end
+/// on `peer_closed` (not a truncation), sends the reply after the peer's
+/// close_notify, reads `0` and returns. The client reads the reply, then the
+/// server's close_notify, then the FIN on the socket.
+#[test]
+fn a_reply_after_the_peers_close_notify_reaches_the_client() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+    *TLS_AFTER_PEER_CLOSE.lock().unwrap() = None;
+    let (certs, key) = generate_self_signed();
+    let config = test_config_builder()
+        .tls(ringline_server_tls(certs.clone(), key))
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<TlsReplyAfterTimer>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    wait_for_server(&addr);
+
+    let server_name: ServerName<'_> = "localhost".try_into().unwrap();
+    let mut tls_conn =
+        rustls::ClientConnection::new(client_tls_config(&certs), server_name).unwrap();
+    let mut tcp = TcpStream::connect(&addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    {
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp);
+        stream.write_all(b"g").unwrap();
+        stream.flush().unwrap();
+    }
+    tls_conn.send_close_notify();
+    while tls_conn.wants_write() {
+        tls_conn.write_tls(&mut tcp).unwrap();
+    }
+
+    let mut plaintext = Vec::new();
+    let mut peer_closed = false;
+    let mut buf = [0u8; 4096];
+    loop {
+        match tls_conn.read_tls(&mut tcp) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => panic!("read_tls failed after {} bytes: {e}", plaintext.len()),
+        }
+        let state = tls_conn
+            .process_new_packets()
+            .expect("server sent a malformed record");
+        loop {
+            match tls_conn.reader().read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => plaintext.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("plaintext read failed: {e}"),
+            }
+        }
+        if state.peer_has_closed() {
+            peer_closed = true;
+        }
+    }
+    // `read_tls` returns 0 once the peer's close_notify was read, so the FIN
+    // is observed on the socket itself.
+    let fin = matches!(tcp.read(&mut buf), Ok(0));
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().expect("worker panicked").expect("worker failed");
+    }
+    assert!(fin, "the server's FIN did not follow its close_notify");
+    assert_eq!(
+        plaintext, b"reply",
+        "the reply after the peer's close_notify"
+    );
+    assert!(
+        peer_closed,
+        "no close_notify from the server before its FIN"
+    );
+    assert_eq!(
+        *TLS_AFTER_PEER_CLOSE.lock().unwrap(),
+        Some((true, true, false, 0)),
+        "(peer_closed, is_alive, eof_truncated, last read) after the timer"
+    );
 }

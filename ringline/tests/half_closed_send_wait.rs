@@ -270,8 +270,9 @@ fn stalled_peers_hold_no_thread<H: AsyncEventHandler>(config: Config, len: usize
 
 /// A send of one pool slot on a socket that is already full, whose peer then
 /// half-closes: the FIN moves it from the one-shot poll to the multishot poll.
-/// The FIN closes the connection when that send finishes, so a later send of
-/// the handler's is refused and the peer sees a prefix.
+/// The FIN closes nothing, so the handler's later sends wait on the same
+/// poll, and the peer reads the whole payload before the FIN the handler's
+/// return sends.
 #[test]
 fn a_fin_during_a_single_slot_send_holds_no_thread() {
     let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -298,7 +299,11 @@ fn a_fin_during_a_single_slot_send_holds_no_thread() {
     for peer in &mut peers {
         let mut got = Vec::new();
         peer.read_to_end(&mut got).expect("the peer sees EOF");
-        assert!(!got.is_empty());
+        assert_eq!(
+            got.len(),
+            16 << 20,
+            "the whole payload arrives after the FIN"
+        );
         if let Some(i) = (0..got.len()).find(|&i| got[i] != pattern(i)) {
             panic!("payload differs at byte {i}");
         }

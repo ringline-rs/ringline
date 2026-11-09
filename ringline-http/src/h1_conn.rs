@@ -117,9 +117,10 @@ impl H1Conn {
         self.tx.id()
     }
 
-    /// Is the connection still usable?
+    /// Is the connection still usable: no close has been requested, and the
+    /// server has not closed its side (a reply could still arrive)?
     pub fn is_alive(&self) -> bool {
-        self.tx.is_alive()
+        self.tx.is_alive() && !self.rx.peer_closed()
     }
 
     /// Close the connection.

@@ -958,9 +958,9 @@ fn stage_incoming(to: &mut TlsConn, ciphertext: &[u8]) {
         .expect("test appends stay under the cap");
 }
 
-/// A handshaked server with the client's close_notify sitting undriven in its
-/// ciphertext buffer.
-fn server_with_undriven_peer_close() -> TlsConn {
+/// A handshaked `(server, client)` pair with the client's close_notify
+/// sitting undriven in the server's ciphertext buffer.
+fn server_with_undriven_peer_close() -> (TlsConn, TlsConn) {
     let (mut server, mut client) = conn_pair();
     let mut accs = AccumulatorTable::new(2, 1024 * 1024);
     handshake(&mut server, &mut client, &mut accs);
@@ -974,7 +974,7 @@ fn server_with_undriven_peer_close() -> TlsConn {
         !server.peer_sent_close_notify,
         "staging must not drive the machine"
     );
-    server
+    (server, client)
 }
 
 // `ConnectionState::PeerClosed` is edge-triggered (`emitted_peer_closed_state`
@@ -984,26 +984,56 @@ fn server_with_undriven_peer_close() -> TlsConn {
 // flag rather than swallow the state. Dropping it leaves
 // `peer_sent_close_notify` false and makes the peer's following FIN read as a
 // truncation: `eof_truncated()` would report an attack that did not happen.
+// The send itself goes out: rustls answers `WriteTraffic` after the peer's
+// close_notify until this side sends its own, and TLS 1.3 allows the write.
 #[test]
-fn encrypt_records_a_peer_close_it_deframes() {
-    let mut server = server_with_undriven_peer_close();
+fn encrypt_records_a_peer_close_it_deframes_and_still_encrypts() {
+    let (mut server, mut client) = server_with_undriven_peer_close();
 
     let mut dst = [0u8; 4096];
-    // The result is beside the point — a closed connection cannot encrypt.
-    // What matters is that the edge was not lost on the way to that answer.
-    let _ = encrypt_chunk(&mut server, b"hello", &mut dst);
+    let (consumed, written) = encrypt_chunk(&mut server, b"hello", &mut dst)
+        .expect("a send after the peer's close_notify encrypts");
+    assert_eq!(consumed, 5, "the whole chunk was taken");
 
     assert!(
         server.peer_sent_close_notify,
         "the send path consumed the PeerClosed edge without recording it"
     );
+    assert_eq!(
+        decrypt_at(&mut client, &dst[..written]).expect("the peer decrypts the record"),
+        b"hello"
+    );
+}
+
+// A send after the receive path deframed the peer's close_notify encrypts
+// too: the common flow, where the edge was consumed by `feed`.
+#[test]
+fn encrypt_after_a_received_close_notify_still_encrypts() {
+    let (mut server, mut client) = conn_pair();
+    let mut accs = AccumulatorTable::new(2, 1024 * 1024);
+    handshake(&mut server, &mut client, &mut accs);
+    accs.reset(0);
+    let mut alert = Vec::new();
+    queue_close_notify(&mut client, &mut alert).expect("queue close_notify");
+    let (outcome, _) = pump(&mut server, &alert, &mut accs);
+    assert!(matches!(outcome, DriveOutcome::Closed), "{outcome:?}");
+
+    let mut dst = [0u8; 4096];
+    let (_, written) = encrypt_chunk(&mut server, b"hello", &mut dst)
+        .expect("a send after the peer's close_notify encrypts");
+    assert_eq!(
+        decrypt_at(&mut client, &dst[..written]).expect("the peer decrypts the record"),
+        b"hello"
+    );
 }
 
 // Same edge, same argument, through the close path: tearing a connection down
-// is exactly when a lost `PeerClosed` would be mistaken for a truncation.
+// is exactly when a lost `PeerClosed` would be mistaken for a truncation. The
+// close then queues this side's alert in reply, as it does when the receive
+// path deframed the peer's.
 #[test]
-fn close_notify_records_a_peer_close_it_deframes() {
-    let mut server = server_with_undriven_peer_close();
+fn close_notify_records_a_peer_close_it_deframes_and_answers_it() {
+    let (mut server, mut client) = server_with_undriven_peer_close();
 
     let mut out = Vec::new();
     queue_close_notify(&mut server, &mut out).expect("a closed connection is not an error");
@@ -1013,8 +1043,15 @@ fn close_notify_records_a_peer_close_it_deframes() {
         "the close path consumed the PeerClosed edge without recording it"
     );
     assert!(
-        out.is_empty(),
-        "a peer that already closed leaves nothing to queue"
+        server.close_notify_sent,
+        "this side's alert was queued in reply"
+    );
+    assert!(!out.is_empty(), "the alert is real ciphertext");
+    let mut accs = AccumulatorTable::new(2, 1024 * 1024);
+    let (outcome, _) = pump(&mut client, &out, &mut accs);
+    assert!(
+        matches!(outcome, DriveOutcome::Closed),
+        "the peer reads a clean close, got {outcome:?}"
     );
 }
 

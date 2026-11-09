@@ -81,9 +81,15 @@ cannot finish waits in ringline:
    still waiting is followed by a one-shot poll, which arms a multishot
    again if it completes without `POLLOUT`.
 6. The poll stays armed until the connection closes, when `try_finalize_close`, or
-   worker exit, cancels it. A half-closed connection is always closing, and a poll
-   armed for step 2 costs one ignored CQE per edge. Cancelling when each send finishes
-   would race the next send's arm.
+   worker exit, cancels it. Since `docs/half-close-design.md` a half-closed connection
+   is not closing, so the poll can be armed for the rest of the connection's life.
+   TCP wakes `POLLOUT` waiters only after a send found no room (`tcp_check_space`
+   calls `sk_write_space` only with `SOCK_NOSPACE` set; read from the kernel
+   source, not measured), so the armed poll posts nothing while sends fit, and
+   `wait_for_room` uses it when a send next waits. A
+   poll armed for step 2 costs one ignored CQE per edge. Cancelling when each send
+   finishes would race the next send's arm: every poll of a connection has the same
+   user_data.
 7. A timer resubmits every waiting send once a second, whichever poll it waits on.
    It covers a lost edge, and a Unix peer's `SHUT_RD`, which a send reports as `-EPIPE`
    and a poll does not report. The interval is a guess, and this retry is unmeasured.

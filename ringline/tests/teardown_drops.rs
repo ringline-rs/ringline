@@ -83,19 +83,34 @@ fn hold_all_but(addr: std::net::SocketAddr, free: usize) -> std::net::TcpStream 
     stream
 }
 
-/// Connect, wait for the server to accept and settle, then close.
-fn connect_and_close(addr: std::net::SocketAddr) {
-    let mut client = std::net::TcpStream::connect(addr).expect("connect");
+/// Connect, wait for the server to accept and settle, then reset the
+/// connection. A reset closes it on the server; a FIN alone finishes the
+/// read half and leaves the sleeping task in place.
+fn connect_and_reset(addr: std::net::SocketAddr) {
+    let client = std::net::TcpStream::connect(addr).expect("connect");
     std::thread::sleep(Duration::from_millis(20));
-    // Set before the write shutdown: macOS refuses `setsockopt` once both
-    // directions are shut, and the server's FIN can arrive before this
-    // call (#778).
-    client
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    client.shutdown(std::net::Shutdown::Write).ok();
-    // The server closes once it sees our FIN; reading to EOF waits for that.
-    let _ = client.read(&mut [0u8; 16]);
+    reset(client);
+}
+
+/// Close `client` with a reset: `SO_LINGER` with a zero timeout turns the
+/// close into an RST.
+fn reset(client: std::net::TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            client.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "setsockopt(SO_LINGER) failed");
+    drop(client);
 }
 
 /// A connection closed while its task sleeps gives the timer slot back, so
@@ -105,6 +120,7 @@ fn a_sleep_dropped_with_its_connection_frees_its_timer_slot() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     ARMED.store(0, Ordering::SeqCst);
     EXHAUSTED.store(0, Ordering::SeqCst);
+    SLEEPERS_DROPPED.store(0, Ordering::SeqCst);
     let config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
@@ -122,8 +138,14 @@ fn a_sleep_dropped_with_its_connection_frees_its_timer_slot() {
         .expect("launch");
     let addr = runtime.bound_addr().unwrap();
     let _filler = hold_all_but(addr, 8);
-    for _ in 0..20 {
-        connect_and_close(addr);
+    for i in 0..20 {
+        connect_and_reset(addr);
+        // The reset is seen asynchronously; wait for the drop so the slots
+        // do not run out before the tasks that hold them are gone.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SLEEPERS_DROPPED.load(Ordering::SeqCst) < i + 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     while ARMED.load(Ordering::SeqCst) + EXHAUSTED.load(Ordering::SeqCst) < 20
@@ -184,8 +206,8 @@ fn a_freed_timer_slot_is_available_to_the_next_connection() {
         .collect();
     wait_for(4);
     for round in 0..30 {
-        // Close the oldest connection and wait for its task to be dropped.
-        drop(open.pop_front().unwrap());
+        // Reset the oldest connection and wait for its task to be dropped.
+        reset(open.pop_front().unwrap());
         let deadline = Instant::now() + Duration::from_secs(5);
         while SLEEPERS_DROPPED.load(Ordering::SeqCst) < round + 1 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
@@ -272,7 +294,7 @@ fn a_spawn_dropped_with_its_connection_closes_its_pidfd() {
         .expect("launch");
     let addr = runtime.bound_addr().unwrap();
     for _ in 0..10 {
-        connect_and_close(addr);
+        connect_and_reset(addr);
     }
     // Let the spawns' results arrive and the event loop release them.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -370,7 +392,7 @@ fn a_blocking_handle_dropped_with_its_connection_drops_the_result() {
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<BlockingInConnection>()
         .expect("launch");
-    connect_and_close(runtime.bound_addr().unwrap());
+    connect_and_reset(runtime.bound_addr().unwrap());
 
     // The blocking pool runs at `SCHED_IDLE`, so on a loaded host its result
     // can take seconds to arrive.
@@ -452,7 +474,7 @@ fn a_sender_dropped_with_its_connection_wakes_the_receiver() {
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SenderInConnection>()
         .expect("launch");
-    connect_and_close(runtime.bound_addr().unwrap());
+    connect_and_reset(runtime.bound_addr().unwrap());
     let deadline = Instant::now() + Duration::from_secs(10);
     while RECV_OUTCOME.lock().unwrap().is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -591,7 +613,7 @@ fn drop_a_connect_to(
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<ConnectsInConnection>()
         .expect("launch");
-    connect_and_close(runtime.bound_addr().unwrap());
+    connect_and_reset(runtime.bound_addr().unwrap());
     let deadline = Instant::now() + Duration::from_secs(5);
     while CONNECT_TASKS_DROPPED.load(Ordering::SeqCst) == 0 {
         assert!(

@@ -752,7 +752,7 @@ pub(crate) struct Driver {
     pub(crate) capacity_released: bool,
     /// Connections whose Close is owed to the event loop's end-of-iteration
     /// drain, which runs `try_finalize_close` for each. `close_connection`
-    /// (peer FIN, read error, task exit, setup failure) registers a
+    /// (read error, task exit, setup failure) registers a
     /// connection when it requests its close with nothing outstanding,
     /// `DriverCtx::close` whenever it requests one, and
     /// `defer_finalize_close` registers it from the completion that drains
@@ -853,9 +853,10 @@ pub(crate) enum ParkBlocker {
     /// The handler has not offered this connection via `offer_for_park`.
     /// Park is opt-in, so this is the common answer, not an error.
     NotOffered,
-    /// Teardown is already requested. Park loses this race deliberately:
-    /// moving a connection the peer is closing buys nothing, and the close
-    /// path is the one carrying the invariants.
+    /// Teardown is already requested, or the read or write half is finished.
+    /// Park loses this race deliberately: moving a connection that is closing
+    /// or half-closed buys nothing, and the close path is the one carrying
+    /// the invariants.
     Closing,
     /// Queued or in-flight sends. Their SQEs reference *this* worker's
     /// `SendCopyPool` slots and `InFlightSendSlab` entries, which Domain
@@ -1695,8 +1696,8 @@ impl Driver {
     /// park install, which commits the Close of a handed-off socket at once.
     /// The send, chain and `Shutdown` completion handlers do not call this:
     /// they call `defer_finalize_close`, so that when the last gating CQE
-    /// lands in the same batch as the peer's FIN, the Close is committed
-    /// after the task woken by the FIN has been polled.
+    /// lands in the same batch as a read error, the Close is committed after
+    /// the task woken by the error has been polled.
     pub(crate) fn try_finalize_close(&mut self, conn_index: u32) {
         let state = &self.send_queues[conn_index as usize];
         let sends_drained = !state.in_flight && state.queue.is_empty();

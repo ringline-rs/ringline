@@ -206,9 +206,8 @@ pub(crate) struct Driver {
     /// awaiting executor cleanup and slot release by the event loop's
     /// `drain_pending_closes`. An entry stays here until its
     /// `pending_sends` have drained (or its stream is gone), so a response
-    /// queued after the peer's FIN is still delivered (io_uring's
-    /// `try_finalize_close` defers the same way for sends already queued at
-    /// the FIN; see #371 for the post-EOF send it does not yet cover). Deferring the release also
+    /// queued before the close is still delivered (io_uring's
+    /// `try_finalize_close` defers the same way). Deferring the release also
     /// (a) lets `Executor::remove_connection` run first (stale parked
     /// futures and waiter flags used to survive into the slot's next
     /// occupant), and (b) closes the reuse window between a task closing a
