@@ -3157,8 +3157,13 @@ mod worker_exit_tests {
                 .bind("127.0.0.1:0".parse().unwrap())
                 .launch::<Echo>()
                 .expect("launch");
-            // The listener went live after the worker stopped, so these reach
-            // the other worker only if `launch()` steered it around.
+            // The worker stops on its first loop iteration, before or after
+            // `launch()` listens: nothing orders the two. Once it has
+            // stopped, its socket is out of the steering and what the
+            // socket queued is closed, so every later connection reaches
+            // the other worker. A connection made before that can hash to
+            // the stopped worker's socket and be closed (#783).
+            wait_for_exit(&handles, 1);
             let addr = runtime.bound_addr().unwrap();
             let results: Vec<Echoed> = (0..16)
                 .map(|_| echo(&mut TcpStream::connect(addr).unwrap()))
