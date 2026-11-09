@@ -472,13 +472,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // ahead of a hangup; peek before blocking rather than at the next
             // completion.
             self.recheck_hangups();
-            // Declining to block still has to reap: under DEFER_TASKRUN the
-            // kernel runs task_work only on a GETEVENTS enter, and
-            // `submit_and_wait(0)` carries no such flag. Going through
-            // `submit_and_get_events` (same single syscall) keeps completions
-            // flowing while a task is runnable — otherwise a task that stays
-            // runnable without queueing SQEs (so `flush()` takes its empty-SQ
-            // shortcut) starves the whole worker of completions.
             // Under `defer_recv_arm`, a wait with no completion pending would
             // block, and arming the deferred receives after it would take a
             // second, non-blocking pass. Arm them now instead; this enter
@@ -489,6 +482,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 self.arm_deferred_recvs();
             }
+            // Declining to block still has to reap: under DEFER_TASKRUN the
+            // kernel runs task_work only on a GETEVENTS enter, and
+            // `submit_and_wait(0)` carries no such flag. Going through
+            // `submit_and_get_events` (same single syscall) keeps completions
+            // flowing while a task is runnable — otherwise a task that stays
+            // runnable without queueing SQEs (so `flush()` takes its empty-SQ
+            // shortcut) starves the whole worker of completions.
             if self.may_block() {
                 self.driver.ring.submit_and_wait(1)?;
             } else {
@@ -1091,6 +1091,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// UDP re-arms: `return_udp_buffers` retries a re-arm that could not be
     /// submitted, and with no tick timeout a blocking wait could outlast every
     /// other completion.
+    ///
+    /// Deferred receives: `completion_pending()` also reports task work that
+    /// posts no completion, so a blocking wait could hold an unarmed deferred
+    /// receive until an unrelated completion arrives.
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
@@ -1109,7 +1113,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
         let mut arms = std::mem::take(&mut self.driver.deferred_recv_arms);
-        for &(conn_index, generation, need) in &arms {
+        // Newest first: a reader that parked twice arms with its latest
+        // `need`, and the older entry finds the receive armed.
+        for &(conn_index, generation, need) in arms.iter().rev() {
             if self.driver.connections.generation(conn_index) != generation
                 || !self.executor.recv_waiters[conn_index as usize]
             {
@@ -5714,6 +5720,25 @@ mod tests {
         el.driver.udp_pending_replenish.push((0, 0));
         el.driver.return_udp_buffers();
         assert!(el.driver.udp_awaiting_buffers.is_empty());
+    }
+
+    /// A queued deferred receive keeps the worker from blocking until
+    /// `arm_deferred_recvs` takes it.
+    #[test]
+    fn a_deferred_recv_arm_keeps_the_worker_from_blocking() {
+        let mut cfg = test_config();
+        cfg.defer_recv_arm = true;
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        el.driver.ring.flush().unwrap();
+        assert!(el.may_block());
+
+        // Slot 0 holds no connection, so the arm drops the entry.
+        el.driver.deferred_recv_arms.push((0, 0, None));
+        assert!(!el.may_block());
+        el.arm_deferred_recvs();
+        assert!(el.driver.deferred_recv_arms.is_empty());
+        assert!(el.may_block());
     }
 
     /// A hangup poll that cannot be submitted puts the connection on the

@@ -11,17 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `ConfigBuilder::defer_recv_arm`, off by default. On io_uring, a plaintext
   connection's reader that parks has its receive armed after the worker's next
-  wait, not in the same submission as the sends queued before it parked, so
-  the receive more often finds the next request queued and completes inline
-  instead of arming a poll. When the wait would block, the receives are armed
-  before it; the ring is set up with `IORING_SETUP_TASKRUN_FLAG` to tell. On a
-  two-machine echo benchmark (Linux 6.12, 512 connections, 256-byte messages,
-  8 workers, 4 interleaved runs per arm) server CPU per operation fell from
-  21.11 to 19.10 µs in closed loop, and closed-loop throughput rose from
-  577-597k to 653-678k operations per second. At 200k and 400k operations per
-  second offered, CPU per operation did not fall (34.47 against 33.77 µs and
-  25.66 against 25.41 µs, overlapping ranges), and syscalls per operation at
-  200k rose from 0.81-0.85 to 0.96-0.99.
+  wait, not in the same submission as the sends queued before it parked, so the
+  receive more often finds the next request queued and completes inline instead
+  of arming a poll. When the wait would block, the receives are armed before
+  it; the ring is set up with `IORING_SETUP_TASKRUN_FLAG` to tell. Under
+  `sqpoll`, which cannot use that flag, receives are always deferred and the
+  worker does not block while one is queued. On a two-machine echo benchmark
+  (Linux 6.12, 512 connections, 256-byte messages, 8 workers, 4 interleaved
+  runs per arm) server CPU per operation fell from 21.11 to 19.10 µs in closed
+  loop, and closed-loop throughput rose from 577-597k to 653-678k operations
+  per second. At 200k and 400k operations per second offered, CPU per operation
+  did not fall (200k: 33.77 µs off, 34.47 µs on; 400k: 25.41 off, 25.66 on;
+  overlapping ranges), and syscalls per operation at 200k rose from 0.81-0.85
+  to 0.96-0.99.
 - The `unstable-accept` feature, off by default and outside semver. It holds
   `AcceptMode`, `ConfigBuilder::accept_mode`, `Runtime::set_worker_accepting`,
   `offer_for_park`, `AsyncEventHandler::on_adopt` and `ParkState`. Without it

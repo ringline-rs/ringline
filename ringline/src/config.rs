@@ -952,18 +952,18 @@ impl ConfigBuilder {
         self
     }
 
-    /// Arm the receive of a plaintext connection whose reader parks after the
+    /// Arm a parked reader's receive on a plaintext connection after the
     /// worker's next wait returns, instead of in the same submission as the
     /// sends the task queued before parking.
     ///
     /// A receive submitted before the peer's next bytes arrive finds the
     /// socket empty, and the kernel arms a poll and completes the receive
     /// later from task work. Submitted after the wait, the receive more often
-    /// finds the bytes already queued and completes inline. That happens
-    /// when the server is saturated: on a two-machine echo benchmark (512
-    /// connections, 256-byte messages, 8 workers) server CPU per operation
-    /// fell 9% in closed loop, and at 200k and 400k operations per second
-    /// offered it did not fall.
+    /// finds the bytes already queued and completes inline. On a two-machine
+    /// echo benchmark (512 connections, 256-byte messages, 8 workers), server
+    /// CPU per operation fell from 21.11 to 19.10 µs in closed loop. At 200k
+    /// and 400k operations per second offered it did not fall, and syscalls
+    /// per operation at 200k rose from 0.81–0.85 to 0.96–0.99.
     ///
     /// Deferring is skipped when the wait would block: if no completion is
     /// ready and the kernel holds no task work, the worker arms the deferred
