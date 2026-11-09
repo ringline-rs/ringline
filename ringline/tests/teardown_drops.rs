@@ -87,10 +87,13 @@ fn hold_all_but(addr: std::net::SocketAddr, free: usize) -> std::net::TcpStream 
 fn connect_and_close(addr: std::net::SocketAddr) {
     let mut client = std::net::TcpStream::connect(addr).expect("connect");
     std::thread::sleep(Duration::from_millis(20));
-    client.shutdown(std::net::Shutdown::Write).ok();
+    // Set before the write shutdown: macOS refuses `setsockopt` once both
+    // directions are shut, and the server's FIN can arrive before this
+    // call (#778).
     client
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
+    client.shutdown(std::net::Shutdown::Write).ok();
     // The server closes once it sees our FIN; reading to EOF waits for that.
     let _ = client.read(&mut [0u8; 16]);
 }
