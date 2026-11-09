@@ -1695,8 +1695,7 @@ pub(crate) mod tests {
         // `test_config`'s four 64-byte slots cap a bounded send at 256
         // bytes, which no socket buffer is small enough to split, so this
         // test builds its own pool: 1 MiB over four 512 KiB slots reserves
-        // two slots and cannot fit in any plausible socket buffer, shrunk or
-        // not. The drain below is single-threaded and reads only bytes the
+        // two slots and does not fit the socket buffers set below. The drain below is single-threaded and reads only bytes the
         // driver has already reported writing, so no read waits for bytes
         // that are not there. Two earlier shapes disagreed between macOS and a Linux
         // CI guest: a reader-thread race that never drained 2 MiB, then a
@@ -1719,10 +1718,14 @@ pub(crate) mod tests {
             .as_ref()
             .expect("attached stream")
             .as_raw_fd();
-        set_socket_buf(stream_fd, libc::SO_SNDBUF, 4096);
-        // Explicitly sizing the peer's receive buffer also disables its
-        // autotuning, so the window cannot grow to swallow the message.
-        set_socket_buf(client.as_raw_fd(), libc::SO_RCVBUF, 4096);
+        // 64 KiB buffers split the message on either kernel. At 4096 bytes
+        // Linux moved about 4 KiB per 100 ms, 416 KiB in the 10 s the loop
+        // below allows (#815); at 64 KiB it takes seven flushes and under a
+        // millisecond. Explicitly sizing the peer's receive buffer also
+        // disables its autotuning, so the window cannot grow to swallow the
+        // message.
+        set_socket_buf(stream_fd, libc::SO_SNDBUF, 64 * 1024);
+        set_socket_buf(client.as_raw_fd(), libc::SO_RCVBUF, 64 * 1024);
 
         let payload = vec![b'p'; PAYLOAD];
         driver
