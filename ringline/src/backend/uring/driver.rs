@@ -2782,8 +2782,8 @@ impl Driver {
     }
 
     /// Close the connections queued for this worker. Dropping a receiver
-    /// drops what is queued, and what a peer queues before its next send
-    /// fails (`crate::handoff`).
+    /// drops what is queued, and a peer's next send fails with
+    /// `Disconnected` (`crate::handoff`).
     fn close_queued_connections(&mut self) {
         drop(self.accept_rx.take());
         drop(self.park_rx.take());

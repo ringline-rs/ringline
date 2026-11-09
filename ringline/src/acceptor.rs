@@ -7,8 +7,8 @@ use crate::handoff::{Sender, TrySendError};
 
 /// One accepted connection on its way to a worker.
 ///
-/// Owns the socket. A worker drains its channel when it exits, so a connection
-/// still queued for it is closed then.
+/// Owns the socket. A worker drops its channel's receiver when it exits, which
+/// closes a connection still queued for it (`crate::handoff`).
 pub struct AcceptedConn {
     pub fd: OwnedFd,
     pub listener: crate::ListenerId,
@@ -225,7 +225,7 @@ const ROOM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 ///
 /// Retries every live queue, [`ROOM_POLL_INTERVAL`] apart: `std::sync::mpsc`
 /// has no wait on several senders at once. The acceptor is here only while
-/// every worker's queue is full, so the interval adds at most a millisecond
+/// every worker's queue is full, so the interval adds about a millisecond
 /// to a connection already waiting behind `accept_queue_capacity` others.
 fn send_when_room(config: &AcceptorConfig, alive: &mut [bool], accepted: AcceptedConn) -> bool {
     let mut accepted = accepted;

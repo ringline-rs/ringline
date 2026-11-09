@@ -545,7 +545,7 @@ impl Config {
                 "max_connections must be > 0 and < 2^24".into(),
             ));
         }
-        // A zero-capacity crossbeam channel has no buffer, so a send completes
+        // A zero-capacity `handoff` channel has no buffer, so a send completes
         // only when a receiver takes it. Workers poll with try_recv and are
         // woken after a send completes, so an idle worker would not take a
         // held connection.

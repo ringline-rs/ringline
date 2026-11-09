@@ -948,14 +948,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - The channels that hand an accepted or parked connection to a worker are
-  `std::sync::mpsc` channels. A worker that stops drains its channel and
-  drops the receiver; a connection a peer queued between the two stayed in
+  `std::sync::mpsc` channels. A worker that stopped drained its channel and
+  dropped the receiver; a connection a peer queued between the two stayed in
   the crossbeam channel, its fd open, until the sending thread exited, and
   its client saw neither a reply nor a close. A `std` receiver drops what is
-  queued with itself. This closes the one route to a hung connection found
-  for #780; the two CI failures were not reproduced, so this is not shown to
-  be their cause. The acceptor, while every worker's queue is full, retries
-  the queues every millisecond instead of waiting in a select.
+  queued with itself (#780). The acceptor, while every worker's queue is
+  full, retries the queues every millisecond instead of waiting in a select.
 - io_uring: the worker's exit drain closes the fd carried by a park's
   `FixedFdInstall` CQE. Before, the drain had no arm for it, and the fd of an
   install whose CQE reached the drain (after a panic in a handler earlier in
