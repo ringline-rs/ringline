@@ -194,7 +194,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// ends the ring's operations and closes its sockets. Those operations can
     /// use the heap memory this event loop owns until they end, so the caller
     /// leaks it. What other threads are waiting on is released here, and the
-    /// fds that completions this loop never handled delivered are closed: an
+    /// fds delivered by completions this loop never handled are closed: an
     /// accepted connection is an ordinary fd, which closing the ring leaves
     /// open.
     ///
@@ -16709,13 +16709,14 @@ mod tests {
         el.driver.cqe_cursor = 1;
         let mut posted_peer = connect();
         let posted = accept();
-        // A NOP with this result completes at the flush, on Linux 6.10 and
-        // later; before that `inject` hands it to `reap` directly.
+        // A NOP with this result completes in the wait, on Linux 6.10 and
+        // later; before that `inject` hands it to `reap` directly and the
+        // wait returns at once.
         el.driver
             .ring
             .submit_nop_inject(ud, posted)
             .expect("inject");
-        let _ = el.driver.ring.flush();
+        el.driver.ring.submit_and_wait(1).expect("submit_and_wait");
 
         // Safety: the loop is leaked below, as the worker leaks it.
         unsafe { el.close_ring() };
