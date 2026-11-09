@@ -82,7 +82,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     pub(crate) fn new(
         config: &Config,
         handler: A,
-        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+        accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
         eventfd: RawFd,
         wake_fd: crate::wakeup::WakeFd,
         shutdown_flag: Arc<AtomicBool>,
@@ -1975,7 +1975,7 @@ mod tests {
     /// `drain_channels`' accept path.
     fn test_loop_with_accept(
         config: &Config,
-        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+        accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
     ) -> (AsyncEventLoop<NoopHandler>, crate::wakeup::WakeHandle) {
         test_loop_with_handler(config, NoopHandler, accept_rx)
     }
@@ -1985,7 +1985,7 @@ mod tests {
     fn test_loop_with_handler<H: AsyncEventHandler>(
         config: &Config,
         handler: H,
-        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+        accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
     ) -> (AsyncEventLoop<H>, crate::wakeup::WakeHandle) {
         let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
         let event_loop = AsyncEventLoop::new(
@@ -2338,7 +2338,7 @@ mod tests {
     fn an_accept_into_a_full_table_is_closed_and_counted() {
         use std::io::Read;
         let config = test_config();
-        let (accept_tx, accept_rx) = crossbeam_channel::unbounded();
+        let (accept_tx, accept_rx) = std::sync::mpsc::channel();
         let (mut event_loop, _wake) = test_loop_with_accept(&config, Some(accept_rx));
         while event_loop.driver.connections.allocate().is_some() {}
         let (fd, mut client, peer) = accepted_socket();
@@ -2381,7 +2381,7 @@ mod tests {
     #[test]
     fn accept_time_slot_reuse_fails_a_stale_bounded_send() {
         let config = test_config();
-        let (accept_tx, accept_rx) = crossbeam_channel::unbounded();
+        let (accept_tx, accept_rx) = std::sync::mpsc::channel();
         let (mut event_loop, _wake) = test_loop_with_accept(&config, Some(accept_rx));
         let (conn_index, _client) = attach_conn(&mut event_loop.driver);
         let conn = token(&event_loop.driver, conn_index);
@@ -2659,7 +2659,7 @@ mod tests {
     #[test]
     fn an_accepted_slot_starts_with_an_empty_arrival_log() {
         let config = test_config();
-        let (accept_tx, accept_rx) = crossbeam_channel::unbounded();
+        let (accept_tx, accept_rx) = std::sync::mpsc::channel();
         let (mut el, _wake) = test_loop_with_accept(&config, Some(accept_rx));
         el.driver.recv_batch.begin();
         el.driver.record_arrival(0, 100);
