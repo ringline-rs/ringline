@@ -461,7 +461,7 @@ reading of the mechanism is that the failed send takes the socket's pending
 error and its CQE reports it, and the receive that follows then reports a
 plain EOF; not traced in a run. #769 runs its write-error test on mio only.
 
-Disposition: fixed (this PR). Every send-failure arm on io_uring
+Disposition: fixed in #794. Every send-failure arm on io_uring
 (`handle_send`, `handle_send_msg_zc`, `handle_send_msg_coalesced` for a
 plaintext or TLS run, `handle_tls_send`, `fire_chain_complete`, and the
 three retry give-up arms) runs `AsyncEventLoop::abort_connection`, the
