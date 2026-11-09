@@ -1314,6 +1314,17 @@ pub(crate) mod tests {
         assert_eq!(rc, 0, "setsockopt: {}", io::Error::last_os_error());
     }
 
+    /// Wait for `fd` to become writable, for at most `timeout`. Returns when
+    /// it is, or when the timeout runs out; the caller bounds its own loop.
+    fn wait_writable(fd: RawFd, timeout: Duration) {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as libc::c_int) };
+    }
+
     /// Drain and return the bounded completions the driver has queued.
     fn take_completions(driver: &mut Driver) -> Vec<(SendId, io::Result<u32>)> {
         driver.settled_sends.drain(..).collect()
@@ -1685,12 +1696,11 @@ pub(crate) mod tests {
         // bytes, which no socket buffer is small enough to split, so this
         // test builds its own pool: 1 MiB over four 512 KiB slots reserves
         // two slots and cannot fit in any plausible socket buffer, shrunk or
-        // not. The drain below is single-threaded and reads only bytes it
-        // already knows were written, so nothing here depends on the host's
-        // scheduling or on what a kernel does with `SO_SNDBUF` — two earlier
-        // shapes did, and disagreed between macOS and a Linux CI guest: a
-        // reader-thread race that never drained 2 MiB, then a 64 KiB payload
-        // that Linux swallowed whole in the first flush.
+        // not. The drain below is single-threaded and reads only bytes the
+        // driver has already reported writing, so no read waits for bytes
+        // that are not there. Two earlier shapes disagreed between macOS and a Linux
+        // CI guest: a reader-thread race that never drained 2 MiB, then a
+        // 64 KiB payload that Linux swallowed whole in the first flush.
         const PAYLOAD: usize = 1024 * 1024;
         let config = ConfigBuilder::new()
             .workers(1)
@@ -1705,14 +1715,11 @@ pub(crate) mod tests {
         let conn = token(&driver, conn_index);
         let id = bounded_ids(1)[0];
 
-        set_socket_buf(
-            driver.tcp_streams[idx]
-                .as_ref()
-                .expect("attached stream")
-                .as_raw_fd(),
-            libc::SO_SNDBUF,
-            4096,
-        );
+        let stream_fd = driver.tcp_streams[idx]
+            .as_ref()
+            .expect("attached stream")
+            .as_raw_fd();
+        set_socket_buf(stream_fd, libc::SO_SNDBUF, 4096);
         // Explicitly sizing the peer's receive buffer also disables its
         // autotuning, so the window cannot grow to swallow the message.
         set_socket_buf(client.as_raw_fd(), libc::SO_RCVBUF, 4096);
@@ -1758,17 +1765,21 @@ pub(crate) mod tests {
 
         // Drain and flush alternately on this one thread. Each read asks for
         // exactly the bytes the driver has already reported writing, so it
-        // can never block on bytes that are not there, and no sleep or
-        // timeout is involved: the loop is bounded by the socket buffer, not
-        // by the clock.
+        // never waits for bytes that are not there. A flush that writes
+        // nothing found the send buffer still holding bytes the peer has read
+        // but not yet acknowledged, and the loop waits for the socket to
+        // become writable before the next flush. Under load the
+        // acknowledgement can take longer than a fixed number of flushes
+        // would wait (#785), so a 10 s deadline bounds the loop.
         let mut client = client;
         let mut sink: Vec<u8> = Vec::with_capacity(PAYLOAD);
         let mut buf = vec![0u8; 64 * 1024];
         let mut written_total = written as usize;
         let mut drained = 0usize;
         let mut finished = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
 
-        for _ in 0..10_000 {
+        loop {
             while drained < written_total {
                 let want = (written_total - drained).min(buf.len());
                 client
@@ -1780,12 +1791,18 @@ pub(crate) mod tests {
             if finished {
                 break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the message never drained to the peer"
+            );
             let (done, w) = driver.flush_sends(conn_index).expect("flush");
             written_total += w as usize;
             // Drain once more before leaving, so `sink` holds every byte.
             finished = done;
+            if !done && w == 0 {
+                wait_writable(stream_fd, Duration::from_millis(100));
+            }
         }
-        assert!(finished, "the message never drained to the peer");
         assert_eq!(
             written_total, PAYLOAD,
             "every byte was written exactly once"
