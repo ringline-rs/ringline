@@ -151,7 +151,7 @@ pub(crate) struct Driver {
     pub(crate) recv_batch: crate::recv::arrival::BatchClock,
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_queues: Vec<ConnSendState>,
-    pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+    pub(crate) accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
     pub(crate) wake_handle: crate::wakeup::WakeFd,
     pub(crate) shutdown_flag: Arc<AtomicBool>,
     pub(crate) shutdown_local: bool,
@@ -355,7 +355,7 @@ impl Driver {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &Config,
-        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+        accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
         eventfd: RawFd,
         wake_fd: crate::wakeup::WakeFd,
         shutdown_flag: Arc<AtomicBool>,
@@ -989,12 +989,9 @@ impl Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        // Close connections still queued for this worker. Dropping the
-        // receiver alone leaves them in the channel until every sender (the
-        // acceptor threads, or in merged mode the other workers) has exited.
-        if let Some(rx) = self.accept_rx.take() {
-            rx.try_iter().for_each(drop);
-        }
+        // Close connections still queued for this worker: dropping the
+        // receiver drops what is queued (`crate::handoff`).
+        drop(self.accept_rx.take());
 
         // Hand back the copy-pool permits of any bounded sends still
         // queued. Worker shutdown drops the driver with whatever is in

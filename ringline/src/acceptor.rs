@@ -3,7 +3,7 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossbeam_channel::Sender;
+use crate::handoff::{Sender, TrySendError};
 
 /// One accepted connection on its way to a worker.
 ///
@@ -181,12 +181,12 @@ pub fn run_acceptor(config: AcceptorConfig) {
                     conn_count = conn_count.wrapping_add(1);
                     break;
                 }
-                Err(crossbeam_channel::TrySendError::Full(accepted)) => {
+                Err(TrySendError::Full(accepted)) => {
                     // Worker is backlogged — try the next one.
                     pending = Some(accepted);
                     continue;
                 }
-                Err(crossbeam_channel::TrySendError::Disconnected(accepted)) => {
+                Err(TrySendError::Disconnected(accepted)) => {
                     // Worker has exited — mark dead. With none left, dropping
                     // the connection closes it.
                     alive[worker_idx] = false;
@@ -212,46 +212,50 @@ pub fn run_acceptor(config: AcceptorConfig) {
     }
 }
 
-/// How often an acceptor waiting checks for shutdown. A wait for queue room also
-/// counts itself this often.
+/// How often an acceptor waiting for a connection checks for shutdown, and
+/// how often one waiting for queue room counts the wait.
 const SHUTDOWN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How often an acceptor holding a connection retries the full queues.
+const ROOM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Block until a live worker's queue takes `accepted`. Returns false, closing
 /// the connection, when the runtime is shutting down or every worker has
 /// exited.
+///
+/// Retries every live queue, [`ROOM_POLL_INTERVAL`] apart: `std::sync::mpsc`
+/// has no wait on several senders at once. The acceptor is here only while
+/// every worker's queue is full, so the interval adds at most a millisecond
+/// to a connection already waiting behind `accept_queue_capacity` others.
 fn send_when_room(config: &AcceptorConfig, alive: &mut [bool], accepted: AcceptedConn) -> bool {
     let mut accepted = accepted;
+    let mut counted = std::time::Instant::now();
     loop {
-        let mut select = crossbeam_channel::Select::new();
-        let mut live = Vec::with_capacity(alive.len());
         for (worker_idx, tx) in config.worker_channels.iter().enumerate() {
-            if alive[worker_idx] {
-                select.send(tx);
-                live.push(worker_idx);
+            if !alive[worker_idx] {
+                continue;
+            }
+            match tx.try_send(accepted) {
+                Ok(()) => {
+                    config.worker_wake_handles[worker_idx].wake();
+                    return true;
+                }
+                Err(TrySendError::Full(returned)) => accepted = returned,
+                // That worker has exited.
+                Err(TrySendError::Disconnected(returned)) => {
+                    alive[worker_idx] = false;
+                    accepted = returned;
+                }
             }
         }
-        if live.is_empty() {
+        if !alive.contains(&true) || config.shutdown_flag.load(Ordering::Acquire) {
             return false;
         }
-        let Ok(operation) = select.select_timeout(SHUTDOWN_CHECK_INTERVAL) else {
-            if config.shutdown_flag.load(Ordering::Acquire) {
-                return false;
-            }
+        if counted.elapsed() >= SHUTDOWN_CHECK_INTERVAL {
             crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPT_QUEUE_FULL);
-            continue;
-        };
-        let worker_idx = live[operation.index()];
-        match operation.send(&config.worker_channels[worker_idx], accepted) {
-            Ok(()) => {
-                config.worker_wake_handles[worker_idx].wake();
-                return true;
-            }
-            // That worker has exited.
-            Err(crossbeam_channel::SendError(returned)) => {
-                alive[worker_idx] = false;
-                accepted = returned;
-            }
+            counted = std::time::Instant::now();
         }
+        std::thread::sleep(ROOM_POLL_INTERVAL);
     }
 }
 
@@ -345,7 +349,7 @@ mod tests {
         // separate the two: a gated acceptor exits on `gates.shutdown()`, one
         // blocked in `accept4` does not.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let (tx, _rx) = crossbeam_channel::bounded::<AcceptedConn>(1);
+        let (tx, _rx) = crate::handoff::bounded::<AcceptedConn>(1);
 
         let config = AcceptorConfig {
             sockets: crate::listener_sockets::ListenerSockets::new(vec![listener.into()]),
@@ -388,7 +392,7 @@ mod tests {
         std::net::SocketAddr,
         Arc<crate::listener_sockets::ListenerSockets>,
         Arc<crate::listen_gate::ListenGates>,
-        crossbeam_channel::Receiver<AcceptedConn>,
+        crate::handoff::Receiver<AcceptedConn>,
         AcceptorConfig,
     ) {
         use std::sync::atomic::AtomicBool;
@@ -400,7 +404,7 @@ mod tests {
         gates.register(0, Arc::clone(&sockets)).expect("register");
         gates.open(0).expect("open");
 
-        let (tx, rx) = crossbeam_channel::bounded::<AcceptedConn>(1);
+        let (tx, rx) = crate::handoff::bounded::<AcceptedConn>(1);
         let filler = std::net::UdpSocket::bind("127.0.0.1:0").expect("filler socket");
         tx.send(AcceptedConn {
             fd: filler.into(),
@@ -579,7 +583,7 @@ mod tests {
         gates.register(0, Arc::clone(&sockets)).expect("register");
         gates.open(0).expect("open");
 
-        let (tx, _rx) = crossbeam_channel::bounded::<AcceptedConn>(8);
+        let (tx, _rx) = crate::handoff::bounded::<AcceptedConn>(8);
         let flag = Arc::new(AtomicBool::new(false));
         let config = AcceptorConfig {
             sockets: Arc::clone(&sockets),
@@ -622,7 +626,7 @@ mod tests {
         gates.register(0, Arc::clone(&sockets)).expect("register");
         gates.open(0).expect("open");
 
-        let (tx, _rx) = crossbeam_channel::bounded::<AcceptedConn>(8);
+        let (tx, _rx) = crate::handoff::bounded::<AcceptedConn>(8);
         let config = AcceptorConfig {
             sockets: Arc::clone(&sockets),
             listener: crate::ListenerId::from_index(0),

@@ -214,7 +214,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     pub(crate) fn new(
         config: &crate::config::Config,
         handler: A,
-        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+        accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
+        park_rx: Option<crate::handoff::Receiver<crate::park::ParkedFd>>,
         eventfd: std::os::fd::RawFd,
         shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
         resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
@@ -231,6 +232,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let driver = Driver::new(
             config,
             accept_rx,
+            park_rx,
             eventfd,
             shutdown_flag,
             resolve_rx,
@@ -1727,9 +1729,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             };
             match tx.try_send(parked) {
                 Ok(()) => wake.wake(),
-                Err(crossbeam_channel::TrySendError::Full(p)) => retry.push(p),
+                Err(crate::handoff::TrySendError::Full(p)) => retry.push(p),
                 // Target gone: nothing to retry onto.
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+                Err(crate::handoff::TrySendError::Disconnected(_)) => {}
             }
         }
         self.driver.park_ready = retry;
@@ -1743,7 +1745,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// That is what makes it safe to arm here: no other worker is still
     /// reading this socket.
     fn drain_adopted(&mut self) {
-        let Some(rx) = self.driver.park_rx.clone() else {
+        let Some(rx) = self.driver.park_rx.take() else {
             return;
         };
         while let Ok(parked) = rx.try_recv() {
@@ -1768,6 +1770,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 Some(crate::backend::uring::driver::Adopt { state, tls }),
             );
         }
+        self.driver.park_rx = Some(rx);
     }
 
     /// Withdraw a park offer because bytes arrived (tier 3, #443).
@@ -2484,8 +2487,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             // Full or gone: keep it here rather than drop it.
             Err(
-                crossbeam_channel::TrySendError::Full(conn)
-                | crossbeam_channel::TrySendError::Disconnected(conn),
+                crate::handoff::TrySendError::Full(conn)
+                | crate::handoff::TrySendError::Disconnected(conn),
             ) => Err((std::os::fd::IntoRawFd::into_raw_fd(conn.fd), conn.peer)),
         }
     }
@@ -4997,6 +5000,7 @@ mod tests {
                 &config,
                 NoopHandler,
                 None,
+                None,
                 eventfd,
                 shutdown,
                 None,
@@ -5384,7 +5388,7 @@ mod tests {
         let loads = std::sync::Arc::new(vec![AtomicU32::new(40), AtomicU32::new(0)]);
         el.driver.worker_loads = Some(loads.clone());
         el.driver.worker_index = 0;
-        let (tx, _rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        let (tx, _rx) = crate::handoff::bounded::<crate::park::ParkedFd>(4);
         let (_r0, w0) = crate::wakeup::create_wake_fd().expect("wake fd");
         let (_r1, w1) = crate::wakeup::create_wake_fd().expect("wake fd");
         el.driver.peer_park = vec![(tx.clone(), w0.as_wake_fd()), (tx, w1.as_wake_fd())];
@@ -5421,7 +5425,7 @@ mod tests {
         let loads = std::sync::Arc::new(vec![AtomicU32::new(20), AtomicU32::new(20)]);
         el.driver.worker_loads = Some(loads);
         el.driver.worker_index = 0;
-        let (tx, _rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        let (tx, _rx) = crate::handoff::bounded::<crate::park::ParkedFd>(4);
         let (_r0, w0) = crate::wakeup::create_wake_fd().expect("wake fd");
         let (_r1, w1) = crate::wakeup::create_wake_fd().expect("wake fd");
         el.driver.peer_park = vec![(tx.clone(), w0.as_wake_fd()), (tx, w1.as_wake_fd())];
@@ -6146,7 +6150,7 @@ mod tests {
         ADOPTS.with(|n| n.set(0));
         ADOPTED_STATE.with(|c| *c.borrow_mut() = None);
 
-        let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        let (tx, rx) = crate::handoff::bounded::<crate::park::ParkedFd>(4);
         el.driver.park_rx = Some(rx);
         let mut entry = parked_entry(0, b"");
         entry.state = Some(ParkState::new(String::from("session-42")));
@@ -6627,7 +6631,7 @@ mod tests {
     /// installed in.
     fn adopt_parked(el: &mut AsyncEventLoop<NoopHandler>, parked: crate::park::ParkedFd) -> u32 {
         ADOPTS.with(|n| n.set(0));
-        let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        let (tx, rx) = crate::handoff::bounded::<crate::park::ParkedFd>(4);
         el.driver.park_rx = Some(rx);
         tx.try_send(parked).expect("queue");
         drop(tx);
@@ -6798,7 +6802,7 @@ mod tests {
     #[test]
     fn a_full_target_channel_retries_rather_than_hanging_up() {
         let mut el = make_test_loop();
-        let (tx, _rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(1);
+        let (tx, _rx) = crate::handoff::bounded::<crate::park::ParkedFd>(1);
         let (_read, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
         el.driver.peer_park = vec![(tx.clone(), wake.as_wake_fd())];
 
@@ -6834,7 +6838,7 @@ mod tests {
     #[test]
     fn a_successful_handover_clears_the_queue_and_reaches_the_target() {
         let mut el = make_test_loop();
-        let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        let (tx, rx) = crate::handoff::bounded::<crate::park::ParkedFd>(4);
         let (_read, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
         el.driver.peer_park = vec![(tx, wake.as_wake_fd())];
         el.driver.park_ready.push(parked_entry(0, b"carried"));
@@ -6853,7 +6857,7 @@ mod tests {
     #[test]
     fn an_adopted_connection_starts_with_its_carried_bytes() {
         let mut el = make_test_loop();
-        let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        let (tx, rx) = crate::handoff::bounded::<crate::park::ParkedFd>(4);
         el.driver.park_rx = Some(rx);
         tx.try_send(parked_entry(0, b"before-the-move"))
             .expect("queue");
@@ -10264,7 +10268,7 @@ mod tests {
         // The slot the adopt will take held another connection's log.
         el.driver.recv_batch.begin_at(Instant::now());
         el.driver.record_arrival(0, 100);
-        let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(4);
+        let (tx, rx) = crate::handoff::bounded::<crate::park::ParkedFd>(4);
         el.driver.park_rx = Some(rx);
         tx.try_send(parked_entry(0, b"carried\n")).expect("queue");
         drop(tx);

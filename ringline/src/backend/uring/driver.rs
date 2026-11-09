@@ -513,9 +513,9 @@ pub(crate) struct Driver {
     /// connection while the first is outstanding.
     pub(crate) park_in_flight: Vec<Option<ParkInFlight>>,
     /// Every worker's park channel and wake handle.
-    pub(crate) peer_park: Vec<(crossbeam_channel::Sender<ParkedFd>, crate::wakeup::WakeFd)>,
+    pub(crate) peer_park: Vec<(crate::handoff::Sender<ParkedFd>, crate::wakeup::WakeFd)>,
     /// This worker's receiving end: connections other workers parked here.
-    pub(crate) park_rx: Option<crossbeam_channel::Receiver<ParkedFd>>,
+    pub(crate) park_rx: Option<crate::handoff::Receiver<ParkedFd>>,
     /// Connections lifted off this worker, waiting to be handed over.
     /// `OwnedFd` means an entry left here is closed rather than leaked.
     pub(crate) park_ready: Vec<ParkedFd>,
@@ -527,7 +527,7 @@ pub(crate) struct Driver {
     ///
     /// The write-side twin of `recv_half_taken`.
     pub(crate) send_half_taken: Vec<bool>,
-    pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+    pub(crate) accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
     /// Merged accept mode: every merged listener's sockets, `(listener index,
     /// sockets)`. This worker accepts on socket `worker_index` of each, and
     /// holds them open until it exits. Empty in pool mode.
@@ -550,7 +550,7 @@ pub(crate) struct Driver {
     /// Every worker's accept channel and wake handle, for handing off a raw fd
     /// to a less-loaded peer.
     pub(crate) peer_accept: Vec<(
-        crossbeam_channel::Sender<crate::acceptor::AcceptedConn>,
+        crate::handoff::Sender<crate::acceptor::AcceptedConn>,
         crate::wakeup::WakeFd,
     )>,
     /// This worker's wake eventfd, read by the ring. Not owned: the worker's
@@ -941,7 +941,8 @@ impl Driver {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &Config,
-        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+        accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
+        park_rx: Option<crate::handoff::Receiver<ParkedFd>>,
         eventfd: RawFd,
         shutdown_flag: Arc<AtomicBool>,
         resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
@@ -1099,7 +1100,7 @@ impl Driver {
             park_in_flight: vec![None; config.max_connections as usize],
             park_ready: Vec::new(),
             peer_park: config.peer_park.clone(),
-            park_rx: config.park_rx.clone(),
+            park_rx,
             recv_half_taken: vec![false; config.max_connections as usize],
             send_half_taken: vec![false; config.max_connections as usize],
             accept_rx,
@@ -2780,14 +2781,12 @@ impl Driver {
         }
     }
 
-    /// Close the connections queued for this worker.
+    /// Close the connections queued for this worker. Dropping a receiver
+    /// drops what is queued, and what a peer queues before its next send
+    /// fails (`crate::handoff`).
     fn close_queued_connections(&mut self) {
-        if let Some(rx) = self.accept_rx.take() {
-            rx.try_iter().for_each(drop);
-        }
-        if let Some(rx) = self.park_rx.take() {
-            rx.try_iter().for_each(drop);
-        }
+        drop(self.accept_rx.take());
+        drop(self.park_rx.take());
     }
 
     /// Release what other threads wait on, for a worker that leaks this driver.
@@ -2803,9 +2802,7 @@ impl Driver {
     /// Shutdown: close all connections and drain remaining CQEs. The eventfd
     /// is closed by `WakeHandle`, not here.
     pub(crate) fn run_shutdown(&mut self) {
-        // Close connections still queued for this worker. Dropping the
-        // receiver alone leaves them in the channel until every sender (the
-        // acceptor threads, or in merged mode the other workers) has exited.
+        // Close connections still queued for this worker.
         self.close_queued_connections();
 
         // 1. Release entries parked on a retry list: their submit found the
