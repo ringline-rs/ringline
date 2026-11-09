@@ -1,0 +1,113 @@
+# Red-then-green run for a zero-copy send refused after the Close is
+# submitted settling `ECANCELED` (send-path audit L3), plus the uring gate on
+# the result.
+#
+# macOS cannot type-check the io_uring path, so the failing test and the fix
+# are both checked here, in an ephemeral VM on the `validation` agent, never by
+# a login to a rig host (CLAUDE.md, "Verifying io_uring code").
+#
+# `red_ref` is the branch's tests-only commit, before the fix. Step 1 runs the
+# new test there and expects `1 failed`. Step 2 runs it at the branch head and
+# expects `0 failed`. Step 3 is the uring gate, as the other verify specs run
+# it.
+#
+# Prediction: red_rc non-zero with `1 failed`; green_rc 0 with `0 failed`;
+# every gate 0.
+#
+#   systemslab submit experiments/zc-refused-after-close-verify.toml
+name = "ringline zc-refused-after-close verify ({branch})"
+
+[params]
+branch = "fix/zc-refused-after-close-settles-cancelled"
+repo   = "https://github.com/brayniac/ringline"
+red_ref = "a1e392c6d9559a922999546794aeae9c335386ef"
+tests  = "a_zc_send_refused_after_the_close_is_submitted_settles_cancelled"
+
+[[jobs]]
+name = "verify"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "debian-13-6.12"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/verify.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cat /etc/anvil-instance.json 2>/dev/null; echo
+rustc -V 2>/dev/null; uname -r
+cd /home/anvil
+{
+  uname -srm
+  echo "io_uring_disabled=$(sysctl -n kernel.io_uring_disabled 2>/dev/null || echo unset)"
+  cargo --version
+
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -3
+
+  ulimit -Sn 65536
+  echo "nofile_soft=$(ulimit -Sn)"
+
+  # This must be the io_uring build; a mio build would run none of the code
+  # under test and report green for it.
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  got=$(./target/debug/bench-server --print-backend)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; echo "gate_backend=1"; exit 1; }
+  echo "gate_backend=0 (backend=$got)"
+
+  # Step 1: the tests at the tests-only commit, on the unfixed code. Not
+  # piped: a piped cargo reports the pipe's status.
+  git checkout -q {red_ref} && git log --oneline -1
+  cargo test --locked -p ringline --lib -- {tests} > /home/anvil/red.out 2>&1
+  echo "red_rc=$?"
+  grep -E '^test .*FAILED|^test result|panicked|left:|right:' /home/anvil/red.out
+  echo "red_summary=$(grep -E '^test result' /home/anvil/red.out | head -1)"
+  git checkout -q {branch} && git log --oneline -1
+
+  # Step 2: the same tests on the fix.
+  cargo test --locked -p ringline --lib -- {tests} > /home/anvil/green.out 2>&1
+  echo "green_rc=$?"
+  grep -E '^test .*FAILED|^test result' /home/anvil/green.out
+  echo "green_summary=$(grep -E '^test result' /home/anvil/green.out | head -1)"
+
+  # Step 3: the uring gate.
+  cargo fmt --all --check; echo "gate_fmt=$?"
+  cargo clippy --locked --all-targets -- -D warnings; echo "gate_clippy_uring=$?"
+  cargo clippy --locked --all-targets --features force-mio -- -D warnings; echo "gate_clippy_mio=$?"
+  cargo clippy --locked --all-targets --features tls-buffered -- -D warnings; echo "gate_clippy_tls=$?"
+  RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ringline; echo "gate_doc=$?"
+  cargo test --locked --all; echo "gate_test_uring=$?"
+} 2>&1 | tee /home/anvil/verify.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+fail=0
+grep -q "^gate_backend=0" verify.log || { echo "FAIL gate_backend"; fail=1; }
+grep -q "^red_rc=[1-9]" verify.log || { echo "FAIL red: the tests passed on the unfixed code"; fail=1; }
+red=$(grep -oE "^red_summary=.*" verify.log)
+echo "$red"
+echo "$red" | grep -qE "; 1 failed;" || { echo "FAIL red: expected 1 failed"; fail=1; }
+grep -q "^green_rc=0" verify.log || { echo "FAIL green"; fail=1; }
+green=$(grep -oE "^green_summary=.*" verify.log)
+echo "$green"
+echo "$green" | grep -qE "; 0 failed;" || { echo "FAIL green: expected 0 failed"; fail=1; }
+for gate in gate_fmt gate_clippy_uring gate_clippy_mio gate_clippy_tls gate_doc gate_test_uring; do
+  if ! grep -q "^${gate}=0" verify.log; then
+    got=$(grep -oE "^${gate}=[0-9]+" verify.log | head -1)
+    echo "FAIL ${gate}: ${got:-never reached}"
+    fail=1
+  else
+    echo "ok   ${gate}"
+  fi
+done
+exit $fail
+'''

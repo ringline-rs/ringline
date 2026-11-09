@@ -3510,8 +3510,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Send complete (all bytes sent) or error (result <= 0). The awaited
         // send settles now; the entry, and the guards it holds, stay until
         // the notification lands.
+        let errno = -result;
         if result > 0 {
             self.settle_slab_ok(slab_idx);
+        } else if self.close_submitted(conn_index)
+            && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOMEM)
+        {
+            // Backpressure, or `ENOMEM` from a zero-copy send (a memlock
+            // refusal) or its drain, after the Close was submitted: the send
+            // is not retried (the arms above skip it), so it settles as the
+            // plain, coalesced and TLS handlers settle a send the close cut
+            // short.
+            self.settle_slab_err(slab_idx, io::Error::from_raw_os_error(libc::ECANCELED));
         } else {
             self.settle_slab_err(slab_idx, Self::send_error(result));
         }
@@ -11083,6 +11093,63 @@ mod tests {
             el.driver.send_queues[conn_index as usize].send_poll,
             SendPoll::None
         );
+    }
+
+    /// After the Close is submitted, a zero-copy send that comes back
+    /// `-EAGAIN` or `-ENOMEM` is not retried, and its awaiter is told
+    /// `ECANCELED`, as the plain, coalesced and TLS handlers tell theirs.
+    #[test]
+    fn a_zc_send_refused_after_the_close_is_submitted_settles_cancelled() {
+        for errno in [libc::EAGAIN, libc::ENOMEM] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            let generation = el.driver.connections.generation(conn_index);
+            let data = Box::new([7u8; 100]);
+            let iovecs = [
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                },
+                libc::iovec {
+                    iov_base: data.as_ptr() as *mut _,
+                    iov_len: 100,
+                },
+            ];
+            let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+            let (slab_idx, _) = el
+                .driver
+                .send_slab
+                .allocate(conn_index, generation, &iovecs, u16::MAX, guards, 0, 100)
+                .unwrap();
+            let id = el.executor.register_send(conn_index);
+            el.driver.send_slab.set_send_id(slab_idx, id, 100);
+            el.driver.send_queues[conn_index as usize].in_flight = true;
+
+            // The close waits behind the in-flight send, and is then forced
+            // past it (the close_notify deadline path), which submits the
+            // Close.
+            el.driver.close_connection(conn_index);
+            el.driver.force_finalize_close(conn_index);
+            assert!(el.driver.send_queues[conn_index as usize].close_submitted);
+
+            let zc = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+            el.test_dispatch_cqe(zc.raw(), -errno, 0);
+            el.drain_settled_sends();
+            let err = el
+                .executor
+                .take_send_result(id)
+                .expect("the send settled")
+                .expect_err("the send was refused");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ECANCELED),
+                "errno {errno}: {err}"
+            );
+            assert!(
+                !el.driver.send_slab.in_use(slab_idx),
+                "errno {errno}: the entry was released"
+            );
+        }
     }
 
     /// A zero-copy send that gets `-EAGAIN` waits for room and keeps the entry
