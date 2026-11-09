@@ -400,8 +400,8 @@ install in flight. The stale CQE was still not constructed on a kernel:
 `FixedFdInstall` completes inline at submit, so its CQE is in the ring
 ahead of any Close CQE for the slot. Found by the review of #791, outside
 the change: `run_shutdown`'s CQE drain has no `ParkInstall` arm, so an
-install CQE drained at worker exit falls through and its fd is not closed,
-in a process that is exiting.
+install CQE drained at worker exit falls through and its fd stays open
+for the rest of the process.
 
 ### F11 — `check_close_notify_deadlines` re-runs `force_finalize_close` every tick while the finalize is blocked; `fail_send_ids` sets `capacity_released` unconditionally (invariant 18). Traced, low.
 
