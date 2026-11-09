@@ -15,20 +15,24 @@ co-located.
 
 ### Read this first
 
-**In the September grid, ringline was roughly 0–10% faster than a
-well-configured tokio, not the 27–71% this file used to lead with.** That larger
+**In the September grid, ringline was faster than the best tokio
+configuration in 13 of 16 cells, by up to 9%, and slower by up to 10% at 16
+KiB; not the 27–71% this file used to lead with.** That larger
 number is real, but it is measured against tokio's *default* runtime, and an
 earlier version of this file quoted it while implying the stronger claim. Both
 figures are in the echo section, labelled.
 
-**A November rerun of one of those cells does not reproduce the 0–10% lead.** At
-512 connections x 256 B, closed loop, ringline's default path (`uring-fwd`)
-used 21.21 µs of server CPU per operation, against 20.85 for `tokio-pc` and
-19.94 for tokio-uring. Below saturation the order reverses: at 200k operations
-per second offered, tokio-uring costs 40.18 µs and `uring-fwd` 34.17.
-`ConfigBuilder::defer_recv_arm`, off by default, takes ringline to 19.34 µs at
-saturation against tokio-uring's 20.08 in the same run. The other 15 cells have
-not been rerun. See [Mechanism](#mechanism--512-connections-256-b).
+**A November rerun of one of those cells does not reproduce ringline's lead.**
+At 512 connections x 256 B, closed loop, ringline's default path (`uring-fwd`)
+did 585,635 ops/s against tokio-uring's 641,809, and used 21.21 µs of server
+CPU per operation against 20.85 for `tokio-pc` and 19.94 for tokio-uring.
+Below saturation the order reverses: at 200k operations per second offered,
+tokio-uring costs 40.18 µs and `uring-fwd` 34.17.
+`ConfigBuilder::defer_recv_arm` (#814, off by default) cut ringline's
+closed-loop cost from 21.11 to 19.10 µs per operation in run `01a1c104`, which
+had no tokio-uring arm. An earlier variant of the option measured 19.34 against
+tokio-uring's 20.08 in one run. Below saturation the option costs up to 2%
+more. The other 15 cells have not been rerun. See [Mechanism](#mechanism--512-connections-256-b).
 
 **Neither run measures a protocol server.** Echo is a byte pipe: no parsing, no
 response building, no application work. Segcache is the closer proxy and has
@@ -77,11 +81,12 @@ server one.
 | Server workers | 8 |
 | Client threads | 16 |
 | Load | closed loop, 20 s steady window after 5 s warmup |
-| Reps | 3 per cell; tables report the median |
+| Reps | 3 per cell in September, 4 in the November rerun; tables report the median |
 
 The server and client are different CPU generations. hv01's X710 sits on a
-PCIe 3.0 x4 link, about 31.5 Gb/s per direction, so the client side cannot
-reach 40G; that bounds only the large-message cells. The September run's logs
+PCIe 3.0 x4 link, about 31.5 Gb/s per direction before protocol overhead, so
+the client cannot reach 40G. Only the 16 KiB cells, at about 22 Gb/s per
+direction, come near it; whether it limited them was not measured. The September run's logs
 do not record the bond state, so whether all four of hv02's ports were up is
 not known.
 
@@ -102,7 +107,7 @@ exists to catch.
 
 ### Headline: it depends entirely on which tokio you mean
 
-Both tables below are the September grid at `a685e16`. The one cell rerun in
+Both tables below are the September grid (ringline at `a685e16`; the tokio arms from #406). The one cell rerun in
 November, 256 B at 512 connections, no longer shows ringline ahead of the best
 tokio configuration; [Mechanism](#mechanism--512-connections-256-b) has that
 run.
@@ -181,31 +186,40 @@ accepted plaintext connection receive into its accumulator; in the same run it
 cost 0.47 µs/op on this path (21.23 against its parent's 20.76).
 
 In September this table had `uring-fwd` first at 20.95 µs/op and tokio-uring
-fourth at 22.21. Since then every tokio arm has become 10–16% cheaper per
-operation and `uring-fwd` 1% dearer. The guest kernel and image changed in
-between; which change moved the tokio arms is not known.
+fourth at 22.21. Since then every tokio arm, and the mio arm built before
+#756, has become 10–16% cheaper per operation, and `uring-fwd` 1% more
+expensive, which includes #699's 0.47 µs/op. Between the runs the guest image,
+tokio (1.52.3 to 1.54.1) and `bench-server` changed; which of them moved these
+arms is not known.
 
 **The closed-loop order is a saturation effect.** ringline arms a connection's
 receive in the same submission as the response it sends, so the receive finds
 the socket empty. The kernel arms a poll and completes the receive later from
 DEFER_TASKRUN task work (`__io_arm_poll_handler`, `io_queue_async`,
-`__io_run_local_work`; perf run `01a1bee6`). tokio-uring submits its read one
-loop iteration later; at saturation the next request has usually arrived by
-then and the read completes inline. Offered a fixed rate below saturation,
-tokio-uring costs more per operation (open-loop run `01a1bef1`, 3 reps):
+`__io_run_local_work`; perf run `01a1bee6`). The same profile shows
+tokio-uring's reads completing inline, with no poll arm. The likely reason,
+not measured directly, is that tokio-uring submits its read one loop iteration
+later, when at saturation the next request has usually arrived. Offered a
+fixed rate below saturation, tokio-uring costs more per operation (open-loop
+run `01a1bef1`, 3 reps; every cell delivered its offered rate):
 
 | offered ops/s | uring-fwd µs-CPU/op | tokio-uring µs-CPU/op |
 |---:|---:|---:|
 | 200,000 | 34.17 [34.00–34.18] | 40.18 [39.83–40.19] |
 | 400,000 | 25.40 [25.23–25.46] | 30.84 [30.31–30.84] |
-| 550,000 | 22.21 [22.03–22.34] | 22.91 [22.91–22.95] |
+| 550,000 (near saturation) | 22.21 [22.03–22.34] | 22.91 [22.91–22.95] |
 
 **`defer_recv_arm` takes the poll path out at saturation.** With
 `ConfigBuilder::defer_recv_arm(true)` (#814) a parked reader's receive is armed
-after the worker's next wait. Run `01a1c070`, 4 closed-loop reps and 3 reps per
-open-loop rate, all three arms interleaved:
+after the worker's next wait. Two runs measured it, each with one binary,
+`52d6ad57` plus an unmerged patch, run with and without the flag. In run
+`01a1c070` the patch deferred past every wait. #814 merged a second variant,
+which arms before a wait that would block; run `01a1c104` measured both
+variants at 19.10 µs/op in closed loop, against 21.11 without the flag. Run
+`01a1c070`, earlier variant, 4 closed-loop reps and 3 reps per open-loop rate,
+all three arms interleaved:
 
-| load | uring-fwd µs-CPU/op | uring-fwd + defer | tokio-uring |
+| load | uring-fwd µs-CPU/op | uring-fwd + defer (earlier variant) | tokio-uring |
 |---|---:|---:|---:|
 | closed loop | 21.30 [21.25–21.44] | **19.34** [19.31–19.42] | 20.08 [19.98–20.12] |
 | closed loop, ops/s | 577,670 | **652,015** | 640,874 |
@@ -213,19 +227,17 @@ open-loop rate, all three arms interleaved:
 | 550,000 offered | 22.06 [21.80–22.33] | 22.26 [22.13–22.32] | 23.13 [22.68–23.22] |
 
 In closed loop the option cuts `__io_run_local_work` from 15.8% to 0.7% of
-server samples, and the poll arm leaves the profile. Below saturation the
-receive still finds the socket empty, and the option saves nothing: at 200,000
-offered, run `01a1c104` measured 34.47 µs/op with it against 33.77 without,
-with overlapping ranges, and 0.96–0.99 syscalls/op against 0.81–0.85. These
-runs measured the option on `52d6ad57` plus the change; the `01a1c070` arm
-deferred past every wait, and #814 merged the variant that arms before a wait
-that would block. Run `01a1c104` measured both variants at 19.10 µs/op in
-closed loop.
+server samples (inclusive), and `__io_arm_poll_handler` no longer appears in
+the profile. Below saturation the receive still finds the socket empty, and
+the option costs 1–2% more CPU per operation, with overlapping ranges: at
+200,000 offered, run `01a1c104` measured the merged variant at 34.47 µs/op
+against 33.77 without, and 0.96–0.99 syscalls/op against 0.81–0.85.
 
 **Syscall count is not what separates the runtimes.** `tokio-pc` and `mio`
-issue 2.01 syscalls per operation and cost within 2% of `uring-fwd`'s CPU per
-operation at 0.03. `tokio` issues 2.00 and costs 9% more than `tokio-pc`: that
-difference is the scheduler.
+issue 2.01 syscalls per operation against `uring-fwd`'s 0.03, and cost within
+2% of its CPU per operation (20.85 and 21.22 against 21.21). `tokio` issues
+2.00 and costs 9% more than `tokio-pc`; the two differ in scheduler
+configuration.
 
 `mio` here includes #756, which ends a socket's read drain on a short read
 instead of reading until `EAGAIN`. The row before it, built at #756's parent,
@@ -235,7 +247,11 @@ pays one more read per operation (3.01 syscalls) and 5.4% more CPU.
 worth saving. At 256 B both splice arms are slower than their copy
 counterparts; in the September grid splice was fastest at 16 KiB.
 
-### 16 KiB: the one regime where ringline loses
+### 16 KiB: where ringline lost in the September grid
+
+This section is the September grid; the November rerun of the 256 B cell is in
+[Mechanism](#mechanism--512-connections-256-b).
+
 
 At 16 KiB and moderate concurrency a zero-copy tokio beats every ringline
 configuration — `tokio-pc-splice` 165,699 against ringline's best 148,659 at 64
@@ -290,7 +306,8 @@ loop and `forward` is `with_data` + `forward_recv_buf`; `direct` and
 `recv-forward` are refused. From 0.7.0-alpha.5 an accepted plaintext
 connection receives into its accumulator and `forward_recv_buf` sends the
 accumulator under a guard, so a rerun of `--echo-mode forward` measures that
-path, not the one in the `uring-fwd` row.
+path. The September `uring-fwd` figure (20.95 µs/op) measured the
+provided-buffer receive that #699 removed.
 
 Client: `bench-client --clients <n> --msg-size <bytes> --threads 16 --warmup 5
 --duration 20`.
