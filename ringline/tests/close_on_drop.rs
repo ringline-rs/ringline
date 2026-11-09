@@ -47,8 +47,6 @@ fn listen() -> TcpListener {
     listener
 }
 
-/// Reads until the connection ends, and panics if it does not within 5 s. A close
-/// with unread bytes in its receive buffer ends in a reset, not a FIN.
 /// Close `client` with a reset: `SO_LINGER` with a zero timeout turns the
 /// close into an RST. A FIN alone finishes the connection's read half and
 /// leaves its task in place (`docs/half-close-design.md`).
@@ -71,6 +69,8 @@ fn reset(client: TcpStream) {
     drop(client);
 }
 
+/// Reads until the connection ends, and panics if it does not within 5 s. A close
+/// with unread bytes in its receive buffer ends in a reset, not a FIN.
 fn expect_eof(stream: &mut TcpStream) {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))

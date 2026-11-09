@@ -1367,11 +1367,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Steps 6b and 8: when a close is pending, poll the ready tasks, then
     /// drain the pending closes.
     ///
-    /// A close requested before step 6 — a peer FIN or a read error seen in
-    /// step 4 — gives its task the step-6 poll before the teardown below
-    /// (#371). A close requested after that poll — by the flush in 6a or 8
-    /// (a write error, `fail_connection_on_send_error`), or by a FIN or read
-    /// error the forward-resume reads of 6a-bis saw — comes too late for it,
+    /// A close requested before step 6 — a read error seen in step 4 — gives
+    /// its task the step-6 poll before the teardown below (#371). A close
+    /// requested after that poll — by the flush in 6a or 8 (a write error,
+    /// `fail_connection_on_send_error`), or by a read error the
+    /// forward-resume reads of 6a-bis saw — comes too late for it,
     /// and `drain_send_completions` polls only when it delivered a settled
     /// send, which a connection with only unawaited sends queued never has.
     /// So the task it woke is polled here, before `drain_pending_closes`

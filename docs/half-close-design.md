@@ -49,11 +49,14 @@ a handler that wants the old behaviour returns when a read resolves `0`.
 - `is_alive()` stays `!close_requested()`. It no longer turns false at the
   peer's FIN, only when a close has been requested. Code that used it to
   detect a departed peer checks `peer_closed()`.
-- New: `Connection::peer_closed()` and `RecvHalf::peer_closed()`: the
-  peer's FIN or close_notify has arrived, or the read failed. True once a
-  read would resolve `0` or an error without parking, and while the slot is
-  held by this connection; false before that and outside the executor.
-  `eof_truncated()` keeps its meaning (a FIN with no close_notify on TLS).
+- New: `Connection::peer_closed()`, `RecvHalf::peer_closed()` and
+  `SendHalf::peer_closed()`: the peer's FIN or close_notify has arrived, or
+  the read failed. True once a read would resolve `0` or an error without
+  parking, and while the slot is held by this connection; false before that
+  and outside the executor. After the end nothing is armed on the socket, so
+  a reset that arrives then is seen by the next send, which closes the
+  connection. `eof_truncated()` keeps its meaning (a FIN with no
+  close_notify on TLS).
 - `recv_ready` resolves at the FIN, as before.
 - Sends after the FIN go to the wire. A peer that fully closed answers with
   a reset, which the next send reports; the connection then aborts with
@@ -155,7 +158,7 @@ Tests that pinned the FIN's close were inverted or retargeted:
 - `tests/echo.rs`: `response_after_peer_fin_is_delivered`'s doc, and the
   mio handed-off-send unit test, close through the task's return.
 - Unit tests at each EOF site assert `read == Eof`, `lifecycle == Open` and
-  no pending close; `a_fin_batched_with_the_last_send_cqe_leaves_the_close_to_the_drain`
+  no pending close; `a_fin_batched_with_the_last_send_cqe_leaves_the_close_to_the_task`
   and `batch_recv_eof_then_send_cqe` are retargeted to the task's close.
 - `tls/unbuffered/tests.rs`: an encrypt after the peer's close_notify
   produces a record the peer decrypts, through both the receive-driven and
@@ -182,7 +185,7 @@ Tests that pinned the FIN's close were inverted or retargeted:
 ## Docs changed
 
 `runtime/io.rs` module doc and `with_data`, `with_data_result`,
-`with_bytes`, `SendHalf::close`, `Connection::is_alive`;
+`SendHalf::close`, `Connection::is_alive`;
 `docs/recv-direct-design.md`; `docs/connection-state-model-design.md`
 (the follow-up is done); `docs/half-closed-send-wait-design.md` step 6;
 `docs/mio-close-lifecycle-design.md`; CLAUDE.md Connection Lifecycle; the

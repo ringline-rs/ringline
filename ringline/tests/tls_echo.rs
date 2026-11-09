@@ -2652,7 +2652,7 @@ impl AsyncEventHandler for TlsReplyAfterTimer {
 /// server's task, asleep on a timer, is not dropped: it sees the peer's end
 /// on `peer_closed` (not a truncation), sends the reply after the peer's
 /// close_notify, reads `0` and returns. The client reads the reply, then the
-/// server's close_notify, then the FIN.
+/// server's close_notify, then the FIN on the socket.
 #[test]
 fn a_reply_after_the_peers_close_notify_reaches_the_client() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2708,11 +2708,15 @@ fn a_reply_after_the_peers_close_notify_reaches_the_client() {
             peer_closed = true;
         }
     }
+    // `read_tls` returns 0 once the peer's close_notify was read, so the FIN
+    // is observed on the socket itself.
+    let fin = matches!(tcp.read(&mut buf), Ok(0));
 
     shutdown.shutdown();
     for h in handles {
         h.join().expect("worker panicked").expect("worker failed");
     }
+    assert!(fin, "the server's FIN did not follow its close_notify");
     assert_eq!(
         plaintext, b"reply",
         "the reply after the peer's close_notify"

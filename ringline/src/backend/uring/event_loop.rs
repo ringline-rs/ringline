@@ -1044,8 +1044,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// iteration: by `close_connection` from a CQE handler or the task-exit
     /// arm, by `DriverCtx::close` from a task, or by `defer_finalize_close`
     /// from the completion that drained the connection's sends, chain or
-    /// `Shutdown`. Runs after `poll_ready_tasks`, so a task woken by the
-    /// peer's FIN is polled, and a send it queues drains, before the Close is
+    /// `Shutdown`. Runs after `poll_ready_tasks`, so a task woken by a read
+    /// error is polled, and a send it queues drains, before the Close is
     /// committed (#371). `try_finalize_close` is guarded: a connection with
     /// sends, a chain or a `Shutdown` still outstanding is dropped from the
     /// list here and registered again by the completion that drains it.
@@ -1583,9 +1583,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Submit owed hangup polls (`retry_hangup_polls`), then peek again on
     /// the connections in `hangup_rechecks` whose `hangup_recheck_due` is
     /// set, once nothing is buffered, armed or parking. The end of the
-    /// stream behind bytes already delivered then closes the connection
-    /// even if no read parks after they are consumed. Drops connections that
-    /// closed, were recycled or finished reading.
+    /// stream behind bytes already delivered is then recorded on the read
+    /// half even if no read parks after they are consumed. Drops connections
+    /// that closed, were recycled or finished reading.
     fn recheck_hangups(&mut self) {
         self.retry_hangup_polls();
         if self.driver.hangup_rechecks.is_empty() {

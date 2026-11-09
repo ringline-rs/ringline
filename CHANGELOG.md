@@ -264,11 +264,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   when its client half-closed lost the request. Now the connection stays
   open while the task holds it, the task may keep sending, and the
   connection closes when the task returns, drops its last half or calls
-  `close`, or on a reset, a read or write error or a TLS failure. Readers
+  `close`, or on a reset or read error seen while the read half was open, a
+  write error or a TLS failure. After the peer's FIN nothing is armed on the
+  socket, and a reset that arrives then is reported by the next send, which
+  closes the connection. Readers
   still resolve `0` at the end, after the buffered bytes; a task that loops
   on `0` spins instead of being dropped. `is_alive` no longer turns false at
   the peer's end; the new `Connection::peer_closed` and
-  `RecvHalf::peer_closed` report it, and a client reusing a connection
+  `RecvHalf::peer_closed` (and `SendHalf::peer_closed`) report it, and a
+  client reusing a connection
   checks both. The client crates' `is_alive` (ringline-redis,
   ringline-memcache, ringline-ping, ringline-http) include that check, so
   their pools reconnect a slot whose server closed, as before. On TLS, a

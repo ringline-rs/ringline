@@ -685,8 +685,9 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// The peer's FIN finishes the read half and closes nothing: the task may
 /// keep sending, and the connection closes when the task returns, drops the
 /// last half or calls `close`, or on an error (`docs/half-close-design.md`).
-/// Sends made once the Close is submitted (after queued sends drain) fail
-/// with `NotConnected`.
+/// After the FIN nothing is armed on the socket, so a reset that arrives then
+/// is reported by the next send. Sends made once the Close is submitted
+/// (after queued sends drain) fail with `NotConnected`.
 ///
 /// A TLS connection receives ciphertext directly too, up to
 /// `recv_direct_region` bytes per receive. With the default engine the
@@ -1992,8 +1993,8 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<'_, F> {
     ) -> Poll<usize> {
         let data = driver.accumulators.data(self.conn_index);
         if data.is_empty() {
-            // Check if the connection has been closed — return 0 (EOF)
-            // so the caller can detect disconnection.
+            // The read half is finished (the peer's end, an error or a
+            // pending close): resolve 0 instead of parking.
             let is_closed = driver
                 .connections
                 .get(self.conn_index)
@@ -2057,8 +2058,8 @@ impl<F: FnMut(&[u8]) -> ParseResult + Unpin> WithDataFuture<'_, F> {
             .accumulators
             .compact_at_message_start(self.conn_index);
 
-        // NeedMore or Consumed(0) on non-empty data: incomplete parse.
-        // Check if the connection is closed (EOF with leftover partial data).
+        // NeedMore or Consumed(0) on non-empty data: incomplete parse. A
+        // finished read half means the rest is not coming.
         let is_closed = driver
             .connections
             .get(self.conn_index)
@@ -2945,11 +2946,13 @@ impl Connection {
     /// The peer's FIN or close_notify does not change this: the read half is
     /// finished, the connection stays open for the task, and
     /// [`peer_closed`](Self::peer_closed) reports the end. A reset or a socket
-    /// error closes the connection, and this returns `false` once the runtime
-    /// has seen it, whether or not a read is parked: on io_uring through the
-    /// `POLLRDHUP` poll every plaintext or TLS connection arms (see
-    /// [`connect`]). A client deciding whether to reuse a connection checks
-    /// both: `is_alive() && !peer_closed()`.
+    /// error seen while the read half is open closes the connection, and this
+    /// returns `false` once the runtime has seen it, whether or not a read is
+    /// parked: on io_uring through the `POLLRDHUP` poll every plaintext or
+    /// TLS connection arms (see [`connect`]). After the peer's FIN nothing is
+    /// armed on the socket; a reset that arrives then is reported by the next
+    /// send, which closes the connection. A client deciding whether to reuse
+    /// a connection checks both: `is_alive() && !peer_closed()`.
     pub fn is_alive(&self) -> bool {
         self.tx.is_alive()
     }
@@ -3007,10 +3010,12 @@ impl Connection {
     ///
     /// The peer's end does not close the connection. The task may keep
     /// sending, and the connection closes when the task returns, drops the
-    /// last half, or calls [`close`](Self::close), or on an error. A read
-    /// made once this is true resolves `0`, or the error, without parking;
-    /// bytes received before the end are delivered first, so this can be
-    /// true while reads still return data.
+    /// last half, or calls [`close`](Self::close), or on an error. After the
+    /// end nothing is armed on the socket, so a reset that arrives then is
+    /// seen by the next send, not here. A read made once this is true
+    /// resolves `0`, or the error, without parking; bytes received before
+    /// the end are delivered first, so this can be true while reads still
+    /// return data.
     ///
     /// Returns `false` outside the executor and once the slot has been
     /// released or reused.
@@ -3221,9 +3226,9 @@ impl SendHalf {
     /// Queued sends drain first, then, on a TLS connection, a close_notify
     /// alert, then the FIN. The drain has no time bound: a peer that stops
     /// reading holds the connection until it reads, resets, or the worker
-    /// exits. On io_uring, if a close is already pending, for example because
-    /// the peer closed first, this sends no alert; mio writes the alert at
-    /// teardown regardless. No alert follows a write shutdown
+    /// exits. On io_uring, if a close is already pending, for example after
+    /// a read error, this sends no alert; mio writes the alert at teardown
+    /// regardless. No alert follows a write shutdown
     /// (`shutdown_write`).
     ///
     /// On io_uring a TLS send made after `close()` returns `NotConnected`,
@@ -3299,6 +3304,11 @@ impl SendHalf {
     /// [the `fs` module docs](crate::fs#blocking-file-io-and-connection-closes-io_uring).
     pub fn shutdown_write(&mut self) {
         self.conn.shutdown_write();
+    }
+
+    /// See [`Connection::peer_closed`].
+    pub fn peer_closed(&self) -> bool {
+        self.conn.peer_closed()
     }
 
     /// See [`Connection::tls_info`].
@@ -3793,7 +3803,7 @@ impl Future for RecvReadyFuture {
                 return Poll::Ready(());
             }
 
-            // Check if the connection is closed.
+            // A finished read half resolves instead of parking.
             let is_closed = driver
                 .connections
                 .get(self.conn_index)

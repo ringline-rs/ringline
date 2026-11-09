@@ -169,9 +169,10 @@ impl Drop for PooledClient {
             return;
         };
         // `is_alive()` gates each close below. It is false once the connection
-        // is closing or its slot has been released, and outside the executor;
-        // `close` does nothing in each of those cases, so the gate only skips
-        // a redundant call.
+        // is closing or its slot has been released, once the server has
+        // closed its side, and outside the executor. `close` does nothing in
+        // the first and last cases; in the peer-closed case the client's
+        // drop releases its halves, which closes the connection.
 
         let alive = client.is_alive();
 
@@ -341,8 +342,9 @@ impl Pool {
                 match std::mem::replace(&mut slots[idx], Slot::Lent) {
                     Slot::Connected(client) if client.is_alive() => Next::Ready(client),
                     // Closed while idle: left reserved and reconnected. The
-                    // connection is already closing or released, so dropping
-                    // the client leaks nothing.
+                    // connection is closing or released, or the server has
+                    // closed its side and dropping the client closes it, so
+                    // nothing leaks.
                     Slot::Connected(_) => Next::Connect,
                     // Already out: put it back and move on.
                     Slot::Lent => {
