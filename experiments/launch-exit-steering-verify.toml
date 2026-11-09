@@ -1,28 +1,29 @@
 # Control-then-fix run for #783: `a_worker_stopping_during_launch_does_not_hang_it`
 # waits for the stopped worker before it connects, and
-# `an_exit_before_the_listener_exists_is_applied_once_it_does` pins the
-# steering `launch()` applies to an exit recorded before the listeners exist.
+# `an_exit_before_the_listener_is_added_is_applied_once_it_is` pins the
+# steering `launch()` applies to an exit recorded before it adds the listener.
 #
 # macOS cannot type-check the io_uring path, so the tests run here, in an
 # ephemeral VM on the `validation` agent, never by a login to a rig host
 # (CLAUDE.md, "Verifying io_uring code").
 #
-# Three refs. `red_ref` (branch `flake-783-red`) delays the injected worker
+# Three refs. `red_ref` (branch `flake-783-red2`) delays the injected worker
 # exit by 20 ms, so the exit lands after `launch()` returns; keeps the test's
 # old shape, connecting as soon as `launch()` returns; and empties
 # `reapply_exits`. Step 1 expects both tests to fail: the first with `Closed`
 # entries, the connections that landed on the stopped worker's socket and
 # were closed with its queue, which is the mechanism behind the two CI
 # failures; the second because nothing steers around the recorded exit.
-# `delayed_ref` (branch `flake-783-delayed`) is the head plus the same 20 ms
+# `delayed_ref` (branch `flake-783-delayed2`) is the head plus the same 20 ms
 # delay. Step 2 expects both tests to pass: the fixed test waits for the exit
 # whichever side of `launch()` it lands. Step 3 runs the two tests 30 times at
 # the head and then the uring gate.
 #
 # Prediction: red_rc non-zero with `2 failed` and at least one `Closed` in the
-# first test's output; delayed_rc 0 with `2 passed`; head_fail_runs=0; every
-# gate 0. A red that reads `0 failed` means the 20 ms delay did not put the
-# exit after `launch()` on this host, not that the mechanism is wrong.
+# first test's result vector; delayed_rc 0 with `2 passed`; head_fail_runs=0;
+# every gate 0. A red that reads `1 failed`, the second test alone, means the
+# 20 ms delay did not put the exit after `launch()` on this host, not that the
+# mechanism is wrong.
 #
 #   systemslab submit experiments/launch-exit-steering-verify.toml
 name = "ringline launch-exit-steering verify ({branch})"
@@ -30,9 +31,9 @@ name = "ringline launch-exit-steering verify ({branch})"
 [params]
 branch = "flake-783"
 repo   = "https://github.com/brayniac/ringline"
-red_ref = "54a4cc3ef530a4cd630a0d0626f63486e8477883"
-delayed_ref = "9e9e24e4b30b361ff66e7909aa104827d9066e03"
-tests  = "a_worker_stopping_during_launch_does_not_hang_it an_exit_before_the_listener_exists_is_applied_once_it_does"
+red_ref = "a12cd4f45abe28b173f556deb1663b19a3488486"
+delayed_ref = "3c7db4223c44f82650cfed919880c9fb7a36859c"
+tests  = "a_worker_stopping_during_launch_does_not_hang_it an_exit_before_the_listener_is_added_is_applied_once_it_is"
 
 [[jobs]]
 name = "verify"
@@ -78,7 +79,7 @@ cd /home/anvil
   echo "red_rc=$?"
   grep -E '^test .*FAILED|^test result|panicked|Closed|Hung' /home/anvil/red.out
   echo "red_summary=$(grep -E '^test result' /home/anvil/red.out | head -1)"
-  echo "red_closed=$(grep -c 'Closed' /home/anvil/red.out)"
+  echo "red_closed=$(grep -E '^\[' /home/anvil/red.out | grep -c Closed)"
 
   # Step 2: the fixed tests under the same delay.
   git checkout -q {delayed_ref} && git log --oneline -1
