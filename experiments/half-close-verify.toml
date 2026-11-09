@@ -67,14 +67,14 @@ cd /home/anvil
   # Step 1: the tests at the tests-only commit, on the unfixed code. Not
   # piped: a piped cargo reports the pipe's status.
   git checkout -q {red_ref} && git log --oneline -1
-  cargo test --locked -p ringline --lib -- {tests} > /home/anvil/red.out 2>&1
+  cargo test --locked -p ringline --test {tests} > /home/anvil/red.out 2>&1
   echo "red_rc=$?"
   grep -E '^test .*FAILED|^test result|panicked|left:|right:' /home/anvil/red.out
   echo "red_summary=$(grep -E '^test result' /home/anvil/red.out | head -1)"
   git checkout -q {branch} && git log --oneline -1
 
   # Step 2: the same tests on the fix.
-  cargo test --locked -p ringline --lib -- {tests} > /home/anvil/green.out 2>&1
+  cargo test --locked -p ringline --test {tests} > /home/anvil/green.out 2>&1
   echo "green_rc=$?"
   grep -E '^test .*FAILED|^test result' /home/anvil/green.out
   echo "green_summary=$(grep -E '^test result' /home/anvil/green.out | head -1)"

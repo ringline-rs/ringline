@@ -12159,12 +12159,15 @@ mod tests {
         // the end-of-iteration drain.
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
+        // A real socket behind the fixed file: the receive armed below stays
+        // in the kernel instead of failing with `EBADF`, which would land as
+        // a read error on the connection the injected EOF leaves open.
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
         el.driver.send_queues[conn_index as usize].in_flight = true;
 
         let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
 
         // Recv EOF + stale send in the same batch.
-        // The EOF handler calls close_connection internally.
         assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
         let recv_slot = el
             .driver
@@ -16341,12 +16344,13 @@ mod tests {
                 let conn_index = accept_connection(&mut el);
 
                 for action in &actions {
-                    // Skip if connection already closed.
+                    // Stop once the connection is closed or its read half is
+                    // finished: nothing arms a receive after the end.
                     if el
                         .driver
                         .connections
                         .get(conn_index)
-                        .is_none_or(|c| c.close_requested())
+                        .is_none_or(|c| c.close_requested() || c.recv_finished())
                     {
                         break;
                     }
