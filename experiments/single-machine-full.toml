@@ -1,6 +1,8 @@
 name = "ringline-benchmarks single-machine full sweep (per-protocol isolation)"
 
-# Regenerates every single-machine table in BENCHMARKS.md on one z1.n.small.
+# Runs every ringline-benchmarks protocol on one z1.n.small. BENCHMARKS.md has
+# had no single-machine tables since #205, and no current host carries the
+# z1.n.small tag, so this spec does not schedule as written.
 # Each protocol runs as its own ringline-benchmarks process so no single
 # process accumulates hundreds of server binds (which intermittently produced
 # dead 0-ops cells). Relies on the PortManager bindability probe for the rest.
