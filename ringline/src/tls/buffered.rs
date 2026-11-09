@@ -191,7 +191,7 @@ pub(super) fn feed_tls_recv_buffered(
             Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
-                return TlsRecvResult::Error(super::record_layer_error(e));
+                return TlsRecvResult::Error(e);
             }
         }
         // Drive the state machine after each chunk so rustls can
@@ -236,7 +236,7 @@ pub(super) fn feed_tls_recv_buffered(
                     out_sends,
                 );
             }
-            return TlsRecvResult::Error(e);
+            return TlsRecvResult::Error(super::record_layer_error(e));
         }
     };
 
