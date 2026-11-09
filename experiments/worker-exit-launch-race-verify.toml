@@ -10,8 +10,11 @@
 # exit before connecting.
 #
 # Prediction: failures at `main_ref` with `[Closed, Yes, ...]`; none at the
-# fix. First run (experiment 01a1c116-42ce-71cb-1577-ae07bb81b301, Debian 13,
-# kernel 6.12): 1 of 300 at main, 0 of 300 at the fix.
+# fix. Two earlier diag specs ran the same two loops on Debian 13, kernel
+# 6.12.63: 1 of 300 at main and 0 of 300 at the fix (experiment
+# 01a1c116-42ce-71cb-1577-ae07bb81b301), then 3 of 3000 at main, every
+# failure `[Closed, Yes, ...]`, and 0 of 3000 at the fix (experiment
+# 01a1c11e-b5b5-712a-e80c-3b22cec65899).
 #
 #   systemslab submit experiments/worker-exit-launch-race-verify.toml
 name = "ringline worker-exit launch race verify ({branch})"
@@ -60,7 +63,7 @@ cd /home/anvil
     B=$(bin)
     for i in $(seq 1 {n}); do
       out=$(./$B {test} --test-threads=1 2>&1)
-      if ! echo "$out" | grep -q 'test result: ok'; then
+      if ! echo "$out" | grep -q 'test result: ok. 1 passed'; then
         fails=$((fails+1)); { echo "=== $label run $i"; echo "$out" | grep -E 'panicked|Closed|Hung|test result'; } >> /home/anvil/failures.log
       fi
     done
@@ -83,6 +86,7 @@ fail=0
 grep -E '^(gate_|main |fix )' verify.log
 grep -q "^gate_backend=0" verify.log || { echo "FAIL gate_backend"; fail=1; }
 grep -q "^fix runs=.* fails=0$" verify.log || { echo "FAIL: the fix still fails"; fail=1; }
+grep -q "^main runs=.* fails=0$" verify.log && echo "PREDICTION NOT MET: no failure at main_ref in this run"
 grep -q "^gate_clippy_uring=0" verify.log || { echo "FAIL clippy"; fail=1; }
 exit $fail
 '''
