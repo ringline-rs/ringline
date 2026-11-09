@@ -685,8 +685,9 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// The peer's FIN finishes the read half and closes nothing: the task may
 /// keep sending, and the connection closes when the task returns, drops the
 /// last half or calls `close`, or on an error (`docs/half-close-design.md`).
-/// After the FIN nothing is armed on the socket, so a reset that arrives then
-/// is reported by the next send. Sends made once the Close is submitted
+/// After the FIN the runtime arms no receive for the socket, so a reset that
+/// arrives then is reported by the next send. Sends made once the Close is
+/// submitted
 /// (after queued sends drain) fail with `NotConnected`.
 ///
 /// A TLS connection receives ciphertext directly too, up to
@@ -2949,9 +2950,10 @@ impl Connection {
     /// error seen while the read half is open closes the connection, and this
     /// returns `false` once the runtime has seen it, whether or not a read is
     /// parked: on io_uring through the `POLLRDHUP` poll every plaintext or
-    /// TLS connection arms (see [`connect`]). After the peer's FIN nothing is
-    /// armed on the socket; a reset that arrives then is reported by the next
-    /// send, which closes the connection. A client deciding whether to reuse
+    /// TLS connection arms (see [`connect`]). After the peer's FIN the
+    /// runtime arms no receive for the socket; a reset that arrives then is
+    /// reported by the next send, which closes the connection. A client
+    /// deciding whether to reuse
     /// a connection checks both: `is_alive() && !peer_closed()`.
     pub fn is_alive(&self) -> bool {
         self.tx.is_alive()
@@ -3011,8 +3013,9 @@ impl Connection {
     /// The peer's end does not close the connection. The task may keep
     /// sending, and the connection closes when the task returns, drops the
     /// last half, or calls [`close`](Self::close), or on an error. After the
-    /// end nothing is armed on the socket, so a reset that arrives then is
-    /// seen by the next send, not here. A read made once this is true
+    /// end the runtime arms no receive for the socket, so a reset that
+    /// arrives then is seen by the next send, not here. A read made once this
+    /// is true
     /// resolves `0`, or the error, without parking; bytes received before
     /// the end are delivered first, so this can be true while reads still
     /// return data.

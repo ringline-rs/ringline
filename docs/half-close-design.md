@@ -53,8 +53,9 @@ a handler that wants the old behaviour returns when a read resolves `0`.
   `SendHalf::peer_closed()`: the peer's FIN or close_notify has arrived, or
   the read failed. True once a read would resolve `0` or an error without
   parking, and while the slot is held by this connection; false before that
-  and outside the executor. After the end nothing is armed on the socket, so
-  a reset that arrives then is seen by the next send, which closes the
+  and outside the executor. After the end the runtime arms no receive for
+  the socket, so a reset that arrives then is seen by the next send, which
+  closes the
   connection. `eof_truncated()` keeps its meaning (a FIN with no
   close_notify on TLS).
 - `recv_ready` resolves at the FIN, as before.

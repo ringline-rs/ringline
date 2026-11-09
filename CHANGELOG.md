@@ -265,8 +265,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   open while the task holds it, the task may keep sending, and the
   connection closes when the task returns, drops its last half or calls
   `close`, or on a reset or read error seen while the read half was open, a
-  write error or a TLS failure. After the peer's FIN nothing is armed on the
-  socket, and a reset that arrives then is reported by the next send, which
+  write error or a TLS failure. After the peer's FIN the runtime arms no
+  receive for the socket, and a reset that arrives then is reported by the
+  next send, which
   closes the connection. Readers
   still resolve `0` at the end, after the buffered bytes; a task that loops
   on `0` spins instead of being dropped. `is_alive` no longer turns false at
