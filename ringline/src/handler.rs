@@ -54,8 +54,8 @@ pub(crate) struct ConnSendState {
     /// the Close SQE is committed.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_submitted: bool,
-    /// Deadline for close_notify completion. Set when close_notify is
-    /// queued by `DriverCtx::close`. If elapsed while `close_pending` is
+    /// Set by `DriverCtx::close` on a TLS connection, whether or not it
+    /// queued an alert. When the deadline passes with `close_pending` still
     /// true, the runtime force-closes the connection.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_notify_deadline: Option<std::time::Instant>,
@@ -1122,6 +1122,10 @@ impl<'a> DriverCtx<'a> {
                 return;
             }
             conn_state.lifecycle = crate::connection::Lifecycle::Closing;
+            // No alert once a write shutdown has been requested: the rule
+            // `Driver::queue_tls_close_notify` applies to the application's
+            // close.
+            let alert_allowed = matches!(conn_state.write, crate::connection::WriteHalf::Open);
 
             // Graceful TLS shutdown: queue close_notify ciphertext through
             // the per-connection send queue so it serializes behind any
@@ -1130,17 +1134,19 @@ impl<'a> DriverCtx<'a> {
             if !self.tls_table.is_null() {
                 let tls_table = unsafe { &mut *self.tls_table };
                 if tls_table.has(conn.index) {
-                    let mut sends = Vec::new();
-                    let retained = tls_table.send_close_notify_queued(
-                        conn.index,
-                        conn.generation,
-                        self.send_copy_pool,
-                        &mut sends,
-                    );
-                    if !sends.is_empty() {
-                        self.queue_built_sends(conn.index, sends);
+                    if alert_allowed {
+                        let mut sends = Vec::new();
+                        let retained = tls_table.send_close_notify_queued(
+                            conn.index,
+                            conn.generation,
+                            self.send_copy_pool,
+                            &mut sends,
+                        );
+                        if !sends.is_empty() {
+                            self.queue_built_sends(conn.index, sends);
+                        }
+                        self.send_queues[conn.index as usize].close_notify_pending = retained;
                     }
-                    self.send_queues[conn.index as usize].close_notify_pending = retained;
                     // Arm the close_notify deadline so the event loop
                     // force-closes if the deferred Close never fires (peer
                     // stops reading and the queue can't drain). Live now
