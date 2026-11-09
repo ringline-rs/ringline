@@ -621,7 +621,10 @@ and this entry's span line named a branch.
   (`SendPollOut` included, so the earlier 15-bit concern is moot). A
   `MSG_DONTWAIT` send never sits in the kernel, so no Send CQE is long-lived.
 - **L7** TLS record-layer errors resolve `Ok(0)` by documented choice
-  (`runtime/io.rs:2719-2722`).
+  (`runtime/io.rs:2719-2722`). Changed in #807 on the owner's decision: a
+  record the engine cannot process is `Err(InvalidData)` to
+  `with_data_result`, and a TLS overflow `Err(QuotaExceeded)`, on both
+  backends.
 
 ## Seeds from the stale pass (f19c31e8), re-established or dropped
 
