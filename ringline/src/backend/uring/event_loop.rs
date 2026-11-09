@@ -472,6 +472,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // ahead of a hangup; peek before blocking rather than at the next
             // completion.
             self.recheck_hangups();
+            // Under `defer_recv_arm`, a wait with no completion pending would
+            // block, and arming the deferred receives after it would take a
+            // second, non-blocking pass. Arm them now instead; this enter
+            // submits them.
+            if self.driver.defer_recv_arm
+                && !self.driver.deferred_recv_arms.is_empty()
+                && !self.driver.ring.completion_pending()
+            {
+                self.arm_deferred_recvs();
+            }
             // Declining to block still has to reap: under DEFER_TASKRUN the
             // kernel runs task_work only on a GETEVENTS enter, and
             // `submit_and_wait(0)` carries no such flag. Going through
@@ -503,6 +513,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             self.drain_completions();
             diag_cqes_1st += self.driver.cqe_batch.len() as u64;
+            self.arm_deferred_recvs();
             // `handle_park_install` fills `park_ready` from the completions
             // just drained. Hand those over in the same iteration: the
             // connections have already left this worker and only the
@@ -1080,13 +1091,45 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// UDP re-arms: `return_udp_buffers` retries a re-arm that could not be
     /// submitted, and with no tick timeout a blocking wait could outlast every
     /// other completion.
+    ///
+    /// Deferred receives: the pre-wait arm skips them when
+    /// `completion_pending()` is true, which can mean task work that posts no
+    /// completion, so a blocking wait could hold an unarmed deferred receive
+    /// until an unrelated completion arrives.
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
         self.executor.ready_queue.is_empty()
             && self.driver.pending_finalize_closes.is_empty()
+            && self.driver.deferred_recv_arms.is_empty()
             && !self.driver.udp_rearm_due()
             && !shutting_down
+    }
+
+    /// Arm the receives `park_recv` deferred (`Config::defer_recv_arm`), for
+    /// connections still in the slot they were deferred in whose reader is
+    /// still parked. An arm that closes the connection wakes the reader.
+    fn arm_deferred_recvs(&mut self) {
+        if self.driver.deferred_recv_arms.is_empty() {
+            return;
+        }
+        let mut arms = std::mem::take(&mut self.driver.deferred_recv_arms);
+        // Newest first: a reader that parked twice arms with its latest
+        // `need`, and the older entry finds the receive armed.
+        for &(conn_index, generation, need) in arms.iter().rev() {
+            if self.driver.connections.generation(conn_index) != generation
+                || !self.executor.recv_waiters[conn_index as usize]
+            {
+                continue;
+            }
+            if self.arm_direct_recv(conn_index, need) {
+                self.executor.wake_recv(conn_index);
+            }
+        }
+        arms.clear();
+        if self.driver.deferred_recv_arms.is_empty() {
+            self.driver.deferred_recv_arms = arms;
+        }
     }
 
     /// Completion of a direct receive (`OpTag::RecvDirect`).
@@ -5678,6 +5721,25 @@ mod tests {
         el.driver.udp_pending_replenish.push((0, 0));
         el.driver.return_udp_buffers();
         assert!(el.driver.udp_awaiting_buffers.is_empty());
+    }
+
+    /// A queued deferred receive keeps the worker from blocking until
+    /// `arm_deferred_recvs` takes it.
+    #[test]
+    fn a_deferred_recv_arm_keeps_the_worker_from_blocking() {
+        let mut cfg = test_config();
+        cfg.defer_recv_arm = true;
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        el.driver.ring.flush().unwrap();
+        assert!(el.may_block());
+
+        // Slot 0 holds no connection, so the arm drops the entry.
+        el.driver.deferred_recv_arms.push((0, 0, None));
+        assert!(!el.may_block());
+        el.arm_deferred_recvs();
+        assert!(el.driver.deferred_recv_arms.is_empty());
+        assert!(el.may_block());
     }
 
     /// A hangup poll that cannot be submitted puts the connection on the
@@ -11552,6 +11614,58 @@ mod tests {
             el.driver.connections.active_count(),
             0,
             "the refused close was retried and completed"
+        );
+    }
+
+    /// The exit drain closes the fd carried by an install CQE it reaps. The
+    /// fd is a second reference to the socket; the connection's Close
+    /// releases the fixed file, and while that fd stays open the peer sees
+    /// no FIN (#800).
+    #[test]
+    fn shutdown_closes_the_fd_of_an_install_it_drains() {
+        let mut el = make_test_loop();
+        if !el.driver.ring.supports_park() {
+            return; // pre-6.8: no install can be in flight
+        }
+        let conn_index = accept_connection(&mut el);
+        let (ours, peer) = attach_socketpair(&mut el, conn_index);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver
+            .ring
+            .submit_park_install(conn_index, generation)
+            .expect("submit_park_install failed");
+        el.driver.park_in_flight[conn_index as usize] =
+            Some(crate::backend::uring::driver::ParkInFlight {
+                target: 1,
+                generation,
+            });
+        // The install completes inline at submit. Take its CQE, check that
+        // it carries an fd (a failed install would leave `ours` the last
+        // reference and the assertion below true without the drain's arm),
+        // and post it again for the exit drain to reap.
+        el.driver.ring.flush().unwrap();
+        let mut cqes = Vec::new();
+        el.driver.ring.reap(&mut cqes);
+        let ud = UserData::encode(OpTag::ParkInstall, conn_index, generation).raw();
+        let (_, installed, _) = *cqes
+            .iter()
+            .find(|(u, _, _)| *u == ud)
+            .expect("no ParkInstall CQE after the flush");
+        assert!(installed >= 0, "the install failed: {installed}");
+        el.driver.ring.submit_nop_inject(ud, installed).unwrap();
+
+        el.driver.run_shutdown();
+        assert!(el.driver.connections.get(conn_index).is_none());
+
+        // The Close released the fixed file and `ours` is dropped here, so
+        // the installed fd is the last reference to the socket. The peer
+        // reads EOF once it is closed too.
+        drop(ours);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            try_recv(&peer, &mut buf),
+            Some(0),
+            "the peer saw no FIN: the installed fd is still open"
         );
     }
 

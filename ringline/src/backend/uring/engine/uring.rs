@@ -133,6 +133,9 @@ pub(crate) struct UringEngine {
     /// set, the kernel runs task_work — and so posts the CQEs it generates —
     /// only on an `io_uring_enter` carrying `IORING_ENTER_GETEVENTS`.
     defer_taskrun: bool,
+    /// Whether the ring was set up with `IORING_SETUP_TASKRUN_FLAG`, so
+    /// `IORING_SQ_TASKRUN` says whether task work is pending.
+    taskrun_flag: bool,
     /// Whether the kernel supports `IORING_OP_FIXED_FD_INSTALL` (6.8+).
     ///
     /// Park (tier 3, #443) has to hand a real fd to another worker, but an
@@ -355,6 +358,9 @@ impl Engine for UringEngine {
         } else {
             builder.setup_coop_taskrun();
             builder.setup_defer_taskrun();
+            if config.defer_recv_arm {
+                builder.setup_taskrun_flag();
+            }
         }
 
         let ring = builder
@@ -404,6 +410,7 @@ impl Engine for UringEngine {
             ring,
             chain_scratch: Vec::new(),
             defer_taskrun: !config.sqpoll,
+            taskrun_flag: !config.sqpoll && config.defer_recv_arm,
             fixed_fd_install,
             close_lead: Self::close_lead_from(config),
             pbuf_resv_set: false,
@@ -750,6 +757,17 @@ impl Engine for UringEngine {
                 .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)?;
         }
         Ok(())
+    }
+
+    fn completion_pending(&self) -> bool {
+        if !self.taskrun_flag {
+            return true;
+        }
+        // Safety: shared views of the ring's flags and head/tail atomics,
+        // read-only.
+        unsafe {
+            self.ring.submission_shared().taskrun() || !self.ring.completion_shared().is_empty()
+        }
     }
 
     /// Append every completion the ring holds to `out` as
@@ -1446,5 +1464,91 @@ mod enter_error_tests {
         for errno in [libc::EBADR, libc::EBADF, libc::EINVAL] {
             assert!(!is_enter_backpressure(&io::Error::from_raw_os_error(errno)));
         }
+    }
+}
+
+#[cfg(test)]
+mod completion_pending_tests {
+    use super::*;
+    use crate::backend::uring::ring::is_memlock_enomem;
+    use crate::config::ConfigBuilder;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    fn engine(defer_recv_arm: bool) -> UringEngine {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .defer_recv_arm(defer_recv_arm)
+            .build()
+            .expect("valid config");
+        // Up to 5 s for earlier rings' memlock charge to be released (#589).
+        for _ in 0..50 {
+            match UringEngine::setup(&config) {
+                Err(e) if is_memlock_enomem(&e) => std::thread::sleep(Duration::from_millis(100)),
+                result => return result.expect("ring"),
+            }
+        }
+        UringEngine::setup(&config).expect("ring")
+    }
+
+    /// A receive that found its socket empty is completed from task work when
+    /// bytes arrive. Under DEFER_TASKRUN that work waits for the next enter,
+    /// and `completion_pending` reports it before that enter, and also
+    /// reports a completion posted but not yet reaped.
+    #[test]
+    fn pending_task_work_and_unreaped_completions_are_reported() {
+        let mut e = engine(true);
+        let (a, mut b) = UnixStream::pair().expect("socketpair");
+        let mut buf = [0u8; 16];
+        let recv = opcode::Recv::new(types::Fd(a.as_raw_fd()), buf.as_mut_ptr(), buf.len() as u32)
+            .build()
+            .user_data(7);
+        // Safety: `buf` and `a` outlive the receive, which is reaped below.
+        unsafe { e.ring.submission().push(&recv.into()) }.expect("room");
+        e.flush().expect("submit");
+        assert!(
+            e.ring.completion().is_empty(),
+            "the receive completed without data"
+        );
+        assert!(
+            !e.completion_pending(),
+            "nothing is pending before the write"
+        );
+
+        b.write_all(b"hello").expect("write");
+        assert!(
+            e.ring.completion().is_empty(),
+            "DEFER_TASKRUN posted without an enter"
+        );
+        assert!(
+            e.completion_pending(),
+            "the receive's task work is not reported"
+        );
+
+        e.submit_and_get_events().expect("enter");
+        assert!(
+            e.completion_pending(),
+            "the posted completion is not reported"
+        );
+        let cqe = e
+            .ring
+            .completion()
+            .next()
+            .expect("the receive's completion");
+        assert_eq!((cqe.user_data(), cqe.result()), (7, 5));
+        assert!(
+            !e.completion_pending(),
+            "pending after the completion was reaped"
+        );
+    }
+
+    /// Without `defer_recv_arm` the ring has no TASKRUN_FLAG and the engine
+    /// cannot tell, so it reports work pending.
+    #[test]
+    fn without_the_taskrun_flag_work_is_always_reported_pending() {
+        let mut e = engine(false);
+        assert!(e.ring.completion().is_empty());
+        assert!(e.completion_pending());
     }
 }

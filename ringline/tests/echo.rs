@@ -411,6 +411,54 @@ fn async_echo_small_message() {
     }
 }
 
+/// With `defer_recv_arm(true)` messages of every size echo in order, and a
+/// request sent after the worker has blocked in its wait is answered.
+#[test]
+#[cfg(has_io_uring)]
+fn async_echo_with_deferred_recv_arm() {
+    // No tick timeout, so only a completion ends a blocking wait.
+    let config = test_config_builder()
+        .defer_recv_arm(true)
+        .tick_timeout_us(0)
+        .build()
+        .expect("config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<AsyncEcho>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+
+    wait_for_server(&addr);
+
+    for len in [22usize, 8192, 256 * 1024] {
+        let msg: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let response = echo_round_trip(&addr, &msg);
+        assert_eq!(response, msg, "{len} bytes");
+    }
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    for i in 0..20 {
+        if i % 5 == 4 {
+            // Long enough for the worker to block in its wait.
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let msg = format!("msg-{i}\n");
+        stream.write_all(msg.as_bytes()).unwrap();
+        let mut buf = vec![0u8; msg.len()];
+        stream.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, msg.as_bytes(), "mismatch on send {i}");
+    }
+    drop(stream);
+
+    shutdown.shutdown();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+}
+
 /// The runtime launches and echoes with `sqpoll(true)`. The kernel refuses
 /// COOP_TASKRUN and DEFER_TASKRUN with SQPOLL, so setup sets neither under
 /// SQPOLL (#630).

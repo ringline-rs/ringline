@@ -47,6 +47,10 @@ impl Engine for StubEngine {
         unreachable!("the stub engine fails at setup")
     }
 
+    fn completion_pending(&self) -> bool {
+        unreachable!("the stub engine fails at setup")
+    }
+
     fn reap(&mut self, _out: &mut Vec<(u64, i32, u32)>) {
         unreachable!("the stub engine fails at setup")
     }
