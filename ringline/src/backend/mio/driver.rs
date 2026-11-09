@@ -1707,7 +1707,7 @@ pub(crate) mod tests {
         // kernel to deliver bytes already written, bounded by `attach_conn`'s
         // 5 s read timeout; a writability wait is bounded at 5 s, and the
         // whole drain at 90 s. On Linux the drain takes about 20 s: each
-        // read of the small receive window waits about 600 ms.
+        // read of the ~32 KiB a flush wrote waits about 600 ms.
         // Three earlier shapes failed on one or the other: a reader-thread
         // race that never drained 2 MiB, a 64 KiB payload that Linux
         // swallowed whole in the first flush, and a 10,000-flush budget that
@@ -1779,7 +1779,7 @@ pub(crate) mod tests {
 
         // Drain and flush alternately on this one thread. Each read asks for
         // exactly the bytes the driver has already reported writing, so it
-        // can never be short of bytes that were written. A flush that writes
+        // never waits for a byte the driver has not written. A flush that writes
         // nothing found the send buffer still full: the read opens the
         // peer's small receive window, and the window update, the segments it
         // admits and their ACKs are processed off this thread, so the buffer
