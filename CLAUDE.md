@@ -421,7 +421,7 @@ These reflect deliberate owner decisions — follow them for any public-surface 
 
 ## Performance Work
 
-- Performance claims require measurement. `BENCHMARKS.md` holds the checked-in baseline (two-machine AWS Graviton4, segcache workload, ringline vs tokio); `ringline-bench`/`ringline-benchmarks` are the load generators; `experiments/` holds SystemsLab specs. Microbenches: criterion `resp_bench` in `ringline-redis`.
+- Performance claims require measurement. `BENCHMARKS.md` holds two checked-in runs: a two-machine TCP echo comparison of ringline and tokio server configurations (server guest on hv02, client guest on hv01, X710 LAG, September 2026) and an older segcache run on AWS Graviton4 (June 2026). Neither matches the current code; BENCHMARKS.md says which rows. `ringline-bench`/`ringline-benchmarks` are the load generators; `experiments/` holds SystemsLab specs. Microbenches: criterion `resp_bench` in `ringline-redis`.
 - Think in copies and syscalls first (see Copy Semantics). Recent wins came from removing scratch buffers, reusing encode buffers, batching guards, and eliminating per-iteration O(n) scans — not from micro-tuning.
 - Watch for environment artifacts before blaming the code: NIC bandwidth caps, IRQ/flow-steering placement, and SMT sibling enumeration have all masqueraded as ringline regressions.
 - The io_uring backend is the performance target; mio needs to be correct and non-pathological, not optimal.
