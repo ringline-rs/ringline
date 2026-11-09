@@ -463,9 +463,11 @@ distinction. Pinned by six io_uring unit tests
 `a_send_error_after_a_requested_close_does_not_mark_the_read_as_an_error`)
 and by `write_error_teardown_is_reported_to_the_reader`, run on both
 backends from this change. Red-then-green on an anvil VM
-(`experiments/send-error-abort-verify.toml`): on the tests-only commit the
-five arm tests fail and the integration test fails in RED_N of 10 runs with
-`Ok(0)`; on the fix all pass, 10 of 10.
+(`experiments/send-error-abort-verify.toml`, Debian 13, kernel 6.12): on the
+tests-only commit the five arm tests fail; the integration test passed 10 of
+10 there, the receive taking the socket's error ahead of the send in every
+run (#769's CI saw the send take it in 3 of 6 jobs), so on io_uring the unit
+tests are the evidence. On the fix all pass, 10 of 10.
 
 ### F14 — docs and comments false or unresolvable at a2e28073. Confirmed by quote and grep.
 

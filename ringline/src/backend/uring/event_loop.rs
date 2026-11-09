@@ -14571,8 +14571,8 @@ mod tests {
         ud
     }
 
-    /// Two single-record TLS sends: every chunk is tagged `Send`, so only the
-    /// connection's TLS state marks the run, and an error still closes.
+    /// Two single-record TLS sends: every chunk is tagged `Send`, and an
+    /// error closes the connection.
     #[test]
     fn tls_connection_run_of_final_chunks_closes_on_error() {
         let mut el = make_test_loop();
@@ -14584,15 +14584,16 @@ mod tests {
         assert!(conn.is_none() || conn.unwrap().close_requested());
     }
 
-    /// The same run on a plaintext connection drains without closing.
+    /// The same run on a plaintext connection closes too, and tells the
+    /// reader why.
     #[test]
-    fn plaintext_run_error_does_not_close() {
+    fn plaintext_run_error_closes_and_tells_the_reader() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
         let ud = two_send_tagged_chunks(&mut el, conn_index);
         el.test_dispatch_cqe(ud.raw(), -104, 0);
-        let conn = el.driver.connections.get(conn_index).expect("still open");
-        assert!(!conn.close_requested());
+        assert_send_error_aborted(&mut el, conn_index, generation, libc::ECONNRESET);
     }
 
     /// With the close already submitted, a partial write settles the sends it
@@ -15953,9 +15954,10 @@ mod tests {
                             }
                         }
 
-                        // Send error on a random live connection.
+                        // Send error on a random live connection: the error
+                        // closes it, and the Close CQE follows.
                         2 if !live_conns.is_empty() => {
-                            let ci = live_conns[0];
+                            let ci = live_conns.remove(0);
                             if let Some((slot, _, _)) = el.driver.send_copy_pool.copy_in(b"data") {
                                 let ud = UserData::encode(
                                     OpTag::Send,
@@ -15966,6 +15968,10 @@ mod tests {
                                     ),
                                 );
                                 el.test_dispatch_cqe(ud.raw(), -104, 0);
+                                let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                                el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                            } else {
+                                live_conns.insert(0, ci); // put it back
                             }
                         }
 
@@ -15988,9 +15994,10 @@ mod tests {
                             }
                         }
 
-                        // ZC send error on a live connection.
+                        // ZC send error on a live connection: the error
+                        // closes it, and the Close CQE follows.
                         4 if !live_conns.is_empty() => {
-                            let ci = live_conns[0];
+                            let ci = live_conns.remove(0);
                             let iovecs = [libc::iovec {
                                 iov_base: std::ptr::null_mut(),
                                 iov_len: 50,
@@ -16007,6 +16014,10 @@ mod tests {
                                 {
                                     el.driver.send_slab.release(slab_idx);
                                 }
+                                let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                                el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                            } else {
+                                live_conns.insert(0, ci); // put it back
                             }
                         }
 
