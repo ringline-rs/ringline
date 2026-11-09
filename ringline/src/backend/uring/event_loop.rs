@@ -13864,6 +13864,52 @@ mod tests {
         assert!(el.driver.send_queues[conn_index as usize].close_submitted);
     }
 
+    /// A `Shutdown` CQE that reports an error (here `ENOTCONN`, the socket
+    /// already closed) is counted under `shutdown_failed`, and still
+    /// releases the Close it held. A successful one is not counted.
+    #[test]
+    fn a_failed_shutdown_is_counted_and_releases_the_close() {
+        let mut el = make_test_loop();
+        let first = accept_connection(&mut el);
+        let second = accept_connection(&mut el);
+        for &c in &[first, second] {
+            let state = &mut el.driver.send_queues[c as usize];
+            state.close_pending = true;
+            state.shutdown_inflight = true;
+        }
+        let count = || {
+            metrics::CONNECTIONS
+                .value(metrics::conn::SHUTDOWN_FAILED)
+                .unwrap_or(0)
+        };
+
+        let before = count();
+        let generation = el.driver.connections.generation(first);
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::Shutdown, first, generation).raw(),
+            0,
+            0,
+        );
+        assert_eq!(count(), before, "a successful Shutdown was counted");
+
+        let generation = el.driver.connections.generation(second);
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::Shutdown, second, generation).raw(),
+            -libc::ENOTCONN,
+            0,
+        );
+        assert!(count() > before, "the failed Shutdown was not counted");
+        assert!(
+            !el.driver.send_queues[second as usize].shutdown_inflight,
+            "the failed Shutdown still holds the Close"
+        );
+        el.finalize_pending_closes();
+        assert!(
+            el.driver.send_queues[second as usize].close_submitted,
+            "the Close was never committed"
+        );
+    }
+
     /// `shutdown_write` on a connection whose close is requested submits
     /// nothing: the Close ends the write half, as on mio.
     #[test]

@@ -12,7 +12,7 @@ use metriken::{Gauge, ShardedCounterGroup, metric};
     name = "ringline/connections",
     description = "Connection lifecycle counters"
 )]
-pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(8);
+pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(9);
 
 #[metric(name = "ringline/bytes", description = "Byte transfer counters")]
 pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
@@ -123,6 +123,12 @@ pub mod conn {
     /// a wait that does not end counts 10 per second. While it waits,
     /// connections stay in the kernel's listen queue.
     pub const ACCEPT_QUEUE_FULL: usize = 7;
+    /// A `shutdown_write` whose `shutdown(SHUT_WR)` failed at the socket:
+    /// the Shutdown SQE's CQE on io_uring, the call's result on mio. Usually
+    /// `ENOTCONN`, the socket already closed by a reset or a failed connect.
+    /// Nothing else changes: the write half stays `Shutdown`, and on
+    /// io_uring the Close it held goes ahead.
+    pub const SHUTDOWN_FAILED: usize = 8;
 }
 
 /// Completions processed, split by `OpTag`.
@@ -458,6 +464,7 @@ pub fn init_metadata() {
         "op".into(),
         "accept_queue_full".into(),
     );
+    CONNECTIONS.insert_metadata(conn::SHUTDOWN_FAILED, "op".into(), "shutdown_failed".into());
 
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_100, "op".into(), "lt_100us".into());
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_250, "op".into(), "lt_250us".into());
@@ -617,6 +624,7 @@ mod tests {
             conn::ACCEPT_TABLE_FULL,
             conn::ACCEPT_REGISTER_FAILED,
             conn::ACCEPT_QUEUE_FULL,
+            conn::SHUTDOWN_FAILED,
         ] {
             assert!(
                 CONNECTIONS.increment(idx),
