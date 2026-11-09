@@ -2921,9 +2921,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Fail the send `ud` names, through the completion path it would have
-    /// taken, and so with what that path does: the connection closes and the
-    /// reader is handed the error (`abort_connection`); a zero-copy entry
-    /// stays for its notifications.
+    /// taken, and so with what that path does: on a connection whose close is
+    /// not yet requested, the connection closes and the reader is handed the
+    /// error (`abort_connection`); on one already closing, nothing is
+    /// recorded; a zero-copy entry stays for its notifications.
     fn fail_waiting_send(&mut self, ud: UserData, result: i32) {
         match ud.tag() {
             Some(OpTag::Send) => self.handle_send(ud, result),
@@ -15955,7 +15956,7 @@ mod tests {
                             }
                         }
 
-                        // Send error on a random live connection: the error
+                        // Send error on the oldest live connection: the error
                         // closes it, and the Close CQE follows.
                         2 if !live_conns.is_empty() => {
                             let ci = live_conns.remove(0);
@@ -15995,8 +15996,8 @@ mod tests {
                             }
                         }
 
-                        // ZC send error on a live connection: the error
-                        // closes it, and the Close CQE follows.
+                        // ZC send error on the oldest live connection: the
+                        // error closes it, and the Close CQE follows.
                         4 if !live_conns.is_empty() => {
                             let ci = live_conns.remove(0);
                             let iovecs = [libc::iovec {
@@ -16009,12 +16010,12 @@ mod tests {
                                     OpTag::SendMsgZc, ci, slab_idx as u32,
                                 );
                                 el.test_dispatch_cqe(ud.raw(), -104, 0);
-                                // Release if should_release.
-                                if el.driver.send_slab.in_use(slab_idx)
-                                    && el.driver.send_slab.should_release(slab_idx)
-                                {
-                                    el.driver.send_slab.release(slab_idx);
-                                }
+                                // No notification is pending (flags 0), so
+                                // the error path released the entry.
+                                prop_assert!(
+                                    !el.driver.send_slab.in_use(slab_idx),
+                                    "the error path releases the entry"
+                                );
                                 let close_ud = UserData::encode(OpTag::Close, ci, 0);
                                 el.test_dispatch_cqe(close_ud.raw(), 0, 0);
                             } else {

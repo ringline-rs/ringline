@@ -465,9 +465,13 @@ and by `write_error_teardown_is_reported_to_the_reader`, run on both
 backends from this change. Red-then-green on an anvil VM
 (`experiments/send-error-abort-verify.toml`, Debian 13, kernel 6.12): on the
 tests-only commit the five arm tests fail; the integration test passed 10 of
-10 there, the receive taking the socket's error ahead of the send in every
-run (#769's CI saw the send take it in 3 of 6 jobs), so on io_uring the unit
-tests are the evidence. On the fix all pass, 10 of 10.
+10 there, so the reader got an error in every run, which by the mechanism
+above is the receive taking the socket's error ahead of the send (not
+traced; #769's CI saw the other order in 3 of 6 jobs), so on io_uring the
+unit tests are the evidence. That run also failed two existing tests that
+encoded the old behaviour (`plaintext_run_error_does_not_close` and the
+mixed-operations CQE proptest, which armed a receive on the connection a
+failed send had closed); both were updated. On the fix all pass, 10 of 10.
 
 ### F14 — docs and comments false or unresolvable at a2e28073. Confirmed by quote and grep.
 
