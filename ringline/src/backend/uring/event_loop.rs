@@ -7251,6 +7251,35 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
     }
 
+    /// The same for a zero-copy send.
+    #[test]
+    fn a_terminal_zero_copy_send_error_closes_the_connection_with_the_error() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let slab_idx = alloc_zc_entry(&mut el, conn_index);
+
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(ud.raw(), -libc::ECONNRESET, 0);
+
+        let conn = el
+            .driver
+            .connections
+            .get(conn_index)
+            .expect("the slot is live");
+        assert!(conn.close_requested(), "the connection stayed open");
+        assert_eq!(
+            conn.read,
+            ReadHalf::Error,
+            "the read half does not record the error"
+        );
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader was not told");
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+    }
+
     /// A TLS chunk's terminal send error already closed the connection; it
     /// records the error for the reader too.
     #[test]
