@@ -3779,11 +3779,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::CONNECTIONS_ACTIVE.decrement();
         }
 
-        // Remove the async task (drops the future).
-        self.executor.remove_connection(conn_index);
-        // The future just dropped may have owned a half, whose `Drop` queues
-        // an orphan that finds a changed generation. Clear the flags before
-        // the slot is reused, or the next occupant inherits them.
+        // Remove the async task (drops the future), with the driver state
+        // installed so the futures it holds clean up as inside a poll.
+        crate::runtime::io::with_driver_state(
+            &mut self.driver,
+            &mut self.executor,
+            |_, executor| {
+                executor.remove_connection(conn_index);
+            },
+        );
+        // The future just dropped may have owned a half, whose `Drop` finds
+        // the close already requested. Clear the claim flags before the slot
+        // is reused, or the next occupant inherits them.
         self.driver.clear_conn_claims(conn_index);
         self.driver.accumulators.release(conn_index);
         self.driver.arrival[conn_index as usize].release();
@@ -13874,7 +13881,7 @@ mod tests {
     /// connection is torn down, and the completion that arrives after the
     /// slot is reused frees its entry without settling it.
     #[test]
-    fn a_stale_completion_frees_an_abandoned_send() {
+    fn a_stale_completion_for_a_dropped_send_settles_nothing() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let old_gen = el.driver.connections.generation(conn_index);
@@ -13887,22 +13894,76 @@ mod tests {
             UserData::send_payload(slot, old_gen),
         );
 
-        // Teardown drops the connection's task, abandoning its send, and the
-        // slot is reused.
+        // The future is dropped with the task (its `Drop` cancels the
+        // entry), the release frees what it left, and the slot is reused.
+        el.executor.cancel_send(id);
         el.executor.remove_connection(conn_index);
         el.driver.connections.release(conn_index);
         let reused = el.driver.connections.allocate().unwrap();
         assert_eq!(reused, conn_index, "test premise: index reused");
-        assert_eq!(el.executor.send_completions.live(), 1);
-
-        el.test_dispatch_cqe(ud.raw(), 8, 0);
-
         assert_eq!(
             el.executor.send_completions.live(),
             0,
-            "the abandoned entry outlived its completion"
+            "nothing left behind"
         );
+
+        el.test_dispatch_cqe(ud.raw(), 8, 0);
+
+        assert_eq!(el.executor.send_completions.live(), 0);
         assert!(send_result(&mut el, id).is_none());
+    }
+
+    thread_local! {
+        /// Whether the probe's `Drop` ran with the driver state installed.
+        static DROPPED_IN_EXECUTOR: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Records, when dropped, whether the executor was reachable.
+    struct DropProbe;
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let inside = crate::runtime::io::try_with_state(|_, _| ()).is_some();
+            DROPPED_IN_EXECUTOR.with(|c| c.set(Some(inside)));
+        }
+    }
+
+    /// A connection task dropped by the Close CQE is dropped with the driver
+    /// state installed, so the futures it holds clean up as they do inside a
+    /// poll.
+    #[test]
+    fn a_connection_task_dropped_by_the_close_cqe_is_dropped_inside_the_executor() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        DROPPED_IN_EXECUTOR.with(|c| c.set(None));
+
+        el.executor.task_slab.spawn(
+            conn_index,
+            Box::pin(async move {
+                let _probe = DropProbe;
+                std::future::pending::<()>().await;
+            }),
+        );
+        el.executor.ready_queue.push_back(conn_index);
+        el.poll_ready_tasks();
+        assert!(
+            DROPPED_IN_EXECUTOR.with(|c| c.get()).is_none(),
+            "the task is parked with the probe alive"
+        );
+
+        el.driver.close_connection(conn_index);
+        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+        assert!(
+            el.driver.connections.get(conn_index).is_none(),
+            "the Close CQE released the slot"
+        );
+        assert_eq!(
+            DROPPED_IN_EXECUTOR.with(|c| c.get()),
+            Some(true),
+            "the task's futures see the executor when they drop"
+        );
     }
 
     /// A zero-copy retry dropped because its connection's Close is submitted
@@ -14907,6 +14968,113 @@ mod tests {
             el.driver.send_copy_pool.free_count(),
             8,
             "the abandoned entry's slot came back"
+        );
+    }
+
+    /// A forced close that `try_finalize_close` cannot commit, because a
+    /// `Shutdown` is still in the kernel, disarms its deadline: the force
+    /// runs once, and the Shutdown CQE commits the Close.
+    #[test]
+    fn a_forced_close_blocked_on_a_shutdown_runs_once() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        {
+            let state = &mut el.driver.send_queues[conn_index as usize];
+            state.close_pending = true;
+            state.shutdown_inflight = true;
+            state.close_notify_deadline = Some(std::time::Instant::now());
+        }
+        el.driver.close_notify_armed.push(conn_index);
+
+        el.check_close_notify_deadlines();
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(
+            state.close_pending && !state.close_submitted,
+            "the Shutdown holds the Close"
+        );
+        assert!(
+            state.close_notify_deadline.is_none(),
+            "the deadline stayed armed after the force"
+        );
+        assert!(
+            !el.driver.close_notify_armed.contains(&conn_index),
+            "the connection stayed on the armed set after the force"
+        );
+
+        // The next tick runs no second force.
+        el.driver.capacity_released = false;
+        el.check_close_notify_deadlines();
+        assert!(
+            !el.driver.capacity_released,
+            "a second force reported released capacity"
+        );
+
+        // The Shutdown CQE registers the connection for the end-of-iteration
+        // drain, which commits the Close.
+        let ud = UserData::encode(OpTag::Shutdown, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+        for c in std::mem::take(&mut el.driver.pending_finalize_closes) {
+            el.driver.try_finalize_close(c);
+        }
+        assert!(
+            el.driver.send_queues[conn_index as usize].close_submitted,
+            "the Close was never committed"
+        );
+    }
+
+    /// Reactivating a slot whose queue is empty returns no slot to the pool,
+    /// and reports none.
+    #[test]
+    fn resetting_an_empty_send_queue_releases_no_capacity() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.capacity_released = false;
+
+        el.driver.reset_send_state(conn_index);
+
+        assert!(
+            !el.driver.capacity_released,
+            "an empty queue reported released capacity"
+        );
+    }
+
+    /// A forced close that abandons a queued send no caller waits on
+    /// (`send_nowait`) still reports the slot it returned to the pool, or a
+    /// bounded send parked on the pool waits for an unrelated release.
+    #[test]
+    fn a_forced_close_abandoning_an_unawaited_send_releases_capacity() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(b"unawaited").unwrap();
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        let entry = crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw());
+        {
+            let state = &mut el.driver.send_queues[conn_index as usize];
+            state.queue.push_back(crate::handler::BuiltSend {
+                entry,
+                pool_slot: slot,
+                slab_idx: u16::MAX,
+            });
+            state.in_flight = true;
+            state.close_pending = true;
+        }
+        el.driver.capacity_released = false;
+
+        el.driver.force_finalize_close(conn_index);
+
+        assert!(
+            el.driver.settled_sends.is_empty(),
+            "nothing awaited the send"
+        );
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "the slot stayed in use"
+        );
+        assert!(
+            el.driver.capacity_released,
+            "the returned slot was not reported"
         );
     }
 
