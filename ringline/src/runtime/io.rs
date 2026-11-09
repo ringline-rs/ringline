@@ -168,7 +168,10 @@ pub(crate) unsafe fn set_driver_state_guarded(state: &mut DriverState) -> Driver
 /// `executor`, for work the runtime does outside a task poll that drops
 /// user futures: a connection task dropped at its connection's release. The
 /// futures' `Drop` impls then reach the executor as they do inside a poll.
-/// When the state is already installed, `f` runs under it.
+/// When the state is already installed, `f` runs under it; no caller
+/// reaches that branch today (`handle_close` and `drain_pending_closes` run
+/// outside every guard), and it keeps a nested call from clearing the
+/// outer guard.
 pub(crate) fn with_driver_state<R>(
     driver: &mut Driver,
     executor: &mut Executor,
@@ -4044,7 +4047,9 @@ impl Drop for BackpressuredSendFuture<'_> {
 /// Dropping it does not cancel the send: the bytes still go out, and the
 /// result is discarded. The future may be handed to another task, which may
 /// first poll it after the creating task has returned and the connection
-/// has closed: it resolves with the send's own result.
+/// has closed: it resolves with the send's own result. Dropped outside a
+/// task on its worker, the future leaves its entry in the table for the
+/// life of the worker.
 pub struct SendFuture {
     conn_index: u32,
     /// See `WithDataFuture` for the role of `generation`.

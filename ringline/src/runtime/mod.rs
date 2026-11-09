@@ -783,9 +783,10 @@ impl Executor {
         // tasks that outlive the connection) and the FIFO's new head. That
         // abort is provisional: a driver result arriving afterwards
         // overwrites it (`send_completion`'s module docs). Runs after
-        // `task_slab.remove` on purpose: the connection's own task is
-        // already gone, and the queue drops its entries rather than parking
-        // results nobody can take.
+        // `task_slab.remove` on purpose: the task's futures cancel their
+        // entries when the task is dropped, so an entry the task still owns
+        // here is held by a future it handed off, and `remove_connection`
+        // keeps it for that future.
         for task_id in self.send_completions.remove_connection(conn_index) {
             let _ = self.wake_task(task_id);
         }

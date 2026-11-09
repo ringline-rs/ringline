@@ -38,8 +38,9 @@
 //! entry's state. A connection task is dropped with the driver state
 //! installed, in its task-exit arm and at its connection's release
 //! ([`Executor::remove_connection`] runs under `with_driver_state`), so
-//! every future that died with it has cancelled its entry by the time the
-//! table is told about the task. An entry still owned by the dead task is
+//! every future that died with it cancels its entry; `cancel` finds the
+//! entry by id, so it does not matter that the `Ready` arms drop the future
+//! after `remove_task` ran. An entry still owned by the dead task is
 //! therefore held by a future the task handed to another task that has not
 //! polled it yet: it is re-owned to [`NO_OWNER`] and kept, resolved or in
 //! flight, and that task's first poll (`set_owner`) claims it.
@@ -449,8 +450,11 @@ impl SendCompletions {
     /// afterwards finds no entry and is ignored). Unknown: ignored.
     ///
     /// Called from `SendFuture`'s and `BackpressuredSendFuture`'s `Drop`. A
-    /// drop outside the executor skips this;
-    /// [`remove_connection`](Self::remove_connection) is the backstop.
+    /// connection task is dropped with the driver state installed, at its
+    /// exit and at its connection's release (`with_driver_state`), so its
+    /// futures reach this. A drop outside the executor (on another thread,
+    /// or in the synchronous body of `on_accept`) skips it and leaves the
+    /// entry in the table for the life of the worker.
     pub(crate) fn cancel(&mut self, id: SendId) -> Option<u32> {
         let e = self.entry_mut(id)?;
         match e.state {

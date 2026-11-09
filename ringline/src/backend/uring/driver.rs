@@ -1343,11 +1343,11 @@ impl Driver {
     /// Clear both half flags, and the park in flight, for a slot being
     /// recycled.
     ///
-    /// `executor.remove_connection` drops a parked task's future with
-    /// `CURRENT_DRIVER` unset, so a half's `Drop` queues an orphan that finds a
-    /// changed generation and clears nothing. A flag can therefore outlive its
-    /// half, and since the flags are indexed by slot rather than by generation,
-    /// the next occupant would inherit it.
+    /// A half dropped with the task at `handle_close` clears its own flag
+    /// (`release_half`, under `with_driver_state`). An occupant that died
+    /// without dropping a half, one whose `on_accept` panicked while building
+    /// the future, leaves its flags set, and since the flags are indexed by
+    /// slot rather than by generation, the next occupant would inherit them.
     ///
     /// Clearing here, at the recycle point, makes that impossible regardless of
     /// how the previous occupant died.
