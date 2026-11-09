@@ -909,7 +909,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - io_uring: a terminal send error (a `Send`, zero-copy send, coalesced send
-  or TLS chunk CQE with an errno other than `EAGAIN`) now closes the
+  or TLS chunk CQE with an errno other than `EAGAIN`, or `ENOMEM` on a
+  zero-copy send, which falls back to plain sends) now closes the
   connection and records the error for its reader, as a receive error and
   mio's flush error do. Before, a plaintext send error drained the queue and
   left the connection open until the hangup poll reported the end of the

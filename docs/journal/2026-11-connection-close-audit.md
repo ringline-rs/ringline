@@ -452,7 +452,7 @@ plain EOF; not traced in a run. #769 runs its write-error test on mio only.
 
 Disposition: fixed in `fix/uring-send-error-closes`, the first way: a
 terminal send error closes the connection and records the error, in both
-arms and in `handle_tls_send`'s, through one
+arms, in `handle_send_msg_zc`'s and in `handle_tls_send`'s, through one
 `fail_connection_on_send_error` on the io_uring event loop that sets
 `read = Error`, hands the error to `fail_recv` and requests the close, as
 mio's `abort_connection` does after a flush error. A `with_data` reader
@@ -460,7 +460,8 @@ still sees EOF; a `with_data_result` reader sees the error. The
 `close_on_error` flag that marked a run with TLS ciphertext as the one
 kind whose error closed is removed: every terminal error closes. Tests:
 `a_terminal_send_error_closes_the_connection_with_the_error`,
-`a_terminal_coalesced_send_error_closes_the_connection_with_the_error`
+`a_terminal_coalesced_send_error_closes_the_connection_with_the_error`,
+`a_terminal_zero_copy_send_error_closes_the_connection_with_the_error`
 and `a_terminal_tls_send_error_records_the_read_error`, each a CQE with
 `ECONNRESET` or `EPIPE` injected into the handler. The #769 observation
 above was not re-run on a kernel.
