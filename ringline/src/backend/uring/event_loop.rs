@@ -3510,8 +3510,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Send complete (all bytes sent) or error (result <= 0). The awaited
         // send settles now; the entry, and the guards it holds, stay until
         // the notification lands.
+        let errno = -result;
         if result > 0 {
             self.settle_slab_ok(slab_idx);
+        } else if self.close_submitted(conn_index)
+            && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOMEM)
+        {
+            // Backpressure, or a memlock refusal, after the Close was
+            // submitted: the send is not retried (the arms above skip it),
+            // so it settles as the plain, coalesced and TLS handlers settle a
+            // send the close cut short.
+            self.settle_slab_err(slab_idx, io::Error::from_raw_os_error(libc::ECANCELED));
         } else {
             self.settle_slab_err(slab_idx, Self::send_error(result));
         }
