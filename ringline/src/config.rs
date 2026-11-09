@@ -916,10 +916,9 @@ impl ConfigBuilder {
     }
 
     /// Set the upper bound on a single per-connection recv accumulator.
-    /// The connection is closed if the cap is exceeded. On a plaintext
-    /// connection a reader parked on `with_data_result` then gets
-    /// `io::ErrorKind::QuotaExceeded`; on a TLS connection the overflow is a
-    /// TLS record-layer error and the reader gets `Ok(0)`. Defaults to 1 GiB;
+    /// The connection is closed if the cap is exceeded, and a reader parked
+    /// on `with_data_result` then gets `io::ErrorKind::QuotaExceeded`, on
+    /// plaintext and TLS connections alike. Defaults to 1 GiB;
     /// `usize::MAX` disables the cap. Must be at least 1.
     ///
     /// Servers accepting data from untrusted peers should set this to

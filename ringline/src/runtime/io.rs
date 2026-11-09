@@ -2754,8 +2754,8 @@ impl Connection {
     /// - `Err(e)` — the socket read failed with a non-`WouldBlock` error
     ///   (`ConnectionReset` after an RST, for example), or the runtime closed
     ///   the connection on its own account: a write to it failed (the write's
-    ///   error), a message on a plaintext connection ran past
-    ///   `recv_accumulator_max` (`QuotaExceeded`), or on io_uring a receive
+    ///   error), a message ran past `recv_accumulator_max`
+    ///   (`QuotaExceeded`), or on io_uring a receive
     ///   could not be armed. Buffered bytes are always delivered before the
     ///   error is surfaced.
     ///
@@ -2766,11 +2766,11 @@ impl Connection {
     /// empty input will see `Ok(n)` there and the recorded error only on the
     /// following call.
     ///
-    /// A TLS record-layer error (a bad record, a failed decrypt, and on a TLS
-    /// connection the `recv_accumulator_max` overflow, which the record layer
-    /// reports) is not reported this way: it still closes the connection
-    /// through the EOF path and resolves to `Ok(0)`, indistinguishable from a
-    /// clean close, exactly as with `with_data`.
+    /// A TLS record the engine cannot process (a bad record, a failed
+    /// decrypt) closes the connection and is reported as `InvalidData`, with
+    /// rustls' error as the source; a decrypted record that runs past
+    /// `recv_accumulator_max` is `QuotaExceeded`, as on a plaintext
+    /// connection. The peer's close_notify is a clean close, `Ok(0)`.
     ///
     /// `with_data` keeps returning `0` for both cases; nothing about it
     /// changes. Use this variant when a protocol handler must tell "the peer
@@ -3080,7 +3080,10 @@ impl SendHalf {
     /// pool cannot admit the whole buffer (retryable once in-flight sends
     /// complete) and `InvalidInput` if the buffer is wider than the entire
     /// pool; on a TLS connection the pool is checked against the ciphertext
-    /// bound before anything is encrypted. On mio a plaintext send never
+    /// bound before anything is encrypted, and that bound includes one
+    /// record of headroom for a record rustls may have queued ahead of the
+    /// data (a key update or an alert), so a message whose ciphertext alone
+    /// would exactly fill the pool is refused too. On mio a plaintext send never
     /// fails for pool reasons. Nothing was queued or transmitted on those
     /// errors, so the same buffer may be sent again later. A TLS encryption
     /// failure (`Other`; on TLS 1.2, the traffic keys exhausted) closes the
@@ -3181,6 +3184,19 @@ impl SendHalf {
     /// On io_uring a TLS send made after `close()` returns `NotConnected`,
     /// because it would follow the alert. On mio it is queued and sent ahead of
     /// the alert, which mio writes once the queue drains.
+    ///
+    /// The connection's task is dropped when the close completes, once the
+    /// queued sends have drained: on mio in that event-loop iteration, on
+    /// io_uring when the Close CQE lands, usually the next. Code after
+    /// `close()` is guaranteed to run only until
+    /// its next `.await`; the task may be dropped there without another poll.
+    /// A `close()` from another task or from `on_tick` against a task parked
+    /// in an `.await` drops that task without another poll.
+    ///
+    /// Closing a socket with unread inbound bytes makes the kernel send an
+    /// RST (Linux and macOS), and bytes of the drained sends still in the
+    /// socket's send buffer are discarded, so the peer can lose the tail of
+    /// the last message. Read to EOF before closing when that matters.
     ///
     /// Does nothing if the connection has already been released (its slot may
     /// now hold another connection), or when called outside the worker's
@@ -3783,6 +3799,11 @@ enum BackpressuredState {
 /// the FIFO; it is released when it reaches the head *and* the pool can cover
 /// that cost. Admission is strictly first-come-first-served per worker, so a
 /// large message cannot be starved by a stream of small ones.
+///
+/// The entry at the head submits only when its task polls the future, so a
+/// head entry whose task is woken but does not poll holds every bounded send
+/// on the worker behind it. Poll or drop the future promptly; dropping it
+/// hands the head to the next waiter.
 ///
 /// A message that could never fit the pool — even empty — is rejected with
 /// [`io::ErrorKind::InvalidInput`] before it joins the queue, because no

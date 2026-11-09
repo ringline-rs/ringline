@@ -734,7 +734,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Close `conn_index` because the runtime cannot go on with it — a write
-    /// failed, or a receive ran past `recv_accumulator_max` — and report
+    /// failed, a receive ran past `recv_accumulator_max`, or the TLS engine
+    /// rejected a received record — and report
     /// `err` to a reader parked on `with_data_result`, as a failed socket
     /// read is reported. `read` is set first, so the close reads as a
     /// failure and not as the peer's close.
@@ -983,8 +984,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             }
                         }
                     }
-                    crate::tls::TlsRecvResult::Error(e) => {
-                        // Wake connect waiter if handshake hasn't completed yet.
+                    crate::tls::TlsRecvResult::Error(err) => {
                         let established = self
                             .driver
                             .connections
@@ -992,11 +992,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             .map(|c| c.established)
                             .unwrap_or(false);
                         if !established {
-                            let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, e);
+                            // No task reads yet: an outbound connect takes the
+                            // failure; a failed inbound handshake has nobody to
+                            // tell.
+                            let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, err);
                             self.executor.wake_connect(conn_index, Err(err));
+                            self.driver.close_connection(conn_index);
+                        } else {
+                            self.abort_connection(conn_index, err);
                         }
-                        self.executor.wake_recv(conn_index);
-                        self.driver.close_connection(conn_index);
                         break;
                     }
                     crate::tls::TlsRecvResult::Closed => {
@@ -1062,9 +1066,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                             // Streamed past recv_accumulator_max. The bytes were
                             // already read off the socket, so the stream cannot
                             // continue coherently — close rather than OOM, as
-                            // the uring and mio-TLS overflow paths do (the TLS
-                            // one through a record-layer error, with no error
-                            // recorded for the reader).
+                            // the uring and TLS overflow paths do.
                             self.abort_connection(
                                 conn_index,
                                 crate::accumulator::recv_cap_exceeded(),

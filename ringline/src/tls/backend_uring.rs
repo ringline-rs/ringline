@@ -123,8 +123,8 @@ fn finish_unbuffered_feed(
     out_sends: &mut Vec<BuiltSend>,
 ) -> TlsRecvResult {
     if !ciphertext_to_sends(send_copy_pool, conn_index, generation, scratch, out_sends) {
-        return TlsRecvResult::Error(ringline_tls::Error::General(
-            "send pool exhausted during TLS output flush".into(),
+        return TlsRecvResult::Error(io::Error::other(
+            "send pool exhausted during TLS output flush",
         ));
     }
     match outcome {
@@ -133,7 +133,10 @@ fn finish_unbuffered_feed(
             peer_closed: peer_sent_close_notify,
         },
         unbuffered::DriveOutcome::Closed => TlsRecvResult::Closed,
-        unbuffered::DriveOutcome::Error(e) => TlsRecvResult::Error(e),
+        unbuffered::DriveOutcome::Error(e) => TlsRecvResult::Error(super::record_layer_error(e)),
+        unbuffered::DriveOutcome::Overflow => {
+            TlsRecvResult::Error(crate::accumulator::recv_cap_exceeded())
+        }
     }
 }
 
@@ -330,9 +333,10 @@ pub fn flush_tls_output(
         // No ciphertext to add: driving an idle machine is what emits the
         // ClientHello (`EncodeTlsData` with an empty incoming buffer). `feed`
         // treats an empty slice as a deliberate flush for exactly this.
-        if let unbuffered::DriveOutcome::Error(_) =
-            unbuffered::feed(tls_conn, None, &mut scratch, &[], conn_index)
-        {
+        if matches!(
+            unbuffered::feed(tls_conn, None, &mut scratch, &[], conn_index),
+            unbuffered::DriveOutcome::Error(_) | unbuffered::DriveOutcome::Overflow
+        ) {
             return false;
         }
         ciphertext_to_sends(send_copy_pool, conn_index, generation, &scratch, out_sends)
