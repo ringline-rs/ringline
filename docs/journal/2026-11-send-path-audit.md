@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send path
 
-- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; L2 and L10 closed by later PRs (#794, the L10 PR); the design limitations L1, L3 to L9 stand
-- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, docs #788, F10 #789, F6 and F11 this PR
+- **Status:** closed — 14 findings recorded; F1 to F5, F7, F9, F12, F13 and F14 fixed; F6, F8, F10 and F11 fixed on the owner's decision in their own PRs; L2 (#794), L5 (#792) and L10 (#797) closed by later PRs; the design limitations L1, L3, L4 and L6 to L9 stand
+- **Span:** 2026-11-07 → 2026-11-08 · tree 6ea67e6c (`main`) · PRs: F1 #773, F2 #775, F3 #777, F4 #781, F5 #782, F7 #784, F13 #786, F8 #787, F9, F12 and F14 (docs) #788, F10 #789, F6 and F11 #790, L5 #792, L2 #794, L10 #797
 
 ## Goal
 
@@ -1071,7 +1071,7 @@ with #781 and is left as written.
   a TLS chunk or TLS run error closes; mio closes on any write error. The
   same peer RST therefore gives a different connection lifecycle per send
   kind and per backend (table in review C). F7 is one consequence. Closed
-  after this record: the connection-close audit's F13 fix makes every
+  after this record (#794): the connection-close audit's F13 fix makes every
   io_uring send-failure arm close the connection and report the error to
   the reader, as mio does.
 - **L3** `handle_send_msg_zc` with `-EAGAIN` or `-ENOMEM` after
@@ -1129,7 +1129,7 @@ for the owner. Reopened by: a hang, or a `ConnectionAborted` for delivered
 bytes, in a task that awaits a `SendFuture` it did not create, after
 awaiting something else first.
 
-Closed after this record (the L10 PR): the table no longer infers a
+Closed after this record (#797): the table no longer infers a
 future's death from its owner's. `remove_task` and `remove_connection`
 re-own the entries a dead task still holds to `NO_OWNER` and leave their
 state; the connection task is dropped under the driver state at the release
