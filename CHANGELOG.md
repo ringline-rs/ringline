@@ -68,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `metrics::park_abandon::RECEIVE_ARMED` (14, `op=receive_armed` on
   `ringline/park_abandoned`): a park whose install found a receive, hangup
   poll or hangup peek armed.
+- `metrics::conn::SHUTDOWN_FAILED` (8, `op=shutdown_failed` on
+  `ringline/connections`): a `shutdown_write` whose `shutdown(SHUT_WR)` the
+  socket refused, usually `ENOTCONN` on a socket already in `TCP_CLOSE`
+  after a reset or a retransmission timeout.
 - `yield_now()` wakes the calling task and returns `Pending` once, so a task
   that makes many `send_nowait` calls without awaiting anything lets the
   worker poll its other queued tasks and process I/O between batches. Callers
@@ -749,14 +753,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a read error requests teardown immediately (`close_connection`), and
   teardown finalizes once queued sends have drained — a response sent after
   the peer's FIN is delivered in full — after which the connection task is
-  dropped. (io_uring itself commits the Close before the task can respond
-  when nothing was queued at the FIN; tracked as #371.) Previously a mio task could keep running indefinitely after
-  EOF. `RecvMode::Closed` is now set only by `close_connection` on both
-  backends. The deferral is unbounded on mio. Design: `docs/mio-close-lifecycle-design.md`.
+  dropped. Previously a mio task could keep running indefinitely after
+  EOF. `Lifecycle::Closing` is entered only through `close_connection` and
+  the `DriverCtx` close on both backends. The deferral is unbounded on mio. Design: `docs/mio-close-lifecycle-design.md`.
 
-- Internal: connection lifecycle state is now three explicit fields on
-  `ConnectionState` (`recv_arm`, `read`, `lifecycle`) instead of
-  `RecvMode` doing triple duty; readers use `recv_finished()` and
+- Internal: connection lifecycle state is now explicit fields on
+  `ConnectionState` (`read`, `lifecycle` and `write`; a `recv_arm` field was
+  removed with the TCP provided-buffer ring, #716) instead of `RecvMode`
+  doing triple duty; readers use `recv_finished()` and
   `close_requested()`. No observable change. Design:
   `docs/connection-state-model-design.md`.
 
@@ -908,6 +912,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `shutdown_write` whose `shutdown(SHUT_WR)` the socket refuses is now
+  counted, in `connections{op="shutdown_failed"}`, on both backends. On
+  io_uring the Shutdown CQE's result was dropped at dispatch; on mio the
+  call's result was discarded. Nothing else changes: the socket is already
+  closed. Audit finding F12 of
+  `docs/journal/2026-11-connection-close-audit.md`.
+
+- io_uring, TLS: a forced close now runs once. When the close_notify
+  deadline fires while a `Shutdown` is still in the kernel,
+  `force_finalize_close` abandons the queue and `try_finalize_close` waits
+  for the Shutdown CQE; the deadline stayed armed, so the force ran again on
+  every tick until then, each run reporting send capacity it had not
+  released. The force now disarms the deadline, and the Shutdown CQE commits
+  the Close. `fail_send_ids` reports released send capacity only when the
+  queue it drained had entries, so reactivating a slot with an empty queue
+  reports none. Audit finding F11 of
+  `docs/journal/2026-11-connection-close-audit.md`.
+
+- A `SendFuture` handed to another task resolves with the send's own result
+  however late that task first polls it. The creating connection task's
+  return, and its connection's release, treated every completion-table
+  entry the task owned as dead with the task, so an entry whose future was
+  alive in another task was abandoned or freed; if the send completed
+  before that task's first poll, the completion freed the entry and the
+  poll found nothing, resolving `ConnectionAborted` for bytes the peer
+  received, or parking forever when it ran before the slot's release. An
+  entry now leaves the table only through its future's drop: a connection
+  task is dropped with the driver state installed at its connection's
+  release too (`with_driver_state`), so its own futures cancel their
+  entries, and an entry the dead task still owns is kept, without an owner
+  until the next poll records one. The shape is `let fut = tx.send(..)?;
+  spawn(async move { other.await; fut.await })` from `on_accept`, then
+  returning, on either backend. Found by the send-path audit
+  (`docs/journal/2026-11-send-path-audit.md`, L10).
 - io_uring: a send that fails (`EPIPE`, `ECONNRESET`, a resubmit the ring
   refused twice) closes the connection and reports the error to a reader
   parked on `with_data_result`, as mio does for an established connection.
@@ -1720,8 +1758,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - mio: while queued sends drained to a peer that had half-closed, the event
   loop re-registered READABLE interest on every iteration, which re-reported
   the peer's EOF and spun the worker at 100% CPU until the peer read.
-  Interest is WRITABLE-only once the receive side is closed, and a closed
-  receive side is no longer read. (found while fixing #368)
+  Interest is registered once, as READABLE|WRITABLE, and never modified
+  (#395), and a closed receive side is no longer read. (found while fixing
+  #368)
 - io_uring: a response sent after the peer's FIN was never delivered when
   the send queue was empty at the FIN — `close_connection` committed the
   Close SQE synchronously, before the task was polled, so the task's send

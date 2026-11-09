@@ -66,10 +66,8 @@ pub(crate) struct ConnSendState {
     /// `Shutdown` names its socket as the *registered-file slot*
     /// `Fixed(conn_index)`, not as an fd, so it must not execute after that slot
     /// has been closed and handed to the next accept — the kernel would FIN
-    /// whoever now holds the slot, half-closing a live connection whose next
-    /// send then fails `EPIPE` (#518). Nothing pinned it before: a `Shutdown` is
-    /// not a queued send, so `try_finalize_close` could not see it, and its
-    /// completion was discarded (`OpTag::Shutdown => {}`). Set when the FIN is
+    /// the connection that now holds the slot, half-closing a live connection
+    /// whose next send then fails `EPIPE` (#518). Set when the FIN is
     /// requested, before the push, so it also covers an SQE parked on
     /// `Driver::pending_shutdown_retries`; cleared by its CQE, and required by
     /// `try_finalize_close` before the `Close` that frees the slot may be
@@ -2900,7 +2898,7 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Close a connection. Marks it Closed and defers teardown (socket,
+    /// Close a connection. Marks it `Closing` and defers teardown (socket,
     /// buffers, executor cleanup, slot release) to the event loop's
     /// drain_pending_closes — releasing the slot here left the executor's
     /// parked future and waiter flags alive into the slot's next occupant.
@@ -2952,13 +2950,15 @@ impl<'a> DriverCtx<'a> {
         }
         if self.pending_sends[idx].is_empty() {
             cs.write = crate::connection::WriteHalf::Shutdown;
-            if let Some(stream) = self.tcp_streams[idx].as_mut() {
-                let _ = stream.shutdown(std::net::Shutdown::Write);
+            if let Some(stream) = self.tcp_streams[idx].as_mut()
+                && stream.shutdown(std::net::Shutdown::Write).is_err()
+            {
+                crate::metrics::CONNECTIONS.increment(crate::metrics::conn::SHUTDOWN_FAILED);
             }
         } else {
             // Defer the FIN until flush_sends drains the queue. Dirty the
-            // queue so the flush pass registers writable interest; the
-            // event that drains it issues the shutdown.
+            // queue so the flush pass visits it; the write that drains it
+            // issues the shutdown.
             cs.write = crate::connection::WriteHalf::ShutdownPending;
             self.mark_send_dirty(idx);
         }

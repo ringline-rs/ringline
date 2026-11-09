@@ -638,9 +638,8 @@ impl Driver {
     /// deregistration, buffer cleanup, and slot release. Called by the
     /// event loop after `Executor::remove_connection`.
     ///
-    /// The flush is a single nonblocking attempt — the previous behavior
-    /// flipped the fd to blocking and `write_all`'d, which let one
-    /// zero-window peer stall the entire worker indefinitely.
+    /// The flush is a single nonblocking attempt: a blocking write here
+    /// would let one zero-window peer stall the worker.
     pub(crate) fn finish_close(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
@@ -955,23 +954,19 @@ impl Driver {
             && matches!(cs.write, WriteHalf::ShutdownPending)
         {
             cs.write = WriteHalf::Shutdown;
-            if let Some(stream) = self.tcp_streams[idx].as_mut() {
-                let _ = stream.shutdown(std::net::Shutdown::Write);
+            if let Some(stream) = self.tcp_streams[idx].as_mut()
+                && stream.shutdown(std::net::Shutdown::Write).is_err()
+            {
+                crate::metrics::CONNECTIONS.increment(crate::metrics::conn::SHUTDOWN_FAILED);
             }
         }
 
-        // All sends flushed. Switch back to read-only interest — unless the
-        // receive side is already closed (peer FIN, read error, or a
-        // requested close), in which case re-adding READABLE would just
-        // No re-arm here any more. Interest is registered once, as
+        // All sends flushed. Interest is registered once, as
         // READABLE|WRITABLE, and never modified: dropping WRITABLE after each
         // drain and re-adding it on the next send cost two `epoll_ctl(MOD)`
-        // per operation, because an echo workload makes that queue transition
-        // on every single request (#395).
-        //
-        // It also removes the hazard this code used to work around: it was a
-        // `reregister` that re-reported EOF on a half-closed socket and span
-        // the loop at 100% CPU. Not re-registering cannot re-report anything.
+        // per operation on an echo workload (#395), and a `reregister` here
+        // re-reported EOF on a half-closed socket and spun the loop at 100%
+        // CPU.
         Ok((true, total_written))
     }
 }
@@ -1623,6 +1618,47 @@ pub(crate) mod tests {
         let mut buf = vec![0u8; 200];
         client.read_exact(&mut buf).expect("read the whole message");
         assert!(buf.iter().all(|&b| b == b'a'));
+    }
+
+    /// A `shutdown_write` whose `shutdown(SHUT_WR)` the socket refuses is
+    /// counted under `shutdown_failed`, and the write half still reads
+    /// `Shutdown`. The socket was never connected, which `shutdown(2)`
+    /// refuses with `ENOTCONN` on Linux and macOS.
+    #[test]
+    fn a_refused_shutdown_is_counted() {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .build()
+            .expect("valid test config");
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, _client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = ConnId::new(conn_index, driver.connections.generation(conn_index));
+        let unconnected = {
+            use std::os::fd::FromRawFd;
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            assert!(fd >= 0, "socket");
+            // SAFETY: a fresh fd this test owns and nothing else holds.
+            unsafe { std::net::TcpStream::from_raw_fd(fd) }
+        };
+        driver.tcp_streams[idx] = Some(mio::net::TcpStream::from_std(unconnected));
+        let count = || {
+            crate::metrics::CONNECTIONS
+                .value(crate::metrics::conn::SHUTDOWN_FAILED)
+                .unwrap_or(0)
+        };
+
+        let before = count();
+        driver.make_ctx().shutdown_write(conn);
+
+        assert!(count() > before, "the refused shutdown was not counted");
+        assert_eq!(
+            driver.connections.get(conn_index).map(|c| c.write),
+            Some(WriteHalf::Shutdown),
+            "the write half does not record the request"
+        );
     }
 
     /// A message split across flushes keeps its id and its permit until the

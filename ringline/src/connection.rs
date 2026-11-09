@@ -67,9 +67,12 @@ pub enum WriteHalf {
     /// or, on io_uring, while a send chain was active; the FIN goes out once
     /// they drain.
     ShutdownPending,
-    /// Our FIN has been issued (io_uring: Shutdown SQE submitted, or parked
-    /// on `pending_shutdown_retries` when the submission queue refused it;
-    /// mio: `shutdown(Write)` called). `send_backpressured` refuses with
+    /// Our FIN has been requested (io_uring: Shutdown SQE submitted, or
+    /// parked on `pending_shutdown_retries` when the submission queue refused
+    /// it; mio: `shutdown(Write)` called). A request the socket refuses,
+    /// `ENOTCONN` on a socket already closed, is counted in
+    /// `connections{op="shutdown_failed"}` and leaves this state as it is.
+    /// `send_backpressured` refuses with
     /// `BrokenPipe` in this state and in `ShutdownPending`; `send`,
     /// `send_nowait` and `send_parts` are accepted: after an accepted Shutdown
     /// they fail at the socket (`EPIPE`), which closes the connection and
@@ -104,7 +107,9 @@ pub struct ConnectionState {
     /// Whether this is an outbound (connect) connection.
     pub outbound: bool,
     /// Whether the connection has been fully established (TCP+TLS handshake done).
-    /// `on_close` is only fired when `established == true`.
+    /// `conn::CLOSED` and `CONNECTIONS_ACTIVE` move at teardown only when this
+    /// is set, on both backends; a receive error before it is set also fails
+    /// the connect waiter.
     pub established: bool,
     /// Peer address (set on accept or connect).
     pub peer_addr: Option<PeerAddr>,

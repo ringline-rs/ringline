@@ -400,7 +400,7 @@ impl Driver {
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
 ///
-/// # Drop order (load-bearing)
+/// # Drop order
 ///
 /// `ring` MUST be declared first so it drops *last*. `ProvidedBufRing` and
 /// `InFlightSendSlab` reference kernel-pinned memory whose lifetime is tied
@@ -1295,11 +1295,8 @@ impl Driver {
     /// A previous occupant's close can leave `in_flight`/`close_pending` set:
     /// its final send CQE can arrive after the slot was released, and the
     /// CQE's identity check correctly refuses to touch the slot's state —
-    /// so nothing else clears it. (Before the identity checks, the stale
-    /// CQE's error path *was* what cleared these flags — misattributed
-    /// cleanup the next occupant accidentally depended on.) Without this
-    /// reset the next occupant's first send parks behind a completion that
-    /// will never come.
+    /// so nothing else clears it. Without this reset the next occupant's
+    /// first send parks behind a completion that will never come.
     pub(crate) fn reset_send_state(&mut self, conn_index: u32) {
         self.forwards_recv_buf[conn_index as usize] = false;
         self.forward_recv_held[conn_index as usize] = false;
@@ -1307,6 +1304,7 @@ impl Driver {
         // Queued-but-unsubmitted sends from the previous occupant hold
         // pool/slab resources; no SQE was submitted for them, so no CQE
         // will release them — do it here.
+        let had_queue = !state.queue.is_empty();
         let settles = Self::release_queued_sends(
             &mut state.queue,
             &mut self.send_slab,
@@ -1320,34 +1318,27 @@ impl Driver {
         // reactivated with a Shutdown still outstanding. If the gate ever leaks,
         // the next occupant must not inherit the block.
         state.shutdown_inflight = false;
-        state.close_notify_deadline = None;
         state.close_notify_pending = None;
         state.waiting_send = None;
         state.send_poll = SendPoll::None;
         state.pollout_seen = false;
         state.resubmitted_on_pollout = false;
         state.on_send_backstop = false;
-        if let Some(pos) = self
-            .close_notify_armed
-            .iter()
-            .position(|&i| i == conn_index)
-        {
-            self.close_notify_armed.swap_remove(pos);
-        }
+        self.disarm_close_notify_deadline(conn_index);
         // A previous occupant's awaited send can still be sitting in the
         // queue here (its close abandoned the drain); the new occupant must
         // not inherit it, and its caller is still waiting.
-        self.fail_send_ids(settles);
+        self.fail_send_ids(settles, had_queue);
     }
 
     /// Clear both half flags, and the park in flight, for a slot being
     /// recycled.
     ///
-    /// `executor.remove_connection` drops a parked task's future with
-    /// `CURRENT_DRIVER` unset, so a half's `Drop` queues an orphan that finds a
-    /// changed generation and clears nothing. A flag can therefore outlive its
-    /// half, and since the flags are indexed by slot rather than by generation,
-    /// the next occupant would inherit it.
+    /// A half dropped with the task at `handle_close` clears its own flag
+    /// (`release_half`, under `with_driver_state`). An occupant that died
+    /// without dropping a half, one whose `on_accept` panicked while building
+    /// the future, leaves its flags set, and since the flags are indexed by
+    /// slot rather than by generation, the next occupant would inherit them.
     ///
     /// Clearing here, at the recycle point, makes that impossible regardless of
     /// how the previous occupant died.
@@ -1396,6 +1387,15 @@ impl Driver {
         *slot = drain;
     }
 
+    /// Request the close of `conn_index`: mark it `Closing`, set
+    /// `close_pending`, and leave its send queue to drain through
+    /// `submit_next_queued`. The send handlers register the connection for
+    /// the end-of-iteration drain (`defer_finalize_close`); with nothing
+    /// queued or in flight, this method registers it itself. The drain's
+    /// `try_finalize_close` commits the Close once no send, chain or
+    /// `Shutdown` is outstanding. Park state is released here, since a slot
+    /// that is never reused would hold a `ParkState` for the life of the
+    /// process.
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         if let Some(conn) = self.connections.get_mut(conn_index) {
             if conn.close_requested() {
@@ -1413,35 +1413,15 @@ impl Driver {
         self.set_park_drain(conn_index, None);
         self.park_carry.remove(&conn_index);
         self.adopt_pending.remove(&conn_index);
-        // An active chain keeps its state: its SQEs are already in the kernel
-        // and their CQEs drive the chain accounting to completion (an error
-        // in one linked op cancels the rest — still CQEs). `close_pending`
-        // is set below and `try_finalize_close` defers the Close until the
-        // chain drains, so the Close cannot recycle the slot while chain
-        // CQEs are outstanding. (An earlier version called
-        // `chain_table.cancel` here, which *dropped* the accounting and let
-        // the Close race the still-in-flight chain sends.)
-        // Defer the actual `Close` SQE until every queued send has
-        // drained through the regular `submit_next_queued` cycle and
-        // its CQE has been handled. Two earlier mistakes are worth
-        // calling out:
-        //
-        //   (a) The original code called `drain_conn_send_queue`,
-        //       which freed slab/pool resources for queued sends
-        //       *without ever submitting them* — silently dropping
-        //       every byte queued behind the in-flight send.
-        //
-        //   (b) An interim attempt pushed all queued SQEs in parallel
-        //       at close time, but io_uring doesn't strictly order
-        //       independent SQEs, so the kernel could process them
-        //       out of order and scramble the byte stream. (Visible
-        //       in release mode where the SQEs land close together.)
-        //
-        // The current strategy preserves the queue's serialized
-        // drain: leave in_flight + queue alone, mark `close_pending`,
-        // and let the send handlers register the connection for the
-        // end-of-iteration drain (`defer_finalize_close`) once both
-        // `in_flight` is false and the queue is empty.
+        // An active chain keeps its state: its SQEs are in the kernel and
+        // their CQEs drive the chain accounting (an error in one linked op
+        // cancels the rest, still with CQEs); `try_finalize_close` waits for
+        // it, so the Close cannot recycle the slot under them. Cancelling
+        // the chain here would drop that accounting.
+        // The queue is neither released nor submitted here: entries not yet
+        // submitted carry bytes the peer is owed, and io_uring does not
+        // order independent SQEs (Domain Invariant 2), so they go out one
+        // at a time through `submit_next_queued`.
         let state = &mut self.send_queues[conn_index as usize];
         state.close_pending = true;
         if state.in_flight {
@@ -1451,7 +1431,8 @@ impl Driver {
         // Nothing in-flight but queue has items — start the serialized drain:
         // submit only the queue head (submit_next_queued coalesces a safe
         // run) and let each CQE pull the next entry. Pushing the whole queue
-        // as parallel SQEs here would repeat "mistake (b)" above.
+        // as parallel SQEs here would let the kernel reorder them (Domain
+        // Invariant 2).
         if !state.queue.is_empty() {
             state.in_flight = true;
             // A `false` here means the head was parked (SQ still full):
@@ -1692,6 +1673,20 @@ impl Driver {
         }
     }
 
+    /// Disarm `conn_index`'s close_notify deadline: clear it and take the
+    /// connection off `close_notify_armed`. `swap_remove` is O(n) over a set
+    /// bounded by the concurrent TLS shutdowns.
+    pub(crate) fn disarm_close_notify_deadline(&mut self, conn_index: u32) {
+        self.send_queues[conn_index as usize].close_notify_deadline = None;
+        if let Some(pos) = self
+            .close_notify_armed
+            .iter()
+            .position(|&i| i == conn_index)
+        {
+            self.close_notify_armed.swap_remove(pos);
+        }
+    }
+
     /// Submit the deferred `Close` SQE once every pending send, send chain and
     /// `Shutdown` for this connection has finished.
     ///
@@ -1731,19 +1726,7 @@ impl Driver {
         // retry): late CQEs must not push new SQEs for this connection.
         st.close_submitted = true;
         // Clear the deadline so the slot's next occupant doesn't inherit it.
-        st.close_notify_deadline = None;
-        // Disarm from the close_notify deadline set. swap_remove is
-        // O(n) but the set is bounded by concurrent TLS shutdowns
-        // (typically 0 or single digits) — well below the cost we just
-        // saved by not walking every connection slot in the deadline
-        // check.
-        if let Some(pos) = self
-            .close_notify_armed
-            .iter()
-            .position(|&i| i == conn_index)
-        {
-            self.close_notify_armed.swap_remove(pos);
-        }
+        self.disarm_close_notify_deadline(conn_index);
         if self.submit_committed_close(conn_index).is_err() {
             crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
             // Queue this connection for retry on a later tick. (An earlier
@@ -1800,8 +1783,10 @@ impl Driver {
     /// waiting for room has only its poll in the kernel: `try_finalize_close`
     /// cancels that, and the poll's CQE or `handle_close` fails the send. A
     /// `Shutdown` in the kernel, or parked on `pending_shutdown_retries`,
-    /// still holds the Close until its CQE lands, so the deadline check
-    /// calls this again on each tick until then.
+    /// still holds the Close until its CQE lands; `handle_shutdown` then
+    /// registers the connection for the end-of-iteration drain, which
+    /// commits it. The deadline is disarmed here, so this runs once per
+    /// close.
     pub(crate) fn force_finalize_close(&mut self, conn_index: u32) {
         // The drain is stuck, so a retained alert would stall the same way:
         // drop it with the queued sends.
@@ -1813,6 +1798,7 @@ impl Driver {
             self.drop_retained_close_notify_flag(conn_index);
         }
         let state = &mut self.send_queues[conn_index as usize];
+        let had_queue = !state.queue.is_empty();
         let settles = Self::release_queued_sends(
             &mut state.queue,
             &mut self.send_slab,
@@ -1832,10 +1818,14 @@ impl Driver {
         {
             cs.write = WriteHalf::Open;
         }
-        self.fail_send_ids(settles);
+        self.fail_send_ids(settles, had_queue);
+        // The chain's slots come back with its CQEs, which report them.
         if let Some(id) = self.chain_table.cancel(conn_index) {
-            self.fail_send_ids(vec![id]);
+            self.fail_send_ids(vec![id], false);
         }
+        // Disarm whether or not the Close commits now: the queue is
+        // abandoned, and if a `Shutdown` holds the Close its CQE commits it.
+        self.disarm_close_notify_deadline(conn_index);
         self.try_finalize_close(conn_index);
     }
 
@@ -2095,6 +2085,7 @@ impl Driver {
     /// Drain and release all queued sends for a connection.
     pub(crate) fn drain_conn_send_queue(&mut self, conn_index: u32) {
         let state = &mut self.send_queues[conn_index as usize];
+        let had_queue = !state.queue.is_empty();
         let settles = Self::release_queued_sends(
             &mut state.queue,
             &mut self.send_slab,
@@ -2103,7 +2094,7 @@ impl Driver {
         state.in_flight = false;
         state.parked = false;
         // Fail the awaited sends the drained entries carried.
-        self.fail_send_ids(settles);
+        self.fail_send_ids(settles, had_queue);
         // The queue is now empty and nothing is in flight: register a
         // deferred close, if one is pending, for the end-of-iteration drain,
         // so the connection does not leak. Worker exit clears
@@ -2164,13 +2155,17 @@ impl Driver {
         ids
     }
 
-    /// Record every send in `ids` as aborted, and note that the slots they
-    /// were holding went back to the pool.
+    /// Record every send in `ids` as aborted and, when `released_capacity`,
+    /// note that slots went back to the pool.
     ///
-    /// The tail of each `release_queued_sends` call site. `ConnectionAborted`
-    /// is the failure every teardown reports: the send was accepted, never
-    /// reached the wire, and its connection is going away.
-    fn fail_send_ids(&mut self, ids: Vec<SendId>) {
+    /// The tail of each `release_queued_sends` call site, which passes
+    /// whether the queue had entries: an unawaited entry holds a slot and
+    /// carries no id, so an empty `ids` does not mean no slot was released.
+    /// A queue of guard-only zero-copy entries sets the flag without
+    /// returning a pool slot. `ConnectionAborted` is the failure every
+    /// teardown reports: the send was accepted, never reached the wire, and
+    /// its connection is going away.
+    fn fail_send_ids(&mut self, ids: Vec<SendId>, released_capacity: bool) {
         for id in ids {
             self.settled_sends.push_back((
                 id,
@@ -2180,10 +2175,9 @@ impl Driver {
                 )),
             ));
         }
-        // Unconditional: the queue held slots whenever it was non-empty, and
-        // a spurious wake costs one `free_count()` read at the end of the
-        // loop iteration.
-        self.capacity_released = true;
+        if released_capacity {
+            self.capacity_released = true;
+        }
     }
 
     /// Release pool slot and/or slab entry for a single BuiltSend.

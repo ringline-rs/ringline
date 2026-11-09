@@ -12,7 +12,7 @@ use metriken::{Gauge, ShardedCounterGroup, metric};
     name = "ringline/connections",
     description = "Connection lifecycle counters"
 )]
-pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(8);
+pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(9);
 
 #[metric(name = "ringline/bytes", description = "Byte transfer counters")]
 pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
@@ -69,7 +69,9 @@ pub static RECV_ARRIVAL: ShardedCounterGroup = ShardedCounterGroup::new(recv_arr
 /// or handshake moves it neither way. Same rule on both backends. A
 /// connection still open when its worker exits is decremented as the worker
 /// closes it; on io_uring a connection whose Close has not completed when
-/// the worker's 10 s shutdown bound runs out (#607) is not. A parked
+/// the worker's 10 s shutdown bound runs out is not: one holding a zero-copy
+/// entry whose notification has not landed (#607), or one whose Close the
+/// ring refused on every pass of the exit drain (#787). A parked
 /// connection is decremented on the worker it leaves and incremented again
 /// on the worker that adopts it.
 #[metric(
@@ -123,6 +125,13 @@ pub mod conn {
     /// a wait that does not end counts 10 per second. While it waits,
     /// connections stay in the kernel's listen queue.
     pub const ACCEPT_QUEUE_FULL: usize = 7;
+    /// A `shutdown_write` whose `shutdown(SHUT_WR)` failed at the socket:
+    /// the Shutdown SQE's CQE on io_uring, the call's result on mio. Usually
+    /// `ENOTCONN`: the socket is already in `TCP_CLOSE`, after a reset or a
+    /// retransmission timeout.
+    /// Nothing else changes: the write half stays `Shutdown`, and on
+    /// io_uring the Close it held goes ahead.
+    pub const SHUTDOWN_FAILED: usize = 8;
 }
 
 /// Completions processed, split by `OpTag`.
@@ -458,6 +467,7 @@ pub fn init_metadata() {
         "op".into(),
         "accept_queue_full".into(),
     );
+    CONNECTIONS.insert_metadata(conn::SHUTDOWN_FAILED, "op".into(), "shutdown_failed".into());
 
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_100, "op".into(), "lt_100us".into());
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_250, "op".into(), "lt_250us".into());
@@ -617,6 +627,7 @@ mod tests {
             conn::ACCEPT_TABLE_FULL,
             conn::ACCEPT_REGISTER_FAILED,
             conn::ACCEPT_QUEUE_FULL,
+            conn::SHUTDOWN_FAILED,
         ] {
             assert!(
                 CONNECTIONS.increment(idx),

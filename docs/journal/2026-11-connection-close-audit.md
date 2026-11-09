@@ -1,7 +1,7 @@
 # 2026-11: Audit of the connection lifecycle and close path
 
-- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791) and F13 (this PR) fixed; the rest recorded, unfixed
-- **Span:** 2026-11-07 · tree a2e28073 (`main`) · PR: `fix/connection-metrics-outbound` (this one)
+- **Status:** open — F1 (#771), F2 and F3 (#767), F4 and F5 (#774), F6 (#769), F7 (#776), F8 (#779), F9 (#768), F10 (#791), F11 (#792), F12 (#793), F13 (#794) and F14 (#798) fixed; every finding fixed, the seven design limitations recorded
+- **Span:** 2026-11-07 → 2026-11-08 · tree a2e28073 (`main`) · PRs: F2 and F3 #767, F9 #768, F6 #769, F1 #771, F4 and F5 #774, F7 #776, F8 #779, F10 #791, F11 #792, F12 #793, F13 #794, F14 #798
 
 ## Goal
 
@@ -325,7 +325,9 @@ outside the event loop.
 
 ### F8 — worker exit leaves `CONNECTIONS_ACTIVE` inflated and abandons mio closing connections (invariants 15, 3). Traced.
 
-io_uring `run_shutdown`'s Close arm (`uring/driver.rs:2605-2610`) releases
+The `OpTag::Close` arm of io_uring's `handle_shutdown_cqe`
+(`uring/driver.rs:2605-2610`), which `run_shutdown` runs for each CQE of its
+drain, releases
 TLS state, claims and the slot without decrementing the gauge. mio `run()`
 returns; `worker.rs:1235-1245` drops tasks and the event loop, so streams
 close on drop: no `finish_close`, no `CLOSED`, no decrement, queued bytes
@@ -337,8 +339,8 @@ Fix: decrement per established connection on both exit paths; document the
 mio abandonment or run one bounded `drain_pending_closes` pass before
 returning.
 
-Disposition: fixed in #779: the io_uring `run_shutdown`
-Close arm and a mio `count_out_open_connections`, run at `run`'s shutdown
+Disposition: fixed in #779: the `OpTag::Close` arm of io_uring's
+`handle_shutdown_cqe` and a mio `count_out_open_connections`, run at `run`'s shutdown
 return and in `drain_after_failure`, count each established connection into
 `CLOSED` and out of `CONNECTIONS_ACTIVE`, as `handle_close` and `finish_close`
 do. The mio abandonment is documented rather than replaced by a drain pass:
@@ -351,8 +353,10 @@ verified by `experiments/exit-closes-count-down-verify.toml` (SystemsLab
 experiment `01a1bc48-5b3e-718d-e469-71f2b93528e2`, Debian 13, Linux 6.12): 0
 passed, 1 failed at 0ef26fb2, 1 passed at the branch head 4ba14ccf, and the
 uring gate (fmt, clippy on three builds, rustdoc, `cargo test --all`) passes. A
-connection `run_shutdown` never closes (a zero-copy entry whose notification
-does not arrive within the 10 s bound, #607) is not counted out.
+connection whose Close has not completed when `run_shutdown`'s 10 s bound
+runs out is not counted out: one holding a zero-copy entry whose
+notification does not arrive (#607), or one whose Close the ring refused on
+every pass (#787).
 
 ### F9 — mio: a close raised inside the step-6a/8 flush or `drain_forward_resumes` with only unawaited sends queued drops the task unpolled (invariant 5). Plausible.
 
@@ -406,13 +410,29 @@ for the rest of the process.
 ### F11 — `check_close_notify_deadlines` re-runs `force_finalize_close` every tick while the finalize is blocked; `fail_send_ids` sets `capacity_released` unconditionally (invariant 18). Traced, low.
 
 `uring/event_loop.rs:4753-4790`, `uring/driver.rs:2020-2034`. One spurious
-`wake_send_capacity` per tick until the Shutdown or chain CQE lands.
+`wake_send_capacity` per tick until the Shutdown CQE lands (the force
+cancels a chain, so only a Shutdown holds the commit).
 
 Fix: skip the force while `shutdown_inflight` or a chain is active; clear
 the deadline in `force_finalize_close`; set `capacity_released` only when
 `ids` is non-empty.
 
-Disposition: open.
+Disposition: fixed in #792, by the
+deadline clear alone: `force_finalize_close` disarms the deadline before
+it calls `try_finalize_close`, so it runs once per close, and
+`handle_shutdown`'s `defer_finalize_close` commits the Close when the
+Shutdown CQE lands (`drain_shutdown_retries` keeps a parked Shutdown
+until its push succeeds, so the CQE comes). No skip is needed: with the
+deadline disarmed there is no second call to skip. The `capacity_released`
+part as proposed would have been wrong: an unawaited send holds a pool
+slot and carries no `SendId`, so an empty `ids` does not mean nothing was
+released. `fail_send_ids` now takes whether the drained queue had
+entries, from each caller. Tests:
+`a_forced_close_blocked_on_a_shutdown_runs_once` (the deadline is
+disarmed by the force, a second tick reports no capacity, the Shutdown
+CQE commits the Close), `resetting_an_empty_send_queue_releases_no_capacity`,
+and the control `a_forced_close_abandoning_an_unawaited_send_releases_capacity`,
+which passes before and after.
 
 ### F12 — `handle_shutdown` ignores the Shutdown result; `WriteHalf::Shutdown` doc says "Our FIN has been issued" (invariant 13, docs). Traced, low.
 
@@ -420,7 +440,18 @@ Disposition: open.
 After `-ENOTCONN` the write half still reads `Shutdown`. Doc fix ("requested")
 or record the failure.
 
-Disposition: open.
+Disposition: fixed in #793, by both changes the
+finding offered: the
+`WriteHalf::Shutdown` doc says the FIN has been requested, and a
+`shutdown(SHUT_WR)` the socket refuses is counted in
+`connections{op="shutdown_failed"}` on both backends (`handle_shutdown`
+now takes the CQE result; mio's two `shutdown(Write)` calls check theirs).
+The write half stays `Shutdown`: the refusal means the socket is already
+closed, so sends fail at the socket either way, and on io_uring the Close
+the Shutdown held goes ahead. `a_failed_shutdown_is_counted_and_releases_the_close`
+dispatches a Shutdown CQE with `-ENOTCONN`; `a_refused_shutdown_is_counted`
+(mio) calls `shutdown_write` on a socket that was never connected, which
+`shutdown(2)` refuses with `ENOTCONN` on Linux and macOS.
 
 ### F13 — `handle_send`'s terminal error arm drains the queue and fails the awaited send but does not close the connection or record a read error (invariants 11, 12). Confirmed by reading; consequence unassessed.
 
@@ -450,7 +481,7 @@ reading of the mechanism is that the failed send takes the socket's pending
 error and its CQE reports it, and the receive that follows then reports a
 plain EOF; not traced in a run. #769 runs its write-error test on mio only.
 
-Disposition: fixed (this PR). Every send-failure arm on io_uring
+Disposition: fixed in #794. Every send-failure arm on io_uring
 (`handle_send`, `handle_send_msg_zc`, `handle_send_msg_coalesced` for a
 plaintext or TLS run, `handle_tls_send`, `fire_chain_complete`, and the
 three retry give-up arms) runs `AsyncEventLoop::abort_connection`, the
@@ -538,7 +569,30 @@ Style: "load-bearing" at `uring/driver.rs:376`, `mio/event_loop.rs:1112`
 design.md`, `ktls-design.md`, three journal entries); personification at
 `handler.rs:68`.
 
-Disposition: open.
+Disposition: fixed in #798, checked item by
+item against ad2c6b23. Already fixed before it: `close_send_count`, the
+`CLAUDE.md` lead sentence, the deadline check's `try_finalize_close`,
+`WriteHalf::Shutdown`'s "does not refuse later sends", the four
+`on_send_complete` comments and the io_uring `DriverCtx::close` history
+(#788); `conn::CLOSED`'s doc (#767). Still false and corrected there: the
+`on_close` sentence; the multishot cancel in `docs/recv-direct-design.md`;
+the mio design's test and TLS-table claims; the deadline check's call-site
+comment; the three "registers writable interest" sites; the four CHANGELOG
+sentences; the state-model note; "Marks it Closed"; `push_sqe_pair`; the
+truncated `flush_sends` sentence. `docs/recv-multi-identity-design.md`
+carries a superseded line. The five history paragraphs are rewritten as
+behaviour; `close_connection` gains a doc comment. "load-bearing" is
+replaced at the two code sites and in the three design docs; the dated
+journal entries keep it as records. Three of this finding's own citations
+were imprecise: the `mio/driver.rs` history is `finish_close`'s doc, nine
+lines above the cited ones; four journal entries carry "load-bearing", not
+three; and "direct file descriptor" is io_uring's own name for a fixed-file
+entry, so only the `push_sqe_pair` half of that item was false. The mio
+`DriverCtx::close` gained callers in #781, so "no mio caller" no longer
+holds. Also corrected: F8's disposition named `run_shutdown` for the arm in
+`handle_shutdown_cqe`, the gauge doc named #607 alone for a connection
+uncounted at the exit bound (#787's refused Close reaches the same state),
+and this entry's span line named a branch.
 
 ## Design limitations (questions for the owner, not fixes)
 

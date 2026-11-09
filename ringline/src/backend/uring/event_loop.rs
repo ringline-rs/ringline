@@ -557,8 +557,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_send_pollout_retries();
             self.driver.tick_count += 1;
 
-            // Check close_notify deadlines — force-close connections where
-            // close_notify was sent but the close CQE never arrived.
+            // Check close_notify deadlines: force-close a TLS connection whose
+            // close requested a close_notify and whose Close is still not
+            // committed (`close_pending`) when the deadline elapses.
             self.check_close_notify_deadlines();
 
             // Drain waker-based ready queue (from wakers fired during poll).
@@ -1658,10 +1659,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Send => self.handle_send(ud, result),
             OpTag::SendMsgZc => self.handle_send_msg_zc(ud, result, flags),
             OpTag::Close => self.handle_close(ud),
-            OpTag::Shutdown => self.handle_shutdown(ud),
-            // The `Close` CQE releases the slot. A shutdown failure changes
-            // nothing: `ENOTCONN` when the socket is already in `TCP_CLOSE`
-            // (reset, failed connect, or both FINs exchanged).
+            OpTag::Shutdown => self.handle_shutdown(ud, result),
+            // The `Close` CQE releases the slot. A failure of this lead
+            // changes nothing and is not counted: `ENOTCONN` when the socket
+            // is already in `TCP_CLOSE` (reset, failed connect, or both FINs
+            // exchanged).
             OpTag::CloseShutdown => {}
             // Ignored likewise: the `Close` CQE releases the slot. The
             // cancelled requests' own CQEs arrive with `-ECANCELED`, usually
@@ -2545,18 +2547,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// A deferred `shutdown(SHUT_WR)` has completed.
     ///
-    /// Its only job is to release the slot: `Shutdown` names its socket as the
+    /// It releases the hold on the Close: `Shutdown` names its socket as the
     /// registered-file slot `Fixed(conn_index)`, so `try_finalize_close` holds
     /// the `Close` that frees the slot until this CQE lands. Without that, the
     /// `Close` could complete first, the next accept could register the slot,
     /// and the kernel could then run the FIN against *that* connection — a live
-    /// peer whose next send fails with `EPIPE` (#518).
+    /// peer whose next send fails with `EPIPE` (#518). A failed result is
+    /// counted (`connections{op="shutdown_failed"}`) and changes nothing else:
+    /// the socket refused the FIN because it is already closed, and the Close
+    /// goes ahead.
     ///
     /// The generation in the payload is checked for form's sake and for the
     /// counter: because the close now waits on this flag, a stale one should be
     /// unreachable, and `shutdown_stale` existing at all would mean the gate
     /// leaked somewhere.
-    fn handle_shutdown(&mut self, ud: UserData) {
+    fn handle_shutdown(&mut self, ud: UserData, result: i32) {
         let conn_index = ud.conn_index();
         let idx = conn_index as usize;
         if idx >= self.driver.send_queues.len() {
@@ -2565,6 +2570,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if self.driver.connections.generation(conn_index) != ud.payload() {
             crate::metrics::RING.increment(crate::metrics::ring::SHUTDOWN_STALE);
             return;
+        }
+        if result < 0 {
+            metrics::CONNECTIONS.increment(metrics::conn::SHUTDOWN_FAILED);
         }
         self.driver.send_queues[idx].shutdown_inflight = false;
         self.driver.defer_finalize_close(conn_index);
@@ -3772,11 +3780,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::CONNECTIONS_ACTIVE.decrement();
         }
 
-        // Remove the async task (drops the future).
-        self.executor.remove_connection(conn_index);
-        // The future just dropped may have owned a half, whose `Drop` queues
-        // an orphan that finds a changed generation. Clear the flags before
-        // the slot is reused, or the next occupant inherits them.
+        // Remove the async task (drops the future), with the driver state
+        // installed so the futures it holds clean up as inside a poll.
+        crate::runtime::io::with_driver_state(
+            &mut self.driver,
+            &mut self.executor,
+            |_, executor| {
+                executor.remove_connection(conn_index);
+            },
+        );
+        // The future just dropped may have owned a half, whose `Drop` finds
+        // the close already requested. Clear the claim flags before the slot
+        // is reused, or the next occupant inherits them.
         self.driver.clear_conn_claims(conn_index);
         self.driver.accumulators.release(conn_index);
         self.driver.arrival[conn_index as usize].release();
@@ -4834,12 +4849,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// armed set is permanently empty and this method is a single
     /// `Vec::is_empty()` check; for TLS workloads the set is bounded
     /// by the number of concurrent in-flight TLS graceful shutdowns
-    /// (typically 0 or single digits).
-    ///
-    /// Profiling the redis bench at 1 client × 64 B (i.e. plain TCP)
-    /// showed the previous O(N over all slots) walk at ~25 % of
-    /// worker CPU because it ran on every event-loop iteration; the
-    /// armed-set version drops that to noise.
+    /// (typically 0 or single digits). A walk over every slot here cost
+    /// about 25 % of worker CPU in the redis bench at 1 client × 64 B,
+    /// because this runs on every iteration.
     fn check_close_notify_deadlines(&mut self) {
         if self.driver.close_notify_armed.is_empty() {
             return;
@@ -13867,7 +13879,7 @@ mod tests {
     /// connection is torn down, and the completion that arrives after the
     /// slot is reused frees its entry without settling it.
     #[test]
-    fn a_stale_completion_frees_an_abandoned_send() {
+    fn a_stale_completion_for_a_dropped_send_settles_nothing() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let old_gen = el.driver.connections.generation(conn_index);
@@ -13880,22 +13892,76 @@ mod tests {
             UserData::send_payload(slot, old_gen),
         );
 
-        // Teardown drops the connection's task, abandoning its send, and the
-        // slot is reused.
+        // The future is dropped with the task (its `Drop` cancels the
+        // entry), the release frees what it left, and the slot is reused.
+        el.executor.cancel_send(id);
         el.executor.remove_connection(conn_index);
         el.driver.connections.release(conn_index);
         let reused = el.driver.connections.allocate().unwrap();
         assert_eq!(reused, conn_index, "test premise: index reused");
-        assert_eq!(el.executor.send_completions.live(), 1);
-
-        el.test_dispatch_cqe(ud.raw(), 8, 0);
-
         assert_eq!(
             el.executor.send_completions.live(),
             0,
-            "the abandoned entry outlived its completion"
+            "nothing left behind"
         );
+
+        el.test_dispatch_cqe(ud.raw(), 8, 0);
+
+        assert_eq!(el.executor.send_completions.live(), 0);
         assert!(send_result(&mut el, id).is_none());
+    }
+
+    thread_local! {
+        /// Whether the probe's `Drop` ran with the driver state installed.
+        static DROPPED_IN_EXECUTOR: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Records, when dropped, whether the executor was reachable.
+    struct DropProbe;
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let inside = crate::runtime::io::try_with_state(|_, _| ()).is_some();
+            DROPPED_IN_EXECUTOR.with(|c| c.set(Some(inside)));
+        }
+    }
+
+    /// A connection task dropped by the Close CQE is dropped with the driver
+    /// state installed, so the futures it holds clean up as they do inside a
+    /// poll.
+    #[test]
+    fn a_connection_task_dropped_by_the_close_cqe_is_dropped_inside_the_executor() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        DROPPED_IN_EXECUTOR.with(|c| c.set(None));
+
+        el.executor.task_slab.spawn(
+            conn_index,
+            Box::pin(async move {
+                let _probe = DropProbe;
+                std::future::pending::<()>().await;
+            }),
+        );
+        el.executor.ready_queue.push_back(conn_index);
+        el.poll_ready_tasks();
+        assert!(
+            DROPPED_IN_EXECUTOR.with(|c| c.get()).is_none(),
+            "the task is parked with the probe alive"
+        );
+
+        el.driver.close_connection(conn_index);
+        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+        assert!(
+            el.driver.connections.get(conn_index).is_none(),
+            "the Close CQE released the slot"
+        );
+        assert_eq!(
+            DROPPED_IN_EXECUTOR.with(|c| c.get()),
+            Some(true),
+            "the task's futures see the executor when they drop"
+        );
     }
 
     /// A zero-copy retry dropped because its connection's Close is submitted
@@ -14101,6 +14167,52 @@ mod tests {
         el.test_dispatch_cqe(ud.raw(), 0, 0);
         el.finalize_pending_closes();
         assert!(el.driver.send_queues[conn_index as usize].close_submitted);
+    }
+
+    /// A `Shutdown` CQE that reports an error (here `ENOTCONN`, the socket
+    /// already closed) is counted under `shutdown_failed`, and still
+    /// releases the Close it held. A successful one is not counted.
+    #[test]
+    fn a_failed_shutdown_is_counted_and_releases_the_close() {
+        let mut el = make_test_loop();
+        let first = accept_connection(&mut el);
+        let second = accept_connection(&mut el);
+        for &c in &[first, second] {
+            let state = &mut el.driver.send_queues[c as usize];
+            state.close_pending = true;
+            state.shutdown_inflight = true;
+        }
+        let count = || {
+            metrics::CONNECTIONS
+                .value(metrics::conn::SHUTDOWN_FAILED)
+                .unwrap_or(0)
+        };
+
+        let before = count();
+        let generation = el.driver.connections.generation(first);
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::Shutdown, first, generation).raw(),
+            0,
+            0,
+        );
+        assert_eq!(count(), before, "a successful Shutdown was counted");
+
+        let generation = el.driver.connections.generation(second);
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::Shutdown, second, generation).raw(),
+            -libc::ENOTCONN,
+            0,
+        );
+        assert!(count() > before, "the failed Shutdown was not counted");
+        assert!(
+            !el.driver.send_queues[second as usize].shutdown_inflight,
+            "the failed Shutdown still holds the Close"
+        );
+        el.finalize_pending_closes();
+        assert!(
+            el.driver.send_queues[second as usize].close_submitted,
+            "the Close was never committed"
+        );
     }
 
     /// `shutdown_write` on a connection whose close is requested submits
@@ -14854,6 +14966,113 @@ mod tests {
             el.driver.send_copy_pool.free_count(),
             8,
             "the abandoned entry's slot came back"
+        );
+    }
+
+    /// A forced close that `try_finalize_close` cannot commit, because a
+    /// `Shutdown` is still in the kernel, disarms its deadline: the force
+    /// runs once, and the Shutdown CQE commits the Close.
+    #[test]
+    fn a_forced_close_blocked_on_a_shutdown_runs_once() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        {
+            let state = &mut el.driver.send_queues[conn_index as usize];
+            state.close_pending = true;
+            state.shutdown_inflight = true;
+            state.close_notify_deadline = Some(std::time::Instant::now());
+        }
+        el.driver.close_notify_armed.push(conn_index);
+
+        el.check_close_notify_deadlines();
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(
+            state.close_pending && !state.close_submitted,
+            "the Shutdown holds the Close"
+        );
+        assert!(
+            state.close_notify_deadline.is_none(),
+            "the deadline stayed armed after the force"
+        );
+        assert!(
+            !el.driver.close_notify_armed.contains(&conn_index),
+            "the connection stayed on the armed set after the force"
+        );
+
+        // The next tick runs no second force.
+        el.driver.capacity_released = false;
+        el.check_close_notify_deadlines();
+        assert!(
+            !el.driver.capacity_released,
+            "a second force reported released capacity"
+        );
+
+        // The Shutdown CQE registers the connection for the end-of-iteration
+        // drain, which commits the Close.
+        let ud = UserData::encode(OpTag::Shutdown, conn_index, generation);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert!(el.driver.pending_finalize_closes.contains(&conn_index));
+        for c in std::mem::take(&mut el.driver.pending_finalize_closes) {
+            el.driver.try_finalize_close(c);
+        }
+        assert!(
+            el.driver.send_queues[conn_index as usize].close_submitted,
+            "the Close was never committed"
+        );
+    }
+
+    /// Reactivating a slot whose queue is empty returns no slot to the pool,
+    /// and reports none.
+    #[test]
+    fn resetting_an_empty_send_queue_releases_no_capacity() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.capacity_released = false;
+
+        el.driver.reset_send_state(conn_index);
+
+        assert!(
+            !el.driver.capacity_released,
+            "an empty queue reported released capacity"
+        );
+    }
+
+    /// A forced close that abandons a queued send no caller waits on
+    /// (`send_nowait`) still reports the slot it returned to the pool, or a
+    /// bounded send parked on the pool waits for an unrelated release.
+    #[test]
+    fn a_forced_close_abandoning_an_unawaited_send_releases_capacity() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (slot, ptr, len) = el.driver.send_copy_pool.copy_in(b"unawaited").unwrap();
+        let ud = UserData::encode(OpTag::Send, conn_index, slot as u32);
+        let entry = crate::backend::uring::sqe::Sqe::stream_send(conn_index, ptr, len, ud.raw());
+        {
+            let state = &mut el.driver.send_queues[conn_index as usize];
+            state.queue.push_back(crate::handler::BuiltSend {
+                entry,
+                pool_slot: slot,
+                slab_idx: u16::MAX,
+            });
+            state.in_flight = true;
+            state.close_pending = true;
+        }
+        el.driver.capacity_released = false;
+
+        el.driver.force_finalize_close(conn_index);
+
+        assert!(
+            el.driver.settled_sends.is_empty(),
+            "nothing awaited the send"
+        );
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "the slot stayed in use"
+        );
+        assert!(
+            el.driver.capacity_released,
+            "the returned slot was not reported"
         );
     }
 

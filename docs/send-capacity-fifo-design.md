@@ -25,10 +25,10 @@ next to the other per-connection waiter bookkeeping.
 - **Executor-owned, no `Rc<RefCell<_>>`.** #318 shared the queue between
   the executor and a `SendCapacityRegistration` guard so the guard's `Drop`
   could unregister without driver access. All other futures in this crate
-  clean up through `try_with_state` and accept that a drop outside the
-  executor skips cleanup; the queue's `remove_connection` is the backstop
-  for the one case that matters (teardown drops the connection task outside
-  a poll). Same pattern, no shared ownership.
+  clean up through `try_with_state`; a connection task dropped at its
+  connection's release is dropped with the driver state installed
+  (`with_driver_state`), so its futures' drops reach the queue there too.
+  Same pattern, no shared ownership.
 - **No per-operation `HashMap`.** Waiting entries are a `VecDeque`;
   submitted entries are a `Vec` scanned linearly (in-flight bounded sends
   per worker are bounded by pool slots). Allocation only on growth.
@@ -105,24 +105,21 @@ Semantics:
   after the abort overwrites it, so a delivered message is never reported
   as aborted. `Executor::remove_connection` runs when the backend releases
   the slot (io_uring `handle_close`, mio `drain_pending_closes`), after the
-  queued sends drained. If the owner is the connection's
-  own task (`task_id == conn_index`) nobody is left to read a result:
-  `task_slab.remove` has already dropped that future. Those entries are
-  cancelled instead:
-  waiting removed, `InFlight` → `Abandoned` (the completion removes it),
-  `Done` removed — so a closed connection never leaves a `Done` entry
-  behind. Abandoned entries are removed. If the head was removed, the new
-  head's task is also returned. Called from `Executor::remove_connection`
-  after `task_slab.remove`.
+  queued sends drained, and drops the connection's task first with the
+  driver state installed, so the futures that die with it cancel their
+  entries. An entry the connection's own task still owns is held by a future
+  the task handed off and not yet polled: it is re-owned to `NO_OWNER` and
+  treated as any other entry on the connection. A resolved entry is kept
+  for the future that holds it. Abandoned entries are removed. If the head
+  was removed, the new head's task is also returned.
 - `remove_task(conn)`: the connection task `conn` returned or panicked
-  while its connection is still closing. Only the entries that task owns
-  are touched, on whichever connection: waiting removed, `InFlight` →
-  `Abandoned` (the completion removes it, unless a poll of a future the
-  task had handed to another task revives it; see `set_owner`), `Done` or
-  `Aborted` removed. Entries other tasks own on the connection are left
-  for the driver, which delivers or fails each queued send before the
-  slot is released and `remove_connection` runs. If the head was removed,
-  the new head's task is returned. Called from
+  while its connection is still closing. The entries that task owns, on
+  whichever connection, are re-owned to `NO_OWNER` and left in their state:
+  the task's own futures cancelled theirs when the task was dropped, so
+  these are held by futures handed to other tasks. Entries other tasks own
+  on the connection are left for the driver, which delivers or fails each
+  queued send before the slot is released and `remove_connection` runs.
+  Nothing is returned to wake. Called from
   `Executor::remove_connection_task`, the task-exit arms of both backends'
   `poll_ready_tasks`.
 - `fail_waiting(conn, generation, kind, msg)`: waiting entries for that

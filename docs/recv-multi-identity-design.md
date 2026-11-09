@@ -2,8 +2,12 @@
 
 Note (2026-10-25): `forward_to` (Mode A) was removed.
 
-Note (2026-10-25): `OpTag::RecvMulti`, `recv_multishot_armed` and
-`ConnectionState::recv_arm` were removed with the TCP provided-buffer ring.
+Superseded by #716, which removed the TCP provided-buffer ring:
+`OpTag::RecvMulti`, `handle_recv_multi`, `recv_multishot_armed` and
+`ConnectionState::recv_arm` do not exist, and `try_finalize_close` submits
+no cancel for a receive (`docs/recv-direct-design.md`, "Close"). The rule
+this document argued for, that every per-connection completion is checked
+against the slot's generation, is Domain Invariant 3 in `CLAUDE.md`.
 
 ## 1. The bug
 

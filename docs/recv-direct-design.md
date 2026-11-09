@@ -571,9 +571,8 @@ documents "The connection is closed if the cap is exceeded").
 
 ### Close
 
-`try_finalize_close` cancels a multishot receive by its user data, gated on
-`recv_multishot_armed`, which a direct connection never sets. The direct
-receive is ended by the close's lead instead: `shutdown` before 6.13,
+`try_finalize_close` submits no cancel for a receive. The direct receive is
+ended by the close's lead: `shutdown` before 6.13,
 `ASYNC_CANCEL` of every request on the fixed file from 6.13. A handed-off
 socket (park, below) is the only case that closes without a lead, and a
 park ends the receive and the hangup poll before the hand-off. The buffer stays in its slab entry
