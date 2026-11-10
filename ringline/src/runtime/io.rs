@@ -1042,8 +1042,9 @@ fn take_forward_zc_consumed(driver: &mut crate::backend::Driver, conn_index: u32
 ///
 /// `forward_recv_buf` uses this when the bytes it was handed are
 /// accumulator-backed rather than a single kernel buffer. Holding the `Bytes`
-/// keeps the allocation alive until the kernel posts the ZC notification, so
-/// the message reaches the wire without being copied into a send-pool slot.
+/// keeps the allocation alive until the kernel posts the ZC notification (on
+/// a Unix-domain connection, until the plain `sendmsg` completes), so the
+/// message reaches the wire without being copied into a send-pool slot.
 /// The memory is a plain heap allocation, not a registered region.
 #[cfg(has_io_uring)]
 struct AccumulatorGuard(bytes::Bytes);

@@ -404,6 +404,15 @@ impl<'a> DriverCtx<'a> {
         *self.shutdown_requested = true;
     }
 
+    /// Whether the connection is Unix-domain. The kernel refuses `SENDMSG_ZC`
+    /// on a Unix socket with `EOPNOTSUPP`, so its guard sends go out as plain
+    /// `sendmsg`s (#829).
+    pub(crate) fn conn_is_unix(&self, conn_index: u32) -> bool {
+        self.connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.peer_addr, Some(crate::connection::PeerAddr::Unix(_))))
+    }
+
     /// Get TLS session information for a connection.
     pub fn tls_info(&self, conn: ConnId) -> Option<crate::tls::TlsInfo> {
         let cs = self.connections.get(conn.index)?;
@@ -3801,7 +3810,8 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     }
 
     /// Add a zero-copy guard part. The guard keeps the memory alive until the kernel
-    /// releases it via the ZC notification.
+    /// releases it via the ZC notification, or, on a Unix-domain connection, until
+    /// the plain `sendmsg` that sends it completes.
     pub fn guard(mut self, guard: GuardBox) -> Self {
         if self.error.is_some() {
             return self;
@@ -4068,11 +4078,20 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 self.conn.index,
                 slab_idx as u32,
             );
-            let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(
-                self.conn.index,
-                msg_ptr,
-                user_data.raw(),
-            );
+            // A Unix socket refuses `SENDMSG_ZC`: send the entry with a plain
+            // `sendmsg`, and mark it so a partial send is resent the same way.
+            // The completion is handled as a zero-copy send that owes no
+            // notification.
+            let entry = if self.ctx.conn_is_unix(self.conn.index) {
+                self.ctx.send_slab.set_plain_msg(slab_idx);
+                crate::backend::uring::sqe::Sqe::send_msg(self.conn.index, msg_ptr, user_data.raw())
+            } else {
+                crate::backend::uring::sqe::Sqe::send_msg_zc(
+                    self.conn.index,
+                    msg_ptr,
+                    user_data.raw(),
+                )
+            };
 
             Ok(BuiltSend {
                 entry,
@@ -4127,11 +4146,20 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 self.conn.index,
                 slab_idx as u32,
             );
-            let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(
-                self.conn.index,
-                msg_ptr,
-                user_data.raw(),
-            );
+            // A Unix socket refuses `SENDMSG_ZC`: send the entry with a plain
+            // `sendmsg`, and mark it so a partial send is resent the same way.
+            // The completion is handled as a zero-copy send that owes no
+            // notification.
+            let entry = if self.ctx.conn_is_unix(self.conn.index) {
+                self.ctx.send_slab.set_plain_msg(slab_idx);
+                crate::backend::uring::sqe::Sqe::send_msg(self.conn.index, msg_ptr, user_data.raw())
+            } else {
+                crate::backend::uring::sqe::Sqe::send_msg_zc(
+                    self.conn.index,
+                    msg_ptr,
+                    user_data.raw(),
+                )
+            };
 
             Ok(BuiltSend {
                 entry,
@@ -4796,11 +4824,20 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                                     conn_index,
                                     slab_idx as u32,
                                 );
-                                let entry = crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
-                                    conn_index,
-                                    msg_ptr,
-                                    user_data.raw(),
-                                );
+                                // A Unix socket refuses `SENDMSG_ZC` (#829).
+                                let entry = if self.chain.ctx.conn_is_unix(conn_index) {
+                                    crate::backend::uring::sqe::Sqe::chain_send_msg(
+                                        conn_index,
+                                        msg_ptr,
+                                        user_data.raw(),
+                                    )
+                                } else {
+                                    crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
+                                        conn_index,
+                                        msg_ptr,
+                                        user_data.raw(),
+                                    )
+                                };
 
                                 BuiltSend {
                                     entry,
@@ -4867,11 +4904,20 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                             conn_index,
                             slab_idx as u32,
                         );
-                        let entry = crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
-                            conn_index,
-                            msg_ptr,
-                            user_data.raw(),
-                        );
+                        // A Unix socket refuses `SENDMSG_ZC` (#829).
+                        let entry = if self.chain.ctx.conn_is_unix(conn_index) {
+                            crate::backend::uring::sqe::Sqe::chain_send_msg(
+                                conn_index,
+                                msg_ptr,
+                                user_data.raw(),
+                            )
+                        } else {
+                            crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
+                                conn_index,
+                                msg_ptr,
+                                user_data.raw(),
+                            )
+                        };
 
                         BuiltSend {
                             entry,

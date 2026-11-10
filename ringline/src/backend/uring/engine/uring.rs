@@ -1174,6 +1174,18 @@ mod encode_tests {
                     .build()),
             ),
             (
+                Sqe::send_msg(9, msg, ud),
+                e(opcode::SendMsg::new(fx, msg)
+                    .flags(crate::completion::STREAM_SEND_FLAGS as u32)
+                    .build()),
+            ),
+            (
+                Sqe::chain_send_msg(9, msg, ud),
+                e(opcode::SendMsg::new(fx, msg)
+                    .flags(crate::completion::CHAIN_SEND_FLAGS as u32)
+                    .build()),
+            ),
+            (
                 Sqe::chain_send_msg_zc(9, msg, ud),
                 e(opcode::SendMsgZc::new(fx, msg)
                     .flags(crate::completion::CHAIN_SEND_FLAGS as u32)
