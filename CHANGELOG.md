@@ -964,6 +964,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: `fs::close` with a read, write or fsync on the file still in
+  flight leaves the file registered until the last of them completes. Before,
+  it unregistered the file at once, and an operation issued earlier in the
+  same task poll, not yet submitted to the kernel, failed with `EBADF`: a
+  write did not reach the file. The handle is refused as soon as `close`
+  returns, as before, but its file-table slot is free only once those
+  operations complete, so an `open` right after `close` on a full table
+  fails until then (#859).
 - mio: worker exit waits, within 10 s, for the raw-pointer reads and writes
   (`fs::read`/`fs::write`, `direct_io_read`/`direct_io_write`) its disk-I/O
   pool is running. Before, the worker dropped its tasks while a pool thread

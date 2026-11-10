@@ -280,8 +280,13 @@ pub(crate) struct FsFileState {
     pub active: bool,
     /// Generation counter for stale-handle detection.
     pub generation: u16,
-    /// Number of commands currently in flight.
+    /// Number of read, write and fsync commands pushed to the SQ and not
+    /// completed (io_uring).
     pub in_flight: u32,
+    /// `close` was called while commands were in flight (io_uring): the
+    /// handle is refused, and the last completion unregisters the file and
+    /// releases the slot (#859).
+    pub closing: bool,
 }
 
 impl FsFileState {
@@ -291,6 +296,7 @@ impl FsFileState {
             active: false,
             generation: 0,
             in_flight: 0,
+            closing: false,
         }
     }
 }
@@ -324,6 +330,7 @@ impl FsFileTable {
         slot.active = false;
         slot.fd_index = u32::MAX;
         slot.in_flight = 0;
+        slot.closing = false;
         slot.generation = slot.generation.wrapping_add(1);
         self.free_list.push(index);
     }
@@ -1041,10 +1048,12 @@ pub fn fsync(file: File) -> io::Result<DiskIoFuture> {
 
 /// Close a file handle.
 ///
-/// Synchronous: on success the handle is invalid and its slot is free when
-/// this returns. On io_uring it removes the file from the ring's fixed-file
-/// table. On mio the fd closes once the operations already queued on it have
-/// finished.
+/// Synchronous: on success the handle is invalid when this returns. A read,
+/// write or fsync already issued on it completes against the file. On
+/// io_uring the file leaves the ring's fixed-file table and its slot is freed
+/// when this returns or, if such operations are in flight, when the last of
+/// them completes. On mio the slot is free when this returns, and the fd
+/// closes once the operations already queued on it have finished.
 ///
 /// # Panics
 ///

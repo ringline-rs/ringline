@@ -2336,9 +2336,22 @@ impl<'a> DriverCtx<'a> {
 
     /// Close a filesystem file.
     ///
-    /// Deregisters the fd from the fixed file table and releases the file slot.
+    /// Deregisters the fd from the fixed file table and releases the file
+    /// slot. With reads, writes or fsyncs in flight, the handle goes stale at
+    /// once and the last completion does both: an operation pushed earlier in
+    /// the same task poll may not be submitted until the loop flushes, and the
+    /// kernel resolves its fixed file then (#859).
     pub(crate) fn fs_close(&mut self, file: crate::fs::File) -> io::Result<()> {
         let fd_index = self.validate_fs_file(file)?;
+
+        if let Some(files) = self.fs_files.as_mut()
+            && let Some(f) = files.get_mut(file.index)
+            && f.in_flight > 0
+        {
+            f.closing = true;
+            f.generation = f.generation.wrapping_add(1);
+            return Ok(());
+        }
 
         // Unregister from the fixed file table.
         self.ring.register_files_update(fd_index, &[-1i32])?;
@@ -2577,7 +2590,7 @@ impl<'a> DriverCtx<'a> {
         let f = files
             .get(file.index)
             .ok_or_else(|| io::Error::other("invalid filesystem file handle"))?;
-        if f.generation != file.generation {
+        if f.closing || f.generation != file.generation {
             return Err(io::Error::other("stale filesystem file handle"));
         }
         Ok(f.fd_index)
