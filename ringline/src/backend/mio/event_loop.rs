@@ -60,23 +60,52 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.panic_reporter.report_worker_drained(worker);
     }
 
-    /// The mio backend has nothing in the kernel to wait for; the connections
-    /// still open are counted out before the event loop is dropped.
+    /// Wait for the disk-I/O operations in flight, and count out the
+    /// connections still open, before the event loop is dropped.
     pub(crate) fn drain_after_failure(&mut self) {
+        self.driver.drain_disk_io_at_exit();
         self.driver.count_out_open_connections();
     }
 
-    /// Always false: the mio backend has no ring. Its disk-I/O pool threads
-    /// can still use a buffer after the worker exits, which this does not cover.
-    pub(crate) fn kernel_holds_memory(&self) -> bool {
-        false
+    /// Whether exit left a raw-pointer read or write (`disk_io_borrowing`)
+    /// running on a pool thread, which can still use memory the event loop and
+    /// its tasks own; the caller must then leak the event loop (#856).
+    pub(crate) fn memory_in_use_at_exit(&self) -> bool {
+        self.driver.disk_io_outstanding
     }
 
-    /// The mio backend has no ring.
+    /// Release what a leaked event loop would otherwise hold for the life of
+    /// the process. The mio backend has no ring; the name matches the io_uring
+    /// backend.
     ///
     /// # Safety
     /// No requirement; the signature matches the io_uring backend.
-    pub(crate) unsafe fn close_ring(&mut self) {}
+    pub(crate) unsafe fn close_ring(&mut self) {
+        // Close the connections queued for this worker, as `Driver::drop`
+        // would, so the acceptor sees the worker gone and routes around it.
+        drop(self.driver.accept_rx.take());
+        // Close this worker's sockets: no task reads or writes them again,
+        // and a peer then sees the connection end.
+        for stream in self.driver.tcp_streams.iter_mut() {
+            drop(stream.take());
+        }
+        self.driver.udp_sockets.clear();
+        self.executor.wakes.deregister();
+        // A pool's threads exit when the last reference to it goes; the
+        // blocking, resolver and spawner pools are shared by the workers. A
+        // disk-I/O thread still running an operation finishes it first, into
+        // memory the leaked loop keeps valid. Dropping the receiver closes an
+        // fd that a late open sends.
+        self.driver.blocking_pool = None;
+        self.driver.resolver = None;
+        self.driver.spawner = None;
+        self.driver.disk_io_pool = None;
+        self.driver.blocking_tx = None;
+        self.driver.resolve_tx = None;
+        self.driver.spawn_tx = None;
+        self.driver.disk_io_tx = None;
+        self.driver.disk_io_rx = None;
+    }
 
     /// The first task panic recorded under `TaskPanicPolicy::Shutdown`.
     pub(crate) fn take_task_panic(&mut self) -> Option<crate::JoinError> {
@@ -116,6 +145,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .wake_keep_alive
                     .clone()
                     .unwrap_or_else(|| Arc::from(Vec::new())),
+                #[cfg(test)]
+                config.test_fault.clone(),
             ));
             let (tx, rx) = crossbeam_channel::unbounded::<crate::disk_io_pool::DiskIoResponse>();
             (Some(rx), Some(tx), Some(pool))
@@ -449,6 +480,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // 9. Check shutdown.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
+                self.driver.drain_disk_io_at_exit();
                 self.driver.count_out_open_connections();
                 return Ok(());
             }
@@ -618,6 +650,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             while let Ok(response) = rx.try_recv() {
                 // The operation is done: its key may be handed out again.
                 self.driver.disk_io_in_flight.remove(&response.seq);
+                self.driver.disk_io_borrowing.remove(&response.seq);
                 // Handle fs_open completions: install fd or release slot.
                 if let Some(file_index) = self.driver.pending_fs_opens.remove(&response.seq) {
                     if self.executor.abandoned_fs_opens.remove(&response.seq) {

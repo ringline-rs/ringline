@@ -50,24 +50,47 @@ pub(crate) struct DiskIoResponse {
     pub(crate) opened: Option<std::os::fd::OwnedFd>,
 }
 
+/// Which requests the pool's threads are running, and whether the worker has
+/// exited.
+#[derive(Default)]
+pub(crate) struct PoolState {
+    /// Set when the worker exits: a request not yet started is answered
+    /// `-ECANCELED` without running, so it uses no memory after exit (#856).
+    pub(crate) abandon: bool,
+    /// The sequence numbers of the requests a thread has started and not
+    /// finished. A thread adds one only while `abandon` is false, under the
+    /// same lock, so the set the exit drain reads after setting `abandon` is
+    /// every request that can still run.
+    pub(crate) running: std::collections::HashSet<u32>,
+}
+
 /// A pool of threads that perform blocking disk I/O.
 ///
-/// Created once during launch and shared (via `Arc`) across all workers.
-/// Shutdown is driven by dropping the request sender, which causes all pool
-/// threads to exit.
+/// Each mio worker starts its own pool, in `AsyncEventLoop::new`. Shutdown is
+/// driven by dropping the request sender, which causes all pool threads to
+/// exit.
 pub(crate) struct DiskIoPool {
     pub(crate) request_tx: Sender<DiskIoRequest>,
+    pub(crate) state: std::sync::Arc<std::sync::Mutex<PoolState>>,
     _threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl DiskIoPool {
     /// Create the channel pair and spawn disk I/O threads.
-    pub(crate) fn start(num_threads: usize, wake_keep_alive: crate::wakeup::WakeKeepAlive) -> Self {
+    pub(crate) fn start(
+        num_threads: usize,
+        wake_keep_alive: crate::wakeup::WakeKeepAlive,
+        #[cfg(test)] fault: Option<std::sync::Arc<crate::config::TestFault>>,
+    ) -> Self {
         let (request_tx, request_rx) = crossbeam_channel::unbounded::<DiskIoRequest>();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(PoolState::default()));
         let mut threads = Vec::with_capacity(num_threads);
 
         for i in 0..num_threads {
             let rx = request_rx.clone();
+            let state = std::sync::Arc::clone(&state);
+            #[cfg(test)]
+            let fault = fault.clone();
             let keep_alive = std::sync::Arc::clone(&wake_keep_alive);
             let handle = thread::Builder::new()
                 .name(format!("ringline-disk-io-{i}"))
@@ -75,7 +98,12 @@ impl DiskIoPool {
                     // Holds every worker's wake fd open while this thread
                     // can still wake one.
                     let _keep_alive = keep_alive;
-                    disk_io_thread(rx);
+                    disk_io_thread(
+                        rx,
+                        &state,
+                        #[cfg(test)]
+                        fault.as_deref(),
+                    );
                 })
                 .expect("failed to spawn disk I/O thread");
             threads.push(handle);
@@ -83,15 +111,59 @@ impl DiskIoPool {
 
         DiskIoPool {
             request_tx,
+            state,
             _threads: threads,
         }
     }
 }
 
 /// Main loop for a disk I/O thread.
-fn disk_io_thread(rx: Receiver<DiskIoRequest>) {
+fn disk_io_thread(
+    rx: Receiver<DiskIoRequest>,
+    state: &std::sync::Mutex<PoolState>,
+    #[cfg(test)] fault: Option<&crate::config::TestFault>,
+) {
     while let Ok(req) = rx.recv() {
-        let result = (req.work)();
+        let start = {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.abandon {
+                state.running.insert(req.seq);
+            }
+            !state.abandon
+        };
+        let result = if start {
+            #[cfg(test)]
+            if let Some(fault) = fault {
+                while fault
+                    .hold_disk_io
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    fault
+                        .disk_io_held
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            let result = (req.work)();
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .running
+                .remove(&req.seq);
+            result
+        } else {
+            #[cfg(test)]
+            if let Some(fault) = fault {
+                fault
+                    .disk_io_skipped
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+            DiskIoResult {
+                result: -libc::ECANCELED,
+                metadata: None,
+                opened: None,
+            }
+        };
         let _ = req.response_tx.send(DiskIoResponse {
             seq: req.seq,
             result: result.result,

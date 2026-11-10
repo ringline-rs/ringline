@@ -2668,6 +2668,8 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) next_disk_io_seq: &'a mut u32,
     /// Keys of pool operations not yet drained; see `Driver::disk_io_in_flight`.
     pub(crate) disk_io_in_flight: &'a mut std::collections::HashSet<u32>,
+    /// See `Driver::disk_io_borrowing`.
+    pub(crate) disk_io_borrowing: &'a mut std::collections::HashSet<u32>,
     /// Direct I/O file table.
     pub(crate) direct_io_files: &'a mut Option<crate::direct_io::DirectIoFileTable>,
     /// Direct I/O fds, indexed by file slot.
@@ -3208,9 +3210,12 @@ impl<'a> DriverCtx<'a> {
     // ── Direct I/O methods ────────────────────────────────────────────
 
     /// Allocate a sequence number and submit work to the disk I/O pool.
+    /// `borrows` is true when `work` reads or writes through a caller's
+    /// buffer address, which worker exit must then wait for.
     fn submit_disk_io(
         &mut self,
         work: Box<dyn FnOnce() -> crate::disk_io_pool::DiskIoResult + Send>,
+        borrows: bool,
     ) -> io::Result<u32> {
         let pool = self
             .disk_io_pool
@@ -3240,6 +3245,9 @@ impl<'a> DriverCtx<'a> {
             })
             .map_err(|_| io::Error::other("disk I/O pool shut down"))?;
         self.disk_io_in_flight.insert(seq);
+        if borrows {
+            self.disk_io_borrowing.insert(seq);
+        }
 
         Ok(seq)
     }
@@ -3342,7 +3350,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(work, true)
     }
 
     /// Submit a direct I/O write via the disk I/O pool.
@@ -3380,7 +3388,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(work, true)
     }
 
     /// Submit an fsync for a direct I/O file via the disk I/O pool.
@@ -3401,7 +3409,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(work, false)
     }
 
     /// Close a direct I/O file and release its slot.
@@ -3497,7 +3505,7 @@ impl<'a> DriverCtx<'a> {
             }
         });
 
-        match self.submit_disk_io(work) {
+        match self.submit_disk_io(work, false) {
             Ok(seq) => {
                 self.pending_fs_opens.insert(seq, file_index);
                 Ok((file_index, generation, seq))
@@ -3541,7 +3549,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(work, true)
     }
 
     /// Submit a filesystem write via the disk I/O pool.
@@ -3576,7 +3584,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(work, true)
     }
 
     /// Submit an fsync for a filesystem file via the disk I/O pool.
@@ -3597,7 +3605,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(work, false)
     }
 
     /// Close a filesystem file and release its slot.
@@ -3641,7 +3649,7 @@ impl<'a> DriverCtx<'a> {
                 }
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(work, false)
     }
 
     /// Submit a rename via the disk I/O pool.
@@ -3667,7 +3675,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(work, false)
     }
 
     /// Submit an unlink via the disk I/O pool.
@@ -3688,7 +3696,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(work, false)
     }
 
     /// Submit a mkdir via the disk I/O pool.
@@ -3709,7 +3717,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(work, false)
     }
 
     /// Validate a filesystem file handle and return a hold on its fd.

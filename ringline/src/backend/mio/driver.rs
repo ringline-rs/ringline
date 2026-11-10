@@ -140,6 +140,10 @@ pub(crate) fn clear_pending_sends_into(
     }
 }
 
+/// The longest worker exit waits for disk-I/O operations already running,
+/// the same bound the io_uring exit drain uses.
+const DISK_IO_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Per-worker mio driver state.
 pub(crate) struct Driver {
     pub(crate) connections: ConnectionTable,
@@ -279,6 +283,14 @@ pub(crate) struct Driver {
     /// busy, a dropped future's key would otherwise be handed out while its
     /// operation still runs (#574).
     pub(crate) disk_io_in_flight: std::collections::HashSet<u32>,
+    /// The keys in `disk_io_in_flight` whose request reads or writes through
+    /// a caller's buffer address: `fs::read`/`fs::write` and
+    /// `direct_io_read`/`direct_io_write`. Worker exit waits for these.
+    pub(crate) disk_io_borrowing: std::collections::HashSet<u32>,
+    /// Set by [`drain_disk_io_at_exit`](Self::drain_disk_io_at_exit) when an
+    /// operation was still running at its bound. A pool thread can still use
+    /// the operation's buffer, so the worker leaks its event loop (#856).
+    pub(crate) disk_io_outstanding: bool,
 
     // ── Direct I/O file management ──────────��───────────────────────
     /// Direct I/O file table (allocates file slots and generations).
@@ -303,6 +315,44 @@ pub(crate) struct Driver {
 }
 
 impl Driver {
+    /// At worker exit: tell the disk-I/O pool to answer the requests it has
+    /// not started with `-ECANCELED`, then wait up to [`DISK_IO_EXIT_BOUND`]
+    /// for the started ones that use a caller's buffer (`disk_io_borrowing`).
+    /// Any other request uses only memory its closure owns, which outlives
+    /// the worker. Responses are dropped: no task is polled again. Sets
+    /// `disk_io_outstanding` if one is still running at the bound.
+    pub(crate) fn drain_disk_io_at_exit(&mut self) {
+        let Some(pool) = self.disk_io_pool.as_ref() else {
+            return;
+        };
+        let mut wait: std::collections::HashSet<u32> = {
+            let mut state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.abandon = true;
+            state
+                .running
+                .iter()
+                .filter(|seq| self.disk_io_borrowing.contains(seq))
+                .copied()
+                .collect()
+        };
+        if let Some(rx) = self.disk_io_rx.as_ref() {
+            let deadline = std::time::Instant::now() + DISK_IO_EXIT_BOUND;
+            while !wait.is_empty() {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(left) {
+                    Ok(response) => {
+                        wait.remove(&response.seq);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        self.disk_io_outstanding = !wait.is_empty();
+    }
+
     /// Bytes the connection holds that no consumer has taken: the
     /// accumulator. The arrival log takes the first unread stream offset as
     /// `delivered - recv_buffered`.
@@ -520,6 +570,8 @@ impl Driver {
             disk_io_pool,
             next_disk_io_seq: 0,
             disk_io_in_flight: std::collections::HashSet::new(),
+            disk_io_borrowing: std::collections::HashSet::new(),
+            disk_io_outstanding: false,
             direct_io_files: config
                 .direct_io
                 .as_ref()
@@ -574,6 +626,7 @@ impl Driver {
             wake_handle: self.wake_handle,
             next_disk_io_seq: &mut self.next_disk_io_seq,
             disk_io_in_flight: &mut self.disk_io_in_flight,
+            disk_io_borrowing: &mut self.disk_io_borrowing,
             direct_io_files: &mut self.direct_io_files,
             direct_io_fds: &mut self.direct_io_fds,
             fs_files: &mut self.fs_files,
