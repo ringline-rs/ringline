@@ -116,8 +116,8 @@ pub(crate) enum DirectRecvBuf {
 /// before it closes the connection with an RST (#607).
 const ABORT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The longest worker exit waits for connections to close and send slab entries
-/// to be released.
+/// The longest worker exit waits for connections to close, send slab entries
+/// to be released and fs, direct I/O and NVMe commands to complete.
 const SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Driver {
@@ -798,6 +798,11 @@ pub(crate) struct Driver {
     pub(crate) fs_cmd_slab: Option<crate::fs::FsCmdSlab>,
     /// Base offset in the fixed file table for filesystem file fds.
     pub(crate) fs_fd_base: u32,
+    /// Set by [`run_shutdown`](Self::run_shutdown) when an fs, direct I/O or
+    /// NVMe command was still in flight at its bound. The kernel can still use
+    /// the command's buffer, statx box or path, so the worker leaks its event
+    /// loop instead of dropping it (#824).
+    pub(crate) disk_io_outstanding: bool,
 }
 
 /// A park in flight: the `FixedFdInstall` has been submitted and its CQE has
@@ -1214,6 +1219,7 @@ impl Driver {
                 .as_ref()
                 .map(|f| crate::fs::FsCmdSlab::new(f.max_commands_in_flight)),
             fs_fd_base: config.max_connections + udp_count + nvme_max + direct_io_max,
+            disk_io_outstanding: false,
             resolve_rx,
             resolve_tx,
             resolver,
@@ -2776,6 +2782,32 @@ impl Driver {
                     metrics::CONNECTIONS_ACTIVE.decrement();
                 }
             }
+            // A disk command's completion: the kernel is done with its
+            // memory. No task is polled again, so nothing is delivered.
+            OpTag::Fs => {
+                let slab_idx = ud.payload() as u16;
+                if let Some(slab) = self.fs_cmd_slab.as_mut()
+                    && slab.in_use(slab_idx)
+                {
+                    slab.release(slab_idx);
+                }
+            }
+            OpTag::DirectIo => {
+                let slab_idx = ud.payload() as u16;
+                if let Some(slab) = self.direct_io_cmd_slab.as_mut()
+                    && slab.in_use(slab_idx)
+                {
+                    slab.release(slab_idx);
+                }
+            }
+            OpTag::NvmeCmd => {
+                let slab_idx = ud.payload() as u16;
+                if let Some(slab) = self.nvme_cmd_slab.as_mut()
+                    && slab.in_use(slab_idx)
+                {
+                    slab.release(slab_idx);
+                }
+            }
             // Merged accept: nothing will serve the connection.
             OpTag::AcceptMulti if result >= 0 => unsafe {
                 libc::close(result);
@@ -2836,6 +2868,20 @@ impl Driver {
         // Each queued message holds an ack sender its registrar waits on.
         region_rx.try_iter().for_each(drop);
         self.merged_listeners.clear();
+    }
+
+    /// Whether an fs, direct I/O or NVMe command has not completed. Its
+    /// operation can still read or write memory this worker owns.
+    fn disk_commands_in_flight(&self) -> bool {
+        self.fs_cmd_slab.as_ref().is_some_and(|s| s.has_in_flight())
+            || self
+                .direct_io_cmd_slab
+                .as_ref()
+                .is_some_and(|s| s.has_in_flight())
+            || self
+                .nvme_cmd_slab
+                .as_ref()
+                .is_some_and(|s| s.has_in_flight())
     }
 
     /// Shutdown: close all connections and drain remaining CQEs. The eventfd
@@ -2916,11 +2962,12 @@ impl Driver {
         }
 
         // 3. Submit + drain loop until every connection's Close has
-        //    completed and every slab entry is released, for at most
-        //    `SHUTDOWN_BOUND`. Keep one timeout SQE armed so
-        //    submit_and_wait(1) never blocks indefinitely (the tick timeout
-        //    from the main loop is not armed here). A pass ends at any CQE, so
-        //    neither the pass count nor one timeout per pass measures time.
+        //    completed, every slab entry is released and every fs, direct I/O
+        //    and NVMe command has completed, for at most `SHUTDOWN_BOUND`.
+        //    Keep one timeout SQE armed so submit_and_wait(1) never blocks
+        //    indefinitely (the tick timeout from the main loop is not armed
+        //    here). A pass ends at any CQE, so neither the pass count nor one
+        //    timeout per pass measures time.
         //
         //    A zero-copy entry is released only once its notifications land,
         //    and the kernel posts those when the peer has acknowledged the data
@@ -2968,6 +3015,7 @@ impl Driver {
             if self.connections.active_count() == 0
                 && !self.send_slab.has_in_flight()
                 && self.direct_recvs.iter().all(Option::is_none)
+                && !self.disk_commands_in_flight()
             {
                 break;
             }
@@ -2997,6 +3045,11 @@ impl Driver {
             self.send_slab.leak_in_flight();
             self.send_copy_pool.leak_backing();
         }
+        // The memory of a disk command still in flight is spread over this
+        // driver (statx box, path) and the tasks (the caller's buffer behind
+        // `fs::read`, `direct_io_read`, `nvme_read` and their writes), so the
+        // worker leaks the whole event loop rather than this one entry.
+        self.disk_io_outstanding = self.disk_commands_in_flight();
 
         // 4. Unregister the UDP provided buffer rings before Driver is dropped
         // (which munmaps the ring memory). Unregistering releases the

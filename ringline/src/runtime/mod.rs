@@ -654,9 +654,9 @@ impl Drop for Executor {
         // A buffer still in the graveyard belongs to an operation that has
         // not completed: a read or write the kernel (io_uring) or a disk-I/O
         // pool thread (mio) can still perform through its raw pointer, after
-        // this worker has exited. Neither backend waits for those at
-        // shutdown, so freeing the buffer here would let that operation write
-        // into freed memory. Leak it instead; the leak is bounded by the
+        // this worker has exited. mio does not wait for those at shutdown, and
+        // io_uring's drain does not deliver their completions, so freeing the
+        // buffer here could let that operation write into freed memory. Leak it instead; the leak is bounded by the
         // operations in flight when the worker exits.
         for (_, buf) in self.disk_io_graveyard.drain() {
             std::mem::forget(buf);

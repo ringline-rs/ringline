@@ -189,8 +189,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.run_shutdown();
     }
 
+    /// Whether the drain ended with an fs, direct I/O or NVMe command still in
+    /// flight. The kernel can still use memory the event loop and its tasks
+    /// own, so the caller must leak it, through [`close_ring`](Self::close_ring)
+    /// (#824).
+    pub(crate) fn kernel_holds_memory(&self) -> bool {
+        self.driver.disk_io_outstanding
+    }
+
     /// Tear the ring down after
-    /// [`drain_after_failure`](Self::drain_after_failure) panicked. The kernel
+    /// [`drain_after_failure`](Self::drain_after_failure) panicked, or after a
+    /// drain that left a command in flight
+    /// ([`kernel_holds_memory`](Self::kernel_holds_memory)). The kernel
     /// ends the ring's operations and closes its sockets. Those operations can
     /// use the heap memory this event loop owns until they end, so the caller
     /// leaks it. What other threads are waiting on is released here, and the

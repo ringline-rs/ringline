@@ -406,6 +406,11 @@ impl FsCmdSlab {
         self.entries.get(idx as usize).is_some_and(|e| e.in_use)
     }
 
+    /// Whether any command holds a slot, so its operation has not completed.
+    pub fn has_in_flight(&self) -> bool {
+        self.free_list.len() < self.entries.len()
+    }
+
     /// Get a reference to an entry (must be in use).
     pub fn get(&self, idx: u16) -> Option<&FsCmdEntry> {
         self.entries.get(idx as usize).filter(|e| e.in_use)

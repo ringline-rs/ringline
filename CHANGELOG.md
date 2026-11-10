@@ -962,6 +962,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: worker exit waits for file, direct I/O and NVMe operations in
+  flight, within the same 10 s bound it gives connections. Before, the drain
+  ended once connections and sends were done, and the worker then freed its
+  tasks and driver while such an operation could still write into the
+  caller's buffer or the command's statx buffer, so a read or `statx` on
+  io-wq or an NVMe command finishing late wrote into memory the allocator had
+  handed out again. A worker with one still in flight when the bound runs
+  out leaks its event loop and its tasks instead of dropping them (#824).
 - io_uring: a worker that stops on an error or a panic, and whose exit drain
   then panics, closes the fds its multishot accept, or a park's install,
   delivered but it never handled. They are ordinary descriptors the kernel

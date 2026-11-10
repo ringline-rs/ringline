@@ -66,6 +66,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.count_out_open_connections();
     }
 
+    /// Always false: the mio backend has no ring. Its disk-I/O pool threads
+    /// can still use a buffer after the worker exits, which this does not cover.
+    pub(crate) fn kernel_holds_memory(&self) -> bool {
+        false
+    }
+
     /// The mio backend has no ring.
     ///
     /// # Safety

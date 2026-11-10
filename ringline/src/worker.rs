@@ -402,7 +402,8 @@ impl Runtime {
     ///
     /// Workers stop accepting new connections, close all active connections (on
     /// io_uring, cancelling each connection's operations in flight and waiting up
-    /// to 10 s for the connections to close), and exit their event loops
+    /// to 10 s for the connections to close and for file, direct I/O and NVMe
+    /// operations in flight to complete), and exit their event loops
     /// returning `Ok(())`, or [`Error::TaskPanicked`](crate::Error::TaskPanicked)
     /// under [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) for
     /// a worker on which a task panicked.
@@ -410,7 +411,10 @@ impl Runtime {
     /// A worker checks for shutdown once per event-loop iteration. Once it sees
     /// the request it polls no task again and drops every task's future. The
     /// futures' `Drop` implementations run, and a task does not resume from the
-    /// `.await` it is suspended at. A task woken after the worker's last poll
+    /// `.await` it is suspended at. An io_uring worker with a file, direct I/O
+    /// or NVMe operation still in flight when the 10 s run out drops nothing:
+    /// it leaks its tasks and event loop, since the operation can still use
+    /// their memory. A task woken after the worker's last poll
     /// pass is dropped even when what it awaited is ready. On both backends a
     /// task can be woken after the iteration's last poll pass, for example from
     /// `on_tick`, by a send result, by released send capacity or from another
@@ -1230,23 +1234,29 @@ impl RinglineBuilder {
                     Ok(Err(e)) => Some(e.to_string()),
                     Err(payload) => Some(format!("panic: {}", panic_payload(&**payload))),
                 };
+                let mut drain_panicked = false;
                 if let Some(cause) = cause {
                     event_loop.report_worker_exit(worker_id, &cause);
                     let drained =
                         catch_unwind(AssertUnwindSafe(|| event_loop.drain_after_failure()));
                     event_loop.report_worker_drained(worker_id);
-                    if drained.is_err() {
-                        let task_panic = event_loop.take_task_panic();
-                        // Safety: `event_loop` is leaked on the next line, so
-                        // nothing uses the ring again.
-                        unsafe { event_loop.close_ring() };
-                        std::mem::forget(event_loop);
-                        return match (task_panic, run_result) {
-                            (Some(panic), _) => Err(crate::error::Error::TaskPanicked(panic)),
-                            (None, Ok(result)) => result,
-                            (None, Err(payload)) => std::panic::resume_unwind(payload),
-                        };
-                    }
+                    drain_panicked = drained.is_err();
+                }
+                // A drain that panicked, or that ended with a disk command in
+                // flight, leaves memory the kernel can still use: leak the
+                // event loop, tasks included, since a task can own the buffer
+                // of an `fs::read`, `direct_io_read` or `nvme_read` (#824).
+                if drain_panicked || event_loop.kernel_holds_memory() {
+                    let task_panic = event_loop.take_task_panic();
+                    // Safety: `event_loop` is leaked on the next line, so
+                    // nothing uses the ring again.
+                    unsafe { event_loop.close_ring() };
+                    std::mem::forget(event_loop);
+                    return match (task_panic, run_result) {
+                        (Some(panic), _) => Err(crate::error::Error::TaskPanicked(panic)),
+                        (None, Ok(result)) => result,
+                        (None, Err(payload)) => std::panic::resume_unwind(payload),
+                    };
                 }
                 event_loop.drop_tasks();
                 // Under `TaskPanicPolicy::Shutdown`, a panic on this worker

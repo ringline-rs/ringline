@@ -361,6 +361,11 @@ impl NvmeCmdSlab {
     pub fn in_use(&self, idx: u16) -> bool {
         self.entries.get(idx as usize).is_some_and(|e| e.in_use)
     }
+
+    /// Whether any command holds a slot, so its operation has not completed.
+    pub fn has_in_flight(&self) -> bool {
+        self.free_list.len() < self.entries.len()
+    }
 }
 
 /// Result of an NVMe command completion.
