@@ -26,6 +26,10 @@ pub(crate) struct TestFault {
     /// Panic in the drain that follows.
     #[cfg(has_io_uring)]
     pub(crate) panic_in_drain: std::sync::atomic::AtomicBool,
+    /// Submit no cancels for disk commands at worker exit, standing in for
+    /// an operation a cancel cannot end.
+    #[cfg(has_io_uring)]
+    pub(crate) keep_disk_commands_at_exit: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]

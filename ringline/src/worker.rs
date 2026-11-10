@@ -402,22 +402,32 @@ impl Runtime {
     ///
     /// Workers stop accepting new connections, close all active connections (on
     /// io_uring, cancelling each connection's operations in flight and waiting up
-    /// to 10 s for the connections to close), and exit their event loops
-    /// returning `Ok(())`, or [`Error::TaskPanicked`](crate::Error::TaskPanicked)
+    /// to 10 s for the connections to close and for file, direct I/O and NVMe
+    /// operations in flight to complete or be cancelled), and exit their event
+    /// loops returning `Ok(())`, or [`Error::TaskPanicked`](crate::Error::TaskPanicked)
     /// under [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) for
     /// a worker on which a task panicked.
     ///
     /// A worker checks for shutdown once per event-loop iteration. Once it sees
-    /// the request it polls no task again and drops every task's future. The
-    /// futures' `Drop` implementations run, and a task does not resume from the
-    /// `.await` it is suspended at. A task woken after the worker's last poll
-    /// pass is dropped even when what it awaited is ready. On both backends a
-    /// task can be woken after the iteration's last poll pass, for example from
-    /// `on_tick`, by a send result, by released send capacity or from another
-    /// thread. On io_uring the check also comes after the completions its wait
-    /// returned are drained, so a task woken by one of those completions is
-    /// dropped too. Work that must finish before exit has to complete before
-    /// shutdown is requested.
+    /// the request it polls no task again and, unless it leaks them (below),
+    /// drops every task's future. The futures' `Drop` implementations run, and
+    /// a task does not resume from the `.await` it is suspended at.
+    ///
+    /// An io_uring worker cancels its file, direct I/O and NVMe operations in
+    /// flight. If one is still running when the 10 s run out, or when the
+    /// worker's ring fails during that wait, the worker does not drop its tasks
+    /// or its event loop: it leaks them, since the operation can still use
+    /// their memory, and writes a line to stderr. Its join result is the same
+    /// as without the leak.
+    ///
+    /// A task woken after the worker's last poll pass is dropped even when
+    /// what it awaited is ready. On both backends a task can be woken after the
+    /// iteration's last poll pass, for example from `on_tick`, by a send
+    /// result, by released send capacity or from another thread. On io_uring
+    /// the check also comes after the completions its wait returned are
+    /// drained, so a task woken by one of those completions is dropped too.
+    /// Work that must finish before exit has to complete before shutdown is
+    /// requested.
     ///
     /// The listeners stop accepting at once on Linux, and within about 100 ms
     /// elsewhere. A listener's sockets close, and its port is free, once the
@@ -1230,23 +1240,40 @@ impl RinglineBuilder {
                     Ok(Err(e)) => Some(e.to_string()),
                     Err(payload) => Some(format!("panic: {}", panic_payload(&**payload))),
                 };
+                let mut drain_panicked = false;
                 if let Some(cause) = cause {
                     event_loop.report_worker_exit(worker_id, &cause);
                     let drained =
                         catch_unwind(AssertUnwindSafe(|| event_loop.drain_after_failure()));
                     event_loop.report_worker_drained(worker_id);
-                    if drained.is_err() {
-                        let task_panic = event_loop.take_task_panic();
-                        // Safety: `event_loop` is leaked on the next line, so
-                        // nothing uses the ring again.
-                        unsafe { event_loop.close_ring() };
-                        std::mem::forget(event_loop);
-                        return match (task_panic, run_result) {
-                            (Some(panic), _) => Err(crate::error::Error::TaskPanicked(panic)),
-                            (None, Ok(result)) => result,
-                            (None, Err(payload)) => std::panic::resume_unwind(payload),
-                        };
-                    }
+                    drain_panicked = drained.is_err();
+                }
+                // A drain that panicked, or that ended with a disk command in
+                // flight, leaves memory the kernel can still use: leak the
+                // event loop, tasks included, since a task can own the buffer
+                // of an `fs::read`, `direct_io_read` or `nvme_read` (#824).
+                let kernel_holds_memory = !drain_panicked && event_loop.kernel_holds_memory();
+                if kernel_holds_memory {
+                    // Not `eprintln!`, which panics if stderr fails.
+                    let _ = std::io::Write::write_fmt(
+                        &mut std::io::stderr(),
+                        format_args!(
+                            "ringline: worker {worker_id} exited with a disk operation still \
+                             in flight; leaking its tasks and event loop\n"
+                        ),
+                    );
+                }
+                if drain_panicked || kernel_holds_memory {
+                    let task_panic = event_loop.take_task_panic();
+                    // Safety: `event_loop` is leaked on the next line, so
+                    // nothing uses the ring again.
+                    unsafe { event_loop.close_ring() };
+                    std::mem::forget(event_loop);
+                    return match (task_panic, run_result) {
+                        (Some(panic), _) => Err(crate::error::Error::TaskPanicked(panic)),
+                        (None, Ok(result)) => result,
+                        (None, Err(payload)) => std::panic::resume_unwind(payload),
+                    };
                 }
                 event_loop.drop_tasks();
                 // Under `TaskPanicPolicy::Shutdown`, a panic on this worker
@@ -3500,5 +3527,253 @@ mod worker_exit_tests {
         for handle in handles {
             let _ = handle.join();
         }
+    }
+}
+
+/// Worker exit and the fs, direct I/O and NVMe operations in flight (#824).
+#[cfg(all(test, has_io_uring))]
+mod disk_exit_tests {
+    use std::future::Future;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use crate::config::{ConfigBuilder, TestFault};
+    use crate::error::Error;
+    use crate::fs::{FsConfig, OpenFlags};
+    use crate::{AsyncEventHandler, Connection, RinglineBuilder, Runtime};
+
+    /// The tests share the statics below, and `cargo test` runs them on
+    /// parallel threads.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    static FIFO: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static READ_QUEUED: AtomicBool = AtomicBool::new(false);
+    static TASK_DROPPED: AtomicBool = AtomicBool::new(false);
+    /// The read's result, once it resolves.
+    static READ_RESULT: Mutex<Option<String>> = Mutex::new(None);
+
+    /// Records that the connection's task, which owns it, was dropped.
+    struct OnDrop;
+
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            TASK_DROPPED.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Reads from a FIFO through the raw-pointer `fs::read` into a buffer the
+    /// task owns: memory a worker that dropped its tasks too early would free
+    /// while the kernel can still write to it.
+    struct ReadsFromFifo;
+
+    impl AsyncEventHandler for ReadsFromFifo {
+        #[allow(clippy::manual_async_fn)]
+        fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+            async move {
+                // Held for the task's life: dropping the connection closes it,
+                // and closing it drops this task.
+                let _conn = conn;
+                let _guard = OnDrop;
+                let fifo = FIFO.lock().unwrap().clone().unwrap();
+                // Read-write, so the open does not wait for a writer and the
+                // read waits for data.
+                let file = crate::fs::open(&fifo, OpenFlags::READ_WRITE, 0)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let mut buf = vec![0u8; 4096];
+                // SAFETY: `buf` is owned by this task and outlives the read
+                // unless the task is dropped first, which is what these tests
+                // check the worker does not do while the read is in flight.
+                let read = unsafe { crate::fs::read(file, 0, buf.as_mut_ptr(), buf.len() as u32) }
+                    .unwrap();
+                READ_QUEUED.store(true, Ordering::SeqCst);
+                let result = read.await;
+                *READ_RESULT.lock().unwrap() = Some(format!("{result:?}"));
+                drop(buf);
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            ReadsFromFifo
+        }
+    }
+
+    struct Launched {
+        fifo: PathBuf,
+        runtime: Runtime,
+        handles: Vec<JoinHandle<Result<(), Error>>>,
+        _client: std::net::TcpStream,
+    }
+
+    /// Starts a one-worker runtime whose one connection's task has a FIFO read
+    /// in flight. With `keep`, the worker's exit submits no cancel for it,
+    /// standing in for an operation a cancel cannot end.
+    fn launch_with_read_in_flight(name: &str, keep: bool) -> Launched {
+        READ_QUEUED.store(false, Ordering::SeqCst);
+        TASK_DROPPED.store(false, Ordering::SeqCst);
+        *READ_RESULT.lock().unwrap() = None;
+        let dir = std::env::temp_dir().join(format!("ringline-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        *FIFO.lock().unwrap() = Some(fifo.clone());
+
+        let mut config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .sq_entries(64)
+            .max_connections(16)
+            .send_pool(16, 16384)
+            .blocking_threads(0)
+            .resolver_threads(0)
+            .spawner_threads(0)
+            .fs(FsConfig::default().max_files(4).max_commands_in_flight(64))
+            .build()
+            .expect("valid config");
+        let fault = Arc::new(TestFault::default());
+        fault
+            .keep_disk_commands_at_exit
+            .store(keep, Ordering::Release);
+        config.test_fault = Some(fault);
+        let (runtime, handles) = RinglineBuilder::new(config)
+            .bind("127.0.0.1:0".parse().unwrap())
+            .launch::<ReadsFromFifo>()
+            .expect("launch");
+        let client = std::net::TcpStream::connect(runtime.bound_addr().unwrap()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !READ_QUEUED.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the read was never queued");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The read's SQE is submitted at the loop's next flush.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            *READ_RESULT.lock().unwrap(),
+            None,
+            "the read resolved before shutdown"
+        );
+        assert!(
+            !TASK_DROPPED.load(Ordering::SeqCst),
+            "the task ended before shutdown"
+        );
+        Launched {
+            fifo,
+            runtime,
+            handles,
+            _client: client,
+        }
+    }
+
+    /// Shuts the runtime down and returns how long its workers took to exit.
+    fn shut_down_and_join(launched: &mut Launched) -> Duration {
+        let start = Instant::now();
+        launched.runtime.shutdown();
+        for h in std::mem::take(&mut launched.handles) {
+            h.join().expect("worker panicked").expect("worker failed");
+        }
+        start.elapsed()
+    }
+
+    /// Opens the FIFO for writing without waiting (the worker's open is a
+    /// reader) and writes to it, which completes the read. Best effort: once
+    /// the worker has closed its end the open fails with `ENXIO`, and the
+    /// caller's assertions report what happened.
+    fn complete_the_read(fifo: &PathBuf) {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut w) = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(fifo)
+        {
+            let _ = w.write_all(b"done");
+        }
+    }
+
+    fn remove(launched: &Launched) {
+        let _ = std::fs::remove_dir_all(launched.fifo.parent().unwrap());
+    }
+
+    /// A read the exit's cancel ends does not hold the worker: it exits at
+    /// once and drops its tasks.
+    #[test]
+    fn worker_exit_cancels_a_disk_read_in_flight() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut launched = launch_with_read_in_flight("exit-cancels", false);
+        let waited = shut_down_and_join(&mut launched);
+        remove(&launched);
+
+        assert!(
+            waited < Duration::from_secs(5),
+            "the worker took {waited:?} to exit: the read was not cancelled"
+        );
+        assert!(
+            TASK_DROPPED.load(Ordering::SeqCst),
+            "the worker leaked its tasks although the read was cancelled"
+        );
+    }
+
+    /// A read the exit does not cancel, which completes during the drain, is
+    /// waited for, and the worker then drops its tasks.
+    #[test]
+    fn worker_exit_waits_for_a_disk_read_it_does_not_cancel() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut launched = launch_with_read_in_flight("exit-waits", true);
+
+        const DELAY: Duration = Duration::from_millis(500);
+        let start = Instant::now();
+        let writer = {
+            let fifo = launched.fifo.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(DELAY);
+                complete_the_read(&fifo);
+            })
+        };
+        launched.runtime.shutdown();
+        for h in std::mem::take(&mut launched.handles) {
+            h.join().expect("worker panicked").expect("worker failed");
+        }
+        let waited = start.elapsed();
+        writer.join().unwrap();
+        remove(&launched);
+
+        assert!(
+            waited >= DELAY,
+            "the worker exited after {waited:?}, before the read completed at {DELAY:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the worker took {waited:?}: the read's completion did not end the wait"
+        );
+        assert!(
+            TASK_DROPPED.load(Ordering::SeqCst),
+            "the worker leaked its tasks although the read completed"
+        );
+    }
+
+    /// A read still in flight at the drain's 10 s bound leaves the task that
+    /// owns its buffer undropped: the worker leaks its event loop.
+    #[test]
+    fn worker_exit_leaks_its_tasks_when_a_disk_read_outlasts_the_drain() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut launched = launch_with_read_in_flight("exit-leaks", true);
+        let waited = shut_down_and_join(&mut launched);
+        let dropped = TASK_DROPPED.load(Ordering::SeqCst);
+        complete_the_read(&launched.fifo);
+        remove(&launched);
+
+        assert!(
+            waited >= Duration::from_secs(9),
+            "the worker exited after {waited:?} with a read in flight"
+        );
+        assert!(
+            !dropped,
+            "the task owning the in-flight read's buffer was dropped"
+        );
     }
 }

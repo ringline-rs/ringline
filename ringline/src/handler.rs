@@ -1582,6 +1582,9 @@ impl<'a> DriverCtx<'a> {
             device.index as u32,
             key,
         );
+        if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
             Ok(()) => {
@@ -1650,6 +1653,9 @@ impl<'a> DriverCtx<'a> {
             device.index as u32,
             key,
         );
+        if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
             Ok(()) => {
@@ -1699,6 +1705,9 @@ impl<'a> DriverCtx<'a> {
             device.index as u32,
             key,
         );
+        if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
             Ok(()) => {
@@ -1868,6 +1877,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) } {
             Ok(()) => {
@@ -1930,6 +1942,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe {
             self.ring
@@ -1981,6 +1996,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match self.ring.submit_direct_fsync(fd_index, ud) {
             Ok(()) => {
@@ -2119,6 +2137,9 @@ impl<'a> DriverCtx<'a> {
             file_index as u32,
             key,
         );
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe {
             self.ring
@@ -2173,6 +2194,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) } {
             Ok(()) => {
@@ -2228,6 +2252,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe {
             self.ring
@@ -2276,6 +2303,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match self.ring.submit_direct_fsync(fd_index, ud) {
             Ok(()) => {
@@ -2355,6 +2385,9 @@ impl<'a> DriverCtx<'a> {
             }
         };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_statx(path_ptr, statx_ptr, ud.raw()) } {
             Ok(()) => Ok(key),
@@ -2407,6 +2440,9 @@ impl<'a> DriverCtx<'a> {
             }
         };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_renameat(old_ptr, new_ptr, ud.raw()) } {
             Ok(()) => Ok(key),
@@ -2456,6 +2492,9 @@ impl<'a> DriverCtx<'a> {
             }
         };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_unlinkat(path_ptr, 0, ud.raw()) } {
             Ok(()) => Ok(key),
@@ -2505,6 +2544,9 @@ impl<'a> DriverCtx<'a> {
             }
         };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_mkdirat(path_ptr, mode, ud.raw()) } {
             Ok(()) => Ok(key),
