@@ -873,6 +873,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                             cs.note_eof(!close_notify_seen);
                         }
+                        let established = self
+                            .driver
+                            .connections
+                            .get(conn_index)
+                            .is_some_and(|c| c.established);
+                        if !established {
+                            // The handshake has not completed, so no task
+                            // holds the connection and nothing else would
+                            // close it. Close it here. An outbound connect
+                            // resolves with `handshake_eof()`; an inbound
+                            // connection has no task to report to.
+                            self.executor
+                                .wake_connect(conn_index, Err(crate::tls::handshake_eof()));
+                            self.driver.close_connection(conn_index);
+                            break;
+                        }
                         self.executor.wake_recv(conn_index);
                         break;
                     }
@@ -3069,6 +3085,63 @@ mod tests {
         let mut recv_buf = vec![0u8; 4096];
         el.handle_readable(conn_index, &mut recv_buf, false);
         assert_half_open(&el, conn_index, true);
+    }
+
+    /// Deliver a FIN to a TLS connection whose handshake has not completed.
+    /// `outbound` registers a connect waiter first, as a parked
+    /// `connect(..).tls(..)` does.
+    fn fin_before_the_tls_handshake_completes(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        outbound: bool,
+    ) -> u32 {
+        let (conn_index, client) = attach_conn(&mut el.driver);
+        let _peer = install_handshaked_tls(el, conn_index);
+        let cs = el.driver.connections.get_mut(conn_index).unwrap();
+        cs.established = false;
+        cs.outbound = outbound;
+        if outbound {
+            el.executor.connect_waiters[conn_index as usize] = true;
+        }
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("peer half-close");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut recv_buf = vec![0u8; 4096];
+        el.handle_readable(conn_index, &mut recv_buf, false);
+        conn_index
+    }
+
+    /// A FIN before the TLS handshake completes closes the connection. No
+    /// task holds an inbound connection until its handshake completes, so
+    /// nothing else would close it and the slot would be held until the
+    /// worker exits.
+    #[test]
+    fn a_tls_fin_before_the_handshake_completes_closes_the_connection() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let conn_index = fin_before_the_tls_handshake_completes(&mut el, false);
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert_eq!(cs.read, ReadHalf::Eof { truncated: true });
+        assert!(cs.close_requested(), "no task holds it to close it");
+        assert!(el.driver.pending_closes.contains(&conn_index));
+    }
+
+    /// The same FIN on an outbound connection resolves the connect with
+    /// `UnexpectedEof` and closes the connection.
+    #[test]
+    fn a_tls_fin_before_the_handshake_completes_fails_the_connect() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let conn_index = fin_before_the_tls_handshake_completes(&mut el, true);
+        assert!(!el.executor.connect_waiters[conn_index as usize]);
+        match el.executor.io_results[conn_index as usize].take() {
+            Some(crate::runtime::IoResult::Connect(Err(e))) => {
+                assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+            }
+            _ => panic!("the connect waiter was not given an error"),
+        }
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(cs.close_requested(), "the failed connect holds no slot");
     }
 
     /// `on_accept` queues an awaited send, hands the unpolled future to a

@@ -897,6 +897,15 @@ pub(crate) fn record_layer_error(e: ringline_tls::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
+/// The error an outbound connect resolves with when the peer's FIN arrives
+/// before the TLS handshake completes.
+pub(crate) fn handshake_eof() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "peer closed the connection during the TLS handshake",
+    )
+}
+
 /// Result of feeding ciphertext into a TLS connection.
 pub enum TlsRecvResult {
     /// Data processed successfully.

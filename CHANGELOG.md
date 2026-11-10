@@ -294,8 +294,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   their pools reconnect a slot whose server closed, as before. On TLS, a
   send after the peer's close_notify is encrypted and sent, including one
   whose encrypt deframes the alert; the task's return then sends this side's
-  close_notify and the FIN. Connection-close audit L1, #809
-  (`docs/half-close-design.md`,
+  close_notify and the FIN. A FIN before the TLS handshake completes still
+  closes the connection, because no task holds it yet, and an outbound
+  `connect(..).tls(..)` then resolves `UnexpectedEof` (#849). Connection-close
+  audit L1, #809 (`docs/half-close-design.md`,
   `docs/journal/2026-11-connection-close-audit.md`).
 
 - `with_data_result` reports a TLS record the engine cannot process (a bad
