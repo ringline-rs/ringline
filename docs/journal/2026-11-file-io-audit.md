@@ -74,13 +74,13 @@ Tests that exist: `ringline/tests/fs.rs`, `direct_io.rs` (both backends), `disk_
 | 4 | in-flight memory stays valid | broken by #824 and #825 (known); holds for the owned-buffer futures |
 | 5 | one owner per fd, close-on-exec, no fd leak | holds |
 | 6 | off-owner drop touches no other worker | holds; what it leaks is undocumented (F10) |
-| 7 | handlers validate CQEs, never panic | holds, by construction: no entry stores its key, so a stale CQE on a reused slab index would be accepted, which nothing can produce today |
+| 7 | handlers validate CQEs, never panic | partly: handlers check `in_use`, not the key, so a stale CQE on a reused slab index would be accepted; nothing produces one today, since a slot is released only by its own completion |
 | 8 | results faithful | broken by F4 (`is_symlink` never true) and F7 (NVMe status word discarded) |
 | 9 | failed submit leaves nothing half-submitted | holds for the release; the text "a full SQ is an error" is wrong (P3): a full SQ submits synchronously, and only an enter failure (`EINTR`, `EBUSY`, `EAGAIN`) reaches the caller |
 | 10 | mio pool ownership | holds |
-| 11 | docs state current behaviour | broken by F5, F6, F8, F9, F10 |
+| 11 | docs state current behaviour | broken by F4, F5, F6, F7, F8, F9, F10 |
 | 12 | exit leaves no file open | holds within #824's limit |
-| 13 | per-operation cost | broken by F5 (no mio bound), P1, P2 and the known #845 |
+| 13 | per-operation cost | broken by F5 (no mio bound), P1, P2, P4 and the known #845 |
 
 ## Findings
 
@@ -88,17 +88,17 @@ Status words: **confirmed** means the auditor ran it (mio, this host) or the anv
 
 ### F1 — io_uring: `fs::close` unregisters the fixed file before the loop submits the SQEs of the same poll (invariant 2). Traced; anvil confirmed: experiment `01a1c583-4481-714a-9765-e8998cd35b21`, the write completed `Err(EBADF)` and the file stayed empty.
 
-`ringline/src/handler.rs:2301-2314`: `fs_close` runs `register_files_update(fd_index, &[-1])`, a synchronous `io_uring_register`, and releases the slot. The read, write and fsync SQEs pushed earlier in the same task poll are still in the user-space SQ (`push_sqe128` submits early only when the SQ is full) until the loop's `flush()` after `poll_ready_tasks`. The kernel resolves a fixed file when it issues the request, inside the `io_uring_enter` that submits it, so an fs operation issued before `close` in one poll finds an empty slot and completes with `-EBADF`; it succeeds only if the SQ happened to fill between the two calls. Direct I/O and NVMe defer the close while `in_flight > 0` and are not affected; on mio the same sequence lands in the file, pinned by `tests/fs_fd_ownership.rs::a_queued_write_lands_in_its_file_after_close`. This sharpens #845's "the kernel's file reference keeps the fd alive": that reference exists only for SQEs the kernel has seen. The `fs::close` doc is accurate ("on success the handle is invalid and its slot is free when this returns") and the backends differ.
+`ringline/src/handler.rs:2301-2314`: `fs_close` runs `register_files_update(fd_index, &[-1])`, a synchronous `io_uring_register`, and releases the slot. The read, write and fsync SQEs pushed earlier in the same task poll are still in the user-space SQ (`push_sqe128` submits early only when the SQ is full) until the loop's `flush()` after `poll_ready_tasks`. The kernel resolves a fixed file when it issues the request, inside the `io_uring_enter` that submits it (from memory of the kernel source; the run below shows the `EBADF`, not the mechanism), so an fs operation issued before `close` in one poll finds an empty slot and completes with `-EBADF`; it succeeds only if the SQ happened to fill between the two calls. Direct I/O and NVMe defer the close while `in_flight > 0` and are not affected; on mio the same sequence lands in the file, pinned by `tests/fs_fd_ownership.rs::a_queued_write_lands_in_its_file_after_close`. This narrows #845's "Nothing breaks today because the kernel holds file references": the reference exists only for SQEs the kernel has seen. The `fs::close` doc is accurate ("on success the handle is invalid and its slot is free when this returns") and the backends differ.
 
 Fix: the deferred close #845 proposes, in the shape of `close_direct_io_file`: a `closing` flag on `FsFileState`, refused by `validate_fs_file`, with `handle_fs` running the unregister and the release when `in_flight` reaches zero. `in_flight` is already maintained. Test: `a_write_issued_before_close_in_the_same_poll_lands` on the reproduction branch, both backends.
 
-### F2 — a path with an interior NUL leaks a direct I/O or NVMe table slot, both backends (invariant 1). Confirmed (mio run; io_uring identical code).
+### F2 — a path with an interior NUL leaks a direct I/O or NVMe table slot, both backends (invariant 1). Confirmed (mio run; anvil run `01a1c583-4481-714a-9765-e8998cd35b21`, same output).
 
-`handler.rs:1786-1795` (direct I/O, io_uring), `:1498-1506` (NVMe), `:3221-3232` (direct I/O, mio): `files.allocate()` runs before `CString::new(path)`, and the `?` on the conversion returns without `files.release(index)`. `fs_open` on both backends converts first. Run with `max_files(2)`: three `open_direct_io_file("a\0b")` return `invalid file path`, `invalid file path`, `direct I/O file table full`, and a valid open afterwards fails with `direct I/O file table full` until the worker exits. Fix: convert the path before allocating, at the three sites. Test: `a_nul_path_does_not_leak_a_direct_io_slot` on the reproduction branch.
+`handler.rs:1786-1795` (direct I/O, io_uring), `:1498-1506` (NVMe), `:3221-3232` (direct I/O, mio): `files.allocate()` runs before `CString::new(path)`, and the `?` on the conversion returns without `files.release(index)`. `fs_open` on both backends allocates first too, but releases the slot in an `inspect_err` on the conversion. Run with `max_files(2)`: three `open_direct_io_file("a\0b")` return `invalid file path`, `invalid file path`, `direct I/O file table full`, and a valid open afterwards fails with `direct I/O file table full` until the worker exits. Fix: convert the path before allocating, at the three sites. Test: `a_nul_path_does_not_leak_a_direct_io_slot` on the reproduction branch.
 
 ### F3 — the 16-bit generation wraps: a stale handle validates again after 65,536 releases of its slot and acts on the new occupant (invariant 2). Confirmed (mio run).
 
-`fs.rs:322-328`, `direct_io.rs:181-188`, `nvme.rs:291-298`: `release` does `generation.wrapping_add(1)` and the validators compare for equality. The free list is LIFO, so an open/close loop reuses one slot. Run (direct I/O, `max_files(1)`): a handle kept from the first open, 65,535 open/close cycles (0.95 s on mio), a new open landing on slot 0 with generation 0 again; `close_direct_io_file(first)` returned `Ok` and closed the new file, and the new handle's own close then failed as invalid. Deferred direct I/O and NVMe closes bump twice, so 32,768 there. Nothing documents the limit. Fix: widen `generation` to `u32` in the three tables and handles (the handles are opaque, `Copy` and `!Send`; the size goes from 4 to 8 bytes), or document the wrap as a limitation. Test: the probe above, both backends.
+`fs.rs:322-328`, `direct_io.rs:181-188`, `nvme.rs:291-298`: `release` does `generation.wrapping_add(1)` and the validators compare for equality. The free list is LIFO, so an open/close loop reuses one slot. Run (direct I/O, `max_files(1)`): a handle kept from the first open, 65,535 open/close cycles (0.90 s on mio in the saved run), a new open landing on slot 0 with generation 0 again; `close_direct_io_file(first)` returned `Ok` and closed the new file, and the new handle's own close then failed as invalid. Deferred direct I/O and NVMe closes bump twice, so 32,768 there. Nothing documents the limit. Fix: widen `generation` to `u32` in the three tables and handles (the handles are opaque, `Copy` and `!Send`; the size goes from 4 to 8 bytes), or document the wrap as a limitation. Test: the probe above, both backends.
 
 ### F4 — `Metadata::is_symlink` is never true: both backends stat through the link (invariants 8, 11). Confirmed (mio run; io_uring by the statx flags, anvil confirmed in the same run: `is_symlink=false is_file=true`).
 
@@ -110,11 +110,11 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 
 ### F6 — `disk_io_threads(0)` with fs or direct I/O configured passes validation; the documented error kind is wrong; a direct I/O open succeeds and its operations fail (invariant 11). Confirmed (mio run).
 
-`config.rs:386` and `:1243` say operations "return `Unsupported`"; `submit_disk_io` returns `io::Error::other("disk I/O pool not configured")`, kind `Other`. Run: `fs::open` fails with that error; `open_direct_io_file` (synchronous, no pool) returns `Ok` and the first read fails with the same message. `Config::validate` has no check. Fix: reject `disk_io_threads == 0` with `fs` or `direct_io` set on the mio build, or document the kind and the message.
+`config.rs:386` says operations "return `Unsupported`" (`:1243` says only "0 = disabled"); `submit_disk_io` returns `io::Error::other("disk I/O pool not configured")`, kind `Other`. Run: `fs::open` fails with that error; `open_direct_io_file` (synchronous, no pool) returns `Ok` and the first read fails with the same message. `Config::validate` has no check. Fix: reject `disk_io_threads == 0` with `fs` or `direct_io` set on the mio build, or document the kind and the message.
 
 ### F7 — io_uring: the NVMe status word is discarded, and three public types describe a completion handler that does not exist (invariants 8, 11). Traced.
 
-`event_loop.rs:4303-4308` maps a positive `cqe->res` (the device status word, e.g. 0x281 media error) to `-EIO`; the caller cannot tell a media error from an invalid field, and no doc on `nvme_read`/`nvme_write`/`nvme_flush` says so. The only public text on the status word is `NvmeCompletion::is_success` (`nvme.rs:366-388`, exported from `lib.rs`), a type nothing constructs; `DirectIoCompletion` and `DirectIoOp` (`direct_io.rs:28`, `:256-285`) are public for the same dead reason, and their docs ("Delivered to the ... completion handler") name a handler removed when `DriverCtx` went private (CHANGELOG Unreleased, the `DriverCtx` entry). Fix: carry the status word in the error (an `io::Error::other` wrapping it) or document `Err(EIO)`; remove the three types under the Unreleased breaking entries. The `is_success` doc stays false until then.
+`event_loop.rs:4303-4308` maps a positive `cqe->res` (the device status word, e.g. 0x281 media error) to `-EIO`; the caller cannot tell a media error from an invalid field, and no doc on `nvme_read`/`nvme_write`/`nvme_flush` says so. The only public text on the status word is `NvmeCompletion::is_success` (`nvme.rs:366-388`, exported from `lib.rs`), a type nothing constructs; `DirectIoCompletion` and `DirectIoOp` (`direct_io.rs:28`, `:256-285`) are public and likewise unused, and their docs ("Delivered to the ... completion handler") name a completion handler that has never existed in this repository: the types have been re-exported and unconstructed since the initial commit. Fix: carry the status word in the error (an `io::Error::other` wrapping it) or document `Err(EIO)`; remove the three types under the Unreleased breaking entries. Until then `is_success`'s comment is the only description of the status word.
 
 ### F8 — `OpenFlags::READ | OpenFlags::WRITE` is `WRITE` (invariant 11). Confirmed by the constants.
 
@@ -122,7 +122,7 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 
 ### F9 — operations on one file are unordered on both backends, and `fs::fsync` reads as covering unresolved writes (invariant 11). Confirmed (reviewer's mio probe; io_uring by Domain Invariant 2).
 
-`disk_io_pool.rs:92-103`: N threads take requests from one channel with no per-file ordering. On io_uring the SQEs are independent (Domain Invariant 2). `fs::fsync` (`fs.rs:1000`) says "Fsync a file, flushing all data and metadata to disk"; `direct_io_fsync` says it correctly ("every write to `file` that completed before the call"). The reviewer's probe on mio with two pool threads: a 32 MiB `write_from` followed by `fsync`, both created before awaiting, resolved the fsync first in 19 of 20 runs; a later 4 KiB write to offset 0 lost to the earlier large write in 1 of 20. Fix: a paragraph in the fs module doc (operations are independent; a write is in the file when its future resolves; `fsync` covers writes whose futures have resolved) and the sentence on `fsync`. Whether fs should offer ordering (linked SQEs, per-file serialisation) is L1.
+`disk_io_pool.rs:92-103`: N threads take requests from one channel with no per-file ordering. On io_uring the SQEs are independent (Domain Invariant 2). `fs::fsync` (`fs.rs:1000`) says "Fsync a file, flushing all data and metadata to disk"; `direct_io_fsync` says it correctly ("every write to `file` that completed before the call"). The reviewer's probe on mio with two pool threads: a 32 MiB `write_from` followed by `fsync`, both created before awaiting, resolved the fsync first in 19 of 20 runs; a later 4 KiB write to offset 0 lost to the earlier large write in 1 of 20 (4 of 20 on the record reviewer's rerun; one-run counts). Fix: a paragraph in the fs module doc (operations are independent; a write is in the file when its future resolves; `fsync` covers writes whose futures have resolved) and the sentence on `fsync`. Whether fs should offer ordering (linked SQEs, per-file serialisation) is L1.
 
 ### F10 — docs and comments false or missing at 6851de26 (invariant 11). Confirmed by quote and grep.
 
@@ -131,33 +131,33 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 - `DiskIoFuture`'s output is undocumented: bytes for reads and writes, `0` for fsync, rename, remove, mkdir, `direct_io_fsync` and every NVMe command.
 - `NvmeUringCmd::read`/`write` (`nvme.rs:91`, `:122`) panic on `num_blocks == 0` with no `# Panics` section.
 - `ConfigBuilder::nvme`/`direct_io`/`fs` (`config.rs:1195-1207`) restate the signature; what a reader needs is that each reserves `max_devices`/`max_files` fixed-file slots per worker on io_uring, and that `nvme(...)` on mio is accepted and every NVMe call fails.
-- `runtime/io.rs:5083-5091`, `:5146-5155` and the direct I/O module doc describe io_uring only: the opens are a blocking `open(2)` plus a synchronous register (#845); on mio the open uses `F_NOCACHE` on macOS, where the module doc's alignment and `-EINVAL` claims do not apply; "Linux 5.6+" is moot under the 6.1 floor; the NVMe functions' "completes when the io_uring CQE arrives" is a pool result on mio, where they fail at submit.
-- `fs.rs:1021-1027` (`fs::close`) says nothing about operations in flight on io_uring (F1, #845). `fs.rs:4` "File operations do not block the worker thread": `close` and the direct I/O and NVMe opens and closes do. `fs.rs:433` "asynchronously via io_uring": the pool on mio.
-- `fs.rs:719-721`: the effective read length limit is `i32::MAX`, not `u32::MAX` (macOS rejects more with `EINVAL`; Linux caps at `0x7ffff000`); no truncation happens.
+- `runtime/io.rs:5083-5091`, `:5146-5155` and the direct I/O module doc describe io_uring only: the opens are a blocking `open(2)` plus a synchronous register (#845); on mio the open uses `F_NOCACHE` on macOS, where the module doc's alignment and `-EINVAL` claims do not apply; "Linux 5.6+" is below the 6.1 floor; the NVMe functions' "completes when the io_uring CQE arrives" is a pool result on mio, where they fail at submit.
+- `fs.rs:1021-1027` (`fs::close`) says nothing about operations in flight on io_uring (F1, #845). `fs.rs:4` "File operations do not block the worker thread": `close` and the direct I/O and NVMe opens and closes do. `fs.rs:429` "asynchronously via io_uring": the pool on mio.
+- `fs.rs:719-721`: the effective read length limit is `i32::MAX`, not `u32::MAX` (macOS rejects more with `EINVAL`; Linux caps at `0x7ffff000`, `MAX_RW_COUNT`, from memory of the kernel source); no truncation happens.
 - A disk-I/O submit that finds the SQ full runs `io_uring_enter` inline (`engine/uring.rs:255-274`) and an `EINTR`, `EBUSY` or `EAGAIN` from it reaches the caller as the operation's error, with everything released; no entry point documents it (P3).
 - `runtime/mod.rs:959`: `wake_disk_io` carries `#[cfg_attr(not(has_io_uring), allow(dead_code))]` and the mio drain calls it.
 - Style: `fs.rs:714-715` argues for the design ("This avoids the use-after-free that motivates the `unsafe` on `read()`"); `direct_io.rs:5-7` compares instead of describing; `nvme.rs:17-19` documents three constants with one comment; `fs.rs:23-25` lists reads among the pool operations where a page-cache miss on ext4, XFS and btrfs retries from task work instead (kernel `io_rw_should_retry`, from memory of the source).
 - Unverifiable here: the measured io-wq table in the fs module doc has no spec or run in the repository; the overlayfs/tmpfs `FMODE_NOWAIT` claims; the `dsync` FUA and flush claims.
 
-### P1 — mio: about 7 µs per serial operation, 20× the `pread` floor, with three avoidable parts (invariant 13). Measured by the performance reviewer on this host (Apple M4 Max, release build, one worker, 4 KiB page-cache reads, N = 20,000, three runs in each of three processes; spread 2% within a process, 20% between).
+### P1 — mio: about 7 µs per serial operation, 20× the `pread` floor, with three avoidable parts (invariant 13). Measured by the performance reviewer on this host (Apple M4 Max, release build, one worker, 4 KiB page-cache reads, N = 20,000, three runs in each of three processes; spread under 2% within a process except one run, 8.20 µs against 6.90 in the same process; 20% between processes).
 
 | mode | µs per op | allocations per op |
 |---|---|---|
 | `pread(2)` floor | 0.33 to 0.37 | |
 | serial `read_into` | 6.9 to 8.4 | 2.07 |
 | depth 64, 2 pool threads | 0.85 to 0.90 | 3.5 (includes `join_all`'s own) |
-| depth 64, 1 thread / 4 threads | 0.76 / 1.15 | |
+| depth 64, 1 thread / 4 threads | 0.76 to 0.77 / 1.15 | |
 | serial `stat` | 7.9 to 9.7 | 3.07 |
 
-The serial cost is the two thread hand-offs; the design accepts that. Avoidable: `mio/event_loop.rs:274-275` allocates a `Vec` of events on every loop iteration (one of the two allocations per serial read; the other is the required closure `Box`); `disk_io_pool.rs:100-102` writes the wake pipe once per completion with no coalescing on the writer (the reader coalesces); `mio/event_loop.rs:468-472` re-registers the wake fd after every drain, which kqueue needs and Linux's epoll does not. More pool threads made pipelined throughput worse (1 thread 0.77, 4 threads 1.15), so the worker side bounds it at this size; not profiled.
+The serial cost is the two thread hand-offs; the design accepts that. Avoidable: `mio/event_loop.rs:274-275` allocates a `Vec` of events on every loop iteration (one of the two allocations per serial read; the other is the required closure `Box`); `disk_io_pool.rs:100-102` writes the wake pipe once per completion with no coalescing on the writer (the reader coalesces); `mio/event_loop.rs:468-472` re-registers the wake fd after every drain, which kqueue needs and Linux's epoll does not. More pool threads made pipelined throughput worse (1 thread 0.76 to 0.77, 4 threads 1.15), so the worker side bounds it at this size; not profiled.
 
-### P2 — io_uring: twelve hash operations, a 59-field context and a redundant waiter registration per operation, and a `Box<libc::statx>` per stat (invariant 13). By reading; cost estimated, not measured.
+### P2 — io_uring: twelve hash operations, a `DriverCtx` of about thirty fields and a redundant waiter registration per operation, and a `Box<libc::statx>` per stat (invariant 13). By reading; cost estimated, not measured.
 
-Per `fs::read_into`: one 128-byte SQE, one CQE, no syscall of its own, no allocation, no io-wq on a page-cache hit; and twelve SipHash operations over `disk_io_waiters`, `disk_io_results`, `disk_io_graveyard` and `DISK_IO_LIVE` (`wait_disk_io` runs at creation, `fs.rs:750`, and again on the first poll, `fs.rs:839`), plus `make_ctx()` building a 59-field `DriverCtx` (`uring/driver.rs:1240-1300`) and an `in_flight` increment and decrement nothing reads (#845). `fs::stat` allocates a `Box<libc::statx>` per call (`handler.rs:2330`); an inline `statx` in `FsCmdEntry` costs 256 bytes × `max_commands_in_flight`. Against a page-cache read the bookkeeping is a minority; against NVMe passthrough at depth it is the worker's whole per-command CPU. The maps exist for stale-result rejection (#574), which a slot-indexed table with the 14-bit sequence as the slot's generation would give in O(1) (L3).
+Per `fs::read_into`: one 128-byte SQE, one CQE, no syscall of its own, no allocation, no io-wq on a page-cache hit; and twelve SipHash operations over `disk_io_waiters`, `disk_io_results`, `disk_io_graveyard` and `DISK_IO_LIVE` (`wait_disk_io` runs at creation, `fs.rs:750`, and again on every pending poll, `fs.rs:854`), plus `make_ctx()` building a `DriverCtx` of about thirty fields (`uring/driver.rs:1240-1300`) and an `in_flight` increment and decrement nothing reads (#845). `fs::stat` allocates a `Box<libc::statx>` per call (`handler.rs:2330`); an inline `statx` in `FsCmdEntry` costs 256 bytes × `max_commands_in_flight`. Against a page-cache read the bookkeeping is a fraction of the cost; against NVMe passthrough at depth it is most of the worker's per-command CPU; neither is measured. The maps exist for stale-result rejection (#574), which a slot-indexed table with the 14-bit sequence as the slot's generation would give in O(1) (L3).
 
 ### P3 — io_uring: a full SQ submits synchronously inside the task poll (invariant 9's text). Traced.
 
-`engine/uring.rs:255-274`: `push_sqe128` on a full SQ calls `make_sq_room(1)`, one `io_uring_enter` on the worker, and errors only if the SQ is still full. The three slabs allow 768 disk SQEs against `sq_entries` 256. Not a user-visible cost at the defaults; it corrects invariant 9 and feeds F10's undocumented errors.
+`engine/uring.rs:255-274`: `push_sqe128` on a full SQ calls `make_sq_room(1)`, one `io_uring_enter` on the worker, and errors only if the SQ is still full. The three slabs allow 768 disk SQEs against `sq_entries` 256. Not a user-visible cost at the defaults; it corrects invariant 9 and is the source of the undocumented errors in F10.
 
 ### P4 — io_uring: 16,384 keys per slab slot, with LIFO slot reuse (invariant 13). By reading; low.
 
@@ -166,8 +166,8 @@ A serial workload lands every operation on one slab slot; a future that complete
 ## Known before the audit
 
 - #824: `run_shutdown` does not wait for the three command slabs; the driver
-  is freed while the kernel may still use caller buffers, statx boxes and
-  paths.
+  is freed while the kernel may still use caller buffers and statx boxes
+  (paths are probably copied at prep).
 - #825: the raw-pointer APIs' safety contract ("until the returned future
   completes") cannot be met when the future is dropped; direct I/O and NVMe
   have no owned-buffer variant.
@@ -181,13 +181,13 @@ A serial workload lands every operation on one slab slot; a future that complete
 - L2 — The mio pool costs two thread hand-offs per operation, about 7 µs serial on this host against 0.35 µs for the syscall (P1). The design accepts mio as correct rather than fast; the avoidable parts in P1 are the only cheap wins.
 - L3 — The completion-key machinery is four hash maps keyed by a 32-bit key whose only purpose is stale-result rejection; a slot-indexed table per subsystem with the 14-bit sequence as the slot's generation gives the same property in O(1) and removes the 16,384-keys-per-slot limit (P2, P4). A refactor of `Executor`'s disk-I/O state and the five futures.
 - L4 — One disk-I/O pool per worker (the code) or one per runtime (the docs)? Per worker isolates workers from each other's backlog and multiplies threads; per runtime is what `disk_io_pool.rs` describes and what `spawn_blocking`'s pool does (F5).
-- L5 — The raw-pointer APIs (#825) and the fs/direct I/O duplication with blocking opens (#845) are known and filed; this audit adds F1 as the sharpest consequence of the un-deferred `fs_close`.
+- L5 — The raw-pointer APIs (#825) and the fs/direct I/O duplication with blocking opens (#845) are known and filed; this audit adds F1, a consequence of the un-deferred `fs_close` that #845 does not state.
 - L6 — The 16-bit generation (F3): widen, or document the wrap?
 
 ## What the audit did not cover
 
 - Nothing ran on io_uring except the reproduction run named below; every other io_uring statement is a trace. The NVMe path ran on no device.
-- The kernel claims in the fs module doc: which filesystems give `FMODE_NOWAIT` (overlayfs, tmpfs), the io-wq pool-size formula, the measured delay table (no spec or run in the repository), and `O_DSYNC`'s FUA and flush behaviour under io_uring versus `pwrite`. Reviewers checked them against memory of the kernel source and said so.
+- The kernel claims in the fs module doc: which filesystems give `FMODE_NOWAIT` (overlayfs, tmpfs), the io-wq pool-size formula, and the measured delay table (no spec or run in the repository); and `DirectIoOpenOptions::dsync`'s FUA and flush claims (`direct_io.rs:51-62`) under io_uring versus `pwrite`. Reviewers checked them against memory of the kernel source and said so.
 - A profile of the mio worker under pipelined disk I/O (P1's depth-64 figures are measured; what bounds them is not).
 - Registered buffers for direct I/O and NVMe (#841) beyond the reviewer's estimate; SQE/CQE sizing (#837).
 - `fs::rename`, `remove`, `mkdir` and `stat` beyond their docs and error paths; the `Metadata` conversions were compared field by field but not run against unusual inodes (devices, sockets).
@@ -195,7 +195,7 @@ A serial workload lands every operation on one slab slot; a future that complete
 
 ## Reproductions
 
-- F2, F3: the ownership reviewer's probe crate, rerun by the auditor on mio (`cargo test --test ownership`): `a_nul_path_leaks_the_direct_io_slot`, `a_stale_handle_validates_again_after_65536_releases`, both reproduce (65,535 cycles in 0.95 s).
+- F2, F3: the ownership reviewer's probe crate, rerun by the auditor on mio (`cargo test --test ownership`): `a_nul_path_leaks_the_direct_io_slot`, `a_stale_handle_validates_again_after_65536_releases`, both reproduce (65,535 cycles in 0.90 s in the saved run; 0.95 s on the auditor's rerun).
 - F4, F6: the auditor's probe (`audit-probes/tests/docs.rs`): `stat(link)` reports `is_symlink=false is_file=true`; `fs::open` with `disk_io_threads(0)` fails with kind `Other`, "disk I/O pool not configured".
 - F5: the auditor's probe (`audit-probes/tests/inflight.rs`): 8 of 8 `read_into` submitted with `max_commands_in_flight(4)`.
 - F9: the mio reviewer's probe: fsync before its preceding 32 MiB write in 19 of 20 runs with two pool threads.
