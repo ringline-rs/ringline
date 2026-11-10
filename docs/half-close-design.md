@@ -38,6 +38,25 @@ error, a write error or a TLS failure (`abort_connection`,
 Read errors are unchanged: a reset or a socket error still sets
 `ReadHalf::Error`, reports to the reader and closes.
 
+One FIN still closes: a FIN on a TLS connection whose handshake has not
+completed. No task holds the connection until then (an inbound connection's
+`on_accept` task is spawned at completion, and an outbound
+`connect(..).tls(..)` is still parked), so nothing would close it. The FIN
+sets `ReadHalf::Eof { truncated: true }`, an outbound connect resolves
+`UnexpectedEof`, and the connection closes (`handle_tls_recv_direct` on
+io_uring, the TLS `Ok(0)` arm of `handle_readable` on mio). Without the
+close, an inbound slot would be held until the worker exits and an outbound
+connect would never resolve.
+
+A close_notify received before the handshake completes is not recorded as a
+close: ringline-tls records one only once application data may be received.
+A warning-level one is ignored until TLS 1.3 is negotiated; after that it is
+an error, which ringline-tls answers with a fatal `decode_error` alert. A
+fatal-level one is an error. So `TlsRecvResult::Closed` is not produced
+before the handshake completes, and the `Closed` arms need no such check. A
+peer whose alert is ignored and that keeps the socket open holds the
+connection as a peer that sends nothing does: the handshake has no deadline.
+
 There is no knob to restore the old policy. 0.7 is a breaking release, and
 a handler that wants the old behaviour returns when a read resolves `0`.
 

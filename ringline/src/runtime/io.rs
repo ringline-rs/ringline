@@ -695,8 +695,10 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// destination is the buffer rustls processes records in, so no copy is made
 /// before decryption; with the `tls-buffered` feature it is a buffer rustls
 /// copies the ciphertext from. Decrypted plaintext goes to the accumulator.
-/// During the handshake a receive is re-armed after each completion. After
-/// it, a receive is armed when a read parks, as on a plaintext connection.
+/// During the handshake a receive is re-armed after each completion. A FIN
+/// before the handshake completes closes the connection, and an outbound
+/// connect resolves `UnexpectedEof`. After the handshake, a receive is armed
+/// when a read parks, as on a plaintext connection.
 /// When the `POLLRDHUP` poll fires because the peer sent a FIN or reset while
 /// nothing reads, the runtime arms one and re-arms it after each completion
 /// until the receive reads the close_notify, returns 0 at the FIN, or fails.
@@ -778,6 +780,9 @@ impl TcpConnect {
     /// Requires a client configuration from
     /// [`ConfigBuilder::tls_client`](crate::ConfigBuilder::tls_client); without
     /// one the connect fails when awaited.
+    ///
+    /// If the peer's FIN arrives before the handshake completes, the connect
+    /// resolves [`UnexpectedEof`](io::ErrorKind::UnexpectedEof).
     pub fn tls(mut self, server_name: impl Into<String>) -> Self {
         self.server_name = Some(server_name.into());
         self

@@ -1364,6 +1364,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                     cs.note_eof(close_notify_seen == Some(false));
                 }
+                let established = self
+                    .driver
+                    .connections
+                    .get(conn_index)
+                    .is_some_and(|c| c.established);
+                if !established {
+                    // The handshake has not completed, so no task holds the
+                    // connection and nothing else would close it. Close it
+                    // here. An outbound connect resolves with
+                    // `handshake_eof()`; an inbound connection has no task to
+                    // report to.
+                    self.executor
+                        .wake_connect(conn_index, Err(crate::tls::handshake_eof()));
+                    self.driver.close_connection(conn_index);
+                    return;
+                }
                 self.executor.wake_recv(conn_index);
                 return;
             }
@@ -5241,6 +5257,69 @@ mod tests {
             el.driver.tls_table.as_ref().unwrap().has(conn_index),
             "the TLS state stays for the task's sends"
         );
+    }
+
+    /// Deliver a FIN to a TLS connection whose handshake has not completed.
+    /// `outbound` registers a connect waiter first, as a parked
+    /// `connect(..).tls(..)` does.
+    fn fin_before_the_tls_handshake_completes(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        outbound: bool,
+    ) -> u32 {
+        let conn_index = accept_connection(el);
+        // Dropped at return: the receive's completion is injected below, and
+        // nothing reads the socket.
+        let (_ours, _peer) = attach_socketpair(el, conn_index);
+        install_handshaked_tls(el, conn_index);
+        let cs = el.driver.connections.get_mut(conn_index).unwrap();
+        cs.established = false;
+        cs.outbound = outbound;
+        if outbound {
+            el.executor.connect_waiters[conn_index as usize] = true;
+        }
+        assert!(!el.driver.arm_direct_recv_or_close(conn_index, None));
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            0,
+            0,
+        );
+        conn_index
+    }
+
+    /// A FIN before the TLS handshake completes closes the connection. No
+    /// task holds an inbound connection until its handshake completes, so
+    /// nothing else would close it and the slot would be held until the
+    /// worker exits.
+    #[test]
+    fn a_tls_fin_before_the_handshake_completes_closes_the_connection() {
+        let mut el = make_test_loop();
+        let conn_index = fin_before_the_tls_handshake_completes(&mut el, false);
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert_eq!(cs.read, ReadHalf::Eof { truncated: true });
+        assert!(cs.close_requested(), "no task holds it to close it");
+    }
+
+    /// The same FIN on an outbound connection resolves the connect with
+    /// `UnexpectedEof` and closes the connection.
+    #[test]
+    fn a_tls_fin_before_the_handshake_completes_fails_the_connect() {
+        let mut el = make_test_loop();
+        let conn_index = fin_before_the_tls_handshake_completes(&mut el, true);
+        assert!(!el.executor.connect_waiters[conn_index as usize]);
+        match el.executor.io_results[conn_index as usize].take() {
+            Some(crate::runtime::IoResult::Connect(Err(e))) => {
+                assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+            }
+            _ => panic!("the connect waiter was not given an error"),
+        }
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(cs.close_requested(), "the failed connect holds no slot");
     }
 
     /// The peer's close_notify, reported by the receive path, finishes the
