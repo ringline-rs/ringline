@@ -964,6 +964,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a guard part of a send on a Unix-domain connection is sent with
+  a plain `sendmsg`. Before, it went out as `SENDMSG_ZC`, which the kernel
+  refuses on a Unix socket with `EOPNOTSUPP`, and the send failed and closed
+  the connection. That covered a `send_parts` or `send_chain` part with a
+  guard, when the send totalled at least `send_zc_threshold` bytes or a
+  smaller one could not be gathered into a pool slot. The kernel copies the
+  guard's bytes into the socket, so the guard is released when the send
+  completes, with no notification to wait for (#829).
 - The acceptor thread no longer exits on an `accept` error that ends one
   pending connection or clears when an fd or memory frees: `ENOBUFS`,
   `ENOMEM`, the errors Linux's `accept4` passes through from the new socket

@@ -212,6 +212,33 @@ impl Sqe {
         )
     }
 
+    /// A plain `sendmsg` on registered file `index`: the kernel copies the
+    /// iovecs into the socket. For a socket that refuses `SENDMSG_ZC`, such as
+    /// a Unix-domain one (#829).
+    pub(crate) fn send_msg(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
+        Sqe::new(
+            Op::SendMsg {
+                fd: Fd::Fixed(index),
+                msg,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
+            },
+            user_data,
+        )
+    }
+
+    /// A plain `sendmsg` in a linked chain. See [`Sqe::send_msg`] and
+    /// [`Sqe::chain_send_msg_zc`].
+    pub(crate) fn chain_send_msg(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
+        Sqe::new(
+            Op::SendMsg {
+                fd: Fd::Fixed(index),
+                msg,
+                flags: crate::completion::CHAIN_SEND_FLAGS as u32,
+            },
+            user_data,
+        )
+    }
+
     /// A zero-copy `sendmsg` on registered file `index`.
     pub(crate) fn send_msg_zc(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
         Sqe::new(

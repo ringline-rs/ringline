@@ -223,8 +223,9 @@ The threads count against `RLIMIT_NPROC`, and a client controls how many.
 A close with a send waiting behaves as it did, and waits for the peer. Completion
 semantics do not change: a short result stays inside its handler, and the send settles
 once with its full length. `SEND_EAGAIN` is now a normal backpressure count. A chain
-part is built with `Sqe::chain_send` or `Sqe::chain_send_msg_zc`, and `push_sqe_chain`
-debug-asserts it, because a chain part with `MSG_DONTWAIT` restores #734.
+part is built with `Sqe::chain_send`, `Sqe::chain_send_msg` or `Sqe::chain_send_msg_zc`,
+and `push_sqe_chain` debug-asserts it, because a chain part with `MSG_DONTWAIT` restores
+#734.
 
 ## Tests
 

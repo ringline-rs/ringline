@@ -2997,10 +2997,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             _ => {
                 let slab_idx = ud.payload() as u16;
+                let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
                 let resubmit = if self.driver.send_slab.plain_send(slab_idx) {
                     self.submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
+                } else if self.driver.send_slab.plain_msg(slab_idx) {
+                    self.driver
+                        .ring
+                        .submit_send_msg(conn_index, msg_ptr, slab_idx)
                 } else {
-                    let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
                     self.driver
                         .ring
                         .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
@@ -3543,7 +3547,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // ENOMEM from a `SendMsgZc` (not from its drain): the pages the send
-        // would pin do not fit under `RLIMIT_MEMLOCK`. Nothing was sent. The
+        // would pin do not fit under `RLIMIT_MEMLOCK`, or, for a `plain_msg`
+        // entry's plain `sendmsg`, an allocation failed. Nothing was sent. The
         // entry's bytes stay valid until it is released, so send them with
         // plain `send`s, which pin nothing, through the drain; the rest of the
         // entry is sent the same way rather than retried zero-copy (#642).
@@ -3551,7 +3556,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && ud.tag() == Some(OpTag::SendMsgZc)
             && !self.close_submitted(conn_index)
         {
-            metrics::POOL.increment(metrics::pool::SEND_ZC_ENOMEM);
+            // A plain `sendmsg` (`plain_msg`) pins nothing, so its `-ENOMEM`
+            // is not the memlock refusal the counter reports.
+            if !self.driver.send_slab.plain_msg(slab_idx) {
+                metrics::POOL.increment(metrics::pool::SEND_ZC_ENOMEM);
+            }
             self.driver.send_slab.set_plain_send(slab_idx);
             if self
                 .submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
@@ -4579,6 +4588,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
             let submitted = if self.driver.send_slab.plain_send(slab_idx) {
                 self.submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
+            } else if self.driver.send_slab.plain_msg(slab_idx) {
+                self.driver
+                    .ring
+                    .submit_send_msg(conn_index, msg_ptr, slab_idx)
             } else {
                 self.driver
                     .ring

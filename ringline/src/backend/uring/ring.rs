@@ -369,6 +369,19 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a plain `sendmsg` of slab entry `slab_idx`, tagged `SendMsgZc`
+    /// like the zero-copy form, for an entry marked `plain_msg` (#829).
+    pub fn submit_send_msg(
+        &mut self,
+        conn_index: u32,
+        msg: *const libc::msghdr,
+        slab_idx: u16,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        let entry = Sqe::send_msg(conn_index, msg, user_data.raw());
+        unsafe { self.push_sqe(&entry) }
+    }
+
     /// Submit a SendMsgZc operation.
     /// The slab index is stored in the payload for lookup on CQE.
     pub fn submit_send_msg_zc(
@@ -900,7 +913,7 @@ impl Ring {
         debug_assert!(
             entries.iter().all(|entry| match entry.op {
                 Op::Send { flags, .. } => flags == crate::completion::CHAIN_SEND_FLAGS,
-                Op::SendMsgZc { flags, .. } => {
+                Op::SendMsg { flags, .. } | Op::SendMsgZc { flags, .. } => {
                     flags == crate::completion::CHAIN_SEND_FLAGS as u32
                 }
                 _ => true,
