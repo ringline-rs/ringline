@@ -12,7 +12,7 @@ use metriken::{Gauge, ShardedCounterGroup, metric};
     name = "ringline/connections",
     description = "Connection lifecycle counters"
 )]
-pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(9);
+pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(11);
 
 #[metric(name = "ringline/bytes", description = "Byte transfer counters")]
 pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
@@ -132,6 +132,15 @@ pub mod conn {
     /// Nothing else changes: the write half stays `Shutdown`, and on
     /// io_uring the Close it held goes ahead.
     pub const SHUTDOWN_FAILED: usize = 8;
+    /// An `accept` on the acceptor thread failed with an error that does not
+    /// end the listener and is not retried at once (`EMFILE`, `ENFILE`,
+    /// `ENOBUFS`, `ENOMEM`, or an errno ringline does not classify). The
+    /// acceptor waits 10 ms and accepts again.
+    pub const ACCEPT_ERROR_BACKOFF: usize = 9;
+    /// An acceptor thread stopped because its listening socket can no longer
+    /// accept (`EBADF`, `ENOTSOCK`, `EINVAL` outside shutdown). Its listener
+    /// accepts nothing afterwards; the error is also written to stderr.
+    pub const ACCEPTOR_STOPPED: usize = 10;
 }
 
 /// Completions processed, split by `OpTag`.
@@ -468,6 +477,16 @@ pub fn init_metadata() {
         "accept_queue_full".into(),
     );
     CONNECTIONS.insert_metadata(conn::SHUTDOWN_FAILED, "op".into(), "shutdown_failed".into());
+    CONNECTIONS.insert_metadata(
+        conn::ACCEPT_ERROR_BACKOFF,
+        "op".into(),
+        "accept_error_backoff".into(),
+    );
+    CONNECTIONS.insert_metadata(
+        conn::ACCEPTOR_STOPPED,
+        "op".into(),
+        "acceptor_stopped".into(),
+    );
 
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_100, "op".into(), "lt_100us".into());
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_250, "op".into(), "lt_250us".into());
@@ -628,6 +647,8 @@ mod tests {
             conn::ACCEPT_REGISTER_FAILED,
             conn::ACCEPT_QUEUE_FULL,
             conn::SHUTDOWN_FAILED,
+            conn::ACCEPT_ERROR_BACKOFF,
+            conn::ACCEPTOR_STOPPED,
         ] {
             assert!(
                 CONNECTIONS.increment(idx),

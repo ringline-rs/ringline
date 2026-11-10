@@ -964,6 +964,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The acceptor thread no longer exits on an `accept` error that ends one
+  pending connection or clears when an fd or memory frees: `ENOBUFS`,
+  `ENOMEM`, the errors Linux's `accept4` passes through from the new socket
+  (`EPROTO`, `ENETDOWN`, `ENETUNREACH`, `EHOSTDOWN`, `EHOSTUNREACH`,
+  `ENONET`, `EOPNOTSUPP`, `ENOPROTOOPT`) and `ETIMEDOUT`.
+  Before, any of these ended the thread with nothing logged, and its listener
+  accepted nothing while the workers ran. It now stops only on `EBADF`,
+  `ENOTSOCK` or `EINVAL` outside shutdown, writing the error to stderr and
+  counting `acceptor_stopped`; `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` and
+  any errno it does not classify wait 10 ms, are counted as
+  `accept_error_backoff`, and accept again (#828).
 - io_uring: worker exit cancels file, direct I/O and NVMe operations in
   flight and waits for them to end, within the same 10 s bound it gives
   connections. Before, the drain ended once connections and sends were done,

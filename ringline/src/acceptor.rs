@@ -119,25 +119,33 @@ pub fn run_acceptor(config: AcceptorConfig) {
 
         if fd < 0 {
             let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                // EAGAIN: on a platform with a non-blocking listener, the
-                // connection `poll` saw has gone.
-                Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
-                Some(libc::EMFILE) | Some(libc::ENFILE) => {
-                    // Too many open files — back off briefly.
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    continue;
+            let errno = err.raw_os_error().unwrap_or(0);
+            // Shutdown makes `accept4` fail (`EINVAL` after `SHUT_RD`), and a
+            // retry would only fail again.
+            if config.shutdown_flag.load(Ordering::Acquire) {
+                return;
+            }
+            match classify_accept_error(errno) {
+                AcceptErrorAction::Retry => {}
+                AcceptErrorAction::Backoff => {
+                    crate::metrics::CONNECTIONS
+                        .increment(crate::metrics::conn::ACCEPT_ERROR_BACKOFF);
+                    std::thread::sleep(ACCEPT_ERROR_BACKOFF);
                 }
-                Some(libc::ECONNABORTED) | Some(libc::ECONNRESET) | Some(libc::EPERM) => {
-                    // Connection reset before accept completed, or blocked by
-                    // firewall — retry immediately.
-                    continue;
-                }
-                _ => {
-                    // Fatal accept error, or the socket was shut down.
+                AcceptErrorAction::Stop => {
+                    crate::metrics::CONNECTIONS.increment(crate::metrics::conn::ACCEPTOR_STOPPED);
+                    // Not `eprintln!`, which panics if stderr fails.
+                    let _ = std::io::Write::write_fmt(
+                        &mut std::io::stderr(),
+                        format_args!(
+                            "ringline: acceptor for listener {} stopped: {err}\n",
+                            config.listener.index()
+                        ),
+                    );
                     return;
                 }
             }
+            continue;
         }
 
         let is_unix = addr_storage.ss_family == libc::AF_UNIX as libc::sa_family_t;
@@ -209,6 +217,59 @@ pub fn run_acceptor(config: AcceptorConfig) {
             }
             conn_count = conn_count.wrapping_add(1);
         }
+    }
+}
+
+/// What the acceptor does after `accept` fails with an errno.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorAction {
+    /// Call `accept` again at once.
+    Retry,
+    /// Wait [`ACCEPT_ERROR_BACKOFF`], then call `accept` again.
+    Backoff,
+    /// The listener cannot accept again: end the acceptor.
+    Stop,
+}
+
+/// How long the acceptor waits after an error that a retry at once would
+/// likely meet again: a full fd table, or no memory for the new socket.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Classify an `accept` errno. Only an error that means the listening socket
+/// is unusable stops the acceptor, since a stopped acceptor leaves its
+/// listener accepting nothing while the workers run. An errno not listed here
+/// backs off and is counted, rather than stopping.
+fn classify_accept_error(errno: i32) -> AcceptErrorAction {
+    match errno {
+        // Not a socket, or not listening (also what `SHUT_RD` gives).
+        libc::EBADF | libc::ENOTSOCK | libc::EINVAL => AcceptErrorAction::Stop,
+        // EINTR: a signal. EAGAIN: on a platform with a non-blocking listener,
+        // the connection `poll` saw has gone. ECONNABORTED, ECONNRESET and
+        // EPERM end one pending connection. EPROTO, ENETDOWN, ENETUNREACH,
+        // EHOSTDOWN, EHOSTUNREACH, ENONET, EOPNOTSUPP and ENOPROTOOPT are the
+        // errors accept(2) says Linux passes through from the new socket, to
+        // be retried like EAGAIN; ETIMEDOUT is one it says some kernels
+        // return. EOPNOTSUPP also means a listener that is not SOCK_STREAM,
+        // which cannot occur here: ringline creates every listener itself.
+        libc::EINTR
+        | libc::EAGAIN
+        | libc::ECONNABORTED
+        | libc::ECONNRESET
+        | libc::EPERM
+        | libc::EPROTO
+        | libc::ENETDOWN
+        | libc::ENETUNREACH
+        | libc::EHOSTDOWN
+        | libc::EHOSTUNREACH
+        | libc::EOPNOTSUPP
+        | libc::ENOPROTOOPT
+        | libc::ETIMEDOUT => AcceptErrorAction::Retry,
+        #[cfg(target_os = "linux")]
+        libc::ENONET => AcceptErrorAction::Retry,
+        // EMFILE, ENFILE, ENOBUFS and ENOMEM clear only when something else
+        // frees an fd or memory, and an errno not listed above is treated the
+        // same way.
+        _ => AcceptErrorAction::Backoff,
     }
 }
 
@@ -425,6 +486,92 @@ mod tests {
         (addr, sockets, gates, rx, config)
     }
 
+    /// Only an error that leaves the listening socket unusable stops the
+    /// acceptor; one that ends a single pending connection, or that clears
+    /// when the process frees an fd or memory, does not (#828).
+    #[test]
+    fn only_a_dead_listener_stops_the_acceptor() {
+        use AcceptErrorAction::{Backoff, Retry, Stop};
+        for errno in [libc::EBADF, libc::ENOTSOCK, libc::EINVAL] {
+            assert_eq!(classify_accept_error(errno), Stop, "errno {errno}");
+        }
+        for errno in [
+            libc::EINTR,
+            libc::EAGAIN,
+            libc::ECONNABORTED,
+            libc::ECONNRESET,
+            libc::EPERM,
+            libc::EPROTO,
+            libc::ENETDOWN,
+            libc::ENETUNREACH,
+            libc::EHOSTDOWN,
+            libc::EHOSTUNREACH,
+            libc::EOPNOTSUPP,
+            libc::ENOPROTOOPT,
+            libc::ETIMEDOUT,
+        ] {
+            assert_eq!(classify_accept_error(errno), Retry, "errno {errno}");
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(classify_accept_error(libc::ENONET), Retry);
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(classify_accept_error(errno), Backoff, "errno {errno}");
+        }
+        // An errno with no case of its own backs off rather than stopping.
+        assert_eq!(classify_accept_error(libc::EIO), Backoff);
+        assert_eq!(classify_accept_error(0), Backoff);
+    }
+
+    /// An acceptor whose listener stops accepting while the runtime is not
+    /// shutting down exits and counts it, instead of exiting unseen.
+    ///
+    /// Linux only: `SHUT_RD` makes `accept4` fail with `EINVAL` there; other
+    /// platforms do not wake a blocked `accept` that way.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_acceptor_whose_listener_dies_stops_and_counts_it() {
+        let stopped = || {
+            crate::metrics::CONNECTIONS
+                .value(crate::metrics::conn::ACCEPTOR_STOPPED)
+                .unwrap_or(0)
+        };
+        let before = stopped();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let sockets = crate::listener_sockets::ListenerSockets::new(vec![listener.into()]);
+        let gates = crate::listen_gate::ListenGates::new(1, 128);
+        gates.register(0, Arc::clone(&sockets)).expect("register");
+        gates.open(0).expect("open");
+        let (tx, _rx) = crate::handoff::bounded::<AcceptedConn>(1);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let config = AcceptorConfig {
+            sockets: Arc::clone(&sockets),
+            listener: crate::ListenerId::from_index(0),
+            worker_channels: vec![tx],
+            worker_wake_handles: Vec::new(),
+            shutdown_flag: Arc::clone(&shutdown_flag),
+            listen_gates: Arc::clone(&gates),
+            tcp_nodelay: false,
+            conn_chunk_size: 1,
+        };
+        let handle = std::thread::spawn(move || run_acceptor(config));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        // The listener fails every `accept` from here on; the flag stays false.
+        sockets.shut_down();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "the acceptor did not stop");
+        handle.join().expect("acceptor panicked");
+        assert!(!shutdown_flag.load(Ordering::Acquire));
+        assert!(
+            stopped() > before,
+            "the acceptor stopped without counting it"
+        );
+    }
+
     fn queue_full_count() -> u64 {
         crate::metrics::CONNECTIONS
             .value(crate::metrics::conn::ACCEPT_QUEUE_FULL)
@@ -444,6 +591,7 @@ mod tests {
 
         let (read_fd, wake) = crate::wakeup::create_wake_fd().expect("wake fd");
         let (addr, sockets, gates, rx, config) = acceptor_with_a_full_queue(wake);
+        let shutdown_flag = Arc::clone(&config.shutdown_flag);
         let before = queue_full_count();
         let handle = std::thread::spawn(move || run_acceptor(config));
 
@@ -481,6 +629,9 @@ mod tests {
         served.read_exact(&mut request).expect("read the request");
         assert_eq!(&request, b"go");
 
+        // As `RuntimeShutdown::shutdown` does: the flag first, so the
+        // acceptor reads the `EINVAL` that `SHUT_RD` causes as shutdown.
+        shutdown_flag.store(true, Ordering::Release);
         gates.shutdown();
         sockets.shut_down();
         handle.join().expect("acceptor panicked");
@@ -627,12 +778,13 @@ mod tests {
         gates.open(0).expect("open");
 
         let (tx, _rx) = crate::handoff::bounded::<AcceptedConn>(8);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
         let config = AcceptorConfig {
             sockets: Arc::clone(&sockets),
             listener: crate::ListenerId::from_index(0),
             worker_channels: vec![tx],
             worker_wake_handles: Vec::new(),
-            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            shutdown_flag: Arc::clone(&shutdown_flag),
             listen_gates: Arc::clone(&gates),
             tcp_nodelay: false,
             conn_chunk_size: 1,
@@ -641,6 +793,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(!handle.is_finished(), "the acceptor exited before shutdown");
 
+        // As `RuntimeShutdown::shutdown` does: the flag first.
+        shutdown_flag.store(true, Ordering::Release);
         gates.shutdown();
         sockets.shut_down();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
