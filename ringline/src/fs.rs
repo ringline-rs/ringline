@@ -342,6 +342,8 @@ pub(crate) struct FsCmdEntry {
     file_index: u16,
     pub(crate) op: FsOp,
     in_use: bool,
+    /// The SQE's user_data, recorded before the SQE is pushed.
+    user_data: u64,
     /// Owned path for open/stat/unlink/mkdir (kept alive until CQE).
     pub path: Option<CString>,
     /// Second path for rename (kept alive until CQE).
@@ -366,6 +368,7 @@ impl FsCmdSlab {
                 file_index: 0,
                 op: FsOp::Read,
                 in_use: false,
+                user_data: 0,
                 path: None,
                 path2: None,
                 #[cfg(target_os = "linux")]
@@ -409,6 +412,19 @@ impl FsCmdSlab {
     /// Whether any command holds a slot, so its operation has not completed.
     pub fn has_in_flight(&self) -> bool {
         self.free_list.len() < self.entries.len()
+    }
+
+    /// Record the user_data of slot `idx`'s SQE, which worker exit cancels.
+    pub fn set_user_data(&mut self, idx: u16, user_data: u64) {
+        self.entries[idx as usize].user_data = user_data;
+    }
+
+    /// The user_data of every command that holds a slot.
+    pub fn in_flight_user_data(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries
+            .iter()
+            .filter(|e| e.in_use)
+            .map(|e| e.user_data)
     }
 
     /// Get a reference to an entry (must be in use).

@@ -319,6 +319,8 @@ struct NvmeCmdEntry {
     device_index: u16,
     /// Whether this slot is in use.
     in_use: bool,
+    /// The SQE's user_data, recorded before the SQE is pushed.
+    user_data: u64,
 }
 
 impl NvmeCmdSlab {
@@ -329,6 +331,7 @@ impl NvmeCmdSlab {
             entries.push(NvmeCmdEntry {
                 device_index: 0,
                 in_use: false,
+                user_data: 0,
             });
             free_list.push(i);
         }
@@ -365,6 +368,19 @@ impl NvmeCmdSlab {
     /// Whether any command holds a slot, so its operation has not completed.
     pub fn has_in_flight(&self) -> bool {
         self.free_list.len() < self.entries.len()
+    }
+
+    /// Record the user_data of slot `idx`'s SQE, which worker exit cancels.
+    pub fn set_user_data(&mut self, idx: u16, user_data: u64) {
+        self.entries[idx as usize].user_data = user_data;
+    }
+
+    /// The user_data of every command that holds a slot.
+    pub fn in_flight_user_data(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries
+            .iter()
+            .filter(|e| e.in_use)
+            .map(|e| e.user_data)
     }
 }
 

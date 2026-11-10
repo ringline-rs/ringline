@@ -798,10 +798,10 @@ pub(crate) struct Driver {
     pub(crate) fs_cmd_slab: Option<crate::fs::FsCmdSlab>,
     /// Base offset in the fixed file table for filesystem file fds.
     pub(crate) fs_fd_base: u32,
-    /// Set by [`run_shutdown`](Self::run_shutdown) when an fs, direct I/O or
-    /// NVMe command was still in flight at its bound. The kernel can still use
-    /// the command's buffer, statx box or path, so the worker leaks its event
-    /// loop instead of dropping it (#824).
+    /// Set by [`run_shutdown`](Self::run_shutdown) when its drain ended, at
+    /// the bound or on a ring error, with an fs, direct I/O or NVMe command
+    /// still in flight. The kernel can still use the command's buffer or statx
+    /// box, so the worker leaks its event loop instead of dropping it (#824).
     pub(crate) disk_io_outstanding: bool,
 }
 
@@ -2870,6 +2870,21 @@ impl Driver {
         self.merged_listeners.clear();
     }
 
+    /// The user_data of every fs, direct I/O and NVMe command in flight.
+    fn disk_command_user_data(&self) -> Vec<u64> {
+        let mut uds = Vec::new();
+        if let Some(s) = self.fs_cmd_slab.as_ref() {
+            uds.extend(s.in_flight_user_data());
+        }
+        if let Some(s) = self.direct_io_cmd_slab.as_ref() {
+            uds.extend(s.in_flight_user_data());
+        }
+        if let Some(s) = self.nvme_cmd_slab.as_ref() {
+            uds.extend(s.in_flight_user_data());
+        }
+        uds
+    }
+
     /// Whether an fs, direct I/O or NVMe command has not completed. Its
     /// operation can still read or write memory this worker owns.
     fn disk_commands_in_flight(&self) -> bool {
@@ -2961,6 +2976,27 @@ impl Driver {
             }
         }
 
+        // Cancel every fs, direct I/O and NVMe command. A read or write
+        // waiting for a pipe or FIFO to become ready ends at once and
+        // transfers nothing. An operation already in progress, on io-wq or in
+        // the device (direct I/O, NVMe), completes in its own time and the
+        // loop below waits for it.
+        let mut disk_cancels_to_retry: Vec<u64> = Vec::new();
+        #[cfg(test)]
+        let keep_disk_commands = self.test_fault.as_ref().is_some_and(|f| {
+            f.keep_disk_commands_at_exit
+                .load(std::sync::atomic::Ordering::Acquire)
+        });
+        #[cfg(not(test))]
+        let keep_disk_commands = false;
+        if !keep_disk_commands {
+            for ud in self.disk_command_user_data() {
+                if self.ring.submit_async_cancel(ud, 0).is_err() {
+                    disk_cancels_to_retry.push(ud);
+                }
+            }
+        }
+
         // 3. Submit + drain loop until every connection's Close has
         //    completed, every slab entry is released and every fs, direct I/O
         //    and NVMe command has completed, for at most `SHUTDOWN_BOUND`.
@@ -2995,6 +3031,12 @@ impl Driver {
             for i in std::mem::take(&mut cancels_to_retry) {
                 if self.ring.submit_cancel_all(i).is_err() {
                     cancels_to_retry.push(i);
+                }
+            }
+            // A cancel for a command that has completed since finds nothing.
+            for ud in std::mem::take(&mut disk_cancels_to_retry) {
+                if self.ring.submit_async_cancel(ud, 0).is_err() {
+                    disk_cancels_to_retry.push(ud);
                 }
             }
             for i in std::mem::take(&mut holding_sends) {
@@ -3046,7 +3088,7 @@ impl Driver {
             self.send_copy_pool.leak_backing();
         }
         // The memory of a disk command still in flight is spread over this
-        // driver (statx box, path) and the tasks (the caller's buffer behind
+        // driver (the statx box) and the tasks (the caller's buffer behind
         // `fs::read`, `direct_io_read`, `nvme_read` and their writes), so the
         // worker leaks the whole event loop rather than this one entry.
         self.disk_io_outstanding = self.disk_commands_in_flight();

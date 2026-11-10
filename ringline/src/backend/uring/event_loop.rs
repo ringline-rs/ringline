@@ -214,6 +214,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.close_fds_in_unhandled_completions();
         self.driver.release_shared();
         self.executor.wakes.deregister();
+        // The blocking, resolver and spawner pools are shared by the workers
+        // and their threads exit when the last reference goes. The kernel uses
+        // none of their memory, so release this loop's references now rather
+        // than keep the threads for the life of the process.
+        self.driver.blocking_pool = None;
+        self.driver.resolver = None;
+        self.driver.spawner = None;
+        self.driver.blocking_tx = None;
+        self.driver.resolve_tx = None;
+        self.driver.spawn_tx = None;
         // Safety: the caller's contract.
         unsafe { std::ptr::drop_in_place(&mut self.driver.ring) };
     }

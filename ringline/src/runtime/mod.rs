@@ -651,13 +651,14 @@ pub(crate) struct Executor {
 
 impl Drop for Executor {
     fn drop(&mut self) {
-        // A buffer still in the graveyard belongs to an operation that has
-        // not completed: a read or write the kernel (io_uring) or a disk-I/O
-        // pool thread (mio) can still perform through its raw pointer, after
-        // this worker has exited. mio does not wait for those at shutdown, and
-        // io_uring's drain does not deliver their completions, so freeing the
-        // buffer here could let that operation write into freed memory. Leak it instead; the leak is bounded by the
-        // operations in flight when the worker exits.
+        // A buffer still in the graveyard belongs to an operation whose
+        // completion this executor has not seen. On mio a disk-I/O pool thread
+        // can still use it after the worker exits, since shutdown does not wait
+        // for the pool, so freeing it here could let that thread write into
+        // freed memory. On io_uring the exit drain waited for the operation (or
+        // the worker leaked this executor), but the drain does not deliver
+        // completions, so the buffer is here all the same. Leak it; the leak is
+        // bounded by the operations in flight when the worker exits.
         for (_, buf) in self.disk_io_graveyard.drain() {
             std::mem::forget(buf);
         }
