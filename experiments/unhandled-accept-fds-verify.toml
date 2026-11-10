@@ -1,0 +1,113 @@
+# Verification of the panic-path fd close (#780) on io_uring, in an ephemeral
+# VM on the `validation` agent (CLAUDE.md, "Verifying io_uring code").
+#
+# `close_ring` closes the fds that unhandled `AcceptMulti` and `ParkInstall`
+# completions delivered. Steps: clippy on the io_uring path and the stub
+# engine; the unit test `close_ring_closes_the_fds_of_unhandled_accepts` at
+# the branch, then with the call to `close_fds_in_unhandled_completions`
+# removed (it must fail there); the ringline suite once; then
+# `connections_arriving_as_a_worker_stops_do_not_hang` {n} times.
+#
+# Prediction: every gate 0, the mutated unit test red, the loop with no
+# failure. Before the change the loop failed 3 of 300 and 1 of 600 at a
+# commit with the hand-off channel change (experiments
+# 01a1c24d-cb49-711f-d93a-0c9714bebd0d, 01a1c25f-557c-7185-c555-6464ebc65b3b),
+# each hung connection's server side an open fd of the test process.
+#
+#   systemslab submit experiments/unhandled-accept-fds-verify.toml
+name = "ringline unhandled accept fds verify ({branch})"
+
+[params]
+repo      = "https://github.com/brayniac/ringline"
+branch    = "fix/close-accepted-fds-after-a-drain-panic"
+unit      = "close_ring_closes_the_fds_of_unhandled_accepts"
+test_exit = "connections_arriving_as_a_worker_stops_do_not_hang"
+n         = "900"
+
+[[jobs]]
+name = "verify"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "debian-13-6.12"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/verify.log", "/home/anvil/suite.log", "/home/anvil/failures.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+: > /home/anvil/failures.log
+{
+  uname -srm; nproc; cargo --version
+  git clone -q {repo} src && cd src && git checkout -q {branch} && git log --oneline -1
+  ulimit -Sn 65536
+  [ "$(ulimit -Sn)" -ge 65536 ] || { echo "gate_nofile=1 (soft=$(ulimit -Sn))"; exit 1; }
+  echo "gate_nofile=0"
+
+  # This must be the io_uring build; a mio build has none of the code under
+  # test.
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  got=$(./target/debug/bench-server --print-backend)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; echo "gate_backend=1"; exit 1; }
+  echo "gate_backend=0 (backend=$got)"
+
+  cargo clippy --locked -p ringline --all-targets -- -D warnings; echo "gate_clippy_uring=$?"
+  RINGLINE_STUB_ENGINE=1 cargo clippy --locked -p ringline -- -D warnings; echo "gate_clippy_stub=$?"
+
+  # cargo's status is taken before the grep, so a failed build is not read
+  # as an empty path.
+  bin() {
+    local o
+    o=$(cargo test --locked -p ringline --lib --no-run 2>&1) || { echo "$o" | tail -20 >&2; return 1; }
+    echo "$o" | grep -oE 'target/debug/deps/ringline-[0-9a-f]+' | head -1
+  }
+
+  # The unit test at the branch, then with the fix removed.
+  B=$(bin) && [ -n "$B" ] || { echo "gate_build_unit=1"; exit 1; }
+  echo "gate_build_unit=0"
+  ./$B {unit} --test-threads=1 2>&1 | grep -E 'test result|panicked'
+  echo "unit_fixed_rc=${PIPESTATUS[0]}"
+  sed -i 's/^\( *\)self\.driver\.close_fds_in_unhandled_completions();/\1\/\/ mutated out/' ringline/src/backend/uring/event_loop.rs
+  grep -c 'mutated out' ringline/src/backend/uring/event_loop.rs
+  B=$(bin) && [ -n "$B" ] || { echo "gate_build_mutant=1"; exit 1; }
+  echo "gate_build_mutant=0"
+  ./$B {unit} --test-threads=1 2>&1 | grep -E 'test result|panicked|was not closed'
+  echo "unit_mutant_rc=${PIPESTATUS[0]}"
+  git checkout -q -- ringline/src/backend/uring/event_loop.rs
+
+  cargo test --locked -p ringline > /home/anvil/suite.log 2>&1; echo "gate_suite=$?"
+  grep -E '^test result:|FAILED|panicked' /home/anvil/suite.log | head -40
+
+  B=$(bin) && [ -n "$B" ] || { echo "gate_build_loop=1"; exit 1; }
+  echo "gate_build_loop=0"
+  fails=0
+  for i in $(seq 1 {n}); do
+    out=$(./$B {test_exit} --test-threads=1 2>&1)
+    if ! echo "$out" | grep -q 'test result: ok. 1 passed'; then
+      fails=$((fails+1)); { echo "=== run $i"; echo "$out" | grep -E 'panicked|Closed|Hung|test result'; } >> /home/anvil/failures.log
+    fi
+  done
+  echo "exit runs={n} fails=$fails"
+} 2>&1 | tee /home/anvil/verify.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+fail=0
+grep -E '^(gate_|unit_|exit )' verify.log
+for g in gate_nofile gate_backend gate_clippy_uring gate_clippy_stub gate_build_unit gate_build_mutant gate_suite gate_build_loop; do
+  grep -q "^$g=0" verify.log || { echo "FAIL $g"; fail=1; }
+done
+grep -q "^unit_fixed_rc=0" verify.log || { echo "FAIL: the unit test fails at the branch"; fail=1; }
+grep -q "^unit_mutant_rc=[1-9]" verify.log || { echo "FAIL: the unit test passed without the fix"; fail=1; }
+grep -q "^exit runs=.* fails=0$" verify.log || { echo "FAIL: the worker-exit test still hangs"; fail=1; }
+exit $fail
+'''

@@ -577,8 +577,10 @@ pub(crate) struct Driver {
     /// Tuple: (user_data, result, flags).
     pub(crate) cqe_batch: Vec<(u64, i32, u32)>,
     /// How many of `cqe_batch`'s completions have been dispatched. After a
-    /// panic in a handler, `run_shutdown` handles the ones after it. What the
-    /// panicking handler held, such as an accepted fd, is lost.
+    /// panic in a handler, `run_shutdown` handles the ones after it, and when
+    /// `run_shutdown` panics, `close_fds_in_unhandled_completions` closes the
+    /// fds among them. What the panicking handler held, such as an accepted
+    /// fd, is lost.
     pub(crate) cqe_cursor: usize,
     /// Per-worker channel for DNS resolve responses from the resolver pool.
     pub(crate) resolve_rx: Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
@@ -2797,6 +2799,35 @@ impl Driver {
         drop(self.park_rx.take());
     }
 
+    /// Close the fds delivered by completions this worker has not handled:
+    /// the fd of an accepted connection (`AcceptMulti`) or of a park's
+    /// install (`ParkInstall`), which the kernel installed in this process
+    /// when the operation completed. Reads the batch from its cursor and
+    /// reaps the completions in the ring's queue, and handles nothing else.
+    /// For a worker that leaks this driver after a panic in its drain:
+    /// closing the ring leaves such an fd open, with nothing to serve or
+    /// close its connection.
+    pub(crate) fn close_fds_in_unhandled_completions(&mut self) {
+        let cursor = self.cqe_cursor.min(self.cqe_batch.len());
+        let mut batch = std::mem::take(&mut self.cqe_batch);
+        batch.drain(..cursor);
+        self.ring.reap(&mut batch);
+        for (user_data_raw, result, _) in batch {
+            if result >= 0
+                && matches!(
+                    UserData(user_data_raw).tag(),
+                    Some(OpTag::AcceptMulti | OpTag::ParkInstall)
+                )
+            {
+                // Safety: the completion installed this fd and no handler
+                // has read the completion.
+                unsafe {
+                    libc::close(result);
+                }
+            }
+        }
+    }
+
     /// Release what other threads wait on, for a worker that leaks this driver.
     pub(crate) fn release_shared(&mut self) {
         self.close_queued_connections();
@@ -2905,8 +2936,12 @@ impl Driver {
         let started = std::time::Instant::now();
         let mut timeout_armed = false;
         // A panic in a handler left these undispatched.
+        // In place, with the cursor kept up to date: a panic here leaves
+        // the rest of the tail for `close_fds_in_unhandled_completions`.
         let cursor = self.cqe_cursor.min(self.cqe_batch.len());
-        for (user_data_raw, result, flags) in self.cqe_batch.split_off(cursor) {
+        for i in cursor..self.cqe_batch.len() {
+            let (user_data_raw, result, flags) = self.cqe_batch[i];
+            self.cqe_cursor = i + 1;
             self.handle_shutdown_cqe(user_data_raw, result, flags, &mut timeout_armed);
         }
         while started.elapsed() < SHUTDOWN_BOUND {

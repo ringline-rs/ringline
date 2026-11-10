@@ -193,11 +193,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// [`drain_after_failure`](Self::drain_after_failure) panicked. The kernel
     /// ends the ring's operations and closes its sockets. Those operations can
     /// use the heap memory this event loop owns until they end, so the caller
-    /// leaks it. What other threads are waiting on is released here.
+    /// leaks it. What other threads are waiting on is released here, and the
+    /// fds delivered by completions this loop never handled are closed: an
+    /// accepted connection is an ordinary fd, which closing the ring leaves
+    /// open.
     ///
     /// # Safety
     /// The ring is dropped here, so the caller must leak this event loop.
     pub(crate) unsafe fn close_ring(&mut self) {
+        self.driver.close_fds_in_unhandled_completions();
         self.driver.release_shared();
         self.executor.wakes.deregister();
         // Safety: the caller's contract.
@@ -16674,6 +16678,70 @@ mod tests {
                     "slab entry leak after mixed operations"
                 );
             }
+        }
+    }
+
+    /// An accept completion the loop never handled carries an ordinary fd the
+    /// kernel installed, and `close_ring` closes it so the peer sees the
+    /// close (#780): one reaped into the batch past its cursor, and one
+    /// posted to the ring and not reaped. A completion before the cursor was
+    /// dispatched, and its fd is left to its owner.
+    #[test]
+    fn close_ring_closes_the_fds_of_unhandled_accepts() {
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+        use std::time::Duration;
+
+        let mut el = make_test_loop();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("listener address");
+        let connect = || std::net::TcpStream::connect(addr).expect("connect");
+        let accept = || listener.accept().expect("accept").0.into_raw_fd();
+        let ud = UserData::encode(OpTag::AcceptMulti, 0, 0).raw();
+
+        let mut handled_peer = connect();
+        let handled = accept();
+        let mut batched_peer = connect();
+        let batched = accept();
+        el.driver.cqe_batch.clear();
+        el.driver.cqe_batch.push((ud, handled, 0));
+        el.driver.cqe_batch.push((ud, batched, 0));
+        el.driver.cqe_cursor = 1;
+        let mut posted_peer = connect();
+        let posted = accept();
+        // A NOP with this result completes in the wait, on Linux 6.10 and
+        // later; before that `inject` hands it to `reap` directly and the
+        // wait returns at once.
+        el.driver
+            .ring
+            .submit_nop_inject(ud, posted)
+            .expect("inject");
+        el.driver.ring.submit_and_wait(1).expect("submit_and_wait");
+
+        // Safety: the loop is leaked below, as the worker leaks it.
+        unsafe { el.close_ring() };
+        std::mem::forget(el);
+
+        let mut byte = [0u8; 1];
+        for (name, peer) in [("batched", &mut batched_peer), ("posted", &mut posted_peer)] {
+            peer.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let read = peer.read(&mut byte);
+            assert!(
+                matches!(read, Ok(0)),
+                "the {name} accept's fd was not closed: {read:?}"
+            );
+        }
+        handled_peer
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("read timeout");
+        assert!(
+            handled_peer.read(&mut byte).is_err(),
+            "the handled accept's fd was closed"
+        );
+        // Safety: `handled` is this test's open fd.
+        unsafe {
+            libc::close(handled);
         }
     }
 }
