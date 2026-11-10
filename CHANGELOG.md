@@ -964,6 +964,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- mio: worker exit waits, within 10 s, for the raw-pointer reads and writes
+  (`fs::read`/`fs::write`, `direct_io_read`/`direct_io_write`) its disk-I/O
+  pool is running. Before, the worker dropped its tasks while a pool thread
+  could still read or write a task's buffer, and requests still queued for
+  the pool ran after the worker had gone. At worker exit, requests the pool
+  has not started are now answered `ECANCELED` without running. A worker
+  whose pool is still running such a read or write when the 10 s run out
+  leaks its event loop and tasks, as on io_uring, closes its sockets and
+  accept queue, and writes a line to stderr (#856).
 - io_uring: a guard part of a send on a Unix-domain connection is sent with
   a plain `sendmsg`. Before, it went out as `SENDMSG_ZC`, which the kernel
   refuses on a Unix socket with `EOPNOTSUPP`, and the send failed and closed

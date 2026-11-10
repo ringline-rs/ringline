@@ -30,6 +30,17 @@ pub(crate) struct TestFault {
     /// an operation a cancel cannot end.
     #[cfg(has_io_uring)]
     pub(crate) keep_disk_commands_at_exit: std::sync::atomic::AtomicBool,
+    /// Hold every disk-I/O pool request a thread starts until cleared, after
+    /// it is marked running, standing in for a slow `pread`.
+    #[cfg(not(has_io_uring))]
+    pub(crate) hold_disk_io: std::sync::atomic::AtomicBool,
+    /// Set by a disk-I/O pool thread once it holds a request.
+    #[cfg(not(has_io_uring))]
+    pub(crate) disk_io_held: std::sync::atomic::AtomicBool,
+    /// Requests a disk-I/O pool thread answered without running, after the
+    /// worker exited.
+    #[cfg(not(has_io_uring))]
+    pub(crate) disk_io_skipped: std::sync::atomic::AtomicU32,
 }
 
 #[cfg(test)]
