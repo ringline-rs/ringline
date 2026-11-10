@@ -265,7 +265,7 @@ pub struct Config {
     /// while over its share can hand the connection to a less-loaded peer. Empty
     /// in pool mode, where the acceptor thread owns these.
     pub(crate) peer_accept: Vec<(
-        crossbeam_channel::Sender<crate::acceptor::AcceptedConn>,
+        crate::handoff::Sender<crate::acceptor::AcceptedConn>,
         crate::wakeup::WakeFd,
     )>,
     /// Every worker's park channel and wake handle, for handing a connection
@@ -276,11 +276,9 @@ pub struct Config {
     /// park, so folding park into that type would put a permanently dead arm
     /// in a backend that cannot reach it.
     pub(crate) peer_park: Vec<(
-        crossbeam_channel::Sender<crate::park::ParkedFd>,
+        crate::handoff::Sender<crate::park::ParkedFd>,
         crate::wakeup::WakeFd,
     )>,
-    /// This worker's receiving end of the park channel.
-    pub(crate) park_rx: Option<crossbeam_channel::Receiver<crate::park::ParkedFd>>,
     /// Print per-worker event-loop diagnostics to stderr at shutdown: the
     /// iteration mix (`[ringline diag]`) and wait/work stall buckets
     /// (`[ringline stall]`). The stall buckets cost ~4 clock reads per
@@ -446,7 +444,6 @@ impl Default for Config {
             worker_accepting: None,
             peer_accept: Vec::new(),
             peer_park: Vec::new(),
-            park_rx: None,
             loop_diag: false,
             max_chain_length: 16,
             standalone_task_capacity: 256,
@@ -552,7 +549,7 @@ impl Config {
                 "max_connections must be > 0 and < 2^24".into(),
             ));
         }
-        // A zero-capacity crossbeam channel has no buffer, so a send completes
+        // A zero-capacity `handoff` channel has no buffer, so a send completes
         // only when a receiver takes it. Workers poll with try_recv and are
         // woken after a send completes, so an idle worker would not take a
         // held connection.

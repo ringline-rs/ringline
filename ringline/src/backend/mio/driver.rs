@@ -151,7 +151,7 @@ pub(crate) struct Driver {
     pub(crate) recv_batch: crate::recv::arrival::BatchClock,
     pub(crate) send_copy_pool: SendCopyPool,
     pub(crate) send_queues: Vec<ConnSendState>,
-    pub(crate) accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+    pub(crate) accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
     pub(crate) wake_handle: crate::wakeup::WakeFd,
     pub(crate) shutdown_flag: Arc<AtomicBool>,
     pub(crate) shutdown_local: bool,
@@ -355,7 +355,7 @@ impl Driver {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &Config,
-        accept_rx: Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+        accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
         eventfd: RawFd,
         wake_fd: crate::wakeup::WakeFd,
         shutdown_flag: Arc<AtomicBool>,
@@ -989,12 +989,9 @@ impl Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        // Close connections still queued for this worker. Dropping the
-        // receiver alone leaves them in the channel until every sender (the
-        // acceptor threads, or in merged mode the other workers) has exited.
-        if let Some(rx) = self.accept_rx.take() {
-            rx.try_iter().for_each(drop);
-        }
+        // Close connections still queued for this worker: dropping the
+        // receiver drops what is queued (`crate::handoff`).
+        drop(self.accept_rx.take());
 
         // Hand back the copy-pool permits of any bounded sends still
         // queued. Worker shutdown drops the driver with whatever is in
@@ -1706,8 +1703,7 @@ pub(crate) mod tests {
         // writable after a flush that wrote nothing. A read waits for the
         // kernel to deliver bytes already written, bounded by `attach_conn`'s
         // 5 s read timeout; a writability wait is bounded at 5 s, and the
-        // whole drain at 90 s. On Linux the drain takes about 20 s: each
-        // read of the ~32 KiB a flush wrote waits about 600 ms.
+        // whole drain at 30 s. The drain takes under 1 ms on Linux.
         // Three earlier shapes failed on one or the other: a reader-thread
         // race that never drained 2 MiB, a 64 KiB payload that Linux
         // swallowed whole in the first flush, and a 10,000-flush budget that
@@ -1735,8 +1731,10 @@ pub(crate) mod tests {
             4096,
         );
         // Explicitly sizing the peer's receive buffer also disables its
-        // autotuning, so the window cannot grow to swallow the message.
-        set_socket_buf(client.as_raw_fd(), libc::SO_RCVBUF, 4096);
+        // autotuning, so the window cannot grow to swallow the message. A
+        // smaller buffer slows the test: at 4 KiB each read waits about
+        // 600 ms on Linux. At 64 KiB the message takes about 20 flushes.
+        set_socket_buf(client.as_raw_fd(), libc::SO_RCVBUF, 64 * 1024);
 
         let payload = vec![b'p'; PAYLOAD];
         driver
@@ -1793,7 +1791,8 @@ pub(crate) mod tests {
         let mut buf = vec![0u8; 64 * 1024];
         let mut written_total = written as usize;
         let mut drained = 0usize;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let mut partial_flushes = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
         loop {
             while drained < written_total {
@@ -1818,6 +1817,9 @@ pub(crate) mod tests {
                 }
                 break;
             }
+            if w > 0 {
+                partial_flushes += 1;
+            }
             assert_eq!(
                 driver.send_copy_pool.free_count(),
                 reserved_free,
@@ -1835,12 +1837,19 @@ pub(crate) mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the message did not drain within 90 s"
+                "the message did not drain within 30 s"
             );
         }
         assert_eq!(
             written_total, PAYLOAD,
             "every byte was written exactly once"
+        );
+        // The mid-message checks above ran after every partial flush; too
+        // few flushes that wrote bytes and a permit released early could go
+        // unseen.
+        assert!(
+            partial_flushes >= 4,
+            "the message split over only {partial_flushes} partial flushes"
         );
         assert_eq!(sink.len(), PAYLOAD, "the peer received the whole message");
         assert!(

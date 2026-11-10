@@ -16,7 +16,7 @@ struct Claim {
 const CLAIMS: &[Claim] = &[
     Claim {
         path: "ringline/src/worker.rs",
-        needle: "crossbeam_channel::bounded::<crate::acceptor::AcceptedConn>",
+        needle: "crate::handoff::bounded::<crate::acceptor::AcceptedConn>",
         meaning: "bounded accepted-fd queue",
     },
     Claim {
@@ -41,8 +41,8 @@ const CLAIMS: &[Claim] = &[
     },
     Claim {
         path: "ringline/src/acceptor.rs",
-        needle: "select.select_timeout(SHUTDOWN_CHECK_INTERVAL)",
-        meaning: "with every worker full, the acceptor blocks until one has room",
+        needle: "std::thread::sleep(ROOM_POLL_INTERVAL)",
+        meaning: "with every worker full, the acceptor waits until one has room",
     },
     Claim {
         path: "ringline/src/acceptor.rs",

@@ -1132,6 +1132,7 @@ impl RinglineBuilder {
             |worker_id,
              config,
              accept_rx,
+             park_rx,
              eventfd,
              shutdown_flag,
              resolve_rx,
@@ -1155,6 +1156,7 @@ impl RinglineBuilder {
                     &config,
                     handler,
                     accept_rx,
+                    park_rx,
                     eventfd.0,
                     shutdown_flag,
                     resolve_rx,
@@ -1171,6 +1173,7 @@ impl RinglineBuilder {
                 #[cfg(not(has_io_uring))]
                 let new_result = {
                     drop(region_rx);
+                    drop(park_rx);
                     AsyncEventLoop::new(
                         &config,
                         handler,
@@ -1273,7 +1276,8 @@ impl RinglineBuilder {
         F: Fn(
                 usize,
                 Config,
-                Option<crossbeam_channel::Receiver<crate::acceptor::AcceptedConn>>,
+                Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
+                Option<crate::handoff::Receiver<crate::park::ParkedFd>>,
                 (RawFd, crate::wakeup::WakeFd),
                 Arc<AtomicBool>,
                 Option<crossbeam_channel::Receiver<crate::resolver::ResolveResponse>>,
@@ -1345,7 +1349,7 @@ impl RinglineBuilder {
             // tries the next worker; if every worker is full, it stops
             // accepting until one has room, which leaves connections in the
             // kernel's listen queue.
-            let (tx, rx) = crossbeam_channel::bounded::<crate::acceptor::AcceptedConn>(
+            let (tx, rx) = crate::handoff::bounded::<crate::acceptor::AcceptedConn>(
                 self.config.accept_queue_capacity,
             );
             let (read_fd, wake_handle) =
@@ -1372,8 +1376,8 @@ impl RinglineBuilder {
         // reason as the accept channels — a slow worker must apply
         // backpressure rather than queue connections without limit.
         //
-        // Created only for merged accept mode. A bounded crossbeam channel
-        // allocates its capacity upfront, so building these unconditionally
+        // Created only for merged accept mode. A bounded channel allocates
+        // its capacity upfront, so building these unconditionally
         // costs `workers * accept_queue_capacity * size_of::<ParkedFd>()` —
         // hundreds of KiB per runtime at the default 1024 — in pool mode,
         // which is the default and can never park.
@@ -1385,7 +1389,7 @@ impl RinglineBuilder {
             park_txs.reserve(num_threads);
             park_rxs.reserve(num_threads);
             for _ in 0..num_threads {
-                let (tx, rx) = crossbeam_channel::bounded::<crate::park::ParkedFd>(
+                let (tx, rx) = crate::handoff::bounded::<crate::park::ParkedFd>(
                     self.config.accept_queue_capacity,
                 );
                 park_txs.push(tx);
@@ -1610,7 +1614,7 @@ impl RinglineBuilder {
                     .zip(worker_wake_fds.iter().copied())
                     .collect();
             }
-            config.park_rx = if park_enabled {
+            let park_rx = if park_enabled {
                 Some(park_rxs.remove(0))
             } else {
                 None
@@ -1698,6 +1702,7 @@ impl RinglineBuilder {
                             worker_id,
                             config,
                             accept_rx,
+                            park_rx,
                             eventfd,
                             worker_shutdown_flag,
                             worker_resolve_rx,
@@ -2458,6 +2463,7 @@ mod startup_gate_tests {
                     move |_,
                           _,
                           accept_rx,
+                          _,
                           _eventfd,
                           _,
                           _,
@@ -2528,7 +2534,7 @@ mod startup_gate_tests {
         let before = fd_count();
         for _ in 0..4 {
             let result = RinglineBuilder::new(one_worker_config()).launch_inner(
-                |_, _, _, _eventfd, _, _, _, _, _, _, _, _, _, _, _, startup_tx| {
+                |_, _, _, _, _eventfd, _, _, _, _, _, _, _, _, _, _, _, startup_tx| {
                     let _ = startup_tx.send(Err(crate::error::Error::Io(io::Error::other(
                         "injected worker startup failure",
                     ))));
@@ -2546,7 +2552,7 @@ mod startup_gate_tests {
     #[test]
     fn startup_returns_the_reported_error_after_rollback() {
         let result = RinglineBuilder::new(one_worker_config()).launch_inner(
-            |_, _, _, _eventfd, _, _, _, _, _, _, _, _, _, _, _, startup_tx| {
+            |_, _, _, _, _eventfd, _, _, _, _, _, _, _, _, _, _, _, startup_tx| {
                 let _ = startup_tx.send(Err(crate::error::Error::Io(io::Error::other(
                     "reported setup failure",
                 ))));
@@ -2569,7 +2575,7 @@ mod startup_gate_tests {
     #[test]
     fn worker_startup_panic_payload_is_preserved() {
         let result = RinglineBuilder::new(one_worker_config()).launch_inner(
-            |_, _, _, _eventfd, _, _, _, _, _, _, _, _, _, _, _, _| {
+            |_, _, _, _, _eventfd, _, _, _, _, _, _, _, _, _, _, _, _| {
                 panic!("injected bootstrap panic")
             },
         );
@@ -2589,7 +2595,7 @@ mod startup_gate_tests {
         let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
         let launched = RinglineBuilder::new(one_worker_config())
             .launch_inner(
-                move |_, _, _, _eventfd, _, _, _, _, _, _, _, _, _, _, _, startup_tx| {
+                move |_, _, _, _, _eventfd, _, _, _, _, _, _, _, _, _, _, _, startup_tx| {
                     let _ = startup_tx.send(Ok(()));
                     drop(startup_tx);
                     let _ = go_rx.recv();

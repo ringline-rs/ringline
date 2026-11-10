@@ -40,7 +40,7 @@ difference papered over at run time:**
 
 **Accepts never enter the ring.** There is no accept opcode anywhere in
 `backend/uring/`. The path is a dedicated thread blocking in `accept4`
-(`acceptor.rs:33`), then a crossbeam send plus an eventfd write to wake the
+(`acceptor.rs:33`), then a channel send plus an eventfd write to wake the
 target worker — a cross-thread handoff per connection, in a runtime whose
 entire premise is that nothing crosses threads. The thread is also unpinned,
 which is the hazard class behind the single-core funnel we root-caused
