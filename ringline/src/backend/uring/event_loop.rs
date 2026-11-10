@@ -4450,6 +4450,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     && let Some(f) = files.get_mut(released_file_index)
                 {
                     f.in_flight = f.in_flight.saturating_sub(1);
+                    // A close deferred by `fs_close` finishes with the last
+                    // operation on the file (#859).
+                    if f.closing && f.in_flight == 0 {
+                        let _ = self.driver.ring.register_files_update(f.fd_index, &[-1i32]);
+                        files.release(released_file_index);
+                    }
                 }
             }
             _ => {}

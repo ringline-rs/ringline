@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, none fixed yet; 3 known issues (#824, #825, #845) confirmed; 6 design limitations for the owner
+- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -87,6 +87,8 @@ Tests that exist: `ringline/tests/fs.rs`, `direct_io.rs` (both backends), `disk_
 Status words: **confirmed** means the auditor ran it (mio, this host) or the anvil run shows it; **traced** means read end to end on both sides but not run.
 
 ### F1 — io_uring: `fs::close` unregisters the fixed file before the loop submits the SQEs of the same poll (invariant 2). Traced; anvil confirmed: experiment `01a1c583-4481-714a-9765-e8998cd35b21`, the write completed `Err(EBADF)` and the file stayed empty.
+
+**Fixed (#859):** `fs_close` defers while reads, writes or fsyncs are in flight, as below; the `fs::close` doc now says the slot is freed when the last of them completes. Test: `ringline/tests/fs_close_in_flight.rs`. The text below is as found at 6851de26.
 
 `ringline/src/handler.rs:2301-2314`: `fs_close` runs `register_files_update(fd_index, &[-1])`, a synchronous `io_uring_register`, and releases the slot. The read, write and fsync SQEs pushed earlier in the same task poll are still in the user-space SQ (`push_sqe128` submits early only when the SQ is full) until the loop's `flush()` after `poll_ready_tasks`. The kernel resolves a fixed file when it issues the request, inside the `io_uring_enter` that submits it (from memory of the kernel source; the run below shows the `EBADF`, not the mechanism), so an fs operation issued before `close` in one poll finds an empty slot and completes with `-EBADF`; it succeeds only if the SQ happened to fill between the two calls. Direct I/O and NVMe defer the close while `in_flight > 0` and are not affected; on mio the same sequence lands in the file, pinned by `tests/fs_fd_ownership.rs::a_queued_write_lands_in_its_file_after_close`. This narrows #845's "Nothing breaks today because the kernel holds file references": the reference exists only for SQEs the kernel has seen. The `fs::close` doc is accurate ("on success the handle is invalid and its slot is free when this returns") and the backends differ.
 
