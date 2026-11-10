@@ -3222,6 +3222,79 @@ mod worker_exit_tests {
         assert_eq!(echo(&mut after_drain), Echoed::Closed);
     }
 
+    /// A worker that exited before the listener was added is steered around,
+    /// and what its socket holds closed, when `reapply_exits` runs after the
+    /// listener is added, as `launch()` runs it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exit_before_the_listener_is_added_is_applied_once_it_is() {
+        use std::os::fd::AsRawFd;
+        // A listening `SO_REUSEPORT` group of two sockets, one per worker, as
+        // merged mode binds them.
+        let first = super::bind_reuseport_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = super::getsockname_v4_v6(first.as_raw_fd()).unwrap();
+        let second = super::bind_reuseport_socket(addr).unwrap();
+        for fd in [first.as_raw_fd(), second.as_raw_fd()] {
+            assert_eq!(unsafe { libc::listen(fd, 128) }, 0);
+        }
+        let sockets = super::ListenerSockets::new(vec![first, second]);
+        let shutdown = super::RuntimeShutdown::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            crate::listen_gate::ListenGates::new(0, 128),
+            Arc::from(Vec::new()),
+        )
+        .unwrap();
+        let accepting = (0..2)
+            .map(|_| std::sync::atomic::AtomicBool::new(true))
+            .collect();
+        let _ = shutdown.accepting.set(Arc::new(accepting));
+
+        // Steer every connection to worker 1, so that the one below queues
+        // on its socket.
+        crate::reuseport_bpf::attach_live_set(sockets.fd(0), &[1]).unwrap();
+        let mut queued = TcpStream::connect(addr).unwrap();
+
+        // The exit arrives with no listener to steer. Adding the listener and
+        // reapplying steers around worker 1 and closes what its socket holds.
+        shutdown.worker_exited(1, false);
+        shutdown.add_listener(Arc::clone(&sockets), true);
+        shutdown.reapply_exits();
+        assert_eq!(echo(&mut queued), Echoed::Closed);
+
+        // Every later connection reaches worker 0's socket.
+        let nonblocking: libc::c_int = 1;
+        unsafe { libc::ioctl(sockets.fd(0), libc::FIONBIO, &nonblocking) };
+        for _ in 0..8 {
+            let _conn = TcpStream::connect(addr).unwrap();
+            let accepted = accept_within(sockets.fd(0), Duration::from_secs(5));
+            assert!(
+                accepted >= 0,
+                "a connection did not reach worker 0's socket"
+            );
+            unsafe { libc::close(accepted) };
+        }
+    }
+
+    /// Accept one connection from the non-blocking listener `fd`, waiting for
+    /// at most `timeout` for one to arrive. Negative when none did.
+    #[cfg(target_os = "linux")]
+    fn accept_within(fd: std::os::fd::RawFd, timeout: Duration) -> std::os::fd::RawFd {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as libc::c_int) };
+        unsafe {
+            libc::accept4(
+                fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        }
+    }
+
     /// A connection arriving as the worker stops does not hang.
     #[cfg(has_io_uring)]
     #[test]
