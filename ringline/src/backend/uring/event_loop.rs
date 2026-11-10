@@ -3936,6 +3936,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // is reused, or the next occupant inherits them.
         self.driver.clear_conn_claims(conn_index);
         self.driver.accumulators.release(conn_index);
+        self.driver.forward_zc_held[conn_index as usize] = None;
         self.driver.arrival[conn_index as usize].release();
         self.driver.connections.release(conn_index);
     }
@@ -10130,6 +10131,115 @@ mod tests {
             "the refused forward dropped the accumulator's bytes ({err})"
         );
         assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
+    }
+
+    /// `len` bytes of `9` whose allocation sets the returned flag when it is
+    /// freed.
+    fn drop_flagged_bytes(
+        len: usize,
+    ) -> (bytes::Bytes, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Owner(Vec<u8>, Arc<AtomicBool>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        let freed = Arc::new(AtomicBool::new(false));
+        let bytes = bytes::Bytes::from_owner(Owner(vec![9u8; len], Arc::clone(&freed)));
+        (bytes, freed)
+    }
+
+    /// `try_with_data` on a connection whose accumulator is a `len`-byte
+    /// remainder put back by `with_bytes`, with a closure that forwards the
+    /// slice it is given. Returns whether the remainder's allocation had been
+    /// freed when `forward_recv_buf` returned, while the closure still held
+    /// the slice, and whether it had been freed when `try_with_data`
+    /// returned.
+    fn forward_a_put_back_remainder(len: usize, tls: bool) -> (bool, bool) {
+        use std::sync::atomic::Ordering;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        if tls {
+            install_handshaked_tls(&mut el, conn_index);
+        }
+        let current = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let (remainder, freed) = drop_flagged_bytes(len);
+        el.driver.accumulators.put_back(conn_index, remainder);
+        let mut freed_in_closure = None;
+        let result = with_driver_state(&mut el, || {
+            current.try_with_data(|data| {
+                assert_eq!(data.len(), len);
+                current.forward_recv_buf(data).expect("forward");
+                freed_in_closure = Some(freed.load(Ordering::SeqCst));
+                crate::ParseResult::Consumed(data.len())
+            })
+        });
+        assert_eq!(result, Some(crate::ParseResult::Consumed(len)));
+        assert!(el.driver.accumulators.data(conn_index).is_empty());
+        (
+            freed_in_closure.expect("the closure ran"),
+            freed.load(Ordering::SeqCst),
+        )
+    }
+
+    /// A forward below `send_zc_threshold` copies the bytes and drops its
+    /// guard inside `forward_recv_buf`. The bytes stay allocated until the
+    /// reader closure that holds a slice of them returns, and are freed then.
+    #[test]
+    fn a_copied_forward_keeps_the_readers_slice_allocated_until_the_closure_returns() {
+        assert_eq!(forward_a_put_back_remainder(99, false), (false, true));
+    }
+
+    /// A TLS forward encrypts the bytes and drops its guard inside
+    /// `forward_recv_buf`, at any size.
+    #[test]
+    fn a_tls_forward_keeps_the_readers_slice_allocated_until_the_closure_returns() {
+        assert_eq!(forward_a_put_back_remainder(5000, true), (false, true));
+    }
+
+    /// A closure that forwards its slice and then calls `close()` still holds
+    /// the slice. `close_connection` leaves the bytes held; they are freed
+    /// when the Close completes and `handle_close` releases the slot.
+    #[test]
+    fn a_copied_forward_then_close_keeps_the_bytes_until_the_slot_is_released() {
+        use std::sync::atomic::Ordering;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let current = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let (remainder, freed) = drop_flagged_bytes(99);
+        el.driver.accumulators.put_back(conn_index, remainder);
+        let mut freed_in_closure = None;
+        with_driver_state(&mut el, || {
+            current.try_with_data(|data| {
+                current.forward_recv_buf(data).expect("forward");
+                current.close();
+                freed_in_closure = Some(freed.load(Ordering::SeqCst));
+                // Not `Consumed(data.len())`: `close_connection` zeroes the
+                // forwarded count, so the delivery path would consume past
+                // the end of the empty accumulator.
+                crate::ParseResult::NeedMore
+            })
+        });
+        assert_eq!(freed_in_closure, Some(false));
+        assert!(!freed.load(Ordering::SeqCst));
+        let ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert!(freed.load(Ordering::SeqCst));
+    }
+
+    /// Control: at `send_zc_threshold` and above the send slab holds the
+    /// guard until the kernel's notification, so the bytes outlive the
+    /// closure.
+    #[test]
+    fn a_zero_copy_forward_holds_the_bytes_past_the_closure() {
+        assert_eq!(forward_a_put_back_remainder(5000, false), (false, false));
     }
 
     /// A handle made stale by real teardown and the slot's re-accept must not
