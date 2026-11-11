@@ -12,7 +12,7 @@ use metriken::{Gauge, ShardedCounterGroup, metric};
     name = "ringline/connections",
     description = "Connection lifecycle counters"
 )]
-pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(11);
+pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(12);
 
 #[metric(name = "ringline/bytes", description = "Byte transfer counters")]
 pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
@@ -141,6 +141,9 @@ pub mod conn {
     /// accept (`EBADF`, `ENOTSOCK`, `EINVAL` outside shutdown). Its listener
     /// accepts nothing afterwards; the error is also written to stderr.
     pub const ACCEPTOR_STOPPED: usize = 10;
+    /// TLS connections, inbound or outbound, closed because their handshake
+    /// had not completed within `ConfigBuilder::tls_handshake_timeout`.
+    pub const TLS_HANDSHAKE_TIMEOUT: usize = 11;
 }
 
 /// Completions processed, split by `OpTag`.
@@ -487,6 +490,11 @@ pub fn init_metadata() {
         "op".into(),
         "acceptor_stopped".into(),
     );
+    CONNECTIONS.insert_metadata(
+        conn::TLS_HANDSHAKE_TIMEOUT,
+        "op".into(),
+        "tls_handshake_timeout".into(),
+    );
 
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_100, "op".into(), "lt_100us".into());
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_250, "op".into(), "lt_250us".into());
@@ -631,6 +639,33 @@ pub fn init_metadata() {
 mod tests {
     use super::*;
 
+    /// Each `conn` index names its own slot, and together they fill
+    /// `CONNECTIONS`, so two counters cannot share a slot.
+    #[test]
+    fn conn_indices_are_distinct_and_fill_the_group() {
+        let mut idx = [
+            conn::ACCEPTED,
+            conn::CLOSED,
+            conn::PARK_STARTED,
+            conn::PARK_COMPLETED,
+            conn::ADOPTED,
+            conn::ACCEPT_TABLE_FULL,
+            conn::ACCEPT_REGISTER_FAILED,
+            conn::ACCEPT_QUEUE_FULL,
+            conn::SHUTDOWN_FAILED,
+            conn::ACCEPT_ERROR_BACKOFF,
+            conn::ACCEPTOR_STOPPED,
+            conn::TLS_HANDSHAKE_TIMEOUT,
+        ];
+        idx.sort_unstable();
+        assert_eq!(idx.to_vec(), (0..idx.len()).collect::<Vec<_>>());
+        assert_eq!(
+            CONNECTIONS.entries(),
+            idx.len(),
+            "CONNECTIONS is not sized to its named slots"
+        );
+    }
+
     /// Every declared slot index must be in bounds for its group —
     /// `ShardedCounterGroup::increment` silently returns `false` on an
     /// out-of-range index, so an undersized group means a counter that
@@ -649,6 +684,7 @@ mod tests {
             conn::SHUTDOWN_FAILED,
             conn::ACCEPT_ERROR_BACKOFF,
             conn::ACCEPTOR_STOPPED,
+            conn::TLS_HANDSHAKE_TIMEOUT,
         ] {
             assert!(
                 CONNECTIONS.increment(idx),
@@ -793,7 +829,7 @@ mod cqe_tag_tests {
     /// which gaps we expect, rather than letting an unnoticed new one look
     /// normal — an unregistered slot reads as a counter stuck at zero.
     ///
-    /// Slots 0, 1, 17, 20, 26 to 30 have no `OpTag` variant.
+    /// Slots 0, 1, 17, 20, 27 to 30 have no `OpTag` variant.
     #[test]
     fn expected_slots_are_unused() {
         let unused: Vec<usize> = (0..cqe_tag::COUNT)
@@ -801,7 +837,7 @@ mod cqe_tag_tests {
             .collect();
         assert_eq!(
             unused,
-            vec![0, 1, 17, 20, 26, 27, 28, 29, 30],
+            vec![0, 1, 17, 20, 27, 28, 29, 30],
             "unexpected unused CQE_BY_TAG slots"
         );
     }

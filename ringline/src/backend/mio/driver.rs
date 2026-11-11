@@ -200,6 +200,8 @@ pub(crate) struct Driver {
     pub(crate) writable: Vec<bool>,
     /// Per-connection connect timeout deadline (None if no timeout or not connecting).
     pub(crate) connect_deadlines: Vec<Option<std::time::Instant>>,
+    /// TLS handshakes in progress and their deadlines.
+    pub(crate) handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines,
     /// The wake pipe's read end, registered with mio as `WAKE_TOKEN`. Not
     /// owned: the worker's `WakeHandle` owns it, and `Config::wake_keep_alive`
     /// holds that handle until the worker exits.
@@ -282,7 +284,14 @@ pub(crate) struct Driver {
     /// not been drained yet. Not reissued: with no slab slot to keep a key
     /// busy, a dropped future's key would otherwise be handed out while its
     /// operation still runs (#574).
-    pub(crate) disk_io_in_flight: std::collections::HashSet<u32>,
+    pub(crate) disk_io_in_flight:
+        std::collections::HashMap<u32, crate::disk_io_pool::PoolSubsystem>,
+    /// Entries of `disk_io_in_flight` per subsystem, indexed by
+    /// `PoolSubsystem`.
+    pub(crate) disk_io_counts: [u16; 2],
+    /// Each subsystem's `max_commands_in_flight`, indexed by `PoolSubsystem`;
+    /// `None` when it is not configured. A submit at the bound fails.
+    pub(crate) disk_io_limits: [Option<u16>; 2],
     /// The keys in `disk_io_in_flight` whose request reads or writes through
     /// a caller's buffer address: `fs::read`/`fs::write` and
     /// `direct_io_read`/`direct_io_write`. Worker exit waits for these.
@@ -549,6 +558,10 @@ impl Driver {
             connect_pending: 0,
             writable: vec![false; max_conn],
             connect_deadlines: vec![None; max_conn],
+            handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines::new(
+                config.tls_handshake_timeout,
+                config.max_connections,
+            ),
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
             forward_conn: (0..max_conn).map(|_| None).collect(),
@@ -569,7 +582,12 @@ impl Driver {
             disk_io_tx,
             disk_io_pool,
             next_disk_io_seq: 0,
-            disk_io_in_flight: std::collections::HashSet::new(),
+            disk_io_in_flight: std::collections::HashMap::new(),
+            disk_io_counts: [0; 2],
+            disk_io_limits: [
+                config.fs.as_ref().map(|f| f.max_commands_in_flight),
+                config.direct_io.as_ref().map(|d| d.max_commands_in_flight),
+            ],
             disk_io_borrowing: std::collections::HashSet::new(),
             disk_io_outstanding: false,
             direct_io_files: config
@@ -626,6 +644,8 @@ impl Driver {
             wake_handle: self.wake_handle,
             next_disk_io_seq: &mut self.next_disk_io_seq,
             disk_io_in_flight: &mut self.disk_io_in_flight,
+            disk_io_counts: &mut self.disk_io_counts,
+            disk_io_limits: self.disk_io_limits,
             disk_io_borrowing: &mut self.disk_io_borrowing,
             direct_io_files: &mut self.direct_io_files,
             direct_io_fds: &mut self.direct_io_fds,

@@ -14,6 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `fs::stat` follows the link, as before, so `Metadata::is_symlink` from it is
   always false; `symlink_metadata` is the only way to get `true`. The fields
   of `Metadata` are now documented (#863).
+- `ConfigBuilder::tls_handshake_timeout`, default 10 s, greater than zero and
+  at most 60 s. A TLS connection whose handshake has not completed within it
+  is closed: inbound, from its worker registering it; outbound, from the TCP
+  connect completing, and the `connect(..).tls(..)` resolves `TimedOut`.
+  Before, an inbound TLS connection whose peer sent nothing, or sent a
+  warning-level close_notify before TLS 1.3 was negotiated, held its slot
+  until the worker exited, because no task holds it before its handshake
+  completes. An outbound `connect(..).tls(..)` to such a peer did not
+  resolve. `metrics::conn::TLS_HANDSHAKE_TIMEOUT` (11,
+  `op=tls_handshake_timeout` on `ringline/connections`) counts the closes.
+  On io_uring with a `tick_timeout_us` of 0 or above 10 ms, the earliest
+  deadline arms a timer of its own (`handshake_deadline` on
+  `ringline/cqe_by_tag`). Send and recv paradigms audit L18
+  (`docs/journal/2026-11-send-recv-paradigms-audit.md`).
 - `ConfigBuilder::defer_recv_arm`, off by default. On io_uring, a plaintext
   connection's reader that parks has its receive armed after the worker's next
   wait, not in the same submission as the sends queued before it parked, so the
@@ -989,6 +1003,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   dropped; 32,768 on io_uring when each close waited for an operation in
   flight), and an operation or close through it acted on that file. That now
   takes 2^32 releases (2^31 when each close waited) (#862).
+- mio: `FsConfig::max_commands_in_flight` and
+  `DirectIoConfig::max_commands_in_flight` bound the operations a worker has
+  in its disk-I/O pool, as they bound the command slabs on io_uring. An
+  operation submitted at the bound fails with the io_uring backend's error,
+  `filesystem command slab exhausted` or `direct I/O command slab exhausted`,
+  until one completes. Before, mio queued every operation on an unbounded
+  channel. A path operation of `fs` (`stat`, `symlink_metadata`, `rename`,
+  `remove`, `mkdir`) on a runtime with fs off (`ConfigBuilder::no_fs`) now fails with
+  `filesystem I/O not configured`, as on io_uring; before, mio ran it when
+  direct I/O was on, and failed with `disk I/O pool not configured` when it
+  was off. The pool's threads are now named
+  `ringline-disk-io-<worker>-<thread>`, and `ConfigBuilder::disk_io_threads`
+  says the count is per worker; each worker always had its own pool (#864).
 - io_uring: `fs::close` with a read, write or fsync on the file still in
   flight leaves the file registered until the last of them completes. Before,
   it unregistered the file at once, and an operation issued earlier in the

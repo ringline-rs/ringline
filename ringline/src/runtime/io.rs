@@ -697,7 +697,10 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// copies the ciphertext from. Decrypted plaintext goes to the accumulator.
 /// During the handshake a receive is re-armed after each completion. A FIN
 /// before the handshake completes closes the connection, and an outbound
-/// connect resolves `UnexpectedEof`. After the handshake, a receive is armed
+/// connect resolves `UnexpectedEof`. A handshake that has not completed
+/// within [`ConfigBuilder::tls_handshake_timeout`](crate::ConfigBuilder::tls_handshake_timeout)
+/// also closes the connection, and an outbound connect resolves `TimedOut`.
+/// After the handshake, a receive is armed
 /// when a read parks, as on a plaintext connection.
 /// When the `POLLRDHUP` poll fires because the peer sent a FIN or reset while
 /// nothing reads, the runtime arms one and re-arms it after each completion
@@ -782,7 +785,11 @@ impl TcpConnect {
     /// one the connect fails when awaited.
     ///
     /// If the peer's FIN arrives before the handshake completes, the connect
-    /// resolves [`UnexpectedEof`](io::ErrorKind::UnexpectedEof).
+    /// resolves [`UnexpectedEof`](io::ErrorKind::UnexpectedEof). If the
+    /// handshake has not completed within
+    /// [`ConfigBuilder::tls_handshake_timeout`](crate::ConfigBuilder::tls_handshake_timeout)
+    /// of the TCP connect completing, it resolves
+    /// [`TimedOut`](io::ErrorKind::TimedOut).
     pub fn tls(mut self, server_name: impl Into<String>) -> Self {
         self.server_name = Some(server_name.into());
         self
@@ -791,7 +798,9 @@ impl TcpConnect {
     /// Fail the connect if it has not completed within `timeout`.
     ///
     /// On a TLS connection the window covers the TCP connect only, not the
-    /// handshake that follows.
+    /// handshake that follows;
+    /// [`ConfigBuilder::tls_handshake_timeout`](crate::ConfigBuilder::tls_handshake_timeout)
+    /// bounds the handshake.
     ///
     /// The duration is truncated to whole milliseconds, because both backends
     /// arm in milliseconds. `Duration::ZERO` arms a timeout that fires

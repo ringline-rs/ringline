@@ -55,7 +55,7 @@
 <text x="90" y="520" font-family="monospace" font-size="17" fill="#222">ringline-resolver-i</text>
 <text x="90" y="555" font-family="monospace" font-size="17" fill="#222">ringline-spawner-i</text>
 <text x="90" y="590" font-family="monospace" font-size="17" fill="#222">ringline-blocking-i</text>
-<text x="90" y="625" font-family="monospace" font-size="17" fill="#222">ringline-disk-io-i (Mio)</text>
+<text x="90" y="625" font-family="monospace" font-size="17" fill="#222">ringline-disk-io-w-i (Mio)</text>
 <line x1="450" y1="565" x2="540" y2="565" stroke="#4D4D4D" stroke-width="1.4" marker-end="url(#arrow)"/>
 <text x="495" y="552" text-anchor="middle" data-role="arrow-label" font-family="sans-serif" font-size="13" fill="#222" stroke="white" stroke-width="6" stroke-linejoin="round" paint-order="stroke">response queue + wake</text>
 <text x="50" y="720" font-family="sans-serif" font-size="16" fill="#222">No shared Driver • no work stealing • no cross-worker task migration</text>
