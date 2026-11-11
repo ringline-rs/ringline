@@ -1005,6 +1005,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `Connection::peer_closed` documented that the runtime sees the peer's end
+  while no read is parked. On io_uring that holds for a FIN and not for a
+  TLS close_notify on a TCP stream the peer keeps open: once the handshake
+  is done, a receive is armed only when a read parks, so a close_notify that
+  arrives while the task does other work is seen by its next read. The doc
+  now says so. On mio the runtime receives whenever the socket is readable.
+  The test that relied on it failed intermittently on io_uring (#889).
+
 - mio with the `tls-buffered` feature: one rustls `write_tls` call writes at
   most 64 records, and the mio paths called it once where more could be
   pending; the rest stayed in rustls until the next receive or send. A flush
