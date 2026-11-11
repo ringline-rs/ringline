@@ -114,6 +114,22 @@ fn sleeps_complete_in_futures_unordered() {
     });
 }
 
+/// A sleep polled again after it completed runs again, as a new timer.
+#[test]
+fn a_sleep_polled_after_it_completed_runs_again() {
+    run_on_start(|| {
+        Box::pin(async {
+            let mut sleep = ringline::sleep(Duration::from_millis(5));
+            (&mut sleep).await;
+            let again = ringline::timeout(LIMIT, poll_fn(|cx| Pin::new(&mut sleep).poll(cx))).await;
+            assert!(
+                again.is_ok(),
+                "a sleep polled after Ready never completed again"
+            );
+        })
+    });
+}
+
 /// A connection task woken during its own poll is polled again: the wake is
 /// recorded in its slot, and parking the task queues it.
 #[test]

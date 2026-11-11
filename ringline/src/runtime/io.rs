@@ -4570,9 +4570,10 @@ mod yield_now_tests {
 ///
 /// On io_uring, uses a timeout SQE internally — no busy-waiting, no timer
 /// thread. The timer fires on the same worker thread as the calling task.
-/// The SQE is pushed on the first poll; if the submission queue has no room,
-/// it is pushed on a later poll, after the event loop has submitted, and the
-/// duration counts from that push.
+/// The SQE is pushed on the first poll. If it cannot be pushed (the submission
+/// queue is full and submitting to make room fails), it is pushed on a later
+/// poll, after the event loop has submitted, and the duration counts from that
+/// push.
 ///
 /// # Panics
 ///
@@ -4669,6 +4670,8 @@ impl Future for SleepFuture {
                     if self.armed && executor.timer_pool.is_fired(slot) {
                         executor.timer_pool.release(slot);
                         self.timer_slot = None;
+                        // Polled again, the sleep takes a new slot and arms it.
+                        self.armed = false;
                         return Poll::Ready(());
                     }
                     // A `Shared` can pass this future between tasks of a worker.
@@ -4702,7 +4705,8 @@ impl Future for SleepFuture {
                 let generation = self.generation;
                 self.arm(driver, executor, slot, generation);
                 if !self.armed {
-                    // The submission queue had no room. The event loop enters
+                    // The submission queue was full and submitting to make
+                    // room failed. The event loop enters
                     // the kernel to submit before it next polls tasks, so
                     // poll again then.
                     cx.waker().wake_by_ref();
@@ -4767,9 +4771,10 @@ pub(crate) fn release_timer_slot(
 /// `Err(TimerExhausted)` so callers can handle capacity limits gracefully.
 ///
 /// The timer slot is allocated eagerly (at call time, not on first poll), and
-/// on io_uring the timeout SQE is pushed then too. If the submission queue has
-/// no room, the slot stays held and the SQE is pushed on a later poll, and
-/// the duration counts from that push.
+/// on io_uring the timeout SQE is pushed then too. If it cannot be pushed (the
+/// submission queue is full and submitting to make room fails), the slot stays
+/// held and the SQE is pushed on a later poll, and the duration counts from
+/// that push.
 ///
 /// # Panics
 ///
@@ -4887,8 +4892,9 @@ pub fn sleep_until(deadline: Deadline) -> SleepFuture {
 /// `Err(TimerExhausted)` so callers can handle capacity limits gracefully.
 ///
 /// The timer slot is allocated eagerly (at call time, not on first poll), and
-/// on io_uring the timeout SQE is pushed then too. If the submission queue has
-/// no room, the slot stays held and the SQE is pushed on a later poll.
+/// on io_uring the timeout SQE is pushed then too. If it cannot be pushed (the
+/// submission queue is full and submitting to make room fails), the slot stays
+/// held and the SQE is pushed on a later poll.
 ///
 /// # Panics
 ///
