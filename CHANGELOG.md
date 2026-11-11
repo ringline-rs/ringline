@@ -1019,6 +1019,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Timers (#836, items 1 and 2):
+  - A sleep or deadline too far out for the clock is never reached instead
+    of failing. On io_uring, a `Duration` with more than `i64::MAX` seconds
+    made a negative `tv_sec`, which the kernel refused with `EINVAL`, and the
+    sleep stayed pending without an error. On mio, `sleep(Duration::MAX)`
+    panicked adding it to an `Instant`, and `Deadline::after(Duration::MAX)`
+    overflowed on both backends.
+  - io_uring: a timeout completion other than expiry (`-ETIME`) or a cancel
+    (`-ECANCELED`) completes the sleep. Before, every other result was taken
+    as a cancel and the sleep waited forever.
+  - io_uring: a sleep dropped while its timeout is in flight, whose cancel
+    cannot be pushed, keeps its timer slot until the timeout completes.
+    Before, the slot was freed at once, and once its 16-bit generation had
+    wrapped, the old timeout could wake the slot's new occupant early.
 - `ConfigBuilder::build` refuses `sq_entries` above 16384. The completion
   queue is 4 × `sq_entries`, and Linux refuses more than 65536 completion
   queue entries, so a larger value passed validation and then failed every

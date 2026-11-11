@@ -4086,15 +4086,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     fn handle_timer(&mut self, ud: UserData, result: i32) {
-        // Timer CQE: -ETIME means the timeout expired normally.
-        // -ECANCELED means it was cancelled (e.g., SleepFuture dropped).
-        if result != -libc::ETIME {
-            // Cancelled or error — the SleepFuture::drop already released the slot.
-            return;
-        }
-
         let payload = ud.payload();
         let (slot, generation) = TimerSlotPool::decode_payload(payload);
+
+        // A slot released while this timeout was in flight, whose cancel
+        // could not be pushed, is freed now that the timeout has completed.
+        if self.executor.timer_pool.release_parked(slot, generation) {
+            return;
+        }
+        // Cancelled: the future was dropped and released the slot.
+        if result == -libc::ECANCELED {
+            return;
+        }
+        // -ETIME is expiry. Any other result means the timeout ended without
+        // expiring and will not complete again, so the sleep completes rather
+        // than wait forever.
 
         if let Some(waker_id) = self.executor.timer_pool.fire(slot, generation) {
             self.executor.wake_task(waker_id);
@@ -10977,6 +10983,73 @@ mod tests {
             el.executor.timer_pool.is_fired(slot),
             "timer not marked as fired"
         );
+    }
+
+    /// A timeout that completes with neither -ETIME nor -ECANCELED will not
+    /// complete again, so its sleep completes instead of waiting forever;
+    /// -ECANCELED completes nothing (#836).
+    #[test]
+    fn a_timer_error_completes_the_sleep_and_a_cancel_does_not() {
+        let mut el = make_test_loop();
+        let (slot, generation) = el.executor.timer_pool.allocate(0).unwrap();
+        let ud = UserData::encode(
+            OpTag::Timer,
+            0,
+            TimerSlotPool::encode_payload(slot, generation),
+        );
+        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+        assert!(!el.executor.timer_pool.is_fired(slot), "a cancel fired it");
+        el.test_dispatch_cqe(ud.raw(), -libc::EINVAL, 0);
+        assert!(
+            el.executor.timer_pool.is_fired(slot),
+            "an error left it pending"
+        );
+    }
+
+    /// A slot whose cancel could not be pushed is not freed while its
+    /// timeout is in flight, so the timeout cannot match a later occupant;
+    /// the timeout's completion frees it and wakes nothing (#836).
+    #[test]
+    fn a_slot_whose_cancel_was_not_pushed_waits_for_its_timeout() {
+        let mut el = make_test_loop();
+        let free = el.executor.timer_pool.free_slots();
+        let (slot, generation) = el.executor.timer_pool.allocate(0).unwrap();
+        el.driver.ring.force_push_failures(1);
+        crate::runtime::io::release_timer_slot(
+            &mut el.driver,
+            &mut el.executor,
+            slot,
+            generation,
+            true,
+        );
+        assert_eq!(
+            el.executor.timer_pool.free_slots(),
+            free - 1,
+            "the slot was freed with its timeout in flight"
+        );
+        let (other, _) = el.executor.timer_pool.allocate(0).unwrap();
+        assert_ne!(other, slot, "a parked slot was handed out again");
+        el.executor.timer_pool.release(other);
+
+        let ud = UserData::encode(
+            OpTag::Timer,
+            0,
+            TimerSlotPool::encode_payload(slot, generation),
+        );
+        el.test_dispatch_cqe(ud.raw(), -libc::ETIME, 0);
+        assert!(
+            !el.executor.timer_pool.is_fired(slot),
+            "it woke the dropped sleep"
+        );
+        assert_eq!(
+            el.executor.timer_pool.free_slots(),
+            free,
+            "the timeout's completion did not free the slot"
+        );
+        // The slot's next occupant has a new generation.
+        let (again, next) = el.executor.timer_pool.allocate(0).unwrap();
+        assert_eq!(again, slot);
+        assert_ne!(next, generation);
     }
 
     #[test]
