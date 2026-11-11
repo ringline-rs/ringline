@@ -2475,6 +2475,7 @@ mod startup_gate_tests {
             .spawner_threads(0)
             .blocking_threads(0)
             .disk_io_threads(0)
+            .no_fs()
             .build()
             .unwrap()
     }

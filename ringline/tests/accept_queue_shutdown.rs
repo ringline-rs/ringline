@@ -103,6 +103,7 @@ fn test_config(workers: usize) -> ringline::Config {
         .resolver_threads(0)
         .spawner_threads(0)
         .disk_io_threads(0)
+        .no_fs()
         .build()
         .expect("valid config")
 }

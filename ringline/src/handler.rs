@@ -2676,7 +2676,7 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) sends_dirty: &'a mut Vec<u32>,
     pub(crate) sends_dirty_flag: &'a mut Vec<bool>,
     pub(crate) connect_pending: &'a mut u32,
-    /// Shared disk I/O pool for filesystem operations.
+    /// This worker's disk I/O pool.
     pub(crate) disk_io_pool: &'a Option<std::sync::Arc<crate::disk_io_pool::DiskIoPool>>,
     /// Per-worker disk I/O response send channel (included in each request).
     pub(crate) disk_io_tx:
@@ -2686,7 +2686,12 @@ pub(crate) struct DriverCtx<'a> {
     /// Monotonic sequence counter for disk I/O requests.
     pub(crate) next_disk_io_seq: &'a mut u32,
     /// Keys of pool operations not yet drained; see `Driver::disk_io_in_flight`.
-    pub(crate) disk_io_in_flight: &'a mut std::collections::HashSet<u32>,
+    pub(crate) disk_io_in_flight:
+        &'a mut std::collections::HashMap<u32, crate::disk_io_pool::PoolSubsystem>,
+    /// See `Driver::disk_io_counts`.
+    pub(crate) disk_io_counts: &'a mut [u16; 2],
+    /// See `Driver::disk_io_limits`.
+    pub(crate) disk_io_limits: [Option<u16>; 2],
     /// See `Driver::disk_io_borrowing`.
     pub(crate) disk_io_borrowing: &'a mut std::collections::HashSet<u32>,
     /// Direct I/O file table.
@@ -3230,27 +3235,38 @@ impl<'a> DriverCtx<'a> {
 
     /// Allocate a sequence number and submit work to the disk I/O pool.
     /// `borrows` is true when `work` reads or writes through a caller's
-    /// buffer address, which worker exit must then wait for.
+    /// buffer address, which worker exit must then wait for. Fails when
+    /// `subsystem` is not configured, or already has its
+    /// `max_commands_in_flight` operations submitted and not drained.
     fn submit_disk_io(
         &mut self,
+        subsystem: crate::disk_io_pool::PoolSubsystem,
         work: Box<dyn FnOnce() -> crate::disk_io_pool::DiskIoResult + Send>,
         borrows: bool,
     ) -> io::Result<u32> {
-        let pool = self
-            .disk_io_pool
-            .as_ref()
-            .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
-        let tx = self
-            .disk_io_tx
-            .as_ref()
-            .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
+        // An unconfigured subsystem fails first, with io_uring's error, even
+        // when this worker has no pool. A missing pool with the subsystem
+        // configured is unreachable through `ConfigBuilder`, which refuses it
+        // on this backend.
+        let limit =
+            self.disk_io_limits[subsystem as usize].ok_or_else(|| subsystem.not_configured())?;
+        let pool = self.disk_io_pool.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "disk I/O pool not configured")
+        })?;
+        let tx = self.disk_io_tx.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "disk I/O pool not configured")
+        })?;
+        if self.disk_io_counts[subsystem as usize] >= limit {
+            return Err(subsystem.exhausted());
+        }
 
         // Skip a key a future still holds, or whose operation is still in the
         // pool; the u32 sequence can wrap on a long-running worker.
         let seq = loop {
             let seq = *self.next_disk_io_seq;
             *self.next_disk_io_seq = seq.wrapping_add(1);
-            if !crate::runtime::disk_io_key_held(seq) && !self.disk_io_in_flight.contains(&seq) {
+            if !crate::runtime::disk_io_key_held(seq) && !self.disk_io_in_flight.contains_key(&seq)
+            {
                 break seq;
             }
         };
@@ -3263,7 +3279,8 @@ impl<'a> DriverCtx<'a> {
                 wake_handle: self.wake_handle,
             })
             .map_err(|_| io::Error::other("disk I/O pool shut down"))?;
-        self.disk_io_in_flight.insert(seq);
+        self.disk_io_in_flight.insert(seq, subsystem);
+        self.disk_io_counts[subsystem as usize] += 1;
         if borrows {
             self.disk_io_borrowing.insert(seq);
         }
@@ -3369,7 +3386,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work, true)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::DirectIo, work, true)
     }
 
     /// Submit a direct I/O write via the disk I/O pool.
@@ -3407,7 +3424,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work, true)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::DirectIo, work, true)
     }
 
     /// Submit an fsync for a direct I/O file via the disk I/O pool.
@@ -3428,7 +3445,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work, false)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::DirectIo, work, false)
     }
 
     /// Close a direct I/O file and release its slot.
@@ -3524,7 +3541,7 @@ impl<'a> DriverCtx<'a> {
             }
         });
 
-        match self.submit_disk_io(work, false) {
+        match self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false) {
             Ok(seq) => {
                 self.pending_fs_opens.insert(seq, file_index);
                 Ok((file_index, generation, seq))
@@ -3568,7 +3585,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work, true)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, true)
     }
 
     /// Submit a filesystem write via the disk I/O pool.
@@ -3603,7 +3620,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work, true)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, true)
     }
 
     /// Submit an fsync for a filesystem file via the disk I/O pool.
@@ -3624,7 +3641,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work, false)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
     }
 
     /// Close a filesystem file and release its slot.
@@ -3672,7 +3689,7 @@ impl<'a> DriverCtx<'a> {
                 }
             }
         });
-        self.submit_disk_io(work, false)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
     }
 
     /// Submit a rename via the disk I/O pool.
@@ -3698,7 +3715,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work, false)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
     }
 
     /// Submit an unlink via the disk I/O pool.
@@ -3719,7 +3736,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work, false)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
     }
 
     /// Submit a mkdir via the disk I/O pool.
@@ -3740,7 +3757,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work, false)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
     }
 
     /// Validate a filesystem file handle and return a hold on its fd.

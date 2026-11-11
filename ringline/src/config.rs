@@ -232,6 +232,9 @@ pub struct Config {
     pub(crate) listener_tls: Vec<Option<TlsConfig>>,
     /// Optional TLS client configuration for outbound `connect(addr).tls(..)` calls.
     pub(crate) tls_client: Option<TlsClientConfig>,
+    /// How long a TLS handshake may take, inbound or outbound, before the
+    /// connection is closed. See [`ConfigBuilder::tls_handshake_timeout`].
+    pub(crate) tls_handshake_timeout: std::time::Duration,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
     pub(crate) tcp_nodelay: bool,
     /// Where connections are accepted. Always `Pool` without the
@@ -393,15 +396,20 @@ pub struct Config {
     /// 0 = disabled (no blocking pool; [`spawn_blocking()`](crate::spawn_blocking)
     /// will return an error). Default: 4.
     pub(crate) blocking_threads: usize,
-    /// Number of dedicated disk I/O threads (mio backend only). The disk I/O
-    /// pool executes blocking filesystem syscalls (pread, pwrite, fsync, stat,
-    /// rename, unlink, mkdir) on background threads, enabling async file I/O
-    /// on non-Linux platforms.
+    /// Number of disk I/O threads per worker (mio backend only). Each worker's
+    /// pool runs the blocking file syscalls (open, pread, pwrite, fsync, stat,
+    /// lstat, rename, unlink, mkdir) off the event loop.
     ///
-    /// 0 = disabled (filesystem/direct I/O operations return `Unsupported`).
+    /// 0 = no pool. On the mio backend `validate` refuses 0 while `fs` (on by
+    /// default) or `direct_io` is set. On io_uring the pool is not used.
     /// Default: 2.
     pub(crate) disk_io_threads: usize,
 }
+
+/// Default for [`ConfigBuilder::tls_handshake_timeout`].
+const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Largest value [`ConfigBuilder::tls_handshake_timeout`] accepts.
+const MAX_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Default for Config {
     fn default() -> Self {
@@ -445,6 +453,7 @@ impl Default for Config {
             tls: None,
             listener_tls: Vec::new(),
             tls_client: None,
+            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             tcp_nodelay: true,
             accept_mode: AcceptMode::Pool,
             task_panic_policy: crate::TaskPanicPolicy::Contain,
@@ -589,6 +598,13 @@ impl Config {
             ));
         }
         self.validate_tls_slot_size()?;
+        if self.tls_handshake_timeout.is_zero()
+            || self.tls_handshake_timeout > MAX_TLS_HANDSHAKE_TIMEOUT
+        {
+            return Err(crate::error::Error::RingSetup(
+                "tls_handshake_timeout must be > 0 and at most 60 s".into(),
+            ));
+        }
         // A cap of 0 would stop a forward's source before it queues its first
         // send, so the forward never makes progress.
         if self.forward_hold_cap == 0 {
@@ -677,6 +693,25 @@ impl Config {
                 return Err(crate::error::Error::RingSetup(
                     "udp_recv_buffer.buffer_size must be >= 66048 when udp_gro is enabled \
                      (a coalesced GRO datagram is up to ~64 KiB plus recvmsg metadata)"
+                        .into(),
+                ));
+            }
+        }
+        // On mio every fs operation, and every direct I/O read, write and
+        // fsync, runs on the disk-I/O pool, so a file subsystem with no pool
+        // would fail at the first operation that needs it.
+        if !cfg!(has_io_uring) && self.disk_io_threads == 0 {
+            if self.fs.is_some() {
+                return Err(crate::error::Error::RingSetup(
+                    "disk_io_threads is 0 with fs enabled; the mio backend runs file \
+                     operations on that pool: set disk_io_threads or call no_fs()"
+                        .into(),
+                ));
+            }
+            if self.direct_io.is_some() {
+                return Err(crate::error::Error::RingSetup(
+                    "disk_io_threads is 0 with direct_io enabled; the mio backend runs \
+                     direct I/O on that pool: set disk_io_threads or leave direct_io unset"
                         .into(),
                 ));
             }
@@ -1255,7 +1290,14 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the number of disk I/O threads (mio backend only). 0 = disabled.
+    /// Set the number of disk I/O threads per worker (mio backend only): each
+    /// worker with fs or direct I/O configured runs its own pool, so a runtime
+    /// runs `workers × threads` of them, named
+    /// `ringline-disk-io-<worker>-<thread>`.
+    ///
+    /// 0 means no pool: on the mio backend `build()` then fails while `fs`
+    /// (on by default; see [`no_fs`](Self::no_fs)) or `direct_io` is set. On
+    /// io_uring the value is accepted and unused.
     pub fn disk_io_threads(mut self, threads: usize) -> Self {
         self.config.disk_io_threads = threads;
         self
@@ -1264,6 +1306,28 @@ impl ConfigBuilder {
     /// Set TLS server configuration.
     pub fn tls(mut self, config: TlsConfig) -> Self {
         self.config.tls = Some(config);
+        self
+    }
+
+    /// How long a TLS handshake may take before the connection is closed.
+    ///
+    /// An inbound connection's timeout starts when its worker registers it,
+    /// and an outbound one's when its TCP connect completes. A connection
+    /// whose handshake has not completed by then is closed, and an outbound
+    /// `connect(..).tls(..)` resolves
+    /// [`TimedOut`](std::io::ErrorKind::TimedOut). No task holds an inbound
+    /// connection before its handshake completes, so a peer that keeps the
+    /// socket open and sends nothing would otherwise hold it until the worker
+    /// exits.
+    /// [`metrics::conn::TLS_HANDSHAKE_TIMEOUT`](crate::metrics::conn::TLS_HANDSHAKE_TIMEOUT)
+    /// counts the closes. [`TcpConnect::timeout`] covers the TCP connect
+    /// only.
+    ///
+    /// Must be greater than zero and at most 60 s. Default: 10 s.
+    ///
+    /// [`TcpConnect::timeout`]: crate::TcpConnect::timeout
+    pub fn tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.config.tls_handshake_timeout = timeout;
         self
     }
 
@@ -1301,6 +1365,7 @@ impl ConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Helper: create a Config with a single field override.
     /// Avoids clippy::field_reassign_with_default on the multi-field Config struct.
@@ -1308,6 +1373,33 @@ mod tests {
         let mut c = Config::default();
         f(&mut c);
         c
+    }
+
+    /// On mio, `disk_io_threads(0)` with the file subsystems on is refused at
+    /// `build()`, since every file operation would fail; with `no_fs` it
+    /// builds.
+    #[cfg(not(has_io_uring))]
+    #[test]
+    fn disk_io_threads_zero_with_fs_is_rejected_on_mio() {
+        let err = ConfigBuilder::new()
+            .disk_io_threads(0)
+            .build()
+            .err()
+            .expect("fs is on by default, so no pool to run it on is an error");
+        assert!(err.to_string().contains("no_fs"), "{err}");
+        let err = ConfigBuilder::new()
+            .no_fs()
+            .direct_io(crate::direct_io::DirectIoConfig::default())
+            .disk_io_threads(0)
+            .build()
+            .err()
+            .expect("direct I/O with no pool is an error");
+        assert!(err.to_string().contains("direct_io"), "{err}");
+        ConfigBuilder::new()
+            .no_fs()
+            .disk_io_threads(0)
+            .build()
+            .expect("no file subsystem needs the pool");
     }
 
     #[test]
@@ -1343,6 +1435,21 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn tls_handshake_timeout_defaults_to_10_s() {
+        let config = ConfigBuilder::new().build().expect("default config");
+        assert_eq!(config.tls_handshake_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn tls_handshake_timeout_is_bounded() {
+        let build = |t| ConfigBuilder::new().tls_handshake_timeout(t).build();
+        assert!(build(Duration::ZERO).is_err());
+        assert!(build(Duration::from_nanos(1)).is_ok());
+        assert!(build(Duration::from_secs(60)).is_ok());
+        assert!(build(Duration::from_secs(60) + Duration::from_nanos(1)).is_err());
     }
 
     #[test]

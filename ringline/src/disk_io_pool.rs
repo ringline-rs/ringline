@@ -1,10 +1,10 @@
 //! Dedicated disk I/O thread pool for the mio backend.
 //!
-//! Offloads blocking filesystem syscalls (pread, pwrite, fsync, stat, rename,
-//! unlink, mkdir) from the mio event loop to a pool of background threads.
-//! Each thread executes one blocking call at a time and sends the result back
-//! via a per-worker crossbeam channel + `WakeFd`, matching the pattern used
-//! by [`BlockingPool`](crate::blocking::BlockingPool).
+//! Offloads blocking filesystem syscalls (open, pread, pwrite, fsync, stat,
+//! lstat, rename, unlink, mkdir) from the mio event loop to a pool of
+//! background threads. Each thread executes one blocking call at a time and
+//! sends the result back via a per-worker crossbeam channel + `WakeFd`,
+//! matching the pattern used by [`BlockingPool`](crate::blocking::BlockingPool).
 //!
 //! Unlike the blocking pool, these threads do NOT use `SCHED_IDLE` — disk I/O
 //! is latency-sensitive and should not be deprioritized.
@@ -50,6 +50,34 @@ pub(crate) struct DiskIoResponse {
     pub(crate) opened: Option<std::os::fd::OwnedFd>,
 }
 
+/// The subsystem a pool request counts against. Each has its own
+/// `max_commands_in_flight` (`FsConfig`, `DirectIoConfig`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PoolSubsystem {
+    Fs = 0,
+    DirectIo = 1,
+}
+
+impl PoolSubsystem {
+    /// The error a submit past the subsystem's bound returns: the io_uring
+    /// backend's text for a full command slab.
+    pub(crate) fn exhausted(self) -> std::io::Error {
+        std::io::Error::other(match self {
+            PoolSubsystem::Fs => "filesystem command slab exhausted",
+            PoolSubsystem::DirectIo => "direct I/O command slab exhausted",
+        })
+    }
+
+    /// The error a submit for an unconfigured subsystem returns: the io_uring
+    /// backend's text.
+    pub(crate) fn not_configured(self) -> std::io::Error {
+        std::io::Error::other(match self {
+            PoolSubsystem::Fs => "filesystem I/O not configured",
+            PoolSubsystem::DirectIo => "direct I/O not configured",
+        })
+    }
+}
+
 /// Which requests the pool's threads are running, and whether the worker has
 /// exited.
 #[derive(Default)]
@@ -76,8 +104,10 @@ pub(crate) struct DiskIoPool {
 }
 
 impl DiskIoPool {
-    /// Create the channel pair and spawn disk I/O threads.
+    /// Create the channel pair and spawn disk I/O threads, named
+    /// `ringline-disk-io-<worker>-<thread>`.
     pub(crate) fn start(
+        worker_index: usize,
         num_threads: usize,
         wake_keep_alive: crate::wakeup::WakeKeepAlive,
         #[cfg(test)] fault: Option<std::sync::Arc<crate::config::TestFault>>,
@@ -93,7 +123,7 @@ impl DiskIoPool {
             let fault = fault.clone();
             let keep_alive = std::sync::Arc::clone(&wake_keep_alive);
             let handle = thread::Builder::new()
-                .name(format!("ringline-disk-io-{i}"))
+                .name(format!("ringline-disk-io-{worker_index}-{i}"))
                 .spawn(move || {
                     // Holds every worker's wake fd open while this thread
                     // can still wake one.

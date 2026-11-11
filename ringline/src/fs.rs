@@ -288,6 +288,10 @@ impl FsConfig {
     }
 
     /// Set the most I/O commands in flight across all files, per worker. Defaults to 256.
+    ///
+    /// Every operation of this module except `close` counts from submission
+    /// until its completion is processed. One submitted at the limit fails
+    /// with `filesystem command slab exhausted`, on both backends.
     pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
         self.max_commands_in_flight = max_commands_in_flight;
         self

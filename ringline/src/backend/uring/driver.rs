@@ -696,6 +696,15 @@ pub(crate) struct Driver {
     pub(crate) send_backstop_ts: crate::backend::uring::abi::Timespec,
     /// Whether the `SendBackstop` timer is armed.
     pub(crate) send_backstop_armed: bool,
+    /// TLS handshakes in progress and their deadlines.
+    pub(crate) handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines,
+    /// The `HandshakeDeadline` timer's wait, set when it is armed.
+    pub(crate) handshake_timer_ts: crate::backend::uring::abi::Timespec,
+    /// Whether the `HandshakeDeadline` timer is armed.
+    pub(crate) handshake_timer_armed: bool,
+    /// Whether the `HandshakeDeadline` timer is used: the worker has no
+    /// tick timeout, or one longer than 10 ms.
+    pub(crate) handshake_timer_used: bool,
     /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
     /// Drained each tick — used when resubmitting a coalesced `sendmsg` found
     /// the SQ full.
@@ -1179,6 +1188,13 @@ impl Driver {
             send_backstop_scratch: Vec::new(),
             send_backstop_ts: crate::backend::uring::abi::Timespec::new().sec(1),
             send_backstop_armed: false,
+            handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines::new(
+                config.tls_handshake_timeout,
+                config.max_connections,
+            ),
+            handshake_timer_ts: crate::backend::uring::abi::Timespec::new(),
+            handshake_timer_armed: false,
+            handshake_timer_used: config.tick_timeout_us == 0 || config.tick_timeout_us > 10_000,
             pending_coalesced_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             pending_shutdown_retries: Vec::new(),
