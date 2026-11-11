@@ -1310,6 +1310,33 @@ mod tests {
         c
     }
 
+    /// On mio, `disk_io_threads(0)` with the file subsystems on is refused at
+    /// `build()`, since every file operation would fail; with `no_fs` it
+    /// builds.
+    #[cfg(not(has_io_uring))]
+    #[test]
+    fn disk_io_threads_zero_with_fs_is_rejected_on_mio() {
+        let err = ConfigBuilder::new()
+            .disk_io_threads(0)
+            .build()
+            .err()
+            .expect("fs is on by default, so no pool to run it on is an error");
+        assert!(err.to_string().contains("no_fs"), "{err}");
+        let err = ConfigBuilder::new()
+            .no_fs()
+            .direct_io(crate::direct_io::DirectIoConfig::default())
+            .disk_io_threads(0)
+            .build()
+            .err()
+            .expect("direct I/O with no pool is an error");
+        assert!(err.to_string().contains("direct_io"), "{err}");
+        ConfigBuilder::new()
+            .no_fs()
+            .disk_io_threads(0)
+            .build()
+            .expect("no file subsystem needs the pool");
+    }
+
     #[test]
     fn validate_default_config_passes() {
         Config::default()
