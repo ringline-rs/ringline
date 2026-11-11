@@ -1697,7 +1697,7 @@ impl RinglineBuilder {
             };
 
             let spawn_result = thread::Builder::new()
-                .name(format!("ringline-worker-{worker_id}"))
+                .name(format!("rl-work-{worker_id}"))
                 .spawn(move || {
                     if config.worker.pin_to_core {
                         let core = pin_cpu;
@@ -1924,7 +1924,7 @@ impl RinglineBuilder {
                         conn_chunk_size: self.config.conn_chunk_size,
                     };
                     thread::Builder::new()
-                        .name(format!("ringline-acceptor-{idx}"))
+                        .name(format!("rl-acpt-{idx}"))
                         .spawn(move || {
                             run_acceptor(acceptor_config);
                             // An acceptor that stops on its own, because every

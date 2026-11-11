@@ -1303,8 +1303,7 @@ impl ConfigBuilder {
 
     /// Set the number of disk I/O threads per worker (mio backend only): each
     /// worker with fs or direct I/O configured runs its own pool, so a runtime
-    /// runs `workers × threads` of them, named
-    /// `ringline-disk-io-<worker>-<thread>`.
+    /// runs `workers × threads` of them, named `rl-disk-<worker>-<thread>`.
     ///
     /// 0 means no pool: on the mio backend `build()` then fails while `fs`
     /// (on by default; see [`no_fs`](Self::no_fs)) or `direct_io` is set. On

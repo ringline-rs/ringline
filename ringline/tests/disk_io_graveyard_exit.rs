@@ -163,7 +163,7 @@ fn an_abandoned_reads_buffer_outlives_its_worker() {
     let (runtime, handles) = RinglineBuilder::new(config)
         .launch::<AbandonsRead>()
         .expect("launch");
-    if let Err(last) = wait_in_open("ringline-disk-i", Duration::from_secs(30)) {
+    if let Err(last) = wait_in_open("rl-disk-", Duration::from_secs(30)) {
         panic!("the disk-I/O thread never blocked in open(2); last syscall reads: {last}");
     }
     RELEASE.store(true, Ordering::SeqCst);

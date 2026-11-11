@@ -124,7 +124,7 @@ pub(crate) struct DiskIoPool {
 
 impl DiskIoPool {
     /// Create the channel pair and spawn disk I/O threads, named
-    /// `ringline-disk-io-<worker>-<thread>`.
+    /// `rl-disk-<worker>-<thread>`.
     pub(crate) fn start(
         worker_index: usize,
         num_threads: usize,
@@ -142,7 +142,7 @@ impl DiskIoPool {
             let fault = fault.clone();
             let keep_alive = std::sync::Arc::clone(&wake_keep_alive);
             let handle = thread::Builder::new()
-                .name(format!("ringline-disk-io-{worker_index}-{i}"))
+                .name(format!("rl-disk-{worker_index}-{i}"))
                 .spawn(move || {
                     // Holds every worker's wake fd open while this thread
                     // can still wake one.

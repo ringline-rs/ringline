@@ -2,7 +2,7 @@
 //! must release that acceptor.
 //!
 //! This is its own test binary because it counts the process's threads whose
-//! name starts with `ringline-accept`, and acceptors started by any other test
+//! name starts with `rl-acpt-`, and acceptors started by any other test
 //! in the same process would be counted too.
 //!
 //! It fails the second bind, so it covers the bind-failure rollback. The
@@ -43,14 +43,12 @@ impl AsyncEventHandler for Idle {
     }
 }
 
-/// The number of live acceptor threads in this process. The kernel truncates
-/// a thread name to 15 bytes, so `ringline-acceptor-0` reads back as
-/// `ringline-accept`.
+/// The number of live acceptor threads in this process.
 fn acceptor_threads() -> usize {
     std::fs::read_dir("/proc/self/task")
         .expect("read /proc/self/task")
         .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
-        .filter(|name| name.trim_end().starts_with("ringline-accept"))
+        .filter(|name| name.trim_end().starts_with("rl-acpt-"))
         .count()
 }
 

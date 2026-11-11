@@ -291,6 +291,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Thread names are short enough that Linux keeps them whole: `rl-work-N`
+  (worker), `rl-acpt-N` (acceptor, numbered by listener), `rl-rslv-N`
+  (resolver), `rl-spwn-N` (process spawner), `rl-blok-N` (blocking pool) and,
+  on mio, `rl-disk-W-T` (disk I/O thread T of worker W). Linux keeps 15 bytes
+  of a thread name, so `ps`, `top` and `/proc/*/task/*/comm` showed the old
+  names as `ringline-worker`, `ringline-accept`, `ringline-resolv`,
+  `ringline-spawne`, `ringline-blocki` and `ringline-disk-i`, with no index.
+  Tooling that matches on those prefixes needs the new ones.
 - mio: a burst of disk-I/O completions writes the worker's wake pipe once
   instead of once per completion, and the event loop reuses one events
   `Vec` instead of allocating one per iteration. A serial `fs::read_into`
@@ -1064,8 +1072,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `remove`, `mkdir`) on a runtime with fs off (`ConfigBuilder::no_fs`) now fails with
   `filesystem I/O not configured`, as on io_uring; before, mio ran it when
   direct I/O was on, and failed with `disk I/O pool not configured` when it
-  was off. The pool's threads are now named
-  `ringline-disk-io-<worker>-<thread>`, and `ConfigBuilder::disk_io_threads`
+  was off. The pool's threads are now named with their worker's index (see
+  the thread-name entry under Changed), and `ConfigBuilder::disk_io_threads`
   says the count is per worker; each worker always had its own pool (#864).
 - io_uring: `fs::close` with a read, write or fsync on the file still in
   flight leaves the file registered until the last of them completes. Before,

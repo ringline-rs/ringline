@@ -49,7 +49,7 @@ impl ResolverPool {
             let rx = request_rx.clone();
             let keep_alive = std::sync::Arc::clone(&wake_keep_alive);
             let handle = thread::Builder::new()
-                .name(format!("ringline-resolver-{i}"))
+                .name(format!("rl-rslv-{i}"))
                 .spawn(move || {
                     // Holds every worker's wake fd open while this thread
                     // can still wake one.
