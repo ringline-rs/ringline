@@ -323,7 +323,7 @@ impl TimerSlotPool {
     pub(crate) fn take_rearm(&mut self, slot: u32) -> bool {
         self.rearm
             .get_mut(slot as usize)
-            .is_some_and(|r| std::mem::take(r))
+            .is_some_and(std::mem::take)
     }
 
     /// Mark a timer as fired. Returns the waker_id if generation matches.
