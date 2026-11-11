@@ -964,6 +964,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `open_direct_io_file` and `open_direct_io_file_with` (both backends) and
+  `open_nvme_device` (io_uring) with a path containing a NUL byte return their
+  error without holding a slot of the file table. Before, each such call left
+  a slot allocated until the worker exited, so later opens failed with
+  `direct I/O file table full` or `NVMe device table full` (#861).
 - io_uring: `fs::close` with a read, write or fsync on the file still in
   flight leaves the file registered until the last of them completes. Before,
   it unregistered the file at once, and an operation issued earlier in the
