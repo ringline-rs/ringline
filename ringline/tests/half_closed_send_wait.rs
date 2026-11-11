@@ -377,7 +377,8 @@ fn tls_sends_to_half_closed_peers_hold_no_thread() {
 
 /// A zero-copy send to a half-closed peer, small enough to fit under
 /// `RLIMIT_MEMLOCK`, stalls with no thread and arrives intact. Under a limit of at
-/// least 64 MiB, which is CI's, it also checks that the send stayed zero-copy.
+/// least 64 MiB, which CI's unlimited limit meets, it also checks that the send
+/// stayed zero-copy.
 #[test]
 fn a_zero_copy_send_to_a_half_closed_peer_holds_no_thread() {
     use ringline::metrics::{POOL, pool};

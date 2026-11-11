@@ -151,10 +151,12 @@ jobs:
       # runners (kernel 6.17), summed over every process the user runs. nextest
       # runs tests as separate processes, so at the runner's 8 MiB limit
       # io_uring_setup failed with ENOMEM in 10/10 release runs, and in 0/10 at
-      # 64 MiB (#426). Raised in the same shell as the tests, because each step
-      # starts a new one.
+      # 64 MiB (#426). Since the default CQ became 65536 entries (#831) each
+      # ring is about 2.5 MiB, so the limit is lifted; memlock_rings and
+      # memlock_limit set their own. Raised in the same shell as the tests,
+      # because each step starts a new one.
       - run: |
-          sudo prlimit --pid $$ --memlock=67108864:67108864
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo nextest run --locked --workspace --profile ci
           cargo test --locked --workspace --doc
           # Without `unstable-accept`: see the note in the clippy job.
@@ -230,10 +232,12 @@ jobs:
       # runners (kernel 6.17), summed over every process the user runs. nextest
       # runs tests as separate processes, so at the runner's 8 MiB limit
       # io_uring_setup failed with ENOMEM in 10/10 release runs, and in 0/10 at
-      # 64 MiB (#426). Raised in the same shell as the tests, because each step
-      # starts a new one.
+      # 64 MiB (#426). Since the default CQ became 65536 entries (#831) each
+      # ring is about 2.5 MiB, so the limit is lifted; memlock_rings and
+      # memlock_limit set their own. Raised in the same shell as the tests,
+      # because each step starts a new one.
       - run: |
-          sudo prlimit --pid $$ --memlock=67108864:67108864
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo nextest run --locked --workspace --profile ci --release
           cargo test --locked --workspace --doc --release
       # Resource state for an io_uring ENOMEM. On kernel 6.12 the uring suite
@@ -317,10 +321,12 @@ jobs:
       # runners (kernel 6.17), summed over every process the user runs. nextest
       # runs tests as separate processes, so at the runner's 8 MiB limit
       # io_uring_setup failed with ENOMEM in 10/10 release runs, and in 0/10 at
-      # 64 MiB (#426). Raised in the same shell as the tests, because each step
-      # starts a new one.
+      # 64 MiB (#426). Since the default CQ became 65536 entries (#831) each
+      # ring is about 2.5 MiB, so the limit is lifted; memlock_rings and
+      # memlock_limit set their own. Raised in the same shell as the tests,
+      # because each step starts a new one.
       - run: |
-          sudo prlimit --pid $$ --memlock=67108864:67108864
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo nextest run --locked --workspace --profile ci --features tls-buffered
           cargo test --locked --workspace --doc --features tls-buffered
           cargo nextest run --locked --workspace --profile ci --features tls-buffered,force-mio

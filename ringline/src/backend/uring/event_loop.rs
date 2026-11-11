@@ -10059,6 +10059,77 @@ mod tests {
         );
     }
 
+    /// A `Child::wait` whose poll cannot be pushed registers no waiter; a
+    /// `WaitFuture` dropped before the child exits cancels its pidfd poll; and
+    /// one that resolved cancels nothing (#833).
+    #[test]
+    fn child_wait_registers_after_its_push_and_cancels_its_poll_on_drop() {
+        use crate::runtime::io::with_state;
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::task::{Context, Poll};
+
+        let mut el = make_test_loop();
+        // The `WaitFuture` below reaps the child with waitid(2), which
+        // clippy cannot see.
+        #[allow(clippy::zombie_processes)]
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = sleeper.id();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        assert!(raw >= 0, "pidfd_open: {}", io::Error::last_os_error());
+        let child =
+            crate::process::Child::from_parts(pid, unsafe { OwnedFd::from_raw_fd(raw as i32) });
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        with_driver_state(&mut el, || {
+            with_state(|d, _| d.ring.force_push_failures(1));
+            assert!(child.wait().is_err(), "the push was refused");
+        });
+        assert!(
+            el.executor.pidfd_waiters.is_empty(),
+            "a wait whose poll was not pushed left a waiter"
+        );
+
+        el.driver.ring.pushed_cancels.clear();
+        let seq = with_driver_state(&mut el, || {
+            let mut fut = Box::pin(child.wait().expect("wait"));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            drop(fut);
+            with_state(|_, e| e.next_pidfd_seq - 1)
+        });
+        assert!(el.executor.pidfd_waiters.is_empty());
+        assert_eq!(
+            el.driver.ring.pushed_cancels,
+            vec![UserData::encode(OpTag::PidfdPoll, 0, seq).raw()],
+            "the dropped wait cancels its poll"
+        );
+
+        sleeper.kill().expect("kill");
+        el.driver.ring.pushed_cancels.clear();
+        let mut fut = with_driver_state(&mut el, || Box::pin(child.wait().expect("wait")));
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            el.driver.ring.submit_and_get_events().expect("submit");
+            el.drain_completions();
+            if let Poll::Ready(status) = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx)) {
+                assert!(!status.expect("exit status").success(), "killed");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the wait never resolved");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        with_driver_state(&mut el, || drop(fut));
+        assert!(
+            el.driver.ring.pushed_cancels.is_empty(),
+            "a resolved wait cancelled its poll"
+        );
+        assert!(el.executor.pidfd_waiters.is_empty());
+        assert!(el.executor.pidfd_results.is_empty());
+    }
+
     /// Deliver `data` to `conn_index` through a direct receive: arm one into
     /// the accumulator's spare capacity, write `data` where the kernel would,
     /// and dispatch its completion.

@@ -561,7 +561,8 @@ pub(crate) enum Orphan {
     /// A `SpawnFuture`'s `pending_spawns` entry, and with it a delivered
     /// child's pidfd.
     Spawn(u64),
-    /// A `WaitFuture`'s `pidfd_waiters` and `pidfd_results` entries.
+    /// A `WaitFuture`'s `pidfd_waiters` and `pidfd_results` entries, and its
+    /// pidfd poll if it is still armed.
     Wait(u32),
     /// A `ConnectFuture`'s outbound connection.
     Connect { conn_index: u32, generation: u32 },
@@ -612,8 +613,7 @@ pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mu
                 executor.pending_spawns.remove(&request_id);
             }
             Orphan::Wait(seq) => {
-                executor.pidfd_waiters.remove(&seq);
-                executor.pidfd_results.remove(&seq);
+                crate::process::release_wait(driver, executor, seq);
             }
             Orphan::Connect {
                 conn_index,
