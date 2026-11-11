@@ -3043,11 +3043,12 @@ impl Connection {
     /// error whether or not a read is parked (on io_uring through the
     /// `POLLRDHUP` poll, see [`connect`]), so this turns true while a task
     /// does other work. A close_notify is seen when a receive reads it. On
-    /// mio the runtime receives whenever the socket is readable. On io_uring
-    /// a receive is armed during the handshake, when a read parks, and after
-    /// each completion once the peer's FIN has arrived; a close_notify that
-    /// arrives after the last receive, while the TCP stream stays open and
-    /// no read is parked, is seen by the next read.
+    /// mio the runtime receives whenever the socket is readable, except
+    /// while a forward from the connection waits on its sink. On io_uring a
+    /// receive is armed during the handshake, when a read parks, and after
+    /// each completion once the peer's FIN or a reset has arrived; a
+    /// close_notify that arrives after the last receive, while the TCP
+    /// stream stays open and no read is parked, is seen once a read parks.
     ///
     /// The peer's end does not close the connection. The task may keep
     /// sending, and the connection closes when the task returns, drops the

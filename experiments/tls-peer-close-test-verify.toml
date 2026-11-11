@@ -96,7 +96,7 @@ fail=0
 grep -q "^gate_backend=0" verify.log || { echo "FAIL gate_backend"; fail=1; }
 # Red: all five runs fail, each with the one test failing.
 n=$(grep -cE "^red_run=[0-9]+ rc=[1-9]" verify.log)
-f=$(grep -cE "0 passed; 1 failed" verify.log)
+f=$(grep -cE "^test result: FAILED\. 0 passed; 1 failed" verify.log)
 echo "red: $n of 5 runs failed; $f failure summaries"
 [ "$n" = 5 ] && [ "$f" = 5 ] || { echo "FAIL red: expected 5 failing runs"; fail=1; }
 # Green: all twenty runs pass, each with the one test passing.

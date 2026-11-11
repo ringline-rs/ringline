@@ -2652,8 +2652,8 @@ impl AsyncEventHandler for TlsReplyAfterTimer {
     }
 }
 
-/// The client sends its request and, once the server has read it, a
-/// close_notify, and keeps TCP open. The server's task reads `0` at the
+/// The client sends its request and, 100 ms after it, a close_notify, and
+/// keeps TCP open. The server's task reads `0` at the
 /// close_notify and is not dropped: after a timer it sees the peer's end on
 /// `peer_closed` (not a truncation), sends the reply, reads `0` again and
 /// returns. The client reads the reply, then the server's close_notify, then
@@ -2684,8 +2684,9 @@ fn a_reply_after_the_peers_close_notify_reaches_the_client() {
         stream.write_all(b"g").unwrap();
         stream.flush().unwrap();
     }
-    // The close_notify goes out after the server has read the request and
-    // its task is asleep, not in the same receive as the request (#889).
+    // The close_notify goes out 100 ms after the request, so it usually
+    // arrives in a receive of its own while the task's second read is parked
+    // (#889).
     std::thread::sleep(Duration::from_millis(100));
     tls_conn.send_close_notify();
     while tls_conn.wants_write() {
