@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F7 fixed (#871), F8 fixed (#872), F9 fixed (#873), F10 fixed (#874), P3 documented (#877), P4 documented (#878); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
+- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F7 fixed (#871), F8 fixed (#872), F9 fixed (#873), F10 fixed (#874), P1 fixed (#875), P3 documented (#877), P4 documented (#878); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -160,6 +160,8 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 - Unverifiable here: the measured io-wq table in the fs module doc has no spec or run in the repository; the overlayfs/tmpfs `FMODE_NOWAIT` claims; the `dsync` FUA and flush claims.
 
 ### P1 — mio: about 7 µs per serial operation, 20× the `pread` floor, with three avoidable parts (invariant 13). Measured by the performance reviewer on this host (Apple M4 Max, release build, one worker, 4 KiB page-cache reads, N = 20,000, three runs in each of three processes; spread under 2% within a process except one run, 8.20 µs against 6.90 in the same process; 20% between processes).
+
+**Fixed (#875):** a pool thread writes the wake pipe only when no pool thread has written it since the worker's last `drain_channels`, which clears the flag with a swap before reading the responses; the events `Vec` lives on the loop. Measured in a SystemsLab VM (experiment `01a1c8a1-2630-7115-cb4c-720b6c6df1b2`, `debian-13-6.12`, Linux 6.12.63, 16 vCPUs, `force-mio`; a probe of 4 KiB `fs::read_into` calls on a 4 MiB file with one worker and two pool threads, N = 20,000; the branch at e3e66544, before the clear became a load and a swap), five rounds interleaved with main and a second copy of main as the noise floor, three runs per variant per round: serial allocations per op 2.08 to 1.08 (the same to within 0.01 in all 15 runs per side); depth-64 median 1.21 µs (main) and 1.22 µs (main again) against 0.96 µs, fastest in 4 of 5 rounds, with round medians ranging 1.01 to 1.48 µs on main; serial, the control, 80.9 and 73.2 µs (main twice) against 70.4 µs, inside the floor. The wake-fd re-registration after every drain stays: kqueue needs it, and on epoll its cost was not measured. The text below is as found at 6851de26.
 
 | mode | µs per op | allocations per op |
 |---|---|---|

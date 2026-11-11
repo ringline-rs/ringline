@@ -2683,6 +2683,8 @@ pub(crate) struct DriverCtx<'a> {
         &'a Option<crossbeam_channel::Sender<crate::disk_io_pool::DiskIoResponse>>,
     /// Wake handle for this worker (used to wake after disk I/O completion).
     pub(crate) wake_handle: crate::wakeup::WakeFd,
+    /// See `Driver::disk_io_wake_pending`.
+    pub(crate) disk_io_wake_pending: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Monotonic sequence counter for disk I/O requests.
     pub(crate) next_disk_io_seq: &'a mut u32,
     /// Keys of pool operations not yet drained; see `Driver::disk_io_in_flight`.
@@ -3277,6 +3279,7 @@ impl<'a> DriverCtx<'a> {
                 seq,
                 response_tx: tx.clone(),
                 wake_handle: self.wake_handle,
+                wake_pending: std::sync::Arc::clone(self.disk_io_wake_pending),
             })
             .map_err(|_| io::Error::other("disk I/O pool shut down"))?;
         self.disk_io_in_flight.insert(seq, subsystem);

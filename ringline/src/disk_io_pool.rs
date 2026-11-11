@@ -23,8 +23,27 @@ pub(crate) struct DiskIoRequest {
     pub(crate) seq: u32,
     /// Per-worker response channel.
     pub(crate) response_tx: Sender<DiskIoResponse>,
-    /// Wake handle — used to wake the worker after sending the response.
+    /// The worker's wake handle, written after a response when `wake_pending`
+    /// was clear ([`wake_coalesced`]).
     pub(crate) wake_handle: crate::wakeup::WakeFd,
+    /// Set by a pool thread that wrote the worker's wake pipe, cleared by the
+    /// worker in `drain_channels`; see [`wake_coalesced`].
+    pub(crate) wake_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Wake a worker unless a pool thread has written its wake pipe since the
+/// worker last cleared `pending` in `drain_channels`.
+///
+/// The worker clears `pending` (a swap) before it reads the response
+/// channel, so a response queued after the clear writes again and none is
+/// missed, while a burst of responses costs one write.
+pub(crate) fn wake_coalesced(
+    pending: &std::sync::atomic::AtomicBool,
+    wake: &crate::wakeup::WakeFd,
+) {
+    if !pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        wake.wake();
+    }
 }
 
 /// Result from a disk I/O worker thread.
@@ -201,7 +220,45 @@ fn disk_io_thread(
             opened: result.opened,
         });
         // Wake the requesting worker so it drains the response channel.
-        req.wake_handle.wake();
+        wake_coalesced(&req.wake_pending, &req.wake_handle);
     }
     // Channel closed — pool is shutting down.
+}
+
+#[cfg(all(test, not(has_io_uring)))]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::wake_coalesced;
+
+    /// Bytes waiting in the non-blocking read end `fd`, drained.
+    fn drain(fd: std::os::fd::RawFd) -> usize {
+        let mut total = 0;
+        let mut buf = [0u8; 64];
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                return total;
+            }
+            total += n as usize;
+        }
+    }
+
+    /// A burst of completions writes the wake pipe once; after the worker
+    /// clears the flag, the next completion writes again.
+    #[test]
+    fn a_burst_of_completions_writes_the_wake_pipe_once() {
+        let (read_fd, handle) = crate::wakeup::create_wake_fd().expect("wake fd");
+        let wake = handle.as_wake_fd();
+        let pending = AtomicBool::new(false);
+        for _ in 0..5 {
+            wake_coalesced(&pending, &wake);
+        }
+        assert_eq!(drain(read_fd), 1, "five completions, one write");
+        wake_coalesced(&pending, &wake);
+        assert_eq!(drain(read_fd), 0, "the flag is still set: no write");
+        pending.store(false, Ordering::Release);
+        wake_coalesced(&pending, &wake);
+        assert_eq!(drain(read_fd), 1, "a completion after the clear writes");
+    }
 }

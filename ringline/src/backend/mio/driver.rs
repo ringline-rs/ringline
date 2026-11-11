@@ -157,6 +157,10 @@ pub(crate) struct Driver {
     pub(crate) send_queues: Vec<ConnSendState>,
     pub(crate) accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
     pub(crate) wake_handle: crate::wakeup::WakeFd,
+    /// Set by a disk-I/O pool thread that wrote the wake pipe, cleared by
+    /// `drain_channels` before it reads the responses, so a burst of
+    /// completions writes the pipe once (`disk_io_pool::wake_coalesced`).
+    pub(crate) disk_io_wake_pending: Arc<AtomicBool>,
     pub(crate) shutdown_flag: Arc<AtomicBool>,
     pub(crate) shutdown_local: bool,
     /// Handles task panics caught on this worker, under the runtime's policy.
@@ -528,6 +532,7 @@ impl Driver {
             // it used to be wrapped here, making every pool wake an EBADF
             // no-op observed only at the poll timeout (~10 ms).
             wake_handle: wake_fd,
+            disk_io_wake_pending: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_fault: config.test_fault.clone(),
             panic_reporter: crate::task_panic::PanicReporter::new(
@@ -642,6 +647,7 @@ impl Driver {
             disk_io_pool: &self.disk_io_pool,
             disk_io_tx: &self.disk_io_tx,
             wake_handle: self.wake_handle,
+            disk_io_wake_pending: &self.disk_io_wake_pending,
             next_disk_io_seq: &mut self.next_disk_io_seq,
             disk_io_in_flight: &mut self.disk_io_in_flight,
             disk_io_counts: &mut self.disk_io_counts,

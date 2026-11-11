@@ -26,6 +26,9 @@ pub(crate) struct AsyncEventLoop<A: AsyncEventHandler> {
     driver: Driver,
     handler: A,
     executor: Executor,
+    /// The iteration's events, copied out of `driver.events` so the handlers
+    /// can borrow the driver; kept across iterations for its capacity.
+    event_list: Vec<(mio::Token, bool, bool, bool)>,
 }
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
@@ -195,6 +198,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             driver,
             handler,
             executor,
+            event_list: Vec::with_capacity(1024),
         })
     }
 
@@ -309,10 +313,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.recv_batch.begin();
 
             // 4. Handle events.
-            // Collect events into a temporary vec to avoid borrow conflict
-            // (self.driver.events borrows driver, but handlers need &mut driver).
-            let mut event_list: Vec<(mio::Token, bool, bool, bool)> =
-                Vec::with_capacity(self.driver.events.iter().count());
+            // Copy the events out so the handlers can borrow the driver
+            // (`self.driver.events` borrows it). The Vec is kept on `self`
+            // for its capacity, so no iteration allocates.
+            let mut event_list = std::mem::take(&mut self.event_list);
+            event_list.clear();
             for event in self.driver.events.iter() {
                 let is_err = event.is_error()
                     || event.is_read_closed()
@@ -326,7 +331,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 ));
             }
 
-            for (token, readable, writable, is_err) in event_list {
+            for (token, readable, writable, is_err) in event_list.drain(..) {
                 match token {
                     WAKE_TOKEN => {
                         if readable {
@@ -375,6 +380,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
             }
+            self.event_list = event_list;
 
             // 5. Drain cross-thread channels unconditionally (not just on wake
             //    events). On macOS/kqueue, SourceFd edge-triggered semantics can
@@ -518,6 +524,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Called unconditionally on every event loop iteration (not just on wake
     /// pipe events) to avoid missed wakeups on macOS/kqueue.
     fn drain_channels(&mut self) {
+        // A disk-I/O completion queued from here on writes the wake pipe
+        // again; one queued before is read below. A swap, not a store: if a
+        // pool thread's swap comes first in the flag's order, its release
+        // synchronizes with this acquire, so the channel read below sees its
+        // response; otherwise that thread reads `false` and writes the pipe.
+        // The load skips the swap on an iteration with no disk-I/O wake. If it
+        // reads `false` while the flag is set, the pool thread that set it first
+        // wrote the pipe and that byte has not been read here (reading it would
+        // make the set visible to this load), so the next poll returns and the
+        // next iteration swaps.
+        if self.driver.disk_io_wake_pending.load(Ordering::Relaxed) {
+            self.driver
+                .disk_io_wake_pending
+                .swap(false, Ordering::AcqRel);
+        }
         // Drain accept channel (server mode).
         loop {
             let item = match self.driver.accept_rx {
@@ -2110,6 +2131,23 @@ mod tests {
         )
         .expect("build mio event loop");
         (event_loop, handle)
+    }
+
+    /// `drain_channels` clears the disk-I/O wake flag, so a completion queued
+    /// after it writes the wake pipe.
+    #[test]
+    fn drain_channels_clears_the_disk_io_wake_flag() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        el.driver
+            .disk_io_wake_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        el.drain_channels();
+        assert!(
+            !el.driver
+                .disk_io_wake_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     /// A key whose operation is still in the disk-I/O pool is not handed
