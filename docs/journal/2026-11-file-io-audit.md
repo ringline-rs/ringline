@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
+- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F7 fixed (#871); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -125,6 +125,8 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 `config.rs:386` says operations "return `Unsupported`" (`:1243` says only "0 = disabled"); `submit_disk_io` returns `io::Error::other("disk I/O pool not configured")`, kind `Other`. Run: `fs::open` fails with that error; `open_direct_io_file` (synchronous, no pool) returns `Ok` and the first read fails with the same message. `Config::validate` has no check. Fix: reject `disk_io_threads == 0` with `fs` or `direct_io` set on the mio build, or document the kind and the message.
 
 ### F7 — io_uring: the NVMe status word is discarded, and three public types describe a completion handler that does not exist (invariants 8, 11). Traced.
+
+**Fixed (#871):** a failed command resolves to an `io::Error` whose inner error is `NvmeStatus`, the status word; `DirectIoCompletion`, `NvmeCompletion` and `DirectIoOp` are no longer public. Test: `a_status_word_reaches_the_caller_as_the_errors_inner_error` in `nvme.rs`, red when the word is mapped to `EIO`. The text below is as found at 6851de26.
 
 `event_loop.rs:4303-4308` maps a positive `cqe->res` (the device status word, e.g. 0x281 media error) to `-EIO`; the caller cannot tell a media error from an invalid field, and no doc on `nvme_read`/`nvme_write`/`nvme_flush` says so. The only public text on the status word is `NvmeCompletion::is_success` (`nvme.rs:366-388`, exported from `lib.rs`), a type nothing constructs; `DirectIoCompletion` and `DirectIoOp` (`direct_io.rs:28`, `:256-285`) are public and likewise unused, and their docs ("Delivered to the ... completion handler") name a completion handler that has never existed in this repository: the types have been re-exported and unconstructed since the initial commit. Fix: carry the status word in the error (an `io::Error::other` wrapping it) or document `Err(EIO)`; remove the three types under the Unreleased breaking entries. Until then `is_success`'s comment is the only description of the status word.
 
