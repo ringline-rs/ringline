@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send and receive paradigms
 
-- **Status:** open — 28 confirmed findings (F1 to F28), 9 plausible (PL1 to PL9), 23 documentation findings (D1 to D23) and 18 design limitations put to the owner as questions (L1 to L18); the owner chose F1 then F2, fixed in #849 and #850 (open); F27, F28 and L18 were found while reviewing those fixes; the invariant list was confirmed by three agents, not agreed line by line with the owner
-- **Span:** 2026-11-09 · tree 6851de26 (`main`, 0.7.0-alpha.68) · PRs: #849 (F1), #850 (F2)
+- **Status:** open — 28 confirmed findings (F1 to F28), 10 plausible (PL1 to PL10), 23 documentation findings (D1 to D23) and 18 design limitations put to the owner as questions (L1 to L18); the owner chose F1 then F2, fixed in #849 (merged) and #850 (open), and chose to bound the TLS handshake for L18, in #868 (merged); F27, F28, L18 and PL10 were found while reviewing those fixes; the invariant list was confirmed by three agents, not agreed line by line with the owner
+- **Span:** 2026-11-09 to 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · PRs: #849 (F1), #850 (F2), #868 (L18)
 
 ## Goal
 
@@ -452,8 +452,8 @@ Long lists:
 Status: **confirmed** = a test or measurement at `6851de26` shows it, with
 the backend and the number of runs given, or (where marked "by reading") the
 quoted text is the whole finding; **plausible** = the code path is real and
-the trigger was not produced. F1 and F2 are fixed; every other finding is
-open. Findings are ordered by
+the trigger was not produced. F1 is fixed; F2's fix is open; every other
+finding is open. Findings are ordered by
 consequence as the auditor judges it; the owner ranks.
 
 ### F1 — A peer FIN before the TLS handshake completes leaves the connection with no task; an outbound `connect().tls()` never resolves (R6a, R10d). Confirmed (run, both backends).
@@ -487,7 +487,7 @@ close. io_uring's error arm beside the FIN arm does both
 has no `wake_connect`; the mio arm that wakes the connect waiter with an
 error is the TLS feed-error arm (`:984–997`).
 
-Fixed in #849 (open). At both FIN arms, a connection that is not
+Fixed in #849, merged as f73022d0. At both FIN arms, a connection that is not
 established wakes the connect waiter with `UnexpectedEof` and is closed.
 Tests: two unit tests per backend and `ringline/tests/tls_handshake_fin.rs`,
 red without the check on both backends, green with it and with both TLS
@@ -1096,6 +1096,23 @@ The code path is real; the trigger was not produced.
   (`uring/event_loop.rs:908–920`), so another holder of the handle would
   read with the bytes gone. That sequence was not traced or run. Proposed
   fix: a guard that calls `put_back` on unwind.
+- **PL10** On both backends, a TLS connection closed before its handshake
+  completes (#849's FIN arm, the feed-error arms, and the
+  `tls_handshake_timeout` expiry) is not torn down while handshake
+  ciphertext is unsent. On io_uring, `try_finalize_close` returns while
+  `in_flight` is set (`uring/driver.rs:1712`), and the close deadline is
+  armed only by the `DriverCtx` close path (`handler.rs:1155`). On mio,
+  `drain_pending_closes` defers `finish_close` while `pending_sends` is
+  non-empty (`mio/event_loop.rs:1423–1428`). This is the pre-handshake
+  case of the connection-close audit's L4, the unbounded close deferral;
+  it matters here because these closes exist to free a stalled peer's
+  slot. A server flight larger than the client's receive buffer and the
+  server's send buffer together, sent to a client that never reads, would
+  hold the slot until a write fails. Found while reviewing the L18 change,
+  by reading; no such client was run. Proposed fix, on both backends: arm
+  a close deadline on these paths, or call `force_finalize_close` on
+  io_uring and, on mio, let `drain_pending_closes` tear these connections
+  down without waiting for `pending_sends`.
 
 ## Documentation findings
 
@@ -1516,6 +1533,20 @@ reading otherwise.
   slot held after 5 s. Should the runtime bound the handshake, and with what
   default?
 
+  The owner chose a bound of at most 60 s, default 10 s:
+  `ConfigBuilder::tls_handshake_timeout`, in #868, merged as 8a33af77. A
+  connection whose handshake has not completed within it is closed, and an
+  outbound `connect(..).tls(..)` resolves `TimedOut`; inbound, the timeout
+  starts when the worker registers the connection, outbound when the TCP
+  connect completes. `metrics::conn::TLS_HANDSHAKE_TIMEOUT` counts the
+  closes. Tests in `ringline/tests/tls_handshake_timeout.rs`, both backends.
+  The first review of the change found that on io_uring a `tick_timeout_us`
+  longer than the timeout delayed the close by up to one tick (with a 300 ms
+  timeout under a 3 s tick, the reviewer's run counted the close at 2.81 s),
+  that the deadline queue was unbounded behind one stalled handshake, and a
+  clock read on every loop iteration; all three were fixed in #868. It also
+  found PL10.
+
 ## Refuted and corrected
 
 Refuted by a run:
@@ -1592,7 +1623,8 @@ Platforms and kernels:
 
 Not run by the auditor:
 
-- The kernel triggers for PL1–PL9, and the live sequences for F15.
+- The kernel triggers for PL1–PL9, the zero-window client PL10 needs,
+  and the live sequences for F15.
 - F4's two reading-only parts, F26's overflow, and the io_uring cause of
   F23.
 - F6 on the reset-then-send path and at the other write sites `finish_close`
