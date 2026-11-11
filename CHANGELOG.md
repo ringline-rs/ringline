@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `fs::symlink_metadata`, which returns the metadata of a symbolic link
+  itself (`lstat`; on io_uring a statx with `AT_SYMLINK_NOFOLLOW`).
+  `fs::stat` follows the link, as before, so `Metadata::is_symlink` from it is
+  always false; `symlink_metadata` is the only way to get `true`. The fields
+  of `Metadata` are now documented (#863).
 - `ConfigBuilder::defer_recv_arm`, off by default. On io_uring, a plaintext
   connection's reader that parks has its receive armed after the worker's next
   wait, not in the same submission as the sends queued before it parked, so the

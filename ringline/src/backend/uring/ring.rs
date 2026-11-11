@@ -1079,7 +1079,8 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a statx via io_uring.
+    /// Submit a statx via io_uring. With `nofollow`, a final symbolic link in
+    /// `pathname` is not followed.
     ///
     /// # Safety
     /// `pathname` must point to a valid null-terminated C string and `statxbuf`
@@ -1088,6 +1089,7 @@ impl Ring {
         &mut self,
         pathname: *const libc::c_char,
         statxbuf: *mut libc::statx,
+        nofollow: bool,
         ud: u64,
     ) -> io::Result<()> {
         // STATX_BASIC_STATS = 0x7ff
@@ -1095,6 +1097,7 @@ impl Ring {
             Op::Statx {
                 path: pathname,
                 buf: statxbuf,
+                nofollow,
             },
             ud,
         );

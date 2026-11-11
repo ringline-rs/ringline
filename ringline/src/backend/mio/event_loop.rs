@@ -2094,7 +2094,7 @@ mod tests {
                 .expect("submit open");
             // Stand in for the u32 sequence coming round to it.
             *ctx.next_disk_io_seq = open_seq;
-            let stat_seq = ctx.fs_stat(&dir).expect("submit stat");
+            let stat_seq = ctx.fs_stat(&dir, false).expect("submit stat");
             (open_seq, stat_seq)
         };
         // Release the pool thread before the loop, and the pool, drop.

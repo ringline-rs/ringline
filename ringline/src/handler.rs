@@ -2365,10 +2365,11 @@ impl<'a> DriverCtx<'a> {
         Ok(())
     }
 
-    /// Submit a statx via io_uring.
+    /// Submit a statx via io_uring. With `nofollow`, a final symbolic link in
+    /// `path` is not followed.
     ///
     /// Returns the slab_idx (seq number for DiskIoFuture).
-    pub(crate) fn fs_stat(&mut self, path: &std::path::Path) -> io::Result<u32> {
+    pub(crate) fn fs_stat(&mut self, path: &std::path::Path, nofollow: bool) -> io::Result<u32> {
         let c_path = crate::fs::path_to_cstring(path)?;
 
         let slab = self
@@ -2413,7 +2414,10 @@ impl<'a> DriverCtx<'a> {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
-        match unsafe { self.ring.submit_statx(path_ptr, statx_ptr, ud.raw()) } {
+        match unsafe {
+            self.ring
+                .submit_statx(path_ptr, statx_ptr, nofollow, ud.raw())
+        } {
             Ok(()) => Ok(key),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
@@ -3636,16 +3640,20 @@ impl<'a> DriverCtx<'a> {
         Ok(())
     }
 
-    /// Submit a stat via the disk I/O pool.
+    /// Submit a stat via the disk I/O pool; with `nofollow`, an lstat.
     ///
     /// Uses `libc::stat` (portable) instead of `statx` (Linux-only). The
     /// result is converted to `crate::fs::Metadata` inside the pool closure
     /// and delivered via `DiskIoResponse::metadata`.
-    pub(crate) fn fs_stat(&mut self, path: &std::path::Path) -> io::Result<u32> {
+    pub(crate) fn fs_stat(&mut self, path: &std::path::Path, nofollow: bool) -> io::Result<u32> {
         let c_path = crate::fs::path_to_cstring(path)?;
         let work = Box::new(move || {
             let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
-            let result = unsafe { libc::stat(c_path.as_ptr(), &mut stat_buf) };
+            let result = if nofollow {
+                unsafe { libc::lstat(c_path.as_ptr(), &mut stat_buf) }
+            } else {
+                unsafe { libc::stat(c_path.as_ptr(), &mut stat_buf) }
+            };
             if result < 0 {
                 let errno = io::Error::last_os_error()
                     .raw_os_error()
