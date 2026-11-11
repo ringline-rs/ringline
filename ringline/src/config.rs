@@ -1242,19 +1242,30 @@ impl ConfigBuilder {
 
     // ── Optional subsystems ──────────────────────────────────────────
 
-    /// Set NVMe passthrough configuration.
+    /// Enable NVMe passthrough (io_uring only). On io_uring each worker
+    /// reserves `max_devices` fixed-file slots and allocates its device table
+    /// and command slab; on mio the config is accepted and every NVMe call
+    /// returns `Unsupported`.
     pub fn nvme(mut self, config: crate::nvme::NvmeConfig) -> Self {
         self.config.nvme = Some(config);
         self
     }
 
-    /// Set direct I/O configuration.
+    /// Enable direct I/O. On io_uring each worker reserves `max_files`
+    /// fixed-file slots and allocates its file table and command slab; on
+    /// mio the files open with `O_DIRECT` (`F_NOCACHE` on macOS) and their
+    /// operations run on the disk-I/O pool.
     pub fn direct_io(mut self, config: crate::direct_io::DirectIoConfig) -> Self {
         self.config.direct_io = Some(config);
         self
     }
 
-    /// Set filesystem I/O configuration.
+    /// Configure filesystem I/O, which is on by default with
+    /// `FsConfig::default()`. On io_uring each worker reserves `max_files`
+    /// fixed-file slots and allocates its file table and command slab; on
+    /// mio the operations run on the disk-I/O pool, at most
+    /// [`max_commands_in_flight`](crate::fs::FsConfig::max_commands_in_flight)
+    /// in flight. [`no_fs`](Self::no_fs) turns it off.
     pub fn fs(mut self, config: crate::fs::FsConfig) -> Self {
         self.config.fs = Some(config);
         self
