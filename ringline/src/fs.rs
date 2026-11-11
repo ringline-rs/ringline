@@ -139,16 +139,35 @@ impl File {
     }
 }
 
-/// Flags for [`open()`].
-#[derive(Debug, Clone, Copy)]
+/// Flags for [`open()`]: one access mode, combined with `|` with any of the
+/// other flags.
+///
+/// The access modes are the `open(2)` values, not bits: `READ` is 0 and
+/// `WRITE` is 1, so `READ | WRITE` is `WRITE`, which opens the file
+/// write-only and fails every read with `EBADF`. The read-write mode is
+/// [`READ_WRITE`](Self::READ_WRITE).
+///
+/// ```
+/// use ringline::fs::OpenFlags;
+/// assert_eq!(OpenFlags::READ | OpenFlags::WRITE, OpenFlags::WRITE);
+/// assert_ne!(OpenFlags::READ_WRITE, OpenFlags::WRITE);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenFlags(pub(crate) i32);
 
 impl OpenFlags {
+    /// Open for reading only (`O_RDONLY`).
     pub const READ: Self = Self(libc::O_RDONLY);
+    /// Open for writing only (`O_WRONLY`).
     pub const WRITE: Self = Self(libc::O_WRONLY);
+    /// Open for reading and writing (`O_RDWR`).
     pub const READ_WRITE: Self = Self(libc::O_RDWR);
+    /// Create the file if it does not exist (`O_CREAT`), with the permission
+    /// bits [`open()`]'s `mode` gives.
     pub const CREATE: Self = Self(libc::O_CREAT);
+    /// Truncate an existing regular file to zero length (`O_TRUNC`).
     pub const TRUNCATE: Self = Self(libc::O_TRUNC);
+    /// Write at the end of the file on every write (`O_APPEND`).
     pub const APPEND: Self = Self(libc::O_APPEND);
 }
 
@@ -477,6 +496,11 @@ pub(crate) fn path_to_cstring(path: &std::path::Path) -> io::Result<CString> {
 /// that can delay the worker's connection closes. See
 /// [the module docs](self#blocking-file-io-and-connection-closes-io_uring)
 /// for when.
+///
+/// `flags` is one access mode with any other [`OpenFlags`] or'ed in;
+/// `mode` is the permission bits (for example `0o644`) a file created with
+/// [`OpenFlags::CREATE`] gets, less the process umask, and is ignored
+/// otherwise.
 ///
 /// Returns an [`OpenFuture`] that resolves to a [`File`] handle on success.
 ///
