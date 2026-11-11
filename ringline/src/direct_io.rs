@@ -1,31 +1,25 @@
-//! Direct I/O via io_uring (`O_DIRECT` + `IORING_OP_READ` / `IORING_OP_WRITE`).
+//! Direct I/O: reads, writes and fsync on a file or block device opened
+//! with `O_DIRECT`, which bypasses the page cache.
 //!
-//! This module provides types for submitting asynchronous file I/O through
-//! io_uring using `O_DIRECT`, bypassing the page cache while still going
-//! through the kernel block layer. This is a more portable alternative to
-//! NVMe passthrough — it works on any file or block device, not just NVMe
-//! character devices.
+//! On io_uring the operations are `IORING_OP_READ`, `IORING_OP_WRITE` and
+//! `IORING_OP_FSYNC` on a fixed file. On mio they are `pread`, `pwrite` and
+//! `fsync` on the disk-I/O pool, with `F_NOCACHE` in place of `O_DIRECT` on
+//! macOS. On io_uring a call that finds the ring's submission queue full
+//! submits the queue inline before pushing, and returns the error if that
+//! submit fails, leaving nothing in flight (see the `fs` module docs).
 //!
 //! # Alignment requirements
 //!
-//! `O_DIRECT` requires that:
-//! - Buffer addresses are aligned to the logical block size (typically 512 or 4096 bytes)
-//! - I/O sizes are multiples of the logical block size
-//! - File offsets are multiples of the logical block size
-//!
-//! The caller is responsible for meeting these alignment requirements.
-//! Violating them results in `-EINVAL` from the kernel.
-//!
-//! # Kernel requirements
-//!
-//! - Linux 5.6+ for basic io_uring read/write
-//! - Linux 6.1+ already required by ringline for `SendMsgZc`
+//! With `O_DIRECT` (Linux) the buffer address, the length and the file
+//! offset of a read or write must each be a multiple of the device's logical
+//! block size (typically 512 or 4096 bytes), or the kernel returns `EINVAL`.
+//! `F_NOCACHE` on macOS has no such requirement.
 
 use std::marker::PhantomData;
 
-/// Operation type for tracking what kind of I/O was submitted.
+/// The operation a command slab entry holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirectIoOp {
+pub(crate) enum DirectIoOp {
     Read,
     Write,
     Fsync,
@@ -274,38 +268,6 @@ impl DirectIoCmdSlab {
     }
 }
 
-/// Result of a direct I/O command completion.
-///
-/// Delivered to the direct I/O completion handler.
-#[derive(Debug, Clone)]
-pub struct DirectIoCompletion {
-    /// The file this command was submitted to.
-    pub file: DirectIoFile,
-    /// The operation type (read, write, or fsync).
-    pub op: DirectIoOp,
-    /// Command slab sequence number (from the return value of the submit method).
-    pub seq: u32,
-    /// io_uring result code. For read/write: bytes transferred on success.
-    /// Negative values are -errno.
-    pub result: i32,
-}
-
-impl DirectIoCompletion {
-    /// Whether the command completed successfully.
-    pub fn is_success(&self) -> bool {
-        self.result >= 0
-    }
-
-    /// Returns the number of bytes transferred, if the operation succeeded.
-    pub fn bytes_transferred(&self) -> Option<u32> {
-        if self.result >= 0 {
-            Some(self.result as u32)
-        } else {
-            None
-        }
-    }
-}
-
 /// Configuration for direct I/O support.
 ///
 /// When present in [`Config`](crate::config::Config), enables direct I/O file
@@ -450,26 +412,5 @@ mod tests {
         assert!(table.allocate().is_some());
         assert!(table.allocate().is_some());
         assert!(table.allocate().is_none());
-    }
-
-    #[test]
-    fn completion_bytes_transferred() {
-        let success = DirectIoCompletion {
-            file: DirectIoFile::new(0, 0),
-            op: DirectIoOp::Read,
-            seq: 0,
-            result: 4096,
-        };
-        assert!(success.is_success());
-        assert_eq!(success.bytes_transferred(), Some(4096));
-
-        let failure = DirectIoCompletion {
-            file: DirectIoFile::new(0, 0),
-            op: DirectIoOp::Write,
-            seq: 1,
-            result: -libc::EINVAL,
-        };
-        assert!(!failure.is_success());
-        assert_eq!(failure.bytes_transferred(), None);
     }
 }

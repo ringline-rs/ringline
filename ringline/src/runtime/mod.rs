@@ -955,7 +955,6 @@ impl Executor {
     /// dropped), discards the result.
     /// Waiters and results are keyed by the disk-I/O key, not the
     /// connection.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) fn wake_disk_io(&mut self, seq: u32, result: i32) {
         if self.disk_io_graveyard.remove(&seq).is_some() {
             return;
