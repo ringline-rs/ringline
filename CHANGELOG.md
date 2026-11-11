@@ -292,8 +292,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - On io_uring `fs::stat` no longer allocates a `libc::statx` per call: the
-  buffer lives in the command slab entry, which costs 256 bytes per
-  `max_commands_in_flight` slot. On both backends the executor keeps one
+  buffer lives in the command slab entry, which costs each worker 256 bytes
+  per `max_commands_in_flight` slot (64 KiB at the default of 256). On both backends the executor keeps one
   map of disk-I/O operations, with a cheaper hash for its 32-bit keys, in
   place of five. Finding P2 of `docs/journal/2026-11-file-io-audit.md`
   (#876).
