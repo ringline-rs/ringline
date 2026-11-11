@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
+- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F6 fixed (#870); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -117,6 +117,8 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 `backend/mio/driver.rs:523-541` builds the file tables from `max_files` only; `grep max_commands_in_flight ringline/src/backend/mio` finds one test config. `submit_disk_io` (`handler.rs:3160-3195`) checks nothing but the key and sends on an unbounded channel. Run: with `FsConfig::max_commands_in_flight(4)`, eight `read_into` calls issued before any await all succeed, where io_uring returns `filesystem command slab exhausted` at the limit. A handler that issues reads faster than the pool drains them grows the queue without bound (per queued operation a `Box<dyn FnOnce>`, a `DiskIoRequest`, an `Arc<OwnedFd>` hold and three map entries). `mio/event_loop.rs:100-116` creates a `DiskIoPool` in every `AsyncEventLoop::new`, so a runtime runs `workers × disk_io_threads` threads, all named `ringline-disk-io-0` or `-1`, while `disk_io_pool.rs:53-57` says "Created once during launch and shared (via `Arc`) across all workers" and `ConfigBuilder::disk_io_threads` does not say per worker (`docs/architecture.md:48-49` has it right). Fix: a per-worker counter from `max_commands_in_flight` that `submit_disk_io` fails past, decremented in the response drain, with io_uring's error text; and either one pool per runtime as the doc says or docs that say per worker and thread names that carry the worker index. Test: the eight-reads probe, mio.
 
 ### F6 — `disk_io_threads(0)` with fs or direct I/O configured passes validation; the documented error kind is wrong; a direct I/O open succeeds and its operations fail (invariant 11). Confirmed (mio run).
+
+**Fixed (#870):** `build()` refuses the combination on mio and names `no_fs()`; the `disk_io_threads` docs say what 0 does on each backend. Test: `disk_io_threads_zero_with_fs_is_rejected_on_mio` in `config.rs`. The text below is as found at 6851de26.
 
 `config.rs:386` says operations "return `Unsupported`" (`:1243` says only "0 = disabled"); `submit_disk_io` returns `io::Error::other("disk I/O pool not configured")`, kind `Other`. Run: `fs::open` fails with that error; `open_direct_io_file` (synchronous, no pool) returns `Ok` and the first read fails with the same message. `Config::validate` has no check. Fix: reject `disk_io_threads == 0` with `fs` or `direct_io` set on the mio build, or document the kind and the message.
 

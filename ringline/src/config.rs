@@ -393,12 +393,12 @@ pub struct Config {
     /// 0 = disabled (no blocking pool; [`spawn_blocking()`](crate::spawn_blocking)
     /// will return an error). Default: 4.
     pub(crate) blocking_threads: usize,
-    /// Number of dedicated disk I/O threads (mio backend only). The disk I/O
-    /// pool executes blocking filesystem syscalls (pread, pwrite, fsync, stat,
-    /// rename, unlink, mkdir) on background threads, enabling async file I/O
-    /// on non-Linux platforms.
+    /// Number of disk I/O threads per worker (mio backend only). The pool
+    /// runs the blocking file syscalls (open, pread, pwrite, fsync, stat,
+    /// rename, unlink, mkdir) off the event loop.
     ///
-    /// 0 = disabled (filesystem/direct I/O operations return `Unsupported`).
+    /// 0 = no pool. On the mio backend `validate` refuses 0 while `fs` (on by
+    /// default) or `direct_io` is set. On io_uring the pool is not used.
     /// Default: 2.
     pub(crate) disk_io_threads: usize,
 }
@@ -677,6 +677,24 @@ impl Config {
                 return Err(crate::error::Error::RingSetup(
                     "udp_recv_buffer.buffer_size must be >= 66048 when udp_gro is enabled \
                      (a coalesced GRO datagram is up to ~64 KiB plus recvmsg metadata)"
+                        .into(),
+                ));
+            }
+        }
+        // On mio every file operation runs on the disk-I/O pool, so a file
+        // subsystem with no pool would fail at its first call.
+        if !cfg!(has_io_uring) && self.disk_io_threads == 0 {
+            if self.fs.is_some() {
+                return Err(crate::error::Error::RingSetup(
+                    "disk_io_threads is 0 with fs enabled; the mio backend runs file \
+                     operations on that pool: set disk_io_threads or call no_fs()"
+                        .into(),
+                ));
+            }
+            if self.direct_io.is_some() {
+                return Err(crate::error::Error::RingSetup(
+                    "disk_io_threads is 0 with direct_io enabled; the mio backend runs \
+                     direct I/O on that pool: set disk_io_threads or leave direct_io unset"
                         .into(),
                 ));
             }
@@ -1255,7 +1273,11 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the number of disk I/O threads (mio backend only). 0 = disabled.
+    /// Set the number of disk I/O threads per worker (mio backend only).
+    ///
+    /// 0 means no pool: on the mio backend `build()` then fails while `fs`
+    /// (on by default; see [`no_fs`](Self::no_fs)) or `direct_io` is set. On
+    /// io_uring the value is accepted and unused.
     pub fn disk_io_threads(mut self, threads: usize) -> Self {
         self.config.disk_io_threads = threads;
         self

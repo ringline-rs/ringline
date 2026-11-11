@@ -3236,14 +3236,14 @@ impl<'a> DriverCtx<'a> {
         work: Box<dyn FnOnce() -> crate::disk_io_pool::DiskIoResult + Send>,
         borrows: bool,
     ) -> io::Result<u32> {
-        let pool = self
-            .disk_io_pool
-            .as_ref()
-            .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
-        let tx = self
-            .disk_io_tx
-            .as_ref()
-            .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
+        // Unreachable through `ConfigBuilder`, which refuses a file subsystem
+        // with no pool on this backend.
+        let pool = self.disk_io_pool.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "disk I/O pool not configured")
+        })?;
+        let tx = self.disk_io_tx.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "disk I/O pool not configured")
+        })?;
 
         // Skip a key a future still holds, or whose operation is still in the
         // pool; the u32 sequence can wrap on a long-running worker.
