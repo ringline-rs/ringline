@@ -5039,7 +5039,8 @@ impl<F: Future> Future for TimeoutFuture<F> {
 /// count is not an error), and `0` for `fs::fsync`, `fs::rename`,
 /// `fs::remove`, `fs::mkdir`, `direct_io_fsync` and every NVMe command. A
 /// failure resolves to the errno's `io::Error`; an NVMe command the device
-/// rejected resolves to `EIO`, and the device's status word is not carried.
+/// failed resolves to an `io::Error` of kind `Other` whose inner error is the
+/// [`NvmeStatus`](crate::NvmeStatus).
 ///
 /// Polled from a task on another worker it stays pending until a task on the
 /// owning worker drives it; polled outside the ringline executor it panics.
@@ -5247,8 +5248,7 @@ pub unsafe fn direct_io_read(
 /// when the io_uring CQE arrives, with `Ok(0)` for a command the device
 /// completed, an `io::Error` of kind `Other` whose inner error (`get_ref()`,
 /// `into_inner()`) is the [`NvmeStatus`](crate::NvmeStatus) for one the
-/// device failed, and the
-/// errno's `io::Error` for a transport failure.
+/// device failed, and the errno's `io::Error` for a transport failure.
 ///
 /// # Safety
 ///
