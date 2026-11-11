@@ -296,6 +296,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Vec` instead of allocating one per iteration. A serial `fs::read_into`
   makes one allocation per operation instead of two. Finding P1 of
   `docs/journal/2026-11-file-io-audit.md` (#875).
+- On io_uring `fs::stat` no longer allocates a `libc::statx` per call: the
+  buffer lives in the command slab entry, which costs each worker 256 bytes
+  per `max_commands_in_flight` slot (64 KiB at the default of 256). On both
+  backends the executor keeps one map of disk-I/O operations, with a cheaper
+  hash for its 32-bit keys, in place of five. Finding P2 of
+  `docs/journal/2026-11-file-io-audit.md` (#876).
 - **Breaking:** a peer's FIN or close_notify finishes the read half and
   closes nothing. Before, every read EOF requested a close, deferred behind
   queued sends and one poll of the task, and the task was then dropped

@@ -4442,23 +4442,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let op = cmd_slab.get(slab_idx).map(|e| e.op);
 
-        // For Statx ops, convert the statx buffer to Metadata before releasing the slab.
-        if op == Some(crate::fs::FsOp::Statx)
-            && result >= 0
-            && let Some(entry) = cmd_slab.get(slab_idx)
-            && let Some(ref statx_buf) = entry.statx_buf
-        {
-            let metadata = crate::fs::Metadata::from_statx(statx_buf);
-            // Keyed by the full disk-I/O key (StatFuture holds the same),
-            // not the raw slab index.
-            self.executor.fs_stat_results.insert(ud.payload(), metadata);
-        }
+        // For Statx ops, convert the statx buffer to Metadata before releasing
+        // the slab; it travels to the future with the result.
+        let metadata = match cmd_slab.get(slab_idx) {
+            Some(entry) if op == Some(crate::fs::FsOp::Statx) && result >= 0 => {
+                Some(crate::fs::Metadata::from_statx(&entry.statx_buf))
+            }
+            _ => None,
+        };
 
         // An open whose `OpenFuture` was dropped: nothing holds a handle to
         // the file, so close it, free the slot and deliver nothing.
-        if op == Some(crate::fs::FsOp::Open)
-            && self.executor.abandoned_fs_opens.remove(&ud.payload())
-        {
+        if op == Some(crate::fs::FsOp::Open) && self.executor.take_abandoned_open(ud.payload()) {
             if result >= 0 {
                 let fd_index = self.driver.fs_fd_base + file_index as u32;
                 let _ = self.driver.ring.register_files_update(fd_index, &[-1i32]);
@@ -4499,7 +4494,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Wake the async task waiting for this completion.
-        self.executor.wake_disk_io(ud.payload(), result);
+        self.executor
+            .wake_disk_io_with(ud.payload(), result, metadata);
     }
 
     fn handle_pidfd_poll(&mut self, ud: UserData, result: i32) {
@@ -12171,11 +12167,11 @@ mod tests {
     fn disk_io_future_drop_clears_waiter() {
         let mut el = make_test_loop();
 
-        // Insert a disk_io_waiter entry manually.
+        // Hold the key as a future's creation does.
         let seq = 42u32;
         let task_id = 0u32;
-        el.executor.disk_io_waiters.insert(seq, task_id);
-        assert!(el.executor.disk_io_waiters.contains_key(&seq));
+        el.executor.wait_disk_io(seq, task_id);
+        assert!(el.executor.disk_io.contains_key(&seq));
 
         // Set up thread-local so DiskIoFuture::drop can access executor.
         let driver_ptr = &mut el.driver as *mut Driver;
@@ -12196,10 +12192,10 @@ mod tests {
 
         drop(guard);
 
-        // Waiter should be cleaned up.
+        // The entry should be gone.
         assert!(
-            !el.executor.disk_io_waiters.contains_key(&seq),
-            "disk_io_waiter not cleared on DiskIoFuture drop"
+            !el.executor.disk_io.contains_key(&seq),
+            "the key's entry was not released on DiskIoFuture drop"
         );
     }
 
@@ -12790,7 +12786,7 @@ mod tests {
         let key = 0x0123_0005;
         el.executor.wait_disk_io(key, 0);
         // Its result has arrived and nothing will take it.
-        el.executor.disk_io_results.insert(key, 0);
+        el.executor.wake_disk_io(key, 0);
 
         // CURRENT_DRIVER is unset here, as during connection teardown.
         crate::fs::abandon_disk_io_key(key);
@@ -12801,7 +12797,7 @@ mod tests {
 
         crate::fs::release_orphans(&mut el.driver, &mut el.executor);
         assert!(!crate::runtime::disk_io_key_held(key));
-        assert!(!el.executor.disk_io_results.contains_key(&key));
+        assert!(!el.executor.disk_io.contains_key(&key));
     }
 
     #[test]
