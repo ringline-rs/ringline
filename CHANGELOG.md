@@ -1023,12 +1023,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   timeout SQE cannot be pushed (the submission queue is full and submitting
   to make room fails) keeps its timer slot, wakes its task and pushes again
   on the next poll. Before, `sleep` and `sleep_until` panicked with `timer
-  SQE submission failed`, and `try_sleep` and `try_sleep_until` freed the slot and left the
-  first poll to allocate and push again, which panicked on an exhausted pool
-  or a second failed push. The same holds for `timeout`, `timeout_at`,
-  `try_timeout` and `try_timeout_at`. A relative sleep (`sleep`, `try_sleep`,
-  `timeout`, `try_timeout`) armed on a later poll counts its duration from
-  that push (#832).
+  SQE submission failed`, and `try_sleep` and `try_sleep_until` freed the
+  slot and left the first poll to allocate and push again, which panicked on
+  an exhausted pool or a second failed push. The same holds for `timeout`,
+  `timeout_at`, `try_timeout` and `try_timeout_at`. A relative sleep
+  (`sleep`, `try_sleep`, `timeout`, `try_timeout`) armed on a later poll
+  counts its duration from that push (#832).
+- io_uring: a connection's `Close` SQE carries the connection's generation,
+  and `handle_close` acts on its CQE only when that matches the slot's, before
+  touching any of the slot's state. The check added in #892 compared the
+  generation with a payload of 0 and ran after the waiting send, TLS state and
+  counters were already released, so a connection on a slot that had been
+  used before was never torn down: its task was not dropped, the slot stayed
+  taken, and the timer slots and pidfds its futures held were not freed.
 - mio with the `tls-buffered` feature: one rustls `write_tls` call writes at
   most 64 records, and the mio paths called it once where more could be
   pending; the rest stayed in rustls until the next receive or send. A flush

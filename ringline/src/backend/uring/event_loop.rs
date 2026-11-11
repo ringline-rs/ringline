@@ -3899,6 +3899,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn handle_close(&mut self, ud: UserData) {
         let conn_index = ud.conn_index();
 
+        // The payload carries the generation the Close was submitted for
+        // (`Ring::submit_close`). A Close CQE for another occupant of the slot
+        // must not tear this one down.
+        match self.driver.connections.get(conn_index) {
+            Some(conn) if conn.generation == ud.payload() => {}
+            _ => return,
+        }
+
         // A forced close leaves a send waiting for room, and the poll's CQE can
         // arrive after this one, when its generation no longer matches.
         if let Some(raw) = self.driver.send_queues[conn_index as usize]
@@ -3921,17 +3929,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::CONNECTIONS.increment(metrics::conn::CLOSED);
             metrics::CONNECTIONS_ACTIVE.decrement();
         }
-
-        // I6: Generation check — a Close Cqe from a prior occupant (same slot,
-        // different generation) must not close the new occupant. `remove_connection`
-        // drops all futures per `task_slab.remove()`, which aborts whatever task
-        // currently occupies the slot if the Cqe is stale.
-        // Match the pattern from `handle_connect`: if generation mismatches, return
-        // without touching the new occupant.
-        match self.driver.connections.get(conn_index) {
-            Some(conn) if conn.generation == ud.payload() => {}
-            _ => return,
-        };
 
         // Remove the async task (drops the future), with the driver state
         // installed so the futures it holds clean up as inside a poll.
@@ -9728,6 +9725,38 @@ mod tests {
         );
     }
 
+    /// A Close CQE carries the generation it was submitted for. One for
+    /// another generation leaves the slot's occupant alone, and the Close the
+    /// driver submits, completed by the kernel, releases a slot that has been
+    /// reused (#892).
+    #[test]
+    fn a_close_cqe_releases_only_the_generation_it_was_submitted_for() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        recycle_to_generation(&mut el, conn_index, PATTERNED_GENERATION);
+        let generation = el.driver.connections.generation(conn_index);
+
+        let other = UserData::encode(OpTag::Close, conn_index, generation - 1);
+        el.test_dispatch_cqe(other.raw(), 0, 0);
+        assert!(
+            el.driver.connections.get(conn_index).is_some(),
+            "a Close CQE for another generation released the slot"
+        );
+
+        el.driver.close_connection(conn_index);
+        el.finalize_pending_closes();
+        assert!(el.driver.send_queues[conn_index as usize].close_submitted);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while el.driver.connections.get(conn_index).is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the Close CQE did not release the slot"
+            );
+            el.driver.ring.submit_and_wait(1).expect("submit");
+            el.drain_completions();
+        }
+    }
+
     /// #371: a close requested by the driver (read error, task exit) must
     /// not commit the Close SQE synchronously — the task gets its poll
     /// window first. The event loop's end-of-iteration drain of
@@ -13036,7 +13065,7 @@ mod tests {
         assert!(!conn.connect_timeout_armed);
         assert!(conn.close_requested());
 
-        let close = UserData::encode(OpTag::Close, conn_index, 0);
+        let close = UserData::encode(OpTag::Close, conn_index, generation);
         el.test_dispatch_cqe(close.raw(), 0, 0);
         assert!(el.driver.connections.get(conn_index).is_none());
 
@@ -16597,7 +16626,7 @@ mod tests {
             conn_index,
             UserData::send_payload(slot, generation),
         );
-        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
         el.inject_linked_chain_and_dispatch(&[(send_ud.raw(), 9), (close_ud.raw(), 0)]);
 
         assert!(
@@ -16646,7 +16675,7 @@ mod tests {
             conn_index,
             UserData::send_payload(slot, generation),
         );
-        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        let close_ud = UserData::encode(OpTag::Close, conn_index, generation);
         el.inject_linked_chain_and_dispatch(&[(close_ud.raw(), 0), (send_ud.raw(), 8)]);
 
         assert!(

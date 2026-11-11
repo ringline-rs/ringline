@@ -509,9 +509,16 @@ impl Ring {
     }
 
     /// Submit the `Close` of a connection's fixed (direct) descriptor,
-    /// hard-linked behind `lead` unless it is `Nothing`.
-    pub fn submit_close(&mut self, conn_index: u32, lead: CloseLead) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::Close, conn_index, 0);
+    /// hard-linked behind `lead` unless it is `Nothing`. The payload carries
+    /// the connection's generation, which `handle_close` checks against the
+    /// slot's.
+    pub fn submit_close(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        lead: CloseLead,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::Close, conn_index, generation);
         let close = Sqe::new(
             Op::Close {
                 fd: sqe::Fd::Fixed(conn_index),
