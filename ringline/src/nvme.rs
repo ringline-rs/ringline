@@ -204,7 +204,7 @@ impl NvmeUringCmd {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct NvmeDevice {
     pub(crate) index: u16,
-    pub(crate) generation: u16,
+    pub(crate) generation: u32,
     /// Makes the handle `!Send`.
     _not_send: PhantomData<*const ()>,
 }
@@ -219,7 +219,7 @@ impl std::fmt::Debug for NvmeDevice {
 }
 
 impl NvmeDevice {
-    pub(crate) fn new(index: u16, generation: u16) -> Self {
+    pub(crate) fn new(index: u16, generation: u32) -> Self {
         NvmeDevice {
             index,
             generation,
@@ -242,7 +242,7 @@ pub(crate) struct NvmeDeviceState {
     /// Whether this slot is in use.
     pub active: bool,
     /// Generation counter for stale-handle detection.
-    pub generation: u16,
+    pub generation: u32,
     /// Number of commands currently in flight.
     pub in_flight: u32,
     /// Closed with commands in flight: the last completion unregisters the
@@ -524,6 +524,20 @@ mod tests {
         assert_eq!(c, a);
         // Generation incremented.
         assert_eq!(table.get(c).unwrap().generation, 1);
+    }
+
+    /// A slot reused 65,536 times does not repeat its first generation, so a
+    /// handle kept from the first open stays stale (#862).
+    #[test]
+    fn generation_does_not_repeat_after_65536_releases() {
+        let mut table = NvmeDeviceTable::new(1);
+        let index = table.allocate().unwrap();
+        let first = table.get(index).unwrap().generation;
+        for _ in 0..65_536 {
+            table.release(index);
+            assert_eq!(table.allocate(), Some(index));
+        }
+        assert_ne!(table.get(index).unwrap().generation, first);
     }
 
     #[test]

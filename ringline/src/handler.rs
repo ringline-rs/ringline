@@ -2081,7 +2081,7 @@ impl<'a> DriverCtx<'a> {
         path: &std::path::Path,
         flags: crate::fs::OpenFlags,
         mode: u32,
-    ) -> io::Result<(u16, u16, u32)> {
+    ) -> io::Result<(u16, u32, u32)> {
         let files = self
             .fs_files
             .as_mut()
@@ -3474,7 +3474,7 @@ impl<'a> DriverCtx<'a> {
         path: &std::path::Path,
         flags: crate::fs::OpenFlags,
         mode: u32,
-    ) -> io::Result<(u16, u16, u32)> {
+    ) -> io::Result<(u16, u32, u32)> {
         let files = self
             .fs_files
             .as_mut()
