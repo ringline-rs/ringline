@@ -529,9 +529,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // pool thread's swap comes first in the flag's order, its release
         // synchronizes with this acquire, so the channel read below sees its
         // response; otherwise that thread reads `false` and writes the pipe.
-        self.driver
-            .disk_io_wake_pending
-            .swap(false, Ordering::AcqRel);
+        // The load skips the swap on an iteration with no disk-I/O wake: a
+        // pool swap it does not see read `false` and wrote the pipe.
+        if self.driver.disk_io_wake_pending.load(Ordering::Relaxed) {
+            self.driver
+                .disk_io_wake_pending
+                .swap(false, Ordering::AcqRel);
+        }
         // Drain accept channel (server mode).
         loop {
             let item = match self.driver.accept_rx {
@@ -1901,23 +1905,6 @@ mod tests {
 
     /// Single-worker config with the driver tests' tiny 4 x 64-byte send
     /// pool, and no filesystem subsystem so no disk-I/O threads start.
-    /// `drain_channels` clears the disk-I/O wake flag, so a completion queued
-    /// after it writes the wake pipe.
-    #[test]
-    fn drain_channels_clears_the_disk_io_wake_flag() {
-        let config = test_config();
-        let (mut el, _wake) = test_loop(&config);
-        el.driver
-            .disk_io_wake_pending
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        el.drain_channels();
-        assert!(
-            !el.driver
-                .disk_io_wake_pending
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
-    }
-
     fn test_config() -> Config {
         ConfigBuilder::new()
             .workers(1)
@@ -2141,6 +2128,23 @@ mod tests {
         )
         .expect("build mio event loop");
         (event_loop, handle)
+    }
+
+    /// `drain_channels` clears the disk-I/O wake flag, so a completion queued
+    /// after it writes the wake pipe.
+    #[test]
+    fn drain_channels_clears_the_disk_io_wake_flag() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        el.driver
+            .disk_io_wake_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        el.drain_channels();
+        assert!(
+            !el.driver
+                .disk_io_wake_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     /// A key whose operation is still in the disk-I/O pool is not handed
