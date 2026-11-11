@@ -300,9 +300,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   default `sq_entries` is 4096 instead of 256. A large CQ keeps completions
   out of the kernel's overflow list, where an allocation failure drops them
   (#831). The default rings take about 2.5 MiB per worker, against about
-  70 KiB before. From Linux 6.14 the kernel charges that to `RLIMIT_MEMLOCK`:
-  with four or more workers the defaults exceed a common 8 MiB limit, and
-  launch fails with `Error::ResourceLimit` naming the `ulimit` to run. Lower
+  70 KiB before. From Linux 6.14 the kernel charges that to `RLIMIT_MEMLOCK`,
+  summed over every process of the user: four workers' defaults exceed an
+  8 MiB hard limit, such as systemd's default, and launch then fails with
+  `Error::ResourceLimit` naming the `ulimit` to run (it raises the soft
+  limit when the hard limit allows). Before Linux 6.10 the CQ and its header
+  are one physically contiguous 4 MiB block per worker, which can fail with
+  `ENOMEM` on fragmented memory; 32768 entries fit in 2 MiB. Lower
   `cq_entries`, raise the limit, or run with `CAP_IPC_LOCK`. With the larger
   SQ, the io-wq pool's bound, `min(sq_entries, 4 × online CPUs)`, is 4 × the
   CPU count on hosts with more than 64 CPUs, where it was 256.

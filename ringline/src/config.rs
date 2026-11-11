@@ -959,10 +959,15 @@ impl ConfigBuilder {
     /// `cqe_dropped`). A large CQ keeps completions out of that list.
     ///
     /// Each CQ entry is 32 bytes, so the default CQ is 2 MiB per worker. From
-    /// Linux 6.14 the kernel charges each ring to `RLIMIT_MEMLOCK`, and launch
-    /// fails with [`Error::ResourceLimit`](crate::Error::ResourceLimit) when
-    /// the workers' rings do not fit in it. Lower this, raise the limit, or
-    /// run with `CAP_IPC_LOCK`.
+    /// Linux 6.14 the kernel charges each ring to `RLIMIT_MEMLOCK`, summed
+    /// over every process of the user. Launch raises the soft limit when the
+    /// hard limit allows, and fails with
+    /// [`Error::ResourceLimit`](crate::Error::ResourceLimit) when the hard
+    /// limit is too low for the workers' rings. Lower this, raise the limit,
+    /// or run with `CAP_IPC_LOCK`. Before Linux 6.10 the kernel allocates the
+    /// CQ and its ring header as one physically contiguous block, 4 MiB at the
+    /// default, which can fail with `ENOMEM` on a host whose memory is
+    /// fragmented; 32768 entries fit in 2 MiB.
     pub fn cq_entries(mut self, n: u32) -> Self {
         self.config.cq_entries = n;
         self

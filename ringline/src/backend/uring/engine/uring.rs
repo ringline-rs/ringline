@@ -41,9 +41,11 @@ fn is_enter_backpressure(error: &io::Error) -> bool {
 /// Whether an `io_uring_enter` failure reports dropped completions, counting
 /// it when it does. `EBADR`: the kernel could not allocate an overflow entry
 /// for a completion and dropped it, so the operation it belonged to never
-/// completes. The kernel reports this once, from an enter that submitted
-/// nothing, and clears it there; nothing else is wrong with the ring, so the
-/// worker carries on. The completion itself cannot be recovered.
+/// completes. The kernel returns it from an enter that waits for completions,
+/// submits nothing and finds the CQ empty, and clears it there. Nothing else
+/// is wrong with the ring, so the worker carries on. The completion itself
+/// cannot be recovered. Of the enters here only `submit_and_wait` with a
+/// nonzero `min_complete` can see it; the others match it as well.
 fn reports_dropped_completions(error: &io::Error) -> bool {
     let dropped = error.raw_os_error() == Some(libc::EBADR);
     if dropped {
@@ -802,7 +804,7 @@ impl Engine for UringEngine {
     fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>) {
         #[cfg(test)]
         out.append(&mut self.injected);
-        let mut cq = self.ring.completion();
+        let cq = self.ring.completion();
         // The kernel counts each completion it drops, cumulatively.
         let dropped = cq.overflow();
         out.extend(cq.map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags())));

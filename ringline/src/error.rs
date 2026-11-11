@@ -279,7 +279,10 @@ pub(crate) fn describe_ring_setup_failure(err: &io::Error, probe: &RingSetupProb
                 msg.push_str(&cause);
                 msg.push_str(", ");
             }
-            None => msg.push_str("Fix the underlying error, "),
+            None => msg.push_str(
+                "Fix the underlying error (a smaller ConfigBuilder::cq_entries needs \
+                 less contiguous memory), ",
+            ),
         },
         _ => {
             msg.push_str("Fix the underlying error, ");
