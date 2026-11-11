@@ -2679,6 +2679,9 @@ fn a_reply_after_the_peers_close_notify_reaches_the_client() {
         stream.write_all(b"g").unwrap();
         stream.flush().unwrap();
     }
+    // The close_notify goes out after the server has read the request and
+    // its task is asleep, not in the same receive as the request (#889).
+    std::thread::sleep(Duration::from_millis(100));
     tls_conn.send_close_notify();
     while tls_conn.wants_write() {
         tls_conn.write_tls(&mut tcp).unwrap();
