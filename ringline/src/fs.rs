@@ -168,7 +168,7 @@ impl OpenFlags {
     /// Truncate an existing regular file to zero length (`O_TRUNC`).
     pub const TRUNCATE: Self = Self(libc::O_TRUNC);
     /// Append every write to the end of the file (`O_APPEND`). On Linux the
-    /// `offset` argument of [`write`] and [`write_from`] is then ignored, on
+    /// `offset` argument of [`write()`] and [`write_from()`] is then ignored, on
     /// both backends; on macOS `pwrite` writes at `offset` regardless.
     pub const APPEND: Self = Self(libc::O_APPEND);
 }
