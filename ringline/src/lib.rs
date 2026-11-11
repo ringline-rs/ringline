@@ -467,26 +467,22 @@ pub use buffer::fixed::RegionId;
 pub use config::Config;
 /// Builder for [`Config`] with discoverable methods and `build()` validation.
 pub use config::ConfigBuilder;
-/// Direct I/O completion result.
-pub use direct_io::DirectIoCompletion;
 /// Direct I/O configuration.
 pub use direct_io::DirectIoConfig;
 /// Direct I/O file handle.
 pub use direct_io::DirectIoFile;
-/// Direct I/O operation type.
-pub use direct_io::DirectIoOp;
 /// Options for opening a direct I/O file.
 pub use direct_io::DirectIoOpenOptions;
 /// Runtime errors.
 pub use error::Error;
 /// Zero-copy send guard trait.
 pub use guard::{GuardBox, SendGuard};
-/// NVMe passthrough completion result.
-pub use nvme::NvmeCompletion;
 /// NVMe passthrough configuration.
 pub use nvme::NvmeConfig;
 /// NVMe passthrough device handle.
 pub use nvme::NvmeDevice;
+/// The status word of an NVMe command the device failed.
+pub use nvme::NvmeStatus;
 /// Refcounted handle for waking a worker thread from any thread.
 pub use wakeup::WakeHandle;
 /// Builder for launching ringline workers.
