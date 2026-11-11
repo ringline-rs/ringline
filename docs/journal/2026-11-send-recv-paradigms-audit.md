@@ -1,7 +1,7 @@
 # 2026-11: Audit of the send and receive paradigms
 
-- **Status:** open — 28 confirmed findings (F1 to F28), 10 plausible (PL1 to PL10), 23 documentation findings (D1 to D23) and 18 design limitations put to the owner as questions (L1 to L18); the owner chose F1 then F2, fixed in #849 (merged) and #850 (open), and chose to bound the TLS handshake for L18, in #868 (merged); F27, F28, L18 and PL10 were found while reviewing those fixes; the invariant list was confirmed by three agents, not agreed line by line with the owner
-- **Span:** 2026-11-09 to 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · PRs: #849 (F1), #850 (F2), #868 (L18)
+- **Status:** open — 28 confirmed findings (F1 to F28), 10 plausible (PL1 to PL10), 23 documentation findings (D1 to D23) and 18 design limitations put to the owner as questions (L1 to L18); the owner chose F1 then F2, fixed in #849 (merged) and #850 (open), and chose to bound the TLS handshake for L18, in #868 (merged); F27, F28, L18 and PL10 were found while reviewing those fixes; PL10 was then confirmed and fixed in #886 (merged); the invariant list was confirmed by three agents, not agreed line by line with the owner
+- **Span:** 2026-11-09 to 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · PRs: #849 (F1), #850 (F2), #868 (L18), #886 (PL10)
 
 ## Goal
 
@@ -452,8 +452,8 @@ Long lists:
 Status: **confirmed** = a test or measurement at `6851de26` shows it, with
 the backend and the number of runs given, or (where marked "by reading") the
 quoted text is the whole finding; **plausible** = the code path is real and
-the trigger was not produced. F1 is fixed; F2's fix is open; every other
-finding is open. Findings are ordered by
+the trigger was not produced. F1 and PL10 are fixed; F2's fix is open;
+every other finding is open. Findings are ordered by
 consequence as the auditor judges it; the owner ranks.
 
 ### F1 — A peer FIN before the TLS handshake completes leaves the connection with no task; an outbound `connect().tls()` never resolves (R6a, R10d). Confirmed (run, both backends).
@@ -1114,6 +1114,21 @@ The code path is real; the trigger was not produced.
   io_uring and, on mio, let `drain_pending_closes` tear these connections
   down without waiting for `pending_sends`.
 
+  Confirmed after the audit, on both backends, and fixed in #886, merged as
+  4cf6d4bb. A one-slot server with a flight of about 2 MB and a peer with a
+  minimal receive buffer that stopped reading after its ClientHello: the
+  slot stayed held after a handshake timeout and after the peer's FIN. On
+  loopback a 0.5 MB flight was taken in full and a 1 MB one was not. A
+  first fix tore the connection down at once; on io_uring a peer that was
+  still reading then lost most of the flight and the alert, and the owner
+  required the alert be delivered. The merged fix keeps the drain and
+  bounds it: `close_connection` sets the close deadline
+  (`CLOSE_NOTIFY_TIMEOUT`, 5 s) on a connection that is not established, on
+  both backends, and mio's `finish_close` writes no close_notify while
+  sends remain queued. Open: on io_uring with `tick_timeout_us(0)` the
+  deadline is checked only when a worker timer wakes the loop; a stall with
+  no send waiting for room was not shown.
+
 ## Documentation findings
 
 Each item compares a sentence in the rustdoc, a design doc, `CLAUDE.md`,
@@ -1623,8 +1638,8 @@ Platforms and kernels:
 
 Not run by the auditor:
 
-- The kernel triggers for PL1–PL9, the zero-window client PL10 needs,
-  and the live sequences for F15.
+- The kernel triggers for PL1–PL9 and the live sequences for F15. PL10's
+  trigger was run later, in #886.
 - F4's two reading-only parts, F26's overflow, and the io_uring cause of
   F23.
 - F6 on the reset-then-send path and at the other write sites `finish_close`
