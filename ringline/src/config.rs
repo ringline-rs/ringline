@@ -76,15 +76,20 @@ impl TestFault {
     }
 }
 
-/// The largest `sq_entries`: the completion queue is 4 × `sq_entries`, and
-/// Linux allows at most 65536 completion queue entries.
-const MAX_SQ_ENTRIES: u32 = 16384;
+/// The largest `sq_entries` Linux accepts (`IORING_MAX_ENTRIES`).
+const MAX_SQ_ENTRIES: u32 = 32768;
+
+/// The largest `cq_entries` Linux accepts (`IORING_MAX_CQ_ENTRIES`), and the
+/// default.
+const MAX_CQ_ENTRIES: u32 = 65536;
 
 /// Configuration for the io_uring driver.
 #[derive(Clone)]
 pub struct Config {
-    /// Number of SQ entries. CQ will be 4x this.
+    /// Number of SQ entries.
     pub(crate) sq_entries: u32,
+    /// Number of CQ entries.
+    pub(crate) cq_entries: u32,
     /// Enable SQPOLL mode (kernel-side submission polling).
     pub(crate) sqpoll: bool,
     /// SQPOLL idle timeout in milliseconds.
@@ -418,7 +423,8 @@ const MAX_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from
 impl Default for Config {
     fn default() -> Self {
         Self {
-            sq_entries: 256,
+            sq_entries: 4096,
+            cq_entries: MAX_CQ_ENTRIES,
             sqpoll: false,
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
@@ -623,12 +629,22 @@ impl Config {
                 "sq_entries must be at least 2 and a power of two".into(),
             ));
         }
-        // The completion queue is 4 × sq_entries, and Linux refuses one of
-        // more than 65536 entries (IORING_MAX_CQ_ENTRIES) with EINVAL.
+        // Linux refuses larger queues, and a CQ smaller than the SQ, with
+        // EINVAL, which the setup error would blame on the kernel version.
         if self.sq_entries > MAX_SQ_ENTRIES {
             return Err(crate::error::Error::RingSetup(format!(
-                "sq_entries must be at most {MAX_SQ_ENTRIES}: the completion queue is 4 × \
-                 sq_entries, and Linux allows at most 65536 completion queue entries"
+                "sq_entries must be at most {MAX_SQ_ENTRIES}, the largest submission \
+                 queue Linux allows"
+            )));
+        }
+        if !self.cq_entries.is_power_of_two()
+            || self.cq_entries < self.sq_entries
+            || self.cq_entries > MAX_CQ_ENTRIES
+        {
+            return Err(crate::error::Error::RingSetup(format!(
+                "cq_entries must be a power of two, at least sq_entries ({}) and at \
+                 most {MAX_CQ_ENTRIES}, the largest completion queue Linux allows",
+                self.sq_entries
             )));
         }
         // The kernel rejects a limit above INT_MAX.
@@ -921,11 +937,34 @@ impl ConfigBuilder {
 
     // ── io_uring settings ────────────────────────────────────────────
 
-    /// Set the number of SQ entries. The CQ is 4 × this. Must be a power of 2,
-    /// at least 2 and at most 16384: Linux allows at most 65536 CQ entries.
-    /// Default: 256.
+    /// Set the number of SQ entries. Must be a power of 2, at least 2 and at
+    /// most 32768, the largest submission queue Linux allows, and at most
+    /// [`cq_entries`](Self::cq_entries). Default: 4096.
+    ///
+    /// An operation submitted when the SQ is full submits the queue inline
+    /// first, so a larger SQ means fewer of those submits.
     pub fn sq_entries(mut self, n: u32) -> Self {
         self.config.sq_entries = n;
+        self
+    }
+
+    /// Set the number of CQ entries (io_uring backend only). Must be a power
+    /// of 2, at least [`sq_entries`](Self::sq_entries) and at most 65536, the
+    /// largest completion queue Linux allows. Default: 65536.
+    ///
+    /// Completions that do not fit in the CQ wait in a kernel overflow list,
+    /// which the kernel allocates as they arrive. When that allocation fails,
+    /// the completion is dropped and the operation it belonged to never
+    /// completes; the `ring` metrics count both (`cq_overflow`,
+    /// `cqe_dropped`). A large CQ keeps completions out of that list.
+    ///
+    /// Each CQ entry is 32 bytes, so the default CQ is 2 MiB per worker. From
+    /// Linux 6.14 the kernel charges each ring to `RLIMIT_MEMLOCK`, and launch
+    /// fails with [`Error::ResourceLimit`](crate::Error::ResourceLimit) when
+    /// the workers' rings do not fit in it. Lower this, raise the limit, or
+    /// run with `CAP_IPC_LOCK`.
+    pub fn cq_entries(mut self, n: u32) -> Self {
+        self.config.cq_entries = n;
         self
     }
 
@@ -1556,15 +1595,40 @@ mod tests {
         assert!(config_with(|c| c.sq_entries = 3).validate().is_err());
     }
 
-    /// The CQ is 4 × sq_entries, and Linux refuses more than 65536 CQ
-    /// entries (#835).
+    /// Linux refuses an SQ above 32768 entries, a CQ above 65536, and a CQ
+    /// smaller than the SQ, with EINVAL (#835, #831).
     #[test]
-    fn validate_sq_entries_above_16384_rejected() {
-        assert!(config_with(|c| c.sq_entries = 16384).validate().is_ok());
-        let err = config_with(|c| c.sq_entries = 32768)
+    fn validate_queue_sizes_past_the_kernel_limits_rejected() {
+        assert!(
+            config_with(|c| {
+                c.sq_entries = 32768;
+                c.cq_entries = 65536;
+            })
+            .validate()
+            .is_ok()
+        );
+        let err = config_with(|c| c.sq_entries = 65536)
+            .validate()
+            .expect_err("an SQ of 65536 entries");
+        assert!(err.to_string().contains("at most 32768"), "{err}");
+        let err = config_with(|c| c.cq_entries = 131072)
             .validate()
             .expect_err("a CQ of 131072 entries");
-        assert!(err.to_string().contains("at most 16384"), "{err}");
+        assert!(err.to_string().contains("at most 65536"), "{err}");
+        let err = config_with(|c| {
+            c.sq_entries = 1024;
+            c.cq_entries = 512;
+        })
+        .validate()
+        .expect_err("a CQ smaller than the SQ");
+        assert!(err.to_string().contains("at least sq_entries"), "{err}");
+        assert!(config_with(|c| c.cq_entries = 3000).validate().is_err());
+    }
+
+    #[test]
+    fn the_default_queues_are_4096_and_65536() {
+        let config = ConfigBuilder::new().build().expect("defaults are valid");
+        assert_eq!((config.sq_entries, config.cq_entries), (4096, 65536));
     }
 
     #[test]

@@ -2134,7 +2134,7 @@ fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: 
         })
         .sum();
     let rings = if charges_rings {
-        let mut bytes = ring_bytes(config.sq_entries, page);
+        let mut bytes = ring_bytes(config.sq_entries, config.cq_entries, page);
         bytes += config.udp_bind.len() as u64
             * provided_ring_bytes(config.udp_recv_buffer.ring_size, page);
         bytes
@@ -2676,7 +2676,8 @@ mod memlock_required_tests {
     const PAGE: u64 = 4096;
 
     fn builder() -> ConfigBuilder {
-        ConfigBuilder::new().sq_entries(64)
+        // The charges below are worked out for a CQ of 4 × the SQ.
+        ConfigBuilder::new().sq_entries(64).cq_entries(256)
     }
 
     #[test]

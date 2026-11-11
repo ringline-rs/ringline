@@ -51,6 +51,8 @@ fn builder() -> ConfigBuilder {
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
+        // The charges below are worked out for a CQ of 4 × the SQ.
+        .cq_entries(256)
         .max_connections(16)
         .send_pool(16, 16384)
 }
@@ -92,7 +94,7 @@ fn hard_limit() -> u64 {
     r.rlim_max
 }
 
-/// A ring set up as `UringEngine::setup` sets it up, for the sizes that matter here.
+/// A ring set up as `UringEngine::setup` sets it up, with a CQ of 4 × the SQ.
 fn ring(sq_entries: u32) -> io::Result<IoUring<squeue::Entry128, cqueue::Entry32>> {
     IoUring::<squeue::Entry128, cqueue::Entry32>::builder()
         .setup_cqsize(sq_entries * 4)
