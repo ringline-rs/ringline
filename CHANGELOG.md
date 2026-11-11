@@ -291,6 +291,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- mio: a burst of disk-I/O completions writes the worker's wake pipe once
+  instead of once per completion, and the event loop reuses one events
+  `Vec` instead of allocating one per iteration. A serial `fs::read_into`
+  makes one allocation per operation instead of two. Finding P1 of
+  `docs/journal/2026-11-file-io-audit.md` (#875).
 - **Breaking:** a peer's FIN or close_notify finishes the read half and
   closes nothing. Before, every read EOF requested a close, deferred behind
   queued sends and one poll of the task, and the task was then dropped

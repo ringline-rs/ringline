@@ -525,10 +525,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// pipe events) to avoid missed wakeups on macOS/kqueue.
     fn drain_channels(&mut self) {
         // A disk-I/O completion queued from here on writes the wake pipe
-        // again; one queued before is read below.
+        // again; one queued before is read below. A swap, not a store: if a
+        // pool thread's swap comes first in the flag's order, its release
+        // synchronizes with this acquire, so the channel read below sees its
+        // response; otherwise that thread reads `false` and writes the pipe.
         self.driver
             .disk_io_wake_pending
-            .store(false, Ordering::Release);
+            .swap(false, Ordering::AcqRel);
         // Drain accept channel (server mode).
         loop {
             let item = match self.driver.accept_rx {
@@ -1898,6 +1901,23 @@ mod tests {
 
     /// Single-worker config with the driver tests' tiny 4 x 64-byte send
     /// pool, and no filesystem subsystem so no disk-I/O threads start.
+    /// `drain_channels` clears the disk-I/O wake flag, so a completion queued
+    /// after it writes the wake pipe.
+    #[test]
+    fn drain_channels_clears_the_disk_io_wake_flag() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        el.driver
+            .disk_io_wake_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        el.drain_channels();
+        assert!(
+            !el.driver
+                .disk_io_wake_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
     fn test_config() -> Config {
         ConfigBuilder::new()
             .workers(1)
