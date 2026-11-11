@@ -343,8 +343,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `UdpSocket` half, a `fs::File`. Code that relied on
   `H: AsyncEventHandler` implying `H: Send` must add the bound itself.
 - **Breaking:** `fs::File`, `direct_io::DirectIoFile` and `nvme::NvmeDevice`
-  are no longer `Send`, and neither are `DirectIoCompletion` and
-  `NvmeCompletion`, which hold them. Each handle is a slot in the table of the
+  are no longer `Send`. Each handle is a slot in the table of the
   worker that opened it. Used on another worker it named that worker's slot:
   a write through a `File` opened on worker 0 and used on worker 1 succeeded
   and landed in worker 1's file. Use a handle on the worker that opened it, or
@@ -843,6 +842,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** `DirectIoCompletion`, `NvmeCompletion` and `DirectIoOp` are
+  no longer public. Nothing constructed the two completion types, and their
+  docs described a completion handler that never existed; the results they
+  were to carry reach callers through the futures of `direct_io_read`,
+  `direct_io_write`, `direct_io_fsync`, `nvme_read`, `nvme_write` and
+  `nvme_flush`, and a failed NVMe command's status word through `NvmeStatus`
+  (#871).
 - **Breaking:** `DriverCtx` is no longer public, and `on_tick` and `on_notify`
   take no argument. The free functions work inside them:
   `ringline::request_shutdown`, `open_direct_io_file`, `open_nvme_device` and
@@ -990,6 +996,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `disk_io_threads` doc said `Unsupported`; `open_direct_io_file` succeeded
   and its operations failed. On io_uring the value is accepted and unused,
   as before. Finding F6 of `docs/journal/2026-11-file-io-audit.md` (#870).
+- io_uring NVMe: a command the device fails resolves to an `io::Error` of
+  kind `Other` whose inner error (`get_ref()`, `into_inner()`) is the new
+  `NvmeStatus`, the completion's status word (`word()`, `code_type()`,
+  `code()`). Before, every status word became `EIO`, so a media error and an
+  invalid field read the same. A transport failure still resolves to the
+  errno's `io::Error`. Finding F7 of `docs/journal/2026-11-file-io-audit.md`
+  (#871).
+- Docs: the file I/O docs state the current behaviour: the `# Safety` sections
+  of `fs::read`, `fs::write`, `direct_io_read`, `direct_io_write`, `nvme_read`
+  and `nvme_write` say the buffer must outlive the operation, which a dropped
+  future gives no way to observe (#825); the futures say what a drop off the
+  owning worker leaks; `DiskIoFuture` says what it resolves to per operation;
+  the fs module doc says operations on one file are independent and what
+  `fsync` covers; the direct I/O and NVMe docs cover the mio backend and the
+  opens that run on the worker thread; `ConfigBuilder::fs`, `direct_io` and
+  `nvme` say what each reserves per worker; and the `NvmeUringCmd` builders
+  document their panic. Findings F9 and F10 of
+  `docs/journal/2026-11-file-io-audit.md` (#873, #874), and the documentation
+  part of P3 (#877).
 - `fs::OpenFlags` documents each flag and that `READ | WRITE` is `WRITE`
   (the access modes are the `open(2)` values, not bits), with a doctest;
   the type is now `PartialEq` and `Eq`. `fs::open` documents its `mode`.
@@ -1813,8 +1838,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - An `OpenFuture` dropped before it resolved, including one owned by a
   connection's task when the connection closed, left its file open and its
   slot in the file table taken, on both backends, until the worker exited;
-  enough of them filled the table. The file is now closed and the slot freed
-  (#551).
+  enough of them filled the table. The file is now closed and the slot freed,
+  unless the future is dropped on a thread other than the worker that
+  created it, which leaves both until that worker exits (#551).
 
 - On mio, files opened by `fs::open` and direct I/O files, and on io_uring,
   NVMe devices and direct I/O files before they enter the fixed-file table,

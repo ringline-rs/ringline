@@ -5034,8 +5034,18 @@ impl<F: Future> Future for TimeoutFuture<F> {
 /// I/O. The operation was submitted before this future was created;
 /// its completion stores the result and wakes the task.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it.
+/// Resolves to the operation's result: the bytes read or written for
+/// `fs::read`, `fs::write`, `direct_io_read` and `direct_io_write` (a short
+/// count is not an error), and `0` for `fs::fsync`, `fs::rename`,
+/// `fs::remove`, `fs::mkdir`, `direct_io_fsync` and every NVMe command. A
+/// failure resolves to the errno's `io::Error`; an NVMe command the device
+/// failed resolves to an `io::Error` of kind `Other` whose inner error is the
+/// [`NvmeStatus`](crate::NvmeStatus).
+///
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaves its result slot
+/// on the owning worker taken until that worker exits.
 pub struct DiskIoFuture {
     pub(crate) seq: u32,
     /// Set once `poll` has returned `Ready`: the result has been taken.
@@ -5066,9 +5076,7 @@ impl Future for DiskIoFuture {
                 return pending(cx);
             }
             match executor.take_disk_io_result(self.seq) {
-                Some(result) if result < 0 => {
-                    Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
-                }
+                Some(result) if result < 0 => Poll::Ready(Err(disk_io_error(self.seq, result))),
                 Some(result) => Poll::Ready(Ok(result)),
                 None => {
                     // Re-register waiter (polled before CQE arrived or after spurious wake).
@@ -5085,6 +5093,17 @@ impl Future for DiskIoFuture {
     }
 }
 
+/// The error a negative disk-I/O result resolves to: for an NVMe command, a
+/// status word the device returned or an errno; otherwise an errno.
+fn disk_io_error(key: u32, result: i32) -> io::Error {
+    #[cfg(has_io_uring)]
+    if key >> 30 == crate::handler::DiskIoKind::Nvme as u32 {
+        return crate::nvme::error_from_result(result);
+    }
+    let _ = key;
+    io::Error::from_raw_os_error(-result)
+}
+
 impl Drop for DiskIoFuture {
     fn drop(&mut self) {
         // Only the owning worker's executor holds the key. Dropped elsewhere
@@ -5095,10 +5114,16 @@ impl Drop for DiskIoFuture {
     }
 }
 
-/// Open a Direct I/O file from any async task.
+/// Open a file for direct I/O: `O_RDWR | O_DIRECT | O_CLOEXEC` on Linux,
+/// `O_RDWR | O_CLOEXEC` with `F_NOCACHE` on macOS.
 ///
-/// Returns a [`DirectIoFile`](crate::direct_io::DirectIoFile) handle
-/// for use with [`direct_io_read()`].
+/// The open runs on the worker thread: `open(2)`, and on io_uring a
+/// synchronous registration of the fd as a fixed file, so every connection
+/// on the worker waits for it (#845).
+///
+/// Returns a [`DirectIoFile`](crate::direct_io::DirectIoFile) handle for
+/// [`direct_io_read()`], [`direct_io_write()`], [`direct_io_fsync()`] and
+/// [`close_direct_io_file()`].
 ///
 /// # Panics
 ///
@@ -5159,10 +5184,16 @@ pub fn close_nvme_device(device: crate::nvme::NvmeDevice) -> io::Result<()> {
     })
 }
 
-/// Open an NVMe device from any async task.
+/// Open an NVMe generic character device (`/dev/ng<X>n<Y>`) for passthrough
+/// commands on namespace `nsid`.
 ///
-/// Returns an [`NvmeDevice`](crate::nvme::NvmeDevice) handle
-/// for use with [`nvme_read()`], [`nvme_write()`], and [`nvme_flush()`].
+/// io_uring only: on mio this returns `Unsupported`. The open runs on the
+/// worker thread, `open(2)` and a synchronous registration of the fd as a
+/// fixed file, so every connection on the worker waits for it (#845).
+///
+/// Returns an [`NvmeDevice`](crate::nvme::NvmeDevice) handle for
+/// [`nvme_read()`], [`nvme_write()`], [`nvme_flush()`] and
+/// [`close_nvme_device()`].
 ///
 /// # Panics
 ///
@@ -5176,13 +5207,18 @@ pub fn open_nvme_device(path: &str, nsid: u32) -> io::Result<crate::nvme::NvmeDe
 
 /// Submit a Direct I/O read and return a future for the result.
 ///
-/// Reads `len` bytes from `offset` into the buffer at `buf`.
-/// The returned future completes when the io_uring CQE arrives.
+/// Reads `len` bytes from `offset` into the buffer at `buf`. The returned
+/// future completes when the operation does: the io_uring completion, or on
+/// mio the pool's `pread`.
 ///
 /// # Safety
 ///
-/// `buf` must point to aligned, writable memory of at least `len` bytes
-/// that remains valid until the future completes.
+/// `buf` must point to aligned, writable memory of at least `len` bytes that
+/// remains valid until the operation completes. The operation keeps using the
+/// memory after the future is dropped, and a dropped future gives no way to
+/// learn when the operation completes, so after a drop the memory must not be
+/// freed or reused: leak it, or use an owned-buffer variant where one exists
+/// (#825). Direct I/O has no owned-buffer variant.
 ///
 /// # Panics
 ///
@@ -5209,12 +5245,19 @@ pub unsafe fn direct_io_read(
 ///
 /// Reads `num_blocks` logical blocks starting at `lba` into the buffer
 /// at `buf_addr` with length `buf_len`. The returned future completes
-/// when the io_uring CQE arrives.
+/// when the io_uring CQE arrives, with `Ok(0)` for a command the device
+/// completed, an `io::Error` of kind `Other` whose inner error (`get_ref()`,
+/// `into_inner()`) is the [`NvmeStatus`](crate::NvmeStatus) for one the
+/// device failed, and the errno's `io::Error` for a transport failure.
 ///
 /// # Safety
 ///
-/// `buf_addr` must point to valid, aligned memory of at least `buf_len`
-/// bytes that remains valid until the returned future completes.
+/// `buf_addr` must point to valid, aligned memory of at least `buf_len` bytes
+/// that remains valid until the operation completes. The operation keeps using
+/// the memory after the future is dropped, and a dropped future gives no way
+/// to learn when the operation completes, so after a drop the memory must not
+/// be freed or reused: leak it, or use an owned-buffer variant where one
+/// exists (#825). NVMe has no owned-buffer variant.
 ///
 /// # Panics
 ///
@@ -5239,13 +5282,18 @@ pub unsafe fn nvme_read(
 
 /// Submit a Direct I/O write and return a future for the result.
 ///
-/// Writes `len` bytes from the buffer at `buf` to `offset` in the file.
-/// The returned future completes when the io_uring CQE arrives.
+/// Writes `len` bytes from the buffer at `buf` to `offset` in the file. The
+/// returned future completes when the operation does: the io_uring
+/// completion, or on mio the pool's `pwrite`.
 ///
 /// # Safety
 ///
-/// `buf` must point to aligned, readable memory of at least `len` bytes
-/// that remains valid until the future completes.
+/// `buf` must point to aligned, readable memory of at least `len` bytes that
+/// remains valid until the operation completes. The operation keeps using the
+/// memory after the future is dropped, and a dropped future gives no way to
+/// learn when the operation completes, so after a drop the memory must not be
+/// freed or reused: leak it, or use an owned-buffer variant where one exists
+/// (#825). Direct I/O has no owned-buffer variant.
 ///
 /// # Panics
 ///
@@ -5299,7 +5347,8 @@ pub fn direct_io_fsync(file: crate::direct_io::DirectIoFile) -> io::Result<DiskI
 ///
 /// Flushes volatile write caches on the device, ensuring all previously
 /// written data is persisted to non-volatile storage. The returned future
-/// completes when the io_uring CQE arrives.
+/// completes when the io_uring CQE arrives, with the outcomes
+/// [`nvme_read`] describes.
 ///
 /// # Panics
 ///
@@ -5318,12 +5367,17 @@ pub fn nvme_flush(device: crate::nvme::NvmeDevice) -> io::Result<DiskIoFuture> {
 ///
 /// Writes `num_blocks` logical blocks starting at `lba` from the buffer
 /// at `buf_addr` with length `buf_len`. The returned future completes
-/// when the io_uring CQE arrives.
+/// when the io_uring CQE arrives, with the outcomes [`nvme_read`]
+/// describes.
 ///
 /// # Safety
 ///
-/// `buf_addr` must point to valid, aligned memory of at least `buf_len`
-/// bytes that remains valid until the returned future completes.
+/// `buf_addr` must point to valid, aligned memory of at least `buf_len` bytes
+/// that remains valid until the operation completes. The operation keeps using
+/// the memory after the future is dropped, and a dropped future gives no way
+/// to learn when the operation completes, so after a drop the memory must not
+/// be freed or reused: leak it, or use an owned-buffer variant where one
+/// exists (#825). NVMe has no owned-buffer variant.
 ///
 /// # Panics
 ///
