@@ -3936,6 +3936,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // is reused, or the next occupant inherits them.
         self.driver.clear_conn_claims(conn_index);
         self.driver.accumulators.release(conn_index);
+        self.driver.forward_zc_held[conn_index as usize] = None;
         self.driver.arrival[conn_index as usize].release();
         self.driver.connections.release(conn_index);
     }
@@ -4441,23 +4442,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         let op = cmd_slab.get(slab_idx).map(|e| e.op);
 
-        // For Statx ops, convert the statx buffer to Metadata before releasing the slab.
-        if op == Some(crate::fs::FsOp::Statx)
-            && result >= 0
-            && let Some(entry) = cmd_slab.get(slab_idx)
-            && let Some(ref statx_buf) = entry.statx_buf
-        {
-            let metadata = crate::fs::Metadata::from_statx(statx_buf);
-            // Keyed by the full disk-I/O key (StatFuture holds the same),
-            // not the raw slab index.
-            self.executor.fs_stat_results.insert(ud.payload(), metadata);
-        }
+        // For Statx ops, convert the statx buffer to Metadata before releasing
+        // the slab; it travels to the future with the result.
+        let metadata = match cmd_slab.get(slab_idx) {
+            Some(entry) if op == Some(crate::fs::FsOp::Statx) && result >= 0 => {
+                Some(crate::fs::Metadata::from_statx(&entry.statx_buf))
+            }
+            _ => None,
+        };
 
         // An open whose `OpenFuture` was dropped: nothing holds a handle to
         // the file, so close it, free the slot and deliver nothing.
-        if op == Some(crate::fs::FsOp::Open)
-            && self.executor.abandoned_fs_opens.remove(&ud.payload())
-        {
+        if op == Some(crate::fs::FsOp::Open) && self.executor.take_abandoned_open(ud.payload()) {
             if result >= 0 {
                 let fd_index = self.driver.fs_fd_base + file_index as u32;
                 let _ = self.driver.ring.register_files_update(fd_index, &[-1i32]);
@@ -4498,7 +4494,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Wake the async task waiting for this completion.
-        self.executor.wake_disk_io(ud.payload(), result);
+        self.executor
+            .wake_disk_io_with(ud.payload(), result, metadata);
     }
 
     fn handle_pidfd_poll(&mut self, ud: UserData, result: i32) {
@@ -10132,6 +10129,115 @@ mod tests {
         assert_eq!(el.driver.forward_zc_consumed[conn_index as usize], 0);
     }
 
+    /// `len` bytes of `9` whose allocation sets the returned flag when it is
+    /// freed.
+    fn drop_flagged_bytes(
+        len: usize,
+    ) -> (bytes::Bytes, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Owner(Vec<u8>, Arc<AtomicBool>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        let freed = Arc::new(AtomicBool::new(false));
+        let bytes = bytes::Bytes::from_owner(Owner(vec![9u8; len], Arc::clone(&freed)));
+        (bytes, freed)
+    }
+
+    /// `try_with_data` on a connection whose accumulator is a `len`-byte
+    /// remainder put back by `with_bytes`, with a closure that forwards the
+    /// slice it is given. Returns whether the remainder's allocation had been
+    /// freed when `forward_recv_buf` returned, while the closure still held
+    /// the slice, and whether it had been freed when `try_with_data`
+    /// returned.
+    fn forward_a_put_back_remainder(len: usize, tls: bool) -> (bool, bool) {
+        use std::sync::atomic::Ordering;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        if tls {
+            install_handshaked_tls(&mut el, conn_index);
+        }
+        let current = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let (remainder, freed) = drop_flagged_bytes(len);
+        el.driver.accumulators.put_back(conn_index, remainder);
+        let mut freed_in_closure = None;
+        let result = with_driver_state(&mut el, || {
+            current.try_with_data(|data| {
+                assert_eq!(data.len(), len);
+                current.forward_recv_buf(data).expect("forward");
+                freed_in_closure = Some(freed.load(Ordering::SeqCst));
+                crate::ParseResult::Consumed(data.len())
+            })
+        });
+        assert_eq!(result, Some(crate::ParseResult::Consumed(len)));
+        assert!(el.driver.accumulators.data(conn_index).is_empty());
+        (
+            freed_in_closure.expect("the closure ran"),
+            freed.load(Ordering::SeqCst),
+        )
+    }
+
+    /// A forward below `send_zc_threshold` copies the bytes and drops its
+    /// guard inside `forward_recv_buf`. The bytes stay allocated until the
+    /// reader closure that holds a slice of them returns, and are freed then.
+    #[test]
+    fn a_copied_forward_keeps_the_readers_slice_allocated_until_the_closure_returns() {
+        assert_eq!(forward_a_put_back_remainder(99, false), (false, true));
+    }
+
+    /// A TLS forward encrypts the bytes and drops its guard inside
+    /// `forward_recv_buf`, at any size.
+    #[test]
+    fn a_tls_forward_keeps_the_readers_slice_allocated_until_the_closure_returns() {
+        assert_eq!(forward_a_put_back_remainder(5000, true), (false, true));
+    }
+
+    /// A closure that forwards its slice and then calls `close()` still holds
+    /// the slice. `close_connection` leaves the bytes held; they are freed
+    /// when the Close completes and `handle_close` releases the slot.
+    #[test]
+    fn a_copied_forward_then_close_keeps_the_bytes_until_the_slot_is_released() {
+        use std::sync::atomic::Ordering;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let current = ConnCtx::new(conn_index, el.driver.connections.generation(conn_index));
+        let (remainder, freed) = drop_flagged_bytes(99);
+        el.driver.accumulators.put_back(conn_index, remainder);
+        let mut freed_in_closure = None;
+        with_driver_state(&mut el, || {
+            current.try_with_data(|data| {
+                current.forward_recv_buf(data).expect("forward");
+                current.close();
+                freed_in_closure = Some(freed.load(Ordering::SeqCst));
+                // Not `Consumed(data.len())`: `close_connection` zeroes the
+                // forwarded count, so the delivery path would consume past
+                // the end of the empty accumulator.
+                crate::ParseResult::NeedMore
+            })
+        });
+        assert_eq!(freed_in_closure, Some(false));
+        assert!(!freed.load(Ordering::SeqCst));
+        let ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.test_dispatch_cqe(ud.raw(), 0, 0);
+        assert!(freed.load(Ordering::SeqCst));
+    }
+
+    /// Control: at `send_zc_threshold` and above the send slab holds the
+    /// guard until the kernel's notification, so the bytes outlive the
+    /// closure.
+    #[test]
+    fn a_zero_copy_forward_holds_the_bytes_past_the_closure() {
+        assert_eq!(forward_a_put_back_remainder(5000, false), (false, false));
+    }
+
     /// A handle made stale by real teardown and the slot's re-accept must not
     /// detach the new occupant's accumulator (#544).
     #[test]
@@ -12061,11 +12167,11 @@ mod tests {
     fn disk_io_future_drop_clears_waiter() {
         let mut el = make_test_loop();
 
-        // Insert a disk_io_waiter entry manually.
+        // Hold the key as a future's creation does.
         let seq = 42u32;
         let task_id = 0u32;
-        el.executor.disk_io_waiters.insert(seq, task_id);
-        assert!(el.executor.disk_io_waiters.contains_key(&seq));
+        el.executor.wait_disk_io(seq, task_id);
+        assert!(el.executor.disk_io.contains_key(&seq));
 
         // Set up thread-local so DiskIoFuture::drop can access executor.
         let driver_ptr = &mut el.driver as *mut Driver;
@@ -12086,10 +12192,10 @@ mod tests {
 
         drop(guard);
 
-        // Waiter should be cleaned up.
+        // The entry should be gone.
         assert!(
-            !el.executor.disk_io_waiters.contains_key(&seq),
-            "disk_io_waiter not cleared on DiskIoFuture drop"
+            !el.executor.disk_io.contains_key(&seq),
+            "the key's entry was not released on DiskIoFuture drop"
         );
     }
 
@@ -12680,7 +12786,7 @@ mod tests {
         let key = 0x0123_0005;
         el.executor.wait_disk_io(key, 0);
         // Its result has arrived and nothing will take it.
-        el.executor.disk_io_results.insert(key, 0);
+        el.executor.wake_disk_io(key, 0);
 
         // CURRENT_DRIVER is unset here, as during connection teardown.
         crate::fs::abandon_disk_io_key(key);
@@ -12691,7 +12797,7 @@ mod tests {
 
         crate::fs::release_orphans(&mut el.driver, &mut el.executor);
         assert!(!crate::runtime::disk_io_key_held(key));
-        assert!(!el.executor.disk_io_results.contains_key(&key));
+        assert!(!el.executor.disk_io.contains_key(&key));
     }
 
     #[test]

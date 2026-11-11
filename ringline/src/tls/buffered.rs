@@ -621,7 +621,7 @@ fn flush_tls_output_mio_inner(
     pending: &mut std::collections::VecDeque<crate::backend::mio::driver::PendingSend>,
 ) {
     write_buf.clear();
-    if buffered_mut(tls_conn).write_tls(write_buf).is_err() {
+    if drain_tls_output(tls_conn, write_buf).is_err() {
         return;
     }
 
@@ -632,6 +632,21 @@ fn flush_tls_output_mio_inner(
     pending.push_back(crate::backend::mio::driver::PendingSend::plain(
         std::mem::take(write_buf),
     ));
+}
+
+/// Append all of rustls' pending TLS output to `buf`. One `write_tls` call
+/// writes at most 64 of rustls' buffered chunks, so a flight of more records
+/// than that takes several calls. The rest would stay in rustls until the
+/// next receive or send, which a peer waiting for the rest of the flight
+/// does not cause.
+#[cfg(not(has_io_uring))]
+fn drain_tls_output(tls_conn: &mut TlsConn, buf: &mut Vec<u8>) -> io::Result<()> {
+    while tls_conn.conn.wants_write() {
+        if buffered_mut(tls_conn).write_tls(buf)? == 0 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Buffered-engine half of [`super::backend_mio::flush_tls_output_mio_direct`]:
@@ -648,7 +663,7 @@ pub(super) fn flush_tls_output_mio_direct_buffered(
     let (conn_slot, write_buf) = borrow_conn_and_buf(tls_table, conn_index);
     let Some(tls_conn) = conn_slot else { return };
     write_buf.clear();
-    if buffered_mut(tls_conn).write_tls(write_buf).is_err() || write_buf.is_empty() {
+    if drain_tls_output(tls_conn, write_buf).is_err() || write_buf.is_empty() {
         return;
     }
     let mut offset = 0;
@@ -680,7 +695,12 @@ pub(super) fn encrypt_for_send_mio_buffered(
         .conn
         .as_buffered_mut()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    encrypt_buffered(buffered, plaintext)
+}
 
+/// Encrypt `plaintext` on `buffered` and return all of the ciphertext.
+#[cfg(not(has_io_uring))]
+fn encrypt_buffered(buffered: &mut BufferedKind, plaintext: &[u8]) -> io::Result<Vec<u8>> {
     // Interleave writer().write with write_tls draining: rustls caps its
     // ciphertext buffer at 64 KiB, so a single write_all of a larger
     // plaintext fails with WriteZero after the first 64 KiB was already
@@ -694,9 +714,18 @@ pub(super) fn encrypt_for_send_mio_buffered(
             .map_err(io::Error::other)?;
         offset += n;
         let before = ciphertext.len();
-        buffered
-            .write_tls(&mut ciphertext)
-            .map_err(io::Error::other)?;
+        // One `write_tls` call writes at most 64 records, and one `write`
+        // makes more than that when the records are small
+        // (`max_fragment_size`).
+        while buffered.wants_write() {
+            if buffered
+                .write_tls(&mut ciphertext)
+                .map_err(io::Error::other)?
+                == 0
+            {
+                break;
+            }
+        }
         if n == 0 && ciphertext.len() == before {
             return Err(io::Error::other("TLS encryption made no progress"));
         }
@@ -760,6 +789,15 @@ pub(crate) mod test_support {
         handshaked_with_versions(ringline_tls::DEFAULT_VERSIONS)
     }
 
+    /// As [`handshaked`], with the server's records limited to
+    /// `max_fragment_size` bytes.
+    #[cfg(not(has_io_uring))]
+    pub(crate) fn handshaked_with_max_fragment(
+        max_fragment_size: usize,
+    ) -> (BufferedKind, BufferedKind) {
+        handshaked_with(ringline_tls::DEFAULT_VERSIONS, Some(max_fragment_size))
+    }
+
     /// As [`handshaked`], pinned to the given protocol versions.
     ///
     /// `&[&ringline_tls::version::TLS12]` is the reason this exists: the ciphertext
@@ -770,13 +808,21 @@ pub(crate) mod test_support {
     pub(crate) fn handshaked_with_versions(
         versions: &[&'static ringline_tls::SupportedProtocolVersion],
     ) -> (BufferedKind, BufferedKind) {
+        handshaked_with(versions, None)
+    }
+
+    fn handshaked_with(
+        versions: &[&'static ringline_tls::SupportedProtocolVersion],
+        max_fragment_size: Option<usize>,
+    ) -> (BufferedKind, BufferedKind) {
         let (certs, key) = test_certs();
-        let server_config = Arc::new(
+        let mut server_config =
             ringline_tls::ServerConfig::builder_with_protocol_versions(versions)
                 .with_no_client_auth()
                 .with_single_cert(certs.clone(), key)
-                .unwrap(),
-        );
+                .unwrap();
+        server_config.max_fragment_size = max_fragment_size;
+        let server_config = Arc::new(server_config);
         let mut roots = ringline_tls::RootCertStore::empty();
         for c in &certs {
             roots.add(c.clone()).unwrap();
@@ -878,5 +924,66 @@ mod drain_tests {
             accs.is_empty(0),
             "nothing is appended once the bound is breached"
         );
+    }
+}
+
+#[cfg(all(test, not(has_io_uring)))]
+mod mio_flush_tests {
+    use super::test_support::*;
+    use super::*;
+    use std::io::{Cursor, Read};
+
+    /// Decrypt `ciphertext` at `to`, draining plaintext after each record so
+    /// rustls' received-plaintext limit does not stop it, and return how many
+    /// plaintext bytes it carried.
+    fn decrypted_len(to: &mut BufferedKind, ciphertext: &[u8]) -> usize {
+        let mut cursor = Cursor::new(ciphertext);
+        let mut total = 0;
+        let mut buf = vec![0u8; 64 * 1024];
+        while (cursor.position() as usize) < ciphertext.len() {
+            if to.read_tls(&mut cursor).unwrap() == 0 {
+                break;
+            }
+            to.process_new_packets().unwrap();
+            loop {
+                match to.reader().read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
+        total
+    }
+
+    /// A flush queues every record rustls holds, not only the first 64.
+    #[test]
+    fn a_flush_queues_more_than_64_records() {
+        let (server, mut client) = handshaked();
+        let mut tls_conn = wrap_server(server);
+        for _ in 0..100 {
+            buffered_mut(&mut tls_conn)
+                .writer()
+                .write_all(&[0x5A; 10])
+                .unwrap();
+        }
+        let mut pending = std::collections::VecDeque::new();
+        let mut buf = Vec::new();
+        flush_tls_output_mio_inner(&mut tls_conn, &mut buf, &mut pending);
+        assert!(!tls_conn.conn.wants_write(), "output left in rustls");
+        let cipher: Vec<u8> = pending.iter().flat_map(|p| p.data.clone()).collect();
+        assert_eq!(decrypted_len(&mut client, &cipher), 1000);
+    }
+
+    /// A send whose records are small enough that one rustls write makes more
+    /// than 64 of them returns all of its ciphertext.
+    #[test]
+    fn a_send_of_more_than_64_records_is_encrypted_in_full() {
+        let (mut server, mut client) = handshaked_with_max_fragment(512);
+        let plaintext = vec![0x5A; 64 * 1024];
+        let cipher = encrypt_buffered(&mut server, &plaintext).unwrap();
+        assert!(!server.wants_write(), "output left in rustls");
+        assert_eq!(decrypted_len(&mut client, &cipher), plaintext.len());
     }
 }

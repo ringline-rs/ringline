@@ -1043,7 +1043,12 @@ fn arrival_settle(driver: &mut Driver, conn_index: u32, before: usize, report: b
 #[cfg(has_io_uring)]
 #[inline]
 fn take_forward_zc_consumed(driver: &mut crate::backend::Driver, conn_index: u32) -> usize {
-    std::mem::replace(&mut driver.forward_zc_consumed[conn_index as usize], 0) as usize
+    let forwarded = std::mem::replace(&mut driver.forward_zc_consumed[conn_index as usize], 0);
+    if forwarded != 0 {
+        // The closure has returned, so nothing borrows the forwarded bytes.
+        driver.forward_zc_held[conn_index as usize] = None;
+    }
+    forwarded as usize
 }
 
 /// Zero-copy send guard over a detached slice of a connection's receive
@@ -1255,7 +1260,9 @@ impl ConnCtx {
                     driver.forward_zc_consumed[conn_index as usize] = frozen.len() as u32;
                     let token = self.id();
                     // A refused send drops the guard; this handle puts the
-                    // bytes back, so nothing is committed on `Err`.
+                    // bytes back, so nothing is committed on `Err`. After a
+                    // send that copied and dropped the guard, it is what
+                    // keeps `data` allocated while the caller's closure runs.
                     let keep = frozen.clone();
                     // `guard()` honours `send_zc_threshold`, so a forward below
                     // it still folds into a copy exactly as before.
@@ -1268,6 +1275,7 @@ impl ConnCtx {
                         driver.accumulators.put_back(conn_index, keep);
                         driver.forward_zc_consumed[conn_index as usize] = 0;
                     } else {
+                        driver.forward_zc_held[conn_index as usize] = Some(keep);
                         driver.forwards_recv_buf[conn_index as usize] = true;
                     }
                     return result;
@@ -3031,9 +3039,16 @@ impl Connection {
     }
 
     /// Whether the peer has finished sending: its FIN or close_notify has
-    /// arrived, or the read side failed. The runtime sees the end whether or
-    /// not a read is parked (on io_uring through the `POLLRDHUP` poll, see
-    /// [`connect`]), so this turns true while a task does other work.
+    /// arrived, or the read side failed. The runtime sees a FIN or a read
+    /// error whether or not a read is parked (on io_uring through the
+    /// `POLLRDHUP` poll, see [`connect`]), so this turns true while a task
+    /// does other work. A close_notify is seen when a receive reads it. On
+    /// mio the runtime receives whenever the socket is readable, except
+    /// while a forward from the connection waits on its sink. On io_uring a
+    /// receive is armed during the handshake, when a read parks, and after
+    /// each completion once the peer's FIN or a reset has arrived; a
+    /// close_notify that arrives after the last receive, while the TCP
+    /// stream stays open and no read is parked, is seen once a read parks.
     ///
     /// The peer's end does not close the connection. The task may keep
     /// sending, and the connection closes when the task returns, drops the
@@ -5075,15 +5090,13 @@ impl Future for DiskIoFuture {
             if self.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            match executor.take_disk_io_result(self.seq) {
-                Some(result) if result < 0 => Poll::Ready(Err(disk_io_error(self.seq, result))),
-                Some(result) => Poll::Ready(Ok(result)),
-                None => {
-                    // Re-register waiter (polled before CQE arrived or after spurious wake).
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(self.seq, task_id);
-                    pending(cx)
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(self.seq, task_id) {
+                Some((result, _)) if result < 0 => {
+                    Poll::Ready(Err(disk_io_error(self.seq, result)))
                 }
+                Some((result, _)) => Poll::Ready(Ok(result)),
+                None => pending(cx),
             }
         });
         if poll.is_ready() {

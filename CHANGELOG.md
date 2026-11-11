@@ -304,6 +304,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Vec` instead of allocating one per iteration. A serial `fs::read_into`
   makes one allocation per operation instead of two. Finding P1 of
   `docs/journal/2026-11-file-io-audit.md` (#875).
+- On io_uring `fs::stat` no longer allocates a `libc::statx` per call: the
+  buffer lives in the command slab entry, which costs each worker 256 bytes
+  per `max_commands_in_flight` slot (64 KiB at the default of 256). On both
+  backends the executor keeps one map of disk-I/O operations, with a cheaper
+  hash for its 32-bit keys, in place of five. Finding P2 of
+  `docs/journal/2026-11-file-io-audit.md` (#876).
 - **Breaking:** a peer's FIN or close_notify finishes the read half and
   closes nothing. Before, every read EOF requested a close, deferred behind
   queued sends and one poll of the task, and the task was then dropped
@@ -1013,6 +1019,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- mio with the `tls-buffered` feature: one rustls `write_tls` call writes at
+  most 64 records, and the mio paths called it once where more could be
+  pending; the rest stayed in rustls until the next receive or send. A flush
+  of TLS output after a handshake flight of more records than that (about
+  1 MB) delivered only part of it to a reading peer, and not the alert a TLS
+  error queued behind it. A send with records small enough that one rustls
+  write made more than 64 (`max_fragment_size` below about 1 KiB) returned
+  part of its ciphertext, and the peer waited for the rest. Both now drain
+  rustls' output, as the io_uring paths do. Found by
+  `tls_close_before_handshake.rs` (#886).
 - Docs: the `max_commands_in_flight` docs of `FsConfig`, `DirectIoConfig`
   and `NvmeConfig` say that on io_uring each command slot has 16,384
   operation keys; that a future neither polled to completion nor dropped
@@ -1124,6 +1140,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   event loop, here or after a panic in its exit drain, releases its
   references to the blocking, resolver and spawner pools, so their threads
   still exit.
+- On io_uring, `forward_recv_buf` (on `Connection` or `SendHalf`) could free
+  the bytes it was given while the calling `with_data`, `with_data_result` or
+  `try_with_data` closure still held the slice. It happened when the receive
+  buffer was a remainder left by an earlier `with_bytes` call, the slice was
+  the whole buffer, and the send copied it: a plaintext send below
+  `send_zc_threshold`, or any send on a TLS connection. A closure that read
+  the slice after the call read freed memory. The runtime now keeps the bytes
+  allocated until the closure returns. The zero-copy forward of the receive
+  buffer is in no release (#850).
 - io_uring: a worker that stops on an error or a panic, and whose exit drain
   then panics, closes the fds its multishot accept, or a park's install,
   delivered but it never handled. They are ordinary descriptors the kernel

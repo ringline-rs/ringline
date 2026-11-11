@@ -920,10 +920,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Allocate a 32-bit disk-I/O completion key: the subsystem in the top 2
     /// bits, a 14-bit sequence below it, and the slab index in the low 16.
-    /// fs, NVMe and direct I/O share the executor's completion and graveyard
-    /// maps but have independent slabs, each numbering its slots from 0.
-    /// CQE handlers extract the slab index from the low 16 bits and wake with
-    /// the full key.
+    /// fs, NVMe and direct I/O share the executor's disk-I/O entry map but
+    /// have independent slabs, each numbering its slots from 0. CQE handlers
+    /// extract the slab index from the low 16 bits and wake with the full key.
     ///
     /// A key is held from submission until its future takes the result or is
     /// dropped, which can be long after the slab slot is freed. A key a
@@ -2384,14 +2383,15 @@ impl<'a> DriverCtx<'a> {
             .allocate(0, crate::fs::FsOp::Statx)
             .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
 
-        // Allocate the statx buffer and store it in the slab entry.
-        let statx_buf: Box<libc::statx> = Box::new(unsafe { std::mem::zeroed() });
-        let statx_ptr = &*statx_buf as *const libc::statx as *mut libc::statx;
-
-        if let Some(entry) = slab.get_mut(slab_idx) {
-            entry.path = Some(c_path);
-            entry.statx_buf = Some(statx_buf);
-        }
+        // The kernel writes into the slab entry's statx buffer; the slab
+        // never moves an entry, so the pointer stays valid until the CQE.
+        let statx_ptr = match slab.get_mut(slab_idx) {
+            Some(entry) => {
+                entry.path = Some(c_path);
+                &mut entry.statx_buf as *mut libc::statx
+            }
+            None => unreachable!("the slab entry was just allocated"),
+        };
 
         let path_ptr = self
             .fs_cmd_slab
