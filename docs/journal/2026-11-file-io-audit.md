@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F9 fixed (#873), F10 fixed (#874); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
+- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F7 fixed (#871), F9 fixed (#873), F10 fixed (#874), P3 documented (#877); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -126,6 +126,8 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 
 ### F7 — io_uring: the NVMe status word is discarded, and three public types describe a completion handler that does not exist (invariants 8, 11). Traced.
 
+**Fixed (#871):** a failed command resolves to an `io::Error` whose inner error is `NvmeStatus`, the status word; `DirectIoCompletion`, `NvmeCompletion` and `DirectIoOp` are no longer public. Test: `a_status_word_reaches_the_caller_as_the_errors_inner_error` in `nvme.rs`, red when the word is mapped to `EIO`. The text below is as found at 6851de26.
+
 `event_loop.rs:4303-4308` maps a positive `cqe->res` (the device status word, e.g. 0x281 media error) to `-EIO`; the caller cannot tell a media error from an invalid field, and no doc on `nvme_read`/`nvme_write`/`nvme_flush` says so. The only public text on the status word is `NvmeCompletion::is_success` (`nvme.rs:366-388`, exported from `lib.rs`), a type nothing constructs; `DirectIoCompletion` and `DirectIoOp` (`direct_io.rs:28`, `:256-285`) are public and likewise unused, and their docs ("Delivered to the ... completion handler") name a completion handler that has never existed in this repository: the types have been re-exported and unconstructed since the initial commit. Fix: carry the status word in the error (an `io::Error::other` wrapping it) or document `Err(EIO)`; remove the three types under the Unreleased breaking entries. Until then `is_success`'s comment is the only description of the status word.
 
 ### F8 — `OpenFlags::READ | OpenFlags::WRITE` is `WRITE` (invariant 11). Confirmed by the constants.
@@ -172,6 +174,8 @@ The serial cost is the two thread hand-offs; the design accepts that. Avoidable:
 Per `fs::read_into`: one 128-byte SQE, one CQE, no syscall of its own, no allocation, no io-wq on a page-cache hit; and twelve SipHash operations over `disk_io_waiters`, `disk_io_results`, `disk_io_graveyard` and `DISK_IO_LIVE` (`wait_disk_io` runs at creation, `fs.rs:750`, and again on every pending poll, `fs.rs:854`), plus `make_ctx()` building a `DriverCtx` of about thirty fields (`uring/driver.rs:1240-1300`) and an `in_flight` increment and decrement nothing reads (#845). `fs::stat` allocates a `Box<libc::statx>` per call (`handler.rs:2330`); an inline `statx` in `FsCmdEntry` costs 256 bytes × `max_commands_in_flight`. Against a page-cache read the bookkeeping is a fraction of the cost; against NVMe passthrough at depth it is most of the worker's per-command CPU; neither is measured. The maps exist for stale-result rejection (#574), which a slot-indexed table with the 14-bit sequence as the slot's generation would give in O(1) (L3).
 
 ### P3 — io_uring: a full SQ submits synchronously inside the task poll (invariant 9's text). Traced.
+
+**Documented (#877):** the fs, direct I/O and NVMe module docs say a call that finds the submission queue full submits it inline (under SQPOLL, waits for the SQ thread) and returns the submit's error with nothing in flight. The code is unchanged: the cost is one `io_uring_enter` on the worker when the queue is full, not measured as user-visible at the defaults, and a retry of the error would cover `EINTR`, which a submit that does not wait does not return in practice, or `EBUSY`/`EAGAIN`, which need completions reaped first. The text below is as found at 6851de26.
 
 `engine/uring.rs:255-274`: `push_sqe128` on a full SQ calls `make_sq_room(1)`, one `io_uring_enter` on the worker, and errors only if the SQ is still full. The three slabs allow 768 disk SQEs against `sq_entries` 256. Not a user-visible cost at the defaults; it corrects invariant 9 and is the source of the undocumented errors in F10.
 
