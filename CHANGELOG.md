@@ -990,16 +990,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `disk_io_threads` doc said `Unsupported`; `open_direct_io_file` succeeded
   and its operations failed. On io_uring the value is accepted and unused,
   as before. Finding F6 of `docs/journal/2026-11-file-io-audit.md` (#870).
-- Docs: the file I/O docs state the current behaviour: the `# Safety` sections of
-  `fs::read`, `fs::write`, `direct_io_read`, `direct_io_write`, `nvme_read`
-  and `nvme_write` say the buffer must outlive the operation, which a
-  dropped future gives no way to observe (#825); the futures say what a drop
-  on another worker leaks; `DiskIoFuture` says what it resolves to per
-  operation; the fs module doc says operations on one file are independent
-  and what `fsync` covers; the direct I/O and NVMe docs cover the mio
-  backend and the opens that run on the worker thread; `ConfigBuilder::fs`,
-  `direct_io` and `nvme` say what each reserves per worker; and the
-  `NvmeUringCmd` builders document their panic. Findings F9 and F10 of
+- Docs: the file I/O docs state the current behaviour: the `# Safety` sections
+  of `fs::read`, `fs::write`, `direct_io_read`, `direct_io_write`, `nvme_read`
+  and `nvme_write` say the buffer must outlive the operation, which a dropped
+  future gives no way to observe (#825); the futures say what a drop off the
+  owning worker leaks; `DiskIoFuture` says what it resolves to per operation;
+  the fs module doc says operations on one file are independent and what
+  `fsync` covers; the direct I/O and NVMe docs cover the mio backend and the
+  opens that run on the worker thread; `ConfigBuilder::fs`, `direct_io` and
+  `nvme` say what each reserves per worker; and the `NvmeUringCmd` builders
+  document their panic. Findings F9 and F10 of
   `docs/journal/2026-11-file-io-audit.md` (#873, #874), and the documentation
   part of P3 (#877).
 - `open_direct_io_file` and `open_direct_io_file_with` (both backends) and

@@ -5042,9 +5042,9 @@ impl<F: Future> Future for TimeoutFuture<F> {
 /// rejected resolves to `EIO`, and the device's status word is not carried.
 ///
 /// Polled from a task on another worker it stays pending until a task on the
-/// owning worker drives it; polled outside a task poll it panics. Dropped on
-/// a thread other than the owning worker, it leaves its result slot on the
-/// owning worker taken until that worker exits.
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaves its result slot
+/// on the owning worker taken until that worker exits.
 pub struct DiskIoFuture {
     pub(crate) seq: u32,
     /// Set once `poll` has returned `Ready`: the result has been taken.
@@ -5203,7 +5203,6 @@ pub fn open_nvme_device(path: &str, nsid: u32) -> io::Result<crate::nvme::NvmeDe
 ///
 /// # Safety
 ///
-/// `buf` must point to aligned, writable memory of at least `len` bytes
 /// `buf` must point to aligned, writable memory of at least `len` bytes that
 /// remains valid until the operation completes. The operation keeps using the
 /// memory after the future is dropped, and a dropped future gives no way to
@@ -5240,7 +5239,6 @@ pub unsafe fn direct_io_read(
 ///
 /// # Safety
 ///
-/// `buf_addr` must point to valid, aligned memory of at least `buf_len`
 /// `buf_addr` must point to valid, aligned memory of at least `buf_len` bytes
 /// that remains valid until the operation completes. The operation keeps using
 /// the memory after the future is dropped, and a dropped future gives no way
@@ -5277,7 +5275,6 @@ pub unsafe fn nvme_read(
 ///
 /// # Safety
 ///
-/// `buf` must point to aligned, readable memory of at least `len` bytes
 /// `buf` must point to aligned, readable memory of at least `len` bytes that
 /// remains valid until the operation completes. The operation keeps using the
 /// memory after the future is dropped, and a dropped future gives no way to
@@ -5360,7 +5357,6 @@ pub fn nvme_flush(device: crate::nvme::NvmeDevice) -> io::Result<DiskIoFuture> {
 ///
 /// # Safety
 ///
-/// `buf_addr` must point to valid, aligned memory of at least `buf_len`
 /// `buf_addr` must point to valid, aligned memory of at least `buf_len` bytes
 /// that remains valid until the operation completes. The operation keeps using
 /// the memory after the future is dropped, and a dropped future gives no way

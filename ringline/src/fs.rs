@@ -549,9 +549,9 @@ pub fn create(path: impl AsRef<std::path::Path>) -> io::Result<OpenFuture> {
 /// completes.
 ///
 /// Polled from a task on another worker it stays pending until a task on the
-/// owning worker drives it; polled outside a task poll it panics. Dropped on
-/// a thread other than the owning worker, it leaves the file open and its
-/// slot taken until the owning worker exits.
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaves the file open
+/// and its slot taken until the owning worker exits.
 pub struct OpenFuture {
     seq: u32,
     file_index: u16,
@@ -716,7 +716,6 @@ pub(crate) fn release_orphans(
 /// # Safety
 ///
 /// `buf` must point to writable memory of at least `len` bytes that remains
-/// `buf` must point to writable memory of at least `len` bytes that remains
 /// valid until the operation completes. The operation keeps using the memory
 /// after the future is dropped, and a dropped future gives no way to learn
 /// when the operation completes, so after a drop the memory must not be freed
@@ -750,7 +749,6 @@ pub unsafe fn read(file: File, offset: u64, buf: *mut u8, len: u32) -> io::Resul
 ///
 /// # Safety
 ///
-/// `buf` must point to readable memory of at least `len` bytes that remains
 /// `buf` must point to readable memory of at least `len` bytes that remains
 /// valid until the operation completes. The operation keeps using the memory
 /// after the future is dropped, and a dropped future gives no way to learn
@@ -896,9 +894,9 @@ pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFut
 /// extended by the number of bytes read.
 ///
 /// Polled from a task on another worker it stays pending until a task on the
-/// owning worker drives it; polled outside a task poll it panics. Dropped on
-/// a thread other than the owning worker, it leaks the buffer and leaves its
-/// result slot on the owning worker taken until that worker exits.
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaks the buffer and
+/// leaves its result slot on the owning worker taken until that worker exits.
 pub struct ReadFuture {
     seq: u32,
     file_index: u16,
@@ -958,9 +956,9 @@ impl Drop for ReadFuture {
 /// unchanged regardless of success or failure.
 ///
 /// Polled from a task on another worker it stays pending until a task on the
-/// owning worker drives it; polled outside a task poll it panics. Dropped on
-/// a thread other than the owning worker, it leaks the buffer and leaves its
-/// result slot on the owning worker taken until that worker exits.
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaks the buffer and
+/// leaves its result slot on the owning worker taken until that worker exits.
 pub struct WriteFuture {
     seq: u32,
     file_index: u16,
@@ -1177,9 +1175,9 @@ fn stat_with(path: &std::path::Path, nofollow: bool) -> io::Result<StatFuture> {
 /// resolves discards the result.
 ///
 /// Polled from a task on another worker it stays pending until a task on the
-/// owning worker drives it; polled outside a task poll it panics. Dropped on
-/// a thread other than the owning worker, it leaves its result slot on the
-/// owning worker taken until that worker exits.
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaves its result slot
+/// on the owning worker taken until that worker exits.
 // On io_uring the statx buffer is owned by the command slab entry, and on
 // completion the handler converts it to `Metadata` and stores it in
 // `Executor::fs_stat_results` before releasing the slab entry. On mio the
