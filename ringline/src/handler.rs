@@ -1506,13 +1506,14 @@ impl<'a> DriverCtx<'a> {
             .as_mut()
             .ok_or_else(|| io::Error::other("NVMe not configured"))?;
 
+        // Convert the path before allocating, so a bad path holds no slot.
+        let c_path =
+            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid device path"))?;
         let index = devices
             .allocate()
             .ok_or_else(|| io::Error::other("NVMe device table full"))?;
 
         // Open the NVMe-generic character device.
-        let c_path =
-            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid device path"))?;
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if fd < 0 {
             devices.release(index);
@@ -1803,13 +1804,14 @@ impl<'a> DriverCtx<'a> {
             .as_mut()
             .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
 
+        // Convert the path before allocating, so a bad path holds no slot.
+        let c_path =
+            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
         let index = files
             .allocate()
             .ok_or_else(|| io::Error::other("direct I/O file table full"))?;
 
         // Open with O_DIRECT | O_RDWR.
-        let c_path =
-            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr(),
@@ -3289,12 +3291,12 @@ impl<'a> DriverCtx<'a> {
             .as_mut()
             .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
 
+        // Convert the path before allocating, so a bad path holds no slot.
+        let c_path =
+            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
         let index = files
             .allocate()
             .ok_or_else(|| io::Error::other("direct I/O file table full"))?;
-
-        let c_path =
-            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
 
         #[cfg(target_os = "linux")]
         let flags = libc::O_RDWR | libc::O_DIRECT;

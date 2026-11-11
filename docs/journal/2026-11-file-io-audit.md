@@ -96,6 +96,8 @@ Fix: the deferred close #845 proposes, in the shape of `close_direct_io_file`: a
 
 ### F2 — a path with an interior NUL leaks a direct I/O or NVMe table slot, both backends (invariant 1). Confirmed (mio run; anvil run `01a1c583-4481-714a-9765-e8998cd35b21`, same output).
 
+**Fixed (#861):** the three sites convert the path before allocating. Test: `ringline/tests/disk_open_bad_path.rs`. The text below is as found at 6851de26.
+
 `handler.rs:1786-1795` (direct I/O, io_uring), `:1498-1506` (NVMe), `:3221-3232` (direct I/O, mio): `files.allocate()` runs before `CString::new(path)`, and the `?` on the conversion returns without `files.release(index)`. `fs_open` on both backends allocates first too, but releases the slot in an `inspect_err` on the conversion. Run with `max_files(2)`: three `open_direct_io_file("a\0b")` return `invalid file path`, `invalid file path`, `direct I/O file table full`, and a valid open afterwards fails with `direct I/O file table full` until the worker exits. Fix: convert the path before allocating, at the three sites. Test: `a_nul_path_does_not_leak_a_direct_io_slot` on the reproduction branch.
 
 ### F3 — the 16-bit generation wraps: a stale handle validates again after 65,536 releases of its slot and acts on the new occupant (invariant 2). Confirmed (mio run).
