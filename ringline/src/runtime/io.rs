@@ -1043,7 +1043,12 @@ fn arrival_settle(driver: &mut Driver, conn_index: u32, before: usize, report: b
 #[cfg(has_io_uring)]
 #[inline]
 fn take_forward_zc_consumed(driver: &mut crate::backend::Driver, conn_index: u32) -> usize {
-    std::mem::replace(&mut driver.forward_zc_consumed[conn_index as usize], 0) as usize
+    let forwarded = std::mem::replace(&mut driver.forward_zc_consumed[conn_index as usize], 0);
+    if forwarded != 0 {
+        // The closure has returned, so nothing borrows the forwarded bytes.
+        driver.forward_zc_held[conn_index as usize] = None;
+    }
+    forwarded as usize
 }
 
 /// Zero-copy send guard over a detached slice of a connection's receive
@@ -1255,7 +1260,9 @@ impl ConnCtx {
                     driver.forward_zc_consumed[conn_index as usize] = frozen.len() as u32;
                     let token = self.id();
                     // A refused send drops the guard; this handle puts the
-                    // bytes back, so nothing is committed on `Err`.
+                    // bytes back, so nothing is committed on `Err`. After a
+                    // send that copied and dropped the guard, it is what
+                    // keeps `data` allocated while the caller's closure runs.
                     let keep = frozen.clone();
                     // `guard()` honours `send_zc_threshold`, so a forward below
                     // it still folds into a copy exactly as before.
@@ -1268,6 +1275,7 @@ impl ConnCtx {
                         driver.accumulators.put_back(conn_index, keep);
                         driver.forward_zc_consumed[conn_index as usize] = 0;
                     } else {
+                        driver.forward_zc_held[conn_index as usize] = Some(keep);
                         driver.forwards_recv_buf[conn_index as usize] = true;
                     }
                     return result;

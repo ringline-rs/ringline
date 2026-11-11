@@ -1011,6 +1011,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- mio with the `tls-buffered` feature: one rustls `write_tls` call writes at
+  most 64 records, and the mio paths called it once where more could be
+  pending; the rest stayed in rustls until the next receive or send. A flush
+  of TLS output after a handshake flight of more records than that (about
+  1 MB) delivered only part of it to a reading peer, and not the alert a TLS
+  error queued behind it. A send with records small enough that one rustls
+  write made more than 64 (`max_fragment_size` below about 1 KiB) returned
+  part of its ciphertext, and the peer waited for the rest. Both now drain
+  rustls' output, as the io_uring paths do. Found by
+  `tls_close_before_handshake.rs` (#886).
 - Docs: the `max_commands_in_flight` docs of `FsConfig`, `DirectIoConfig`
   and `NvmeConfig` say that on io_uring each command slot has 16,384
   operation keys; that a future neither polled to completion nor dropped
@@ -1122,6 +1132,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   event loop, here or after a panic in its exit drain, releases its
   references to the blocking, resolver and spawner pools, so their threads
   still exit.
+- On io_uring, `forward_recv_buf` (on `Connection` or `SendHalf`) could free
+  the bytes it was given while the calling `with_data`, `with_data_result` or
+  `try_with_data` closure still held the slice. It happened when the receive
+  buffer was a remainder left by an earlier `with_bytes` call, the slice was
+  the whole buffer, and the send copied it: a plaintext send below
+  `send_zc_threshold`, or any send on a TLS connection. A closure that read
+  the slice after the call read freed memory. The runtime now keeps the bytes
+  allocated until the closure returns. The zero-copy forward of the receive
+  buffer is in no release (#850).
 - io_uring: a worker that stops on an error or a panic, and whose exit drain
   then panics, closes the fds its multishot accept, or a park's install,
   delivered but it never handled. They are ordinary descriptors the kernel
