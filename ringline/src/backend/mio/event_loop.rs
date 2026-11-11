@@ -139,6 +139,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && (config.direct_io.is_some() || config.fs.is_some())
         {
             let pool = Arc::new(crate::disk_io_pool::DiskIoPool::start(
+                config.worker_index,
                 config.disk_io_threads,
                 // `None` only in unit tests, which hold their own `WakeHandle`.
                 config
@@ -648,8 +649,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Drain disk I/O responses.
         if let Some(ref rx) = self.driver.disk_io_rx {
             while let Ok(response) = rx.try_recv() {
-                // The operation is done: its key may be handed out again.
-                self.driver.disk_io_in_flight.remove(&response.seq);
+                // The operation is done: its key may be handed out again, and
+                // it no longer counts against its subsystem's bound.
+                if let Some(subsystem) = self.driver.disk_io_in_flight.remove(&response.seq) {
+                    self.driver.disk_io_counts[subsystem as usize] -= 1;
+                }
                 self.driver.disk_io_borrowing.remove(&response.seq);
                 // Handle fs_open completions: install fd or release slot.
                 if let Some(file_index) = self.driver.pending_fs_opens.remove(&response.seq) {
