@@ -200,6 +200,8 @@ pub(crate) struct Driver {
     pub(crate) writable: Vec<bool>,
     /// Per-connection connect timeout deadline (None if no timeout or not connecting).
     pub(crate) connect_deadlines: Vec<Option<std::time::Instant>>,
+    /// TLS handshakes in progress and their deadlines.
+    pub(crate) handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines,
     /// The wake pipe's read end, registered with mio as `WAKE_TOKEN`. Not
     /// owned: the worker's `WakeHandle` owns it, and `Config::wake_keep_alive`
     /// holds that handle until the worker exits.
@@ -556,6 +558,10 @@ impl Driver {
             connect_pending: 0,
             writable: vec![false; max_conn],
             connect_deadlines: vec![None; max_conn],
+            handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines::new(
+                config.tls_handshake_timeout,
+                config.max_connections,
+            ),
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
             forward_conn: (0..max_conn).map(|_| None).collect(),

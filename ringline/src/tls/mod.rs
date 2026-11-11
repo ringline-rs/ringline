@@ -50,6 +50,7 @@ mod backend_mio;
 #[cfg(has_io_uring)]
 mod backend_uring;
 pub(crate) mod buffered;
+pub(crate) mod handshake_deadline;
 // The incoming-ciphertext buffer belongs to the unbuffered engine and has no
 // other consumer, so it shares the engine's gate; under `tls-buffered` every
 // item in the module would be dead code.

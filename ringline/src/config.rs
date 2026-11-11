@@ -232,6 +232,9 @@ pub struct Config {
     pub(crate) listener_tls: Vec<Option<TlsConfig>>,
     /// Optional TLS client configuration for outbound `connect(addr).tls(..)` calls.
     pub(crate) tls_client: Option<TlsClientConfig>,
+    /// How long a TLS handshake may take, inbound or outbound, before the
+    /// connection is closed. See [`ConfigBuilder::tls_handshake_timeout`].
+    pub(crate) tls_handshake_timeout: std::time::Duration,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
     pub(crate) tcp_nodelay: bool,
     /// Where connections are accepted. Always `Pool` without the
@@ -403,6 +406,11 @@ pub struct Config {
     pub(crate) disk_io_threads: usize,
 }
 
+/// Default for [`ConfigBuilder::tls_handshake_timeout`].
+const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Largest value [`ConfigBuilder::tls_handshake_timeout`] accepts.
+const MAX_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -445,6 +453,7 @@ impl Default for Config {
             tls: None,
             listener_tls: Vec::new(),
             tls_client: None,
+            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             tcp_nodelay: true,
             accept_mode: AcceptMode::Pool,
             task_panic_policy: crate::TaskPanicPolicy::Contain,
@@ -589,6 +598,13 @@ impl Config {
             ));
         }
         self.validate_tls_slot_size()?;
+        if self.tls_handshake_timeout.is_zero()
+            || self.tls_handshake_timeout > MAX_TLS_HANDSHAKE_TIMEOUT
+        {
+            return Err(crate::error::Error::RingSetup(
+                "tls_handshake_timeout must be > 0 and at most 60 s".into(),
+            ));
+        }
         // A cap of 0 would stop a forward's source before it queues its first
         // send, so the forward never makes progress.
         if self.forward_hold_cap == 0 {
@@ -1270,6 +1286,28 @@ impl ConfigBuilder {
         self
     }
 
+    /// How long a TLS handshake may take before the connection is closed.
+    ///
+    /// An inbound connection's timeout starts when its worker registers it,
+    /// and an outbound one's when its TCP connect completes. A connection
+    /// whose handshake has not completed by then is closed, and an outbound
+    /// `connect(..).tls(..)` resolves
+    /// [`TimedOut`](std::io::ErrorKind::TimedOut). No task holds an inbound
+    /// connection before its handshake completes, so a peer that keeps the
+    /// socket open and sends nothing would otherwise hold it until the worker
+    /// exits.
+    /// [`metrics::conn::TLS_HANDSHAKE_TIMEOUT`](crate::metrics::conn::TLS_HANDSHAKE_TIMEOUT)
+    /// counts the closes. [`TcpConnect::timeout`] covers the TCP connect
+    /// only.
+    ///
+    /// Must be greater than zero and at most 60 s. Default: 10 s.
+    ///
+    /// [`TcpConnect::timeout`]: crate::TcpConnect::timeout
+    pub fn tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.config.tls_handshake_timeout = timeout;
+        self
+    }
+
     /// Set TLS client configuration for outbound connections.
     pub fn tls_client(mut self, config: TlsClientConfig) -> Self {
         self.config.tls_client = Some(config);
@@ -1304,6 +1342,7 @@ impl ConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Helper: create a Config with a single field override.
     /// Avoids clippy::field_reassign_with_default on the multi-field Config struct.
@@ -1346,6 +1385,21 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn tls_handshake_timeout_defaults_to_10_s() {
+        let config = ConfigBuilder::new().build().expect("default config");
+        assert_eq!(config.tls_handshake_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn tls_handshake_timeout_is_bounded() {
+        let build = |t| ConfigBuilder::new().tls_handshake_timeout(t).build();
+        assert!(build(Duration::ZERO).is_err());
+        assert!(build(Duration::from_nanos(1)).is_ok());
+        assert!(build(Duration::from_secs(60)).is_ok());
+        assert!(build(Duration::from_secs(60) + Duration::from_nanos(1)).is_err());
     }
 
     #[test]
