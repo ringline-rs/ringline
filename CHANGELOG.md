@@ -1038,6 +1038,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: dropping a `Child::wait` future before the child exits cancels
+  its pidfd poll. Before, the poll stayed armed until the child exited, so a
+  loop that raced `wait` against a timer added one armed poll per iteration,
+  each holding the pidfd's file. `Child::wait` also registers its waiter only
+  after the poll is pushed; a failed push left the entry behind (#833).
 - `ConfigBuilder::build` refuses queue sizes Linux refuses: `sq_entries`
   above 32768, `cq_entries` above 65536, and `cq_entries` below
   `sq_entries`. Before, the CQ was 4 × `sq_entries`, so `sq_entries(32768)`

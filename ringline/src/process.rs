@@ -49,6 +49,15 @@ pub struct Child {
 }
 
 impl Child {
+    /// A `Child` for a process the test started, with its pidfd.
+    #[cfg(all(test, has_io_uring))]
+    pub(crate) fn from_parts(pid: u32, pidfd: OwnedFd) -> Self {
+        Child {
+            pid,
+            pidfd: Some(pidfd),
+        }
+    }
+
     /// Get the process ID.
     pub fn id(&self) -> u32 {
         self.pid
@@ -57,25 +66,29 @@ impl Child {
     /// Wait for the child to exit.
     ///
     /// Submits an io_uring `PollAdd` on the child's pidfd and returns a future
-    /// that resolves when the child exits.
+    /// that resolves when the child exits. Dropping the future on the worker
+    /// that created it, before it resolves, cancels the poll. The cancel is
+    /// best effort: if it cannot be pushed, the poll completes when the child
+    /// exits.
     #[cfg(has_io_uring)]
     pub fn wait(&self) -> io::Result<WaitFuture> {
         with_state(|driver, executor| {
-            let seq = executor.next_pidfd_seq;
-            executor.next_pidfd_seq += 1;
-            let task_id = CURRENT_TASK_ID.with(|c| c.get());
-            executor.pidfd_waiters.insert(seq, task_id);
-
             // Present on Linux, the only target with io_uring.
             let pidfd = self
                 .pidfd
                 .as_ref()
                 .map(AsRawFd::as_raw_fd)
                 .ok_or_else(|| io::Error::other("child has no pidfd"))?;
+            let seq = executor.next_pidfd_seq;
+            executor.next_pidfd_seq += 1;
             let ud = UserData::encode(OpTag::PidfdPoll, 0, seq);
             driver
                 .ring
                 .submit_poll_add(pidfd, libc::POLLIN as u32, ud.raw())?;
+            // The waiter marks the poll as in flight until its completion
+            // arrives or the future is released.
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            executor.pidfd_waiters.insert(seq, task_id);
             Ok(WaitFuture {
                 seq,
                 pid: self.pid,
@@ -122,13 +135,12 @@ impl Drop for WaitFuture {
         if crate::runtime::waker::current_worker() != self.owner {
             return;
         }
-        // Deregister so an abandoned wait (select/timeout loser) leaves no
-        // waiter or result entry; a completion after this finds no waiter and
-        // is not stored. Outside a task poll, the release is deferred and
-        // removes both entries.
-        let released = try_with_state(|_driver, executor| {
-            executor.pidfd_waiters.remove(&self.seq);
-            executor.pidfd_results.remove(&self.seq);
+        // An abandoned wait (a select or timeout loser) leaves no waiter or
+        // result entry and no armed poll; a completion after this finds no
+        // waiter and is not stored. Outside a task poll, the release is
+        // deferred.
+        let released = try_with_state(|driver, executor| {
+            release_wait(driver, executor, self.seq);
         });
         // Outside a task poll (a connection's task dropped at teardown).
         if released.is_none() {
@@ -176,6 +188,26 @@ impl Future for WaitFuture {
                 pending(cx)
             }
         })
+    }
+}
+
+/// Release a wait's entries. A waiter still registered means its poll has not
+/// completed, so on io_uring the poll is cancelled: it would otherwise stay
+/// armed, holding the pidfd's file, until the child exits. The cancel is best
+/// effort; if it cannot be pushed, the poll completes when the child exits and
+/// its completion finds no waiter.
+#[cfg_attr(not(has_io_uring), allow(unused_variables))]
+pub(crate) fn release_wait(
+    driver: &mut crate::backend::Driver,
+    executor: &mut crate::runtime::Executor,
+    seq: u32,
+) {
+    let in_flight = executor.pidfd_waiters.remove(&seq).is_some();
+    executor.pidfd_results.remove(&seq);
+    #[cfg(has_io_uring)]
+    if in_flight {
+        let target = UserData::encode(OpTag::PidfdPoll, 0, seq);
+        let _ = driver.ring.submit_async_cancel(target.raw(), 0);
     }
 }
 
