@@ -434,6 +434,14 @@ pub(crate) struct Driver {
     /// reports consuming, because the forward already removed those bytes
     /// (see `ConnCtx::forward_recv_buf`).
     pub(crate) forward_zc_consumed: Vec<u32>,
+    /// Per-connection: the bytes the last whole-accumulator
+    /// `forward_recv_buf` detached. The slice the reader closure was given
+    /// points into them, and a forward that is copied (below
+    /// `send_zc_threshold`, or encrypted on TLS) drops its guard before the
+    /// closure returns. This handle keeps them allocated until a delivery
+    /// path reads a non-zero `forward_zc_consumed` after the closure returns,
+    /// or until `handle_close` releases the slot.
+    pub(crate) forward_zc_held: Vec<Option<bytes::Bytes>>,
     /// Send slab entries a connection that forwards its receive buffers may
     /// hold before it stops receiving, once the slab is over half used. See
     /// `ConfigBuilder::forward_hold_cap`.
@@ -1106,6 +1114,7 @@ impl Driver {
             send_slab,
             accumulators,
             forward_zc_consumed: vec![0; config.max_connections as usize],
+            forward_zc_held: vec![None; config.max_connections as usize],
             forward_hold_cap: config.forward_hold_cap,
             forwards_recv_buf: vec![false; config.max_connections as usize],
             forward_recv_held: vec![false; config.max_connections as usize],

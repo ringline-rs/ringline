@@ -1126,6 +1126,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   event loop, here or after a panic in its exit drain, releases its
   references to the blocking, resolver and spawner pools, so their threads
   still exit.
+- On io_uring, `forward_recv_buf` (on `Connection` or `SendHalf`) could free
+  the bytes it was given while the calling `with_data`, `with_data_result` or
+  `try_with_data` closure still held the slice. It happened when the receive
+  buffer was a remainder left by an earlier `with_bytes` call, the slice was
+  the whole buffer, and the send copied it: a plaintext send below
+  `send_zc_threshold`, or any send on a TLS connection. A closure that read
+  the slice after the call read freed memory. The runtime now keeps the bytes
+  allocated until the closure returns. The zero-copy forward of the receive
+  buffer is in no release (#850).
 - io_uring: a worker that stops on an error or a panic, and whose exit drain
   then panics, closes the fds its multishot accept, or a park's install,
   delivered but it never handled. They are ordinary descriptors the kernel
