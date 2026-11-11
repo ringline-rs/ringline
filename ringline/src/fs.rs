@@ -49,8 +49,8 @@
 //!
 //! The pool has `min(sq_entries, 4 × the host's online CPUs)` threads per
 //! worker; a container's CPU limit does not lower it. With the default
-//! [`sq_entries`](crate::ConfigBuilder::sq_entries) of 256 that is 4 × the
-//! CPU count on hosts with up to 64 CPUs, and 256 on larger hosts.
+//! [`sq_entries`](crate::ConfigBuilder::sq_entries) of 4096 that is 4 × the
+//! CPU count on hosts with up to 1024 CPUs.
 //! [`ConfigBuilder::iowq_max_workers`](crate::ConfigBuilder::iowq_max_workers)
 //! lowers it.
 //!

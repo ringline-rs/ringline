@@ -73,7 +73,7 @@ fn page_align(bytes: u64, page: u64) -> u64 {
 
 /// The bytes the kernel charges for one ring set up the way
 /// `backend::uring::engine::uring::UringEngine::setup` does it: 128-byte SQEs, 32-byte CQEs,
-/// a CQ four times the SQ, and an SQ index array.
+/// a CQ of `cq_entries`, and an SQ index array.
 ///
 /// The kernel rounds both entry counts up to a power of two, then charges two
 /// regions, each rounded up to whole pages:
@@ -82,9 +82,9 @@ fn page_align(bytes: u64, page: u64) -> u64 {
 ///   doubled for 32-byte CQEs and aligned to a 64-byte cache line, followed by
 ///   a 4-byte index per SQ entry (`rings_size` in `io_uring/io_uring.c`);
 /// - the SQE array: 128 bytes per SQ entry.
-pub(crate) fn ring_bytes(sq_entries: u32, page: u64) -> u64 {
+pub(crate) fn ring_bytes(sq_entries: u32, cq_entries: u32, page: u64) -> u64 {
     let sq = u64::from(sq_entries.max(1).next_power_of_two());
-    let cq = (sq * 4).next_power_of_two();
+    let cq = u64::from(cq_entries).max(sq).next_power_of_two();
     let rings = ((64 + cq * 16) * 2).next_multiple_of(64) + sq * 4;
     page_align(rings, page) + page_align(sq * 128, page)
 }
@@ -162,14 +162,17 @@ mod tests {
     fn ring_bytes_matches_the_kernel_layout() {
         // sq 64, cq 256: (64 + 256*16)*2 = 8320, +64*4 = 8576 -> 3 pages;
         // SQEs 64*128 = 8192 -> 2 pages.
-        assert_eq!(ring_bytes(64, PAGE), 5 * PAGE);
+        assert_eq!(ring_bytes(64, 256, PAGE), 5 * PAGE);
         // sq 256, cq 1024: (64 + 16384)*2 = 32896, +1024 = 33920 -> 9 pages;
         // SQEs 32768 -> 8 pages.
-        assert_eq!(ring_bytes(256, PAGE), 17 * PAGE);
+        assert_eq!(ring_bytes(256, 1024, PAGE), 17 * PAGE);
         // sq 1, cq 4: 260 bytes -> 1 page; one 128-byte SQE -> 1 page.
-        assert_eq!(ring_bytes(1, PAGE), 2 * PAGE);
+        assert_eq!(ring_bytes(1, 4, PAGE), 2 * PAGE);
+        // The defaults, sq 4096 and cq 65536: (64 + 65536*16)*2 = 2097280,
+        // +4096*4 = 2113664 -> 517 pages; SQEs 524288 -> 128 pages.
+        assert_eq!(ring_bytes(4096, 65536, PAGE), 645 * PAGE);
         // The kernel rounds sq up to a power of two: 100 is charged as 128.
-        assert_eq!(ring_bytes(100, PAGE), ring_bytes(128, PAGE));
+        assert_eq!(ring_bytes(100, 512, PAGE), ring_bytes(128, 512, PAGE));
     }
 
     #[test]

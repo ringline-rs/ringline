@@ -18,7 +18,7 @@ pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(12);
 pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
 
 #[metric(name = "ringline/ring", description = "Ring utilization counters")]
-pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(6);
+pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(ring::COUNT);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
 pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(7);
@@ -325,6 +325,17 @@ pub mod ring {
     /// until the `Shutdown` CQE lands, so this should stay at zero; a nonzero
     /// value means that gate leaked (#518).
     pub const SHUTDOWN_STALE: usize = 5;
+    /// io_uring: reaps that found completions waiting in the kernel's
+    /// overflow list because the CQ was full. They are delivered on the next
+    /// enter; the count says the CQ is too small for the load.
+    pub const CQ_OVERFLOW: usize = 6;
+    /// io_uring: completions the kernel dropped because it could not allocate
+    /// an overflow entry. Each is an operation that never completes.
+    pub const CQE_DROPPED: usize = 7;
+    /// io_uring: enters that returned `EBADR`, the kernel's report that
+    /// completions were dropped. The worker carries on.
+    pub const CQE_DROPPED_REPORTED: usize = 8;
+    pub const COUNT: usize = 9;
 }
 
 /// Slot indices for `RECV_RING`: copies in the receive path.
@@ -600,6 +611,13 @@ pub fn init_metadata() {
     }
     RING.insert_metadata(ring::CQE_UNKNOWN_TAG, "op".into(), "cqe_unknown_tag".into());
     RING.insert_metadata(ring::SHUTDOWN_STALE, "op".into(), "shutdown_stale".into());
+    RING.insert_metadata(ring::CQ_OVERFLOW, "op".into(), "cq_overflow".into());
+    RING.insert_metadata(ring::CQE_DROPPED, "op".into(), "cqe_dropped".into());
+    RING.insert_metadata(
+        ring::CQE_DROPPED_REPORTED,
+        "op".into(),
+        "cqe_dropped_reported".into(),
+    );
 
     POOL.insert_metadata(pool::SEND_EXHAUSTED, "op".into(), "send_exhausted".into());
     POOL.insert_metadata(pool::TIMER_EXHAUSTED, "op".into(), "timer_exhausted".into());

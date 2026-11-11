@@ -38,6 +38,22 @@ fn is_enter_backpressure(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EBUSY | libc::EAGAIN))
 }
 
+/// Whether an `io_uring_enter` failure reports dropped completions, counting
+/// it when it does. `EBADR`: the kernel could not allocate an overflow entry
+/// for a completion and dropped it, so the operation it belonged to never
+/// completes. The kernel returns it from an enter that waits for completions,
+/// submits nothing and finds the CQ empty, and clears it there. Nothing else
+/// is wrong with the ring, so the worker carries on. The completion itself
+/// cannot be recovered. Of the enters here only `submit_and_wait` with a
+/// nonzero `min_complete` can see it; the others match it as well.
+fn reports_dropped_completions(error: &io::Error) -> bool {
+    let dropped = error.raw_os_error() == Some(libc::EBADR);
+    if dropped {
+        crate::metrics::RING.increment(crate::metrics::ring::CQE_DROPPED_REPORTED);
+    }
+    dropped
+}
+
 /// `struct io_uring_buf_reg`, which the `io-uring` crate fills with `resv`
 /// zeroed and does not let the caller set.
 #[repr(C)]
@@ -147,6 +163,8 @@ pub(crate) struct UringEngine {
     /// What goes ahead of a connection's `Close` on this kernel. See
     /// [`close_lead_for`].
     close_lead: CloseLead,
+    /// The kernel's count of dropped completions when `reap` last read it.
+    dropped_seen: u32,
     /// The kernel accepted a provided buffer ring only with `resv[0]` set,
     /// so later registrations use that form and unregistration tries it
     /// first. See [`retry_with_resv_set`].
@@ -282,7 +300,11 @@ impl UringEngine {
     /// returns at once, so this repeats the enter until the SQ thread frees
     /// the rest.
     fn make_sq_room(&mut self, needed: usize) -> io::Result<()> {
-        self.ring.submit()?;
+        match self.ring.submit() {
+            Ok(_) => {}
+            Err(e) if reports_dropped_completions(&e) => {}
+            Err(e) => return Err(e),
+        }
         if self.ring.params().is_setup_sqpoll() {
             loop {
                 let sq = self.ring.submission();
@@ -338,10 +360,7 @@ impl Engine for UringEngine {
     /// `io_uring_setup(2)` names the subsystem and, for `EPERM`, the
     /// `kernel.io_uring_disabled` sysctl or seccomp profile behind it.
     fn setup(config: &Config) -> Result<Self, Error> {
-        let cq_entries = config
-            .sq_entries
-            .checked_mul(4)
-            .unwrap_or(config.sq_entries);
+        let cq_entries = config.cq_entries;
 
         let mut builder = IoUring::<squeue::Entry128, cqueue::Entry32>::builder();
         builder.setup_cqsize(cq_entries);
@@ -413,6 +432,7 @@ impl Engine for UringEngine {
             taskrun_flag: !config.sqpoll && config.defer_recv_arm,
             fixed_fd_install,
             close_lead: Self::close_lead_from(config),
+            dropped_seen: 0,
             pbuf_resv_set: false,
             #[cfg(test)]
             forced_push_failures: 0,
@@ -661,6 +681,7 @@ impl Engine for UringEngine {
                     self.reap_after_backpressure(&e);
                     return Ok(());
                 }
+                Err(e) if reports_dropped_completions(&e) => return Ok(()),
                 Err(e) => return Err(e),
             }
         }
@@ -702,6 +723,7 @@ impl Engine for UringEngine {
                     self.reap_after_backpressure(&e);
                     return Ok(());
                 }
+                Err(e) if reports_dropped_completions(&e) => return Ok(()),
                 Err(e) => return Err(e),
             }
         }
@@ -736,7 +758,11 @@ impl Engine for UringEngine {
             // that thread when it has gone idle, or to flush an overflowed
             // CQ; a raw enter here would cost a syscall on every flush and
             // would not wake it.
-            self.ring.submit()?;
+            match self.ring.submit() {
+                Ok(_) => {}
+                Err(e) if reports_dropped_completions(&e) => {}
+                Err(e) => return Err(e),
+            }
             return Ok(());
         }
         if n == 0 {
@@ -751,12 +777,15 @@ impl Engine for UringEngine {
             // task_work indefinitely.)
             return Ok(());
         }
-        unsafe {
+        match unsafe {
             self.ring
                 .submitter()
-                .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)?;
+                .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+        } {
+            Ok(_) => Ok(()),
+            Err(e) if reports_dropped_completions(&e) => Ok(()),
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
     fn completion_pending(&self) -> bool {
@@ -775,11 +804,23 @@ impl Engine for UringEngine {
     fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>) {
         #[cfg(test)]
         out.append(&mut self.injected);
-        out.extend(
-            self.ring
-                .completion()
-                .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags())),
-        );
+        let cq = self.ring.completion();
+        // The kernel counts each completion it drops, cumulatively.
+        let dropped = cq.overflow();
+        out.extend(cq.map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags())));
+        if dropped != self.dropped_seen {
+            crate::metrics::RING.add(
+                crate::metrics::ring::CQE_DROPPED,
+                u64::from(dropped.wrapping_sub(self.dropped_seen)),
+            );
+            self.dropped_seen = dropped;
+        }
+        // Completions that did not fit in the CQ wait in the kernel's overflow
+        // list, which the next enter moves into the CQ.
+        // Safety: a shared view of the ring's flags, read-only.
+        if unsafe { self.ring.submission_shared().cq_overflow() } {
+            crate::metrics::RING.increment(crate::metrics::ring::CQ_OVERFLOW);
+        }
     }
 
     /// Test-only: make the next `count` `push_sqe`/`push_sqe128` calls fail.
@@ -1509,6 +1550,23 @@ mod enter_error_tests {
             assert!(!is_enter_backpressure(&io::Error::from_raw_os_error(errno)));
         }
     }
+
+    /// Dropped completions are reported and counted, and the worker carries
+    /// on; other errors still end it (#831).
+    #[test]
+    fn a_report_of_dropped_completions_is_counted_and_not_fatal() {
+        use crate::metrics::{RING, ring};
+        let before = RING.value(ring::CQE_DROPPED_REPORTED).unwrap_or(0);
+        assert!(reports_dropped_completions(&io::Error::from_raw_os_error(
+            libc::EBADR
+        )));
+        assert!(RING.value(ring::CQE_DROPPED_REPORTED).unwrap_or(0) > before);
+        for errno in [libc::EBADF, libc::EINVAL, libc::EBUSY] {
+            assert!(!reports_dropped_completions(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1534,6 +1592,67 @@ mod completion_pending_tests {
             }
         }
         UringEngine::setup(&config).expect("ring")
+    }
+
+    /// Completions past a full CQ wait in the kernel's overflow list: a reap
+    /// that finds them counts `cq_overflow`, and the next enter delivers them,
+    /// none dropped (#831).
+    #[test]
+    fn completions_past_a_full_cq_are_counted_and_delivered() {
+        use crate::metrics::{RING, ring};
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .sq_entries(4)
+            .cq_entries(4)
+            .build()
+            .expect("valid config");
+        let mut e = UringEngine::setup(&config).expect("ring");
+        let nop = |ud: u64| -> squeue::Entry128 { opcode::Nop::new().build().user_data(ud).into() };
+        let overflow_before = RING.value(ring::CQ_OVERFLOW).unwrap_or(0);
+        let dropped_before = RING.value(ring::CQE_DROPPED).unwrap_or(0);
+        // Eight completions into a four-entry CQ, none reaped in between.
+        for batch in 0..2u64 {
+            for i in 0..4 {
+                unsafe { e.ring.submission().push(&nop(batch * 4 + i)) }.expect("room");
+            }
+            e.submit_and_get_events().expect("submit");
+        }
+        let mut out = Vec::new();
+        e.reap(&mut out);
+        assert_eq!(out.len(), 4, "the CQ holds four");
+        assert!(
+            RING.value(ring::CQ_OVERFLOW).unwrap_or(0) > overflow_before,
+            "the reap did not count the overflow"
+        );
+        e.submit_and_get_events().expect("submit");
+        e.reap(&mut out);
+        let mut delivered: Vec<u64> = out.iter().map(|&(ud, _, _)| ud).collect();
+        delivered.sort();
+        assert_eq!(
+            delivered,
+            (0..8).collect::<Vec<_>>(),
+            "an overflowed completion was lost"
+        );
+        assert_eq!(RING.value(ring::CQE_DROPPED).unwrap_or(0), dropped_before);
+    }
+
+    /// The ring's queues are the sizes the config asks for, the defaults
+    /// included (#831).
+    #[test]
+    fn the_ring_has_the_configured_queue_sizes() {
+        let defaults = engine(false);
+        assert_eq!(defaults.ring.params().sq_entries(), 4096);
+        assert_eq!(defaults.ring.params().cq_entries(), 65536);
+        drop(defaults);
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .sq_entries(64)
+            .cq_entries(128)
+            .build()
+            .expect("valid config");
+        let small = UringEngine::setup(&config).expect("ring");
+        assert_eq!(small.ring.params().sq_entries(), 64);
+        assert_eq!(small.ring.params().cq_entries(), 128);
     }
 
     /// A receive that found its socket empty is completed from task work when

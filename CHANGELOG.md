@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- io_uring: three `ringline/ring` counters for completion queue overflow
+  (#831): `cq_overflow`, reaps that found completions waiting in the kernel's
+  overflow list; `cqe_dropped`, completions the kernel dropped, from its own
+  count; and `cqe_dropped_reported`, enters that returned `EBADR`.
 - `fs::symlink_metadata`, which returns the metadata of a symbolic link
   itself (`lstat`; on io_uring a statx with `AT_SYMLINK_NOFOLLOW`).
   `fs::stat` follows the link, as before, so `Metadata::is_symlink` from it is
@@ -291,6 +295,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- io_uring: the CQ is sized by the new `ConfigBuilder::cq_entries`, default
+  65536, the largest Linux allows, instead of 4 × `sq_entries`; and the
+  default `sq_entries` is 4096 instead of 256. A large CQ keeps completions
+  out of the kernel's overflow list, where an allocation failure drops them
+  (#831). The default rings take about 2.5 MiB per worker, against about
+  70 KiB before. From Linux 6.14 the kernel charges that to `RLIMIT_MEMLOCK`,
+  summed over every process of the user: four workers' defaults exceed an
+  8 MiB hard limit, such as systemd's default, and launch then fails with
+  `Error::ResourceLimit` naming the `ulimit` to run (it raises the soft
+  limit when the hard limit allows). Before Linux 6.10 the CQ and its header
+  are one physically contiguous 4 MiB block per worker, which can fail with
+  `ENOMEM` on fragmented memory; 32768 entries fit in 2 MiB. Lower
+  `cq_entries`, raise the limit, or run with `CAP_IPC_LOCK`. With the larger
+  SQ, the io-wq pool's bound, `min(sq_entries, 4 × online CPUs)`, is 4 × the
+  CPU count on hosts with more than 64 CPUs, where it was 256.
 - Thread names are short enough that Linux keeps them whole: `rl-work-N`
   (worker), `rl-acpt-N` (acceptor, numbered by listener), `rl-rslv-N`
   (resolver), `rl-spwn-N` (process spawner), `rl-blok-N` (blocking pool) and,
@@ -1024,13 +1043,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   loop that raced `wait` against a timer added one armed poll per iteration,
   each holding the pidfd's file. `Child::wait` also registers its waiter only
   after the poll is pushed; a failed push left the entry behind (#833).
-- `ConfigBuilder::build` refuses `sq_entries` above 16384. The completion
-  queue is 4 × `sq_entries`, and Linux refuses more than 65536 completion
-  queue entries, so a larger value passed validation and then failed every
-  worker's `io_uring_setup` with `EINVAL`, reported as a kernel too old for
-  ringline's setup flags. The check applies on the mio backend too, which
-  does not use `sq_entries`, so a `force-mio` build that set more than 16384
-  is now refused (#835).
+- `ConfigBuilder::build` refuses queue sizes Linux refuses: `sq_entries`
+  above 32768, `cq_entries` above 65536, and `cq_entries` below
+  `sq_entries`. Before, the CQ was 4 × `sq_entries`, so `sq_entries(32768)`
+  passed validation and then failed every worker's `io_uring_setup` with
+  `EINVAL`, reported as a kernel too old for ringline's setup flags. The
+  check applies on the mio backend too, which does not use the queue sizes,
+  so a `force-mio` build that set larger values is now refused (#835, #831).
+- io_uring: an `io_uring_enter` that returns `EBADR` no longer ends the
+  worker and every connection on it. `EBADR` is the kernel's report that it
+  dropped completions it could not queue in its overflow list. The worker
+  carries on and counts it; the operations whose completions were dropped
+  never complete (#831).
 - io_uring: a `sleep`, `sleep_until`, `try_sleep` or `try_sleep_until` whose
   timeout SQE cannot be pushed (the submission queue is full and submitting
   to make room fails) keeps its timer slot, wakes its task and pushes again

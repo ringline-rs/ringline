@@ -41,9 +41,9 @@ threads-required = "num-test-threads"
 filter = 'binary(shutdown_zero_copy) | test(a_stopped_worker_holds_a_guard)'
 threads-required = "num-test-threads"
 
-# Sets up a ring at the largest sq_entries, which from Linux 6.14 charges about
-# 4 MiB to RLIMIT_MEMLOCK, against a limit shared with every test running
-# alongside.
+# Sets up a ring at the largest sq_entries and cq_entries, which from Linux 6.14
+# charges about 6 MiB to RLIMIT_MEMLOCK, against a limit shared with every test
+# running alongside.
 [[profile.default.overrides]]
-filter = 'binary(sq_entries_limit) & test(the_largest_accepted_sq_entries_sets_up_a_ring)'
+filter = 'binary(sq_entries_limit) & test(the_largest_accepted_queues_set_up_a_ring)'
 threads-required = "num-test-threads"
