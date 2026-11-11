@@ -5065,17 +5065,13 @@ impl Future for DiskIoFuture {
             if self.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            match executor.take_disk_io_result(self.seq) {
-                Some(result) if result < 0 => {
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(self.seq, task_id) {
+                Some((result, _)) if result < 0 => {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
                 }
-                Some(result) => Poll::Ready(Ok(result)),
-                None => {
-                    // Re-register waiter (polled before CQE arrived or after spurious wake).
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(self.seq, task_id);
-                    pending(cx)
-                }
+                Some((result, _)) => Poll::Ready(Ok(result)),
+                None => pending(cx),
             }
         });
         if poll.is_ready() {

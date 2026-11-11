@@ -2380,14 +2380,15 @@ impl<'a> DriverCtx<'a> {
             .allocate(0, crate::fs::FsOp::Statx)
             .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
 
-        // Allocate the statx buffer and store it in the slab entry.
-        let statx_buf: Box<libc::statx> = Box::new(unsafe { std::mem::zeroed() });
-        let statx_ptr = &*statx_buf as *const libc::statx as *mut libc::statx;
-
-        if let Some(entry) = slab.get_mut(slab_idx) {
-            entry.path = Some(c_path);
-            entry.statx_buf = Some(statx_buf);
-        }
+        // The kernel writes into the slab entry's statx buffer; the slab
+        // never moves an entry, so the pointer stays valid until the CQE.
+        let statx_ptr = match slab.get_mut(slab_idx) {
+            Some(entry) => {
+                entry.path = Some(c_path);
+                &mut entry.statx_buf as *mut libc::statx
+            }
+            None => unreachable!("the slab entry was just allocated"),
+        };
 
         let path_ptr = self
             .fs_cmd_slab

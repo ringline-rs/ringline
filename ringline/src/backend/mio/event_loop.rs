@@ -667,7 +667,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.disk_io_borrowing.remove(&response.seq);
                 // Handle fs_open completions: install fd or release slot.
                 if let Some(file_index) = self.driver.pending_fs_opens.remove(&response.seq) {
-                    if self.executor.abandoned_fs_opens.remove(&response.seq) {
+                    if self.executor.take_abandoned_open(response.seq) {
                         // Nothing holds a handle to this file: drop the fd, if
                         // the open succeeded, and free the slot.
                         drop(response.opened);
@@ -693,11 +693,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     continue;
                 }
 
-                // If the response carries metadata (stat), store it.
-                if let Some(metadata) = response.metadata {
-                    self.executor.fs_stat_results.insert(response.seq, metadata);
-                }
-                self.executor.wake_disk_io(response.seq, response.result);
+                // A stat's metadata travels with the result.
+                self.executor
+                    .wake_disk_io_with(response.seq, response.result, response.metadata);
             }
         }
 

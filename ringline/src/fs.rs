@@ -376,9 +376,10 @@ pub(crate) struct FsCmdEntry {
     pub path: Option<CString>,
     /// Second path for rename (kept alive until CQE).
     pub path2: Option<CString>,
-    /// Heap-allocated statx buffer (kept alive until CQE).
+    /// The statx buffer of a stat, written by the kernel until the CQE. In
+    /// the entry rather than boxed per call; the slab never moves an entry.
     #[cfg(target_os = "linux")]
-    pub statx_buf: Option<Box<libc::statx>>,
+    pub statx_buf: libc::statx,
 }
 
 /// Tracks in-flight filesystem commands for resource cleanup on completion.
@@ -400,7 +401,7 @@ impl FsCmdSlab {
                 path: None,
                 path2: None,
                 #[cfg(target_os = "linux")]
-                statx_buf: None,
+                statx_buf: unsafe { std::mem::zeroed() },
             });
             free_list.push(i);
         }
@@ -425,10 +426,6 @@ impl FsCmdSlab {
         entry.in_use = false;
         entry.path = None;
         entry.path2 = None;
-        #[cfg(target_os = "linux")]
-        {
-            entry.statx_buf = None;
-        }
         self.free_list.push(idx);
         (file_index, op)
     }
@@ -553,16 +550,13 @@ impl Future for OpenFuture {
             if self.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            match executor.take_disk_io_result(self.seq) {
-                Some(result) if result < 0 => {
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(self.seq, task_id) {
+                Some((result, _)) if result < 0 => {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
                 }
                 Some(_) => Poll::Ready(Ok(File::new(self.file_index, self.generation))),
-                None => {
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(self.seq, task_id);
-                    pending(cx)
-                }
+                None => pending(cx),
             }
         });
         if poll.is_ready() {
@@ -632,7 +626,7 @@ impl Drop for OrphanedBuffers {
 /// after the first pass, and before the worker waits for I/O.
 ///
 /// An open that has completed is closed now. One still in flight is marked in
-/// `abandoned_fs_opens`, and its completion handler closes it. A buffer whose
+/// abandoned, and its completion handler closes it. A buffer whose
 /// operation has completed is dropped now; one still in flight is parked in
 /// the graveyard until the completion arrives.
 pub(crate) fn release_orphans(
@@ -669,17 +663,13 @@ pub(crate) fn release_orphans(
         }
     });
     for (seq, index, generation) in orphans {
-        executor.disk_io_waiters.remove(&seq);
         match executor.take_disk_io_result(seq) {
             Some(result) if result >= 0 => {
                 let _ = driver.make_ctx().fs_close(File::new(index, generation));
             }
             // The open failed, and its slot is already free.
             Some(_) => {}
-            None => {
-                crate::runtime::untrack_disk_io(seq);
-                executor.abandoned_fs_opens.insert(seq);
-            }
+            None => executor.abandon_disk_io_open(seq),
         }
     }
 }
@@ -883,12 +873,13 @@ impl Future for ReadFuture {
             if me.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            match executor.take_disk_io_result(me.seq) {
-                Some(result) if result < 0 => {
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(me.seq, task_id) {
+                Some((result, _)) if result < 0 => {
                     let buf = me.buf.take().expect("ReadFuture polled after completion");
                     Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
                 }
-                Some(result) => {
+                Some((result, _)) => {
                     let mut buf = me.buf.take().expect("ReadFuture polled after completion");
                     let n = result as usize;
                     let max_n = buf.capacity() - me.initial_len;
@@ -898,11 +889,7 @@ impl Future for ReadFuture {
                     unsafe { buf.set_len(me.initial_len + n) };
                     Poll::Ready((Ok(n), buf))
                 }
-                None => {
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(me.seq, task_id);
-                    pending(cx)
-                }
+                None => pending(cx),
             }
         })
     }
@@ -942,20 +929,17 @@ impl Future for WriteFuture {
             if me.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            match executor.take_disk_io_result(me.seq) {
-                Some(result) if result < 0 => {
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(me.seq, task_id) {
+                Some((result, _)) if result < 0 => {
                     let buf = me.buf.take().expect("WriteFuture polled after completion");
                     Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
                 }
-                Some(result) => {
+                Some((result, _)) => {
                     let buf = me.buf.take().expect("WriteFuture polled after completion");
                     Poll::Ready((Ok(result as usize), buf))
                 }
-                None => {
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(me.seq, task_id);
-                    pending(cx)
-                }
+                None => pending(cx),
             }
         })
     }
@@ -1008,9 +992,9 @@ fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
     park_buffer(driver, executor, seq, file_index, buf);
 }
 
-/// Drop `buf` if its operation has completed (its result is in
-/// `disk_io_results`), otherwise park it in `disk_io_graveyard` keyed by
-/// `seq`; `wake_disk_io` frees it when the operation completes.
+/// Drop `buf` if its operation has completed (its result has arrived),
+/// otherwise park it under `seq`; `wake_disk_io` frees it when the
+/// operation completes.
 ///
 /// On io_uring, also submit a best-effort `ASYNC_CANCEL` to speed up the
 /// completion, which then arrives with `-ECANCELED` or the natural result.
@@ -1024,16 +1008,12 @@ fn park_buffer(
     file_index: u16,
     buf: BytesMut,
 ) {
-    executor.disk_io_waiters.remove(&seq);
     if executor.take_disk_io_result(seq).is_some() {
         // The operation has completed and released the buffer.
         drop(buf);
         return;
     }
-    // The graveyard now holds the key; `wake_disk_io` frees the buffer
-    // before it checks whether the key is held.
-    crate::runtime::untrack_disk_io(seq);
-    executor.disk_io_graveyard.insert(seq, buf);
+    executor.park_disk_io(seq, buf);
     #[cfg(has_io_uring)]
     {
         let target = crate::completion::UserData::encode(
@@ -1137,10 +1117,9 @@ fn stat_with(path: &std::path::Path, nofollow: bool) -> io::Result<StatFuture> {
 ///
 /// Polled on another worker it stays pending until a task on the owning worker
 /// drives it.
-// On io_uring the statx buffer is owned by the command slab entry, and on
-// completion the handler converts it to `Metadata` and stores it in
-// `Executor::fs_stat_results` before releasing the slab entry. On mio the
-// disk-I/O pool returns the `Metadata`.
+// On io_uring the statx buffer is the command slab entry's, and on
+// completion the handler converts it to `Metadata` and delivers it with the
+// result. On mio the disk-I/O pool returns the `Metadata`.
 pub struct StatFuture {
     seq: u32,
     /// Set once `poll` has returned `Ready`: the result has been taken.
@@ -1160,28 +1139,15 @@ impl Future for StatFuture {
             if self.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            // First check if there's a normal error result (negative).
-            match executor.take_disk_io_result(self.seq) {
-                Some(result) if result < 0 => {
-                    // Also remove any stat result that might have been stored.
-                    executor.fs_stat_results.remove(&self.seq);
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(self.seq, task_id) {
+                Some((result, _)) if result < 0 => {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
                 }
-                Some(_) => {
-                    // Success — read the Metadata from the stat results map.
-                    match executor.fs_stat_results.remove(&self.seq) {
-                        Some(metadata) => Poll::Ready(Ok(metadata)),
-                        None => {
-                            // Should not happen — handle_fs stores it before waking.
-                            Poll::Ready(Err(io::Error::other("stat result missing")))
-                        }
-                    }
-                }
-                None => {
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(self.seq, task_id);
-                    pending(cx)
-                }
+                Some((_, Some(metadata))) => Poll::Ready(Ok(metadata)),
+                // The completion handler stores the metadata with the result.
+                Some((_, None)) => Poll::Ready(Err(io::Error::other("stat result missing"))),
+                None => pending(cx),
             }
         });
         if poll.is_ready() {
@@ -1350,20 +1316,14 @@ mod tests {
         {
             let entry = slab.get_mut(a).unwrap();
             entry.path = Some(CString::new("/tmp/test").unwrap());
-            #[cfg(target_os = "linux")]
-            {
-                entry.statx_buf = Some(Box::new(unsafe { std::mem::zeroed() }));
-            }
         }
         slab.release(a);
-        // After release, the entry is not in use but the path/statx_buf should be None.
+        // After release, the entry is not in use and its path is None.
         // We can verify by re-allocating and checking.
         let b = slab.allocate(0, FsOp::Read).unwrap();
         assert_eq!(b, a);
         let entry = slab.get(b).unwrap();
         assert!(entry.path.is_none());
-        #[cfg(target_os = "linux")]
-        assert!(entry.statx_buf.is_none());
     }
 
     #[test]
