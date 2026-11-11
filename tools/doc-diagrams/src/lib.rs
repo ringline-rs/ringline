@@ -126,7 +126,7 @@ const CLAIMS: &[Claim] = &[
     },
     Claim {
         path: "ringline/src/disk_io_pool.rs",
-        needle: "req.wake_handle.wake()",
+        needle: "wake_coalesced(&req.wake_pending, &req.wake_handle)",
         meaning: "Mio disk I/O response wake",
     },
     Claim {

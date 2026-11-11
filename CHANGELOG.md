@@ -291,6 +291,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- mio: a burst of disk-I/O completions writes the worker's wake pipe once
+  instead of once per completion, and the event loop reuses one events
+  `Vec` instead of allocating one per iteration. A serial `fs::read_into`
+  makes one allocation per operation instead of two. Finding P1 of
+  `docs/journal/2026-11-file-io-audit.md` (#875).
 - On io_uring `fs::stat` no longer allocates a `libc::statx` per call: the
   buffer lives in the command slab entry, which costs each worker 256 bytes
   per `max_commands_in_flight` slot (64 KiB at the default of 256). On both
@@ -324,6 +329,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `connect(..).tls(..)` then resolves `UnexpectedEof` (#849). Connection-close
   audit L1, #809 (`docs/half-close-design.md`,
   `docs/journal/2026-11-connection-close-audit.md`).
+
+- A TLS connection closed before its handshake completes (by the peer's FIN,
+  a TLS error or `tls_handshake_timeout`) waits at most 5 s for its queued
+  sends, the rest of the handshake flight and any alert, and is then closed
+  without them. Before, the wait had no bound, so a peer that sent a
+  ClientHello and stopped reading held the slot, on both backends, whenever
+  the server's flight was larger than the peer's receive window and the
+  server's send buffer together; on loopback a 2 MB flight did, a 0.5 MB one
+  did not. A peer that reads the flight within the 5 s still receives it and
+  the alert. Send and recv paradigms audit PL10
+  (`docs/journal/2026-11-send-recv-paradigms-audit.md`).
 
 - `with_data_result` reports a TLS record the engine cannot process (a bad
   record, a failed decrypt) as `Err(InvalidData)`, with rustls' error as the
@@ -995,6 +1011,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Docs: the `max_commands_in_flight` docs of `FsConfig`, `DirectIoConfig`
+  and `NvmeConfig` say that on io_uring each command slot has 16,384
+  operation keys; that a future neither polled to completion nor dropped
+  keeps its key, as does one dropped on a thread other than the worker that
+  created it; and that in a serial workload 16,384 such futures make every
+  later operation fail while other slots are free. Finding P4 of
+  `docs/journal/2026-11-file-io-audit.md` (#878).
 - mio: `ConfigBuilder::build` refuses `disk_io_threads(0)` while `fs` (on
   by default) or `direct_io` is set, naming `no_fs()` (fs) or `direct_io`
   (direct I/O). Before, the config built and every file operation failed at
@@ -1021,6 +1044,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   document their panic. Findings F9 and F10 of
   `docs/journal/2026-11-file-io-audit.md` (#873, #874), and the documentation
   part of P3 (#877).
+- `fs::OpenFlags` documents each flag and that `READ | WRITE` is `WRITE`
+  (the access modes are the `open(2)` values, not bits), with a doctest;
+  the type is now `PartialEq` and `Eq`. `fs::open` documents its `mode`.
+  Finding F8 of `docs/journal/2026-11-file-io-audit.md` (#872).
 - `open_direct_io_file` and `open_direct_io_file_with` (both backends) and
   `open_nvme_device` (io_uring) with a path containing a NUL byte return their
   error without holding a slot of the file table. Before, each such call left

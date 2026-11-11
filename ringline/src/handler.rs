@@ -54,10 +54,12 @@ pub(crate) struct ConnSendState {
     /// the Close SQE is committed.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_submitted: bool,
-    /// Set by `DriverCtx::close` on a TLS connection, whether or not it
-    /// queued an alert. When the deadline passes with `close_pending` still
-    /// true, the runtime force-closes the connection.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    /// Set to `CLOSE_NOTIFY_TIMEOUT` from now by `DriverCtx::close` on a TLS
+    /// connection (io_uring), whether or not it queued an alert, and by
+    /// `close_connection` on a connection whose handshake or connect has not
+    /// completed (both backends). When the deadline passes with
+    /// `close_pending` still true, the runtime closes the connection without
+    /// its queued sends.
     pub close_notify_deadline: Option<std::time::Instant>,
     /// Whether a `Shutdown` for the current occupant has been requested and
     /// its CQE has not arrived: the SQE is in the kernel, or parked on
@@ -165,10 +167,12 @@ impl ConnId {
     }
 }
 
-/// How long a TLS close after a fatal encrypt error waits for its queued sends and
-/// close_notify to drain before the connection is closed without them.
-#[cfg(has_io_uring)]
-const CLOSE_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a close waits for its queued sends to drain before the
+/// connection is closed without them: a close after a fatal encrypt error
+/// (io_uring), with its close_notify, and a close before the handshake
+/// completes (both backends), with the rest of the handshake flight and any
+/// alert.
+pub(crate) const CLOSE_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Identifies which listener a connection arrived on.
 ///
@@ -2683,6 +2687,8 @@ pub(crate) struct DriverCtx<'a> {
         &'a Option<crossbeam_channel::Sender<crate::disk_io_pool::DiskIoResponse>>,
     /// Wake handle for this worker (used to wake after disk I/O completion).
     pub(crate) wake_handle: crate::wakeup::WakeFd,
+    /// See `Driver::disk_io_wake_pending`.
+    pub(crate) disk_io_wake_pending: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Monotonic sequence counter for disk I/O requests.
     pub(crate) next_disk_io_seq: &'a mut u32,
     /// Keys of pool operations not yet drained; see `Driver::disk_io_in_flight`.
@@ -3277,6 +3283,7 @@ impl<'a> DriverCtx<'a> {
                 seq,
                 response_tx: tx.clone(),
                 wake_handle: self.wake_handle,
+                wake_pending: std::sync::Arc::clone(self.disk_io_wake_pending),
             })
             .map_err(|_| io::Error::other("disk I/O pool shut down"))?;
         self.disk_io_in_flight.insert(seq, subsystem);
