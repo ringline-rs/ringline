@@ -1499,10 +1499,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// the loop back here. A write error clears `pending_sends`
     /// (`fail_connection_on_send_error`), which ends the deferral.
     ///
-    /// The deferral is unbounded, as on io_uring for plaintext; mio has no
-    /// equivalent of io_uring's TLS `close_notify_deadline`, so a TLS peer
-    /// that half-closes and stops reading holds its slot until the write
-    /// errors.
+    /// The deferral is unbounded, as on io_uring for plaintext, except for a
+    /// connection closed before its handshake or connect completed: its
+    /// `close_notify_deadline` ends the wait, and `finish_close` then writes
+    /// what the socket takes and drops the rest. mio sets no deadline for a
+    /// task's close, so a TLS peer that half-closes and stops reading holds
+    /// its slot until the write errors.
     ///
     /// Executor cleanup runs first — the slot must not be released (and
     /// reusable) while a stale parked future, waiter flags, or a recv-sink
@@ -1516,8 +1518,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.send_queues[idx].close_pending,
                 "pending_closes entry {conn_index} without close_pending"
             );
-            let sends_drained =
-                self.driver.pending_sends[idx].is_empty() || self.driver.tcp_streams[idx].is_none();
+            let sends_drained = self.driver.pending_sends[idx].is_empty()
+                || self.driver.tcp_streams[idx].is_none()
+                || self.driver.send_queues[idx]
+                    .close_notify_deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline);
             if !sends_drained {
                 self.driver.mark_send_dirty(idx);
                 i += 1;

@@ -324,6 +324,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   audit L1, #809 (`docs/half-close-design.md`,
   `docs/journal/2026-11-connection-close-audit.md`).
 
+- A TLS connection closed before its handshake completes (by the peer's FIN,
+  a TLS error or `tls_handshake_timeout`) waits at most 5 s for its queued
+  sends, the rest of the handshake flight and any alert, and is then closed
+  without them. Before, the wait had no bound, so a peer that sent a
+  ClientHello and stopped reading held the slot, on both backends, whenever
+  the server's flight was larger than the peer's receive window and the
+  server's send buffer together; on loopback a 2 MB flight did, a 0.5 MB one
+  did not. A peer that reads the flight within the 5 s still receives it and
+  the alert. Send and recv paradigms audit PL10
+  (`docs/journal/2026-11-send-recv-paradigms-audit.md`).
+
 - `with_data_result` reports a TLS record the engine cannot process (a bad
   record, a failed decrypt) as `Err(InvalidData)`, with rustls' error as the
   source, and a TLS message that runs past `recv_accumulator_max` as
