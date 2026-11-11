@@ -3245,17 +3245,17 @@ impl<'a> DriverCtx<'a> {
         borrows: bool,
     ) -> io::Result<u32> {
         // An unconfigured subsystem fails first, with io_uring's error, even
-        // when this worker has no pool.
+        // when this worker has no pool. A missing pool with the subsystem
+        // configured is unreachable through `ConfigBuilder`, which refuses it
+        // on this backend.
         let limit =
             self.disk_io_limits[subsystem as usize].ok_or_else(|| subsystem.not_configured())?;
-        let pool = self
-            .disk_io_pool
-            .as_ref()
-            .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
-        let tx = self
-            .disk_io_tx
-            .as_ref()
-            .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
+        let pool = self.disk_io_pool.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "disk I/O pool not configured")
+        })?;
+        let tx = self.disk_io_tx.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "disk I/O pool not configured")
+        })?;
         if self.disk_io_counts[subsystem as usize] >= limit {
             return Err(subsystem.exhausted());
         }

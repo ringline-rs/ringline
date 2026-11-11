@@ -319,6 +319,7 @@ fn a_running_worker_keeps_its_wake_fd_open() {
         .resolver_threads(0)
         .spawner_threads(0)
         .disk_io_threads(0)
+        .no_fs()
         .build()
         .expect("valid config");
     let baseline = open_fds();
