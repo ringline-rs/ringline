@@ -983,6 +983,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Docs: the `max_commands_in_flight` docs of `FsConfig`, `DirectIoConfig`
+  and `NvmeConfig` say that on io_uring each command slot has 16,384
+  operation keys, that a future neither polled to completion nor dropped
+  keeps its key, and that in a serial workload 16,384 such futures make the
+  next operation fail while other slots are free. Finding P4 of
+  `docs/journal/2026-11-file-io-audit.md` (#878).
 - mio: `ConfigBuilder::build` refuses `disk_io_threads(0)` while `fs` (on
   by default) or `direct_io` is set, naming `no_fs()` (fs) or `direct_io`
   (direct I/O). Before, the config built and every file operation failed at

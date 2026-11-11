@@ -339,6 +339,14 @@ impl DirectIoConfig {
     /// Reads, writes and fsyncs count from submission until their completion
     /// is processed. One submitted at the limit fails with
     /// `direct I/O command slab exhausted`, on both backends.
+    ///
+    /// On io_uring each command slot has 16,384 operation keys. A future holds
+    /// one from submission until it takes its result or is dropped, so a
+    /// future that is neither polled to completion nor dropped keeps its key
+    /// after its command completes. The slot freed last is reused first, so in
+    /// a serial workload 16,384 such futures make the next operation fail with
+    /// `every disk-I/O key for this slab slot is held by a future`, while
+    /// other slots are free.
     pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
         self.max_commands_in_flight = max_commands_in_flight;
         self
