@@ -1,6 +1,6 @@
 [package]
 name = "ringline"
-version = "0.7.0-alpha.86"
+version = "0.7.0-alpha.87"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
