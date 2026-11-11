@@ -1005,6 +1005,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- mio with the `tls-buffered` feature: one rustls `write_tls` call writes at
+  most 64 records, and the mio paths called it once where more could be
+  pending; the rest stayed in rustls until the next receive or send. A flush
+  of TLS output after a handshake flight of more records than that (about
+  1 MB) delivered only part of it to a reading peer, and not the alert a TLS
+  error queued behind it. A send with records small enough that one rustls
+  write made more than 64 (`max_fragment_size` below about 1 KiB) returned
+  part of its ciphertext, and the peer waited for the rest. Both now drain
+  rustls' output, as the io_uring paths do. Found by
+  `tls_close_before_handshake.rs` (#886).
 - Docs: the `max_commands_in_flight` docs of `FsConfig`, `DirectIoConfig`
   and `NvmeConfig` say that on io_uring each command slot has 16,384
   operation keys; that a future neither polled to completion nor dropped
