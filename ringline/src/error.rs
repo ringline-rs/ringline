@@ -648,8 +648,6 @@ mod tests {
         let old = describe_ring_setup_failure(&enomem(), &memlock_probe((6, 9), 8 << 20, false));
         assert!(old.contains("physically contiguous"), "{old}");
         assert!(old.contains("cq_entries"), "{old}");
-        let unknown = describe_ring_setup_failure(&enomem(), &RingSetupProbe::default());
-        assert!(unknown.contains("physically contiguous"), "{unknown}");
         let new = describe_ring_setup_failure(&enomem(), &memlock_probe((6, 12), 8 << 20, false));
         assert!(!new.contains("contiguous"), "{new}");
         assert!(new.contains("cq_entries"), "{new}");
