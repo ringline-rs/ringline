@@ -275,6 +275,13 @@ impl TimerSlotPool {
         self.generations.len()
     }
 
+    /// Number of slots not held.
+    #[cfg(test)]
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn free_slots(&self) -> usize {
+        self.free_list.len()
+    }
+
     /// Check if a timer slot has fired.
     pub(crate) fn is_fired(&self, slot: u32) -> bool {
         self.fired.get(slot as usize).copied().unwrap_or(false)
@@ -470,8 +477,12 @@ thread_local! {
 /// task is dropped at connection teardown, outside any task poll, where the
 /// driver is not reachable (#575).
 pub(crate) enum Orphan {
-    /// A `SleepFuture`'s timer slot.
-    TimerSlot { slot: u32, generation: u16 },
+    /// A `SleepFuture`'s timer slot, and whether its timer was armed.
+    TimerSlot {
+        slot: u32,
+        generation: u16,
+        armed: bool,
+    },
     /// A `SpawnFuture`'s `pending_spawns` entry, and with it a delivered
     /// child's pidfd.
     Spawn(u64),
@@ -515,8 +526,12 @@ pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mu
     let orphans = ORPHANS.with(|orphans| std::mem::take(&mut *orphans.borrow_mut()));
     for orphan in orphans {
         match orphan {
-            Orphan::TimerSlot { slot, generation } => {
-                io::release_timer_slot(driver, executor, slot, generation);
+            Orphan::TimerSlot {
+                slot,
+                generation,
+                armed,
+            } => {
+                io::release_timer_slot(driver, executor, slot, generation, armed);
             }
             Orphan::Spawn(request_id) => {
                 executor.pending_spawns.remove(&request_id);

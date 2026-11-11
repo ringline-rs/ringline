@@ -9939,6 +9939,112 @@ mod tests {
         f()
     }
 
+    /// A sleep whose timeout SQE cannot be pushed keeps its slot, wakes its
+    /// task, and pushes again on its next poll. It neither panics nor
+    /// completes before the timer fires (#832). Covers `sleep`, `sleep_until`,
+    /// `try_sleep` and `try_sleep_until`.
+    #[test]
+    fn a_sleep_whose_push_fails_is_armed_on_a_later_poll() {
+        use crate::runtime::io::{Deadline, sleep, sleep_until, try_sleep, try_sleep_until};
+        use std::task::{Context, Poll, Wake, Waker};
+        use std::time::Duration;
+
+        struct Count(AtomicU32);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut el = make_test_loop();
+        let free = el.executor.timer_pool.free_slots();
+        let delay = Duration::from_millis(5);
+        for (name, eager, absolute) in [
+            ("sleep", false, false),
+            ("sleep_until", false, true),
+            ("try_sleep", true, false),
+            ("try_sleep_until", true, true),
+        ] {
+            let wakes = Arc::new(Count(AtomicU32::new(0)));
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut cx = Context::from_waker(&waker);
+            let start = Instant::now();
+
+            // Two pushes fail. The try_ variants push at creation and then on
+            // their first poll; the others on their first two polls.
+            let mut fut = with_driver_state(&mut el, || {
+                crate::runtime::io::with_state(|d, _| d.ring.force_push_failures(2));
+                Box::pin(match (eager, absolute) {
+                    (false, false) => sleep(delay),
+                    (false, true) => sleep_until(Deadline::after(delay)),
+                    (true, false) => try_sleep(delay).expect("a free slot"),
+                    (true, true) => try_sleep_until(Deadline::after(delay)).expect("a free slot"),
+                })
+            });
+            let failed_polls = if eager { 1 } else { 2 };
+            for i in 1..=failed_polls {
+                let polled = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
+                assert!(polled.is_pending(), "{name}: ready before its timer fired");
+                // The failed push woke the task so that it polls again.
+                assert_eq!(wakes.0.load(Ordering::SeqCst), i, "{name}: no wake");
+            }
+            let polled = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
+            assert!(polled.is_pending(), "{name}: ready before its timer fired");
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                failed_polls,
+                "{name}: woke after a push succeeded"
+            );
+            assert_eq!(
+                el.executor.timer_pool.free_slots(),
+                free - 1,
+                "{name}: the slot was not held"
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                el.driver.ring.submit_and_wait(1).expect("submit");
+                el.drain_completions();
+                let polled = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
+                if polled == Poll::Ready(()) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{name}: the timer never fired");
+            }
+            assert!(start.elapsed() >= delay, "{name}: fired early");
+            assert_eq!(
+                el.executor.timer_pool.free_slots(),
+                free,
+                "{name}: slot kept"
+            );
+            with_driver_state(&mut el, || drop(fut));
+        }
+
+        // Dropped before a push succeeds, the slot is freed and no cancel is
+        // pushed for a timeout that was never pushed.
+        let waker = Waker::from(Arc::new(Count(AtomicU32::new(0))));
+        let mut cx = Context::from_waker(&waker);
+        el.driver.ring.pushed_cancels.clear();
+        with_driver_state(&mut el, || {
+            crate::runtime::io::with_state(|d, _| d.ring.force_push_failures(1));
+            let mut fut = Box::pin(sleep(delay));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            drop(fut);
+        });
+        assert_eq!(
+            el.executor.timer_pool.free_slots(),
+            free,
+            "an unarmed slot was kept"
+        );
+        assert!(
+            el.driver.ring.pushed_cancels.is_empty(),
+            "a cancel was pushed for an unarmed timer"
+        );
+    }
+
     /// Deliver `data` to `conn_index` through a direct receive: arm one into
     /// the accumulator's spare capacity, write `data` where the kernel would,
     /// and dispatch its completion.
