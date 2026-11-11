@@ -9752,8 +9752,11 @@ mod tests {
                 Instant::now() < deadline,
                 "the Close CQE did not release the slot"
             );
-            el.driver.ring.submit_and_wait(1).expect("submit");
+            // Without waiting: once the Close CQE has been drained, nothing
+            // else completes, and a wait would block past the deadline.
+            el.driver.ring.submit_and_get_events().expect("submit");
             el.drain_completions();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
