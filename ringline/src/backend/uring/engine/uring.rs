@@ -1592,6 +1592,48 @@ mod completion_pending_tests {
         UringEngine::setup(&config).expect("ring")
     }
 
+    /// Completions past a full CQ wait in the kernel's overflow list: a reap
+    /// that finds them counts `cq_overflow`, and the next enter delivers them,
+    /// none dropped (#831).
+    #[test]
+    fn completions_past_a_full_cq_are_counted_and_delivered() {
+        use crate::metrics::{RING, ring};
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .sq_entries(4)
+            .cq_entries(4)
+            .build()
+            .expect("valid config");
+        let mut e = UringEngine::setup(&config).expect("ring");
+        let nop = |ud: u64| -> squeue::Entry128 { opcode::Nop::new().build().user_data(ud).into() };
+        let overflow_before = RING.value(ring::CQ_OVERFLOW).unwrap_or(0);
+        let dropped_before = RING.value(ring::CQE_DROPPED).unwrap_or(0);
+        // Eight completions into a four-entry CQ, none reaped in between.
+        for batch in 0..2u64 {
+            for i in 0..4 {
+                unsafe { e.ring.submission().push(&nop(batch * 4 + i)) }.expect("room");
+            }
+            e.submit_and_get_events().expect("submit");
+        }
+        let mut out = Vec::new();
+        e.reap(&mut out);
+        assert_eq!(out.len(), 4, "the CQ holds four");
+        assert!(
+            RING.value(ring::CQ_OVERFLOW).unwrap_or(0) > overflow_before,
+            "the reap did not count the overflow"
+        );
+        e.submit_and_get_events().expect("submit");
+        e.reap(&mut out);
+        let mut delivered: Vec<u64> = out.iter().map(|&(ud, _, _)| ud).collect();
+        delivered.sort();
+        assert_eq!(
+            delivered,
+            (0..8).collect::<Vec<_>>(),
+            "an overflowed completion was lost"
+        );
+        assert_eq!(RING.value(ring::CQE_DROPPED).unwrap_or(0), dropped_before);
+    }
+
     /// The ring's queues are the sizes the config asks for, the defaults
     /// included (#831).
     #[test]
