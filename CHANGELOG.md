@@ -1019,6 +1019,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `ConfigBuilder::build` refuses `sq_entries` above 16384. The completion
+  queue is 4 × `sq_entries`, and Linux refuses more than 65536 completion
+  queue entries, so a larger value passed validation and then failed every
+  worker's `io_uring_setup` with `EINVAL`, reported as a kernel too old for
+  ringline's setup flags. The check applies on the mio backend too, which
+  does not use `sq_entries`, so a `force-mio` build that set more than 16384
+  is now refused (#835).
 - io_uring: a `sleep`, `sleep_until`, `try_sleep` or `try_sleep_until` whose
   timeout SQE cannot be pushed (the submission queue is full and submitting
   to make room fails) keeps its timer slot, wakes its task and pushes again
