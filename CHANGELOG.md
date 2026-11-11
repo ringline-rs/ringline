@@ -14,6 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `fs::stat` follows the link, as before, so `Metadata::is_symlink` from it is
   always false; `symlink_metadata` is the only way to get `true`. The fields
   of `Metadata` are now documented (#863).
+- `ConfigBuilder::tls_handshake_timeout`, default 10 s, greater than zero and
+  at most 60 s. A TLS connection whose handshake has not completed within it
+  is closed: inbound, from its worker registering it; outbound, from the TCP
+  connect completing, and the `connect(..).tls(..)` resolves `TimedOut`.
+  Before, an inbound TLS connection whose peer sent nothing, or sent a
+  warning-level close_notify before TLS 1.3 was negotiated, held its slot
+  until the worker exited, because no task holds it before its handshake
+  completes. An outbound `connect(..).tls(..)` to such a peer did not
+  resolve. `metrics::conn::TLS_HANDSHAKE_TIMEOUT` (11,
+  `op=tls_handshake_timeout` on `ringline/connections`) counts the closes.
+  On io_uring with a `tick_timeout_us` of 0 or above 10 ms, the earliest
+  deadline arms a timer of its own (`handshake_deadline` on
+  `ringline/cqe_by_tag`). Send and recv paradigms audit L18
+  (`docs/journal/2026-11-send-recv-paradigms-audit.md`).
 - `ConfigBuilder::defer_recv_arm`, off by default. On io_uring, a plaintext
   connection's reader that parks has its receive armed after the worker's next
   wait, not in the same submission as the sends queued before it parked, so the

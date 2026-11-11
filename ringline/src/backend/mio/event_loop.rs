@@ -259,8 +259,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let mut recv_buf = vec![0u8; 8192];
 
         loop {
-            // 1. Fire expired timers.
+            // 1. Fire expired timers, and close TLS connections whose
+            // handshake deadline has passed.
             self.fire_expired_timers();
+            self.check_handshake_deadlines();
 
             // 2. Compute poll timeout from nearest timer deadline. Don't
             // block at all while tasks are already runnable (woken after the
@@ -600,6 +602,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 if tls_table.create(conn_index, Some(listener)).is_err() {
                     self.driver.close_connection(conn_index);
+                } else {
+                    let generation = self.driver.connections.generation(conn_index);
+                    let driver = &mut self.driver;
+                    driver
+                        .handshake_deadlines
+                        .arm(conn_index, generation, |i, g| {
+                            crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+                        });
                 }
                 continue;
             }
@@ -1229,6 +1239,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         self.driver.mark_send_dirty(idx);
                     }
                     let _ = self.driver.flush_sends(conn_index);
+                    let generation = self.driver.connections.generation(conn_index);
+                    let driver = &mut self.driver;
+                    driver
+                        .handshake_deadlines
+                        .arm(conn_index, generation, |i, g| {
+                            crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+                        });
                     return;
                 }
 
@@ -1595,11 +1612,38 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// peek — no pool scan).
     fn compute_poll_timeout(&mut self) -> Duration {
         let default = Duration::from_millis(10); // default tick interval
-        match self.executor.timer_pool.next_deadline() {
-            Some(deadline) => deadline
-                .saturating_duration_since(Instant::now())
-                .min(default),
-            None => default,
+        let deadline = match (
+            self.executor.timer_pool.next_deadline(),
+            self.driver.handshake_deadlines.next_deadline(),
+        ) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(d), None) | (None, Some(d)) => d,
+            (None, None) => return default,
+        };
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(default)
+    }
+
+    /// Close every TLS connection whose handshake has not completed by its
+    /// deadline (`ConfigBuilder::tls_handshake_timeout`). An outbound connect
+    /// resolves `TimedOut`; an inbound connection has no task to report to.
+    fn check_handshake_deadlines(&mut self) {
+        if self.driver.handshake_deadlines.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        loop {
+            let driver = &mut self.driver;
+            let Some(conn_index) = driver.handshake_deadlines.pop_expired(now, |i, g| {
+                crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+            }) else {
+                return;
+            };
+            metrics::CONNECTIONS.increment(metrics::conn::TLS_HANDSHAKE_TIMEOUT);
+            self.executor
+                .wake_connect(conn_index, Err(crate::tls::handshake_deadline::timed_out()));
+            self.driver.close_connection(conn_index);
         }
     }
 

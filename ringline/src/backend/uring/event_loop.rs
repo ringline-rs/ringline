@@ -453,6 +453,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.driver.ring.submit_tick_timeout(ts, ud.raw()).is_ok();
             }
 
+            // Without a tick timeout the wait can block indefinitely, and with
+            // one longer than 10 ms a deadline would be checked late, so the
+            // earliest handshake deadline arms a timer of its own. As above, a
+            // full SQ leaves this unarmed for the next iteration.
+            if self.driver.handshake_timer_used
+                && !self.driver.handshake_timer_armed
+                && let Some(deadline) = self.driver.handshake_deadlines.next_deadline()
+            {
+                let wait = deadline.saturating_duration_since(std::time::Instant::now());
+                self.driver.handshake_timer_ts = crate::backend::uring::abi::Timespec::new()
+                    .sec(wait.as_secs())
+                    .nsec(wait.subsec_nanos());
+                let ud = UserData::encode(OpTag::HandshakeDeadline, 0, 0);
+                let ts = &raw const self.driver.handshake_timer_ts;
+                self.driver.handshake_timer_armed =
+                    self.driver.ring.submit_tick_timeout(ts, ud.raw()).is_ok();
+            }
+
             // The blocking wait itself is always performed; only the timing
             // around it is gated on `loop_diag`.
             let wait_start = if loop_diag {
@@ -598,6 +616,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // close requested a close_notify and whose Close is still not
             // committed (`close_pending`) when the deadline elapses.
             self.check_close_notify_deadlines();
+            self.check_handshake_deadlines();
 
             // Drain waker-based ready queue (from wakers fired during poll).
             self.executor.collect_wakeups();
@@ -1778,6 +1797,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
             OpTag::SendPollOut => self.handle_send_pollout(ud, result, flags),
             OpTag::SendBackstop => self.handle_send_backstop(),
+            // The loop checks the deadlines on every iteration; the timer
+            // only ends the wait.
+            OpTag::HandshakeDeadline => self.driver.handshake_timer_armed = false,
             OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
             // No notification follows a plain `send`.
             OpTag::SendMsgZcDrain => self.handle_send_msg_zc(ud, result, 0),
@@ -2435,6 +2457,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.close_connection(conn_index);
                 return;
             }
+            let generation = self.driver.connections.generation(conn_index);
+            let driver = &mut self.driver;
+            driver
+                .handshake_deadlines
+                .arm(conn_index, generation, |i, g| {
+                    crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+                });
             // The handshake's receives are armed after each completion; once
             // it is done, a parked read arms them. The hangup poll covers a
             // peer close while nothing reads.
@@ -3798,6 +3827,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 return;
             }
             self.driver.arm_hangup_poll(conn_index);
+            let generation = self.driver.connections.generation(conn_index);
+            let driver = &mut self.driver;
+            driver
+                .handshake_deadlines
+                .arm(conn_index, generation, |i, g| {
+                    crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+                });
             return;
         }
 
@@ -4989,6 +5025,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // try_finalize_close would wait forever here — the deadline fired
             // precisely because the drain is stuck (peer stopped reading).
             self.driver.force_finalize_close(idx);
+        }
+    }
+
+    /// Close every TLS connection whose handshake has not completed by its
+    /// deadline (`ConfigBuilder::tls_handshake_timeout`). An outbound connect
+    /// resolves `TimedOut`; an inbound connection has no task to report to.
+    fn check_handshake_deadlines(&mut self) {
+        if self.driver.handshake_deadlines.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        loop {
+            let driver = &mut self.driver;
+            let Some(conn_index) = driver.handshake_deadlines.pop_expired(now, |i, g| {
+                crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+            }) else {
+                return;
+            };
+            metrics::CONNECTIONS.increment(metrics::conn::TLS_HANDSHAKE_TIMEOUT);
+            self.executor
+                .wake_connect(conn_index, Err(crate::tls::handshake_deadline::timed_out()));
+            self.driver.close_connection(conn_index);
         }
     }
 }
