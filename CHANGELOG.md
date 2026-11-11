@@ -990,7 +990,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `disk_io_threads` doc said `Unsupported`; `open_direct_io_file` succeeded
   and its operations failed. On io_uring the value is accepted and unused,
   as before. Finding F6 of `docs/journal/2026-11-file-io-audit.md` (#870).
-- File I/O docs state the current behaviour: the `# Safety` sections of
+- Docs: the file I/O docs state the current behaviour: the `# Safety` sections of
   `fs::read`, `fs::write`, `direct_io_read`, `direct_io_write`, `nvme_read`
   and `nvme_write` say the buffer must outlive the operation, which a
   dropped future gives no way to observe (#825); the futures say what a drop
@@ -1822,8 +1822,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection's task when the connection closed, left its file open and its
   slot in the file table taken, on both backends, until the worker exited;
   enough of them filled the table. The file is now closed and the slot freed,
-  unless the future is dropped on a worker other than the one that created
-  it, which leaves both until that worker exits (#551).
+  unless the future is dropped on a thread other than the worker that
+  created it, which leaves both until that worker exits (#551).
 
 - On mio, files opened by `fs::open` and direct I/O files, and on io_uring,
   NVMe devices and direct I/O files before they enter the fixed-file table,

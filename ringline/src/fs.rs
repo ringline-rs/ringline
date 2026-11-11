@@ -14,10 +14,12 @@
 //! two operations, await the first before submitting the second.
 //!
 //! On io_uring a call that finds the ring's submission queue full submits the
-//! queue inline before pushing; if that submit fails (`Interrupted`, or
-//! `EBUSY` while the completion queue has overflowed, or `EAGAIN` when the
-//! kernel cannot start a worker thread), the call returns the error and
-//! leaves nothing in flight. Submission-queue room is `sq_entries` per worker.
+//! queue inline before pushing (under [`sqpoll`](crate::ConfigBuilder::sqpoll)
+//! it waits for the SQ thread to free an entry); if that submit
+//! (`io_uring_enter(2)`) fails, for example with `Interrupted`, `EBUSY` or
+//! `EAGAIN`, the call returns the error and leaves nothing in flight. The
+//! submission queue holds `sq_entries` entries per worker, shared by every
+//! operation on it.
 //!
 //! ## Blocking file I/O and connection closes (io_uring)
 //!
@@ -36,9 +38,10 @@
 //!   write;
 //! - on a filesystem that cannot run buffered writes asynchronously, such as
 //!   ext4 or f2fs (XFS and btrfs can): every write;
-//! - otherwise, opens and writes the kernel cannot finish without blocking.
-//!   A buffered read that misses the page cache on ext4, XFS or btrfs waits
-//!   for the page in task work rather than on the pool.
+//! - otherwise, opens, reads and writes the kernel cannot finish without
+//!   blocking, except that a buffered read that misses the page cache on
+//!   ext4, XFS or btrfs waits for the page in task work rather than on the
+//!   pool.
 //!
 //! [`direct_io_fsync`](crate::direct_io_fsync) always
 //! uses the pool too. Direct I/O reads and writes use it always on overlayfs
@@ -545,9 +548,10 @@ pub fn create(path: impl AsRef<std::path::Path>) -> io::Result<OpenFuture> {
 /// event loop's next iteration if the open has completed, otherwise when it
 /// completes.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it. Dropped on another worker, it leaves the file open and its slot
-/// taken until the owning worker exits.
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside a task poll it panics. Dropped on
+/// a thread other than the owning worker, it leaves the file open and its
+/// slot taken until the owning worker exits.
 pub struct OpenFuture {
     seq: u32,
     file_index: u16,
@@ -712,11 +716,12 @@ pub(crate) fn release_orphans(
 /// # Safety
 ///
 /// `buf` must point to writable memory of at least `len` bytes that remains
-/// valid until the operation completes. The operation keeps using the memory after the future is
-/// dropped, and a dropped future gives no way to learn when the operation
-/// completes, so after a drop the memory must not be freed or reused: leak
-/// it, or use an owned-buffer variant where one exists (#825). Here that is
-/// [`read_into`].
+/// `buf` must point to writable memory of at least `len` bytes that remains
+/// valid until the operation completes. The operation keeps using the memory
+/// after the future is dropped, and a dropped future gives no way to learn
+/// when the operation completes, so after a drop the memory must not be freed
+/// or reused: leak it, or use an owned-buffer variant where one exists (#825).
+/// Here that is [`read_into`].
 ///
 /// # Panics
 ///
@@ -746,11 +751,12 @@ pub unsafe fn read(file: File, offset: u64, buf: *mut u8, len: u32) -> io::Resul
 /// # Safety
 ///
 /// `buf` must point to readable memory of at least `len` bytes that remains
-/// valid until the operation completes. The operation keeps using the memory after the future is
-/// dropped, and a dropped future gives no way to learn when the operation
-/// completes, so after a drop the memory must not be freed or reused: leak
-/// it, or use an owned-buffer variant where one exists (#825). Here that is
-/// [`write_from`].
+/// `buf` must point to readable memory of at least `len` bytes that remains
+/// valid until the operation completes. The operation keeps using the memory
+/// after the future is dropped, and a dropped future gives no way to learn
+/// when the operation completes, so after a drop the memory must not be freed
+/// or reused: leak it, or use an owned-buffer variant where one exists (#825).
+/// Here that is [`write_from`].
 ///
 /// # Panics
 ///
@@ -784,8 +790,8 @@ pub unsafe fn write(file: File, offset: u64, buf: *const u8, len: u32) -> io::Re
 /// If the future is dropped before the I/O completes, the buffer is kept
 /// until the operation completes and then freed. On io_uring a best-effort
 /// `ASYNC_CANCEL` is also submitted. If the worker exits first, or the future
-/// is dropped on a worker other than the one that created it, the buffer is
-/// leaked.
+/// is dropped on a thread other than the worker that created it, the buffer
+/// is leaked.
 ///
 /// Returns [`io::ErrorKind::InvalidInput`] if `buf` has no spare capacity
 /// or if spare capacity exceeds `u32::MAX`. A spare capacity above
@@ -847,8 +853,8 @@ pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadF
 /// If the future is dropped before the I/O completes, the buffer is kept
 /// until the operation completes and then freed. On io_uring a best-effort
 /// `ASYNC_CANCEL` is also submitted. If the worker exits first, or the future
-/// is dropped on a worker other than the one that created it, the buffer is
-/// leaked.
+/// is dropped on a thread other than the worker that created it, the buffer
+/// is leaked.
 ///
 /// Returns [`io::ErrorKind::InvalidInput`] if `buf.len() > u32::MAX`. A
 /// length above `i32::MAX` is refused by macOS with `EINVAL` and written
@@ -889,8 +895,10 @@ pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFut
 /// Resolves to `(io::Result<usize>, BytesMut)`. On success `buf.len()` is
 /// extended by the number of bytes read.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it. Dropped on another worker, it leaks the buffer.
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside a task poll it panics. Dropped on
+/// a thread other than the owning worker, it leaks the buffer and leaves its
+/// result slot on the owning worker taken until that worker exits.
 pub struct ReadFuture {
     seq: u32,
     file_index: u16,
@@ -949,8 +957,10 @@ impl Drop for ReadFuture {
 /// Resolves to `(io::Result<usize>, BytesMut)`. The buffer is returned
 /// unchanged regardless of success or failure.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it. Dropped on another worker, it leaks the buffer.
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside a task poll it panics. Dropped on
+/// a thread other than the owning worker, it leaks the buffer and leaves its
+/// result slot on the owning worker taken until that worker exits.
 pub struct WriteFuture {
     seq: u32,
     file_index: u16,
@@ -1078,8 +1088,8 @@ fn park_buffer(
 }
 
 /// Fsync a file: `fsync(2)`, which persists the writes to it whose futures
-/// have resolved. A write whose future has not resolved is not covered;
-/// await it first.
+/// have resolved. A write whose future has not resolved may not be covered;
+/// await it first. On macOS `fsync(2)` does not flush the drive's own cache.
 ///
 /// On io_uring this always runs on the worker's io-wq pool; before Linux 6.13
 /// that can delay the worker's connection closes. See
@@ -1166,8 +1176,9 @@ fn stat_with(path: &std::path::Path, nofollow: bool) -> io::Result<StatFuture> {
 /// Future that resolves to the file's [`Metadata`]. Dropping it before it
 /// resolves discards the result.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it. Dropped on another worker, it leaves its result slot on the
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside a task poll it panics. Dropped on
+/// a thread other than the owning worker, it leaves its result slot on the
 /// owning worker taken until that worker exits.
 // On io_uring the statx buffer is owned by the command slab entry, and on
 // completion the handler converts it to `Metadata` and stores it in

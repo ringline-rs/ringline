@@ -5038,11 +5038,12 @@ impl<F: Future> Future for TimeoutFuture<F> {
 /// `fs::read`, `fs::write`, `direct_io_read` and `direct_io_write` (a short
 /// count is not an error), and `0` for `fs::fsync`, `fs::rename`,
 /// `fs::remove`, `fs::mkdir`, `direct_io_fsync` and every NVMe command. A
-/// failure resolves to the errno's `io::Error`, or for an NVMe command the
-/// device failed to the error `nvme_read` describes.
+/// failure resolves to the errno's `io::Error`; an NVMe command the device
+/// rejected resolves to `EIO`, and the device's status word is not carried.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it. Dropped on another worker, it leaves its result slot on the
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside a task poll it panics. Dropped on
+/// a thread other than the owning worker, it leaves its result slot on the
 /// owning worker taken until that worker exits.
 pub struct DiskIoFuture {
     pub(crate) seq: u32,
@@ -5203,11 +5204,12 @@ pub fn open_nvme_device(path: &str, nsid: u32) -> io::Result<crate::nvme::NvmeDe
 /// # Safety
 ///
 /// `buf` must point to aligned, writable memory of at least `len` bytes
-/// that remains valid until the operation completes. The operation keeps using the memory after the future is
-/// dropped, and a dropped future gives no way to learn when the operation
-/// completes, so after a drop the memory must not be freed or reused: leak
-/// it, or use an owned-buffer variant where one exists (#825).
-/// Direct I/O has no owned-buffer variant.
+/// `buf` must point to aligned, writable memory of at least `len` bytes that
+/// remains valid until the operation completes. The operation keeps using the
+/// memory after the future is dropped, and a dropped future gives no way to
+/// learn when the operation completes, so after a drop the memory must not be
+/// freed or reused: leak it, or use an owned-buffer variant where one exists
+/// (#825). Direct I/O has no owned-buffer variant.
 ///
 /// # Panics
 ///
@@ -5239,11 +5241,12 @@ pub unsafe fn direct_io_read(
 /// # Safety
 ///
 /// `buf_addr` must point to valid, aligned memory of at least `buf_len`
-/// bytes that remains valid until the operation completes. The operation keeps using the memory after the future is
-/// dropped, and a dropped future gives no way to learn when the operation
-/// completes, so after a drop the memory must not be freed or reused: leak
-/// it, or use an owned-buffer variant where one exists (#825).
-/// NVMe has no owned-buffer variant.
+/// `buf_addr` must point to valid, aligned memory of at least `buf_len` bytes
+/// that remains valid until the operation completes. The operation keeps using
+/// the memory after the future is dropped, and a dropped future gives no way
+/// to learn when the operation completes, so after a drop the memory must not
+/// be freed or reused: leak it, or use an owned-buffer variant where one
+/// exists (#825). NVMe has no owned-buffer variant.
 ///
 /// # Panics
 ///
@@ -5275,11 +5278,12 @@ pub unsafe fn nvme_read(
 /// # Safety
 ///
 /// `buf` must point to aligned, readable memory of at least `len` bytes
-/// that remains valid until the operation completes. The operation keeps using the memory after the future is
-/// dropped, and a dropped future gives no way to learn when the operation
-/// completes, so after a drop the memory must not be freed or reused: leak
-/// it, or use an owned-buffer variant where one exists (#825).
-/// Direct I/O has no owned-buffer variant.
+/// `buf` must point to aligned, readable memory of at least `len` bytes that
+/// remains valid until the operation completes. The operation keeps using the
+/// memory after the future is dropped, and a dropped future gives no way to
+/// learn when the operation completes, so after a drop the memory must not be
+/// freed or reused: leak it, or use an owned-buffer variant where one exists
+/// (#825). Direct I/O has no owned-buffer variant.
 ///
 /// # Panics
 ///
@@ -5357,11 +5361,12 @@ pub fn nvme_flush(device: crate::nvme::NvmeDevice) -> io::Result<DiskIoFuture> {
 /// # Safety
 ///
 /// `buf_addr` must point to valid, aligned memory of at least `buf_len`
-/// bytes that remains valid until the operation completes. The operation keeps using the memory after the future is
-/// dropped, and a dropped future gives no way to learn when the operation
-/// completes, so after a drop the memory must not be freed or reused: leak
-/// it, or use an owned-buffer variant where one exists (#825).
-/// NVMe has no owned-buffer variant.
+/// `buf_addr` must point to valid, aligned memory of at least `buf_len` bytes
+/// that remains valid until the operation completes. The operation keeps using
+/// the memory after the future is dropped, and a dropped future gives no way
+/// to learn when the operation completes, so after a drop the memory must not
+/// be freed or reused: leak it, or use an owned-buffer variant where one
+/// exists (#825). NVMe has no owned-buffer variant.
 ///
 /// # Panics
 ///
