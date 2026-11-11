@@ -3922,6 +3922,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             metrics::CONNECTIONS_ACTIVE.decrement();
         }
 
+        // I6: Generation check — a Close Cqe from a prior occupant (same slot,
+        // different generation) must not close the new occupant. `remove_connection`
+        // drops all futures per `task_slab.remove()`, which aborts whatever task
+        // currently occupies the slot if the Cqe is stale.
+        // Match the pattern from `handle_connect`: if generation mismatches, return
+        // without touching the new occupant.
+        match self.driver.connections.get(conn_index) {
+            Some(conn) if conn.generation == ud.payload() => {}
+            _ => return,
+        };
+
         // Remove the async task (drops the future), with the driver state
         // installed so the futures it holds clean up as inside a poll.
         crate::runtime::io::with_driver_state(
