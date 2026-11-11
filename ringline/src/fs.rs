@@ -273,12 +273,14 @@ impl FsConfig {
     /// with `filesystem command slab exhausted`, on both backends.
     ///
     /// On io_uring each command slot has 16,384 operation keys. A future holds
-    /// one from submission until it takes its result or is dropped, so a
-    /// future that is neither polled to completion nor dropped keeps its key
-    /// after its command completes. The slot freed last is reused first, so in
-    /// a serial workload 16,384 such futures make the next operation fail with
-    /// `every disk-I/O key for this slab slot is held by a future`, while
-    /// other slots are free.
+    /// one from submission until it takes its result or is dropped on the
+    /// worker that created it. A future that is neither polled to completion
+    /// nor dropped keeps its key after its command completes, and one dropped
+    /// on another thread keeps it for the life of that worker. The slot freed
+    /// last is reused first, so in a serial workload 16,384 such futures make
+    /// every later operation fail with `every disk-I/O key for this slab slot
+    /// is held by a future`, until one of them takes its result or is dropped,
+    /// while other slots are free.
     pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
         self.max_commands_in_flight = max_commands_in_flight;
         self
