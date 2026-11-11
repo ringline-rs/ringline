@@ -10058,6 +10058,9 @@ mod tests {
         use std::task::{Context, Poll};
 
         let mut el = make_test_loop();
+        // The `WaitFuture` below reaps the child with waitid(2), which
+        // clippy cannot see.
+        #[allow(clippy::zombie_processes)]
         let mut sleeper = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
