@@ -16977,8 +16977,9 @@ mod tests {
                                     ),
                                 );
                                 el.test_dispatch_cqe(ud.raw(), -104, 0);
-                                let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                                let close_ud = UserData::encode(OpTag::Close, ci, el.driver.connections.generation(ci));
                                 el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                                prop_assert!(el.driver.connections.get(ci).is_none(), "the Close CQE released the slot");
                             } else {
                                 live_conns.insert(0, ci); // put it back
                             }
@@ -17023,8 +17024,9 @@ mod tests {
                                     !el.driver.send_slab.in_use(slab_idx),
                                     "the error path releases the entry"
                                 );
-                                let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                                let close_ud = UserData::encode(OpTag::Close, ci, el.driver.connections.generation(ci));
                                 el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                                prop_assert!(el.driver.connections.get(ci).is_none(), "the Close CQE released the slot");
                             } else {
                                 live_conns.insert(0, ci); // put it back
                             }
@@ -17038,8 +17040,9 @@ mod tests {
                             el.test_dispatch_cqe(ud.raw(), 0, 0);
                             el.driver.close_connection(ci);
                             // Simulate Close CQE.
-                            let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                            let close_ud = UserData::encode(OpTag::Close, ci, el.driver.connections.generation(ci));
                             el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                            prop_assert!(el.driver.connections.get(ci).is_none(), "the Close CQE released the slot");
                         }
 
                         // Recv data.
@@ -17067,8 +17070,9 @@ mod tests {
                                 el.test_dispatch_cqe(send_ud.raw(), 4, 0);
                                 // The task's return closes; then the Close CQE.
                                 el.driver.close_connection(ci);
-                                let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                                let close_ud = UserData::encode(OpTag::Close, ci, el.driver.connections.generation(ci));
                                 el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                                prop_assert!(el.driver.connections.get(ci).is_none(), "the Close CQE released the slot");
                             } else {
                                 live_conns.insert(0, ci); // put it back
                             }
@@ -17078,8 +17082,9 @@ mod tests {
                         8 if !live_conns.is_empty() => {
                             let ci = live_conns.remove(0);
                             el.driver.close_connection(ci);
-                            let close_ud = UserData::encode(OpTag::Close, ci, 0);
+                            let close_ud = UserData::encode(OpTag::Close, ci, el.driver.connections.generation(ci));
                             el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                            prop_assert!(el.driver.connections.get(ci).is_none(), "the Close CQE released the slot");
                         }
 
                         // No-op (or action on empty conn list).
@@ -17090,8 +17095,9 @@ mod tests {
                 // Clean up remaining live connections.
                 for ci in &live_conns {
                     el.driver.close_connection(*ci);
-                    let close_ud = UserData::encode(OpTag::Close, *ci, 0);
+                    let close_ud = UserData::encode(OpTag::Close, *ci, el.driver.connections.generation(*ci));
                     el.test_dispatch_cqe(close_ud.raw(), 0, 0);
+                    prop_assert!(el.driver.connections.get(*ci).is_none(), "the Close CQE released the slot");
                 }
 
                 // Invariants: no resource leaks.
