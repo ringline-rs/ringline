@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F7 fixed (#871), F8 fixed (#872), F9 fixed (#873), F10 fixed (#874), P3 documented (#877); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
+- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F7 fixed (#871), F8 fixed (#872), F9 fixed (#873), F10 fixed (#874), P3 documented (#877), P4 documented (#878); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -182,6 +182,8 @@ Per `fs::read_into`: one 128-byte SQE, one CQE, no syscall of its own, no alloca
 `engine/uring.rs:255-274`: `push_sqe128` on a full SQ calls `make_sq_room(1)`, one `io_uring_enter` on the worker, and errors only if the SQ is still full. The three slabs allow 768 disk SQEs against `sq_entries` 256. Not a user-visible cost at the defaults; it corrects invariant 9 and is the source of the undocumented errors in F10.
 
 ### P4 — io_uring: 16,384 keys per slab slot, with LIFO slot reuse (invariant 13). By reading; low.
+
+**Documented (#878):** the `max_commands_in_flight` docs of `FsConfig`, `DirectIoConfig` and `NvmeConfig` state the limit and its trigger; the code is unchanged, and the slot-indexed table of L3 is what would remove it. The text below is as found at 6851de26.
 
 A serial workload lands every operation on one slab slot; a future that completed but is never polled again and never dropped holds its key, and after 16,384 of them the next operation on that slot fails while 255 slots are free. The scan cost is benign (a held key costs one extra lookup per 16,384 allocations); the failure is the finding. The slot-indexed table of L3 removes the shared counter.
 
