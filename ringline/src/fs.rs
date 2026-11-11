@@ -376,14 +376,16 @@ pub(crate) struct FsCmdEntry {
     pub path: Option<CString>,
     /// Second path for rename (kept alive until CQE).
     pub path2: Option<CString>,
-    /// The statx buffer of a stat, written by the kernel until the CQE. In
-    /// the entry rather than boxed per call; the slab never moves an entry.
+    /// The statx buffer of a stat; the kernel writes it until the CQE through
+    /// a pointer into this entry.
     #[cfg(target_os = "linux")]
     pub statx_buf: libc::statx,
 }
 
 /// Tracks in-flight filesystem commands for resource cleanup on completion.
 pub(crate) struct FsCmdSlab {
+    /// Filled in `new` and never resized: an in-flight stat holds a pointer
+    /// into its entry.
     entries: Vec<FsCmdEntry>,
     free_list: Vec<u16>,
 }
@@ -607,8 +609,8 @@ struct OrphanedBuffers(Vec<(u32, u16, BytesMut)>);
 impl Drop for OrphanedBuffers {
     fn drop(&mut self) {
         // Dropped when the worker thread exits. The operations may still be
-        // using these buffers, so leak them, as the executor's graveyard does
-        // at exit.
+        // using these buffers, so leak them, as the executor does with parked
+        // buffers at exit.
         for (_, _, buf) in self.0.drain(..) {
             std::mem::forget(buf);
         }
@@ -625,10 +627,10 @@ impl Drop for OrphanedBuffers {
 /// writes. Called by the event loop at the start of every task-poll pass,
 /// after the first pass, and before the worker waits for I/O.
 ///
-/// An open that has completed is closed now. One still in flight is marked in
-/// abandoned, and its completion handler closes it. A buffer whose
-/// operation has completed is dropped now; one still in flight is parked in
-/// the graveyard until the completion arrives.
+/// An open that has completed is closed now. One still in flight is marked
+/// abandoned (`Executor::abandon_disk_io_open`), and its completion handler
+/// closes it. A buffer whose operation has completed is dropped now; one still
+/// in flight is parked (`DiskIoEntry::Parked`) until the completion arrives.
 pub(crate) fn release_orphans(
     driver: &mut crate::backend::Driver,
     executor: &mut crate::runtime::Executor,
@@ -784,7 +786,7 @@ pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadF
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
         // Safety: caller-side invariant is upheld by ReadFuture's ownership +
-        // graveyard-on-drop (see ReadFuture::Drop).
+        // parking on drop (see ReadFuture::Drop).
         let seq = unsafe { ctx.fs_read(file, offset, ptr, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.wait_disk_io(seq, task_id);
@@ -832,7 +834,7 @@ pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFut
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
         // Safety: caller-side invariant is upheld by WriteFuture's ownership +
-        // graveyard-on-drop (see WriteFuture::Drop).
+        // parking on drop (see WriteFuture::Drop).
         let seq = unsafe { ctx.fs_write(file, offset, ptr, len_u32)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.wait_disk_io(seq, task_id);
@@ -1145,7 +1147,8 @@ impl Future for StatFuture {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
                 }
                 Some((_, Some(metadata))) => Poll::Ready(Ok(metadata)),
-                // The completion handler stores the metadata with the result.
+                // Unreachable: a successful stat's completion carries its
+                // metadata.
                 Some((_, None)) => Poll::Ready(Err(io::Error::other("stat result missing"))),
                 None => pending(cx),
             }

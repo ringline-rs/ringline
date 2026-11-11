@@ -30,6 +30,7 @@ pub(crate) mod task;
 pub(crate) mod waker;
 
 use std::cell::Cell;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::io as stdio;
 
@@ -403,16 +404,19 @@ impl TimerSlotPool {
     }
 }
 
-/// Hasher for the 32-bit disk-I/O keys: one multiply, where the default
-/// hasher runs SipHash over the four bytes. A key's low 16 bits are a slab
-/// index and its high bits a kind and a sequence, so the multiply spreads
-/// them.
+/// Hasher for the 32-bit disk-I/O keys: one multiply and a fold, where the
+/// default hasher runs SipHash over the four bytes. The low bits of a product
+/// depend only on the low bits of the key, which on io_uring are the slab
+/// index, and hashbrown takes the bucket from the low bits of the hash; so
+/// `finish` folds the high half of the product, which depends on every key
+/// bit, into the low half. Without the fold every key of one slab slot would
+/// start its probe at the same bucket.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct KeyHasher(u64);
 
 impl std::hash::Hasher for KeyHasher {
     fn finish(&self) -> u64 {
-        self.0
+        self.0 ^ (self.0 >> 32)
     }
 
     fn write(&mut self, bytes: &[u8]) {
@@ -432,8 +436,8 @@ pub(crate) type KeyMap<V> = HashMap<u32, V, std::hash::BuildHasherDefault<KeyHas
 pub(crate) type KeySet = std::collections::HashSet<u32, std::hash::BuildHasherDefault<KeyHasher>>;
 
 /// What the executor holds for one disk-I/O key, from the future's creation
-/// until the future takes its result or the completion releases what a
-/// dropped future left behind.
+/// until the future takes its result or is dropped, or until the completion
+/// releases what a dropped future left behind.
 pub(crate) enum DiskIoEntry {
     /// A future holds the key: the task to wake when the operation
     /// completes, and the result and stat metadata once it has.
@@ -636,8 +640,9 @@ pub(crate) struct Executor {
     /// empty because sends are synchronous and never suspend.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) udp_send_ready_waiters: Vec<Option<u32>>,
-    /// Disk I/O: what the executor holds per key ([`DiskIoEntry`]), so each
-    /// step of an operation is one lookup.
+    /// Disk I/O: what the executor holds per key ([`DiskIoEntry`]); each step
+    /// of an operation is one lookup in this map, plus an update of the held
+    /// set (`DISK_IO_LIVE`) when the step ends the future's hold.
     pub(crate) disk_io: KeyMap<DiskIoEntry>,
     /// Pending DNS resolve requests: request_id -> (task_id to wake, result slot).
     pub(crate) pending_resolves: HashMap<u64, (u32, Option<stdio::Result<std::net::SocketAddr>>)>,
@@ -686,7 +691,7 @@ pub(crate) struct Executor {
 
 impl Drop for Executor {
     fn drop(&mut self) {
-        // A buffer still in the graveyard belongs to an operation whose
+        // A buffer still parked belongs to an operation whose
         // completion this executor has not seen. The exit drain waited for the
         // operation, or on mio had the pool skip it, or the worker leaked this
         // executor; the drain delivers no completions, so the buffer is here
@@ -954,18 +959,20 @@ impl Executor {
     /// Hold the key `seq` for a future created by `task_id`'s task, which is
     /// woken when the operation completes.
     pub(crate) fn wait_disk_io(&mut self, seq: u32, task_id: u32) {
-        match self.disk_io.get_mut(&seq) {
-            Some(DiskIoEntry::Held { waiter, .. }) => *waiter = Some(task_id),
-            Some(_) => {}
-            None => {
-                self.disk_io.insert(
-                    seq,
-                    DiskIoEntry::Held {
-                        waiter: Some(task_id),
-                        result: None,
-                        metadata: None,
-                    },
-                );
+        match self.disk_io.entry(seq) {
+            Entry::Occupied(mut e) => match e.get_mut() {
+                DiskIoEntry::Held { waiter, .. } => *waiter = Some(task_id),
+                // A parked buffer or abandoned open keeps its key until its
+                // completion, and the key allocators skip a key in flight, so
+                // no new future can be given it.
+                _ => debug_assert!(false, "disk-I/O key {seq:#x} reused while in flight"),
+            },
+            Entry::Vacant(e) => {
+                e.insert(DiskIoEntry::Held {
+                    waiter: Some(task_id),
+                    result: None,
+                    metadata: None,
+                });
             }
         }
         DISK_IO_LIVE.with(|live| live.borrow_mut().insert(seq));
@@ -980,22 +987,25 @@ impl Executor {
         seq: u32,
         task_id: u32,
     ) -> Option<(i32, Option<crate::fs::Metadata>)> {
-        match self.disk_io.get_mut(&seq) {
-            Some(DiskIoEntry::Held {
+        let Entry::Occupied(mut e) = self.disk_io.entry(seq) else {
+            return None;
+        };
+        match e.get_mut() {
+            DiskIoEntry::Held {
                 result: Some(_), ..
-            }) => {}
-            Some(DiskIoEntry::Held { waiter, .. }) => {
+            } => {}
+            DiskIoEntry::Held { waiter, .. } => {
                 *waiter = Some(task_id);
                 return None;
             }
             // A parked or abandoned key: no future polls it.
             _ => return None,
         }
-        let Some(DiskIoEntry::Held {
+        let DiskIoEntry::Held {
             result: Some(result),
             metadata,
             ..
-        }) = self.disk_io.remove(&seq)
+        } = e.remove()
         else {
             unreachable!("checked above");
         };
@@ -1006,18 +1016,19 @@ impl Executor {
     /// Take the result of the operation `seq`, if it has completed. Taking
     /// it ends the future's interest in the key.
     pub(crate) fn take_disk_io_result(&mut self, seq: u32) -> Option<i32> {
-        match self.disk_io.get(&seq) {
-            Some(DiskIoEntry::Held {
-                result: Some(result),
-                ..
-            }) => {
-                let result = *result;
-                self.disk_io.remove(&seq);
-                untrack_disk_io(seq);
-                Some(result)
-            }
-            _ => None,
-        }
+        let Entry::Occupied(e) = self.disk_io.entry(seq) else {
+            return None;
+        };
+        let DiskIoEntry::Held {
+            result: Some(result),
+            ..
+        } = *e.get()
+        else {
+            return None;
+        };
+        e.remove();
+        untrack_disk_io(seq);
+        Some(result)
     }
 
     /// Forget the operation `seq`, whose future was dropped before it took
@@ -1025,8 +1036,10 @@ impl Executor {
     /// its key from the held set, so `wake_disk_io` discards a result that
     /// arrives later.
     pub(crate) fn abandon_disk_io(&mut self, seq: u32) {
-        if let Some(DiskIoEntry::Held { .. }) = self.disk_io.get(&seq) {
-            self.disk_io.remove(&seq);
+        if let Entry::Occupied(e) = self.disk_io.entry(seq)
+            && matches!(e.get(), DiskIoEntry::Held { .. })
+        {
+            e.remove();
         }
         untrack_disk_io(seq);
     }
@@ -1047,11 +1060,12 @@ impl Executor {
 
     /// Whether the open `seq` was abandoned; if so, forget it.
     pub(crate) fn take_abandoned_open(&mut self, seq: u32) -> bool {
-        if matches!(self.disk_io.get(&seq), Some(DiskIoEntry::AbandonedOpen)) {
-            self.disk_io.remove(&seq);
-            true
-        } else {
-            false
+        match self.disk_io.entry(seq) {
+            Entry::Occupied(e) if matches!(e.get(), DiskIoEntry::AbandonedOpen) => {
+                e.remove();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1075,21 +1089,24 @@ impl Executor {
         result: i32,
         metadata: Option<crate::fs::Metadata>,
     ) {
-        let task_id = match self.disk_io.get_mut(&seq) {
-            Some(DiskIoEntry::Parked(_)) => {
-                self.disk_io.remove(&seq);
+        let Entry::Occupied(mut e) = self.disk_io.entry(seq) else {
+            return;
+        };
+        let task_id = match e.get_mut() {
+            DiskIoEntry::Parked(_) => {
+                e.remove();
                 return;
             }
-            Some(DiskIoEntry::Held {
+            DiskIoEntry::Held {
                 waiter,
                 result: slot,
                 metadata: slot_metadata,
-            }) => {
+            } => {
                 *slot = Some(result);
                 *slot_metadata = metadata;
                 waiter.take()
             }
-            Some(DiskIoEntry::AbandonedOpen) | None => return,
+            DiskIoEntry::AbandonedOpen => return,
         };
         if let Some(task_id) = task_id {
             self.wake_task(task_id);

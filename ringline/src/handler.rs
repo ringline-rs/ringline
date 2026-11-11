@@ -916,10 +916,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Allocate a 32-bit disk-I/O completion key: the subsystem in the top 2
     /// bits, a 14-bit sequence below it, and the slab index in the low 16.
-    /// fs, NVMe and direct I/O share the executor's completion and graveyard
-    /// maps but have independent slabs, each numbering its slots from 0.
-    /// CQE handlers extract the slab index from the low 16 bits and wake with
-    /// the full key.
+    /// fs, NVMe and direct I/O share the executor's disk-I/O entry map but
+    /// have independent slabs, each numbering its slots from 0. CQE handlers
+    /// extract the slab index from the low 16 bits and wake with the full key.
     ///
     /// A key is held from submission until its future takes the result or is
     /// dropped, which can be long after the slab slot is freed. A key a

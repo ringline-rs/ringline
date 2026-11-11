@@ -317,9 +317,9 @@ pub(crate) struct Driver {
     pub(crate) fs_fds: Vec<Option<Arc<OwnedFd>>>,
     /// Pending fs_open requests: maps seq → file_index. On completion, the
     /// opened fd (`DiskIoResponse::opened`) is stored in `fs_fds[file_index]`.
-    /// On failure, the file slot is released. If the seq is in
-    /// abandoned (`Executor::take_abandoned_open`), the fd is dropped and the slot released
-    /// instead.
+    /// On failure, the file slot is released. If the open was abandoned
+    /// (`Executor::take_abandoned_open` returns true), the fd is dropped and
+    /// the slot released instead.
     pub(crate) pending_fs_opens: std::collections::HashMap<u32, u16>,
 }
 
