@@ -1431,14 +1431,15 @@ impl Driver {
     /// that is never reused would hold a `ParkState` for the life of the
     /// process.
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
-        if let Some(conn) = self.connections.get_mut(conn_index) {
+        let established = if let Some(conn) = self.connections.get_mut(conn_index) {
             if conn.close_requested() {
                 return; // already closing — avoid double Close SQE
             }
             conn.lifecycle = Lifecycle::Closing;
+            conn.established
         } else {
             return;
-        }
+        };
         self.forward_zc_consumed[conn_index as usize] = 0;
         // Release handler state here rather than waiting for the slot to be
         // reused: a `ParkState` is an arbitrary user value, and a slot that is
@@ -1456,6 +1457,19 @@ impl Driver {
         // submitted carry bytes the peer is owed, and io_uring does not
         // order independent SQEs (Domain Invariant 2), so they go out one
         // at a time through `submit_next_queued`.
+        //
+        // Before its handshake (or connect) completes, a connection drains its
+        // queue, so the peer receives the rest of the handshake flight and any
+        // alert, but only until the close deadline: a peer that stopped
+        // reading would otherwise hold the slot while the flight waits for
+        // room. `check_close_notify_deadlines` then force-finalizes it.
+        if !established {
+            self.send_queues[conn_index as usize].close_notify_deadline =
+                Some(std::time::Instant::now() + crate::handler::CLOSE_NOTIFY_TIMEOUT);
+            if !self.close_notify_armed.contains(&conn_index) {
+                self.close_notify_armed.push(conn_index);
+            }
+        }
         let state = &mut self.send_queues[conn_index as usize];
         state.close_pending = true;
         if state.in_flight {

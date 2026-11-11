@@ -685,15 +685,25 @@ impl Driver {
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
-        if let Some(conn) = self.connections.get_mut(conn_index) {
+        let established = if let Some(conn) = self.connections.get_mut(conn_index) {
             if conn.close_requested() {
                 return; // already closing
             }
             conn.lifecycle = Lifecycle::Closing;
+            conn.established
         } else {
             return;
-        }
+        };
         self.send_queues[idx].close_pending = true;
+        // Before its handshake (or connect) completes, a connection drains its
+        // queue, so the peer receives the rest of the handshake flight and any
+        // alert, but only until the close deadline: a peer that stopped
+        // reading would otherwise hold the slot while the flight waits for
+        // room. `drain_pending_closes` stops waiting once it passes.
+        if !established {
+            self.send_queues[idx].close_notify_deadline =
+                Some(std::time::Instant::now() + crate::handler::CLOSE_NOTIFY_TIMEOUT);
+        }
         self.pending_closes.push(conn_index);
     }
 
@@ -729,11 +739,17 @@ impl Driver {
         // above issued the FIN when it drained the queue, and a write after
         // it fails with `EPIPE`. A shutdown still pending here has no stream
         // to write to. `queue_tls_close_notify` and `DriverCtx::close` apply
-        // the rule on io_uring.
-        let alert_allowed = self
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| matches!(c.write, WriteHalf::Open));
+        // the rule on io_uring. No alert either while sends are still queued
+        // or the flush failed: the alert would follow an unsent or partly
+        // written record, and the peer would read a corrupt stream. That is
+        // the case for a connection closed before its handshake completed
+        // whose close deadline passed.
+        let alert_allowed = flush_error.is_none()
+            && self.pending_sends[idx].is_empty()
+            && self
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| matches!(c.write, WriteHalf::Open));
 
         if let Some(ref mut stream) = self.tcp_streams[idx] {
             use std::io::Write;
@@ -793,6 +809,7 @@ impl Driver {
         self.send_queues[idx].queue.clear();
         self.send_queues[idx].in_flight = false;
         self.send_queues[idx].close_pending = false;
+        self.send_queues[idx].close_notify_deadline = None;
 
         // The future dropped at teardown may have owned a half, whose `Drop`
         // queues an orphan that finds a changed generation. Clear the flags
