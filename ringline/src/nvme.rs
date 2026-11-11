@@ -492,7 +492,7 @@ mod tests {
     /// resolves to an error that carries the word. Zero and a negative errno
     /// resolve as before.
     #[test]
-    fn a_status_word_reaches_the_caller_as_the_errors_source() {
+    fn a_status_word_reaches_the_caller_as_the_errors_inner_error() {
         assert_eq!(status_result(0), 0);
         assert_eq!(status_result(-libc::EINVAL), -libc::EINVAL);
         let encoded = status_result(0x281);
