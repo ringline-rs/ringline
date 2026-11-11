@@ -386,9 +386,10 @@ impl NvmeCmdSlab {
 
 /// The status word of an NVMe command the device failed.
 ///
-/// The source of the `io::Error` of kind `Other` that [`nvme_read`](crate::nvme_read),
+/// The inner error of the `io::Error` of kind `Other` that [`nvme_read`](crate::nvme_read),
 /// [`nvme_write`](crate::nvme_write) and [`nvme_flush`](crate::nvme_flush)
-/// resolve to for such a command: `error.get_ref()` downcasts to this type.
+/// resolve to for such a command: `error.get_ref()` or `error.into_inner()`
+/// gives it, and it downcasts to this type. It is not in the `source()` chain.
 /// A command that failed in transport resolves to the errno's `io::Error`
 /// instead. The word is the 15-bit status field of the completion queue
 /// entry: status code type in bits 8 to 10, status code in bits 0 to 7.
@@ -427,8 +428,8 @@ const STATUS_RESULT_BASE: i32 = 0x1_0000;
 
 /// The disk-I/O result of an NVMe command's `cqe->res`: 0 and a negative
 /// errno pass through, and a positive status word (the device failed the
-/// command) becomes a negative value above every errno, so the result stays
-/// an error and keeps the word.
+/// command) becomes a negative value at or below `-0x1_0000`, past every
+/// errno, so the result stays an error and keeps the word.
 pub(crate) fn status_result(res: i32) -> i32 {
     if res > 0 {
         -(STATUS_RESULT_BASE | (res & 0xFFFF))
@@ -502,7 +503,7 @@ mod tests {
             .get_ref()
             .and_then(|e| e.downcast_ref::<NvmeStatus>())
             .copied()
-            .expect("the error's source is the status word");
+            .expect("the error's inner error is the status word");
         assert_eq!(status.word(), 0x281);
         assert_eq!(status.code_type(), 2, "media and data integrity");
         assert_eq!(status.code(), 0x81, "unrecovered read error");

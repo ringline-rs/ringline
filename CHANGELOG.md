@@ -343,8 +343,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `UdpSocket` half, a `fs::File`. Code that relied on
   `H: AsyncEventHandler` implying `H: Send` must add the bound itself.
 - **Breaking:** `fs::File`, `direct_io::DirectIoFile` and `nvme::NvmeDevice`
-  are no longer `Send`, and neither are `DirectIoCompletion` and
-  `NvmeCompletion`, which hold them. Each handle is a slot in the table of the
+  are no longer `Send`. Each handle is a slot in the table of the
   worker that opened it. Used on another worker it named that worker's slot:
   a write through a `File` opened on worker 0 and used on worker 1 succeeded
   and landed in worker 1's file. Use a handle on the worker that opened it, or
@@ -998,7 +997,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and its operations failed. On io_uring the value is accepted and unused,
   as before. Finding F6 of `docs/journal/2026-11-file-io-audit.md` (#870).
 - io_uring NVMe: a command the device fails resolves to an `io::Error` of
-  kind `Other` whose source is the new `NvmeStatus`, the completion's
+  kind `Other` whose inner error (`get_ref()`, `into_inner()`) is the new
+  `NvmeStatus`, the completion's
   status word (`word()`, `code_type()`, `code()`). Before, every status word
   became `EIO`, so a media error and an invalid field read the same. A
   transport failure still resolves to the errno's `io::Error`. Finding F7

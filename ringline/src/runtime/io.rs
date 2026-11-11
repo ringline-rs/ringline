@@ -5219,8 +5219,9 @@ pub unsafe fn direct_io_read(
 /// Reads `num_blocks` logical blocks starting at `lba` into the buffer
 /// at `buf_addr` with length `buf_len`. The returned future completes
 /// when the io_uring CQE arrives, with `Ok(0)` for a command the device
-/// completed, an `io::Error` of kind `Other` whose source is the
-/// [`NvmeStatus`](crate::NvmeStatus) for one the device failed, and the
+/// completed, an `io::Error` of kind `Other` whose inner error (`get_ref()`,
+/// `into_inner()`) is the [`NvmeStatus`](crate::NvmeStatus) for one the
+/// device failed, and the
 /// errno's `io::Error` for a transport failure.
 ///
 /// # Safety
