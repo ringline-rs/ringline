@@ -1019,6 +1019,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a `sleep`, `sleep_until`, `try_sleep` or `try_sleep_until` whose
+  timeout SQE cannot be pushed, because the submission queue has no room,
+  keeps its timer slot, wakes its task and pushes again on the next poll.
+  Before, `sleep` and `sleep_until` panicked with `timer SQE submission
+  failed`, and `try_sleep` and `try_sleep_until` freed the slot and left the
+  first poll to allocate and push again, which panicked on an exhausted pool
+  or a second failed push. The same holds for `timeout`, `timeout_at`,
+  `try_timeout` and `try_timeout_at`. A relative sleep (`sleep`, `try_sleep`,
+  `timeout`, `try_timeout`) armed on a later poll counts its duration from
+  that push (#832).
 - mio with the `tls-buffered` feature: one rustls `write_tls` call writes at
   most 64 records, and the mio paths called it once where more could be
   pending; the rest stayed in rustls until the next receive or send. A flush

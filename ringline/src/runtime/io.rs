@@ -4570,6 +4570,9 @@ mod yield_now_tests {
 ///
 /// On io_uring, uses a timeout SQE internally — no busy-waiting, no timer
 /// thread. The timer fires on the same worker thread as the calling task.
+/// The SQE is pushed on the first poll; if the submission queue has no room,
+/// it is pushed on a later poll, after the event loop has submitted, and the
+/// duration counts from that push.
 ///
 /// # Panics
 ///
@@ -4580,6 +4583,7 @@ pub fn sleep(duration: Duration) -> SleepFuture {
     SleepFuture {
         duration,
         timer_slot: None,
+        armed: false,
         owner: 0,
         generation: 0,
         absolute: None,
@@ -4595,6 +4599,10 @@ pub struct SleepFuture {
     duration: Duration,
     /// None until first poll, then Some(slot_index).
     timer_slot: Option<u32>,
+    /// Whether the timer is armed: on io_uring, its timeout SQE was pushed.
+    /// A slot whose push failed is held unarmed, and the next poll pushes
+    /// again.
+    armed: bool,
     /// Generation when the slot was allocated.
     generation: u16,
     /// If Some, this is an absolute timer (sleep_until).
@@ -4603,89 +4611,103 @@ pub struct SleepFuture {
     owner: u32,
 }
 
+impl SleepFuture {
+    /// Arm the timer in `slot`: on io_uring push its timeout SQE, on mio
+    /// record its deadline. Sets `armed` when it succeeds. A failed push is
+    /// backpressure (Domain Invariant 7): the slot stays held, and the caller
+    /// tries again on a later poll.
+    #[cfg_attr(not(has_io_uring), allow(unused_variables))]
+    fn arm(
+        &mut self,
+        driver: &mut crate::backend::Driver,
+        executor: &mut crate::runtime::Executor,
+        slot: u32,
+        generation: u16,
+    ) {
+        #[cfg(has_io_uring)]
+        {
+            let payload = TimerSlotPool::encode_payload(slot, generation);
+            let ud = UserData::encode(OpTag::Timer, 0, payload);
+            let pushed = if let Some(deadline) = self.absolute {
+                let ts_ptr = executor
+                    .timer_pool
+                    .set_absolute(slot, deadline.secs, deadline.nsecs);
+                driver.ring.submit_timeout_abs(ts_ptr, ud)
+            } else {
+                let ts_ptr = executor.timer_pool.set_relative(slot, self.duration);
+                driver.ring.submit_timeout(ts_ptr, ud)
+            };
+            self.armed = pushed.is_ok();
+        }
+
+        #[cfg(not(has_io_uring))]
+        {
+            // The event loop polls the deadline.
+            if let Some(deadline) = self.absolute {
+                executor
+                    .timer_pool
+                    .set_absolute(slot, deadline.secs, deadline.nsecs);
+            } else {
+                executor.timer_pool.set_relative(slot, self.duration);
+            }
+            self.armed = true;
+        }
+    }
+}
+
 impl Future for SleepFuture {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         with_state(|driver, executor| {
-            let _ = driver; // used only on io_uring path
-            if let Some(slot) = self.timer_slot {
-                // On another worker this slot is that worker's timer.
-                if self.owner != crate::runtime::waker::current_worker() {
-                    return pending(cx);
+            let slot = match self.timer_slot {
+                Some(slot) => {
+                    // On another worker this slot is that worker's timer.
+                    if self.owner != crate::runtime::waker::current_worker() {
+                        return pending(cx);
+                    }
+                    if self.armed && executor.timer_pool.is_fired(slot) {
+                        executor.timer_pool.release(slot);
+                        self.timer_slot = None;
+                        return Poll::Ready(());
+                    }
+                    // A `Shared` can pass this future between tasks of a worker.
+                    executor.timer_pool.waker_ids[slot as usize] =
+                        CURRENT_TASK_ID.with(|c| c.get());
+                    slot
                 }
-                // Already submitted — check if fired.
-                if executor.timer_pool.is_fired(slot) {
-                    executor.timer_pool.release(slot);
-                    self.timer_slot = None;
-                    return Poll::Ready(());
-                }
-                // A `Shared` can pass this future between tasks of a worker.
-                executor.timer_pool.waker_ids[slot as usize] = CURRENT_TASK_ID.with(|c| c.get());
-                return pending(cx);
-            }
-
-            // First poll — allocate slot, fill timespec, submit SQE.
-            let waker_id = CURRENT_TASK_ID.with(|c| c.get());
-            let (slot, generation) = match executor.timer_pool.allocate(waker_id) {
-                Some(pair) => pair,
                 None => {
-                    // Documented contract: the infallible variants panic on
-                    // pool exhaustion (try_sleep/try_timeout are the fallible
-                    // API). Completing immediately instead was far worse than
-                    // the panic: every timeout() fired a spurious
-                    // zero-duration Elapsed that cancelled healthy I/O, and a
-                    // sleep() loop became a busy-spin keeping the pool
-                    // exhausted.
-                    panic!(
-                        "timer slot pool exhausted ({} slots) — use try_sleep()/try_timeout() to handle it",
-                        executor.timer_pool.capacity()
-                    );
+                    // First poll: allocate a slot.
+                    let waker_id = CURRENT_TASK_ID.with(|c| c.get());
+                    let Some((slot, generation)) = executor.timer_pool.allocate(waker_id) else {
+                        // Documented contract: the infallible variants panic
+                        // on pool exhaustion (try_sleep/try_timeout are the
+                        // fallible API). Completing immediately instead was
+                        // far worse than the panic: every timeout() fired a
+                        // spurious zero-duration Elapsed that cancelled
+                        // healthy I/O, and a sleep() loop became a busy-spin
+                        // keeping the pool exhausted.
+                        panic!(
+                            "timer slot pool exhausted ({} slots) — use try_sleep()/try_timeout() to handle it",
+                            executor.timer_pool.capacity()
+                        );
+                    };
+                    self.timer_slot = Some(slot);
+                    self.generation = generation;
+                    self.owner = crate::runtime::waker::current_worker();
+                    slot
                 }
             };
-
-            #[cfg(has_io_uring)]
-            {
-                let payload = TimerSlotPool::encode_payload(slot, generation);
-                let ud = UserData::encode(OpTag::Timer, 0, payload);
-
-                let submit_result = if let Some(deadline) = self.absolute {
-                    let ts_ptr =
-                        executor
-                            .timer_pool
-                            .set_absolute(slot, deadline.secs, deadline.nsecs);
-                    driver.ring.submit_timeout_abs(ts_ptr, ud)
-                } else {
-                    let ts_ptr = executor.timer_pool.set_relative(slot, self.duration);
-                    driver.ring.submit_timeout(ts_ptr, ud)
-                };
-
-                if let Err(e) = submit_result {
-                    executor.timer_pool.release(slot);
-                    // SQ full at timer-arm time. Completing immediately would
-                    // fire a spurious zero-duration timeout; panicking matches
-                    // the documented infallible contract.
-                    panic!(
-                        "timer SQE submission failed: {e} — use try_sleep()/try_timeout() for fallible arming"
-                    );
+            if !self.armed {
+                let generation = self.generation;
+                self.arm(driver, executor, slot, generation);
+                if !self.armed {
+                    // The submission queue had no room. The event loop enters
+                    // the kernel to submit before it next polls tasks, so
+                    // poll again then.
+                    cx.waker().wake_by_ref();
                 }
             }
-
-            #[cfg(not(has_io_uring))]
-            {
-                // Mio backend: store deadline; the event loop polls timer expiry.
-                if let Some(deadline) = self.absolute {
-                    executor
-                        .timer_pool
-                        .set_absolute(slot, deadline.secs, deadline.nsecs);
-                } else {
-                    executor.timer_pool.set_relative(slot, self.duration);
-                }
-            }
-
-            self.timer_slot = Some(slot);
-            self.generation = generation;
-            self.owner = crate::runtime::waker::current_worker();
             pending(cx)
         })
     }
@@ -4704,19 +4726,20 @@ impl Drop for SleepFuture {
                 let state = unsafe { non_null.as_mut() };
                 let driver = unsafe { &mut *state.driver.as_mut() };
                 let executor = unsafe { &mut *state.executor.as_mut() };
-                release_timer_slot(driver, executor, slot, self.generation);
+                release_timer_slot(driver, executor, slot, self.generation, self.armed);
             }
             // Outside a task poll (a connection's task dropped at teardown).
             None => crate::runtime::defer_release(crate::runtime::Orphan::TimerSlot {
                 slot,
                 generation: self.generation,
+                armed: self.armed,
             }),
         }
     }
 }
 
 /// Release a sleep's timer slot. On io_uring, cancels the timer first if it
-/// has not fired; a timer CQE that arrives after the release is
+/// was armed and has not fired; a timer CQE that arrives after the release is
 /// rejected by its generation. On mio, releasing clears the deadline.
 #[cfg_attr(not(has_io_uring), allow(unused_variables))]
 pub(crate) fn release_timer_slot(
@@ -4724,8 +4747,9 @@ pub(crate) fn release_timer_slot(
     executor: &mut crate::runtime::Executor,
     slot: u32,
     generation: u16,
+    armed: bool,
 ) {
-    if !executor.timer_pool.is_fired(slot) {
+    if armed && !executor.timer_pool.is_fired(slot) {
         #[cfg(has_io_uring)]
         {
             let payload = TimerSlotPool::encode_payload(slot, generation);
@@ -4742,52 +4766,40 @@ pub(crate) fn release_timer_slot(
 /// Unlike [`sleep()`] which panics on pool exhaustion, this returns
 /// `Err(TimerExhausted)` so callers can handle capacity limits gracefully.
 ///
-/// The timer slot is allocated eagerly (at call time, not on first poll).
+/// The timer slot is allocated eagerly (at call time, not on first poll), and
+/// on io_uring the timeout SQE is pushed then too. If the submission queue has
+/// no room, the slot stays held and the SQE is pushed on a later poll, and
+/// the duration counts from that push.
 ///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
 pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
+    try_arm(SleepFuture {
+        duration,
+        timer_slot: None,
+        armed: false,
+        owner: 0,
+        generation: 0,
+        absolute: None,
+    })
+}
+
+/// Allocate `sleep`'s timer slot now and arm it, for [`try_sleep`] and
+/// [`try_sleep_until`]. A failed push leaves the slot held and unarmed, and
+/// the first poll pushes again.
+fn try_arm(mut sleep: SleepFuture) -> Result<SleepFuture, TimerExhausted> {
     with_state(|driver, executor| {
-        let _ = driver; // used only on io_uring path
         let waker_id = CURRENT_TASK_ID.with(|c| c.get());
         let (slot, generation) = executor.timer_pool.allocate(waker_id).ok_or_else(|| {
             crate::metrics::POOL.increment(crate::metrics::pool::TIMER_EXHAUSTED);
             TimerExhausted
         })?;
-
-        #[cfg(has_io_uring)]
-        {
-            let payload = TimerSlotPool::encode_payload(slot, generation);
-            let ud = UserData::encode(OpTag::Timer, 0, payload);
-            let ts_ptr = executor.timer_pool.set_relative(slot, duration);
-
-            if let Err(_e) = driver.ring.submit_timeout(ts_ptr, ud) {
-                executor.timer_pool.release(slot);
-                // SQE submission failure — complete immediately (`sleep()`
-                // panics instead).
-                return Ok(SleepFuture {
-                    duration,
-                    timer_slot: None,
-                    owner: 0,
-                    generation: 0,
-                    absolute: None,
-                });
-            }
-        }
-
-        #[cfg(not(has_io_uring))]
-        {
-            executor.timer_pool.set_relative(slot, duration);
-        }
-
-        Ok(SleepFuture {
-            duration,
-            timer_slot: Some(slot),
-            owner: crate::runtime::waker::current_worker(),
-            generation,
-            absolute: None,
-        })
+        sleep.timer_slot = Some(slot);
+        sleep.generation = generation;
+        sleep.owner = crate::runtime::waker::current_worker();
+        sleep.arm(driver, executor, slot, generation);
+        Ok(sleep)
     })
 }
 
@@ -4862,6 +4874,7 @@ pub fn sleep_until(deadline: Deadline) -> SleepFuture {
     SleepFuture {
         duration: Duration::ZERO, // unused for absolute timers
         timer_slot: None,
+        armed: false,
         owner: 0,
         generation: 0,
         absolute: Some(deadline),
@@ -4873,54 +4886,21 @@ pub fn sleep_until(deadline: Deadline) -> SleepFuture {
 /// Unlike [`sleep_until()`] which panics on pool exhaustion, this returns
 /// `Err(TimerExhausted)` so callers can handle capacity limits gracefully.
 ///
-/// The timer slot is allocated eagerly (at call time, not on first poll).
+/// The timer slot is allocated eagerly (at call time, not on first poll), and
+/// on io_uring the timeout SQE is pushed then too. If the submission queue has
+/// no room, the slot stays held and the SQE is pushed on a later poll.
 ///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
 pub fn try_sleep_until(deadline: Deadline) -> Result<SleepFuture, TimerExhausted> {
-    with_state(|driver, executor| {
-        let _ = driver; // used only on io_uring path
-        let waker_id = CURRENT_TASK_ID.with(|c| c.get());
-        let (slot, generation) = executor.timer_pool.allocate(waker_id).ok_or_else(|| {
-            crate::metrics::POOL.increment(crate::metrics::pool::TIMER_EXHAUSTED);
-            TimerExhausted
-        })?;
-
-        #[cfg(has_io_uring)]
-        {
-            let payload = TimerSlotPool::encode_payload(slot, generation);
-            let ud = UserData::encode(OpTag::Timer, 0, payload);
-            let ts_ptr = executor
-                .timer_pool
-                .set_absolute(slot, deadline.secs, deadline.nsecs);
-
-            if let Err(_e) = driver.ring.submit_timeout_abs(ts_ptr, ud) {
-                executor.timer_pool.release(slot);
-                return Ok(SleepFuture {
-                    duration: Duration::ZERO,
-                    timer_slot: None,
-                    owner: 0,
-                    generation: 0,
-                    absolute: Some(deadline),
-                });
-            }
-        }
-
-        #[cfg(not(has_io_uring))]
-        {
-            executor
-                .timer_pool
-                .set_absolute(slot, deadline.secs, deadline.nsecs);
-        }
-
-        Ok(SleepFuture {
-            duration: Duration::ZERO,
-            timer_slot: Some(slot),
-            owner: crate::runtime::waker::current_worker(),
-            generation,
-            absolute: Some(deadline),
-        })
+    try_arm(SleepFuture {
+        duration: Duration::ZERO, // unused for absolute timers
+        timer_slot: None,
+        armed: false,
+        owner: 0,
+        generation: 0,
+        absolute: Some(deadline),
     })
 }
 
