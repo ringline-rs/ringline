@@ -118,7 +118,7 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 
 ### F6 — `disk_io_threads(0)` with fs or direct I/O configured passes validation; the documented error kind is wrong; a direct I/O open succeeds and its operations fail (invariant 11). Confirmed (mio run).
 
-**Fixed (#870):** `build()` refuses the combination on mio and names `no_fs()`; the `disk_io_threads` docs say what 0 does on each backend. Test: `disk_io_threads_zero_with_fs_is_rejected_on_mio` in `config.rs`. The text below is as found at 6851de26.
+**Fixed (#870):** `build()` refuses the combination on mio, naming `no_fs()` (fs) or `direct_io` (direct I/O); the `disk_io_threads` docs say what 0 does on each backend. Test: `disk_io_threads_zero_with_fs_is_rejected_on_mio` in `config.rs`. The text below is as found at 6851de26.
 
 `config.rs:386` says operations "return `Unsupported`" (`:1243` says only "0 = disabled"); `submit_disk_io` returns `io::Error::other("disk I/O pool not configured")`, kind `Other`. Run: `fs::open` fails with that error; `open_direct_io_file` (synchronous, no pool) returns `Ok` and the first read fails with the same message. `Config::validate` has no check. Fix: reject `disk_io_threads == 0` with `fs` or `direct_io` set on the mio build, or document the kind and the message.
 

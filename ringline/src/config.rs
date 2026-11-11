@@ -395,7 +395,7 @@ pub struct Config {
     pub(crate) blocking_threads: usize,
     /// Number of disk I/O threads per worker (mio backend only). The pool
     /// runs the blocking file syscalls (open, pread, pwrite, fsync, stat,
-    /// rename, unlink, mkdir) off the event loop.
+    /// lstat, rename, unlink, mkdir) off the event loop.
     ///
     /// 0 = no pool. On the mio backend `validate` refuses 0 while `fs` (on by
     /// default) or `direct_io` is set. On io_uring the pool is not used.
@@ -681,8 +681,9 @@ impl Config {
                 ));
             }
         }
-        // On mio every file operation runs on the disk-I/O pool, so a file
-        // subsystem with no pool would fail at its first call.
+        // On mio every fs operation, and every direct I/O read, write and
+        // fsync, runs on the disk-I/O pool, so a file subsystem with no pool
+        // would fail at the first operation that needs it.
         if !cfg!(has_io_uring) && self.disk_io_threads == 0 {
             if self.fs.is_some() {
                 return Err(crate::error::Error::RingSetup(

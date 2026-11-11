@@ -970,7 +970,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - mio: `ConfigBuilder::build` refuses `disk_io_threads(0)` while `fs` (on
-  by default) or `direct_io` is set, naming `no_fs()`. Before, the config
+  by default) or `direct_io` is set, naming `no_fs()` (fs) or `direct_io`
+  (direct I/O). Before, the config
   built and every file operation failed at its first call with an `Other`
   error naming the pool, where the `disk_io_threads` doc said `Unsupported`;
   `open_direct_io_file` succeeded and its operations failed. On io_uring the
