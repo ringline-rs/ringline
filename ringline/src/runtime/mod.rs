@@ -537,8 +537,7 @@ pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mu
                 executor.pending_spawns.remove(&request_id);
             }
             Orphan::Wait(seq) => {
-                executor.pidfd_waiters.remove(&seq);
-                executor.pidfd_results.remove(&seq);
+                crate::process::release_wait(driver, executor, seq);
             }
             Orphan::Connect {
                 conn_index,
