@@ -384,26 +384,67 @@ impl NvmeCmdSlab {
     }
 }
 
-/// Result of an NVMe command completion.
+/// The status word of an NVMe command the device failed.
 ///
-/// Delivered to the NVMe completion handler.
-#[derive(Debug, Clone)]
-pub struct NvmeCompletion {
-    /// The device this command was submitted to.
-    pub device: NvmeDevice,
-    /// Command slab sequence number (from the payload of `nvme_read`/`nvme_write`).
-    pub seq: u32,
-    /// io_uring result code. Negative values are -errno.
-    pub result: i32,
+/// The source of the `io::Error` of kind `Other` that [`nvme_read`](crate::nvme_read),
+/// [`nvme_write`](crate::nvme_write) and [`nvme_flush`](crate::nvme_flush)
+/// resolve to for such a command: `error.get_ref()` downcasts to this type.
+/// A command that failed in transport resolves to the errno's `io::Error`
+/// instead. The word is the 15-bit status field of the completion queue
+/// entry: status code type in bits 8 to 10, status code in bits 0 to 7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvmeStatus(u16);
+
+impl NvmeStatus {
+    /// The status word.
+    pub fn word(&self) -> u16 {
+        self.0
+    }
+
+    /// Bits 8 to 10: the status code type (0 generic, 1 command-specific,
+    /// 2 media and data integrity, 3 path, 7 vendor-specific).
+    pub fn code_type(&self) -> u8 {
+        ((self.0 >> 8) & 0x7) as u8
+    }
+
+    /// Bits 0 to 7: the status code within its type.
+    pub fn code(&self) -> u8 {
+        (self.0 & 0xFF) as u8
+    }
 }
 
-impl NvmeCompletion {
-    /// Whether the command completed successfully.
-    pub fn is_success(&self) -> bool {
-        // 0 is success. Positive values are the NVMe status word (SCT/SC,
-        // e.g. 0x281 media error) placed in cqe->res by the kernel's
-        // passthrough completion; negative values are transport errnos.
-        self.result == 0
+impl std::fmt::Display for NvmeStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NVMe status 0x{:x}", self.0)
+    }
+}
+
+impl std::error::Error for NvmeStatus {}
+
+/// Below this (negated) the disk-I/O result of an NVMe command is an errno;
+/// at or above it, a status word.
+const STATUS_RESULT_BASE: i32 = 0x1_0000;
+
+/// The disk-I/O result of an NVMe command's `cqe->res`: 0 and a negative
+/// errno pass through, and a positive status word (the device failed the
+/// command) becomes a negative value above every errno, so the result stays
+/// an error and keeps the word.
+pub(crate) fn status_result(res: i32) -> i32 {
+    if res > 0 {
+        -(STATUS_RESULT_BASE | (res & 0xFFFF))
+    } else {
+        res
+    }
+}
+
+/// The error a negative disk-I/O result of an NVMe command resolves to.
+pub(crate) fn error_from_result(result: i32) -> std::io::Error {
+    debug_assert!(result < 0);
+    if result <= -STATUS_RESULT_BASE {
+        let word = ((-result) & 0xFFFF) as u16;
+        std::io::Error::other(NvmeStatus(word))
+    } else {
+        std::io::Error::from_raw_os_error(-result)
     }
 }
 
@@ -445,6 +486,31 @@ impl NvmeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A positive `cqe->res` is the status word the device returned; it
+    /// resolves to an error that carries the word. Zero and a negative errno
+    /// resolve as before.
+    #[test]
+    fn a_status_word_reaches_the_caller_as_the_errors_source() {
+        assert_eq!(status_result(0), 0);
+        assert_eq!(status_result(-libc::EINVAL), -libc::EINVAL);
+        let encoded = status_result(0x281);
+        assert!(encoded < 0, "a status word is an error");
+        let err = error_from_result(encoded);
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        let status = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<NvmeStatus>())
+            .copied()
+            .expect("the error's source is the status word");
+        assert_eq!(status.word(), 0x281);
+        assert_eq!(status.code_type(), 2, "media and data integrity");
+        assert_eq!(status.code(), 0x81, "unrecovered read error");
+        assert_eq!(err.to_string(), "NVMe status 0x281");
+        let errno = error_from_result(-libc::EINVAL);
+        assert_eq!(errno.raw_os_error(), Some(libc::EINVAL));
+        assert!(errno.get_ref().is_none());
+    }
 
     #[test]
     fn builder_sets_each_field_and_default_keeps_the_rest() {

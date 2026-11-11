@@ -843,6 +843,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** `DirectIoCompletion`, `NvmeCompletion` and `DirectIoOp` are
+  no longer public. Nothing constructed the two completion types, and their
+  docs described a completion handler that never existed; the results they
+  were to carry reach callers through the futures of `direct_io_read`,
+  `direct_io_write`, `direct_io_fsync`, `nvme_read`, `nvme_write` and
+  `nvme_flush`, and a failed NVMe command's status word through `NvmeStatus`
+  (#871).
 - **Breaking:** `DriverCtx` is no longer public, and `on_tick` and `on_notify`
   take no argument. The free functions work inside them:
   `ringline::request_shutdown`, `open_direct_io_file`, `open_nvme_device` and
@@ -990,6 +997,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `disk_io_threads` doc said `Unsupported`; `open_direct_io_file` succeeded
   and its operations failed. On io_uring the value is accepted and unused,
   as before. Finding F6 of `docs/journal/2026-11-file-io-audit.md` (#870).
+- io_uring NVMe: a command the device fails resolves to an `io::Error` of
+  kind `Other` whose source is the new `NvmeStatus`, the completion's
+  status word (`word()`, `code_type()`, `code()`). Before, every status word
+  became `EIO`, so a media error and an invalid field read the same. A
+  transport failure still resolves to the errno's `io::Error`. Finding F7
+  of `docs/journal/2026-11-file-io-audit.md` (#871).
 - `open_direct_io_file` and `open_direct_io_file_with` (both backends) and
   `open_nvme_device` (io_uring) with a path containing a NUL byte return their
   error without holding a slot of the file table. Before, each such call left

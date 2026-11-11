@@ -5066,9 +5066,7 @@ impl Future for DiskIoFuture {
                 return pending(cx);
             }
             match executor.take_disk_io_result(self.seq) {
-                Some(result) if result < 0 => {
-                    Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
-                }
+                Some(result) if result < 0 => Poll::Ready(Err(disk_io_error(self.seq, result))),
                 Some(result) => Poll::Ready(Ok(result)),
                 None => {
                     // Re-register waiter (polled before CQE arrived or after spurious wake).
@@ -5083,6 +5081,17 @@ impl Future for DiskIoFuture {
         }
         poll
     }
+}
+
+/// The error a negative disk-I/O result resolves to: for an NVMe command, a
+/// status word the device returned or an errno; otherwise an errno.
+fn disk_io_error(key: u32, result: i32) -> io::Error {
+    #[cfg(has_io_uring)]
+    if key >> 30 == crate::handler::DiskIoKind::Nvme as u32 {
+        return crate::nvme::error_from_result(result);
+    }
+    let _ = key;
+    io::Error::from_raw_os_error(-result)
 }
 
 impl Drop for DiskIoFuture {
@@ -5209,7 +5218,10 @@ pub unsafe fn direct_io_read(
 ///
 /// Reads `num_blocks` logical blocks starting at `lba` into the buffer
 /// at `buf_addr` with length `buf_len`. The returned future completes
-/// when the io_uring CQE arrives.
+/// when the io_uring CQE arrives, with `Ok(0)` for a command the device
+/// completed, an `io::Error` of kind `Other` whose source is the
+/// [`NvmeStatus`](crate::NvmeStatus) for one the device failed, and the
+/// errno's `io::Error` for a transport failure.
 ///
 /// # Safety
 ///
@@ -5299,7 +5311,8 @@ pub fn direct_io_fsync(file: crate::direct_io::DirectIoFile) -> io::Result<DiskI
 ///
 /// Flushes volatile write caches on the device, ensuring all previously
 /// written data is persisted to non-volatile storage. The returned future
-/// completes when the io_uring CQE arrives.
+/// completes when the io_uring CQE arrives, with the outcomes
+/// [`nvme_read`] describes.
 ///
 /// # Panics
 ///
@@ -5318,7 +5331,8 @@ pub fn nvme_flush(device: crate::nvme::NvmeDevice) -> io::Result<DiskIoFuture> {
 ///
 /// Writes `num_blocks` logical blocks starting at `lba` from the buffer
 /// at `buf_addr` with length `buf_len`. The returned future completes
-/// when the io_uring CQE arrives.
+/// when the io_uring CQE arrives, with the outcomes [`nvme_read`]
+/// describes.
 ///
 /// # Safety
 ///

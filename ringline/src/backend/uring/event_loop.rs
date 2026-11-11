@@ -4386,12 +4386,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
         }
 
-        // NVMe passthrough puts the device-level status word (positive,
-        // e.g. 0x281 media error) in cqe->res on command failure; 0 is
-        // success and negative is a transport errno. Treating result >= 0
-        // as success returned Ok(status) for failed reads/writes — silent
-        // data corruption on device errors.
-        let result = if result > 0 { -libc::EIO } else { result };
+        // NVMe passthrough puts the device's status word (positive, e.g.
+        // 0x281 for a media error) in cqe->res when the device fails the
+        // command; 0 is success and negative is a transport errno. The word
+        // travels to the future as a negative result above every errno.
+        let result = crate::nvme::status_result(result);
 
         // Wake the async task waiting for this NVMe completion.
         self.executor.wake_disk_io(ud.payload(), result);

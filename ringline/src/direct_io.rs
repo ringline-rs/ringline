@@ -23,9 +23,9 @@
 
 use std::marker::PhantomData;
 
-/// Operation type for tracking what kind of I/O was submitted.
+/// The operation a command slab entry holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirectIoOp {
+pub(crate) enum DirectIoOp {
     Read,
     Write,
     Fsync,
@@ -274,38 +274,6 @@ impl DirectIoCmdSlab {
     }
 }
 
-/// Result of a direct I/O command completion.
-///
-/// Delivered to the direct I/O completion handler.
-#[derive(Debug, Clone)]
-pub struct DirectIoCompletion {
-    /// The file this command was submitted to.
-    pub file: DirectIoFile,
-    /// The operation type (read, write, or fsync).
-    pub op: DirectIoOp,
-    /// Command slab sequence number (from the return value of the submit method).
-    pub seq: u32,
-    /// io_uring result code. For read/write: bytes transferred on success.
-    /// Negative values are -errno.
-    pub result: i32,
-}
-
-impl DirectIoCompletion {
-    /// Whether the command completed successfully.
-    pub fn is_success(&self) -> bool {
-        self.result >= 0
-    }
-
-    /// Returns the number of bytes transferred, if the operation succeeded.
-    pub fn bytes_transferred(&self) -> Option<u32> {
-        if self.result >= 0 {
-            Some(self.result as u32)
-        } else {
-            None
-        }
-    }
-}
-
 /// Configuration for direct I/O support.
 ///
 /// When present in [`Config`](crate::config::Config), enables direct I/O file
@@ -440,26 +408,5 @@ mod tests {
         assert!(table.allocate().is_some());
         assert!(table.allocate().is_some());
         assert!(table.allocate().is_none());
-    }
-
-    #[test]
-    fn completion_bytes_transferred() {
-        let success = DirectIoCompletion {
-            file: DirectIoFile::new(0, 0),
-            op: DirectIoOp::Read,
-            seq: 0,
-            result: 4096,
-        };
-        assert!(success.is_success());
-        assert_eq!(success.bytes_transferred(), Some(4096));
-
-        let failure = DirectIoCompletion {
-            file: DirectIoFile::new(0, 0),
-            op: DirectIoOp::Write,
-            seq: 1,
-            result: -libc::EINVAL,
-        };
-        assert!(!failure.is_success());
-        assert_eq!(failure.bytes_transferred(), None);
     }
 }
