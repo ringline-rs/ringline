@@ -66,8 +66,10 @@ impl Child {
     /// Wait for the child to exit.
     ///
     /// Submits an io_uring `PollAdd` on the child's pidfd and returns a future
-    /// that resolves when the child exits. Dropping the future before it
-    /// resolves cancels the poll.
+    /// that resolves when the child exits. Dropping the future on the worker
+    /// that created it, before it resolves, cancels the poll. The cancel is
+    /// best effort: if it cannot be pushed, the poll completes when the child
+    /// exits.
     #[cfg(has_io_uring)]
     pub fn wait(&self) -> io::Result<WaitFuture> {
         with_state(|driver, executor| {

@@ -486,7 +486,8 @@ pub(crate) enum Orphan {
     /// A `SpawnFuture`'s `pending_spawns` entry, and with it a delivered
     /// child's pidfd.
     Spawn(u64),
-    /// A `WaitFuture`'s `pidfd_waiters` and `pidfd_results` entries.
+    /// A `WaitFuture`'s `pidfd_waiters` and `pidfd_results` entries, and its
+    /// pidfd poll if it is still armed.
     Wait(u32),
     /// A `ConnectFuture`'s outbound connection.
     Connect { conn_index: u32, generation: u32 },
