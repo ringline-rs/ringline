@@ -998,11 +998,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   as before. Finding F6 of `docs/journal/2026-11-file-io-audit.md` (#870).
 - io_uring NVMe: a command the device fails resolves to an `io::Error` of
   kind `Other` whose inner error (`get_ref()`, `into_inner()`) is the new
-  `NvmeStatus`, the completion's
-  status word (`word()`, `code_type()`, `code()`). Before, every status word
-  became `EIO`, so a media error and an invalid field read the same. A
-  transport failure still resolves to the errno's `io::Error`. Finding F7
-  of `docs/journal/2026-11-file-io-audit.md` (#871).
+  `NvmeStatus`, the completion's status word (`word()`, `code_type()`,
+  `code()`). Before, every status word became `EIO`, so a media error and an
+  invalid field read the same. A transport failure still resolves to the
+  errno's `io::Error`. Finding F7 of `docs/journal/2026-11-file-io-audit.md`
+  (#871).
 - `open_direct_io_file` and `open_direct_io_file_with` (both backends) and
   `open_nvme_device` (io_uring) with a path containing a NUL byte return their
   error without holding a slot of the file table. Before, each such call left
