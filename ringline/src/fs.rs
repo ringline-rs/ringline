@@ -109,7 +109,7 @@ use crate::runtime::waker::pending;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct File {
     pub(crate) index: u16,
-    pub(crate) generation: u16,
+    pub(crate) generation: u32,
     /// Makes the handle `!Send`.
     _not_send: PhantomData<*const ()>,
 }
@@ -124,7 +124,7 @@ impl std::fmt::Debug for File {
 }
 
 impl File {
-    pub(crate) fn new(index: u16, generation: u16) -> Self {
+    pub(crate) fn new(index: u16, generation: u32) -> Self {
         File {
             index,
             generation,
@@ -279,7 +279,7 @@ pub(crate) struct FsFileState {
     /// Whether this slot is in use.
     pub active: bool,
     /// Generation counter for stale-handle detection.
-    pub generation: u16,
+    pub generation: u32,
     /// Number of read, write and fsync commands pushed to the SQ and not
     /// completed (io_uring).
     pub in_flight: u32,
@@ -514,7 +514,7 @@ pub fn create(path: impl AsRef<std::path::Path>) -> io::Result<OpenFuture> {
 pub struct OpenFuture {
     seq: u32,
     file_index: u16,
-    generation: u16,
+    generation: u32,
     /// Set once `poll` has returned `Ready`: the caller owns the outcome.
     done: bool,
     /// The worker whose executor holds `seq`.
@@ -573,7 +573,7 @@ impl Drop for OpenFuture {
 thread_local! {
     // Opens whose `OpenFuture` was dropped before it resolved, as `(disk I/O
     // key, file slot, generation)`. Nothing holds a handle to these files.
-    static ORPHANED_OPENS: std::cell::RefCell<Vec<(u32, u16, u16)>> =
+    static ORPHANED_OPENS: std::cell::RefCell<Vec<(u32, u16, u32)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     // Disk-I/O keys of operations whose future (`DiskIoFuture`,
     // `StatFuture`) was dropped outside the executor, before it resolved.
@@ -1267,6 +1267,20 @@ mod tests {
         assert_eq!(c, a);
         // Generation incremented.
         assert_eq!(table.get(c).unwrap().generation, 1);
+    }
+
+    /// A slot reused 65,536 times does not repeat its first generation, so a
+    /// handle kept from the first open stays stale (#862).
+    #[test]
+    fn generation_does_not_repeat_after_65536_releases() {
+        let mut table = FsFileTable::new(1);
+        let index = table.allocate().unwrap();
+        let first = table.get(index).unwrap().generation;
+        for _ in 0..65_536 {
+            table.release(index);
+            assert_eq!(table.allocate(), Some(index));
+        }
+        assert_ne!(table.get(index).unwrap().generation, first);
     }
 
     #[test]

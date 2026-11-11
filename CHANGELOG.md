@@ -969,6 +969,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   error without holding a slot of the file table. Before, each such call left
   a slot allocated until the worker exited, so later opens failed with
   `direct I/O file table full` or `NVMe device table full` (#861).
+- The slot generation of `fs::File`, `DirectIoFile` and `NvmeDevice` handles
+  is 32 bits, up from 16, and the handles grow from 4 to 8 bytes. A handle
+  kept after its close matched the slot's new file again after 65,536 releases
+  of the slot (a close, an open that failed, or an open whose future was
+  dropped; 32,768 on io_uring when each close waited for an operation in
+  flight), and an operation or close through it acted on that file. That now
+  takes 2^32 releases (2^31 when each close waited) (#862).
 - io_uring: `fs::close` with a read, write or fsync on the file still in
   flight leaves the file registered until the last of them completes. Before,
   it unregistered the file at once, and an operation issued earlier in the

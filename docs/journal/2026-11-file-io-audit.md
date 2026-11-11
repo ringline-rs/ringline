@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
+- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -102,6 +102,8 @@ Fix: the deferred close #845 proposes, in the shape of `close_direct_io_file`: a
 
 ### F3 — the 16-bit generation wraps: a stale handle validates again after 65,536 releases of its slot and acts on the new occupant (invariant 2). Confirmed (mio run).
 
+**Fixed (#862):** the generation is `u32` in the three tables and handles, so the wrap takes 2^32 releases (2^31 with deferred closes). Retiring a slot at `u32::MAX` was tried and dropped in review: it makes the table shrink under any long open/close loop (about 17 hours at 70k cycles/s with `max_files(1)`), a failure that no longer depends on a caller keeping a stale handle. Tests: `generation_does_not_repeat_after_65536_releases` in `fs.rs`, `direct_io.rs` and `nvme.rs`, and `ringline/tests/disk_handle_generation.rs`. The text below is as found at 6851de26.
+
 `fs.rs:322-328`, `direct_io.rs:181-188`, `nvme.rs:291-298`: `release` does `generation.wrapping_add(1)` and the validators compare for equality. The free list is LIFO, so an open/close loop reuses one slot. Run (direct I/O, `max_files(1)`): a handle kept from the first open, 65,535 open/close cycles (0.90 s on mio in the saved run), a new open landing on slot 0 with generation 0 again; `close_direct_io_file(first)` returned `Ok` and closed the new file, and the new handle's own close then failed as invalid. Deferred direct I/O and NVMe closes bump twice, so 32,768 there. Nothing documents the limit. Fix: widen `generation` to `u32` in the three tables and handles (the handles are opaque, `Copy` and `!Send`; the size goes from 4 to 8 bytes), or document the wrap as a limitation. Test: the probe above, both backends.
 
 ### F4 — `Metadata::is_symlink` is never true: both backends stat through the link (invariants 8, 11). Confirmed (mio run; io_uring by the statx flags, anvil confirmed in the same run: `is_symlink=false is_file=true`).
@@ -186,7 +188,7 @@ A serial workload lands every operation on one slab slot; a future that complete
 - L3 — The completion-key machinery is four hash maps keyed by a 32-bit key whose only purpose is stale-result rejection; a slot-indexed table per subsystem with the 14-bit sequence as the slot's generation gives the same property in O(1) and removes the 16,384-keys-per-slot limit (P2, P4). A refactor of `Executor`'s disk-I/O state and the five futures.
 - L4 — One disk-I/O pool per worker (the code) or one per runtime (the docs)? Per worker isolates workers from each other's backlog and multiplies threads; per runtime is what `disk_io_pool.rs` describes and what `spawn_blocking`'s pool does (F5).
 - L5 — The raw-pointer APIs (#825) and the fs/direct I/O duplication with blocking opens (#845) are known and filed; this audit adds F1, a consequence of the un-deferred `fs_close` that #845 does not state.
-- L6 — The 16-bit generation (F3): widen, or document the wrap?
+- L6 — The 16-bit generation (F3): widen, or document the wrap? Answered in #862: widened to `u32`.
 
 ## What the audit did not cover
 
