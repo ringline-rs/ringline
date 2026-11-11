@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
+- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F9 fixed (#873), F10 fixed (#874); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -134,9 +134,13 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 
 ### F9 — operations on one file are unordered on both backends, and `fs::fsync` reads as covering unresolved writes (invariant 11). Confirmed (reviewer's mio probe; io_uring by Domain Invariant 2).
 
+**Fixed (#873):** the fs module doc says operations are independent, including on one file, that a write is in the file when its future resolves, and that `fsync` covers writes whose futures have resolved; `fsync`'s doc says the same. Whether fs should order them is L1. The text below is as found at 6851de26.
+
 `disk_io_pool.rs:92-103`: N threads take requests from one channel with no per-file ordering. On io_uring the SQEs are independent (Domain Invariant 2). `fs::fsync` (`fs.rs:1000`) says "Fsync a file, flushing all data and metadata to disk"; `direct_io_fsync` says it correctly ("every write to `file` that completed before the call"). The reviewer's probe on mio with two pool threads: a 32 MiB `write_from` followed by `fsync`, both created before awaiting, resolved the fsync first in 19 of 20 runs; a later 4 KiB write to offset 0 lost to the earlier large write in 1 of 20 (4 of 20 on the record reviewer's rerun; one-run counts). Fix: a paragraph in the fs module doc (operations are independent; a write is in the file when its future resolves; `fsync` covers writes whose futures have resolved) and the sentence on `fsync`. Whether fs should offer ordering (linked SQEs, per-file serialisation) is L1.
 
 ### F10 — docs and comments false or missing at 6851de26 (invariant 11). Confirmed by quote and grep.
+
+**Fixed (#874):** every item below is restated or added at HEAD, except the unverifiable kernel claims, which stand as they were. The full-SQ submit of P3 is documented in the fs, direct I/O and NVMe module docs (#877's documentation part). The text below is as found at 6851de26.
 
 - `fs.rs:647-650`, `:677-680`; `runtime/io.rs:5170`, `:5202`, `:5233`, `:5311`: the `# Safety` sections say the buffer must stay valid "until the returned future completes"; a dropped future never completes and the operation runs on (#825). Until #825 lands, the contract to state is: until the operation completes, which a drop gives no way to observe, so after a drop the memory is leaked or the owned-buffer variants are used.
 - Off-owner drops: `OpenFuture` (`fs.rs:478-481`, "closes the file and frees its slot"), `read_into`/`write_from` ("kept until the operation completes and then freed"), `DiskIoFuture`, `StatFuture`: dropped on a worker other than the owner, the slot, buffer or key is leaked for the worker's life, by design (#575); only the `Drop` comments say so. Polling on a thread that is no worker panics in `with_state` rather than staying pending. CHANGELOG's #551 entry carries the unqualified "The file is now closed and the slot freed".

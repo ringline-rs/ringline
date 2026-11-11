@@ -1,25 +1,19 @@
-//! Direct I/O via io_uring (`O_DIRECT` + `IORING_OP_READ` / `IORING_OP_WRITE`).
+//! Direct I/O: reads, writes and fsync on a file or block device opened
+//! with `O_DIRECT`, which bypasses the page cache.
 //!
-//! This module provides types for submitting asynchronous file I/O through
-//! io_uring using `O_DIRECT`, bypassing the page cache while still going
-//! through the kernel block layer. This is a more portable alternative to
-//! NVMe passthrough — it works on any file or block device, not just NVMe
-//! character devices.
+//! On io_uring the operations are `IORING_OP_READ`, `IORING_OP_WRITE` and
+//! `IORING_OP_FSYNC` on a fixed file. On mio they are `pread`, `pwrite` and
+//! `fsync` on the disk-I/O pool, with `F_NOCACHE` in place of `O_DIRECT` on
+//! macOS. On io_uring a call that finds the ring's submission queue full
+//! submits the queue inline before pushing, and returns the error if that
+//! submit fails, leaving nothing in flight (see the `fs` module docs).
 //!
 //! # Alignment requirements
 //!
-//! `O_DIRECT` requires that:
-//! - Buffer addresses are aligned to the logical block size (typically 512 or 4096 bytes)
-//! - I/O sizes are multiples of the logical block size
-//! - File offsets are multiples of the logical block size
-//!
-//! The caller is responsible for meeting these alignment requirements.
-//! Violating them results in `-EINVAL` from the kernel.
-//!
-//! # Kernel requirements
-//!
-//! - Linux 5.6+ for basic io_uring read/write
-//! - Linux 6.1+ already required by ringline for `SendMsgZc`
+//! With `O_DIRECT` (Linux) the buffer address, the length and the file
+//! offset of a read or write must each be a multiple of the device's logical
+//! block size (typically 512 or 4096 bytes), or the kernel returns `EINVAL`.
+//! `F_NOCACHE` on macOS has no such requirement.
 
 use std::marker::PhantomData;
 

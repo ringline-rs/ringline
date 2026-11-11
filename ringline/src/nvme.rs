@@ -10,12 +10,19 @@
 //! - Linux 5.19+ for `IORING_OP_URING_CMD`
 //! - Linux 6.1+ already required by ringline for `SendMsgZc`
 //! - NVMe device accessible via `/dev/ng*` (requires `CAP_SYS_ADMIN` or udev rules)
+//!
+//! io_uring only: on the mio backend every NVMe call returns `Unsupported`.
+//! On io_uring a call that finds the ring's submission queue full submits the
+//! queue inline before pushing, and returns the error if that submit fails,
+//! leaving nothing in flight (see the `fs` module docs).
 
 use std::marker::PhantomData;
 
-/// NVMe I/O command opcodes (NVM command set).
+/// NVM command set opcode: flush.
 pub const NVME_CMD_FLUSH: u8 = 0x00;
+/// NVM command set opcode: write.
 pub const NVME_CMD_WRITE: u8 = 0x01;
+/// NVM command set opcode: read.
 pub const NVME_CMD_READ: u8 = 0x02;
 
 /// NVMe uring_cmd opcode passed as `cmd_op` to `IORING_OP_URING_CMD`.
@@ -88,6 +95,10 @@ impl NvmeUringCmd {
     /// - `num_blocks`: Number of blocks to read (1-based; 1 = one block)
     /// - `buf_addr`: Userspace buffer address for the read data
     /// - `buf_len`: Buffer length in bytes
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_blocks` is 0.
     pub fn read(nsid: u32, lba: u64, num_blocks: u16, buf_addr: u64, buf_len: u32) -> Self {
         NvmeUringCmd {
             opcode: NVME_CMD_READ,
@@ -119,6 +130,10 @@ impl NvmeUringCmd {
     /// - `num_blocks`: Number of blocks to write (1-based; 1 = one block)
     /// - `buf_addr`: Userspace buffer address containing write data
     /// - `buf_len`: Buffer length in bytes
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_blocks` is 0.
     pub fn write(nsid: u32, lba: u64, num_blocks: u16, buf_addr: u64, buf_len: u32) -> Self {
         NvmeUringCmd {
             opcode: NVME_CMD_WRITE,
