@@ -2609,12 +2609,13 @@ fn a_close_during_a_read_with_a_partial_handshake_message() {
 
 // ── A reply after the peer's close_notify ────────────────────────────
 
-/// `(peer_closed, is_alive, eof_truncated)` after the timer, and the last
-/// read's result.
-static TLS_AFTER_PEER_CLOSE: Mutex<Option<(bool, bool, bool, usize)>> = Mutex::new(None);
+/// The read that reached the peer's end, `(peer_closed, is_alive,
+/// eof_truncated)` after the timer, and the last read's result.
+type AfterPeerClose = (usize, bool, bool, bool, usize);
+static TLS_AFTER_PEER_CLOSE: Mutex<Option<AfterPeerClose>> = Mutex::new(None);
 
-/// Reads one byte, waits on a timer, sends a reply, reads to the end and
-/// returns.
+/// Reads the request, reads to the peer's end, waits on a timer, sends a
+/// reply, reads again and returns.
 struct TlsReplyAfterTimer;
 
 impl AsyncEventHandler for TlsReplyAfterTimer {
@@ -2633,13 +2634,16 @@ impl AsyncEventHandler for TlsReplyAfterTimer {
             if n == 0 {
                 return;
             }
+            // On io_uring nothing receives the close_notify while no read is
+            // parked and the TCP stream stays open, so the task reads it.
+            let end = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
             ringline::sleep(Duration::from_millis(300)).await;
             let flags = (conn.peer_closed(), conn.is_alive(), conn.eof_truncated());
             if let Ok(fut) = conn.send(b"reply") {
                 let _ = fut.await;
             }
             let last = conn.with_data(|d| ParseResult::Consumed(d.len())).await;
-            *TLS_AFTER_PEER_CLOSE.lock().unwrap() = Some((flags.0, flags.1, flags.2, last));
+            *TLS_AFTER_PEER_CLOSE.lock().unwrap() = Some((end, flags.0, flags.1, flags.2, last));
         }
     }
 
@@ -2648,11 +2652,12 @@ impl AsyncEventHandler for TlsReplyAfterTimer {
     }
 }
 
-/// The client sends its request and a close_notify, and keeps TCP open. The
-/// server's task, asleep on a timer, is not dropped: it sees the peer's end
-/// on `peer_closed` (not a truncation), sends the reply after the peer's
-/// close_notify, reads `0` and returns. The client reads the reply, then the
-/// server's close_notify, then the FIN on the socket.
+/// The client sends its request and, 100 ms after it, a close_notify, and
+/// keeps TCP open. The server's task reads `0` at the
+/// close_notify and is not dropped: after a timer it sees the peer's end on
+/// `peer_closed` (not a truncation), sends the reply, reads `0` again and
+/// returns. The client reads the reply, then the server's close_notify, then
+/// the FIN on the socket.
 #[test]
 fn a_reply_after_the_peers_close_notify_reaches_the_client() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2679,6 +2684,10 @@ fn a_reply_after_the_peers_close_notify_reaches_the_client() {
         stream.write_all(b"g").unwrap();
         stream.flush().unwrap();
     }
+    // The close_notify goes out 100 ms after the request, so it usually
+    // arrives in a receive of its own while the task's second read is parked
+    // (#889).
+    std::thread::sleep(Duration::from_millis(100));
     tls_conn.send_close_notify();
     while tls_conn.wants_write() {
         tls_conn.write_tls(&mut tcp).unwrap();
@@ -2727,7 +2736,7 @@ fn a_reply_after_the_peers_close_notify_reaches_the_client() {
     );
     assert_eq!(
         *TLS_AFTER_PEER_CLOSE.lock().unwrap(),
-        Some((true, true, false, 0)),
-        "(peer_closed, is_alive, eof_truncated, last read) after the timer"
+        Some((0, true, true, false, 0)),
+        "(read at the end, peer_closed, is_alive, eof_truncated, last read)"
     );
 }
