@@ -4706,9 +4706,8 @@ impl Future for SleepFuture {
                 self.arm(driver, executor, slot, generation);
                 if !self.armed {
                     // The submission queue was full and submitting to make
-                    // room failed. The event loop enters
-                    // the kernel to submit before it next polls tasks, so
-                    // poll again then.
+                    // room failed. The event loop enters the kernel to submit
+                    // before it next polls tasks, so poll again then.
                     cx.waker().wake_by_ref();
                 }
             }
