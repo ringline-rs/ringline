@@ -347,8 +347,8 @@ impl DirectIoConfig {
     /// on another thread keeps it for the life of that worker. The slot freed
     /// last is reused first, so in a serial workload 16,384 such futures make
     /// every later operation fail with `every disk-I/O key for this slab slot
-    /// is held by a future`, until one of them takes its result or is dropped,
-    /// while other slots are free.
+    /// is held by a future`, until one of them takes its result or is dropped
+    /// on that worker, while other slots are free.
     pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
         self.max_commands_in_flight = max_commands_in_flight;
         self
