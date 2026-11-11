@@ -26,6 +26,9 @@ pub(crate) struct AsyncEventLoop<A: AsyncEventHandler> {
     driver: Driver,
     handler: A,
     executor: Executor,
+    /// The iteration's events, copied out of `driver.events` so the handlers
+    /// can borrow the driver; kept across iterations for its capacity.
+    event_list: Vec<(mio::Token, bool, bool, bool)>,
 }
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
@@ -195,6 +198,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             driver,
             handler,
             executor,
+            event_list: Vec::with_capacity(1024),
         })
     }
 
@@ -309,10 +313,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.recv_batch.begin();
 
             // 4. Handle events.
-            // Collect events into a temporary vec to avoid borrow conflict
-            // (self.driver.events borrows driver, but handlers need &mut driver).
-            let mut event_list: Vec<(mio::Token, bool, bool, bool)> =
-                Vec::with_capacity(self.driver.events.iter().count());
+            // Copy the events out so the handlers can borrow the driver
+            // (`self.driver.events` borrows it). The Vec is kept on `self`
+            // for its capacity, so no iteration allocates.
+            let mut event_list = std::mem::take(&mut self.event_list);
+            event_list.clear();
             for event in self.driver.events.iter() {
                 let is_err = event.is_error()
                     || event.is_read_closed()
@@ -326,7 +331,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 ));
             }
 
-            for (token, readable, writable, is_err) in event_list {
+            for (token, readable, writable, is_err) in event_list.drain(..) {
                 match token {
                     WAKE_TOKEN => {
                         if readable {
@@ -375,6 +380,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
             }
+            self.event_list = event_list;
 
             // 5. Drain cross-thread channels unconditionally (not just on wake
             //    events). On macOS/kqueue, SourceFd edge-triggered semantics can
@@ -518,6 +524,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Called unconditionally on every event loop iteration (not just on wake
     /// pipe events) to avoid missed wakeups on macOS/kqueue.
     fn drain_channels(&mut self) {
+        // A disk-I/O completion queued from here on writes the wake pipe
+        // again; one queued before is read below.
+        self.driver
+            .disk_io_wake_pending
+            .store(false, Ordering::Release);
         // Drain accept channel (server mode).
         loop {
             let item = match self.driver.accept_rx {
