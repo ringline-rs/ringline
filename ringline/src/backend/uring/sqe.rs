@@ -143,10 +143,12 @@ pub(crate) enum Op {
         mode: u32,
         file_index: u32,
     },
-    /// `statx(AT_FDCWD, path, AT_STATX_SYNC_AS_STAT, STATX_BASIC_STATS)`.
+    /// `statx(AT_FDCWD, path, AT_STATX_SYNC_AS_STAT, STATX_BASIC_STATS)`,
+    /// with `AT_SYMLINK_NOFOLLOW` added when `nofollow` is set.
     Statx {
         path: *const libc::c_char,
         buf: *mut libc::statx,
+        nofollow: bool,
     },
     RenameAt {
         old: *const libc::c_char,

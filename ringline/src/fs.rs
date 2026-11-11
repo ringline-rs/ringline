@@ -1,9 +1,9 @@
 //! Async filesystem I/O.
 //!
-//! Provides buffered file read/write and metadata operations (stat, rename,
-//! remove, mkdir). File operations do not block the worker thread: on
-//! io_uring the kernel completes them inline or on its own threads (see
-//! below); on mio they run on a thread pool.
+//! Provides buffered file read/write and metadata operations (stat,
+//! symlink_metadata, rename, remove, mkdir). File operations do not block the
+//! worker thread: on io_uring the kernel completes them inline or on its own
+//! threads (see below); on mio they run on a thread pool.
 //!
 //! ## Blocking file I/O and connection closes (io_uring)
 //!
@@ -14,8 +14,9 @@
 //! File and path operations go to the bounded one, whose size limit is given
 //! below. These are the pool operations:
 //!
-//! - always: [`fsync`], [`stat`], [`rename`], [`remove`], [`mkdir`], and
-//!   [`open`] with `CREATE` or `TRUNCATE` (including [`create`]);
+//! - always: [`fsync`], [`stat`], [`symlink_metadata`], [`rename`],
+//!   [`remove`], [`mkdir`], and [`open`] with `CREATE` or `TRUNCATE`
+//!   (including [`create`]);
 //! - on overlayfs (the usual root filesystem of a Docker or Kubernetes
 //!   container; a mounted volume usually is not) and tmpfs: every read and
 //!   write;
@@ -158,18 +159,34 @@ impl std::ops::BitOr for OpenFlags {
     }
 }
 
-/// File metadata returned by [`stat()`].
+/// File metadata returned by [`stat()`] and [`symlink_metadata()`].
 #[derive(Debug, Clone)]
 pub struct Metadata {
+    /// Size in bytes (`st_size`). For a symbolic link from
+    /// [`symlink_metadata()`], the length of the path it holds.
     pub size: u64,
+    /// `st_mode`: the file type bits (`S_IFMT`), the setuid, setgid and
+    /// sticky bits, and the permission bits.
     pub mode: u32,
+    /// Owner's user ID.
     pub uid: u32,
+    /// Owner's group ID.
     pub gid: u32,
+    /// Last access time, as the time since the Unix epoch. A time before 1970
+    /// has negative seconds, which are cast to `u64` and wrap.
     pub atime: Duration,
+    /// Last modification time, as the time since the Unix epoch. A time before
+    /// 1970 has negative seconds, which are cast to `u64` and wrap.
     pub mtime: Duration,
+    /// Last status change time, as the time since the Unix epoch. A time before
+    /// 1970 has negative seconds, which are cast to `u64` and wrap.
     pub ctime: Duration,
+    /// A regular file.
     pub is_file: bool,
+    /// A directory.
     pub is_dir: bool,
+    /// A symbolic link. Only [`symlink_metadata()`] reports one; [`stat()`]
+    /// follows the link.
     pub is_symlink: bool,
 }
 
@@ -1065,7 +1082,9 @@ pub fn close(file: File) -> io::Result<()> {
     })
 }
 
-/// Get file metadata (stat) for a path.
+/// Get file metadata (stat) for a path. A symbolic link is followed, so the
+/// metadata is the target's and [`Metadata::is_symlink`] is false; see
+/// [`symlink_metadata`] for the link's own.
 ///
 /// On io_uring this always runs on the worker's io-wq pool; before Linux 6.13
 /// that can delay the worker's connection closes. See
@@ -1077,9 +1096,28 @@ pub fn close(file: File) -> io::Result<()> {
 ///
 /// Panics if called outside the ringline async executor.
 pub fn stat(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
+    stat_with(path.as_ref(), false)
+}
+
+/// Get file metadata for a path without following a final symbolic link
+/// (`lstat`; on io_uring a statx with `AT_SYMLINK_NOFOLLOW`). If the path
+/// names a link, the metadata is the link's own and [`Metadata::is_symlink`]
+/// is true; a trailing `/` makes the link be followed, as it does for `lstat`.
+/// Any other path gives what [`stat`] gives.
+///
+/// Runs where [`stat`] runs, with the same effect on connection closes.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor.
+pub fn symlink_metadata(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
+    stat_with(path.as_ref(), true)
+}
+
+fn stat_with(path: &std::path::Path, nofollow: bool) -> io::Result<StatFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        let seq = ctx.fs_stat(path.as_ref())?;
+        let seq = ctx.fs_stat(path, nofollow)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.wait_disk_io(seq, task_id);
         Ok(StatFuture {

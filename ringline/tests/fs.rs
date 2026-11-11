@@ -397,3 +397,113 @@ fn fs_safe_api_drop_in_flight() {
     common::join_workers(&shutdown, handles);
     assert_eq!(FS_DROP_RESULT.load(Ordering::SeqCst), 1);
 }
+
+// ── stat and symlink_metadata on a symbolic link ────────────────────
+
+static FS_SYMLINK_RESULT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+
+async fn stat_and_lstat_a_link(
+    target: &std::path::Path,
+    link: &std::path::Path,
+) -> Result<(), String> {
+    let followed = ringline::fs::stat(link)
+        .map_err(|e| format!("stat submit: {e}"))?
+        .await
+        .map_err(|e| format!("stat: {e}"))?;
+    if !followed.is_file || followed.is_symlink || followed.size != 5 {
+        return Err(format!(
+            "stat(link) did not report the target: {followed:?}"
+        ));
+    }
+    let own = ringline::fs::symlink_metadata(link)
+        .map_err(|e| format!("symlink_metadata submit: {e}"))?
+        .await
+        .map_err(|e| format!("symlink_metadata: {e}"))?;
+    // S_IFMT and S_IFLNK, which libc types as u32 on Linux and u16 on macOS.
+    if !own.is_symlink || own.is_file || own.mode & 0o170000 != 0o120000 {
+        return Err(format!(
+            "symlink_metadata(link) did not report a link: {own:?}"
+        ));
+    }
+    if own.size != target.as_os_str().len() as u64 {
+        return Err(format!(
+            "symlink_metadata(link) size {} is not the target path's length {}",
+            own.size,
+            target.as_os_str().len()
+        ));
+    }
+    let dangling = link.with_extension("dangling");
+    match ringline::fs::stat(&dangling)
+        .map_err(|e| format!("stat(dangling) submit: {e}"))?
+        .await
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        other => return Err(format!("stat(dangling) did not fail NotFound: {other:?}")),
+    }
+    let own = ringline::fs::symlink_metadata(&dangling)
+        .map_err(|e| format!("symlink_metadata(dangling) submit: {e}"))?
+        .await
+        .map_err(|e| format!("symlink_metadata(dangling): {e}"))?;
+    if !own.is_symlink {
+        return Err(format!(
+            "symlink_metadata(dangling) did not report a link: {own:?}"
+        ));
+    }
+    let plain = ringline::fs::symlink_metadata(target)
+        .map_err(|e| format!("symlink_metadata(target) submit: {e}"))?
+        .await
+        .map_err(|e| format!("symlink_metadata(target): {e}"))?;
+    if !plain.is_file || plain.is_symlink || plain.size != 5 {
+        return Err(format!(
+            "symlink_metadata(target) differs from stat: {plain:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn symlink_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    (temp_path("symlink-target"), temp_path("symlink-link"))
+}
+
+struct FsSymlinkHandler;
+
+impl AsyncEventHandler for FsSymlinkHandler {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let (target, link) = symlink_paths();
+            let _ = FS_SYMLINK_RESULT.set(stat_and_lstat_a_link(&target, &link).await);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        FsSymlinkHandler
+    }
+}
+
+#[test]
+fn stat_follows_a_symlink_and_symlink_metadata_does_not() {
+    let (target, link) = symlink_paths();
+    let _ = std::fs::remove_file(&link);
+    std::fs::write(&target, b"hello").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let dangling = link.with_extension("dangling");
+    let _ = std::fs::remove_file(&dangling);
+    std::os::unix::fs::symlink(temp_path("symlink-missing"), &dangling).unwrap();
+
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .launch::<FsSymlinkHandler>()
+        .expect("launch failed");
+    common::join_workers(&shutdown, handles);
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_file(&dangling);
+    let _ = std::fs::remove_file(&target);
+    FS_SYMLINK_RESULT
+        .get()
+        .expect("the task finished")
+        .clone()
+        .unwrap();
+}

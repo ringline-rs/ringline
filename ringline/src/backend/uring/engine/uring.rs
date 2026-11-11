@@ -1020,9 +1020,18 @@ impl Sqe {
                     .file_index(Some(dest))
                     .build()
             }
-            Op::Statx { path, buf } => {
+            Op::Statx {
+                path,
+                buf,
+                nofollow,
+            } => {
+                let nofollow_flag = if nofollow {
+                    libc::AT_SYMLINK_NOFOLLOW
+                } else {
+                    0
+                };
                 opcode::Statx::new(types::Fd(libc::AT_FDCWD), path, buf as *mut types::statx)
-                    .flags(libc::AT_STATX_SYNC_AS_STAT)
+                    .flags(libc::AT_STATX_SYNC_AS_STAT | nofollow_flag)
                     .mask(0x7ff) // STATX_BASIC_STATS
                     .build()
             }
@@ -1319,10 +1328,33 @@ mod encode_tests {
                     .build()),
             ),
             (
-                Sqe::new(Op::Statx { path, buf: stx }, ud),
+                Sqe::new(
+                    Op::Statx {
+                        path,
+                        buf: stx,
+                        nofollow: false,
+                    },
+                    ud,
+                ),
                 e(
                     opcode::Statx::new(types::Fd(libc::AT_FDCWD), path, stx as *mut types::statx)
                         .flags(libc::AT_STATX_SYNC_AS_STAT)
+                        .mask(0x7ff)
+                        .build(),
+                ),
+            ),
+            (
+                Sqe::new(
+                    Op::Statx {
+                        path,
+                        buf: stx,
+                        nofollow: true,
+                    },
+                    ud,
+                ),
+                e(
+                    opcode::Statx::new(types::Fd(libc::AT_FDCWD), path, stx as *mut types::statx)
+                        .flags(libc::AT_STATX_SYNC_AS_STAT | libc::AT_SYMLINK_NOFOLLOW)
                         .mask(0x7ff)
                         .build(),
                 ),

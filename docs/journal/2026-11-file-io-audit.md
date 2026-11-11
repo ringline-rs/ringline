@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
+- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -107,6 +107,8 @@ Fix: the deferred close #845 proposes, in the shape of `close_direct_io_file`: a
 `fs.rs:322-328`, `direct_io.rs:181-188`, `nvme.rs:291-298`: `release` does `generation.wrapping_add(1)` and the validators compare for equality. The free list is LIFO, so an open/close loop reuses one slot. Run (direct I/O, `max_files(1)`): a handle kept from the first open, 65,535 open/close cycles (0.90 s on mio in the saved run), a new open landing on slot 0 with generation 0 again; `close_direct_io_file(first)` returned `Ok` and closed the new file, and the new handle's own close then failed as invalid. Deferred direct I/O and NVMe closes bump twice, so 32,768 there. Nothing documents the limit. Fix: widen `generation` to `u32` in the three tables and handles (the handles are opaque, `Copy` and `!Send`; the size goes from 4 to 8 bytes), or document the wrap as a limitation. Test: the probe above, both backends.
 
 ### F4 — `Metadata::is_symlink` is never true: both backends stat through the link (invariants 8, 11). Confirmed (mio run; io_uring by the statx flags, anvil confirmed in the same run: `is_symlink=false is_file=true`).
+
+**Fixed (#863):** `fs::symlink_metadata` stats without following (`lstat`; `AT_SYMLINK_NOFOLLOW`), `fs::stat` still follows and says so, and each `Metadata` field is documented. The ten `pub` fields stay. Test: `stat_follows_a_symlink_and_symlink_metadata_does_not` in `ringline/tests/fs.rs`. The text below is as found at 6851de26.
 
 mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlinks; io_uring `submit_statx` (`sqe.rs:146`) passes `AT_STATX_SYNC_AS_STAT` without `AT_SYMLINK_NOFOLLOW`. Run: `stat(link)` gives `is_symlink=false is_file=true size=1`. The two `Metadata` conversions otherwise agree. No field of `Metadata` is documented (units of the times, that `mode` carries the type bits, which backend fills what), and the struct has ten `pub` fields against the repo's rule. Fix: either stat without following (`lstat`, `AT_SYMLINK_NOFOLLOW`) and say so, or drop `is_symlink`; document each field. Test: `stat_of_a_symlink_reports_is_symlink` on the reproduction branch.
 
