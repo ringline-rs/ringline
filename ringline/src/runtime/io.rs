@@ -4674,6 +4674,11 @@ impl Future for SleepFuture {
                         self.armed = false;
                         return Poll::Ready(());
                     }
+                    // The timeout ended without expiring: push it again.
+                    #[cfg(has_io_uring)]
+                    if self.armed && executor.timer_pool.take_rearm(slot) {
+                        self.armed = false;
+                    }
                     // A `Shared` can pass this future between tasks of a worker.
                     executor.timer_pool.waker_ids[slot as usize] =
                         CURRENT_TASK_ID.with(|c| c.get());
@@ -4752,13 +4757,24 @@ pub(crate) fn release_timer_slot(
     generation: u16,
     armed: bool,
 ) {
+    // A timeout that ended with an error and awaits its re-push is no longer
+    // in flight: there is nothing to cancel.
+    #[cfg(has_io_uring)]
+    let armed = armed && !executor.timer_pool.take_rearm(slot);
     if armed && !executor.timer_pool.is_fired(slot) {
         #[cfg(has_io_uring)]
         {
             let payload = TimerSlotPool::encode_payload(slot, generation);
             let target_ud = UserData::encode(OpTag::Timer, 0, payload);
-            // Best effort cancel; timer fires harmlessly if already expired.
-            let _ = driver.ring.submit_async_cancel(target_ud.raw(), 0);
+            // A timeout that already expired completes harmlessly. If the
+            // cancel cannot be pushed, the timeout stays in flight, so the
+            // slot keeps its generation until the timeout completes; freed
+            // now, the timeout could match a later occupant after the 16-bit
+            // generation wraps and wake it early.
+            if driver.ring.submit_async_cancel(target_ud.raw(), 0).is_err() {
+                executor.timer_pool.park(slot);
+                return;
+            }
         }
     }
     executor.timer_pool.release(slot);
@@ -4839,11 +4855,12 @@ impl Deadline {
     /// Create a deadline `duration` from now.
     pub fn after(duration: Duration) -> Self {
         let now = Self::now();
-        let mut secs = now.secs + duration.as_secs();
+        // Saturates: a deadline that far out is never reached.
+        let mut secs = now.secs.saturating_add(duration.as_secs());
         let mut nsecs = now.nsecs + duration.subsec_nanos();
         if nsecs >= 1_000_000_000 {
             nsecs -= 1_000_000_000;
-            secs += 1;
+            secs = secs.saturating_add(1);
         }
         Deadline { secs, nsecs }
     }

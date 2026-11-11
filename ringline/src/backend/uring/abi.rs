@@ -21,8 +21,15 @@ impl Timespec {
         }
     }
 
+    /// Seconds past `i64::MAX` are clamped to it: the kernel refuses a
+    /// negative `tv_sec` with `EINVAL`, and a timeout that far out never
+    /// expires either way.
     pub(crate) const fn sec(mut self, sec: u64) -> Self {
-        self.tv_sec = sec as i64;
+        self.tv_sec = if sec > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            sec as i64
+        };
         self
     }
 
@@ -171,6 +178,15 @@ impl<'buf> RecvMsgOut<'buf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel refuses a negative `tv_sec`; seconds past `i64::MAX`
+    /// clamp to it (#836).
+    #[test]
+    fn timespec_seconds_clamp_to_i64_max() {
+        assert_eq!(Timespec::new().sec(u64::MAX).tv_sec, i64::MAX);
+        assert_eq!(Timespec::new().sec(i64::MAX as u64).tv_sec, i64::MAX);
+        assert_eq!(Timespec::new().sec(5).tv_sec, 5);
+    }
 
     #[test]
     fn timespec_matches_the_kernel_layout() {

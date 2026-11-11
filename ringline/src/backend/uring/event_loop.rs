@@ -4086,17 +4086,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     fn handle_timer(&mut self, ud: UserData, result: i32) {
-        // Timer CQE: -ETIME means the timeout expired normally.
-        // -ECANCELED means it was cancelled (e.g., SleepFuture dropped).
-        if result != -libc::ETIME {
-            // Cancelled or error — the SleepFuture::drop already released the slot.
-            return;
-        }
-
         let payload = ud.payload();
         let (slot, generation) = TimerSlotPool::decode_payload(payload);
 
-        if let Some(waker_id) = self.executor.timer_pool.fire(slot, generation) {
+        // A slot released while this timeout was in flight, whose cancel
+        // could not be pushed, is freed now that the timeout has completed.
+        if self.executor.timer_pool.release_parked(slot, generation) {
+            return;
+        }
+        // Cancelled: the future was dropped and released the slot.
+        if result == -libc::ECANCELED {
+            return;
+        }
+        // Any result other than expiry means the timeout ended without
+        // expiring (with the seconds clamped, -ENOMEM from the kernel's
+        // prep). Completing the sleep would make a `timeout()` report a
+        // spurious `Elapsed`, so its task is woken to push the timeout again.
+        let waker_id = if result == -libc::ETIME {
+            self.executor.timer_pool.fire(slot, generation)
+        } else {
+            self.executor.timer_pool.rearm(slot, generation)
+        };
+        if let Some(waker_id) = waker_id {
             self.executor.wake_task(waker_id);
         }
     }
@@ -11048,6 +11059,116 @@ mod tests {
             el.executor.timer_pool.is_fired(slot),
             "timer not marked as fired"
         );
+    }
+
+    /// A sleep whose timeout completes with an error, neither expiring nor
+    /// cancelled, pushes its timeout again on its next poll and does not
+    /// complete. One dropped before that poll frees its slot without a cancel,
+    /// since no timeout is in flight (#836).
+    #[test]
+    fn a_timer_error_rearms_the_sleep() {
+        use crate::runtime::io::sleep;
+        use std::task::{Context, Poll};
+        use std::time::Duration;
+
+        let mut el = make_test_loop();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(sleep(Duration::from_millis(5)));
+        let first = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
+        assert!(first.is_pending());
+        let pushed = el.driver.ring.last_pushed.as_ref().unwrap().user_data;
+        assert_eq!(UserData(pushed).tag(), Some(OpTag::Timer));
+
+        // The kernel ends that timeout with an error. It must not fire, and the
+        // next poll pushes the same timeout again.
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(pushed, -libc::ENOMEM, 0);
+        let (slot, _) = TimerSlotPool::decode_payload(UserData(pushed).payload());
+        assert!(!el.executor.timer_pool.is_fired(slot), "an error fired it");
+        let again = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
+        assert!(again.is_pending(), "an error completed the sleep");
+        assert_eq!(
+            el.driver.ring.last_pushed.as_ref().map(|s| s.user_data),
+            Some(pushed),
+            "the timeout was not pushed again"
+        );
+
+        // A cancel completion for it fires nothing.
+        el.test_dispatch_cqe(pushed, -libc::ECANCELED, 0);
+        assert!(!el.executor.timer_pool.is_fired(slot), "a cancel fired it");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            el.driver.ring.submit_and_get_events().expect("submit");
+            el.drain_completions();
+            if with_driver_state(&mut el, || fut.as_mut().poll(&mut cx)) == Poll::Ready(()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the sleep never completed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Dropped while its re-push is pending, a sleep tries no cancel, so a
+        // refused push cannot park its slot: the slot is freed.
+        let free = el.executor.timer_pool.free_slots();
+        let mut fut = Box::pin(sleep(Duration::from_secs(60)));
+        assert!(with_driver_state(&mut el, || fut.as_mut().poll(&mut cx)).is_pending());
+        let pushed = el.driver.ring.last_pushed.as_ref().unwrap().user_data;
+        el.test_dispatch_cqe(pushed, -libc::ENOMEM, 0);
+        el.driver.ring.force_push_failures(1);
+        with_driver_state(&mut el, || drop(fut));
+        assert_eq!(
+            el.executor.timer_pool.free_slots(),
+            free,
+            "the slot was not freed"
+        );
+    }
+
+    /// A slot whose cancel could not be pushed is not freed while its
+    /// timeout is in flight, so the timeout cannot match a later occupant;
+    /// the timeout's completion frees it and wakes nothing (#836).
+    #[test]
+    fn a_slot_whose_cancel_was_not_pushed_waits_for_its_timeout() {
+        let mut el = make_test_loop();
+        let free = el.executor.timer_pool.free_slots();
+        let (slot, generation) = el.executor.timer_pool.allocate(0).unwrap();
+        el.driver.ring.force_push_failures(1);
+        crate::runtime::io::release_timer_slot(
+            &mut el.driver,
+            &mut el.executor,
+            slot,
+            generation,
+            true,
+        );
+        assert_eq!(
+            el.executor.timer_pool.free_slots(),
+            free - 1,
+            "the slot was freed with its timeout in flight"
+        );
+        let (other, _) = el.executor.timer_pool.allocate(0).unwrap();
+        assert_ne!(other, slot, "a parked slot was handed out again");
+        el.executor.timer_pool.release(other);
+
+        let ud = UserData::encode(
+            OpTag::Timer,
+            0,
+            TimerSlotPool::encode_payload(slot, generation),
+        );
+        el.test_dispatch_cqe(ud.raw(), -libc::ETIME, 0);
+        assert!(
+            !el.executor.timer_pool.is_fired(slot),
+            "it woke the dropped sleep"
+        );
+        assert_eq!(
+            el.executor.timer_pool.free_slots(),
+            free,
+            "the timeout's completion did not free the slot"
+        );
+        // The slot's next occupant has a new generation.
+        let (again, next) = el.executor.timer_pool.allocate(0).unwrap();
+        assert_eq!(again, slot);
+        assert_ne!(next, generation);
     }
 
     #[test]

@@ -1038,6 +1038,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Timers (#836, items 1 and 2):
+  - A sleep or deadline too far out for the clock is never reached instead
+    of failing. On io_uring, a `Duration` with more than `i64::MAX` seconds
+    made a negative `tv_sec`, which the kernel refused with `EINVAL`, and the
+    sleep stayed pending without an error. On mio, `sleep(Duration::MAX)`
+    panicked adding it to an `Instant`, and `Deadline::after(Duration::MAX)`
+    overflowed on both backends.
+  - io_uring: a timeout that completes with an error instead of expiring
+    (`-ETIME`) or being cancelled (`-ECANCELED`) is pushed again on the
+    sleep's next poll. Before, every such result was taken as a cancel and
+    the sleep waited forever.
+  - io_uring: a sleep dropped while its timeout is in flight, whose cancel
+    cannot be pushed, keeps its timer slot until the timeout completes.
+    Before, the slot was freed at once, and once its 16-bit generation had
+    wrapped, the old timeout could wake the slot's new occupant early.
 - io_uring: dropping a `Child::wait` future before the child exits cancels
   its pidfd poll. Before, the poll stayed armed until the child exited, so a
   loop that raced `wait` against a timer added one armed poll per iteration,

@@ -209,6 +209,17 @@ pub(crate) struct TimerSlotPool {
     pub(crate) generations: Vec<u16>,
     /// Free slot indices for O(1) allocation.
     free_list: Vec<u32>,
+    /// Slots released while their timeout was in flight and its cancel could
+    /// not be pushed. Such a slot keeps its generation and stays off the free
+    /// list until the timeout's own completion arrives, so that completion
+    /// cannot match a later occupant. For a timeout that never expires, such
+    /// as `sleep(Duration::MAX)`, that is the ring's teardown at worker exit.
+    #[cfg(has_io_uring)]
+    parked: Vec<bool>,
+    /// Slots whose timeout completed with an error instead of expiring; the
+    /// sleep pushes its timeout again on its next poll.
+    #[cfg(has_io_uring)]
+    rearm: Vec<bool>,
 }
 
 impl TimerSlotPool {
@@ -230,6 +241,10 @@ impl TimerSlotPool {
             fired: vec![false; cap],
             generations: vec![0; cap],
             free_list,
+            #[cfg(has_io_uring)]
+            parked: vec![false; cap],
+            #[cfg(has_io_uring)]
+            rearm: vec![false; cap],
         }
     }
 
@@ -239,6 +254,10 @@ impl TimerSlotPool {
         let idx = slot as usize;
         self.waker_ids[idx] = waker_id;
         self.fired[idx] = false;
+        #[cfg(has_io_uring)]
+        {
+            self.rearm[idx] = false;
+        }
         let generation = self.generations[idx];
         Some((slot, generation))
     }
@@ -248,6 +267,10 @@ impl TimerSlotPool {
         let idx = slot as usize;
         if idx < self.generations.len() {
             self.generations[idx] = self.generations[idx].wrapping_add(1);
+            #[cfg(has_io_uring)]
+            {
+                self.rearm[idx] = false;
+            }
             // Clear the mio deadline: the expiry scan reads the slot's
             // *current* generation, so a stale deadline on a free slot would
             // pass fire()'s generation check, spuriously wake the old
@@ -258,6 +281,49 @@ impl TimerSlotPool {
             }
             self.free_list.push(slot);
         }
+    }
+
+    /// Hold `slot` until its timeout's completion arrives, for a slot whose
+    /// cancel could not be pushed. See `parked`.
+    #[cfg(has_io_uring)]
+    pub(crate) fn park(&mut self, slot: u32) {
+        if let Some(parked) = self.parked.get_mut(slot as usize) {
+            *parked = true;
+        }
+    }
+
+    /// Release `slot` if it is parked in `generation`: its timeout has
+    /// completed, so nothing in flight names it. Returns whether it was.
+    #[cfg(has_io_uring)]
+    pub(crate) fn release_parked(&mut self, slot: u32, generation: u16) -> bool {
+        let idx = slot as usize;
+        if idx >= self.generations.len() || !self.parked[idx] || self.generations[idx] != generation
+        {
+            return false;
+        }
+        self.parked[idx] = false;
+        self.release(slot);
+        true
+    }
+
+    /// Mark `slot`'s timeout, in `generation`, as ended without expiring, so
+    /// its sleep pushes it again. Returns the waker_id if generation matches.
+    #[cfg(has_io_uring)]
+    pub(crate) fn rearm(&mut self, slot: u32, generation: u16) -> Option<u32> {
+        let idx = slot as usize;
+        if idx >= self.generations.len() || self.generations[idx] != generation {
+            return None;
+        }
+        self.rearm[idx] = true;
+        Some(self.waker_ids[idx])
+    }
+
+    /// Whether `slot`'s timeout must be pushed again, clearing the mark.
+    #[cfg(has_io_uring)]
+    pub(crate) fn take_rearm(&mut self, slot: u32) -> bool {
+        self.rearm
+            .get_mut(slot as usize)
+            .is_some_and(std::mem::take)
     }
 
     /// Mark a timer as fired. Returns the waker_id if generation matches.
@@ -333,20 +399,29 @@ impl TimerSlotPool {
     }
 
     /// Store a relative duration as a deadline (mio backend).
+    /// A deadline past what `Instant` can hold is never reached: the slot
+    /// gets no deadline and never fires.
     #[cfg(not(has_io_uring))]
     pub(crate) fn set_relative(&mut self, slot: u32, duration: std::time::Duration) {
+        let deadline = std::time::Instant::now().checked_add(duration);
+        self.set_deadline(slot, deadline);
+    }
+
+    /// Store `deadline`, or none for a timer that never fires (mio backend).
+    #[cfg(not(has_io_uring))]
+    fn set_deadline(&mut self, slot: u32, deadline: Option<std::time::Instant>) {
         let idx = slot as usize;
-        let deadline = std::time::Instant::now() + duration;
-        self.deadlines[idx] = Some(deadline);
-        self.expiry_heap
-            .push(std::cmp::Reverse((deadline, slot, self.generations[idx])));
+        self.deadlines[idx] = deadline;
+        if let Some(deadline) = deadline {
+            self.expiry_heap
+                .push(std::cmp::Reverse((deadline, slot, self.generations[idx])));
+        }
     }
 
     /// Store an absolute deadline (mio backend).
     /// The secs/nsecs are CLOCK_MONOTONIC values; convert to Instant.
     #[cfg(not(has_io_uring))]
     pub(crate) fn set_absolute(&mut self, slot: u32, secs: u64, nsecs: u32) {
-        let idx = slot as usize;
         // Approximate: compute offset from current monotonic clock to the deadline.
         let mut ts = libc::timespec {
             tv_sec: 0,
@@ -357,15 +432,15 @@ impl TimerSlotPool {
         }
         let now_ns = ts.tv_sec as u128 * 1_000_000_000 + ts.tv_nsec as u128;
         let deadline_ns = secs as u128 * 1_000_000_000 + nsecs as u128;
+        // A deadline past what `Instant` can hold is never reached.
         let deadline = if deadline_ns > now_ns {
-            std::time::Instant::now()
-                + std::time::Duration::from_nanos((deadline_ns - now_ns) as u64)
+            u64::try_from(deadline_ns - now_ns).ok().and_then(|ns| {
+                std::time::Instant::now().checked_add(std::time::Duration::from_nanos(ns))
+            })
         } else {
-            std::time::Instant::now()
+            Some(std::time::Instant::now())
         };
-        self.deadlines[idx] = Some(deadline);
-        self.expiry_heap
-            .push(std::cmp::Reverse((deadline, slot, self.generations[idx])));
+        self.set_deadline(slot, deadline);
     }
 
     /// A heap entry is live iff the slot still holds this exact deadline in
