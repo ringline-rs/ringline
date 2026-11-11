@@ -1807,7 +1807,7 @@ impl Driver {
         }
         state.send_poll = SendPoll::None;
         let lead = self.close_lead(conn_index);
-        self.ring.submit_close(conn_index, lead)
+        self.ring.submit_close(conn_index, generation, lead)
     }
 
     /// Register a connection whose close is pending on
@@ -3003,7 +3003,7 @@ impl Driver {
                     holding_sends.push(i);
                 } else if self
                     .ring
-                    .submit_close(i, super::ring::CloseLead::CancelAll)
+                    .submit_close(i, generation, super::ring::CloseLead::CancelAll)
                     .is_err()
                 {
                     // The push was refused (the SQ still full after a
@@ -3089,7 +3089,8 @@ impl Driver {
                     }
                 };
                 // A full SQ tries again next round.
-                if self.ring.submit_close(i, lead).is_err() {
+                let generation = self.connections.generation(i);
+                if self.ring.submit_close(i, generation, lead).is_err() {
                     holding_sends.push(i);
                 }
             }
