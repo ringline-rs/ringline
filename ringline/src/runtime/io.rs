@@ -4757,6 +4757,10 @@ pub(crate) fn release_timer_slot(
     generation: u16,
     armed: bool,
 ) {
+    // A timeout that ended with an error and awaits its re-push is no longer
+    // in flight: there is nothing to cancel.
+    #[cfg(has_io_uring)]
+    let armed = armed && !executor.timer_pool.take_rearm(slot);
     if armed && !executor.timer_pool.is_fired(slot) {
         #[cfg(has_io_uring)]
         {

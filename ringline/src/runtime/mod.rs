@@ -267,6 +267,10 @@ impl TimerSlotPool {
         let idx = slot as usize;
         if idx < self.generations.len() {
             self.generations[idx] = self.generations[idx].wrapping_add(1);
+            #[cfg(has_io_uring)]
+            {
+                self.rearm[idx] = false;
+            }
             // Clear the mio deadline: the expiry scan reads the slot's
             // *current* generation, so a stale deadline on a free slot would
             // pass fire()'s generation check, spuriously wake the old
