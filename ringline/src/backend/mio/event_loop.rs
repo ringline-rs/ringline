@@ -529,8 +529,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // pool thread's swap comes first in the flag's order, its release
         // synchronizes with this acquire, so the channel read below sees its
         // response; otherwise that thread reads `false` and writes the pipe.
-        // The load skips the swap on an iteration with no disk-I/O wake: a
-        // pool swap it does not see read `false` and wrote the pipe.
+        // The load skips the swap on an iteration with no disk-I/O wake. If it
+        // reads `false` while the flag is set, the pool thread that set it first
+        // wrote the pipe and that byte has not been read here (reading it would
+        // make the set visible to this load), so the next poll returns and the
+        // next iteration swaps.
         if self.driver.disk_io_wake_pending.load(Ordering::Relaxed) {
             self.driver
                 .disk_io_wake_pending
