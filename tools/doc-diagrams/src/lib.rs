@@ -121,7 +121,7 @@ const CLAIMS: &[Claim] = &[
     },
     Claim {
         path: "ringline/src/disk_io_pool.rs",
-        needle: ".name(format!(\"ringline-disk-io-{i}\"))",
+        needle: ".name(format!(\"ringline-disk-io-{worker_index}-{i}\"))",
         meaning: "literal Mio disk I/O thread name",
     },
     Claim {
@@ -684,7 +684,7 @@ fn render_runtime() -> String {
     text(&mut svg, 90, 520, "ringline-resolver-i", 17, true);
     text(&mut svg, 90, 555, "ringline-spawner-i", 17, true);
     text(&mut svg, 90, 590, "ringline-blocking-i", 17, true);
-    text(&mut svg, 90, 625, "ringline-disk-io-i (Mio)", 17, true);
+    text(&mut svg, 90, 625, "ringline-disk-io-w-i (Mio)", 17, true);
     arrow(&mut svg, 450, 565, 540, 565, "response queue + wake");
 
     text(

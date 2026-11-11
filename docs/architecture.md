@@ -55,7 +55,10 @@ entry point; `on_tick` is a synchronous callback inside the worker loop.
 
 The auxiliary thread names are `ringline-resolver-{i}`,
 `ringline-spawner-{i}`, `ringline-blocking-{i}`, and, on Mio,
-`ringline-disk-io-{i}`.
+`ringline-disk-io-{worker_index}-{i}`, since each worker has its own disk-I/O
+pool. Linux keeps the first 15 bytes of a thread name, so `ps`, `top` and
+`/proc` show none of the indexes: `ringline-worker`, `ringline-accept`,
+`ringline-resolv`, `ringline-spawne`, `ringline-blocki` and `ringline-disk-i`.
 
 ![Runtime topology](diagrams/runtime.svg)
 

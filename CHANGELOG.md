@@ -981,6 +981,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   dropped; 32,768 on io_uring when each close waited for an operation in
   flight), and an operation or close through it acted on that file. That now
   takes 2^32 releases (2^31 when each close waited) (#862).
+- mio: `FsConfig::max_commands_in_flight` and
+  `DirectIoConfig::max_commands_in_flight` bound the operations a worker has
+  in its disk-I/O pool, as they bound the command slabs on io_uring. An
+  operation submitted at the bound fails with the io_uring backend's error,
+  `filesystem command slab exhausted` or `direct I/O command slab exhausted`,
+  until one completes. Before, mio queued every operation on an unbounded
+  channel. A path operation of `fs` (`stat`, `symlink_metadata`, `rename`,
+  `remove`, `mkdir`) on a runtime with fs off (`ConfigBuilder::no_fs`) now fails with
+  `filesystem I/O not configured`, as on io_uring; before, mio ran it when
+  direct I/O was on, and failed with `disk I/O pool not configured` when it
+  was off. The pool's threads are now named
+  `ringline-disk-io-<worker>-<thread>`, and `ConfigBuilder::disk_io_threads`
+  says the count is per worker; each worker always had its own pool (#864).
 - io_uring: `fs::close` with a read, write or fsync on the file still in
   flight leaves the file registered until the last of them completes. Before,
   it unregistered the file at once, and an operation issued earlier in the
