@@ -642,7 +642,7 @@ pub(crate) struct Executor {
     pub(crate) udp_send_ready_waiters: Vec<Option<u32>>,
     /// Disk I/O: what the executor holds per key ([`DiskIoEntry`]); each step
     /// of an operation is one lookup in this map, plus an update of the held
-    /// set (`DISK_IO_LIVE`) when the step ends the future's hold.
+    /// set (`DISK_IO_LIVE`) when the step begins or ends the future's hold.
     pub(crate) disk_io: KeyMap<DiskIoEntry>,
     /// Pending DNS resolve requests: request_id -> (task_id to wake, result slot).
     pub(crate) pending_resolves: HashMap<u64, (u32, Option<stdio::Result<std::net::SocketAddr>>)>,
@@ -962,9 +962,10 @@ impl Executor {
         match self.disk_io.entry(seq) {
             Entry::Occupied(mut e) => match e.get_mut() {
                 DiskIoEntry::Held { waiter, .. } => *waiter = Some(task_id),
-                // A parked buffer or abandoned open keeps its key until its
-                // completion, and the key allocators skip a key in flight, so
-                // no new future can be given it.
+                // A parked buffer or abandoned open keeps its entry until its
+                // completion; until then no new future can be given its key,
+                // because on io_uring the key's slab slot stays allocated and
+                // on mio the allocator skips a key in `disk_io_in_flight`.
                 _ => debug_assert!(false, "disk-I/O key {seq:#x} reused while in flight"),
             },
             Entry::Vacant(e) => {
