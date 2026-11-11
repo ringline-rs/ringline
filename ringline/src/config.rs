@@ -76,6 +76,10 @@ impl TestFault {
     }
 }
 
+/// The largest `sq_entries`: the completion queue is 4 × `sq_entries`, and
+/// Linux allows at most 65536 completion queue entries.
+const MAX_SQ_ENTRIES: u32 = 16384;
+
 /// Configuration for the io_uring driver.
 #[derive(Clone)]
 pub struct Config {
@@ -619,6 +623,14 @@ impl Config {
                 "sq_entries must be at least 2 and a power of two".into(),
             ));
         }
+        // The completion queue is 4 × sq_entries, and Linux refuses one of
+        // more than 65536 entries (IORING_MAX_CQ_ENTRIES) with EINVAL.
+        if self.sq_entries > MAX_SQ_ENTRIES {
+            return Err(crate::error::Error::RingSetup(format!(
+                "sq_entries must be at most {MAX_SQ_ENTRIES}: the completion queue is 4 × \
+                 sq_entries, and Linux allows at most 65536 completion queue entries"
+            )));
+        }
         // The kernel rejects a limit above INT_MAX.
         if self.iowq_max_workers > i32::MAX as u32 {
             return Err(crate::error::Error::RingSetup(
@@ -909,8 +921,9 @@ impl ConfigBuilder {
 
     // ── io_uring settings ────────────────────────────────────────────
 
-    /// Set the number of SQ entries. CQ will be 4x this. Must be a power of 2
-    /// and at least 2.
+    /// Set the number of SQ entries. The CQ is 4 × this. Must be a power of 2,
+    /// at least 2 and at most 16384: Linux allows at most 65536 CQ entries.
+    /// Default: 256.
     pub fn sq_entries(mut self, n: u32) -> Self {
         self.config.sq_entries = n;
         self
@@ -1541,6 +1554,17 @@ mod tests {
     #[test]
     fn validate_sq_entries_not_power_of_two_rejected() {
         assert!(config_with(|c| c.sq_entries = 3).validate().is_err());
+    }
+
+    /// The CQ is 4 × sq_entries, and Linux refuses more than 65536 CQ
+    /// entries (#835).
+    #[test]
+    fn validate_sq_entries_above_16384_rejected() {
+        assert!(config_with(|c| c.sq_entries = 16384).validate().is_ok());
+        let err = config_with(|c| c.sq_entries = 32768)
+            .validate()
+            .expect_err("a CQ of 131072 entries");
+        assert!(err.to_string().contains("at most 16384"), "{err}");
     }
 
     #[test]
