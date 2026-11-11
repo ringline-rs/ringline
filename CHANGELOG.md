@@ -1015,6 +1015,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   document their panic. Findings F9 and F10 of
   `docs/journal/2026-11-file-io-audit.md` (#873, #874), and the documentation
   part of P3 (#877).
+- `fs::OpenFlags` documents each flag and that `READ | WRITE` is `WRITE`
+  (the access modes are the `open(2)` values, not bits), with a doctest;
+  the type is now `PartialEq` and `Eq`. `fs::open` documents its `mode`.
+  Finding F8 of `docs/journal/2026-11-file-io-audit.md` (#872).
 - `open_direct_io_file` and `open_direct_io_file_with` (both backends) and
   `open_nvme_device` (io_uring) with a path containing a NUL byte return their
   error without holding a slot of the file table. Before, each such call left

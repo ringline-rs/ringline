@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F7 fixed (#871), F9 fixed (#873), F10 fixed (#874), P3 documented (#877); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
+- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F7 fixed (#871), F8 fixed (#872), F9 fixed (#873), F10 fixed (#874), P3 documented (#877); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations for the owner
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -131,6 +131,8 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 `event_loop.rs:4303-4308` maps a positive `cqe->res` (the device status word, e.g. 0x281 media error) to `-EIO`; the caller cannot tell a media error from an invalid field, and no doc on `nvme_read`/`nvme_write`/`nvme_flush` says so. The only public text on the status word is `NvmeCompletion::is_success` (`nvme.rs:366-388`, exported from `lib.rs`), a type nothing constructs; `DirectIoCompletion` and `DirectIoOp` (`direct_io.rs:28`, `:256-285`) are public and likewise unused, and their docs ("Delivered to the ... completion handler") name a completion handler that has never existed in this repository: the types have been re-exported and unconstructed since the initial commit. Fix: carry the status word in the error (an `io::Error::other` wrapping it) or document `Err(EIO)`; remove the three types under the Unreleased breaking entries. Until then `is_success`'s comment is the only description of the status word.
 
 ### F8 — `OpenFlags::READ | OpenFlags::WRITE` is `WRITE` (invariant 11). Confirmed by the constants.
+
+**Fixed (#872):** each flag and `open`'s `mode` are documented, the type doc says `READ | WRITE` is `WRITE` and names `READ_WRITE`, and a doctest pins it; `OpenFlags` is `PartialEq` and `Eq`. The text below is as found at 6851de26.
 
 `fs.rs:143-152`: `READ = O_RDONLY` (0), `WRITE = O_WRONLY` (1), `READ_WRITE = O_RDWR` (2), with `BitOr`. A caller who writes `READ | WRITE` opens write-only and every read fails with `EBADF`. No constant is documented; `open`'s `mode` parameter is not either. No caller in the tree does this. Fix: document each constant and that `READ | WRITE` is `WRITE`; a doctest pins it.
 
