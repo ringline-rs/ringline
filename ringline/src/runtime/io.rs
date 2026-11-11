@@ -4674,6 +4674,11 @@ impl Future for SleepFuture {
                         self.armed = false;
                         return Poll::Ready(());
                     }
+                    // The timeout ended without expiring: push it again.
+                    #[cfg(has_io_uring)]
+                    if self.armed && executor.timer_pool.take_rearm(slot) {
+                        self.armed = false;
+                    }
                     // A `Shared` can pass this future between tasks of a worker.
                     executor.timer_pool.waker_ids[slot as usize] =
                         CURRENT_TASK_ID.with(|c| c.get());

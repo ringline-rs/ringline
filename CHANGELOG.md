@@ -1026,9 +1026,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     sleep stayed pending without an error. On mio, `sleep(Duration::MAX)`
     panicked adding it to an `Instant`, and `Deadline::after(Duration::MAX)`
     overflowed on both backends.
-  - io_uring: a timeout completion other than expiry (`-ETIME`) or a cancel
-    (`-ECANCELED`) completes the sleep. Before, every other result was taken
-    as a cancel and the sleep waited forever.
+  - io_uring: a timeout that completes with an error instead of expiring
+    (`-ETIME`) or being cancelled (`-ECANCELED`) is pushed again on the
+    sleep's next poll. Before, every such result was taken as a cancel and
+    the sleep waited forever.
   - io_uring: a sleep dropped while its timeout is in flight, whose cancel
     cannot be pushed, keeps its timer slot until the timeout completes.
     Before, the slot was freed at once, and once its 16-bit generation had

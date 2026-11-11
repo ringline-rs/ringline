@@ -212,9 +212,14 @@ pub(crate) struct TimerSlotPool {
     /// Slots released while their timeout was in flight and its cancel could
     /// not be pushed. Such a slot keeps its generation and stays off the free
     /// list until the timeout's own completion arrives, so that completion
-    /// cannot match a later occupant.
+    /// cannot match a later occupant. For a timeout that never expires, such
+    /// as `sleep(Duration::MAX)`, that is the ring's teardown at worker exit.
     #[cfg(has_io_uring)]
     parked: Vec<bool>,
+    /// Slots whose timeout completed with an error instead of expiring; the
+    /// sleep pushes its timeout again on its next poll.
+    #[cfg(has_io_uring)]
+    rearm: Vec<bool>,
 }
 
 impl TimerSlotPool {
@@ -238,6 +243,8 @@ impl TimerSlotPool {
             free_list,
             #[cfg(has_io_uring)]
             parked: vec![false; cap],
+            #[cfg(has_io_uring)]
+            rearm: vec![false; cap],
         }
     }
 
@@ -247,6 +254,10 @@ impl TimerSlotPool {
         let idx = slot as usize;
         self.waker_ids[idx] = waker_id;
         self.fired[idx] = false;
+        #[cfg(has_io_uring)]
+        {
+            self.rearm[idx] = false;
+        }
         let generation = self.generations[idx];
         Some((slot, generation))
     }
@@ -289,6 +300,26 @@ impl TimerSlotPool {
         self.parked[idx] = false;
         self.release(slot);
         true
+    }
+
+    /// Mark `slot`'s timeout, in `generation`, as ended without expiring, so
+    /// its sleep pushes it again. Returns the waker_id if generation matches.
+    #[cfg(has_io_uring)]
+    pub(crate) fn rearm(&mut self, slot: u32, generation: u16) -> Option<u32> {
+        let idx = slot as usize;
+        if idx >= self.generations.len() || self.generations[idx] != generation {
+            return None;
+        }
+        self.rearm[idx] = true;
+        Some(self.waker_ids[idx])
+    }
+
+    /// Whether `slot`'s timeout must be pushed again, clearing the mark.
+    #[cfg(has_io_uring)]
+    pub(crate) fn take_rearm(&mut self, slot: u32) -> bool {
+        self.rearm
+            .get_mut(slot as usize)
+            .is_some_and(|r| std::mem::take(r))
     }
 
     /// Mark a timer as fired. Returns the waker_id if generation matches.

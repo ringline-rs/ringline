@@ -4098,11 +4098,16 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         if result == -libc::ECANCELED {
             return;
         }
-        // -ETIME is expiry. Any other result means the timeout ended without
-        // expiring and will not complete again, so the sleep completes rather
-        // than wait forever.
-
-        if let Some(waker_id) = self.executor.timer_pool.fire(slot, generation) {
+        // Any result other than expiry means the timeout ended without
+        // expiring (with the seconds clamped, -ENOMEM from the kernel's
+        // prep). Completing the sleep would make a `timeout()` report a
+        // spurious `Elapsed`, so its task is woken to push the timeout again.
+        let waker_id = if result == -libc::ETIME {
+            self.executor.timer_pool.fire(slot, generation)
+        } else {
+            self.executor.timer_pool.rearm(slot, generation)
+        };
+        if let Some(waker_id) = waker_id {
             self.executor.wake_task(waker_id);
         }
     }
@@ -10985,25 +10990,55 @@ mod tests {
         );
     }
 
-    /// A timeout that completes with neither -ETIME nor -ECANCELED will not
-    /// complete again, so its sleep completes instead of waiting forever;
-    /// -ECANCELED completes nothing (#836).
+    /// A sleep whose timeout completes with an error, neither expiring nor
+    /// cancelled, pushes its timeout again on its next poll and does not
+    /// complete; it completes when the new timeout expires (#836).
     #[test]
-    fn a_timer_error_completes_the_sleep_and_a_cancel_does_not() {
+    fn a_timer_error_rearms_the_sleep() {
+        use crate::runtime::io::sleep;
+        use std::task::{Context, Poll};
+        use std::time::Duration;
+
         let mut el = make_test_loop();
-        let (slot, generation) = el.executor.timer_pool.allocate(0).unwrap();
-        let ud = UserData::encode(
-            OpTag::Timer,
-            0,
-            TimerSlotPool::encode_payload(slot, generation),
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(sleep(Duration::from_millis(5)));
+        let first = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
+        assert!(first.is_pending());
+        let pushed = el.driver.ring.last_pushed.as_ref().unwrap().user_data;
+        assert_eq!(UserData(pushed).tag(), Some(OpTag::Timer));
+
+        // The kernel ends that timeout with an error. It must not fire, and the
+        // next poll pushes the same timeout again.
+        el.driver.ring.last_pushed = None;
+        el.test_dispatch_cqe(pushed, -libc::ENOMEM, 0);
+        let (slot, _) = TimerSlotPool::decode_payload(UserData(pushed).payload());
+        assert!(!el.executor.timer_pool.is_fired(slot), "an error fired it");
+        let again = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
+        assert!(again.is_pending(), "an error completed the sleep");
+        assert_eq!(
+            el.driver.ring.last_pushed.as_ref().map(|s| s.user_data),
+            Some(pushed),
+            "the timeout was not pushed again"
         );
-        el.test_dispatch_cqe(ud.raw(), -libc::ECANCELED, 0);
+
+        // A cancel completion for it fires nothing.
+        el.test_dispatch_cqe(pushed, -libc::ECANCELED, 0);
         assert!(!el.executor.timer_pool.is_fired(slot), "a cancel fired it");
-        el.test_dispatch_cqe(ud.raw(), -libc::EINVAL, 0);
-        assert!(
-            el.executor.timer_pool.is_fired(slot),
-            "an error left it pending"
-        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            el.driver.ring.submit_and_get_events().expect("submit");
+            el.drain_completions();
+            if with_driver_state(&mut el, || fut.as_mut().poll(&mut cx)) == Poll::Ready(()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the re-pushed timeout never fired"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// A slot whose cancel could not be pushed is not freed while its
