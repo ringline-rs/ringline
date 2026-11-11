@@ -126,7 +126,7 @@ mio `fs_stat` (`handler.rs:3570-3595`) calls `libc::stat`, which follows symlink
 
 ### F8 — `OpenFlags::READ | OpenFlags::WRITE` is `WRITE` (invariant 11). Confirmed by the constants.
 
-**Fixed (#872):** each flag and `open`'s `mode` are documented, the type doc says `READ | WRITE` is `WRITE` and names `READ_WRITE`, and a doctest pins it; `OpenFlags` is `PartialEq`. The text below is as found at 6851de26.
+**Fixed (#872):** each flag and `open`'s `mode` are documented, the type doc says `READ | WRITE` is `WRITE` and names `READ_WRITE`, and a doctest pins it; `OpenFlags` is `PartialEq` and `Eq`. The text below is as found at 6851de26.
 
 `fs.rs:143-152`: `READ = O_RDONLY` (0), `WRITE = O_WRONLY` (1), `READ_WRITE = O_RDWR` (2), with `BitOr`. A caller who writes `READ | WRITE` opens write-only and every read fails with `EBADF`. No constant is documented; `open`'s `mode` parameter is not either. No caller in the tree does this. Fix: document each constant and that `READ | WRITE` is `WRITE`; a doctest pins it.
 
