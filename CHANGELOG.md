@@ -985,12 +985,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - mio: `ConfigBuilder::build` refuses `disk_io_threads(0)` while `fs` (on
   by default) or `direct_io` is set, naming `no_fs()` (fs) or `direct_io`
-  (direct I/O). Before, the config
-  built and every file operation failed at its first call with an `Other`
-  error naming the pool, where the `disk_io_threads` doc said `Unsupported`;
-  `open_direct_io_file` succeeded and its operations failed. On io_uring the
-  value is accepted and unused, as before. Finding F6 of
-  `docs/journal/2026-11-file-io-audit.md` (#870).
+  (direct I/O). Before, the config built and every file operation failed at
+  its first call with an `Other` error naming the pool, where the
+  `disk_io_threads` doc said `Unsupported`; `open_direct_io_file` succeeded
+  and its operations failed. On io_uring the value is accepted and unused,
+  as before. Finding F6 of `docs/journal/2026-11-file-io-audit.md` (#870).
 - `open_direct_io_file` and `open_direct_io_file_with` (both backends) and
   `open_nvme_device` (io_uring) with a path containing a NUL byte return their
   error without holding a slot of the file table. Before, each such call left
