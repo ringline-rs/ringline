@@ -994,6 +994,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Docs: the `max_commands_in_flight` docs of `FsConfig`, `DirectIoConfig`
+  and `NvmeConfig` say that on io_uring each command slot has 16,384
+  operation keys; that a future neither polled to completion nor dropped
+  keeps its key, as does one dropped on a thread other than the worker that
+  created it; and that in a serial workload 16,384 such futures make every
+  later operation fail while other slots are free. Finding P4 of
+  `docs/journal/2026-11-file-io-audit.md` (#878).
 - mio: `ConfigBuilder::build` refuses `disk_io_threads(0)` while `fs` (on
   by default) or `direct_io` is set, naming `no_fs()` (fs) or `direct_io`
   (direct I/O). Before, the config built and every file operation failed at
@@ -1020,6 +1027,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   document their panic. Findings F9 and F10 of
   `docs/journal/2026-11-file-io-audit.md` (#873, #874), and the documentation
   part of P3 (#877).
+- `fs::OpenFlags` documents each flag and that `READ | WRITE` is `WRITE`
+  (the access modes are the `open(2)` values, not bits), with a doctest;
+  the type is now `PartialEq` and `Eq`. `fs::open` documents its `mode`.
+  Finding F8 of `docs/journal/2026-11-file-io-audit.md` (#872).
 - `open_direct_io_file` and `open_direct_io_file_with` (both backends) and
   `open_nvme_device` (io_uring) with a path containing a NUL byte return their
   error without holding a slot of the file table. Before, each such call left
