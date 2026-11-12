@@ -588,7 +588,7 @@ impl Ring {
 
     /// Submit an async connect for a direct file descriptor. The payload
     /// carries the connection's generation, which `handle_connect` checks
-    /// against the slot's, and the cancel from `handle_timeout` names.
+    /// against the slot's, and the cancel from `check_connect_deadlines` names.
     pub fn submit_connect(
         &mut self,
         conn_index: u32,
@@ -602,25 +602,6 @@ impl Ring {
                 fd: sqe::Fd::Fixed(conn_index),
                 addr,
                 addrlen,
-            },
-            user_data.raw(),
-        );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
-    }
-
-    /// Submit a timeout SQE. The timespec must remain valid until the CQE arrives.
-    pub fn submit_timeout(
-        &mut self,
-        timespec: *const crate::backend::uring::abi::Timespec,
-        user_data: UserData,
-    ) -> io::Result<()> {
-        let entry = Sqe::new(
-            Op::Timeout {
-                ts: timespec,
-                abs: false,
             },
             user_data.raw(),
         );
@@ -855,21 +836,6 @@ impl Ring {
             ud.raw(),
         );
         unsafe { self.push_sqe(&entry) }
-    }
-
-    /// Submit a timeout SQE that fires after the given duration, for the
-    /// send backstop. Produces a CQE with the given user_data when it fires
-    /// (-ETIME) or is cancelled (-ECANCELED).
-    pub fn submit_tick_timeout(
-        &mut self,
-        ts: *const crate::backend::uring::abi::Timespec,
-        user_data: u64,
-    ) -> io::Result<()> {
-        let entry = Sqe::new(Op::Timeout { ts, abs: false }, user_data);
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
     }
 
     /// Push an operation to the submission queue.

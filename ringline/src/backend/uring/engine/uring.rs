@@ -5,7 +5,7 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 
 use io_uring::squeue::{Entry, Entry128, Flags};
-use io_uring::types::{self, CancelBuilder, DestinationSlot, Fixed, TimeoutFlags};
+use io_uring::types::{self, CancelBuilder, DestinationSlot, Fixed};
 use io_uring::{IoUring, cqueue, opcode, squeue};
 
 use super::Engine;
@@ -1089,16 +1089,6 @@ impl Sqe {
             Op::Connect { fd, addr, addrlen } => {
                 on!(fd, |t| opcode::Connect::new(t, addr, addrlen).build())
             }
-            Op::Timeout { ts, abs } => {
-                // `abi::Timespec` is `struct __kernel_timespec`, as is the
-                // crate's type; a test pins the layouts together.
-                let ts = ts.cast::<types::Timespec>();
-                if abs {
-                    opcode::Timeout::new(ts).flags(TimeoutFlags::ABS).build()
-                } else {
-                    opcode::Timeout::new(ts).build()
-                }
-            }
             Op::FixedFdInstall { index } => opcode::FixedFdInstall::new(Fixed(index), 0).build(),
             Op::PollAdd { fd, mask, multi } => {
                 on!(fd, |t| opcode::PollAdd::new(t, mask).multi(multi).build())
@@ -1172,7 +1162,6 @@ mod encode_tests {
         let msg = 0x2000 as *const libc::msghdr;
         let path = 0x3000 as *const libc::c_char;
         let path2 = 0x3100 as *const libc::c_char;
-        let ts = 0x4000 as *const crate::backend::uring::abi::Timespec;
         let addr = 0x6000 as *const libc::sockaddr;
         let stx = 0x7000 as *mut libc::statx;
         let cmd = [7u8; 80];
@@ -1369,16 +1358,6 @@ mod encode_tests {
                     ud,
                 ),
                 e(opcode::Connect::new(fx, addr, 16).build()),
-            ),
-            (
-                Sqe::new(Op::Timeout { ts, abs: false }, ud),
-                e(opcode::Timeout::new(ts.cast()).build()),
-            ),
-            (
-                Sqe::new(Op::Timeout { ts, abs: true }, ud),
-                e(opcode::Timeout::new(ts.cast())
-                    .flags(TimeoutFlags::ABS)
-                    .build()),
             ),
             (
                 Sqe::new(Op::FixedFdInstall { index: 9 }, ud),

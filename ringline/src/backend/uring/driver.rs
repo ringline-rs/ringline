@@ -396,6 +396,10 @@ impl Driver {
     }
 }
 
+/// How often the send backstop resubmits every send waiting for room
+/// (`AsyncEventLoop::handle_send_backstop`).
+pub(crate) const SEND_BACKSTOP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
@@ -579,8 +583,11 @@ pub(crate) struct Driver {
     pub(crate) tls_table: Option<crate::tls::TlsTable>,
     /// Pre-allocated sockaddr storage for outbound connect SQEs.
     pub(crate) connect_addrs: Vec<libc::sockaddr_storage>,
-    /// Pre-allocated timespec storage for connect timeouts.
-    pub(crate) connect_timespecs: Vec<crate::backend::uring::abi::Timespec>,
+    /// Deadlines of outbound connects with a timeout.
+    pub(crate) connect_deadlines: crate::backend::uring::connect_deadlines::ConnectDeadlines,
+    /// Connect cancels for connects whose timeout fired, which the SQ had no
+    /// room for: (conn_index, generation). Retried each iteration.
+    pub(crate) pending_connect_cancels: Vec<(u32, u32)>,
     /// Pre-allocated batch buffer for draining CQEs.
     /// Tuple: (user_data, result, flags).
     pub(crate) cqe_batch: Vec<(u64, i32, u32)>,
@@ -697,15 +704,15 @@ pub(crate) struct Driver {
     /// Drained each tick.
     pub(crate) pending_send_pollout_retries: Vec<(u32, u32, bool)>,
     /// Connections with a send waiting for room, as (conn_index, generation),
-    /// for `handle_send_backstop`. An entry leaves when the timer finds nothing
+    /// for `handle_send_backstop`. An entry leaves when the backstop finds nothing
     /// waiting.
     pub(crate) send_backstop_list: Vec<(u32, u32)>,
-    /// Scratch swapped with `send_backstop_list` while the timer walks it.
+    /// Scratch swapped with `send_backstop_list` while the backstop walks it.
     pub(crate) send_backstop_scratch: Vec<(u32, u32)>,
-    /// The `SendBackstop` timer's interval.
-    pub(crate) send_backstop_ts: crate::backend::uring::abi::Timespec,
-    /// Whether the `SendBackstop` timer is armed.
-    pub(crate) send_backstop_armed: bool,
+    /// When the backstop next runs: set one `SEND_BACKSTOP_INTERVAL` ahead
+    /// when `send_backstop_list` is non-empty and none is set, and taken when
+    /// it runs. It bounds the run loop's wait (`next_deadline`).
+    pub(crate) send_backstop_at: Option<std::time::Instant>,
     /// TLS handshakes in progress and their deadlines.
     pub(crate) handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines,
     /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
@@ -1070,12 +1077,6 @@ impl Driver {
             std::mem::zeroed()
         });
 
-        let mut connect_timespecs = Vec::with_capacity(config.max_connections as usize);
-        connect_timespecs.resize(
-            config.max_connections as usize,
-            crate::backend::uring::abi::Timespec::new(),
-        );
-
         let mut send_queues = Vec::with_capacity(config.max_connections as usize);
         for _ in 0..config.max_connections {
             send_queues.push(ConnSendState::new());
@@ -1152,7 +1153,8 @@ impl Driver {
             shutdown_local: false,
             tls_table,
             connect_addrs,
-            connect_timespecs,
+            connect_deadlines: crate::backend::uring::connect_deadlines::ConnectDeadlines::new(),
+            pending_connect_cancels: Vec::new(),
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),
             cqe_cursor: 0,
             tcp_nodelay: config.tcp_nodelay,
@@ -1185,8 +1187,7 @@ impl Driver {
             pending_send_pollout_retries: Vec::new(),
             send_backstop_list: Vec::new(),
             send_backstop_scratch: Vec::new(),
-            send_backstop_ts: crate::backend::uring::abi::Timespec::new().sec(1),
-            send_backstop_armed: false,
+            send_backstop_at: None,
             handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines::new(
                 config.tls_handshake_timeout,
                 config.max_connections,
@@ -1296,7 +1297,7 @@ impl Driver {
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
             send_zc_threshold: self.send_zc_threshold,
-            connect_timespecs: &mut self.connect_timespecs,
+            connect_deadlines: &mut self.connect_deadlines,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
             send_queues: &mut self.send_queues,
@@ -1417,12 +1418,14 @@ impl Driver {
         *slot = drain;
     }
 
-    /// The worker's earliest deadline: the deadline at the front of the
-    /// handshake queue (possibly a handshake that has since completed; the
-    /// wait then ends early), or the earliest close deadline
-    /// (`close_notify_deadline`) of a connection still waiting for its sends
-    /// to drain.
-    pub(crate) fn next_deadline(&self) -> Option<std::time::Instant> {
+    /// The worker's earliest deadline, other than its timers and tick: the
+    /// deadline at the front of the handshake queue (possibly a handshake
+    /// that has since completed; the wait then ends early), the earliest
+    /// close deadline (`close_notify_deadline`) of a connection still
+    /// waiting for its sends to drain, the next run of the send backstop, and
+    /// the earliest connect deadline. Takes `&mut self` to drop connect
+    /// deadlines that are no longer live.
+    pub(crate) fn next_deadline(&mut self) -> Option<std::time::Instant> {
         let close = self
             .close_notify_armed
             .iter()
@@ -1431,10 +1434,15 @@ impl Driver {
                 state.close_pending.then_some(state.close_notify_deadline)?
             })
             .min();
-        match (self.handshake_deadlines.next_deadline(), close) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [
+            self.handshake_deadlines.next_deadline(),
+            close,
+            self.send_backstop_at,
+            self.connect_deadlines.next_deadline(&self.connections),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Request the close of `conn_index`: mark it `Closing`, set

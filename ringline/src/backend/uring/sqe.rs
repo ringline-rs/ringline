@@ -120,11 +120,6 @@ pub(crate) enum Op {
         addr: *const libc::sockaddr,
         addrlen: libc::socklen_t,
     },
-    /// A timeout, relative or (`abs`) absolute `CLOCK_MONOTONIC`.
-    Timeout {
-        ts: *const super::abi::Timespec,
-        abs: bool,
-    },
     /// Install a real fd for registered file `index` (`FIXED_FD_INSTALL`).
     FixedFdInstall {
         index: u32,
