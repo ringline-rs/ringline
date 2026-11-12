@@ -254,8 +254,8 @@ fn the_slot_returns_after_a_fin_with_an_unsent_flight() {
 }
 
 /// With `tick_timeout_us(0)` and no traffic after the close, the close
-/// deadline is checked only when one of the worker's own timers ends its
-/// wait. One probe made 2 s after the deadline is served only if the
+/// deadline is checked only when the worker's wait ends at a deadline that
+/// bounds it. One probe made 2 s after the deadline is served only if the
 /// connection was torn down by then: a probe that woke the worker would find
 /// the slot still held. `close` is what closed it.
 fn the_close_deadline_fires_without_a_tick(close: Close) -> bool {
@@ -291,8 +291,7 @@ fn the_close_deadline_fires_without_a_tick_after_a_handshake_timeout() {
 
 /// After the peer's FIN. The stalled flight still comes back short and waits
 /// for room, so on io_uring the 1 s retry timer wakes the worker here too;
-/// the worker's deadline timer is what wakes it only when that timer is
-/// disabled.
+/// without it the close deadline, which bounds the wait, would.
 #[test]
 fn the_close_deadline_fires_without_a_tick_after_a_fin() {
     assert!(

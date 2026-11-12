@@ -840,14 +840,14 @@ mod cqe_tag_tests {
             cqe_tag::COUNT
         );
         // Guard against the walk finding nothing and passing vacuously.
-        assert!(found >= 30, "expected the full tag set, found {found}");
+        assert!(found >= 28, "expected the full tag set, found {found}");
     }
 
     /// The array is indexed by discriminant, which leaves gaps. Assert exactly
     /// which gaps we expect, rather than letting an unnoticed new one look
     /// normal — an unregistered slot reads as a counter stuck at zero.
     ///
-    /// Slots 0, 1, 17, 20, 27 to 30 have no `OpTag` variant.
+    /// Slots 0, 1, 11, 12, 17, 20, 26 to 30 have no `OpTag` variant.
     #[test]
     fn expected_slots_are_unused() {
         let unused: Vec<usize> = (0..cqe_tag::COUNT)
@@ -855,7 +855,7 @@ mod cqe_tag_tests {
             .collect();
         assert_eq!(
             unused,
-            vec![0, 1, 17, 20, 27, 28, 29, 30],
+            vec![0, 1, 11, 12, 17, 20, 26, 27, 28, 29, 30],
             "unexpected unused CQE_BY_TAG slots"
         );
     }

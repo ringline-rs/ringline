@@ -7259,10 +7259,8 @@ fn deferred_close_does_not_spin_on_half_closed_peer() {
         .unwrap();
 
     // Baseline: the loop's own cadence with this connection open and idle.
-    // It is backend- and host-dependent (mio blocks in poll with a 10 ms cap,
-    // about 45 ticks per 500 ms; io_uring's tick timeout gave about 380 on a
-    // Linux 6.12 arm64 host), so the spin check below is relative to it
-    // rather than a fixed number.
+    // It is backend- and host-dependent, so the spin check below is relative
+    // to it rather than a fixed number.
     std::thread::sleep(Duration::from_millis(100));
     let base_before = DRAIN_TICKS.load(Ordering::Relaxed);
     std::thread::sleep(Duration::from_millis(500));

@@ -40,8 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   completes. An outbound `connect(..).tls(..)` to such a peer did not
   resolve. `metrics::conn::TLS_HANDSHAKE_TIMEOUT` (11,
   `op=tls_handshake_timeout` on `ringline/connections`) counts the closes.
-  On io_uring with a `tick_timeout_us` of 0 or above 10 ms, the earliest
-  deadline arms a timer of its own (`deadline` on `ringline/cqe_by_tag`).
+  On io_uring the earliest handshake deadline bounds the worker's wait for
+  I/O, so it is checked on time whatever `tick_timeout_us` is (#838).
   Send and recv paradigms audit L18
   (`docs/journal/2026-11-send-recv-paradigms-audit.md`).
 - `ConfigBuilder::defer_recv_arm`, off by default. On io_uring, a plaintext
@@ -307,6 +307,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- io_uring: timers and the loop tick no longer use the ring (#838). A
+  `sleep`, `timeout` or related timer records its deadline in a per-worker
+  min-heap, the one the mio backend already used, and the worker passes the
+  earliest of the next tick, the earliest timer and the earliest TLS
+  handshake or close deadline to `io_uring_enter` as its wait timeout
+  (`IORING_ENTER_EXT_ARG`, Linux 5.11). A timer costs no SQE and no CQE, and a
+  `timeout` whose future wins pushes no `ASYNC_CANCEL`. That cancel was the
+  expensive part: the kernel finds a timeout to cancel by walking its list of
+  pending timeouts. With one pinned worker on a Linux 6.12 VM (5 runs a
+  side, interleaved with the build before this change, medians), a
+  `timeout(60 s, yield_now())` took 1.44 µs of CPU before and 306 ns after
+  with no other timer pending, 6.43 µs and 332 ns with 1,000, 105 µs and
+  355 ns with 16,000, and 386 µs and 361 ns with 60,000. 64 tasks looping
+  `sleep(100 µs)` take 627 ns of CPU per sleep instead of 980, and complete
+  467,000 sleeps a second instead of 429,000. An idle worker uses the same
+  CPU as before at a 1 ms, 10 ms and 100 ms tick. One task looping
+  `sleep(100 µs)` at the 1 ms tick completes 7,349 sleeps a second instead
+  of 7,795 (136 µs per sleep instead of 128), and uses 36.5 µs of CPU per
+  sleep instead of 27.6. The cause is not known. That difference depends on
+  the tick: with no tick, the two builds complete the same number of 100 µs
+  sleeps (7,287 and 7,278 a second, 5 interleaved runs a side) with the same
+  median overshoot of 34 µs; with a 100 ms tick the build before this change
+  was 3 µs per sleep faster at 100 µs; at 200 µs and 500 µs the run ranges
+  overlap. This build takes about the same time per sleep at every tick. A
+  timer fires at its own deadline whatever `tick_timeout_us` is, including
+  0, and the kernel applies no timer slack to the wait. A wait passed to the
+  kernel is at most an hour long: the kernel adds it to the current time
+  without saturating, so a wait longer than about 292 years would wrap;
+  capping at an hour keeps it in range. `on_tick` still runs on every loop
+  iteration, and an idle worker still wakes every `tick_timeout_us`. The
+  deadline heap drops the entries of released timers once it holds twice the
+  entries it kept at its last compaction, so a loop of `timeout`s whose
+  futures win no longer grows it on either backend. The worker's exit drain
+  waits with the same timed wait.
+
 - io_uring: the CQ is sized by the new `ConfigBuilder::cq_entries`, default
   65536, the largest Linux allows, instead of 4 × `sq_entries`; and the
   default `sq_entries` is 4096 instead of 256. A large CQ keeps completions
@@ -377,11 +412,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the server's flight was larger than the peer's receive window and the
   server's send buffer together; on loopback a 2 MB flight did, a 0.5 MB one
   did not. A peer that reads the flight within the 5 s still receives it and
-  the alert. On io_uring with a `tick_timeout_us` of 0 or above 10 ms, the
-  worker's timer that ends its wait for the earliest handshake deadline also
-  covers close deadlines (`deadline` on `ringline/cqe_by_tag`), so a
-  close deadline is checked on time even when no other timer wakes the
-  worker. Send and recv paradigms audit PL10
+  the alert. On io_uring the earliest close deadline bounds the worker's
+  wait for I/O, so it is checked on time even when nothing else wakes the
+  worker (#838). Send and recv paradigms audit PL10
   (`docs/journal/2026-11-send-recv-paradigms-audit.md`).
 
 - `with_data_result` reports a TLS record the engine cannot process (a bad
@@ -907,6 +940,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- The `timer`, `tick_timeout` and `deadline` values of the `op` label on
+  `ringline/cqe_by_tag`: those completions no longer exist (#838).
+
 - **Breaking:** `DirectIoCompletion`, `NvmeCompletion` and `DirectIoOp` are
   no longer public. Nothing constructed the two completion types, and their
   docs described a completion handler that never existed; the results they
@@ -1061,14 +1097,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     sleep stayed pending without an error. On mio, `sleep(Duration::MAX)`
     panicked adding it to an `Instant`, and `Deadline::after(Duration::MAX)`
     overflowed on both backends.
-  - io_uring: a timeout that completes with an error instead of expiring
-    (`-ETIME`) or being cancelled (`-ECANCELED`) is pushed again on the
-    sleep's next poll. Before, every such result was taken as a cancel and
-    the sleep waited forever.
-  - io_uring: a sleep dropped while its timeout is in flight, whose cancel
-    cannot be pushed, keeps its timer slot until the timeout completes.
-    Before, the slot was freed at once, and once its 16-bit generation had
-    wrapped, the old timeout could wake the slot's new occupant early.
+  - io_uring: a timeout that completed with an error instead of expiring
+    (`-ETIME`) or being cancelled (`-ECANCELED`) was taken as a cancel and
+    the sleep waited forever; and a sleep dropped while its timeout was in
+    flight, whose cancel could not be pushed, freed its slot at once, so
+    once the slot's 16-bit generation had wrapped the old timeout could wake
+    the slot's new occupant early. Timers no longer use timeout SQEs (#838),
+    so neither can happen.
 - io_uring: dropping a `Child::wait` future before the child exits cancels
   its pidfd poll. Before, the poll stayed armed until the child exited, so a
   loop that raced `wait` against a timer added one armed poll per iteration,
@@ -1086,16 +1121,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   dropped completions it could not queue in its overflow list. The worker
   carries on and counts it; the operations whose completions were dropped
   never complete (#831).
-- io_uring: a `sleep`, `sleep_until`, `try_sleep` or `try_sleep_until` whose
-  timeout SQE cannot be pushed (the submission queue is full and submitting
-  to make room fails) keeps its timer slot, wakes its task and pushes again
-  on the next poll. Before, `sleep` and `sleep_until` panicked with `timer
-  SQE submission failed`, and `try_sleep` and `try_sleep_until` freed the
-  slot and left the first poll to allocate and push again, which panicked on
-  an exhausted pool or a second failed push. The same holds for `timeout`,
-  `timeout_at`, `try_timeout` and `try_timeout_at`. A relative sleep
-  (`sleep`, `try_sleep`, `timeout`, `try_timeout`) armed on a later poll
-  counts its duration from that push (#832).
+- io_uring: a full submission queue no longer makes a `sleep`, `sleep_until`,
+  `try_sleep` or `try_sleep_until` fail. Before, `sleep` and `sleep_until`
+  panicked with `timer SQE submission failed` when the timeout SQE could not
+  be pushed, and `try_sleep` and `try_sleep_until` freed the slot and left
+  the first poll to allocate and push again, which panicked on an exhausted
+  pool or a second failed push. The same held for `timeout`, `timeout_at`,
+  `try_timeout` and `try_timeout_at` (#832). Timers no longer push an SQE
+  (#838).
 - io_uring: a connection's `Close` SQE carries the connection's generation,
   and `handle_close` acts on its CQE only when that matches the slot's, before
   touching any of the slot's state. The check added in #892 compared the

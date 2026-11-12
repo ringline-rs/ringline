@@ -63,6 +63,16 @@ pub(crate) trait Engine: Sized {
     /// reaps.
     fn submit_and_wait(&self, min_complete: u32) -> io::Result<()>;
 
+    /// As [`submit_and_wait`](Self::submit_and_wait), but return once
+    /// `timeout` has passed, whether or not `min_complete` completions are
+    /// ready. Expiry returns `Ok`, and so does `EINTR`, without restarting
+    /// the wait.
+    fn submit_and_wait_timeout(
+        &self,
+        min_complete: u32,
+        timeout: std::time::Duration,
+    ) -> io::Result<()>;
+
     /// Start queued operations and make ready completions reapable, without
     /// blocking.
     fn submit_and_get_events(&self) -> io::Result<()>;

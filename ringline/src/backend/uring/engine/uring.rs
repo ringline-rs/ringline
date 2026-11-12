@@ -30,6 +30,10 @@ pub(crate) fn retry_with_resv_set(err: &io::Error, kernel: Option<KernelVersion>
     err.raw_os_error() == Some(libc::EINVAL) && kernel == Some(PBUF_RESV_INVERTED_ON)
 }
 
+/// The longest timed wait [`UringEngine::submit_and_wait_timeout`] passes
+/// to the kernel. A longer wait ends early and the caller waits again.
+pub(crate) const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Whether an `io_uring_enter` failure is temporary, so the caller carries on
 /// and reaps. `EBUSY`: the CQ is backed up (overflow list non-empty), and
 /// reaping frees it. `EAGAIN`: the kernel could not allocate a request for the
@@ -684,6 +688,58 @@ impl Engine for UringEngine {
                 Err(e) if reports_dropped_completions(&e) => return Ok(()),
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    /// Submit all pending SQEs and wait for at least `min_complete` CQEs or
+    /// until `timeout` has passed, in one `io_uring_enter` with
+    /// `IORING_ENTER_EXT_ARG` (Linux 5.11). The kernel applies no timer slack
+    /// to the wait (`schedule_hrtimeout` with a delta of 0 through 6.10,
+    /// `hrtimer_set_expires_range_ns(.., 0)` from 6.12).
+    ///
+    /// `timeout` is capped at [`MAX_WAIT`]. The kernel adds the timeout to
+    /// the current time without saturating (`io_cqring_wait`:
+    /// `ktime_add_ns(timespec64_to_ktime(ts), ktime_get_ns())` in 6.1,
+    /// `ktime_add(iowq.timeout, start_time)` in 6.12), so a timeout of more
+    /// than `KTIME_MAX` (about 9.2e9 s) less the uptime gives a negative
+    /// expiry; one of `KTIME_SEC_MAX` seconds or more is first saturated to
+    /// `KTIME_MAX` by `timespec64_to_ktime`, and wraps as well. `hrtimer_set_expires_range_ns` saturates the hard expiry to
+    /// `KTIME_SEC_MAX` seconds (`ktime_add_safe`) but keeps the negative soft
+    /// expiry, so the wait does not end at once, but can end at any hrtimer
+    /// interrupt on the CPU that finds it first in its clock base.
+    ///
+    /// Errors as [`submit_and_wait`](Self::submit_and_wait), except:
+    /// - `ETIME`: the timeout passed with fewer than `min_complete` CQEs
+    ///   ready. That is the expected end of a timed wait, so it returns `Ok`.
+    /// - `EINTR` returns `Ok` instead of restarting the wait: a restart
+    ///   would wait the whole `timeout` again. The caller computes a new
+    ///   timeout before it next waits.
+    fn submit_and_wait_timeout(
+        &self,
+        min_complete: u32,
+        timeout: std::time::Duration,
+    ) -> io::Result<()> {
+        // What `inject` queued needs no wait.
+        #[cfg(test)]
+        if !self.injected.is_empty() {
+            return self.submit_and_wait(0);
+        }
+        let ts = types::Timespec::from(timeout.min(MAX_WAIT));
+        let args = types::SubmitArgs::new().timespec(&ts);
+        match self
+            .ring
+            .submitter()
+            .submit_with_args(min_complete as usize, &args)
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
+            Err(e) if is_enter_backpressure(&e) => {
+                self.reap_after_backpressure(&e);
+                Ok(())
+            }
+            Err(e) if reports_dropped_completions(&e) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 

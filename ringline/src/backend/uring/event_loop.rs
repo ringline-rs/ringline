@@ -18,7 +18,7 @@ use crate::runtime::io::{ConnCtx, DriverState, UdpSocket, set_driver_state_guard
 use crate::runtime::send_completion::SendId;
 use crate::runtime::task::Park;
 use crate::runtime::waker::{STANDALONE_BIT, conn_waker, standalone_waker};
-use crate::runtime::{CURRENT_TASK_ID, Executor, TimerSlotPool};
+use crate::runtime::{CURRENT_TASK_ID, Executor};
 
 /// Async event loop that reuses `Driver` infrastructure with an `Executor`
 /// for polling connection futures instead of push-based callbacks.
@@ -425,57 +425,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .is_ok();
             }
 
-            // Arm a tick timeout before blocking.
-            // Only mark as armed if the SQE was actually submitted — if the SQ
-            // is full the submission silently fails, and leaving armed=false
-            // ensures we retry on the next iteration rather than calling
-            // submit_and_wait without any timeout in the ring.
-            if !self.driver.tick_timeout_armed
-                && let Some(ref ts) = self.driver.tick_timeout_ts
-            {
-                let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
-                if self
-                    .driver
-                    .ring
-                    .submit_tick_timeout(ts as *const _, ud.raw())
-                    .is_ok()
-                {
-                    self.driver.tick_timeout_armed = true;
-                }
-            }
-
-            // A wait with `tick_timeout_us = 0` has no timer of its own. As
-            // above, a full SQ leaves this unarmed for the next iteration.
+            // A full SQ leaves this unarmed for the next iteration.
             if !self.driver.send_backstop_armed && !self.driver.send_backstop_list.is_empty() {
                 let ud = UserData::encode(OpTag::SendBackstop, 0, 0);
                 let ts = &raw const self.driver.send_backstop_ts;
                 self.driver.send_backstop_armed =
                     self.driver.ring.submit_tick_timeout(ts, ud.raw()).is_ok();
-            }
-
-            // Without a tick timeout the wait can block indefinitely, and with
-            // one longer than 10 ms a deadline would be checked late, so the
-            // earliest handshake or close deadline arms a timer of its own,
-            // and an earlier one arms another. Every arm reads the one timespec
-            // field, which lives as long as the driver. An older timer the
-            // kernel has not yet prepared then waits for the new value, and
-            // the new timer covers the earliest deadline either way. As
-            // above, a full SQ leaves this unarmed for the next iteration.
-            if self.driver.deadline_timer_used
-                && let Some(deadline) = self.driver.next_deadline()
-                && self.driver.deadline_timer_at.is_none_or(|at| deadline < at)
-            {
-                let wait = deadline.saturating_duration_since(std::time::Instant::now());
-                self.driver.deadline_timer_ts = crate::backend::uring::abi::Timespec::new()
-                    .sec(wait.as_secs())
-                    .nsec(wait.subsec_nanos());
-                let seq = self.driver.deadline_timer_seq.wrapping_add(1);
-                let ud = UserData::encode(OpTag::Deadline, 0, seq);
-                let ts = &raw const self.driver.deadline_timer_ts;
-                if self.driver.ring.submit_tick_timeout(ts, ud.raw()).is_ok() {
-                    self.driver.deadline_timer_seq = seq;
-                    self.driver.deadline_timer_at = Some(deadline);
-                }
             }
 
             // The blocking wait itself is always performed; only the timing
@@ -506,12 +461,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // Don't block while tasks are already runnable (self-wakes
             // collected after the last poll pass, tasks woken from
             // on_tick): submit SQEs but return immediately so the ready
-            // queue is polled now instead of after the next CQE or tick
-            // timeout (indefinitely, with tick_timeout_us = 0).
+            // queue is polled now instead of after the next CQE or the end
+            // of the wait's bound (indefinitely, with no bound).
             //
             // First release what futures dropped at a close since the last
             // poll pass queued, so an idle worker does not hold it until its
-            // next completion; the wait below submits any timer cancels.
+            // next completion, and a released timer no longer bounds the wait.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
             self.executor.collect_wakeups();
             // Tasks have read what they will read in this pass. The wait below
@@ -540,8 +495,23 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // flowing while a task is runnable — otherwise a task that stays
             // runnable without queueing SQEs (so `flush()` takes its empty-SQ
             // shortcut) starves the whole worker of completions.
+            //
+            // A blocking wait ends by the next tick, the earliest timer, and
+            // the earliest handshake or close deadline. The bound is read
+            // here, after every task poll and orphan release of the
+            // iteration, so a timer armed in this iteration bounds this wait.
+            //
+            // A zero bound (a deadline has passed) takes the non-blocking
+            // enter: the kernel would arm an hrtimer and schedule even for a
+            // timeout already past.
             if self.may_block() {
-                self.driver.ring.submit_and_wait(1)?;
+                match self.wait_bound() {
+                    Some(bound) if bound.is_zero() => {
+                        self.driver.ring.submit_and_get_events()?;
+                    }
+                    Some(bound) => self.driver.ring.submit_and_wait_timeout(1, bound)?,
+                    None => self.driver.ring.submit_and_wait(1)?,
+                }
             } else {
                 self.driver.ring.submit_and_get_events()?;
             }
@@ -618,6 +588,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_shutdown_retries();
             self.drain_send_pollout_retries();
             self.driver.tick_count += 1;
+
+            // Wake the tasks whose timers have expired, and publish the load
+            // if a tick is due.
+            self.executor.fire_expired_timers();
+            self.tick_if_due();
 
             // Check close_notify deadlines: force-close a TLS connection whose
             // close requested a close_notify and whose Close is still not
@@ -1123,7 +1098,39 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.pending_finalize_closes = pending;
     }
 
-    /// Whether the run loop may block in `submit_and_wait(1)`. It may not while a
+    /// How long a blocking wait may last: until the next tick
+    /// (`Driver::next_tick`), the earliest timer, or the earliest handshake
+    /// or close deadline (`Driver::next_deadline`), whichever is first.
+    /// Zero when that has passed. `None` when there is no tick and no
+    /// deadline: the wait then lasts until a completion.
+    fn wait_bound(&mut self) -> Option<std::time::Duration> {
+        let earliest = [
+            self.driver.next_tick,
+            self.executor.timer_pool.next_deadline(),
+            self.driver.next_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()?;
+        Some(earliest.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// If the tick is due, publish the worker's load and set the next tick
+    /// one interval from now. Connections closing is the other way the
+    /// worker's count moves, and without this a worker that shed all its
+    /// work would still look busy to its peers.
+    fn tick_if_due(&mut self) {
+        let (Some(due), Some(interval)) = (self.driver.next_tick, self.driver.tick_interval) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now >= due {
+            self.driver.next_tick = Some(now + interval);
+            self.publish_load();
+        }
+    }
+
+    /// Whether the run loop may block waiting for a completion. It may not while a
     /// task is runnable, while a close released by the orphan drain awaits the
     /// end-of-iteration drain, while a UDP re-arm is due, or once shutdown is
     /// pending.
@@ -1786,14 +1793,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Connect => self.handle_connect(ud, result),
             OpTag::Timeout => self.handle_timeout(ud, result),
             OpTag::Cancel => {}
-            OpTag::TickTimeout => {
-                self.driver.tick_timeout_armed = false;
-                // Republish the load: connections closing is the other way this
-                // worker's count moves, and without this a worker that shed all
-                // its work would still look busy to its peers.
-                self.publish_load();
-            }
-            OpTag::Timer => self.handle_timer(ud, result),
             OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result, flags),
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
             OpTag::RecvUdp => self.handle_recv_udp(ud, result, flags),
@@ -1804,14 +1803,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
             OpTag::SendPollOut => self.handle_send_pollout(ud, result, flags),
             OpTag::SendBackstop => self.handle_send_backstop(),
-            // The loop checks the deadlines on every iteration; the timer
-            // only ends the wait. A completion of an earlier arm leaves the
-            // latest one recorded.
-            OpTag::Deadline => {
-                if ud.payload() == self.driver.deadline_timer_seq {
-                    self.driver.deadline_timer_at = None;
-                }
-            }
             OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
             // No notification follows a plain `send`.
             OpTag::SendMsgZcDrain => self.handle_send_msg_zc(ud, result, 0),
@@ -4095,33 +4086,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // its Close on chain_drained. The chain state was just taken, so
         // register the close for the end-of-iteration drain.
         self.driver.defer_finalize_close(conn_index);
-    }
-
-    fn handle_timer(&mut self, ud: UserData, result: i32) {
-        let payload = ud.payload();
-        let (slot, generation) = TimerSlotPool::decode_payload(payload);
-
-        // A slot released while this timeout was in flight, whose cancel
-        // could not be pushed, is freed now that the timeout has completed.
-        if self.executor.timer_pool.release_parked(slot, generation) {
-            return;
-        }
-        // Cancelled: the future was dropped and released the slot.
-        if result == -libc::ECANCELED {
-            return;
-        }
-        // Any result other than expiry means the timeout ended without
-        // expiring (with the seconds clamped, -ENOMEM from the kernel's
-        // prep). Completing the sleep would make a `timeout()` report a
-        // spurious `Elapsed`, so its task is woken to push the timeout again.
-        let waker_id = if result == -libc::ETIME {
-            self.executor.timer_pool.fire(slot, generation)
-        } else {
-            self.executor.timer_pool.rearm(slot, generation)
-        };
-        if let Some(waker_id) = waker_id {
-            self.executor.wake_task(waker_id);
-        }
     }
 
     fn handle_recv_msg_udp(&mut self, ud: UserData, result: i32, flags: u32) {
@@ -9965,13 +9929,17 @@ mod tests {
         f()
     }
 
-    /// A sleep whose timeout SQE cannot be pushed keeps its slot, wakes its
-    /// task, and pushes again on its next poll. It neither panics nor
-    /// completes before the timer fires (#832). Covers `sleep`, `sleep_until`,
-    /// `try_sleep` and `try_sleep_until`.
+    /// Every sleep variant records its deadline in the timer heap without
+    /// pushing an SQE, holds its slot until it completes, and completes no
+    /// earlier than its delay once the loop fires expired timers, which wakes
+    /// its task. A `timeout` dropped before its deadline pushes no cancel and
+    /// frees its slot (#838). Covers `sleep`, `sleep_until`, `try_sleep` and
+    /// `try_sleep_until`.
     #[test]
-    fn a_sleep_whose_push_fails_is_armed_on_a_later_poll() {
-        use crate::runtime::io::{Deadline, sleep, sleep_until, try_sleep, try_sleep_until};
+    fn sleeps_push_no_sqe_and_fire_from_the_heap() {
+        use crate::runtime::io::{
+            Deadline, sleep, sleep_until, timeout, try_sleep, try_sleep_until,
+        };
         use std::task::{Context, Poll, Wake, Waker};
         use std::time::Duration;
 
@@ -9998,11 +9966,9 @@ mod tests {
             let waker = Waker::from(Arc::clone(&wakes));
             let mut cx = Context::from_waker(&waker);
             let start = Instant::now();
+            el.driver.ring.last_pushed = None;
 
-            // Two pushes fail. The try_ variants push at creation and then on
-            // their first poll; the others on their first two polls.
             let mut fut = with_driver_state(&mut el, || {
-                crate::runtime::io::with_state(|d, _| d.ring.force_push_failures(2));
                 Box::pin(match (eager, absolute) {
                     (false, false) => sleep(delay),
                     (false, true) => sleep_until(Deadline::after(delay)),
@@ -10010,64 +9976,80 @@ mod tests {
                     (true, true) => try_sleep_until(Deadline::after(delay)).expect("a free slot"),
                 })
             });
-            let failed_polls = if eager { 1 } else { 2 };
-            for i in 1..=failed_polls {
-                let polled = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
-                assert!(polled.is_pending(), "{name}: ready before its timer fired");
-                // The failed push woke the task so that it polls again.
-                assert_eq!(wakes.0.load(Ordering::SeqCst), i, "{name}: no wake");
-            }
             let polled = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
-            assert!(polled.is_pending(), "{name}: ready before its timer fired");
-            assert_eq!(
-                wakes.0.load(Ordering::SeqCst),
-                failed_polls,
-                "{name}: woke after a push succeeded"
+            assert!(polled.is_pending(), "{name}: ready before its deadline");
+            assert!(
+                el.driver.ring.last_pushed.is_none(),
+                "{name}: arming pushed an SQE"
             );
             assert_eq!(
                 el.executor.timer_pool.free_slots(),
                 free - 1,
                 "{name}: the slot was not held"
             );
+            assert!(
+                el.executor.timer_pool.next_deadline().is_some(),
+                "{name}: no deadline in the heap"
+            );
 
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                el.driver.ring.submit_and_wait(1).expect("submit");
-                el.drain_completions();
+                el.executor.fire_expired_timers();
                 let polled = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
                 if polled == Poll::Ready(()) {
                     break;
                 }
                 assert!(Instant::now() < deadline, "{name}: the timer never fired");
+                std::thread::sleep(Duration::from_millis(1));
             }
             assert!(start.elapsed() >= delay, "{name}: fired early");
+            assert!(
+                wakes.0.load(Ordering::SeqCst) >= 1,
+                "{name}: firing did not wake the task"
+            );
             assert_eq!(
                 el.executor.timer_pool.free_slots(),
                 free,
                 "{name}: slot kept"
             );
+            assert!(
+                el.driver.ring.last_pushed.is_none(),
+                "{name}: pushed an SQE"
+            );
             with_driver_state(&mut el, || drop(fut));
         }
 
-        // Dropped before a push succeeds, the slot is freed and no cancel is
-        // pushed for a timeout that was never pushed.
+        // A timeout whose future is pending is dropped before its deadline,
+        // as one whose future completes first drops its timer.
         let waker = Waker::from(Arc::new(Count(AtomicU32::new(0))));
         let mut cx = Context::from_waker(&waker);
+        el.driver.ring.last_pushed = None;
         el.driver.ring.pushed_cancels.clear();
         with_driver_state(&mut el, || {
-            crate::runtime::io::with_state(|d, _| d.ring.force_push_failures(1));
-            let mut fut = Box::pin(sleep(delay));
+            let mut fut = Box::pin(timeout(
+                Duration::from_secs(60),
+                std::future::pending::<()>(),
+            ));
             assert!(fut.as_mut().poll(&mut cx).is_pending());
             drop(fut);
         });
         assert_eq!(
             el.executor.timer_pool.free_slots(),
             free,
-            "an unarmed slot was kept"
+            "a dropped timeout kept its slot"
+        );
+        assert!(
+            el.driver.ring.last_pushed.is_none(),
+            "a timeout pushed an SQE"
         );
         assert!(
             el.driver.ring.pushed_cancels.is_empty(),
-            "a cancel was pushed for an unarmed timer"
+            "a dropped timeout pushed a cancel"
+        );
+        assert_eq!(
+            el.executor.timer_pool.next_deadline(),
+            None,
+            "a dropped timeout left a live deadline"
         );
     }
 
@@ -11052,157 +11034,148 @@ mod tests {
 
     // ── Timer tests ────────────────────────────────────────────────
 
+    /// An expired timer is marked fired. `sleeps_push_no_sqe_and_fire_from_the_heap`
+    /// checks that firing wakes the task.
     #[test]
-    fn handle_timer_fires_and_wakes_task() {
+    fn fire_expired_timers_marks_the_timer_fired() {
         let mut el = make_test_loop();
-
-        // Allocate a timer slot.
         let waker_id = 0u32; // conn_index 0 as waker
-        let (slot, generation) = el.executor.timer_pool.allocate(waker_id).unwrap();
-
-        let payload = TimerSlotPool::encode_payload(slot, generation);
-        let ud = UserData::encode(OpTag::Timer, 0, payload);
-
-        // Simulate timer CQE (result == -ETIME = -62).
-        el.test_dispatch_cqe(ud.raw(), -62, 0);
-
-        // Timer should be marked as fired.
+        let (slot, _) = el.executor.timer_pool.allocate(waker_id).unwrap();
+        el.executor
+            .timer_pool
+            .set_relative(slot, std::time::Duration::ZERO);
+        el.executor.fire_expired_timers();
         assert!(
             el.executor.timer_pool.is_fired(slot),
             "timer not marked as fired"
         );
     }
 
-    /// A sleep whose timeout completes with an error, neither expiring nor
-    /// cancelled, pushes its timeout again on its next poll and does not
-    /// complete. One dropped before that poll frees its slot without a cancel,
-    /// since no timeout is in flight (#836).
+    /// The expired deadline of a released timer does not fire the slot's
+    /// next occupant or wake the old task.
     #[test]
-    fn a_timer_error_rearms_the_sleep() {
+    fn a_released_timer_does_not_fire_its_slots_next_occupant() {
+        let mut el = make_test_loop();
+        let (slot, generation) = el.executor.timer_pool.allocate(0).unwrap();
+        el.executor
+            .timer_pool
+            .set_relative(slot, std::time::Duration::ZERO);
+        el.executor.timer_pool.release(slot);
+        let (slot2, gen2) = el.executor.timer_pool.allocate(1).unwrap();
+        assert_eq!(slot2, slot);
+        assert_ne!(generation, gen2, "generation should have changed");
+        el.executor
+            .timer_pool
+            .set_relative(slot2, std::time::Duration::from_secs(60));
+        el.executor.fire_expired_timers();
+        assert!(
+            !el.executor.timer_pool.is_fired(slot2),
+            "the released timer's deadline fired the next occupant"
+        );
+    }
+
+    /// The wait is bounded by the earliest of the next tick, the earliest
+    /// timer and the earliest handshake deadline, and is unbounded only with
+    /// no tick and nothing pending.
+    #[test]
+    fn the_wait_bound_is_the_earliest_deadline() {
+        use std::time::Duration;
+        let mut cfg = test_config();
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        assert_eq!(el.wait_bound(), None, "nothing pending bounds the wait");
+
+        // A handshake deadline (the test config's 10 s handshake timeout).
+        el.driver.handshake_deadlines.arm(0, 0, |_, _| true);
+        let bound = el.wait_bound().expect("the handshake deadline bounds it");
+        assert!(bound > Duration::from_secs(5) && bound <= Duration::from_secs(10));
+
+        // An earlier timer.
+        let (slot, _) = el.executor.timer_pool.allocate(0).unwrap();
+        el.executor
+            .timer_pool
+            .set_relative(slot, Duration::from_millis(50));
+        let bound = el.wait_bound().expect("the timer bounds it");
+        assert!(bound <= Duration::from_millis(50), "{bound:?}");
+
+        // A released timer no longer bounds it.
+        el.executor.timer_pool.release(slot);
+        let bound = el.wait_bound().expect("the handshake deadline bounds it");
+        assert!(bound > Duration::from_secs(5), "{bound:?}");
+
+        // A tick earlier than both.
+        el.driver.next_tick = Some(Instant::now() + Duration::from_millis(1));
+        let bound = el.wait_bound().expect("the tick bounds it");
+        assert!(bound <= Duration::from_millis(1), "{bound:?}");
+
+        // A passed deadline gives a zero bound.
+        let (slot, _) = el.executor.timer_pool.allocate(0).unwrap();
+        el.executor.timer_pool.set_relative(slot, Duration::ZERO);
+        assert_eq!(el.wait_bound(), Some(Duration::ZERO));
+    }
+
+    /// With no tick, a pending sleep bounds the kernel wait: the timed wait
+    /// returns at the deadline with no completion, and the sleep fires.
+    #[test]
+    fn a_timed_wait_ends_at_the_timer_deadline() {
         use crate::runtime::io::sleep;
         use std::task::{Context, Poll};
         use std::time::Duration;
 
-        let mut el = make_test_loop();
+        let mut cfg = test_config();
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        el.driver.ring.flush().unwrap();
+        el.drain_completions();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut fut = Box::pin(sleep(Duration::from_millis(5)));
-        let first = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
-        assert!(first.is_pending());
-        let pushed = el.driver.ring.last_pushed.as_ref().unwrap().user_data;
-        assert_eq!(UserData(pushed).tag(), Some(OpTag::Timer));
-
-        // The kernel ends that timeout with an error. It must not fire, and the
-        // next poll pushes the same timeout again.
-        el.driver.ring.last_pushed = None;
-        el.test_dispatch_cqe(pushed, -libc::ENOMEM, 0);
-        let (slot, _) = TimerSlotPool::decode_payload(UserData(pushed).payload());
-        assert!(!el.executor.timer_pool.is_fired(slot), "an error fired it");
-        let again = with_driver_state(&mut el, || fut.as_mut().poll(&mut cx));
-        assert!(again.is_pending(), "an error completed the sleep");
-        assert_eq!(
-            el.driver.ring.last_pushed.as_ref().map(|s| s.user_data),
-            Some(pushed),
-            "the timeout was not pushed again"
-        );
-
-        // A cancel completion for it fires nothing.
-        el.test_dispatch_cqe(pushed, -libc::ECANCELED, 0);
-        assert!(!el.executor.timer_pool.is_fired(slot), "a cancel fired it");
-
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let delay = Duration::from_millis(20);
+        let start = Instant::now();
+        let mut fut = Box::pin(sleep(delay));
+        assert!(with_driver_state(&mut el, || fut.as_mut().poll(&mut cx)).is_pending());
+        let mut waits = 0;
         loop {
-            el.driver.ring.submit_and_get_events().expect("submit");
+            let bound = el.wait_bound().expect("the sleep bounds the wait");
+            assert!(bound <= delay, "{bound:?}");
+            el.driver
+                .ring
+                .submit_and_wait_timeout(1, bound)
+                .expect("timed wait");
+            waits += 1;
             el.drain_completions();
+            el.executor.fire_expired_timers();
             if with_driver_state(&mut el, || fut.as_mut().poll(&mut cx)) == Poll::Ready(()) {
                 break;
             }
-            assert!(Instant::now() < deadline, "the sleep never completed");
-            std::thread::sleep(Duration::from_millis(1));
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the sleep never fired"
+            );
         }
-
-        // Dropped while its re-push is pending, a sleep tries no cancel, so a
-        // refused push cannot park its slot: the slot is freed.
-        let free = el.executor.timer_pool.free_slots();
-        let mut fut = Box::pin(sleep(Duration::from_secs(60)));
-        assert!(with_driver_state(&mut el, || fut.as_mut().poll(&mut cx)).is_pending());
-        let pushed = el.driver.ring.last_pushed.as_ref().unwrap().user_data;
-        el.test_dispatch_cqe(pushed, -libc::ENOMEM, 0);
-        el.driver.ring.force_push_failures(1);
-        with_driver_state(&mut el, || drop(fut));
-        assert_eq!(
-            el.executor.timer_pool.free_slots(),
-            free,
-            "the slot was not freed"
+        let elapsed = start.elapsed();
+        assert!(elapsed >= delay, "fired early: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "fired late: {elapsed:?} after {waits} waits"
         );
     }
 
-    /// A slot whose cancel could not be pushed is not freed while its
-    /// timeout is in flight, so the timeout cannot match a later occupant;
-    /// the timeout's completion frees it and wakes nothing (#836).
+    /// A tick that has passed publishes the load and sets the next tick one
+    /// interval later; one that has not changes nothing.
     #[test]
-    fn a_slot_whose_cancel_was_not_pushed_waits_for_its_timeout() {
+    fn a_due_tick_moves_the_next_tick() {
+        use std::time::Duration;
         let mut el = make_test_loop();
-        let free = el.executor.timer_pool.free_slots();
-        let (slot, generation) = el.executor.timer_pool.allocate(0).unwrap();
-        el.driver.ring.force_push_failures(1);
-        crate::runtime::io::release_timer_slot(
-            &mut el.driver,
-            &mut el.executor,
-            slot,
-            generation,
-            true,
-        );
-        assert_eq!(
-            el.executor.timer_pool.free_slots(),
-            free - 1,
-            "the slot was freed with its timeout in flight"
-        );
-        let (other, _) = el.executor.timer_pool.allocate(0).unwrap();
-        assert_ne!(other, slot, "a parked slot was handed out again");
-        el.executor.timer_pool.release(other);
-
-        let ud = UserData::encode(
-            OpTag::Timer,
-            0,
-            TimerSlotPool::encode_payload(slot, generation),
-        );
-        el.test_dispatch_cqe(ud.raw(), -libc::ETIME, 0);
-        assert!(
-            !el.executor.timer_pool.is_fired(slot),
-            "it woke the dropped sleep"
-        );
-        assert_eq!(
-            el.executor.timer_pool.free_slots(),
-            free,
-            "the timeout's completion did not free the slot"
-        );
-        // The slot's next occupant has a new generation.
-        let (again, next) = el.executor.timer_pool.allocate(0).unwrap();
-        assert_eq!(again, slot);
-        assert_ne!(next, generation);
-    }
-
-    #[test]
-    fn handle_timer_stale_generation_ignored() {
-        let mut el = make_test_loop();
-
-        let (slot, generation) = el.executor.timer_pool.allocate(0).unwrap();
-        // Release and reallocate to bump generation.
-        el.executor.timer_pool.release(slot);
-        let (_slot2, gen2) = el.executor.timer_pool.allocate(0).unwrap();
-        assert_ne!(generation, gen2, "generation should have changed");
-
-        // Dispatch with OLD generation — should be ignored.
-        let payload = TimerSlotPool::encode_payload(slot, generation);
-        let ud = UserData::encode(OpTag::Timer, 0, payload);
-        el.test_dispatch_cqe(ud.raw(), -62, 0);
-
-        // Timer should NOT be fired (stale generation).
-        assert!(
-            !el.executor.timer_pool.is_fired(slot),
-            "stale timer should not be fired"
-        );
+        let interval = el.driver.tick_interval.expect("the test config ticks");
+        let future = Instant::now() + Duration::from_secs(60);
+        el.driver.next_tick = Some(future);
+        el.tick_if_due();
+        assert_eq!(el.driver.next_tick, Some(future));
+        let before = Instant::now();
+        el.driver.next_tick = Some(before);
+        el.tick_if_due();
+        let next = el.driver.next_tick.expect("a next tick");
+        assert!(next >= before + interval && next <= Instant::now() + interval);
     }
 
     // ── TLS send tests ─────────────────────────────────────────────
@@ -12339,22 +12312,6 @@ mod tests {
         );
     }
 
-    // ── Tick timeout test ──────────────────────────────────────────
-
-    #[test]
-    fn handle_tick_timeout_clears_armed_flag() {
-        let mut el = make_test_loop();
-        el.driver.tick_timeout_armed = true;
-
-        let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
-        el.test_dispatch_cqe(ud.raw(), -62, 0);
-
-        assert!(
-            !el.driver.tick_timeout_armed,
-            "tick_timeout_armed not cleared"
-        );
-    }
-
     // ── UDP send error metric test ─────────────────────────────────
 
     #[test]
@@ -12641,25 +12598,6 @@ mod tests {
     }
 
     #[test]
-    fn nop_inject_timer_fires() {
-        let mut el = make_test_loop();
-
-        let waker_id = 0u32;
-        let (slot, generation) = el.executor.timer_pool.allocate(waker_id).unwrap();
-
-        let payload = TimerSlotPool::encode_payload(slot, generation);
-        let ud = UserData::encode(OpTag::Timer, 0, payload);
-
-        // Inject timer expiry through real pipeline.
-        el.inject_and_dispatch(ud.raw(), -62); // -ETIME
-
-        assert!(
-            el.executor.timer_pool.is_fired(slot),
-            "timer not fired via NOP inject"
-        );
-    }
-
-    #[test]
     fn nop_inject_send_settles_the_awaited_send() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
@@ -12802,20 +12740,6 @@ mod tests {
     }
 
     #[test]
-    fn nop_inject_timer_stale_generation() {
-        let mut el = make_test_loop();
-        let (slot, generation) = el.executor.timer_pool.allocate(0).unwrap();
-        el.executor.timer_pool.release(slot);
-        let (_slot2, _gen2) = el.executor.timer_pool.allocate(0).unwrap();
-
-        let payload = TimerSlotPool::encode_payload(slot, generation);
-        let ud = UserData::encode(OpTag::Timer, 0, payload);
-        el.inject_and_dispatch(ud.raw(), -62);
-
-        assert!(!el.executor.timer_pool.is_fired(slot));
-    }
-
-    #[test]
     fn nop_inject_tls_send_complete() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
@@ -12844,17 +12768,6 @@ mod tests {
         assert!(!el.driver.send_copy_pool.in_use(slot));
         let conn = el.driver.connections.get(conn_index);
         assert!(conn.is_none() || conn.unwrap().close_requested());
-    }
-
-    #[test]
-    fn nop_inject_tick_timeout() {
-        let mut el = make_test_loop();
-        el.driver.tick_timeout_armed = true;
-
-        let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
-        el.inject_and_dispatch(ud.raw(), -62);
-
-        assert!(!el.driver.tick_timeout_armed);
     }
 
     #[test]
@@ -13718,113 +13631,6 @@ mod tests {
         assert_eq!(el.driver.send_copy_pool.free_count(), free_before + 3);
         assert!(!el.driver.chain_table.is_active(conn_index));
         assert_eq!(send_result(&mut el, id).unwrap().unwrap(), 9);
-    }
-
-    // ── Cancel injection tests ─────────────────────────────────────
-    //
-    // Submit a real timeout SQE, then cancel it with ASYNC_CANCEL.
-    // This exercises the timer ECANCELED path through the real kernel,
-    // simulating what happens when SleepFuture is dropped via select!.
-
-    #[test]
-    fn cancel_injection_timer_ecanceled() {
-        let mut el = make_test_loop();
-
-        // Allocate a timer slot and submit a real timeout (10 seconds — won't fire).
-        let waker_id = 0u32;
-        let (slot, generation) = el.executor.timer_pool.allocate(waker_id).unwrap();
-
-        // Set up the timespec in the pool.
-        el.executor.timer_pool.timespecs[slot as usize] =
-            crate::backend::uring::abi::Timespec::new().sec(10).nsec(0);
-
-        let payload = TimerSlotPool::encode_payload(slot, generation);
-        let timer_ud = UserData::encode(OpTag::Timer, 0, payload);
-        let ts_ptr = &el.executor.timer_pool.timespecs[slot as usize]
-            as *const crate::backend::uring::abi::Timespec;
-
-        // Submit the real timeout SQE.
-        el.driver
-            .ring
-            .submit_timeout(ts_ptr, timer_ud)
-            .expect("submit_timeout failed");
-
-        // Now cancel it — simulating SleepFuture::drop.
-        el.driver
-            .ring
-            .submit_async_cancel(timer_ud.raw(), 0)
-            .expect("submit_async_cancel failed");
-
-        // Process CQEs: should get Timer CQE with -ECANCELED,
-        // and Cancel CQE (which is a no-op in dispatch).
-        el.driver
-            .ring
-            .submit_and_wait(2)
-            .expect("submit_and_wait failed");
-        el.drain_completions();
-
-        // Timer should NOT be fired (it was cancelled, not expired).
-        assert!(
-            !el.executor.timer_pool.is_fired(slot),
-            "cancelled timer should not be fired"
-        );
-
-        // Simulate SleepFuture::drop releasing the slot.
-        el.executor.timer_pool.release(slot);
-
-        // Verify the slot can be reallocated (proves it was returned).
-        let (slot2, _gen2) = el.executor.timer_pool.allocate(0).unwrap();
-        assert_eq!(slot2, slot, "released slot should be reusable");
-        el.executor.timer_pool.release(slot2);
-    }
-
-    #[test]
-    fn cancel_injection_timer_fires_before_cancel() {
-        // Submit a very short timeout (1ns), then cancel. The timeout
-        // might fire before the cancel takes effect. Both outcomes
-        // should be handled without panic or leak.
-        let mut el = make_test_loop();
-
-        let waker_id = 0u32;
-        let (slot, generation) = el.executor.timer_pool.allocate(waker_id).unwrap();
-
-        // 1 nanosecond timeout — will fire almost immediately.
-        el.executor.timer_pool.timespecs[slot as usize] =
-            crate::backend::uring::abi::Timespec::new().sec(0).nsec(1);
-
-        let payload = TimerSlotPool::encode_payload(slot, generation);
-        let timer_ud = UserData::encode(OpTag::Timer, 0, payload);
-        let ts_ptr = &el.executor.timer_pool.timespecs[slot as usize]
-            as *const crate::backend::uring::abi::Timespec;
-
-        el.driver
-            .ring
-            .submit_timeout(ts_ptr, timer_ud)
-            .expect("submit_timeout failed");
-        el.driver
-            .ring
-            .submit_async_cancel(timer_ud.raw(), 0)
-            .expect("submit_async_cancel failed");
-
-        // Process all CQEs.
-        el.driver
-            .ring
-            .submit_and_wait(1)
-            .expect("submit_and_wait failed");
-        // Small sleep to let both CQEs arrive.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        el.drain_completions();
-
-        // Either the timer fired (-ETIME) or was cancelled (-ECANCELED).
-        // In both cases: no panic, no leak.
-        // If fired, the slot is marked as fired.
-        // If cancelled, the slot is not fired.
-        // Release the slot (simulating SleepFuture::drop).
-        el.executor.timer_pool.release(slot);
-
-        // No assertions on fired state — both outcomes are valid.
-        // The key assertion: no panic during processing, and the slot
-        // is cleanly released.
     }
 
     // ── Bounded-send settlement, teardown and identity ─────────────

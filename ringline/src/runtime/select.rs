@@ -51,7 +51,7 @@ impl<A: Future, B: Future> Future for Select<A, B> {
 ///
 /// Safe with ringline I/O futures — data buffered for a dropped `WithDataFuture`
 /// remains in the accumulator and is consumed on the next `with_data()` call.
-/// Dropped `SleepFuture`s correctly cancel their io_uring timeout SQE.
+/// A dropped `SleepFuture` releases its timer slot.
 pub fn select<A: IntoFuture, B: IntoFuture>(a: A, b: B) -> Select<A::IntoFuture, B::IntoFuture> {
     Select {
         a: a.into_future(),

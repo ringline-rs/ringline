@@ -39,6 +39,14 @@ impl Engine for StubEngine {
         unreachable!("the stub engine fails at setup")
     }
 
+    fn submit_and_wait_timeout(
+        &self,
+        _min_complete: u32,
+        _timeout: std::time::Duration,
+    ) -> io::Result<()> {
+        unreachable!("the stub engine fails at setup")
+    }
+
     fn submit_and_get_events(&self) -> io::Result<()> {
         unreachable!("the stub engine fails at setup")
     }
