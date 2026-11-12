@@ -29,8 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   resolve. `metrics::conn::TLS_HANDSHAKE_TIMEOUT` (11,
   `op=tls_handshake_timeout` on `ringline/connections`) counts the closes.
   On io_uring with a `tick_timeout_us` of 0 or above 10 ms, the earliest
-  deadline arms a timer of its own (`handshake_deadline` on
-  `ringline/cqe_by_tag`). Send and recv paradigms audit L18
+  deadline arms a timer of its own (`deadline` on `ringline/cqe_by_tag`).
+  Send and recv paradigms audit L18
   (`docs/journal/2026-11-send-recv-paradigms-audit.md`).
 - `ConfigBuilder::defer_recv_arm`, off by default. On io_uring, a plaintext
   connection's reader that parks has its receive armed after the worker's next
@@ -365,7 +365,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the server's flight was larger than the peer's receive window and the
   server's send buffer together; on loopback a 2 MB flight did, a 0.5 MB one
   did not. A peer that reads the flight within the 5 s still receives it and
-  the alert. Send and recv paradigms audit PL10
+  the alert. On io_uring with a `tick_timeout_us` of 0 or above 10 ms, the
+  worker's timer that ends its wait for the earliest handshake deadline also
+  covers close deadlines (`deadline` on `ringline/cqe_by_tag`), so a
+  close deadline is checked on time even when no other timer wakes the
+  worker. Send and recv paradigms audit PL10
   (`docs/journal/2026-11-send-recv-paradigms-audit.md`).
 
 - `with_data_result` reports a TLS record the engine cannot process (a bad
