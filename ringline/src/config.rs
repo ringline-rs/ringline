@@ -81,7 +81,22 @@ const MAX_SQ_ENTRIES: u32 = 32768;
 
 /// The largest `cq_entries` Linux accepts (`IORING_MAX_CQ_ENTRIES`), and the
 /// default.
-const MAX_CQ_ENTRIES: u32 = 65536;
+pub(crate) const MAX_CQ_ENTRIES: u32 = 65536;
+
+/// The default `sq_entries`.
+pub(crate) const DEFAULT_SQ_ENTRIES: u32 = 4096;
+
+/// The default `max_connections`.
+pub(crate) const DEFAULT_MAX_CONNECTIONS: u32 = 16000;
+
+/// Which of the sizes launch may lower to fit `RLIMIT_MEMLOCK` the caller
+/// set on the builder (see `crate::memlock::fit_ring_sizes`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SizesSet {
+    pub(crate) max_connections: bool,
+    pub(crate) sq_entries: bool,
+    pub(crate) cq_entries: bool,
+}
 
 /// Configuration for the io_uring driver.
 #[derive(Clone)]
@@ -90,6 +105,9 @@ pub struct Config {
     pub(crate) sq_entries: u32,
     /// Number of CQ entries.
     pub(crate) cq_entries: u32,
+    /// Which of `max_connections`, `sq_entries` and `cq_entries` the caller
+    /// set, so launch lowers only the others to fit `RLIMIT_MEMLOCK`.
+    pub(crate) sizes_set: SizesSet,
     /// Enable SQPOLL mode (kernel-side submission polling).
     pub(crate) sqpoll: bool,
     /// SQPOLL idle timeout in milliseconds.
@@ -423,8 +441,9 @@ const MAX_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from
 impl Default for Config {
     fn default() -> Self {
         Self {
-            sq_entries: 4096,
+            sq_entries: DEFAULT_SQ_ENTRIES,
             cq_entries: MAX_CQ_ENTRIES,
+            sizes_set: SizesSet::default(),
             sqpoll: false,
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
@@ -440,7 +459,7 @@ impl Default for Config {
             max_registered_regions: 64,
             worker: WorkerConfig::default(),
             backlog: 65535,
-            max_connections: 16000,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             recv_accumulator_capacity: 4096,
             recv_accumulator_max: 1024 * 1024 * 1024,
             recv_direct_region: 32 * 1024,
@@ -848,9 +867,15 @@ impl ConfigBuilder {
 
     // ── Connection settings ──────────────────────────────────────────
 
-    /// Set the maximum number of direct file descriptors (connections).
+    /// Set the maximum number of direct file descriptors (connections) per
+    /// worker. Default: 16000.
+    ///
+    /// Left at the default, launch on io_uring may lower it, with
+    /// [`cq_entries`](Self::cq_entries), when `RLIMIT_MEMLOCK` is too low for
+    /// the default rings. A value set here is kept.
     pub fn max_connections(mut self, n: u32) -> Self {
         self.config.max_connections = n;
+        self.config.sizes_set.max_connections = true;
         self
     }
 
@@ -943,8 +968,13 @@ impl ConfigBuilder {
     ///
     /// An operation submitted when the SQ is full submits the queue inline
     /// first, so a larger SQ means fewer of those submits.
+    ///
+    /// Left at the default, launch may lower it, with
+    /// [`cq_entries`](Self::cq_entries), when `RLIMIT_MEMLOCK` is too low for
+    /// the default rings. A value set here is kept.
     pub fn sq_entries(mut self, n: u32) -> Self {
         self.config.sq_entries = n;
+        self.config.sizes_set.sq_entries = true;
         self
     }
 
@@ -961,15 +991,29 @@ impl ConfigBuilder {
     /// Each CQ entry is 32 bytes, so the default CQ is 2 MiB per worker. From
     /// Linux 6.14 the kernel charges each ring to `RLIMIT_MEMLOCK`, summed
     /// over every process of the user. Launch raises the soft limit when the
-    /// hard limit allows, and fails with
-    /// [`Error::ResourceLimit`](crate::Error::ResourceLimit) when the hard
-    /// limit is too low for the workers' rings. Lower this, raise the limit,
-    /// or run with `CAP_IPC_LOCK`. Before Linux 6.10 the kernel allocates the
-    /// CQ and its ring header as one physically contiguous block, 4 MiB at the
-    /// default, which can fail with `ENOMEM` on a host whose memory is
-    /// fragmented; 32768 entries fit in 2 MiB.
+    /// hard limit allows. When the hard limit is too low for the workers'
+    /// rings and this is left at the default, launch halves it until the
+    /// rings fit, down to 1024 entries, and lowers the
+    /// [`sq_entries`](Self::sq_entries) and
+    /// [`max_connections`](Self::max_connections) left at their defaults in
+    /// proportion: a CQ of `c` gives an SQ of `c / 16` and
+    /// `c * 16000 / 65536` connections. An `sq_entries` or `max_connections`
+    /// set on the builder that a smaller CQ cannot hold in that proportion
+    /// stops the fit. A fitted launch writes one line to stderr naming the
+    /// sizes, and [`Runtime::cq_entries`](crate::Runtime::cq_entries) and the
+    /// related accessors report them. When nothing fits, launch fails with
+    /// [`Error::ResourceLimit`](crate::Error::ResourceLimit). To have launch
+    /// fail instead of running at smaller sizes, set `cq_entries` here. When
+    /// launch fails, raise the limit, run with `CAP_IPC_LOCK`, or set a
+    /// smaller `cq_entries`.
+    ///
+    /// Before Linux 6.10 the kernel allocates the CQ and its ring header as
+    /// one physically contiguous block, 4 MiB at the default, which can fail
+    /// with `ENOMEM` on a host whose memory is fragmented; 32768 entries fit
+    /// in 2 MiB.
     pub fn cq_entries(mut self, n: u32) -> Self {
         self.config.cq_entries = n;
+        self.config.sizes_set.cq_entries = true;
         self
     }
 

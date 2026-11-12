@@ -128,9 +128,36 @@ pub struct Runtime {
     /// zero port replaced by the port the kernel chose, `None` for a connected
     /// zero-port bind, whose workers each have their own port.
     udp_addrs: Vec<Option<SocketAddr>>,
+    /// Each worker's `max_connections`, `sq_entries` and `cq_entries`, after
+    /// launch fitted them to `RLIMIT_MEMLOCK`.
+    max_connections: u32,
+    sq_entries: u32,
+    cq_entries: u32,
 }
 
 impl Runtime {
+    /// Each worker's connection limit: the configured
+    /// [`max_connections`](crate::ConfigBuilder::max_connections), or the
+    /// lower value launch chose to fit `RLIMIT_MEMLOCK` when it was left at
+    /// the default (see [`cq_entries`](crate::ConfigBuilder::cq_entries)).
+    pub fn max_connections(&self) -> u32 {
+        self.max_connections
+    }
+
+    /// Each worker's SQ size: the configured
+    /// [`sq_entries`](crate::ConfigBuilder::sq_entries), or the lower value
+    /// launch chose to fit `RLIMIT_MEMLOCK`. Unused on the mio backend.
+    pub fn sq_entries(&self) -> u32 {
+        self.sq_entries
+    }
+
+    /// Each worker's CQ size: the configured
+    /// [`cq_entries`](crate::ConfigBuilder::cq_entries), or the lower value
+    /// launch chose to fit `RLIMIT_MEMLOCK`. Unused on the mio backend.
+    pub fn cq_entries(&self) -> u32 {
+        self.cq_entries
+    }
+
     /// The actual TCP address of the **first** TCP listener, if any. Returns
     /// `Some` for a TCP `bind()` (the port may have been zero-resolved) and
     /// `None` for client-only mode or when every listener is a Unix socket.
@@ -1358,9 +1385,11 @@ impl RinglineBuilder {
             .collect::<Vec<_>>()
             .into();
 
-        ensure_nofile_limit(self.config.max_connections, num_threads)?;
+        // Before the descriptor check: fitting the rings to `RLIMIT_MEMLOCK`
+        // can lower `max_connections`.
         #[cfg(has_io_uring)]
-        ensure_memlock_limit(&self.config, num_threads)?;
+        ensure_memlock_limit(&mut self.config, num_threads)?;
+        ensure_nofile_limit(self.config.max_connections, num_threads)?;
 
         crate::metrics::init_metadata();
 
@@ -1981,6 +2010,9 @@ impl RinglineBuilder {
             region_registrar,
             listen_gates,
             udp_addrs,
+            max_connections: self.config.max_connections,
+            sq_entries: self.config.sq_entries,
+            cq_entries: self.config.cq_entries,
         };
 
         Ok((runtime, handles))
@@ -2063,15 +2095,22 @@ fn ensure_nofile_limit(
 /// limit, which leaves room for the charges it cannot count. Otherwise it
 /// fails with the fix spelled out.
 ///
+/// When the hard limit is too low and the CQ was left at its default, the
+/// rings are fitted to the hard limit instead (`fit_ring_sizes`), which lowers
+/// `cq_entries`, and the `sq_entries` and `max_connections` left at their
+/// defaults, in `config`, and writes one line to stderr naming the sizes.
+///
 /// The kernel compares the limit with everything the same user has charged in
 /// any process, which this cannot see, so passing here does not rule out an
 /// `ENOMEM` at setup; the setup error names the limit in that case. A region
 /// added later through `Runtime::register_region` is not counted here; if that
 /// call fails with `ENOMEM`, its error names the limit.
 #[cfg(has_io_uring)]
-fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::error::Error> {
+fn ensure_memlock_limit(config: &mut Config, workers: usize) -> Result<(), crate::error::Error> {
     use crate::error::{MemlockLimit, MemlockPlan, describe_memlock_shortfall, memlock_plan};
-    use crate::memlock::{KernelVersion, charges_rings, has_cap_ipc_lock};
+    use crate::memlock::{
+        FitStop, KernelVersion, RingSizes, charges_rings, fit_ring_sizes, has_cap_ipc_lock,
+    };
 
     if has_cap_ipc_lock() {
         return Ok(());
@@ -2096,6 +2135,60 @@ fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::er
             Ok(())
         }
         MemlockPlan::HardTooLow => {
+            let current = RingSizes {
+                max_connections: config.max_connections,
+                sq_entries: config.sq_entries,
+                cq_entries: config.cq_entries,
+            };
+            let fit = charges_rings(kernel).then(|| {
+                fit_ring_sizes(current, config.sizes_set, |sizes| {
+                    memlock_required_for(
+                        config,
+                        sizes.sq_entries,
+                        sizes.cq_entries,
+                        workers,
+                        true,
+                        page,
+                    ) <= limit.hard
+                })
+            });
+            if let Some(Ok(sizes)) = fit {
+                let rlim = libc::rlimit {
+                    rlim_cur: limit.hard,
+                    rlim_max: limit.hard,
+                };
+                if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) } != 0 {
+                    return Err(crate::error::Error::Io(io::Error::last_os_error()));
+                }
+                config.max_connections = sizes.max_connections;
+                config.sq_entries = sizes.sq_entries;
+                config.cq_entries = sizes.cq_entries;
+                // Not `eprintln!`, which panics if stderr fails.
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!(
+                        "ringline: RLIMIT_MEMLOCK hard limit {} KiB is below the {} KiB that \
+                         {workers} worker(s) need at max_connections {}, sq_entries {}, \
+                         cq_entries {}; using max_connections {}, sq_entries {}, cq_entries {} \
+                         per worker. Raise the limit (`ulimit -l`, or `LimitMEMLOCK=`) to run \
+                         at max_connections {}, sq_entries {}, cq_entries {}, or set \
+                         cq_entries on the builder to fail instead of running smaller.\n",
+                        limit.hard.div_ceil(1024),
+                        required.div_ceil(1024),
+                        current.max_connections,
+                        current.sq_entries,
+                        current.cq_entries,
+                        sizes.max_connections,
+                        sizes.sq_entries,
+                        sizes.cq_entries,
+                        current.max_connections,
+                        current.sq_entries,
+                        current.cq_entries,
+                    ),
+                );
+                return Ok(());
+            }
+            let stop = fit.and_then(Result::err);
             let mut what = format!("{workers} worker(s)");
             if charges_rings(kernel) {
                 what.push_str(&match kernel {
@@ -2109,9 +2202,35 @@ fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::er
                     config.registered_regions.len()
                 ));
             }
-            Err(crate::error::Error::ResourceLimit(
-                describe_memlock_shortfall(required, &limit, &what),
-            ))
+            let mut message = describe_memlock_shortfall(required, &limit, &what);
+            match stop {
+                None => {}
+                Some(FitStop::CqSet) => message.push_str(
+                    " cq_entries was set on the builder, so launch did not lower it to fit the \
+                     limit; left at its default, launch would have tried smaller CQs.",
+                ),
+                Some(FitStop::MaxConnections {
+                    max_connections,
+                    needs_cq,
+                }) => message.push_str(&format!(
+                    " Launch lowers cq_entries left at its default to fit the limit, but \
+                     max_connections {max_connections}, set on the builder, needs a CQ of at \
+                     least {needs_cq} entries (16000 connections per 65536), and that does not \
+                     fit; set a lower max_connections, or leave it at its default."
+                )),
+                Some(FitStop::SqEntries { sq_entries }) => message.push_str(&format!(
+                    " Launch lowers cq_entries left at its default to fit the limit, but \
+                     sq_entries {sq_entries}, set on the builder, needs a CQ at least that \
+                     large, and that does not fit; set a lower sq_entries, or leave it at its \
+                     default."
+                )),
+                Some(FitStop::Floor) => message.push_str(&format!(
+                    " Lowering cq_entries, and the sq_entries and max_connections left at \
+                     their defaults, did not fit the rings either, down to {} CQ entries.",
+                    crate::memlock::FIT_MIN_CQ_ENTRIES
+                )),
+            }
+            Err(crate::error::Error::ResourceLimit(message))
         }
     }
 }
@@ -2121,6 +2240,26 @@ fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::er
 /// ring per UDP socket when the kernel charges those (`charges_rings`).
 #[cfg(any(has_io_uring, test))]
 fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: u64) -> u64 {
+    memlock_required_for(
+        config,
+        config.sq_entries,
+        config.cq_entries,
+        workers,
+        charges_rings,
+        page,
+    )
+}
+
+/// [`memlock_required`] with the rings sized `sq_entries` and `cq_entries`.
+#[cfg(any(has_io_uring, test))]
+fn memlock_required_for(
+    config: &Config,
+    sq_entries: u32,
+    cq_entries: u32,
+    workers: usize,
+    charges_rings: bool,
+    page: u64,
+) -> u64 {
     use crate::memlock::{provided_ring_bytes, ring_bytes};
 
     // The kernel pins every page the region touches. This assumes base pages:
@@ -2134,7 +2273,7 @@ fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: 
         })
         .sum();
     let rings = if charges_rings {
-        let mut bytes = ring_bytes(config.sq_entries, config.cq_entries, page);
+        let mut bytes = ring_bytes(sq_entries, cq_entries, page);
         bytes += config.udp_bind.len() as u64
             * provided_ring_bytes(config.udp_recv_buffer.ring_size, page);
         bytes
