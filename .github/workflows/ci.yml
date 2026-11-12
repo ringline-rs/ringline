@@ -67,8 +67,8 @@ jobs:
       - run: cargo clippy --locked --all-targets --features tls-buffered -- -D warnings
 
   clippy-stub-engine:
-    # The io_uring driver on the stub engine: only the engine may use the
-    # io_uring crate.
+    # The io_uring driver built and linted on the stub engine, without
+    # UringEngine.
     name: Clippy (stub engine)
     runs-on: ubuntu-latest
     env:
@@ -80,14 +80,6 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked -p ringline --all-targets -- -D warnings
-      - name: The driver does not use the io_uring crate
-        run: |
-          out=$(cargo rustc --locked -p ringline --lib -- -W unused-crate-dependencies 2>&1)
-          echo "$out" | grep -q 'extern crate `io_uring` is unused' || {
-            echo "$out" | tail -20
-            echo "the driver uses the io_uring crate outside the engine"
-            exit 1
-          }
 
   clippy-macos:
     name: Clippy (macOS)

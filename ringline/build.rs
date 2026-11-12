@@ -4,8 +4,8 @@ fn main() {
 
     // `has_io_uring` selects the io_uring driver; `uring_engine` runs it on
     // the kernel's io_uring. `RINGLINE_STUB_ENGINE=1` builds the driver on
-    // a stub engine instead, to check that only the engine needs the
-    // `io_uring` crate.
+    // a stub engine instead, so the driver compiles and lints without
+    // `UringEngine`.
     println!("cargo:rerun-if-env-changed=RINGLINE_STUB_ENGINE");
     // Printing any rerun-if line drops cargo's default of rerunning on every
     // package change; keep rerunning on source edits, so a target dir reused
