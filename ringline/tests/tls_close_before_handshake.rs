@@ -254,24 +254,49 @@ fn the_slot_returns_after_a_fin_with_an_unsent_flight() {
 }
 
 /// With `tick_timeout_us(0)` and no traffic after the close, the close
-/// deadline is checked when one of the worker's own timers ends its wait (on
-/// io_uring, the 1 s retry timer for a send waiting for room). One probe made
-/// 2 s after the deadline is served only if the connection was torn down by
-/// then: a probe that woke the worker would find the slot still held.
-#[test]
-fn the_close_deadline_fires_without_a_tick() {
+/// deadline is checked only when one of the worker's own timers ends its
+/// wait. One probe made 2 s after the deadline is served only if the
+/// connection was torn down by then: a probe that woke the worker would find
+/// the slot still held. `close` is what closed it.
+fn the_close_deadline_fires_without_a_tick(close: Close) -> bool {
     let _serial = serial();
-    let server = Server::start(LARGE, Duration::from_millis(300), 0);
+    let timeout = match close {
+        Close::Timeout => Duration::from_millis(300),
+        Close::Fin => Duration::from_secs(60),
+    };
+    let server = Server::start(LARGE, timeout, 0);
     let mut stalled = connect_with_small_window(server.addr);
     stalled.write_all(&tls13_hello()).unwrap();
-    // The handshake timeout (300 ms, up to about 1 s with a 2 MB flight to
-    // build), then the close deadline, then 2 s.
+    if close == Close::Fin {
+        stalled.shutdown(std::net::Shutdown::Write).unwrap();
+    }
+    // The close (up to about 1 s with a 2 MB flight to build), then the close
+    // deadline, then 2 s.
     std::thread::sleep(Duration::from_secs(1) + CLOSE_DEADLINE + Duration::from_secs(2));
     let served = served_once(server.addr);
     drop(stalled);
     server.stop();
+    served
+}
+
+/// After a handshake timeout the stalled send comes back short and waits for
+/// room, so on io_uring the 1 s retry timer for such sends wakes the worker.
+#[test]
+fn the_close_deadline_fires_without_a_tick_after_a_handshake_timeout() {
     assert!(
-        served,
+        the_close_deadline_fires_without_a_tick(Close::Timeout),
+        "the slot was still held 2 s after the close deadline"
+    );
+}
+
+/// After the peer's FIN. The stalled flight still comes back short and waits
+/// for room, so on io_uring the 1 s retry timer wakes the worker here too;
+/// the worker's deadline timer is what wakes it only when that timer is
+/// disabled.
+#[test]
+fn the_close_deadline_fires_without_a_tick_after_a_fin() {
+    assert!(
+        the_close_deadline_fires_without_a_tick(Close::Fin),
         "the slot was still held 2 s after the close deadline"
     );
 }

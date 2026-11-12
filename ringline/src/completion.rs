@@ -108,9 +108,11 @@ pub enum OpTag {
     /// The worker's timer that retries sends waiting for room, as
     /// `AsyncEventLoop::handle_send_backstop` describes.
     SendBackstop = 25,
-    /// The worker's timer for the earliest TLS handshake deadline, armed
-    /// only when the worker's tick timeout is 0 or longer than 10 ms.
-    HandshakeDeadline = 26,
+    /// The worker's timer for its earliest deadline, a TLS handshake's or a
+    /// close's (`Driver::next_deadline`), armed only when the worker's tick
+    /// timeout is 0 or longer than 10 ms. The payload is the arm's sequence
+    /// number.
+    Deadline = 26,
 }
 
 impl OpTag {
@@ -138,7 +140,7 @@ impl OpTag {
             23 => Some(OpTag::SendUdp),
             24 => Some(OpTag::SendMsgCoalesced),
             25 => Some(OpTag::SendBackstop),
-            26 => Some(OpTag::HandshakeDeadline),
+            26 => Some(OpTag::Deadline),
             31 => Some(OpTag::AcceptMulti),
             32 => Some(OpTag::ParkInstall),
             33 => Some(OpTag::CloseShutdown),
@@ -190,7 +192,7 @@ impl OpTag {
             OpTag::HangupPoll => "hangup_poll",
             OpTag::HangupPeek => "hangup_peek",
             OpTag::SendBackstop => "send_backstop",
-            OpTag::HandshakeDeadline => "handshake_deadline",
+            OpTag::Deadline => "deadline",
         }
     }
 }

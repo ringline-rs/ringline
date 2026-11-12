@@ -706,13 +706,17 @@ pub(crate) struct Driver {
     pub(crate) send_backstop_armed: bool,
     /// TLS handshakes in progress and their deadlines.
     pub(crate) handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines,
-    /// The `HandshakeDeadline` timer's wait, set when it is armed.
-    pub(crate) handshake_timer_ts: crate::backend::uring::abi::Timespec,
-    /// Whether the `HandshakeDeadline` timer is armed.
-    pub(crate) handshake_timer_armed: bool,
-    /// Whether the `HandshakeDeadline` timer is used: the worker has no
+    /// The `Deadline` timer's wait, set when it is armed.
+    pub(crate) deadline_timer_ts: crate::backend::uring::abi::Timespec,
+    /// The deadline the latest `Deadline` timer was armed for, until its
+    /// completion. A deadline earlier than this arms another timer.
+    pub(crate) deadline_timer_at: Option<std::time::Instant>,
+    /// The latest `Deadline` timer's sequence number, its user data payload.
+    /// A completion with another number is from a timer armed before it.
+    pub(crate) deadline_timer_seq: u32,
+    /// Whether the `Deadline` timer is used: the worker has no
     /// tick timeout, or one longer than 10 ms.
-    pub(crate) handshake_timer_used: bool,
+    pub(crate) deadline_timer_used: bool,
     /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
     /// Drained each tick — used when resubmitting a coalesced `sendmsg` found
     /// the SQ full.
@@ -1201,9 +1205,10 @@ impl Driver {
                 config.tls_handshake_timeout,
                 config.max_connections,
             ),
-            handshake_timer_ts: crate::backend::uring::abi::Timespec::new(),
-            handshake_timer_armed: false,
-            handshake_timer_used: config.tick_timeout_us == 0 || config.tick_timeout_us > 10_000,
+            deadline_timer_ts: crate::backend::uring::abi::Timespec::new(),
+            deadline_timer_at: None,
+            deadline_timer_seq: 0,
+            deadline_timer_used: config.tick_timeout_us == 0 || config.tick_timeout_us > 10_000,
             pending_coalesced_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             pending_shutdown_retries: Vec::new(),
@@ -1428,6 +1433,26 @@ impl Driver {
             self.park_drain_pending.push(conn_index);
         }
         *slot = drain;
+    }
+
+    /// The worker's earliest deadline: the deadline at the front of the
+    /// handshake queue (possibly a handshake that has since completed; the
+    /// timer then ends the wait early), or the earliest close deadline
+    /// (`close_notify_deadline`) of a connection still waiting for its sends
+    /// to drain.
+    pub(crate) fn next_deadline(&self) -> Option<std::time::Instant> {
+        let close = self
+            .close_notify_armed
+            .iter()
+            .filter_map(|&i| {
+                let state = &self.send_queues[i as usize];
+                state.close_pending.then_some(state.close_notify_deadline)?
+            })
+            .min();
+        match (self.handshake_deadlines.next_deadline(), close) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Request the close of `conn_index`: mark it `Closing`, set

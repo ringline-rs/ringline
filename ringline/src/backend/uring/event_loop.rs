@@ -455,20 +455,27 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // Without a tick timeout the wait can block indefinitely, and with
             // one longer than 10 ms a deadline would be checked late, so the
-            // earliest handshake deadline arms a timer of its own. As above, a
-            // full SQ leaves this unarmed for the next iteration.
-            if self.driver.handshake_timer_used
-                && !self.driver.handshake_timer_armed
-                && let Some(deadline) = self.driver.handshake_deadlines.next_deadline()
+            // earliest handshake or close deadline arms a timer of its own,
+            // and an earlier one arms another. Every arm reads the one timespec
+            // field, which lives as long as the driver. An older timer the
+            // kernel has not yet prepared then waits for the new value, and
+            // the new timer covers the earliest deadline either way. As
+            // above, a full SQ leaves this unarmed for the next iteration.
+            if self.driver.deadline_timer_used
+                && let Some(deadline) = self.driver.next_deadline()
+                && self.driver.deadline_timer_at.is_none_or(|at| deadline < at)
             {
                 let wait = deadline.saturating_duration_since(std::time::Instant::now());
-                self.driver.handshake_timer_ts = crate::backend::uring::abi::Timespec::new()
+                self.driver.deadline_timer_ts = crate::backend::uring::abi::Timespec::new()
                     .sec(wait.as_secs())
                     .nsec(wait.subsec_nanos());
-                let ud = UserData::encode(OpTag::HandshakeDeadline, 0, 0);
-                let ts = &raw const self.driver.handshake_timer_ts;
-                self.driver.handshake_timer_armed =
-                    self.driver.ring.submit_tick_timeout(ts, ud.raw()).is_ok();
+                let seq = self.driver.deadline_timer_seq.wrapping_add(1);
+                let ud = UserData::encode(OpTag::Deadline, 0, seq);
+                let ts = &raw const self.driver.deadline_timer_ts;
+                if self.driver.ring.submit_tick_timeout(ts, ud.raw()).is_ok() {
+                    self.driver.deadline_timer_seq = seq;
+                    self.driver.deadline_timer_at = Some(deadline);
+                }
             }
 
             // The blocking wait itself is always performed; only the timing
@@ -1798,8 +1805,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendPollOut => self.handle_send_pollout(ud, result, flags),
             OpTag::SendBackstop => self.handle_send_backstop(),
             // The loop checks the deadlines on every iteration; the timer
-            // only ends the wait.
-            OpTag::HandshakeDeadline => self.driver.handshake_timer_armed = false,
+            // only ends the wait. A completion of an earlier arm leaves the
+            // latest one recorded.
+            OpTag::Deadline => {
+                if ud.payload() == self.driver.deadline_timer_seq {
+                    self.driver.deadline_timer_at = None;
+                }
+            }
             OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
             // No notification follows a plain `send`.
             OpTag::SendMsgZcDrain => self.handle_send_msg_zc(ud, result, 0),
