@@ -1605,19 +1605,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Fire all expired timers and push the associated tasks to the ready queue.
     fn fire_expired_timers(&mut self) {
-        let now = Instant::now();
-        // Heap-driven expiry: O(log n) per fired timer instead of a full
-        // pool scan per loop iteration.
-        while let Some((slot, generation)) = self.executor.timer_pool.pop_expired(now) {
-            if let Some(waker_id) = self.executor.timer_pool.fire(slot, generation) {
-                self.executor.wake_task(waker_id);
-            }
-        }
+        self.executor.fire_expired_timers();
 
         // Check for timed-out connect operations. `connect_pending` counts
         // armed deadlines so the common no-outbound-connects case skips the
         // scan entirely.
         if self.driver.connect_pending > 0 {
+            let now = Instant::now();
             let mut timed_out: Vec<u32> = Vec::new();
             for (idx, deadline) in self.driver.connect_deadlines.iter().enumerate() {
                 if let Some(dl) = deadline

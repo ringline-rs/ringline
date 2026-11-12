@@ -181,13 +181,13 @@ Ringline is a thread-per-core async I/O runtime. No work-stealing, no cross-thre
 ### Event Loop (per worker)
 
 io_uring — `AsyncEventLoop::run()`:
-1. `submit_and_wait(1)` — block until a CQE arrives
-2. `drain_completions()` — decode CQEs via `OpTag` + `UserData`, dispatch (recv → accumulator append + wake task, send → dequeue next pending send, connect → store result + wake, timer → fire slot + wake)
+1. `submit_and_wait_timeout(1, bound)` — block until a CQE arrives or the bound passes. The bound is the earliest of the next tick (`tick_timeout_us`), the earliest timer in the executor's deadline heap, and the earliest TLS handshake or close deadline (`wait_bound`); with no tick and no deadline the loop calls `submit_and_wait(1)`, and with a bound of zero (a deadline has passed) the non-blocking `submit_and_get_events()`. The engine caps a timed wait at `MAX_WAIT` (1 h). The wait passes the bound to `io_uring_enter` through `IORING_ENTER_EXT_ARG`, so timers and the tick cost no SQE or CQE
+2. `drain_completions()` — decode CQEs via `OpTag` + `UserData`, dispatch (recv → accumulator append + wake task, send → dequeue next pending send, connect → store result + wake), then `fire_expired_timers()` wakes the tasks whose timers have passed
 3. `collect_wakeups()` — drain thread-local `READY_QUEUE` and the worker's cross-thread wake inbox into executor's ready list
 4. `poll_ready_tasks()` — poll all Ready futures (sets `CURRENT_DRIVER` thread-local before each poll)
 5. `on_tick()` — call handler's sync tick callback
 
-The mio loop is epoll-shaped (poll with timer-heap-derived timeout → readable/writable handlers → same `collect_wakeups()`/`poll_ready_tasks()` → fire expired timers → `on_tick()`) and uses dirty-lists + a timer min-heap rather than per-iteration scans. Steps 3–4 (the portable executor) are shared.
+The mio loop is epoll-shaped (poll with timer-heap-derived timeout → readable/writable handlers → same `collect_wakeups()`/`poll_ready_tasks()` → fire expired timers → `on_tick()`) and uses dirty-lists rather than per-iteration scans. Steps 3–4 (the portable executor) and the timer heap (`TimerSlotPool`) are shared.
 
 ### Key Abstractions
 
@@ -195,9 +195,9 @@ The mio loop is epoll-shaped (poll with timer-heap-derived timeout → readable/
 
 **`Connection`** — An owned connection, from `on_accept` or `connect`; `split()` gives a `SendHalf` and a `RecvHalf`, neither `Copy`. `with_data(|&[u8]| -> ParseResult)` / `with_bytes(|Bytes| -> ParseResult)` for recv (`with_data_result` is the `io::Result` form that separates a clean close from a transport error); `send()`/`send_nowait()`/`send_parts()` for send; `eof_truncated()` distinguishes a peer FIN mid-message from a clean close. Internally indexes into the driver's connection table via `(conn_index, generation)`, in the `pub(crate)` `ConnCtx`.
 
-**`Driver`** — Owns all I/O state: the ring (or mio poll), `ConnectionTable`, buffer pools (the UDP `ProvidedBufRing`, `SendCopyPool`, `InFlightSendSlab`), `AccumulatorTable`, `TimerSlotPool`.
+**`Driver`** — Owns all I/O state: the ring (or mio poll), `ConnectionTable`, buffer pools (the UDP `ProvidedBufRing`, `SendCopyPool`, `InFlightSendSlab`), `AccumulatorTable`.
 
-**`Executor`** — Owns task state: `TaskSlab` (per-connection futures), `StandaloneTaskSlab` (spawned tasks), per-connection waiters/results vectors, ready queue.
+**`Executor`** — Owns task state: `TaskSlab` (per-connection futures), `StandaloneTaskSlab` (spawned tasks), per-connection waiters/results vectors, ready queue, and the timer pool and deadline heap (`TimerSlotPool`, `executor.timer_pool`).
 
 ### Thread-Local State Pattern
 
@@ -205,7 +205,7 @@ Async futures access the driver via `CURRENT_DRIVER` thread-local (raw pointer, 
 
 ### Connection Lifecycle
 
-Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → arm the hangup poll (TLS: also the handshake's receive; `on_accept` is spawned when the handshake completes) → spawn `on_accept` task (plaintext). Outbound: `connect(addr)` → allocate slot → submit connect SQE (optionally IO_LINK'd with timeout) → `ConnectFuture` resolves to a new `Connection`. On io_uring every plaintext connection, accepted or outbound, arms no ring receive: it receives directly into its accumulator, with a one-shot `RECV` armed when a read parks, and one `POLL_ADD(POLLRDHUP)` armed when it opens so a peer close is seen while nothing reads (`docs/recv-direct-design.md`). A TLS connection receives the same way, into its TLS engine's ciphertext buffer (with `tls-buffered`, a pooled buffer that `read_tls` copies from): re-armed after each completion during the handshake, then armed when a read parks (or after each completion once the hangup poll has fired).
+Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → arm the hangup poll (TLS: also the handshake's receive; `on_accept` is spawned when the handshake completes) → spawn `on_accept` task (plaintext). Outbound: `connect(addr)` → allocate slot → submit connect SQE (with a connect timeout, a separate Timeout SQE whose expiry pushes an `ASYNC_CANCEL` of the connect, `handle_timeout`) → `ConnectFuture` resolves to a new `Connection`. On io_uring every plaintext connection, accepted or outbound, arms no ring receive: it receives directly into its accumulator, with a one-shot `RECV` armed when a read parks, and one `POLL_ADD(POLLRDHUP)` armed when it opens so a peer close is seen while nothing reads (`docs/recv-direct-design.md`). A TLS connection receives the same way, into its TLS engine's ciphertext buffer (with `tls-buffered`, a pooled buffer that `read_tls` copies from): re-armed after each completion during the handshake, then armed when a read parks (or after each completion once the hangup poll has fired).
 
 A peer's FIN or close_notify finishes the read half and closes nothing: the task keeps the connection, may keep sending, and `Connection::peer_closed` reports the end; readers resolve `0` (`docs/half-close-design.md`). A FIN on a TLS connection whose handshake has not completed closes it, and an outbound connect resolves `UnexpectedEof`; a handshake still incomplete after `tls_handshake_timeout` closes it too, and an outbound connect resolves `TimedOut`. A reset or a read error still closes. Dropping the last half of a connection closes it (`release_half`, queued through `defer_release` when the drop is outside a task poll). Close, on both backends: only `close_connection` (and the `DriverCtx` close) moves the connection to `Lifecycle::Closing`; it also sets `ConnSendState::close_pending`, and teardown finalizes once queued sends drain (io_uring: `try_finalize_close` submits the Close SQE behind the kernel-dependent lead Domain Invariant 8 describes; mio: `drain_pending_closes` defers `finish_close`); a connection whose handshake or connect has not completed waits at most `CLOSE_NOTIFY_TIMEOUT` (5 s), set in `close_connection`, and is then closed without its unsent sends. A backend site that marks the connection closing directly leaks the slot — that was #368.
 
@@ -229,9 +229,9 @@ A leaf future (recv, send, timer, disk, channel) registers its task's id and ret
 ### UserData Encoding (64-bit CQE identification)
 
 ```
-Bits 63..56: OpTag (8 bits) — operation type (RecvDirect, Send, Connect, Timer, coalesced sends, etc.)
+Bits 63..56: OpTag (8 bits) — operation type (RecvDirect, Send, Connect, Timeout, coalesced sends, etc.)
 Bits 55..32: ConnIndex (24 bits)
-Bits 31..0:  Payload (32 bits) — buffer id, slab slot, timer slot, etc.
+Bits 31..0:  Payload (32 bits) — buffer id, slab slot, etc.
 ```
 
 For pool-slot send ops (`Send`/`TlsSend`) the payload's high bits carry the

@@ -24,7 +24,7 @@ immediately after the alert — a slow peer could delay the FIN.
 
 Auto-close connections that have been idle (no data sent or received) for
 a configurable duration. Track last-activity timestamps per connection and
-use periodic timeout SQEs or on_tick checks.
+check them from the worker's timer heap or `on_tick`.
 
 ## Per-Operation Timeouts
 

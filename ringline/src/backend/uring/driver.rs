@@ -678,11 +678,13 @@ pub(crate) struct Driver {
     /// drain batch. One clock read per batch instead of one per datagram;
     /// precision loss is bounded by the drain duration (microseconds).
     pub(crate) udp_batch_recv_at: std::time::Instant,
-    /// Tick timeout duration. When set, a timeout SQE ensures the event loop
-    /// wakes periodically even when no I/O completions are pending.
-    pub(crate) tick_timeout_ts: Option<crate::backend::uring::abi::Timespec>,
-    /// Whether a tick timeout SQE is currently in-flight.
-    pub(crate) tick_timeout_armed: bool,
+    /// The tick interval (`ConfigBuilder::tick_timeout_us`), or `None` for
+    /// 0: the wait is then bounded only by deadlines.
+    pub(crate) tick_interval: Option<std::time::Duration>,
+    /// When the next tick is due. The run loop's wait ends by then, and the
+    /// iteration that finds it passed publishes the worker's load and sets
+    /// the next one a `tick_interval` later.
+    pub(crate) next_tick: Option<std::time::Instant>,
     /// Monotonic tick counter for backoff-based retry scheduling.
     pub(crate) tick_count: u64,
     /// Whether the eventfd read SQE is currently armed.
@@ -706,17 +708,6 @@ pub(crate) struct Driver {
     pub(crate) send_backstop_armed: bool,
     /// TLS handshakes in progress and their deadlines.
     pub(crate) handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines,
-    /// The `Deadline` timer's wait, set when it is armed.
-    pub(crate) deadline_timer_ts: crate::backend::uring::abi::Timespec,
-    /// The deadline the latest `Deadline` timer was armed for, until its
-    /// completion. A deadline earlier than this arms another timer.
-    pub(crate) deadline_timer_at: Option<std::time::Instant>,
-    /// The latest `Deadline` timer's sequence number, its user data payload.
-    /// A completion with another number is from a timer armed before it.
-    pub(crate) deadline_timer_seq: u32,
-    /// Whether the `Deadline` timer is used: the worker has no
-    /// tick timeout, or one longer than 10 ms.
-    pub(crate) deadline_timer_used: bool,
     /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
     /// Drained each tick — used when resubmitting a coalesced `sendmsg` found
     /// the SQ full.
@@ -1182,16 +1173,11 @@ impl Driver {
             defer_recv_arm: config.defer_recv_arm,
             deferred_recv_arms: Vec::new(),
             udp_batch_recv_at: std::time::Instant::now(),
-            tick_timeout_ts: if config.tick_timeout_us > 0 {
-                Some(
-                    crate::backend::uring::abi::Timespec::new()
-                        .sec(config.tick_timeout_us / 1_000_000)
-                        .nsec((config.tick_timeout_us % 1_000_000) as u32 * 1000),
-                )
-            } else {
-                None
-            },
-            tick_timeout_armed: false,
+            tick_interval: (config.tick_timeout_us > 0)
+                .then(|| std::time::Duration::from_micros(config.tick_timeout_us)),
+            next_tick: (config.tick_timeout_us > 0).then(|| {
+                std::time::Instant::now() + std::time::Duration::from_micros(config.tick_timeout_us)
+            }),
             tick_count: 0,
             eventfd_armed: false,
             pending_zc_retries: Vec::new(),
@@ -1205,10 +1191,6 @@ impl Driver {
                 config.tls_handshake_timeout,
                 config.max_connections,
             ),
-            deadline_timer_ts: crate::backend::uring::abi::Timespec::new(),
-            deadline_timer_at: None,
-            deadline_timer_seq: 0,
-            deadline_timer_used: config.tick_timeout_us == 0 || config.tick_timeout_us > 10_000,
             pending_coalesced_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             pending_shutdown_retries: Vec::new(),
@@ -1437,7 +1419,7 @@ impl Driver {
 
     /// The worker's earliest deadline: the deadline at the front of the
     /// handshake queue (possibly a handshake that has since completed; the
-    /// timer then ends the wait early), or the earliest close deadline
+    /// wait then ends early), or the earliest close deadline
     /// (`close_notify_deadline`) of a connection still waiting for its sends
     /// to drain.
     pub(crate) fn next_deadline(&self) -> Option<std::time::Instant> {
@@ -2754,19 +2736,12 @@ impl Driver {
     }
 
     /// Handle one completion in `run_shutdown`.
-    fn handle_shutdown_cqe(
-        &mut self,
-        user_data_raw: u64,
-        result: i32,
-        flags: u32,
-        timeout_armed: &mut bool,
-    ) {
+    fn handle_shutdown_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
         let ud = UserData(user_data_raw);
         let Some(tag) = ud.tag() else {
             return;
         };
         match tag {
-            OpTag::TickTimeout => *timeout_armed = false,
             OpTag::Send | OpTag::TlsSend => {
                 self.release_slot_at_shutdown(UserData::send_payload_slot(ud.payload()));
             }
@@ -3064,10 +3039,9 @@ impl Driver {
         // 3. Submit + drain loop until every connection's Close has
         //    completed, every slab entry is released and every fs, direct I/O
         //    and NVMe command has completed, for at most `SHUTDOWN_BOUND`.
-        //    Keep one timeout SQE armed so submit_and_wait(1) never blocks
-        //    indefinitely (the tick timeout from the main loop is not armed
-        //    here). A pass ends at any CQE, so neither the pass count nor one
-        //    timeout per pass measures time.
+        //    Each wait ends after at most 100 ms, so a pass never blocks
+        //    indefinitely. A pass ends at any CQE, so neither the pass count
+        //    nor one timeout per pass measures time.
         //
         //    A zero-copy entry is released only once its notifications land,
         //    and the kernel posts those when the peer has acknowledged the data
@@ -3079,9 +3053,7 @@ impl Driver {
         //    io_uring (below 6.7), or when its connection had closed before
         //    exit began, so nothing can abort it. Its guards and the send pool's
         //    memory are then leaked, because the kernel can still read them.
-        let shutdown_ts = crate::backend::uring::abi::Timespec::new().nsec(100_000_000); // 100ms
         let started = std::time::Instant::now();
-        let mut timeout_armed = false;
         // A panic in a handler left these undispatched.
         // In place, with the cursor kept up to date: a panic here leaves
         // the rest of the tail for `close_fds_in_unhandled_completions`.
@@ -3089,7 +3061,7 @@ impl Driver {
         for i in cursor..self.cqe_batch.len() {
             let (user_data_raw, result, flags) = self.cqe_batch[i];
             self.cqe_cursor = i + 1;
-            self.handle_shutdown_cqe(user_data_raw, result, flags, &mut timeout_armed);
+            self.handle_shutdown_cqe(user_data_raw, result, flags);
         }
         while started.elapsed() < SHUTDOWN_BOUND {
             for i in std::mem::take(&mut cancels_to_retry) {
@@ -3126,14 +3098,11 @@ impl Driver {
             {
                 break;
             }
-            if !timeout_armed {
-                let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
-                timeout_armed = self
-                    .ring
-                    .submit_tick_timeout(&shutdown_ts, ud.raw())
-                    .is_ok();
-            }
-            if self.ring.submit_and_wait(1).is_err() {
+            if self
+                .ring
+                .submit_and_wait_timeout(1, std::time::Duration::from_millis(100))
+                .is_err()
+            {
                 break;
             }
 
@@ -3144,7 +3113,7 @@ impl Driver {
             for i in 0..self.cqe_batch.len() {
                 let (user_data_raw, result, flags) = self.cqe_batch[i];
                 self.cqe_cursor = i + 1;
-                self.handle_shutdown_cqe(user_data_raw, result, flags, &mut timeout_armed);
+                self.handle_shutdown_cqe(user_data_raw, result, flags);
             }
         }
 

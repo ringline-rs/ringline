@@ -138,7 +138,7 @@ task-waker scheme are shared. The I/O mechanisms are not:
 | File descriptors | Fixed-file table for connections | Registered ordinary sockets |
 | Sends | Copy pool plus guarded `SendMsgZc` scatter/gather | Owned/copy pending-send buffers |
 | Send retry | CQE handling, retry lists, and drain sends after `EAGAIN` | Writable readiness and dirty lists |
-| Timers | Timeout SQEs and completion generations | Deadline min-heap |
+| Timers | Deadline min-heap; the earliest deadline bounds `io_uring_enter` | Deadline min-heap; the earliest deadline bounds `epoll_wait` |
 | File/direct I/O | Submitted through the ring | Dedicated disk-I/O pool |
 | NVMe and registered regions | Supported | Unsupported |
 

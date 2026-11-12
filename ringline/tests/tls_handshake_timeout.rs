@@ -201,9 +201,9 @@ fn handshake_timeouts() -> u64 {
 }
 
 /// With no tick timeout and no traffic after the silent peer connects, on
-/// io_uring nothing ends the worker's wait but the deadline's own timer. The
-/// counter is read with no further connection, because each one would wake
-/// the worker.
+/// io_uring nothing ends the worker's wait but the handshake deadline, which
+/// bounds it. The counter is read with no further connection, because each
+/// one would wake the worker.
 #[test]
 fn a_silent_peer_is_closed_after_the_handshake_timeout_without_a_tick() {
     let _serial = serial();

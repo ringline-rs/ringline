@@ -176,6 +176,15 @@ impl Ring {
         self.engine.submit_and_wait(min_complete)
     }
 
+    /// See [`Engine::submit_and_wait_timeout`].
+    pub fn submit_and_wait_timeout(
+        &self,
+        min_complete: u32,
+        timeout: std::time::Duration,
+    ) -> io::Result<()> {
+        self.engine.submit_and_wait_timeout(min_complete, timeout)
+    }
+
     /// See [`Engine::submit_and_get_events`].
     pub fn submit_and_get_events(&self) -> io::Result<()> {
         self.engine.submit_and_get_events()
@@ -621,27 +630,6 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit an absolute timeout SQE. The timespec contains absolute
-    /// `CLOCK_MONOTONIC` seconds/nanoseconds. The timespec must remain valid
-    /// until the CQE arrives.
-    pub fn submit_timeout_abs(
-        &mut self,
-        timespec: *const crate::backend::uring::abi::Timespec,
-        user_data: UserData,
-    ) -> io::Result<()> {
-        let entry = Sqe::new(
-            Op::Timeout {
-                ts: timespec,
-                abs: true,
-            },
-            user_data.raw(),
-        );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
-    }
-
     /// Cancel a request on `conn_index` ahead of a park: its direct receive
     /// or its hangup poll, matched by `cancel_recv_user_data`.
     ///
@@ -869,9 +857,9 @@ impl Ring {
         unsafe { self.push_sqe(&entry) }
     }
 
-    /// Submit a timeout SQE that fires after the given duration.
-    /// Produces a CQE with the given user_data when it fires (-ETIME)
-    /// or is cancelled (-ECANCELED).
+    /// Submit a timeout SQE that fires after the given duration, for the
+    /// send backstop. Produces a CQE with the given user_data when it fires
+    /// (-ETIME) or is cancelled (-ECANCELED).
     pub fn submit_tick_timeout(
         &mut self,
         ts: *const crate::backend::uring::abi::Timespec,

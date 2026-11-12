@@ -289,7 +289,8 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
         "Mio drains disk I/O responses in the worker loop",
     )?;
     // Both ring-entry branches must precede the drain, and both must carry
-    // GETEVENTS: `submit_and_wait(1)` when the loop blocks, and
+    // GETEVENTS: `submit_and_wait(1)` (or `submit_and_wait_timeout`, which
+    // the matched branch sits beside) when the loop blocks, and
     // `submit_and_get_events()` when it declines to because a task is
     // runnable. A plain `submit_and_wait(0)` here would set no GETEVENTS and,
     // under DEFER_TASKRUN, strand task_work indefinitely.

@@ -1241,7 +1241,12 @@ impl ConfigBuilder {
 
     // ── Timing settings ──────────────────────────────────────────────
 
-    /// Set the tick timeout in microseconds. 0 = block indefinitely.
+    /// Set the tick interval in microseconds: the longest a worker waits for
+    /// I/O before calling [`on_tick`](crate::AsyncEventHandler::on_tick)
+    /// again (default 1000). 0 = no tick: the wait ends only at a completion
+    /// or the worker's earliest timer, TLS handshake or close deadline.
+    /// Timers fire at their own deadlines whatever this is. On mio the wait
+    /// is at most 10 ms, whatever this is.
     pub fn tick_timeout_us(mut self, us: u64) -> Self {
         self.config.tick_timeout_us = us;
         self

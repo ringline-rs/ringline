@@ -28,7 +28,7 @@ follow):
 | Read the request bytes | 1 `read()` | **0** — the recv CQE *delivers a filled buffer*; no read call exists |
 | Send the response | 1 `writev()` | **0 dedicated** — a send SQE rides the iteration's shared enter |
 | Confirm the send completed | (return value of `writev`) | **0** — send CQE, drained in the same iteration |
-| Arm/fire a timeout | folded into the `epoll_wait` timeout | **0** — timeout SQE/CQE |
+| Arm/fire a timeout | folded into the `epoll_wait` timeout | **0** — folded into the `io_uring_enter` timeout |
 | **Total, idle connection** | **~3 syscalls, every request** | **~2 enters** |
 | **Total, under load** | ~2 per request — the reads and writes never amortize, only the `epoll_wait` does | **(1–3 enters) ÷ requests in the batch** — *every* step amortizes |
 
@@ -76,8 +76,8 @@ Everything a request needs rides inside those batched enters as SQEs and CQEs:
 | Receive a message | **0** | A plaintext connection submits a one-shot `RECV` into its accumulator when a read parks (`docs/recv-direct-design.md`): 1 SQE per completion, plus one `POLL_ADD(POLLRDHUP)` per connection, armed when it opens. When the poll fires with no receive in flight, a `MSG_PEEK` recv checks for bytes queued ahead of the end. A TLS connection submits the same one-shot `RECV`, into its TLS engine's ciphertext buffer, 1 SQE per completion, submitted by the iteration's shared enter. During the handshake it is re-armed when it completes; after it, when a read parks. It arms the same `POLL_ADD(POLLRDHUP)`, and when the poll fires a receive reads the rest of the stream; there is no peek. |
 | Send a response | **0 dedicated** | `send()`/`send_nowait()` push an `opcode::Send` SQE (`MSG_DONTWAIT`, so a short send waits for `POLLOUT` and resubmits, one more ring pass each time), and a send wider than one send-pool slot goes out as `opcode::SendMsg` SQEs of up to 32 slots each (per-slot `opcode::Send`s if the send slab is full); coalesced sends are one `opcode::SendMsg` SQE gathering several queued sends; zero-copy sends are `opcode::SendMsgZc`. All are submitted by the iteration's shared enter. |
 | Zero-copy notification | **0** | The "DMA done, guard can drop" signal is a second CQE on the same SQE, not a syscall. |
-| Timer arm/fire | **0** | Timeout SQE / timeout CQE. |
-| Outbound connect | **0 dedicated** | Connect SQE, optionally `IO_LINK`ed with a timeout SQE. A plaintext connection then arms one `POLL_ADD(POLLRDHUP)` SQE (`docs/recv-direct-design.md`). |
+| Timer arm/fire | **0** | A deadline in the worker's heap. The earliest deadline, or the next tick if sooner, is the timeout of the blocking `io_uring_enter` (`IORING_ENTER_EXT_ARG`); no SQE or CQE. |
+| Outbound connect | **0 dedicated** | Connect SQE, and with a connect timeout a separate Timeout SQE whose expiry pushes an `ASYNC_CANCEL` of the connect. A plaintext connection then arms one `POLL_ADD(POLLRDHUP)` SQE (`docs/recv-direct-design.md`). |
 | Accept | 1 per connection | The dedicated acceptor thread runs blocking `accept4()` and hands the fd to a worker over a channel, waking it via eventfd write. The worker's side of that wake is an eventfd-read *SQE* — no syscall on the worker. This is one-time per connection, not per request. |
 
 So in steady state:
