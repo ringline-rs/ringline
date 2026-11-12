@@ -152,9 +152,9 @@ jobs:
       # runs tests as separate processes, so at the runner's 8 MiB limit
       # io_uring_setup failed with ENOMEM in 10/10 release runs, and in 0/10 at
       # 64 MiB (#426). Since the default CQ became 65536 entries (#831) each
-      # ring is about 2.5 MiB, so the limit is lifted; memlock_rings and
-      # memlock_limit set their own. Raised in the same shell as the tests,
-      # because each step starts a new one.
+      # ring is about 2.5 MiB, so the limit is lifted; memlock_rings,
+      # memlock_limit and memlock_fit set their own. Raised in the same shell
+      # as the tests, because each step starts a new one.
       - run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo nextest run --locked --workspace --profile ci
@@ -233,9 +233,9 @@ jobs:
       # runs tests as separate processes, so at the runner's 8 MiB limit
       # io_uring_setup failed with ENOMEM in 10/10 release runs, and in 0/10 at
       # 64 MiB (#426). Since the default CQ became 65536 entries (#831) each
-      # ring is about 2.5 MiB, so the limit is lifted; memlock_rings and
-      # memlock_limit set their own. Raised in the same shell as the tests,
-      # because each step starts a new one.
+      # ring is about 2.5 MiB, so the limit is lifted; memlock_rings,
+      # memlock_limit and memlock_fit set their own. Raised in the same shell
+      # as the tests, because each step starts a new one.
       - run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo nextest run --locked --workspace --profile ci --release
@@ -322,9 +322,9 @@ jobs:
       # runs tests as separate processes, so at the runner's 8 MiB limit
       # io_uring_setup failed with ENOMEM in 10/10 release runs, and in 0/10 at
       # 64 MiB (#426). Since the default CQ became 65536 entries (#831) each
-      # ring is about 2.5 MiB, so the limit is lifted; memlock_rings and
-      # memlock_limit set their own. Raised in the same shell as the tests,
-      # because each step starts a new one.
+      # ring is about 2.5 MiB, so the limit is lifted; memlock_rings,
+      # memlock_limit and memlock_fit set their own. Raised in the same shell
+      # as the tests, because each step starts a new one.
       - run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo nextest run --locked --workspace --profile ci --features tls-buffered

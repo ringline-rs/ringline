@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- On io_uring, when `RLIMIT_MEMLOCK`'s hard limit is too low for the
+  workers' rings and `cq_entries` was left at its default, launch fits the
+  rings to the limit instead of failing with `Error::ResourceLimit`. It halves
+  `cq_entries` until the rings fit, down to 1024, and lowers `sq_entries` and
+  `max_connections` left at their defaults in proportion (`cq / 16` and
+  `cq * 16000 / 65536`), and writes one line to stderr naming the sizes. At
+  the 8 MiB systemd sets by default, four workers run at 32768 CQ entries,
+  2048 SQ entries and 8000 connections each, where the defaults need about
+  10 MiB. Sizes set on the builder are kept: a `cq_entries` set there is
+  never lowered, and a `max_connections` or `sq_entries` the fitted CQ could
+  not hold ends the fit, which fails as before. `Runtime::max_connections`,
+  `Runtime::sq_entries` and `Runtime::cq_entries` report each worker's sizes.
 - io_uring: three `ringline/ring` counters for completion queue overflow
   (#831): `cq_overflow`, reaps that found completions waiting in the kernel's
   overflow list; `cqe_dropped`, completions the kernel dropped, from its own

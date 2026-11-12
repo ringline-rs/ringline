@@ -127,7 +127,13 @@ pub enum Error {
     ///   high-concurrency workloads. `ulimit -n 65536` or higher.
     /// - `RLIMIT_MEMLOCK` (io_uring): fixed buffers from
     ///   [`ConfigBuilder::registered_regions`](crate::ConfigBuilder::registered_regions)
-    ///   are pinned against it. `ulimit -l <KiB>`, or `CAP_IPC_LOCK`.
+    ///   are pinned against it, and from Linux 6.14 each worker's ring. A
+    ///   `cq_entries` left at its default is first lowered to fit (see
+    ///   [`ConfigBuilder::cq_entries`](crate::ConfigBuilder::cq_entries)), so
+    ///   this is returned when the rings do not fit even then, when
+    ///   `cq_entries` was set on the builder, or when an `sq_entries` or
+    ///   `max_connections` set there needs a larger CQ than fits.
+    ///   `ulimit -l <KiB>`, or `CAP_IPC_LOCK`.
     #[error("{0}")]
     ResourceLimit(String),
 

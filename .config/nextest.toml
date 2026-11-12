@@ -22,6 +22,12 @@ failure-output = "immediate-final"
 filter = 'binary(memlock_rings)'
 threads-required = "num-test-threads"
 
+# memlock_fit lowers RLIMIT_MEMLOCK to 8 MiB and launches four workers whose
+# rings are fitted to it, against the same per-user total.
+[[profile.default.overrides]]
+filter = 'binary(memlock_fit)'
+threads-required = "num-test-threads"
+
 # These hold zero-copy sends to a peer that does not read. From Linux 6.15 each
 # charges its pages to RLIMIT_MEMLOCK until the peer has them, several MiB per
 # peer once the socket buffers fill, and ring setup in a test running alongside
