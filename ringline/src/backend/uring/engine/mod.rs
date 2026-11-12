@@ -1,8 +1,8 @@
 //! The engine executes the operations the driver submits and reports their
 //! completions. `UringEngine` runs them on the kernel's io_uring. Building
 //! with the environment variable `RINGLINE_STUB_ENGINE=1` selects
-//! `StubEngine` instead, which compiles the driver without using the
-//! `io_uring` crate and fails at setup.
+//! `StubEngine` instead, which compiles the driver without `UringEngine`
+//! and fails at setup.
 
 use std::io;
 use std::os::fd::RawFd;

@@ -225,7 +225,6 @@ impl InFlightSendSlab {
     /// Advance past `bytes_sent` bytes in the iovec array.
     /// Returns `Some(msghdr_ptr)` if there are remaining bytes to send (partial resubmit).
     /// Returns `None` if all data has been sent.
-    #[allow(clippy::mut_range_bound)]
     pub fn try_advance(&mut self, idx: u16, bytes_sent: u32) -> Option<*const libc::msghdr> {
         let entry = &mut self.entries[idx as usize];
         debug_assert!(entry.in_use);
@@ -233,17 +232,17 @@ impl InFlightSendSlab {
         entry.sent = entry.sent.saturating_add(bytes_sent);
         let mut skip = bytes_sent as usize;
         let count = entry.iov_count as usize;
-        let mut new_start = entry.iov_start as usize;
+        let start = entry.iov_start as usize;
+        let mut new_start = start;
 
-        for i in new_start..count {
-            if skip >= entry.iovecs[i].iov_len {
-                skip -= entry.iovecs[i].iov_len;
+        for (i, iov) in entry.iovecs.iter_mut().enumerate().take(count).skip(start) {
+            if skip >= iov.iov_len {
+                skip -= iov.iov_len;
                 new_start = i + 1;
             } else {
                 // Partial iovec — adjust in place
-                entry.iovecs[i].iov_base =
-                    (entry.iovecs[i].iov_base as *mut u8).wrapping_add(skip) as *mut _;
-                entry.iovecs[i].iov_len -= skip;
+                iov.iov_base = (iov.iov_base as *mut u8).wrapping_add(skip) as *mut _;
+                iov.iov_len -= skip;
                 new_start = i;
                 break;
             }
