@@ -221,7 +221,7 @@ target-side progress, such as tcp. The options:
 
 1. Poll the CQ from `on_tick`. The io_uring loop bounds each wait by the
    next tick, so `on_tick` runs at least every `tick_timeout_us` (default
-   1 ms; 0 blocks until a completion arrives). On the mio backend `on_tick`
+   10 ms; 0 blocks until a completion arrives). On the mio backend `on_tick`
    runs at least every 10 ms, a fixed interval that `tick_timeout_us` does
    not change. On tcp the target reads the socket only when it polls, so a
    value larger than the TCP receive window costs up to one tick period per

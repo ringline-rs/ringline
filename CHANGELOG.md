@@ -307,6 +307,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- io_uring: the default `tick_timeout_us` is 10,000 (10 ms) instead of
+  1,000. Timers and TLS handshake and close deadlines have their own
+  wake-ups since #838. The tick still sets how often an idle worker calls
+  `on_tick`, how often a worker publishes its connection count for merged
+  accept mode's placement and parking, and, on an idle worker, how long a
+  retry after a full submission queue or a full peer channel waits: one
+  tick for most, four for a Close or `shutdown`, and 64 for a park drain.
+  An idle worker used 3.5% of a core at 1 ms and 0.5% at 10 ms (one pinned
+  worker, Linux 6.12 VM, 5 runs). A handler that uses `on_tick` as a 1 ms
+  periodic callback on io_uring sets `tick_timeout_us(1000)`. The setting
+  has no effect on mio, whose wait is at most 10 ms.
 - io_uring: timers and the loop tick no longer use the ring (#838). A
   `sleep`, `timeout` or related timer records its deadline in a per-worker
   min-heap, the one the mio backend already used, and the worker passes the
