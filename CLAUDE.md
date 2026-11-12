@@ -126,6 +126,23 @@ Three things worth knowing wherever the uring tests run:
   their processes, still exceeds the limit after 5 s, `make_test_loop`
   aborts the binary with the setup message.
 
+  Since the default ring sizes rose to SQ 4096 and CQ 65536 (#901), each
+  worker's ring charges about 2.5 MiB (645 pages at 4 KiB; `ring_bytes` in
+  `memlock.rs`). CI lifts the limit before the io_uring suites (`ci.yml`).
+  At the 8 MiB that systemd sets by default (`DefaultLimitMEMLOCK`), 344
+  ringline io_uring tests failed with ENOMEM on a Linux 7.2 host, and about
+  250 still did with `-j 1`. A finished test's charge is released
+  asynchronously, and one test can hold several rings. Check `ulimit -l`
+  before a local io_uring run. To raise the limit for a running shell:
+  `sudo prlimit --pid <shell pid> --memlock=unlimited:unlimited`; processes
+  that shell starts afterwards inherit it. For later sessions, processes
+  the systemd user manager starts (tmux under systemd, graphical
+  terminals) take the limit from a `user@.service` drop-in with
+  `[Service]` and `LimitMEMLOCK=infinity`, applied after
+  `systemctl daemon-reload` and a restart of `user@<uid>.service`. Shells
+  started by sshd or `login` take it from pam_limits: add
+  `<user> - memlock unlimited` to a file in `/etc/security/limits.d/`.
+
 ## Workspace Structure
 
 This is a Cargo workspace. The core runtime is in `ringline/`; protocol client crates build on top of it:
