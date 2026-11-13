@@ -46,7 +46,8 @@ them cites this section.
    iteration re-runs nothing and is the model the ring already uses for
    partial resubmits and `Close`; persistent starvation past the retry cap
    is terminal for the connection, with the waiter failed, never a silent
-   drop.
+   drop. (#830 removed the cap: a parked SQE is now retried until the ring
+   takes it.)
 2. **The TLS ciphertext bound was first applied to bounded sends only.** The
    bound is conservative (record header plus rustls' maximum overhead per
    16 KiB record, rounded to whole slots). On io_uring it now gates plain
@@ -153,7 +154,7 @@ condition on a first TLS entry returned `Err` after rustls had advanced.
 cannot be pushed is parked at its queue head with `in_flight = true` and
 re-pushed by `drain_send_retries` next iteration; two failed attempts fail
 the waiter and close the connection, mirroring `drain_copy_retries`
-(departure 1, refined above). Ring gains `#[cfg(test)]
+(departure 1, refined above; #830 later removed the cap from both). Ring gains `#[cfg(test)]
 force_push_failures(n)`; the error kind stays `Other`. Unit tests on the
 pool, io_uring event-loop tests for admission and parking, and an echo
 integration test on both backends. This PR gets a changelog `Fixed` line

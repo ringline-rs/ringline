@@ -585,6 +585,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_close_retries();
             self.drain_shutdown_retries();
             self.drain_send_pollout_retries();
+            self.retry_recv_arms();
             self.driver.tick_count += 1;
 
             // Wake the tasks whose timers have expired, and publish the load
@@ -1158,6 +1159,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// `completion_pending()` is true, which can mean task work that posts no
     /// completion, so a blocking wait could hold an unarmed deferred receive
     /// until an unrelated completion arrives.
+    ///
+    /// Refused pushes: a receive (`recv_arm_retries`) or a send
+    /// (`pending_send_retries`, `pending_copy_retries`,
+    /// `pending_coalesced_retries`, `pending_zc_retries`) the ring could not
+    /// take has nothing in the kernel, and the drains after the wait push it
+    /// again. A blocking wait would hold it until an unrelated completion or
+    /// the wait's bound (#830).
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
@@ -1165,7 +1173,18 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && self.driver.pending_finalize_closes.is_empty()
             && self.driver.deferred_recv_arms.is_empty()
             && !self.driver.udp_rearm_due()
+            && !self.push_retry_due()
             && !shutting_down
+    }
+
+    /// Whether a receive or a send the ring refused is waiting to be pushed
+    /// again (`may_block`).
+    fn push_retry_due(&self) -> bool {
+        !self.driver.recv_arm_retries.is_empty()
+            || !self.driver.pending_send_retries.is_empty()
+            || !self.driver.pending_copy_retries.is_empty()
+            || !self.driver.pending_coalesced_retries.is_empty()
+            || !self.driver.pending_zc_retries.is_empty()
     }
 
     /// Arm the receives `park_recv` deferred (`Config::defer_recv_arm`), for
@@ -1699,6 +1718,44 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         });
         list.append(&mut self.driver.hangup_poll_retries);
         self.driver.hangup_poll_retries = list;
+    }
+
+    /// Arm the receives the ring refused (`Driver::recv_arm_retries`, #830).
+    /// An entry is dropped if its connection was recycled, or if no receive
+    /// is owed: no reader is parked and the connection is not a TLS one that
+    /// re-arms after each completion (`rearms_after_completion`).
+    /// `arm_direct_recv` drops the rest of the stale cases: a connection
+    /// closing or finished reading, a receive already armed, a park pending
+    /// (`rearm_direct_after_park` wakes the reader when it ends) and a hold
+    /// by `forward_recv_over_cap` (`resume_forward_recvs` arms it). A push
+    /// refused again puts the entry back, and an arm that closes the
+    /// connection wakes the reader.
+    fn retry_recv_arms(&mut self) {
+        if self.driver.recv_arm_retries.is_empty() {
+            return;
+        }
+        let mut list = std::mem::take(&mut self.driver.recv_arm_retries);
+        for &(conn_index, generation, need) in &list {
+            let Some(cs) = self.driver.connections.get_mut(conn_index) else {
+                continue;
+            };
+            if cs.generation != generation || !cs.recv_arm_retry {
+                continue;
+            }
+            cs.recv_arm_retry = false;
+            if !self.executor.recv_waiters[conn_index as usize]
+                && !self.driver.rearms_after_completion(conn_index)
+            {
+                continue;
+            }
+            if self.arm_direct_recv(conn_index, need) {
+                self.executor.wake_recv(conn_index);
+            }
+        }
+        list.clear();
+        if self.driver.recv_arm_retries.is_empty() {
+            self.driver.recv_arm_retries = list;
+        }
     }
 
     /// Submit owed hangup polls (`retry_hangup_polls`), then peek again on
@@ -3011,7 +3068,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if resubmit.is_err() {
                     self.driver
                         .pending_copy_retries
-                        .push((conn_index, generation, pool_slot, 0, tag));
+                        .push((conn_index, generation, pool_slot, tag));
                 }
             }
             Some(OpTag::SendMsgCoalesced) => {
@@ -3025,7 +3082,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 {
                     self.driver
                         .pending_coalesced_retries
-                        .push((conn_index, generation, slab_idx, 0));
+                        .push((conn_index, generation, slab_idx));
                 }
             }
             _ => {
@@ -3045,7 +3102,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 if resubmit.is_err() {
                     self.driver
                         .pending_zc_retries
-                        .push((conn_index, generation, slab_idx, 0));
+                        .push((conn_index, generation, slab_idx));
                 }
             }
         }
@@ -3622,7 +3679,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 let generation = self.driver.connections.generation(conn_index);
                 self.driver
                     .pending_zc_retries
-                    .push((conn_index, generation, slab_idx, 0));
+                    .push((conn_index, generation, slab_idx));
             }
             return;
         }
@@ -4587,6 +4644,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Retry ZC send resubmissions that failed on a previous tick (SQ full).
+    /// An entry stays until its push goes through or its connection goes
+    /// (Domain Invariant 7): the slab entry keeps the send's memory and
+    /// `in_flight` keeps the connection's later sends behind it (#830).
     fn drain_zc_retries(&mut self) {
         if self.driver.pending_zc_retries.is_empty() {
             return;
@@ -4596,7 +4656,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             &mut self.driver.zc_retry_scratch,
         );
         for idx in 0..self.driver.zc_retry_scratch.len() {
-            let (conn_index, generation, slab_idx, retries) = self.driver.zc_retry_scratch[idx];
+            let (conn_index, generation, slab_idx) = self.driver.zc_retry_scratch[idx];
             if !self.driver.send_slab.in_use(slab_idx) {
                 continue; // slab was released in the meantime
             }
@@ -4608,22 +4668,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if !identity_ok || self.close_submitted(conn_index) {
                 self.settle_abandoned_retry(slab_idx, identity_ok);
                 self.release_zc_slab(slab_idx);
-                continue;
-            }
-            if retries >= 2 {
-                // Give up: bytes of this send are already missing from the
-                // stream, so fail the send and close rather than leaving
-                // in_flight stuck and the connection wedged open.
-                self.settle_slab_err(
-                    slab_idx,
-                    io::Error::other("max retries during zc send resubmit"),
-                );
-                self.release_zc_slab(slab_idx);
-                self.driver.drain_conn_send_queue(conn_index);
-                self.abort_connection(
-                    conn_index,
-                    io::Error::other("max retries during zc send resubmit"),
-                );
                 continue;
             }
             let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
@@ -4639,12 +4683,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
             };
             if submitted.is_err() {
-                self.driver.pending_zc_retries.push((
-                    conn_index,
-                    generation,
-                    slab_idx,
-                    retries + 1,
-                ));
+                self.driver
+                    .pending_zc_retries
+                    .push((conn_index, generation, slab_idx));
             }
         }
         self.driver.zc_retry_scratch.clear();
@@ -4662,7 +4703,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// Retry coalesced send resubmissions that failed (SQ was full).
+    /// Retry coalesced send resubmissions that failed (SQ was full). As in
+    /// `drain_zc_retries`, an entry stays until its push goes through or its
+    /// connection goes (#830).
     fn drain_coalesced_retries(&mut self) {
         if self.driver.pending_coalesced_retries.is_empty() {
             return;
@@ -4672,8 +4715,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             &mut self.driver.coalesced_retry_scratch,
         );
         for idx in 0..self.driver.coalesced_retry_scratch.len() {
-            let (conn_index, generation, slab_idx, retries) =
-                self.driver.coalesced_retry_scratch[idx];
+            let (conn_index, generation, slab_idx) = self.driver.coalesced_retry_scratch[idx];
             if !self.driver.send_slab.in_use(slab_idx) {
                 continue; // slab released meanwhile
             }
@@ -4693,26 +4735,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.release_coalesced(slab_idx);
                 continue;
             }
-            if retries >= 2 {
-                // Give up: fail the send and close so the connection isn't
-                // left open with a hole in its byte stream.
-                let settles = self.driver.send_slab.take_sends(slab_idx);
-                self.release_coalesced(slab_idx);
-                self.driver.drain_conn_send_queue(conn_index);
-                for (id, _logical_len) in settles {
-                    self.settle_send(
-                        id,
-                        Err(io::Error::other(
-                            "max retries during coalesced send resubmit",
-                        )),
-                    );
-                }
-                self.abort_connection(
-                    conn_index,
-                    io::Error::other("max retries during coalesced send resubmit"),
-                );
-                continue;
-            }
             let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
             if self
                 .driver
@@ -4720,18 +4742,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
                 .is_err()
             {
-                self.driver.pending_coalesced_retries.push((
-                    conn_index,
-                    generation,
-                    slab_idx,
-                    retries + 1,
-                ));
+                self.driver
+                    .pending_coalesced_retries
+                    .push((conn_index, generation, slab_idx));
             }
         }
         self.driver.coalesced_retry_scratch.clear();
     }
 
-    /// Retry copy send resubmissions that failed (SQ was full).
+    /// Retry copy send resubmissions that failed (SQ was full). As in
+    /// `drain_zc_retries`, an entry stays until its push goes through or its
+    /// connection goes (#830).
     fn drain_copy_retries(&mut self) {
         if self.driver.pending_copy_retries.is_empty() {
             return;
@@ -4741,8 +4762,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             &mut self.driver.copy_retry_scratch,
         );
         for idx in 0..self.driver.copy_retry_scratch.len() {
-            let (conn_index, generation, pool_slot, retries, op) =
-                self.driver.copy_retry_scratch[idx];
+            let (conn_index, generation, pool_slot, op) = self.driver.copy_retry_scratch[idx];
             if !self.driver.send_copy_pool.in_use(pool_slot) {
                 continue;
             }
@@ -4764,24 +4784,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 }
                 continue;
             }
-            if retries >= 2 {
-                // Give up: fail the send and close so the connection isn't
-                // left open with a hole in its byte stream.
-                let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-                self.release_pool_slot(pool_slot);
-                self.driver.drain_conn_send_queue(conn_index);
-                if let Some((id, _logical_len)) = settles {
-                    self.settle_send(
-                        id,
-                        Err(io::Error::other("max retries during send resubmit")),
-                    );
-                }
-                self.abort_connection(
-                    conn_index,
-                    io::Error::other("max retries during send resubmit"),
-                );
-                continue;
-            }
             let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
             // Resubmit with the entry's original OpTag. Choosing by
             // tls_table membership here re-tagged the *final* chunk of a TLS
@@ -4797,13 +4799,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .submit_send_copied(conn_index, generation, ptr, remaining, pool_slot)
             };
             if result.is_err() {
-                self.driver.pending_copy_retries.push((
-                    conn_index,
-                    generation,
-                    pool_slot,
-                    retries + 1,
-                    op,
-                ));
+                self.driver
+                    .pending_copy_retries
+                    .push((conn_index, generation, pool_slot, op));
             }
         }
         self.driver.copy_retry_scratch.clear();
@@ -4813,10 +4811,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     ///
     /// The entry waited at its queue head with `in_flight = true`, so the
     /// connection's stream order is intact and a requested close stays
-    /// deferred behind it. Two failed attempts convert persistent starvation
-    /// into a terminal connection error — release the queue, fail the send
-    /// waiter, wake the reader, close — mirroring `drain_copy_retries`, so a
-    /// connection is never left open with a parked send nobody will push.
+    /// deferred behind it. A push refused again parks it again; there is no
+    /// cap, because a full SQ is backpressure and not a connection error
+    /// (Domain Invariant 7, #830).
     fn drain_send_retries(&mut self) {
         if self.driver.pending_send_retries.is_empty() {
             return;
@@ -4826,7 +4823,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             &mut self.driver.send_retry_scratch,
         );
         for idx in 0..self.driver.send_retry_scratch.len() {
-            let (conn_index, generation, attempts) = self.driver.send_retry_scratch[idx];
+            let (conn_index, generation) = self.driver.send_retry_scratch[idx];
             // Connection closed or reused, or its Close already submitted:
             // the close path released the queue, so there is nothing to push.
             if self.driver.connections.get(conn_index).is_none()
@@ -4843,27 +4840,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             if !state.parked || state.queue.is_empty() {
                 continue;
             }
-            if attempts >= 2 {
-                // Give up: release the parked entry and everything behind it,
-                // fail the send and close so the connection isn't left open
-                // with a hole in its byte stream.
-                //
-                // No send is settled here because none is in hand:
-                // the parked entry is still *queued*, so
-                // `drain_conn_send_queue` -> `release_queued_sends` takes its
-                // id off the pool slot and fails it (as `ConnectionAborted`)
-                // through `Driver::settled_sends`, which the run
-                // loop drains.
-                self.driver.drain_conn_send_queue(conn_index);
-                self.executor.wake_recv(conn_index);
-                self.driver.close_connection(conn_index);
-                continue;
-            }
-            // Re-parks itself on `pending_send_retries` with `attempts + 1`
-            // if the push fails again; pops the head and returns true if it
-            // goes through.
-            self.driver
-                .submit_next_queued_inner(conn_index, attempts + 1);
+            // Re-parks itself on `pending_send_retries` if the push fails
+            // again; pops the head and returns true if it goes through.
+            self.driver.submit_next_queued_inner(conn_index);
         }
         self.driver.send_retry_scratch.clear();
     }
@@ -5976,6 +5955,195 @@ mod tests {
                 .hangup_poll_armed
         );
         assert!(el.driver.hangup_poll_retries.is_empty());
+    }
+
+    /// A receive arm the ring refuses closes nothing (#830): the buffer goes
+    /// back to the accumulator, the reader stays parked with no error, and
+    /// the connection goes on `recv_arm_retries` once, with the latest
+    /// `need`. The worker does not block while the entry is owed, and the
+    /// retry after the refusals end arms the receive, which then delivers
+    /// the peer's bytes.
+    #[test]
+    fn a_receive_the_ring_refuses_is_retried_and_closes_nothing() {
+        use std::os::fd::AsRawFd;
+        let mut cfg = test_config();
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
+        el.driver.ring.flush().unwrap();
+        assert!(el.may_block(), "control: nothing owed yet");
+
+        el.executor.recv_waiters[conn_index as usize] = true;
+        el.driver.ring.force_push_failures(3);
+        assert!(
+            !el.arm_direct_recv(conn_index, None),
+            "a refused push is not a close"
+        );
+        // A second park while the retry is owed updates its `need`.
+        assert!(!el.arm_direct_recv(conn_index, Some(100)));
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(!cs.recv_direct_armed);
+        assert!(cs.recv_arm_retry);
+        assert_eq!(cs.read, ReadHalf::Open);
+        assert!(!cs.close_requested(), "a refused push closes nothing");
+        assert_eq!(
+            el.driver.recv_arm_retries,
+            vec![(conn_index, generation, Some(100))]
+        );
+        assert!(el.driver.recv_aborts.is_empty(), "no error for the reader");
+        assert!(
+            el.executor.ready_queue.is_empty(),
+            "the reader stays parked"
+        );
+        assert!(!el.may_block(), "an owed receive keeps the worker awake");
+
+        el.retry_recv_arms();
+        assert_eq!(
+            el.driver.recv_arm_retries,
+            vec![(conn_index, generation, Some(100))],
+            "a refused retry keeps one entry"
+        );
+        assert!(!el.may_block());
+
+        el.retry_recv_arms();
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(cs.recv_direct_armed, "the retry armed the receive");
+        assert!(!cs.recv_arm_retry);
+        assert!(el.driver.recv_arm_retries.is_empty());
+        assert!(el.may_block());
+
+        let n = unsafe { libc::write(peer.as_raw_fd(), b"ping".as_ptr().cast(), 4) };
+        assert_eq!(n, 4);
+        el.driver
+            .ring
+            .submit_and_wait(1)
+            .expect("submit_and_wait failed");
+        el.drain_completions();
+        assert_eq!(el.driver.recv_buffered(conn_index), 4);
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(!cs.recv_direct_armed);
+        assert!(!cs.close_requested());
+    }
+
+    /// A TLS connection's handshake receive that the ring refuses is retried
+    /// with no reader parked (the handshake re-arms after each completion),
+    /// and the refusal ends the receive in the TLS engine, so none is in
+    /// flight until the retry arms it.
+    #[test]
+    fn a_refused_tls_handshake_receive_is_retried() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .unwrap()
+            .established = false;
+
+        el.driver.ring.force_push_failures(1);
+        assert!(!el.arm_direct_recv(conn_index, None));
+        assert_eq!(
+            el.driver.recv_arm_retries,
+            vec![(conn_index, generation, None)]
+        );
+        assert!(
+            crate::tls::tls_take_recv_allocation(el.driver.tls_table.as_mut().unwrap(), conn_index)
+                .is_none(),
+            "the refused receive was ended in the engine"
+        );
+        assert!(
+            !el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .close_requested()
+        );
+
+        el.retry_recv_arms();
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .unwrap()
+                .recv_direct_armed,
+            "armed with no reader parked"
+        );
+        assert!(el.driver.recv_arm_retries.is_empty());
+
+        // End the armed receive, as a completion would, so the TLS state is
+        // not dropped with a receive in flight.
+        let slot = el
+            .driver
+            .connections
+            .get(conn_index)
+            .unwrap()
+            .recv_direct_slot;
+        el.test_dispatch_cqe(
+            UserData::encode(OpTag::RecvDirect, conn_index, slot).raw(),
+            -libc::ECANCELED,
+            0,
+        );
+        assert!(
+            crate::tls::tls_take_recv_allocation(el.driver.tls_table.as_mut().unwrap(), conn_index)
+                .is_none()
+        );
+    }
+
+    /// An owed receive is dropped when no receive is owed any more: the
+    /// connection closed, or (plaintext) its reader is no longer parked.
+    #[test]
+    fn a_stale_receive_retry_is_dropped() {
+        let mut el = make_test_loop();
+        let closed = accept_connection(&mut el);
+        let unparked = accept_connection(&mut el);
+        for ci in [closed, unparked] {
+            el.executor.recv_waiters[ci as usize] = true;
+            el.driver.ring.force_push_failures(1);
+            assert!(!el.arm_direct_recv(ci, None));
+        }
+        assert_eq!(el.driver.recv_arm_retries.len(), 2);
+        el.driver.close_connection(closed);
+        el.executor.recv_waiters[unparked as usize] = false;
+
+        el.retry_recv_arms();
+        assert!(el.driver.recv_arm_retries.is_empty());
+        for ci in [closed, unparked] {
+            if let Some(cs) = el.driver.connections.get(ci) {
+                assert!(!cs.recv_direct_armed, "no receive for {ci}");
+                assert!(!cs.recv_arm_retry);
+            }
+        }
+    }
+
+    /// Each list of pushes the ring refused keeps the worker from blocking:
+    /// nothing in the kernel would complete to retry them (#830).
+    #[test]
+    fn a_refused_push_keeps_the_worker_from_blocking() {
+        let mut cfg = test_config();
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        el.driver.ring.flush().unwrap();
+        assert!(el.may_block(), "control: nothing owed");
+        for list in 0..5 {
+            match list {
+                0 => el.driver.recv_arm_retries.push((0, 0, None)),
+                1 => el.driver.pending_send_retries.push((0, 0)),
+                2 => el.driver.pending_copy_retries.push((0, 0, 0, OpTag::Send)),
+                3 => el.driver.pending_coalesced_retries.push((0, 0, 0)),
+                _ => el.driver.pending_zc_retries.push((0, 0, 0)),
+            }
+            assert!(!el.may_block(), "list {list}");
+            el.driver.recv_arm_retries.clear();
+            el.driver.pending_send_retries.clear();
+            el.driver.pending_copy_retries.clear();
+            el.driver.pending_coalesced_retries.clear();
+            el.driver.pending_zc_retries.clear();
+            assert!(el.may_block(), "list {list} cleared");
+        }
     }
 
     /// A hangup poll retry waits while a park of the connection is pending:
@@ -7908,8 +8076,8 @@ mod tests {
         };
         result.expect("SQ pressure must not surface as a send error");
 
-        // Parked: still queued, in_flight held, registered for retry with
-        // attempts 0, and the pool slot still owned by the queued entry.
+        // Parked: still queued, in_flight held, registered for retry, and
+        // the pool slot still owned by the queued entry.
         {
             let state = &el.driver.send_queues[conn_index as usize];
             assert_eq!(state.queue.len(), 1, "the entry must stay queued");
@@ -7917,7 +8085,7 @@ mod tests {
         }
         assert_eq!(
             el.driver.pending_send_retries,
-            vec![(conn_index, generation, 0)],
+            vec![(conn_index, generation)],
             "the connection must be registered for one retry"
         );
         assert_eq!(el.driver.send_copy_pool.free_count(), 7);
@@ -8022,7 +8190,7 @@ mod tests {
         );
         assert_eq!(
             el.driver.pending_send_retries,
-            vec![(conn_index, generation, 0)]
+            vec![(conn_index, generation)]
         );
 
         // The retry pushes the head; the two chunks behind it are untouched.
@@ -8097,7 +8265,7 @@ mod tests {
         );
         assert_eq!(
             el.driver.pending_send_retries,
-            vec![(conn_index, generation, 0)]
+            vec![(conn_index, generation)]
         );
 
         // The retry re-coalesces the run and pushes it: the queue drains
@@ -8115,12 +8283,14 @@ mod tests {
         assert!(el.driver.pending_send_retries.is_empty());
     }
 
-    /// Persistent SQ starvation is terminal for the connection, never a
-    /// silent drop: after two failed retries the parked queue is released,
-    /// the awaited send resolves `Err`, and the connection closes — the same
-    /// shape as `drain_copy_retries`' give-up.
+    /// SQ backpressure on a queued head is never terminal (#830): a send the
+    /// ring refuses on the first push and on four retries stays parked, with
+    /// the connection open and the send unresolved, and the retry after the
+    /// refusals end pushes it. The send then completes with its bytes on the
+    /// wire once. Before #830 the third refusal failed the send and closed
+    /// the connection.
     #[test]
-    fn send_retry_cap_fails_the_send_and_closes() {
+    fn send_retry_keeps_the_send_parked_until_the_ring_takes_it() {
         let mut el = make_test_loop_with_config(
             test_config_builder()
                 .send_pool(8, 64)
@@ -8130,61 +8300,68 @@ mod tests {
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let token = crate::handler::ConnId::new(conn_index, generation);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
         let id = el.executor.register_send(conn_index);
 
-        // The initial push and both retries are refused.
-        el.driver.ring.force_push_failures(3);
+        // The initial push and four retries are refused.
+        el.driver.ring.force_push_failures(5);
         let result = {
             let mut ctx = el.driver.make_ctx();
             ctx.send_awaited(token, b"hello", id)
         };
         result.expect("SQ pressure must not surface as a send error");
-        assert_eq!(
-            el.driver.pending_send_retries,
-            vec![(conn_index, generation, 0)]
-        );
 
-        // Retry 1 fails: re-parked with attempts 1.
-        el.drain_send_retries();
-        assert_eq!(
-            el.driver.pending_send_retries,
-            vec![(conn_index, generation, 1)],
-            "a failed retry must re-park with the incremented attempt count"
-        );
-        assert_eq!(el.driver.send_queues[conn_index as usize].queue.len(), 1);
-        assert!(send_result(&mut el, id).is_none());
-
-        // Retry 2 fails: re-parked with attempts 2.
-        el.drain_send_retries();
-        assert_eq!(
-            el.driver.pending_send_retries,
-            vec![(conn_index, generation, 2)]
-        );
-        assert_eq!(el.driver.send_queues[conn_index as usize].queue.len(), 1);
-        assert!(send_result(&mut el, id).is_none());
-
-        // Retry 3 hits the cap: give up.
-        el.drain_send_retries();
-        assert!(el.driver.pending_send_retries.is_empty());
-        assert!(
-            matches!(send_result(&mut el, id), Some(Err(_))),
-            "expected the send to be failed by the retry cap"
-        );
-        {
+        for retry in 1..=4 {
+            assert_eq!(
+                el.driver.pending_send_retries,
+                vec![(conn_index, generation)],
+                "one entry before retry {retry}"
+            );
+            el.drain_send_retries();
             let state = &el.driver.send_queues[conn_index as usize];
-            assert!(state.queue.is_empty(), "give-up must release the queue");
-            assert!(!state.in_flight, "give-up must clear in_flight");
+            assert_eq!(state.queue.len(), 1, "retry {retry}: still queued");
+            assert!(state.in_flight, "retry {retry}: in_flight held");
+            assert!(state.parked, "retry {retry}: parked again");
+            assert!(
+                send_result(&mut el, id).is_none(),
+                "retry {retry}: a refused push resolves nothing"
+            );
+            assert!(
+                !el.driver
+                    .connections
+                    .get(conn_index)
+                    .expect("the connection stays open")
+                    .close_requested(),
+                "retry {retry}: a refused push closes nothing"
+            );
+            assert_eq!(el.driver.send_copy_pool.free_count(), 7);
         }
         assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            8,
-            "give-up must return the parked entry's pool slot"
+            el.driver.pending_send_retries,
+            vec![(conn_index, generation)]
         );
-        let conn = el.driver.connections.get(conn_index);
-        assert!(
-            conn.is_none() || conn.unwrap().close_requested(),
-            "give-up must close the connection"
+
+        // The refusals have ended: this retry pushes the head.
+        el.drain_send_retries();
+        assert!(el.driver.pending_send_retries.is_empty());
+        assert!(el.driver.send_queues[conn_index as usize].queue.is_empty());
+
+        el.driver
+            .ring
+            .submit_and_wait(1)
+            .expect("submit_and_wait failed");
+        el.drain_completions();
+        assert_eq!(
+            send_result(&mut el, id)
+                .expect("the send completed")
+                .expect("the send succeeded"),
+            5
         );
+        assert_eq!(el.driver.send_copy_pool.free_count(), 8);
+        let mut buf = [0u8; 16];
+        assert_eq!(try_recv(&peer, &mut buf), Some(5));
+        assert_eq!(&buf[..5], b"hello");
+        assert_eq!(try_recv(&peer, &mut buf), None, "delivered once");
     }
 
     /// A parked send satisfies `in_flight` for the close-deferral machinery:
@@ -8309,7 +8486,7 @@ mod tests {
         assert!(el.driver.send_queues[conn_index as usize].parked);
         assert_eq!(
             el.driver.pending_send_retries,
-            vec![(conn_index, generation, 0)]
+            vec![(conn_index, generation)]
         );
 
         // Another path pushes the head first.
@@ -8370,7 +8547,7 @@ mod tests {
         }
         assert_eq!(
             el.driver.pending_send_retries,
-            vec![(conn_index, generation, 0)]
+            vec![(conn_index, generation)]
         );
         assert_eq!(
             el.driver.send_copy_pool.free_count(),
@@ -8454,7 +8631,7 @@ mod tests {
         }
         assert_eq!(
             el.driver.pending_send_retries,
-            vec![(conn_index, generation, 0)],
+            vec![(conn_index, generation)],
             "registered once, at attempt 0"
         );
         el.drain_send_retries();
@@ -12152,7 +12329,7 @@ mod tests {
         el.driver.ring.last_pushed = None;
         el.driver
             .pending_zc_retries
-            .push((conn_index, generation, slab_idx, 0));
+            .push((conn_index, generation, slab_idx));
         el.drain_zc_retries();
         assert_plain_drain(&el, conn_index);
         assert_eq!(
@@ -12237,7 +12414,7 @@ mod tests {
                 .send_slab
                 .allocate(conn_index, generation, &iovecs, u16::MAX, guards, 0, 100)
                 .unwrap();
-            let entry = (conn_index, generation, slab_idx, 0);
+            let entry = (conn_index, generation, slab_idx);
             match list {
                 0 => el.driver.pending_coalesced_retries.push(entry),
                 _ => el.driver.pending_zc_retries.push(entry),
@@ -12985,7 +13162,7 @@ mod tests {
         // Queue the retry.
         el.driver
             .pending_copy_retries
-            .push((conn_index, generation, slot, 0, OpTag::Send));
+            .push((conn_index, generation, slot, OpTag::Send));
 
         // Close the connection before the retry fires.
         el.driver.close_connection(conn_index);
@@ -13019,7 +13196,7 @@ mod tests {
         // Queue the retry with the old generation.
         el.driver
             .pending_copy_retries
-            .push((conn_index, old_generation, slot, 0, OpTag::Send));
+            .push((conn_index, old_generation, slot, OpTag::Send));
 
         // Close the connection.
         el.driver.close_connection(conn_index);
@@ -13078,7 +13255,7 @@ mod tests {
         // Queue the ZC retry.
         el.driver
             .pending_zc_retries
-            .push((conn_index, generation, slab_idx, 0));
+            .push((conn_index, generation, slab_idx));
 
         // Close the connection.
         el.driver.close_connection(conn_index);
@@ -13420,35 +13597,61 @@ mod tests {
         );
     }
 
+    /// A partial-send resubmit the ring keeps refusing stays on
+    /// `pending_copy_retries` with its pool slot and its send, the connection
+    /// open, until the ring takes it; the send then completes (#830). Before
+    /// #830 a third refusal released the slot, failed the send and closed the
+    /// connection.
     #[test]
-    fn copy_retry_giveup_fails_send_and_closes() {
-        // Exhausted retries must not leave the connection wedged open with
-        // in_flight stuck: release the slot, fail the send, close.
+    fn copy_retry_keeps_the_resubmit_until_the_ring_takes_it() {
         let mut el = make_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
         let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"data").unwrap();
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let id = await_slot(&mut el, conn_index, slot, 4);
 
         el.driver
             .pending_copy_retries
-            .push((conn_index, generation, slot, 2, OpTag::Send));
-        el.drain_copy_retries();
+            .push((conn_index, generation, slot, OpTag::Send));
+        el.driver.ring.force_push_failures(3);
+        for retry in 1..=3 {
+            el.drain_copy_retries();
+            assert_eq!(
+                el.driver.pending_copy_retries,
+                vec![(conn_index, generation, slot, OpTag::Send)],
+                "retry {retry}: the entry stays"
+            );
+            assert!(el.driver.send_copy_pool.in_use(slot), "retry {retry}");
+            assert!(send_result(&mut el, id).is_none(), "retry {retry}");
+            assert!(
+                !el.driver
+                    .connections
+                    .get(conn_index)
+                    .expect("the connection stays open")
+                    .close_requested(),
+                "retry {retry}: a refused push closes nothing"
+            );
+        }
 
-        assert!(
-            !el.driver.send_copy_pool.in_use(slot),
-            "give-up must release the pool slot"
+        el.drain_copy_retries();
+        assert!(el.driver.pending_copy_retries.is_empty());
+        el.driver
+            .ring
+            .submit_and_wait(1)
+            .expect("submit_and_wait failed");
+        el.drain_completions();
+        assert_eq!(
+            send_result(&mut el, id)
+                .expect("the send completed")
+                .expect("the send succeeded"),
+            4
         );
-        assert!(
-            matches!(send_result(&mut el, id), Some(Err(_))),
-            "give-up must fail the send"
-        );
-        let conn = el.driver.connections.get(conn_index);
-        assert!(
-            conn.is_none() || conn.unwrap().close_requested(),
-            "give-up must close the connection"
-        );
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+        let mut buf = [0u8; 16];
+        assert_eq!(try_recv(&peer, &mut buf), Some(4));
+        assert_eq!(&buf[..4], b"data");
     }
 
     #[test]
@@ -13777,8 +13980,8 @@ mod tests {
     // (`ConnCtx::send_backpressured`, series PR 9) must resolve with the
     // exact result of *its own* operation. On io_uring its id rides the
     // final pool slot — lifted onto the slab entry when the run is
-    // coalesced — and every completion, give-up and teardown site takes the
-    // id and settles it.
+    // coalesced — and every completion and teardown site takes the id and
+    // settles it.
     //
     // A site that drops a settle and a site that drops the *take* fail
     // differently, on purpose: the first leaves the operation unresolved and
@@ -14227,25 +14430,25 @@ mod tests {
     /// that never reached the wire, so the re-encrypted records carry
     /// sequence numbers the peer is not expecting and it fails the connection
     /// with `bad_record_mac`. PR 4 refined the rule: park the *built* SQE and
-    /// re-push the same bytes, which re-runs no encryption at all, and if the
-    /// SQ stays full past the cap, fail the operation and close the
-    /// connection rather than drop it silently.
+    /// re-push the same bytes, which re-runs no encryption at all.
     ///
-    /// What this pins is that a bounded TLS send takes that path: it never
-    /// re-encrypts, the caller is told, and the connection goes down instead
-    /// of emitting a record gap.
+    /// What this pins is that a bounded TLS send takes that path for as long
+    /// as the ring refuses it: it never re-encrypts, nothing resolves, the
+    /// connection stays open, and once the push goes through the peer
+    /// decrypts the records (#830 removed the cap that failed the send and
+    /// closed the connection after two refused retries).
     #[test]
-    fn bounded_tls_send_parks_and_then_fails_rather_than_re_encrypting() {
+    fn bounded_tls_send_parks_and_goes_out_without_re_encrypting() {
         let mut el = tls_bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let token = crate::handler::ConnId::new(conn_index, generation);
-        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
-        install_handshaked_tls(&mut el, conn_index);
+        let (_ours, peer_fd) = attach_socketpair(&mut el, conn_index);
+        let mut peer = install_handshaked_tls_with_peer(&mut el, conn_index);
 
         let free_before = el.driver.send_copy_pool.free_count();
 
-        // The initial push and every retry are refused.
+        // The initial push and three retries are refused.
         el.driver.ring.force_push_failures(4);
         let id = admit_bounded_send(&mut el, token, &[b'z'; 512], 2);
 
@@ -14253,47 +14456,43 @@ mod tests {
         // committed to this connection's stream.
         assert_eq!(
             el.driver.pending_send_retries,
-            vec![(conn_index, generation, 0)],
+            vec![(conn_index, generation)],
             "a full SQ parks the built SQE rather than failing the send"
         );
-        assert!(
-            el.executor.take_send_result(id).is_none(),
-            "nothing resolves while the entry is merely parked"
-        );
+        for retry in 1..=3 {
+            el.drain_send_retries();
+            el.drain_settled_sends();
+            assert!(
+                el.executor.take_send_result(id).is_none(),
+                "retry {retry}: nothing resolves while the entry is parked"
+            );
+            assert!(
+                !el.driver
+                    .connections
+                    .get(conn_index)
+                    .expect("the connection stays open")
+                    .close_requested(),
+                "retry {retry}: a refused push closes nothing"
+            );
+        }
 
-        el.drain_send_retries();
-        assert!(el.executor.take_send_result(id).is_none());
-        el.drain_send_retries();
-        assert!(el.executor.take_send_result(id).is_none());
-
-        // Past the cap: the operation fails and the connection goes down.
         el.drain_send_retries();
         assert!(el.driver.pending_send_retries.is_empty());
-        // The give-up path does not settle the id directly — the parked entry
-        // is still queued, so `drain_conn_send_queue` -> `release_queued_sends`
-        // takes it off the pool slot and fails it through the driver's
-        // completion queue, which the run loop drains. Skipping this step is
-        // what makes the settle look like it never happened.
-        el.drain_settled_sends();
-        let result = el
-            .executor
-            .take_send_result(id)
-            .expect("the retry cap must settle the bounded send, not drop it");
-        assert!(
-            result.is_err(),
-            "the caller learns the message did not go out"
-        );
-        let conn = el.driver.connections.get(conn_index);
-        assert!(
-            conn.is_none() || conn.unwrap().close_requested(),
-            "a TLS send that cannot reach the wire closes the connection, \
-             because the records it already sealed left a gap"
-        );
+        let wire = flush_sends_to_peer(&mut el, conn_index, &peer_fd);
         assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            free_before,
-            "giving up returns every slot the encryption took"
+            peer.decrypt(&wire).as_deref(),
+            Ok(&[b'z'; 512][..]),
+            "the parked records decrypt: none was re-encrypted or dropped"
         );
+        el.drain_settled_sends();
+        assert_eq!(
+            el.executor
+                .take_send_result(id)
+                .expect("the send completed")
+                .expect("the send succeeded"),
+            512
+        );
+        assert_eq!(el.driver.send_copy_pool.free_count(), free_before);
     }
 
     /// Series PR 8 on the io_uring side: a bounded TLS send is admitted
@@ -14923,7 +15122,7 @@ mod tests {
         el.driver.send_queues[conn_index as usize].close_submitted = true;
         el.driver
             .pending_zc_retries
-            .push((conn_index, generation, slab_idx, 0));
+            .push((conn_index, generation, slab_idx));
         el.drain_zc_retries();
         assert_eq!(
             send_result(&mut el, id)
@@ -15314,43 +15513,56 @@ mod tests {
         );
     }
 
-    /// `drain_copy_retries`' give-up arm: persistent SQ starvation during a
-    /// partial-send resubmit is terminal for the connection, and the bounded
-    /// send is told so rather than waiting for a CQE nobody will ask for.
+    /// `drain_copy_retries` keeps a bounded send's resubmit for as long as
+    /// the ring refuses it, and the send settles with its length once the
+    /// resubmit completes (#830; the retry cap used to settle it `Err` and
+    /// close the connection).
     #[test]
-    fn copy_retry_cap_settles_the_bounded_send_err() {
+    fn copy_retry_settles_the_bounded_send_once_the_resubmit_lands() {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
 
         let id = submitted_id(&mut el, conn_index, generation);
         let (slot, _p, _l) = el.driver.send_copy_pool.copy_in(b"stuck").unwrap();
         el.driver.send_copy_pool.set_send_id(slot, id, 5);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
         el.driver
             .pending_copy_retries
-            .push((conn_index, generation, slot, 2, OpTag::Send));
+            .push((conn_index, generation, slot, OpTag::Send));
 
+        el.driver.ring.force_push_failures(3);
+        for retry in 1..=3 {
+            el.drain_copy_retries();
+            assert_eq!(el.driver.pending_copy_retries.len(), 1, "retry {retry}");
+            el.drain_settled_sends();
+            assert!(
+                el.executor.take_send_result(id).is_none(),
+                "retry {retry}: nothing resolves while the ring refuses"
+            );
+        }
         el.drain_copy_retries();
-
-        let err = el
-            .executor
-            .take_send_result(id)
-            .expect("the give-up arm must settle the operation")
-            .expect_err("the resubmit never landed");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert!(
-            err.to_string().contains("max retries during send resubmit"),
-            "unexpected message: {err}"
+        assert!(el.driver.pending_copy_retries.is_empty());
+        el.driver
+            .ring
+            .submit_and_wait(1)
+            .expect("submit_and_wait failed");
+        el.drain_completions();
+        el.drain_settled_sends();
+        assert_eq!(
+            el.executor
+                .take_send_result(id)
+                .expect("the resubmit settled the operation")
+                .expect("the resubmit landed"),
+            5
         );
-        assert!(
-            !el.driver.send_copy_pool.in_use(slot),
-            "give-up returns the slot"
-        );
-        let conn = el.driver.connections.get(conn_index);
-        assert!(
-            conn.is_none() || conn.unwrap().close_requested(),
-            "give-up must close the connection"
-        );
+        assert!(!el.driver.send_copy_pool.in_use(slot));
+        let conn = el.driver.connections.get(conn_index).expect("open");
+        assert!(!conn.close_requested());
+        let mut buf = [0u8; 16];
+        assert_eq!(try_recv(&peer, &mut buf), Some(5));
+        assert_eq!(&buf[..5], b"stuck");
     }
 
     /// Queue two awaited copy sends, `aa` and `bbb`, behind an in-flight
@@ -15704,31 +15916,47 @@ mod tests {
         }
     }
 
-    /// The coalesced retry's give-up fails every send in the run.
+    /// A coalesced resubmit the ring keeps refusing settles none of its
+    /// sends; once it is pushed, its completion settles each with its own
+    /// length (#830).
     #[test]
-    fn the_coalesced_retry_give_up_fails_every_send() {
+    fn the_coalesced_retry_settles_every_send_once_pushed() {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let (first, second, slab_idx) = two_pipelined_sends(&mut el, conn_index, generation);
         el.driver
             .pending_coalesced_retries
-            .push((conn_index, generation, slab_idx, 2));
-        el.drain_coalesced_retries();
-        for id in [first, second] {
-            let err = el
-                .executor
-                .take_send_result(id)
-                .expect("settled")
-                .unwrap_err();
-            assert!(err.to_string().contains("max retries"), "{err}");
+            .push((conn_index, generation, slab_idx));
+        el.driver.ring.force_push_failures(3);
+        el.driver.ring.last_pushed = None;
+        for retry in 1..=3 {
+            el.drain_coalesced_retries();
+            assert_eq!(
+                el.driver.pending_coalesced_retries,
+                vec![(conn_index, generation, slab_idx)],
+                "retry {retry}: the entry stays"
+            );
+            for id in [first, second] {
+                assert!(el.executor.take_send_result(id).is_none(), "retry {retry}");
+            }
         }
+        el.drain_coalesced_retries();
+        assert!(el.driver.pending_coalesced_retries.is_empty());
+        let pushed = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        assert_eq!(pushed.tag(), Some(OpTag::SendMsgCoalesced));
+        assert_eq!(pushed.payload() as u16, slab_idx);
+        el.test_dispatch_cqe(pushed.raw(), 5, 0);
+        assert_eq!(el.executor.take_send_result(first).unwrap().unwrap(), 2);
+        assert_eq!(el.executor.take_send_result(second).unwrap().unwrap(), 3);
     }
 
-    /// `drain_coalesced_retries`' give-up arm, on the id the slab entry
-    /// carries.
+    /// `drain_coalesced_retries` keeps the slab entry, its pool slots and the
+    /// id it carries for as long as the ring refuses the resubmit; the
+    /// completion of the pushed resubmit settles the id with its logical
+    /// length and returns every slot (#830).
     #[test]
-    fn coalesced_retry_cap_settles_the_bounded_send_err() {
+    fn coalesced_retry_settles_the_bounded_send_once_pushed() {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
@@ -15758,78 +15986,98 @@ mod tests {
                 Some((id, 99, l0 + l1)),
             )
             .expect("slab room");
+        el.driver.send_queues[conn_index as usize].in_flight = true;
         el.driver
             .pending_coalesced_retries
-            .push((conn_index, generation, slab_idx, 2));
+            .push((conn_index, generation, slab_idx));
 
+        el.driver.ring.force_push_failures(3);
+        for retry in 1..=3 {
+            el.drain_coalesced_retries();
+            assert_eq!(
+                el.driver.pending_coalesced_retries.len(),
+                1,
+                "retry {retry}"
+            );
+            assert!(el.driver.send_slab.in_use(slab_idx), "retry {retry}");
+            assert_eq!(el.driver.send_copy_pool.free_count(), 6, "retry {retry}");
+            el.drain_settled_sends();
+            assert!(el.executor.take_send_result(id).is_none(), "retry {retry}");
+        }
         el.drain_coalesced_retries();
+        assert!(el.driver.pending_coalesced_retries.is_empty());
 
-        let err = el
-            .executor
-            .take_send_result(id)
-            .expect("the give-up arm must settle the operation")
-            .expect_err("the resubmit never landed");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert!(
-            err.to_string()
-                .contains("max retries during coalesced send resubmit"),
-            "unexpected message: {err}"
+        let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, slab_idx as u32);
+        el.test_dispatch_cqe(ud.raw(), (l0 + l1) as i32, 0);
+        assert_eq!(
+            el.executor
+                .take_send_result(id)
+                .expect("the completion settles the operation")
+                .expect("the resubmit landed"),
+            99,
+            "the carried logical length"
         );
         assert_eq!(
             el.driver.send_copy_pool.free_count(),
             8,
-            "give-up returns every slot the run held"
+            "the completion returns every slot the run held"
         );
+        assert!(!el.driver.send_slab.in_use(slab_idx));
     }
 
-    /// `drain_send_retries`' give-up arm holds no id at all: the parked
-    /// entry is still *queued*, so `drain_conn_send_queue` takes the id off
-    /// its pool slot and aborts it through
-    /// `Driver::settled_sends`, which the run loop drains. Both
-    /// halves have to work or the caller hangs.
+    /// A parked bounded send stays queued, unresolved and holding its slot
+    /// for as long as the ring refuses it, with nothing recorded on
+    /// `settled_sends`; once pushed it settles with its length (#830). The
+    /// retry cap used to abort it with `ConnectionAborted`.
     #[test]
-    fn send_retry_cap_aborts_the_parked_bounded_send() {
+    fn send_retry_keeps_the_parked_bounded_send_until_pushed() {
         let mut el = bounded_test_loop();
         let conn_index = accept_connection(&mut el);
         let generation = el.driver.connections.generation(conn_index);
         let token = crate::handler::ConnId::new(conn_index, generation);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
 
-        // The initial push and both retries are refused.
-        el.driver.ring.force_push_failures(3);
+        // The initial push and three retries are refused.
+        el.driver.ring.force_push_failures(4);
         let id = admit_bounded_send(&mut el, token, b"parked", 1);
         assert_eq!(
             el.driver.pending_send_retries,
-            vec![(conn_index, generation, 0)],
+            vec![(conn_index, generation)],
             "SQ pressure parks the entry instead of failing the send"
         );
 
-        el.drain_send_retries();
-        el.drain_send_retries();
-        assert!(
-            el.executor.take_send_result(id).is_none(),
-            "a re-parked entry must not resolve"
-        );
+        for retry in 1..=3 {
+            el.drain_send_retries();
+            assert!(
+                el.driver.settled_sends.is_empty(),
+                "retry {retry}: nothing is settled"
+            );
+            assert!(
+                el.executor.take_send_result(id).is_none(),
+                "retry {retry}: a re-parked entry must not resolve"
+            );
+            assert_eq!(el.driver.send_copy_pool.free_count(), 7, "retry {retry}");
+        }
 
-        // The cap.
         el.drain_send_retries();
-        assert_eq!(
-            el.driver.settled_sends.len(),
-            1,
-            "the destroyed queue entry is recorded for the loop to deliver"
-        );
+        assert!(el.driver.pending_send_retries.is_empty());
+        el.driver
+            .ring
+            .submit_and_wait(1)
+            .expect("submit_and_wait failed");
+        el.drain_completions();
         el.drain_settled_sends();
-
-        let err = el
-            .executor
-            .take_send_result(id)
-            .expect("the aborted entry must be told")
-            .expect_err("the message never reached the wire");
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
         assert_eq!(
-            el.driver.send_copy_pool.free_count(),
-            8,
-            "the parked entry's slot came back"
+            el.executor
+                .take_send_result(id)
+                .expect("the pushed entry settles")
+                .expect("the message reached the wire"),
+            6
         );
+        assert_eq!(el.driver.send_copy_pool.free_count(), 8);
+        let mut buf = [0u8; 16];
+        assert_eq!(try_recv(&peer, &mut buf), Some(6));
+        assert_eq!(&buf[..6], b"parked");
     }
 
     /// Teardown through `drain_conn_send_queue`: a bounded send still queued
@@ -16546,8 +16794,8 @@ mod tests {
     ///
     /// No existing test covers `handle_send_msg_coalesced`'s terminal error
     /// branch with an id at all — the closest,
-    /// `coalesced_retry_cap_settles_the_bounded_send_err`, drives the retry
-    /// drain, which is a different site reporting a different error. It is
+    /// `coalesced_retry_settles_the_bounded_send_once_pushed`, drives the
+    /// retry drain and settles a success. It is
     /// also a path the tripwire cannot cover: the id rides the *slab* entry,
     /// which `InFlightSendSlab::release` clears silently, unlike
     /// `SendCopyPool::release`. Drop the take here and nothing panics — the

@@ -1114,6 +1114,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring: a submission queue that stays full no longer closes connections
+  or fails sends (#830). A send whose SQE the ring refused on two retries
+  was failed with `max retries during send resubmit` (or `... coalesced
+  send resubmit`, `... zc send resubmit`), or `ConnectionAborted` for a
+  queued send, and its connection was closed; this was in every 0.6
+  release. The send now stays queued, in order, and is pushed again every
+  iteration until the ring takes it. A receive the ring refused closed the
+  connection, and the read failed with `the receive could not be submitted
+  to the ring`; the receive is now armed again after the next wait, and the
+  read stays pending. The worker does not block in its wait while either is
+  owed.
 - Timers (#836, items 1 and 2):
   - A sleep or deadline too far out for the clock is never reached instead
     of failing. On io_uring, a `Duration` with more than `i64::MAX` seconds

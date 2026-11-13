@@ -149,10 +149,13 @@ A built SQE that cannot be pushed because the SQ is still full after
 `submit()` is parked, never dropped: it stays at the head of its connection's
 send queue with `in_flight = true`, the connection is registered on
 `pending_send_retries`, and the event loop's `drain_send_retries` re-pushes
-the same bytes on the next iteration. After two failed attempts the send
-waiter is failed and the connection closed, exactly as `drain_copy_retries`
-does for a partial-write resubmit, so a starved connection is never left open
-with a hole in its byte stream.
+the same bytes on the next iteration, and on every iteration after until the
+ring takes it. A partial-write resubmit the ring refuses goes on
+`pending_copy_retries` (or the coalesced or zero-copy list) the same way.
+Neither has a cap: a full SQ is backpressure, not a connection error (Domain
+Invariant 7). Until #830, two failed attempts failed the send and closed the
+connection. The worker does not block while a retry is owed (`may_block`),
+since nothing in the kernel would complete to trigger it.
 
 Consequence: on io_uring `DriverCtx::send` fails only before it has committed
 anything (stale token, or pool admission). TLS pool exhaustion during

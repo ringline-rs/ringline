@@ -202,7 +202,8 @@ on the next loop iteration. Concretely:
   `wake_send(Err(io::Error::other("max retries during send submit")))`,
   `wake_recv`, `close_connection`. The cap and message shape are shared
   with the existing copy-retry path so the two failure modes read the same
-  in logs.
+  in logs. (#830 removed the cap and the attempt count from both: an entry
+  is retried every iteration until the ring takes it.)
 - A parked connection satisfies `in_flight` for the close-deferral
   machinery (`try_finalize_close` waits for `!in_flight && queue.is_empty()`),
   so a close requested while parked waits for the parked send to go out or
@@ -224,7 +225,8 @@ a *built* SQE and re-pushing the same bytes re-runs nothing; it is the model
 the ring already uses for partial resubmits and Close. What stays terminal
 is persistent starvation past the retry cap, and it is terminal for the
 connection with the waiter failed, never a silent drop. The series doc's
-departure 1 paragraph is updated to say this.
+departure 1 paragraph is updated to say this. (#830 removed the cap, so
+nothing here is terminal any more.)
 
 ### Ring: `#[cfg(test)] force_push_failures(n)`
 
