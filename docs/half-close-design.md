@@ -208,8 +208,9 @@ Tests that pinned the FIN's close were inverted or retargeted:
    peek's error path).
 4. TLS: the client sends close_notify; the server sends a reply and
    returns; the client reads the reply, then close_notify, then the FIN.
-5. A task that only sends on a connection the peer fully closed gets the
-   send error and the connection closes.
+5. A task that has read to the end of the stream and then only sends on a
+   connection the peer fully closed gets the send error and the connection
+   closes.
 6. A half-open idle connection does not spin the event loop: `on_tick`
    counts over 500 ms at the idle rate.
 
