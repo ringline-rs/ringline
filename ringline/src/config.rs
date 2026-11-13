@@ -112,8 +112,12 @@ pub struct Config {
     pub(crate) sqpoll: bool,
     /// SQPOLL idle timeout in milliseconds.
     pub(crate) sqpoll_idle_ms: u32,
-    /// Pin SQPOLL kernel thread to this CPU core. Only meaningful when sqpoll=true.
-    pub(crate) sqpoll_cpu: Option<u32>,
+    /// Where the workers' SQPOLL threads are pinned, from `sqpoll_cpu` or
+    /// `sqpoll_cpus`. Only meaningful when sqpoll=true.
+    pub(crate) sqpoll_cpu: Option<SqpollCpus>,
+    /// The CPU this worker's SQPOLL thread is pinned to: set per worker at
+    /// launch from `sq_thread_cpus`, and read by ring setup.
+    pub(crate) sq_thread_cpu: Option<u32>,
     /// Upper bound on each worker's bounded io-wq pool; 0 (the default)
     /// leaves the kernel's limit.
     pub(crate) iowq_max_workers: u32,
@@ -438,6 +442,49 @@ const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::
 /// Largest value [`ConfigBuilder::tls_handshake_timeout`] accepts.
 const MAX_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Where the workers' SQPOLL threads go: set by
+/// [`ConfigBuilder::sqpoll_cpu`] or [`ConfigBuilder::sqpoll_cpus`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SqpollCpus {
+    /// Worker `i` on logical CPU `base + i`.
+    Base(u32),
+    /// Worker `i` on logical CPU `list[i]`; one entry per worker.
+    List(Vec<u32>),
+}
+
+/// The CPU each of `workers` workers' SQPOLL thread is pinned to, or the
+/// launch error for a `sqpoll_cpus` list whose length is not `workers`, or a
+/// `sqpoll_cpu` base whose last CPU does not fit in a `u32`.
+pub(crate) fn sq_thread_cpus(
+    spec: Option<&SqpollCpus>,
+    workers: usize,
+) -> Result<Vec<Option<u32>>, crate::error::Error> {
+    match spec {
+        None => Ok(vec![None; workers]),
+        Some(SqpollCpus::Base(base)) => (0..workers)
+            .map(|i| {
+                u32::try_from(i)
+                    .ok()
+                    .and_then(|i| base.checked_add(i))
+                    .map(Some)
+                    .ok_or_else(|| {
+                        crate::error::Error::RingSetup(format!(
+                            "sqpoll_cpu {base} + worker {i} is beyond the u32 CPU ids io_uring takes"
+                        ))
+                    })
+            })
+            .collect(),
+        Some(SqpollCpus::List(list)) if list.len() == workers => {
+            Ok(list.iter().copied().map(Some).collect())
+        }
+        Some(SqpollCpus::List(list)) => Err(crate::error::Error::RingSetup(format!(
+            "sqpoll_cpus has {} entries and the runtime has {workers} workers; \
+             give one CPU per worker (entries may repeat)",
+            list.len()
+        ))),
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -447,6 +494,7 @@ impl Default for Config {
             sqpoll: false,
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
+            sq_thread_cpu: None,
             iowq_max_workers: 0,
             #[cfg(all(test, has_io_uring))]
             close_lead_override: None,
@@ -1029,9 +1077,41 @@ impl ConfigBuilder {
         self
     }
 
-    /// Pin SQPOLL kernel thread to a specific CPU core.
+    /// Pin worker `i`'s SQPOLL kernel thread to logical CPU `cpu + i`. Only
+    /// used with [`sqpoll`](Self::sqpoll).
+    ///
+    /// Every worker has its own ring and so its own SQ thread. The CPUs are
+    /// logical CPU ids, as `sched_setaffinity(2)` numbers them, with no
+    /// mapping to physical cores. With one worker the SQ thread is on `cpu`
+    /// itself. [`sqpoll_cpus`](Self::sqpoll_cpus) places each worker's SQ
+    /// thread from a list instead; of the two, the last one called applies.
+    ///
+    /// The kernel refuses, with `EINVAL`, a CPU at or beyond its CPU count or
+    /// offline, and from Linux 6.12, and in the stable series from 6.11.2,
+    /// 6.6.54 and 6.1.113, a CPU outside the process's cpuset.
+    /// [`launch`](crate::RinglineBuilder::launch) then fails with
+    /// [`Error::RingSetup`](crate::Error::RingSetup) naming the worker and
+    /// the CPU. `build()` does not check the CPU, since the worker count can
+    /// be left to launch.
     pub fn sqpoll_cpu(mut self, cpu: u32) -> Self {
-        self.config.sqpoll_cpu = Some(cpu);
+        self.config.sqpoll_cpu = Some(SqpollCpus::Base(cpu));
+        self
+    }
+
+    /// Pin worker `i`'s SQPOLL kernel thread to logical CPU `cpus[i]`. Only
+    /// used with [`sqpoll`](Self::sqpoll).
+    ///
+    /// The list needs one entry per worker: with `sqpoll(true)`,
+    /// [`launch`](crate::RinglineBuilder::launch) fails with
+    /// [`Error::RingSetup`](crate::Error::RingSetup) when its length differs
+    /// from the worker count. With [`workers`](Self::workers) left at 0, launch
+    /// starts [`physical_core_count()`](crate::physical_core_count) workers,
+    /// so size the list from that. Entries may repeat, so several SQ
+    /// threads can share one housekeeping CPU. Of this and
+    /// [`sqpoll_cpu`](Self::sqpoll_cpu), the last one called applies. The
+    /// kernel checks each CPU as `sqpoll_cpu` describes.
+    pub fn sqpoll_cpus(mut self, cpus: &[u32]) -> Self {
+        self.config.sqpoll_cpu = Some(SqpollCpus::List(cpus.to_vec()));
         self
     }
 
@@ -1491,6 +1571,56 @@ impl ConfigBuilder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sqpoll_cpu_offsets_each_worker_by_its_index() {
+        let cpus = super::sq_thread_cpus(Some(&super::SqpollCpus::Base(4)), 3).unwrap();
+        assert_eq!(cpus, [Some(4), Some(5), Some(6)]);
+    }
+
+    #[test]
+    fn sqpoll_cpu_past_u32_is_a_launch_error() {
+        let err = super::sq_thread_cpus(Some(&super::SqpollCpus::Base(u32::MAX)), 2).unwrap_err();
+        assert!(err.to_string().contains("worker 1"), "{err}");
+    }
+
+    #[test]
+    fn sqpoll_cpus_list_gives_worker_i_entry_i_and_may_repeat() {
+        let list = super::SqpollCpus::List(vec![7, 7, 2]);
+        let cpus = super::sq_thread_cpus(Some(&list), 3).unwrap();
+        assert_eq!(cpus, [Some(7), Some(7), Some(2)]);
+    }
+
+    #[test]
+    fn sqpoll_cpus_list_of_the_wrong_length_is_a_launch_error() {
+        let list = super::SqpollCpus::List(vec![0]);
+        let err = super::sq_thread_cpus(Some(&list), 2).unwrap_err();
+        assert!(matches!(err, crate::error::Error::RingSetup(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("sqpoll_cpus has 1 entries"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn no_sqpoll_cpu_leaves_every_sq_thread_unpinned() {
+        assert_eq!(super::sq_thread_cpus(None, 2).unwrap(), [None, None]);
+    }
+
+    #[test]
+    fn the_last_of_sqpoll_cpu_and_sqpoll_cpus_applies() {
+        let c = super::ConfigBuilder::new()
+            .sqpoll_cpus(&[1, 2])
+            .sqpoll_cpu(5);
+        assert_eq!(c.config.sqpoll_cpu, Some(super::SqpollCpus::Base(5)));
+        let c = super::ConfigBuilder::new()
+            .sqpoll_cpu(5)
+            .sqpoll_cpus(&[1, 2]);
+        assert_eq!(
+            c.config.sqpoll_cpu,
+            Some(super::SqpollCpus::List(vec![1, 2]))
+        );
+    }
+
     use super::*;
     use std::time::Duration;
 

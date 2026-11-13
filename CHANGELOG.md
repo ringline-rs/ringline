@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- io_uring: `ConfigBuilder::sqpoll_cpus(&[u32])` pins worker `i`'s SQPOLL
+  thread to logical CPU `cpus[i]` (#834). Entries may repeat, so several SQ
+  threads can share one CPU. With `sqpoll(true)`, `launch` fails with
+  `Error::RingSetup`, on either backend, when the list's length is not the
+  worker count.
+  `ConfigBuilder::sqpoll_cpu(c)` pins worker `i`'s SQ thread to logical CPU
+  `c + i`. Of the two, the last one called applies. When the kernel refuses a
+  worker's SQ CPU with `EINVAL`, `launch` fails with an `Error::RingSetup`
+  naming the worker and the CPU, instead of the generic `EINVAL` message
+  about a missing 6.1 setup flag. The kernel refuses a CPU at or beyond its
+  CPU count or offline, and from Linux 6.12, and in the stable series from
+  6.11.2, 6.6.54 and 6.1.113, one outside the process's cpuset.
 - On io_uring, when `RLIMIT_MEMLOCK`'s hard limit is too low for the
   workers' rings and `cq_entries` was left at its default, launch fits the
   rings to the limit instead of failing with `Error::ResourceLimit`. It halves
