@@ -1372,6 +1372,14 @@ impl RinglineBuilder {
             self.config.worker.threads
         };
 
+        // Each worker's SQPOLL thread CPU (#834). A `sqpoll_cpus` list can be
+        // checked against the worker count only now that it is known.
+        let sq_thread_cpus = if self.config.sqpoll {
+            crate::config::sq_thread_cpus(self.config.sqpoll_cpu.as_ref(), num_threads)?
+        } else {
+            vec![None; num_threads]
+        };
+
         // Each worker binds its own socket per UDP address, so an unresolved
         // zero port gives each worker its own ephemeral port. Resolve it here
         // for every bind that should share one port. The first worker to set
@@ -1656,6 +1664,7 @@ impl RinglineBuilder {
             config.wake_keep_alive = Some(wake_keep_alive.clone());
             config.runtime_shutdown = Some(runtime_shutdown.clone());
             config.worker_index = worker_id;
+            config.sq_thread_cpu = sq_thread_cpus[worker_id];
             config.worker_loads = worker_loads.clone();
             config.worker_accepting = Some(worker_accepting.clone());
             if worker_loads.is_some() {

@@ -34,6 +34,59 @@ pub(crate) fn retry_with_resv_set(err: &io::Error, kernel: Option<KernelVersion>
 /// to the kernel. A longer wait ends early and the caller waits again.
 pub(crate) const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// `Error::RingSetup` for a failed `io_uring_setup(2)`.
+///
+/// An `EINVAL` on a ring whose SQPOLL thread was pinned to `sq_cpu` can come
+/// from the CPU or from a setup flag, and only the kernel can say which: it
+/// checks the CPU against its cpuset, which this thread's affinity (a pinned
+/// worker's single core) does not show. So `retry_unpinned` sets the ring up
+/// again with the same flags and no SQ CPU:
+/// - it succeeds: the CPU was refused, and the message names it;
+/// - it fails with `EINVAL`: a setup flag was refused, and the original error
+///   gets the generic message;
+/// - it fails otherwise: the original `EINVAL` gets the generic message and a
+///   note that the SQ CPU may be the cause. On Linux 6.14+ the refused ring's
+///   memlock charge is released asynchronously, so a probe built right after
+///   it can fail with `ENOMEM` under a fitted `RLIMIT_MEMLOCK`, and that is
+///   not reported as a memlock failure.
+fn ring_setup_error<R>(
+    err: io::Error,
+    sq_cpu: Option<u32>,
+    config: &Config,
+    retry_unpinned: impl FnOnce() -> io::Result<R>,
+) -> Error {
+    let Some(cpu) = sq_cpu.filter(|_| err.raw_os_error() == Some(libc::EINVAL)) else {
+        return Error::ring_setup(err);
+    };
+    let source = crate::error::sq_cpu_source(config.sqpoll_cpu.as_ref(), config.worker_index);
+    match retry_unpinned() {
+        Ok(probe) => {
+            drop(probe);
+            let reason = crate::error::sq_cpu_reason(cpu, &crate::error::SqCpuProbe::read());
+            Error::RingSetup(crate::error::describe_sq_cpu_refused(
+                &err,
+                cpu,
+                config.worker_index,
+                &source,
+                &reason,
+            ))
+        }
+        Err(retry_err) if retry_err.raw_os_error() == Some(libc::EINVAL) => Error::ring_setup(err),
+        Err(retry_err) => match Error::ring_setup(err) {
+            Error::RingSetup(msg) => Error::RingSetup(format!(
+                "{msg} {}",
+                crate::error::describe_sq_cpu_unresolved(
+                    cpu,
+                    config.worker_index,
+                    &source,
+                    &retry_err
+                )
+            )),
+            other => other,
+        },
+    }
+}
+
 /// Whether an `io_uring_enter` failure is temporary, so the caller carries on
 /// and reaps. `EBUSY`: the CQ is backed up (overflow list non-empty), and
 /// reaping frees it. `EAGAIN`: the kernel could not allocate a request for the
@@ -364,31 +417,31 @@ impl Engine for UringEngine {
     /// `io_uring_setup(2)` names the subsystem and, for `EPERM`, the
     /// `kernel.io_uring_disabled` sysctl or seccomp profile behind it.
     fn setup(config: &Config) -> Result<Self, Error> {
-        let cq_entries = config.cq_entries;
+        let build = |sq_cpu: Option<u32>| {
+            let mut builder = IoUring::<squeue::Entry128, cqueue::Entry32>::builder();
+            builder.setup_cqsize(config.cq_entries);
+            builder.setup_single_issuer();
 
-        let mut builder = IoUring::<squeue::Entry128, cqueue::Entry32>::builder();
-        builder.setup_cqsize(cq_entries);
-        builder.setup_single_issuer();
-
-        if config.sqpoll {
-            builder.setup_sqpoll(config.sqpoll_idle_ms);
-            if let Some(cpu) = config.sqpoll_cpu {
-                builder.setup_sqpoll_cpu(cpu);
+            if config.sqpoll {
+                builder.setup_sqpoll(config.sqpoll_idle_ms);
+                if let Some(cpu) = sq_cpu {
+                    builder.setup_sqpoll_cpu(cpu);
+                }
+                // The kernel refuses COOP_TASKRUN, TASKRUN_FLAG and
+                // DEFER_TASKRUN with SQPOLL (EINVAL). The SQ thread issues the
+                // requests, so their task_work runs on it, not on this worker.
+            } else {
+                builder.setup_coop_taskrun();
+                builder.setup_defer_taskrun();
+                if config.defer_recv_arm {
+                    builder.setup_taskrun_flag();
+                }
             }
-            // The kernel refuses COOP_TASKRUN, TASKRUN_FLAG and
-            // DEFER_TASKRUN with SQPOLL (EINVAL). The SQ thread issues the
-            // requests, so their task_work runs on it, not on this worker.
-        } else {
-            builder.setup_coop_taskrun();
-            builder.setup_defer_taskrun();
-            if config.defer_recv_arm {
-                builder.setup_taskrun_flag();
-            }
-        }
+            builder.build(config.sq_entries)
+        };
 
-        let ring = builder
-            .build(config.sq_entries)
-            .map_err(Error::ring_setup)?;
+        let ring = build(config.sq_thread_cpu)
+            .map_err(|e| ring_setup_error(e, config.sq_thread_cpu, config, || build(None)))?;
 
         // Applies to the io-wq of the thread that issues requests: the
         // calling thread, which is why the ring is set up on its worker's
@@ -1569,6 +1622,153 @@ mod sq_room_tests {
             exercised > 0,
             "the SQ thread consumed every round's NOPs before the pair push"
         );
+    }
+}
+
+#[cfg(test)]
+mod sq_cpu_refusal_tests {
+    use super::*;
+    use crate::config::{ConfigBuilder, SqpollCpus};
+
+    fn einval() -> io::Error {
+        io::Error::from_raw_os_error(libc::EINVAL)
+    }
+
+    /// `UringEngine::setup`, retried for up to 5 s while it fails for
+    /// earlier rings' memlock charge (#589).
+    #[cfg(uring_engine)]
+    fn setup_retrying_memlock(config: &Config) -> Result<UringEngine, Error> {
+        for _ in 0..50 {
+            match UringEngine::setup(config) {
+                Err(e) if crate::backend::uring::ring::is_memlock_enomem(&e) => {
+                    std::thread::sleep(std::time::Duration::from_millis(100))
+                }
+                result => return result,
+            }
+        }
+        UringEngine::setup(config)
+    }
+
+    fn config() -> Config {
+        let mut config = ConfigBuilder::new()
+            .workers(1)
+            .sqpoll(true)
+            .sqpoll_cpu(5)
+            .build()
+            .unwrap();
+        config.worker_index = 2;
+        config
+    }
+
+    #[test]
+    fn an_einval_that_an_unpinned_retry_avoids_names_the_cpu() {
+        let err = ring_setup_error(einval(), Some(7), &config(), || Ok(()));
+        let text = err.to_string();
+        assert!(text.contains("worker 2's SQPOLL thread on CPU 7"), "{text}");
+        assert!(text.contains("sqpoll_cpu 5 + worker 2"), "{text}");
+    }
+
+    #[test]
+    fn an_einval_the_unpinned_retry_also_gets_is_the_generic_error() {
+        let mut retried = false;
+        let err = ring_setup_error(einval(), Some(7), &config(), || {
+            retried = true;
+            Err::<(), _>(einval())
+        });
+        assert!(retried);
+        let text = err.to_string();
+        assert!(!text.contains("SQPOLL thread"), "{text}");
+        assert!(text.contains("EINVAL"), "{text}");
+    }
+
+    #[test]
+    fn a_retry_that_fails_with_einval_too_gets_the_generic_error() {
+        let err = ring_setup_error(einval(), Some(7), &config(), || Err::<(), _>(einval()));
+        let text = err.to_string();
+        assert!(!text.contains("CPU 7"), "{text}");
+        assert!(text.contains("(EINVAL)"), "{text}");
+    }
+
+    #[test]
+    fn a_retry_that_fails_with_enomem_keeps_the_einval_and_names_the_cpu() {
+        let err = ring_setup_error(einval(), Some(7), &config(), || {
+            Err::<(), _>(io::Error::from_raw_os_error(libc::ENOMEM))
+        });
+        let text = err.to_string();
+        assert!(
+            !crate::backend::uring::ring::is_memlock_enomem(&err),
+            "{text}"
+        );
+        assert!(text.contains("(EINVAL)"), "{text}");
+        assert!(text.contains("Worker 2's SQPOLL CPU 7"), "{text}");
+        assert!(text.contains("sqpoll_cpu 5 + worker 2"), "{text}");
+        assert!(text.contains("may be the cause"), "{text}");
+    }
+
+    #[test]
+    fn other_errors_and_unpinned_rings_are_not_retried() {
+        let no_retry = || -> io::Result<()> { panic!("retried") };
+        let err = ring_setup_error(
+            io::Error::from_raw_os_error(libc::EPERM),
+            Some(7),
+            &config(),
+            no_retry,
+        );
+        assert!(!err.to_string().contains("SQPOLL thread"), "{err}");
+        let err = ring_setup_error(einval(), None, &config(), no_retry);
+        assert!(!err.to_string().contains("SQPOLL thread"), "{err}");
+    }
+
+    /// On a real kernel: a CQ smaller than the SQ (which `build()` refuses,
+    /// so it is set here directly) makes `io_uring_setup` fail with `EINVAL`
+    /// whatever the SQ CPU, and the error must not blame the CPU.
+    #[cfg(uring_engine)]
+    #[test]
+    fn a_ring_the_kernel_refuses_for_another_reason_does_not_blame_the_cpu() {
+        let mut config = config();
+        config.sq_entries = 64;
+        config.cq_entries = 32;
+        config.sqpoll_cpu = Some(SqpollCpus::Base(0));
+        config.sq_thread_cpu = Some(0);
+        let err = setup_retrying_memlock(&config)
+            .err()
+            .expect("setup refused");
+        let text = err.to_string();
+        assert!(text.contains("EINVAL"), "{text}");
+        assert!(!text.contains("SQPOLL thread"), "{text}");
+    }
+
+    /// On a real kernel, from a thread pinned to CPU 0: a CPU far beyond the
+    /// machine is reported as the CPU, whatever this thread's affinity.
+    #[cfg(uring_engine)]
+    #[test]
+    fn a_refused_cpu_is_named_from_a_pinned_thread() {
+        std::thread::spawn(|| {
+            // Pin to the first CPU this thread may run on.
+            unsafe {
+                let size = std::mem::size_of::<libc::cpu_set_t>();
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                assert_eq!(libc::sched_getaffinity(0, size, &mut set), 0);
+                let first = (0..8 * size)
+                    .find(|&c| libc::CPU_ISSET(c, &set))
+                    .expect("an allowed CPU");
+                let mut one: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(first, &mut one);
+                assert_eq!(libc::sched_setaffinity(0, size, &one), 0);
+            }
+            let mut config = config();
+            config.sq_entries = 64;
+            config.cq_entries = 128;
+            config.sq_thread_cpu = Some(1 << 20);
+            let err = setup_retrying_memlock(&config)
+                .err()
+                .expect("setup refused");
+            let text = err.to_string();
+            assert!(text.contains("SQPOLL thread on CPU 1048576"), "{text}");
+            assert!(text.contains("beyond"), "{text}");
+        })
+        .join()
+        .unwrap();
     }
 }
 

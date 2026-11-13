@@ -39,7 +39,14 @@ pub enum Error {
     ///   `SystemCallFilter=`). The message says which, based on the sysctl.
     /// - `ENOSYS`: kernel built without io_uring.
     /// - `EINVAL`: kernel older than 6.1 rejecting a required setup flag
-    ///   (`DEFER_TASKRUN` and `SendMsgZc` are 6.1 features).
+    ///   (`DEFER_TASKRUN` and `SendMsgZc` are 6.1 features), or, with
+    ///   [`ConfigBuilder::sqpoll_cpu`](crate::ConfigBuilder::sqpoll_cpu) or
+    ///   [`sqpoll_cpus`](crate::ConfigBuilder::sqpoll_cpus), a worker's SQPOLL
+    ///   CPU the kernel refuses: at or beyond its CPU count, offline, or, from
+    ///   Linux 6.12 and in the stable series from 6.11.2, 6.6.54 and 6.1.113,
+    ///   outside the process's cpuset. After an `EINVAL` on a ring with an SQ
+    ///   CPU, ringline sets the ring up once more without the CPU; the message
+    ///   names the CPU and the worker when that succeeds.
     ///
     /// The backend is chosen at build time by `build.rs` (Linux 6.1+ host
     /// gets io_uring); the only opt-out is the `force-mio` cargo feature,
@@ -348,6 +355,123 @@ impl Error {
     pub(crate) fn ring_setup_with_probe(err: io::Error, probe: &RingSetupProbe) -> Self {
         Error::RingSetup(describe_ring_setup_failure(&err, probe))
     }
+}
+
+/// What ringline can read about the machine's CPUs, to say why the kernel
+/// refused an SQPOLL thread's CPU. `None` in a field means it could not be
+/// read.
+#[cfg(any(has_io_uring, test))]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SqCpuProbe {
+    /// `sysconf(_SC_NPROCESSORS_CONF)`.
+    pub(crate) configured: Option<usize>,
+    /// `/sys/devices/system/cpu/online`, e.g. `0-3,6`.
+    pub(crate) online: Option<String>,
+}
+
+#[cfg(has_io_uring)]
+impl SqCpuProbe {
+    pub(crate) fn read() -> Self {
+        let configured = match unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) } {
+            n if n > 0 => Some(n as usize),
+            _ => None,
+        };
+        let online = std::fs::read_to_string("/sys/devices/system/cpu/online").ok();
+        Self { configured, online }
+    }
+}
+
+/// Whether a kernel CPU list (`0-3,6`) holds `cpu`; `None` if it does not
+/// parse.
+#[cfg(any(has_io_uring, test))]
+fn cpu_list_contains(list: &str, cpu: u32) -> Option<bool> {
+    let mut found = false;
+    for part in list.trim().split(',').filter(|p| !p.is_empty()) {
+        let (lo, hi) = match part.split_once('-') {
+            Some((lo, hi)) => (lo.parse::<u32>().ok()?, hi.parse::<u32>().ok()?),
+            None => {
+                let c = part.parse::<u32>().ok()?;
+                (c, c)
+            }
+        };
+        found |= (lo..=hi).contains(&cpu);
+    }
+    Some(found)
+}
+
+/// Why the kernel refused `cpu` for an SQ thread, once an unpinned retry has
+/// shown the CPU was the cause. The kernel refuses a CPU at or beyond
+/// `nr_cpu_ids` or offline, and from Linux 6.12, and in the stable series
+/// from 6.11.2, 6.6.54 and 6.1.113, one outside the caller's cpuset
+/// (`io_sq_offload_create`). The cpuset is not read here; it is the reason
+/// given when the other two do not apply.
+#[cfg(any(has_io_uring, test))]
+pub(crate) fn sq_cpu_reason(cpu: u32, probe: &SqCpuProbe) -> String {
+    if let Some(n) = probe.configured
+        && cpu as usize >= n
+    {
+        return format!("it is beyond the machine's {n} CPUs (0 to {})", n - 1);
+    }
+    if let Some(online) = probe.online.as_deref()
+        && cpu_list_contains(online, cpu) == Some(false)
+    {
+        return format!("it is offline (online: {})", online.trim());
+    }
+    "the kernel refused it; it is online, so it is most likely outside this \
+     process's cpuset, which Linux 6.12, and the stable series from 6.11.2, \
+     6.6.54 and 6.1.113, refuse"
+        .to_owned()
+}
+
+/// Where worker `worker`'s SQPOLL CPU came from, for an error message.
+#[cfg(any(has_io_uring, test))]
+pub(crate) fn sq_cpu_source(spec: Option<&crate::config::SqpollCpus>, worker: usize) -> String {
+    match spec {
+        Some(crate::config::SqpollCpus::Base(base)) => {
+            format!("ConfigBuilder::sqpoll_cpu {base} + worker {worker}")
+        }
+        Some(crate::config::SqpollCpus::List(_)) => {
+            format!("ConfigBuilder::sqpoll_cpus[{worker}]")
+        }
+        None => "no SQPOLL CPU configured".to_owned(),
+    }
+}
+
+/// The message for an `EINVAL` from `io_uring_setup(2)` on worker `worker`'s
+/// ring, whose SQPOLL thread is pinned to `cpu`, when the kernel refused that
+/// CPU and `problem` says why.
+#[cfg(any(has_io_uring, test))]
+pub(crate) fn describe_sq_cpu_refused(
+    err: &io::Error,
+    cpu: u32,
+    worker: usize,
+    source: &str,
+    problem: &str,
+) -> String {
+    format!(
+        "io_uring_setup(2): {err} (EINVAL) for worker {worker}'s SQPOLL thread on CPU {cpu} \
+         ({source}): {problem}. The ring sets up without that CPU, so choose SQPOLL \
+         CPUs that are online and in this process's cpuset"
+    )
+}
+
+/// The note added to the generic message for an `EINVAL` on worker
+/// `worker`'s ring, whose SQPOLL thread was pinned to `cpu`, when setting the
+/// ring up without that CPU failed with `retry_err` (not `EINVAL`), so it is
+/// unknown whether the kernel refused the CPU. It names the errno without
+/// parentheses, so the message is not read as an `ENOMEM` from setup.
+#[cfg(any(has_io_uring, test))]
+pub(crate) fn describe_sq_cpu_unresolved(
+    cpu: u32,
+    worker: usize,
+    source: &str,
+    retry_err: &io::Error,
+) -> String {
+    let errno = errno_name(retry_err).map_or_else(String::new, |n| format!("{n}: "));
+    format!(
+        "Worker {worker}'s SQPOLL CPU {cpu} ({source}) may be the cause: setting the \
+         ring up without it failed with {errno}{retry_err}"
+    )
 }
 
 /// The process's `RLIMIT_MEMLOCK`, in bytes. io_uring charges registered
@@ -682,6 +806,59 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("EPERM"), "{text}");
+    }
+
+    fn sq_probe(configured: usize, online: &str) -> SqCpuProbe {
+        SqCpuProbe {
+            configured: Some(configured),
+            online: Some(online.to_owned()),
+        }
+    }
+
+    #[test]
+    fn sq_cpu_refusal_names_the_worker_the_cpu_and_the_knob() {
+        let err = io::Error::from_raw_os_error(libc::EINVAL);
+        let source = sq_cpu_source(Some(&crate::config::SqpollCpus::Base(6)), 3);
+        let text = describe_sq_cpu_refused(&err, 9, 3, &source, "it is offline");
+        assert!(text.contains("worker 3's SQPOLL thread on CPU 9"), "{text}");
+        assert!(text.contains("sqpoll_cpu 6 + worker 3"), "{text}");
+        assert!(text.contains("it is offline"), "{text}");
+        let source = sq_cpu_source(Some(&crate::config::SqpollCpus::List(vec![1, 9])), 1);
+        assert_eq!(source, "ConfigBuilder::sqpoll_cpus[1]");
+    }
+
+    #[test]
+    fn a_refused_cpu_past_the_configured_count_says_so() {
+        let why = sq_cpu_reason(4, &sq_probe(4, "0-3"));
+        assert!(why.contains("beyond the machine's 4 CPUs"), "{why}");
+    }
+
+    #[test]
+    fn an_unresolved_sq_cpu_note_names_the_retry_errno_without_parentheses() {
+        let note =
+            describe_sq_cpu_unresolved(7, 2, "src", &io::Error::from_raw_os_error(libc::ENOMEM));
+        assert!(
+            note.contains("Worker 2's SQPOLL CPU 7 (src) may be the cause"),
+            "{note}"
+        );
+        assert!(note.contains("failed with ENOMEM: "), "{note}");
+        assert!(!note.contains(" (ENOMEM)"), "{note}");
+    }
+
+    #[test]
+    fn a_refused_offline_cpu_says_so() {
+        let why = sq_cpu_reason(2, &sq_probe(8, "0-1,3-7\n"));
+        assert!(why.contains("offline (online: 0-1,3-7)"), "{why}");
+    }
+
+    #[test]
+    fn a_refused_cpu_that_is_present_and_online_points_at_the_cpuset() {
+        for (cpu, online) in [(5, "0-1,3-7\n"), (6, "0,6"), (1, "garbage")] {
+            let why = sq_cpu_reason(cpu, &sq_probe(8, online));
+            assert!(why.contains("cpuset"), "{cpu} {online}: {why}");
+        }
+        let why = sq_cpu_reason(2, &SqCpuProbe::default());
+        assert!(why.contains("cpuset"), "{why}");
     }
 
     #[test]
