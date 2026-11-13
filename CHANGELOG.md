@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - io_uring: `ConfigBuilder::sqpoll_cpus(&[u32])` pins worker `i`'s SQPOLL
   thread to logical CPU `cpus[i]` (#834). Entries may repeat, so several SQ
   threads can share one CPU. With `sqpoll(true)`, `launch` fails with
-  `Error::RingSetup` when the list's length is not the worker count.
+  `Error::RingSetup`, on either backend, when the list's length is not the
+  worker count.
   `ConfigBuilder::sqpoll_cpu(c)` pins worker `i`'s SQ thread to logical CPU
   `c + i`. Of the two, the last one called applies. When the kernel refuses a
   worker's SQ CPU with `EINVAL`, `launch` fails with an `Error::RingSetup`
