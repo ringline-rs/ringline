@@ -244,19 +244,40 @@ fn a_silent_peer_holds_its_slot_until_the_handshake_timeout() {
 }
 
 /// The timeout applies to the handshake only: an established connection
-/// left idle for longer than it stays open.
+/// left idle for longer than it stays open. The timeout is 2 s so that a slow
+/// runner completes the handshake well within it (#914); the idle is longer
+/// than the timeout, so a deadline still armed after the handshake would
+/// close the connection before the second echo.
 #[test]
 fn an_established_connection_outlives_the_handshake_timeout() {
     let _serial = serial();
-    let server = Server::start(Duration::from_millis(200), 1000);
+    let timeout = Duration::from_secs(2);
+    let server = Server::start(timeout, 1000);
     let result = (|| {
         let (mut tls_conn, mut tcp) = tls_client(server.addr, &server.certs)?;
-        echo(&mut tls_conn, &mut tcp, b"first")?;
-        std::thread::sleep(Duration::from_millis(600));
+        let started = std::time::Instant::now();
+        tls_conn
+            .complete_io(&mut tcp)
+            .map_err(|e| step_error("the handshake", e))?;
+        let handshake = started.elapsed();
+        if handshake >= timeout {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("the handshake took {handshake:?}, not within the {timeout:?} timeout"),
+            ));
+        }
+        echo(&mut tls_conn, &mut tcp, b"first").map_err(|e| step_error("the first echo", e))?;
+        std::thread::sleep(timeout + Duration::from_millis(500));
         echo(&mut tls_conn, &mut tcp, b"second")
+            .map_err(|e| step_error("the echo after idling past the timeout", e))
     })();
     server.stop();
-    result.expect("an echo after the connection idled past the handshake timeout");
+    result.expect("an established connection outlives the handshake timeout");
+}
+
+/// `error`, prefixed with the step of the test that failed.
+fn step_error(step: &str, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("{step}: {error}"))
 }
 
 /// Where `Dial` connects.
