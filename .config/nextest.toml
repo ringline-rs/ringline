@@ -28,6 +28,12 @@ threads-required = "num-test-threads"
 filter = 'binary(memlock_fit)'
 threads-required = "num-test-threads"
 
+# sqpoll_cpu_memlock lowers RLIMIT_MEMLOCK to 3 MiB, about half a ring above
+# one ring's charge, against the same per-user total.
+[[profile.default.overrides]]
+filter = 'binary(sqpoll_cpu_memlock)'
+threads-required = "num-test-threads"
+
 # These hold zero-copy sends to a peer that does not read. From Linux 6.15 each
 # charges its pages to RLIMIT_MEMLOCK until the peer has them, several MiB per
 # peer once the socket buffers fill, and ring setup in a test running alongside

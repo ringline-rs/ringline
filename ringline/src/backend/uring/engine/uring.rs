@@ -45,10 +45,11 @@ pub(crate) const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// - it fails with `EINVAL`: a setup flag was refused, and the original error
 ///   gets the generic message;
 /// - it fails otherwise: the original `EINVAL` gets the generic message and a
-///   note that the SQ CPU may be the cause. On Linux 6.14+ the refused ring's
-///   memlock charge is released asynchronously, so a probe built right after
-///   it can fail with `ENOMEM` under a fitted `RLIMIT_MEMLOCK`, and that is
-///   not reported as a memlock failure.
+///   note that the SQ CPU may be the cause, and is not reported as a memlock
+///   failure. On Linux 6.14+ the refused ring's memlock charge can still be
+///   held when the retry runs, so `UringEngine::setup` makes a retry that `ENOMEM`
+///   refused again at `probe_sizes`; this case is left for when that fails
+///   too.
 fn ring_setup_error<R>(
     err: io::Error,
     sq_cpu: Option<u32>,
@@ -85,6 +86,20 @@ fn ring_setup_error<R>(
             other => other,
         },
     }
+}
+
+/// SQ and CQ sizes for an unpinned retry that `ENOMEM` refused at the ring's
+/// own sizes: both divided by the same power of two, until the CQ has at most
+/// 16 entries, and at least 1 each. The kernel checks the sizes before it
+/// charges the ring, so an `ENOMEM` at the ring's own sizes means they were
+/// accepted; the retry at these only shows whether the ring can be set up
+/// without the CPU.
+fn probe_sizes(sq_entries: u32, cq_entries: u32) -> (u32, u32) {
+    let mut shift = 0;
+    while cq_entries >> shift > 16 {
+        shift += 1;
+    }
+    ((sq_entries >> shift).max(1), (cq_entries >> shift).max(1))
 }
 
 /// Whether an `io_uring_enter` failure is temporary, so the caller carries on
@@ -423,9 +438,9 @@ impl Engine for UringEngine {
     /// `io_uring_setup(2)` names the subsystem and, for `EPERM`, the
     /// `kernel.io_uring_disabled` sysctl or seccomp profile behind it.
     fn setup(config: &Config) -> Result<Self, Error> {
-        let build = |sq_cpu: Option<u32>| {
+        let build = |sq_cpu: Option<u32>, sq_entries: u32, cq_entries: u32| {
             let mut builder = IoUring::<squeue::Entry128, cqueue::Entry32>::builder();
-            builder.setup_cqsize(config.cq_entries);
+            builder.setup_cqsize(cq_entries);
             builder.setup_single_issuer();
 
             if config.sqpoll {
@@ -443,11 +458,23 @@ impl Engine for UringEngine {
                     builder.setup_taskrun_flag();
                 }
             }
-            builder.build(config.sq_entries)
+            builder.build(sq_entries)
         };
 
-        let ring = build(config.sq_thread_cpu)
-            .map_err(|e| ring_setup_error(e, config.sq_thread_cpu, config, || build(None)))?;
+        // The unpinned retry first uses the ring's own sizes. On Linux 6.14+
+        // the refused ring's memlock charge can still be held when it runs,
+        // so under a limit with less than a ring of headroom it fails with
+        // ENOMEM; it is then made again at `probe_sizes`, which needs two
+        // pages of memlock.
+        let unpinned = || match build(None, config.sq_entries, config.cq_entries) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
+                let (sq, cq) = probe_sizes(config.sq_entries, config.cq_entries);
+                build(None, sq, cq)
+            }
+            other => other,
+        };
+        let ring = build(config.sq_thread_cpu, config.sq_entries, config.cq_entries)
+            .map_err(|e| ring_setup_error(e, config.sq_thread_cpu, config, unpinned))?;
 
         // Applies to the io-wq of the thread that issues requests: the
         // calling thread, which is why the ring is set up on its worker's
@@ -1652,7 +1679,6 @@ mod sq_cpu_refusal_tests {
 
     /// `UringEngine::setup`, retried for up to 5 s while it fails for
     /// earlier rings' memlock charge (#589).
-    #[cfg(uring_engine)]
     fn setup_retrying_memlock(config: &Config) -> Result<UringEngine, Error> {
         for _ in 0..50 {
             match UringEngine::setup(config) {
@@ -1685,21 +1711,13 @@ mod sq_cpu_refusal_tests {
     }
 
     #[test]
-    fn an_einval_the_unpinned_retry_also_gets_is_the_generic_error() {
+    fn a_retry_that_fails_with_einval_too_gets_the_generic_error() {
         let mut retried = false;
         let err = ring_setup_error(einval(), Some(7), &config(), || {
             retried = true;
             Err::<(), _>(einval())
         });
         assert!(retried);
-        let text = err.to_string();
-        assert!(!text.contains("SQPOLL thread"), "{text}");
-        assert!(text.contains("EINVAL"), "{text}");
-    }
-
-    #[test]
-    fn a_retry_that_fails_with_einval_too_gets_the_generic_error() {
-        let err = ring_setup_error(einval(), Some(7), &config(), || Err::<(), _>(einval()));
         let text = err.to_string();
         assert!(!text.contains("CPU 7"), "{text}");
         assert!(text.contains("(EINVAL)"), "{text}");
@@ -1722,6 +1740,17 @@ mod sq_cpu_refusal_tests {
     }
 
     #[test]
+    fn probe_sizes_shrink_both_by_one_factor() {
+        // The defaults: SQ 4096, CQ 65536.
+        assert_eq!(probe_sizes(4096, 65536), (1, 16));
+        assert_eq!(probe_sizes(64, 128), (8, 16));
+        // A CQ smaller than the SQ stays smaller.
+        assert_eq!(probe_sizes(64, 32), (32, 16));
+        // Already small: unchanged.
+        assert_eq!(probe_sizes(4, 8), (4, 8));
+    }
+
+    #[test]
     fn other_errors_and_unpinned_rings_are_not_retried() {
         let no_retry = || -> io::Result<()> { panic!("retried") };
         let err = ring_setup_error(
@@ -1738,7 +1767,6 @@ mod sq_cpu_refusal_tests {
     /// On a real kernel: a CQ smaller than the SQ (which `build()` refuses,
     /// so it is set here directly) makes `io_uring_setup` fail with `EINVAL`
     /// whatever the SQ CPU, and the error must not blame the CPU.
-    #[cfg(uring_engine)]
     #[test]
     fn a_ring_the_kernel_refuses_for_another_reason_does_not_blame_the_cpu() {
         let mut config = config();
@@ -1756,7 +1784,6 @@ mod sq_cpu_refusal_tests {
 
     /// On a real kernel, from a thread pinned to CPU 0: a CPU far beyond the
     /// machine is reported as the CPU, whatever this thread's affinity.
-    #[cfg(uring_engine)]
     #[test]
     fn a_refused_cpu_is_named_from_a_pinned_thread() {
         std::thread::spawn(|| {
