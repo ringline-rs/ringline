@@ -117,10 +117,11 @@ fn thread_alive(prefix: &str) -> bool {
 /// Waits until a thread whose name starts with `prefix` is inside open(2), or
 /// `limit` has passed. A FIFO open with no writer does not return, so once the
 /// thread is inside the call it stays there until the test opens the writer.
-/// On timeout, returns what the last poll read from each matching thread's
-/// `/proc/self/task/<tid>/syscall`.
+/// Returns the matching thread's `/proc/self/task/<tid>` directory. On
+/// timeout, returns each matching thread's `tid comm` with what the last poll
+/// read from its `/proc/self/task/<tid>/syscall`.
 #[cfg(not(has_io_uring))]
-fn wait_in_open(prefix: &str, limit: Duration) -> Result<(), String> {
+fn wait_in_open(prefix: &str, limit: Duration) -> Result<std::path::PathBuf, String> {
     // musl's open() makes the open syscall on archs that have it, of which
     // only x86_64 is built here; glibc's makes openat.
     #[cfg(target_arch = "x86_64")]
@@ -129,19 +130,26 @@ fn wait_in_open(prefix: &str, limit: Duration) -> Result<(), String> {
     let open_calls = [libc::SYS_openat];
     let deadline = Instant::now() + limit;
     loop {
-        let reads: Vec<std::io::Result<String>> = std::fs::read_dir("/proc/self/task")
-            .expect("read /proc/self/task")
-            .filter_map(|t| t.ok())
-            .filter(|t| {
-                std::fs::read_to_string(t.path().join("comm"))
-                    .is_ok_and(|name| name.trim_end().starts_with(prefix))
-            })
-            .map(|t| std::fs::read_to_string(t.path().join("syscall")))
-            .collect();
+        let reads: Vec<(std::path::PathBuf, String, std::io::Result<String>)> =
+            std::fs::read_dir("/proc/self/task")
+                .expect("read /proc/self/task")
+                .filter_map(|t| t.ok())
+                .filter_map(|t| {
+                    let name = std::fs::read_to_string(t.path().join("comm")).ok()?;
+                    let name = name.trim_end();
+                    name.starts_with(prefix).then(|| {
+                        (
+                            t.path(),
+                            format!("{} {name}", t.file_name().to_string_lossy()),
+                            std::fs::read_to_string(t.path().join("syscall")),
+                        )
+                    })
+                })
+                .collect();
         // While the thread is blocked in a syscall the first field is its
         // number; blocked outside one, `-1`; on a CPU, the file reads
         // `running`.
-        let in_open = reads.iter().any(|read| {
+        let in_open = reads.iter().find(|(_, _, read)| {
             read.as_ref().is_ok_and(|s| {
                 s.split_whitespace()
                     .next()
@@ -149,14 +157,51 @@ fn wait_in_open(prefix: &str, limit: Duration) -> Result<(), String> {
                     .is_some_and(|nr| open_calls.contains(&nr))
             })
         });
-        if in_open {
-            return Ok(());
+        if let Some((dir, _, _)) = in_open {
+            return Ok(dir.clone());
         }
         if Instant::now() >= deadline {
-            return Err(format!("{reads:?}"));
+            let last: Vec<_> = reads
+                .iter()
+                .map(|(_, thread, read)| (thread, read))
+                .collect();
+            return Err(format!("{last:?}"));
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// The thread at `dir` (`/proc/self/task/<tid>`) as `tid comm: syscall line
+/// [wchan]`, for a failure message. `wchan` names the kernel function a
+/// blocked thread waits in; a FIFO open waiting for a writer waits in
+/// fs/pipe.c.
+#[cfg(not(has_io_uring))]
+fn thread_state(dir: &std::path::Path) -> String {
+    let read = |f: &str| {
+        std::fs::read_to_string(dir.join(f))
+            .map(|s| s.trim_end().to_owned())
+            .unwrap_or_else(|e| format!("<{e}>"))
+    };
+    format!(
+        "{} {}: {} [{}]",
+        dir.file_name().unwrap_or_default().to_string_lossy(),
+        read("comm"),
+        read("syscall"),
+        read("wchan")
+    )
+}
+
+/// Every thread of this process as [`thread_state`] gives it, for a failure
+/// message.
+#[cfg(not(has_io_uring))]
+fn all_threads() -> String {
+    let mut out: Vec<String> = std::fs::read_dir("/proc/self/task")
+        .expect("read /proc/self/task")
+        .filter_map(|t| t.ok())
+        .map(|t| thread_state(&t.path()))
+        .collect();
+    out.sort();
+    out.join("; ")
 }
 
 /// Whether `fd` is open, checked without opening anything.
@@ -369,6 +414,12 @@ fn a_running_worker_keeps_its_wake_fd_open() {
 
 #[cfg(not(has_io_uring))]
 static DISK_OPEN_ISSUED: AtomicBool = AtomicBool::new(false);
+/// What the FIFO open's future resolved with, if the task was polled with its
+/// result before the worker exited. Stays `None` if the open returned after
+/// the worker's last poll of ready tasks (the response then reaches no task)
+/// or never returned (#893).
+#[cfg(not(has_io_uring))]
+static DISK_OPEN_RESULT: Mutex<Option<String>> = Mutex::new(None);
 #[cfg(not(has_io_uring))]
 static FIFO_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
@@ -389,7 +440,9 @@ impl AsyncEventHandler for FifoOpen {
             let open =
                 ringline::fs::open(path, ringline::fs::OpenFlags::READ, 0).expect("fs::open");
             DISK_OPEN_ISSUED.store(true, Ordering::Release);
-            let _ = open.await;
+            let result = open.await;
+            *DISK_OPEN_RESULT.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(format!("{:?}", result.map(|_| "opened")));
         }))
     }
 
@@ -439,18 +492,29 @@ fn a_late_disk_io_wake_does_not_write_into_a_reused_fd() {
         DISK_OPEN_ISSUED.load(Ordering::Acquire),
         "fs::open never issued"
     );
-    if let Err(last) = wait_in_open("rl-disk-", Duration::from_secs(30)) {
-        panic!("the disk-I/O thread never blocked in open(2); last syscall reads: {last}");
-    }
+    let matched_dir = match wait_in_open("rl-disk-", Duration::from_secs(30)) {
+        Ok(dir) => dir,
+        Err(last) => {
+            panic!("the disk-I/O thread never blocked in open(2); last syscall reads: {last}")
+        }
+    };
+    let matched = thread_state(&matched_dir);
 
     let before = open_fds();
+    let before_drop = thread_state(&matched_dir);
     drop(runtime);
     for h in handles {
         h.join().expect("worker panicked").expect("worker error");
     }
     assert!(
         thread_alive("rl-disk-"),
-        "the disk-I/O thread exited before the open completed; the test proves nothing"
+        "the disk-I/O thread exited before the open completed; the test proves nothing. \
+         Matched in open(2): {matched}. Before the drop: {before_drop}. \
+         The open resolved before the worker exited: {:?}. FIFO still exists: {}. \
+         Threads now: {}",
+        DISK_OPEN_RESULT.lock().unwrap_or_else(|e| e.into_inner()),
+        fifo.exists(),
+        all_threads()
     );
     let freed: Vec<RawFd> = before.iter().copied().filter(|&fd| !is_open(fd)).collect();
 
