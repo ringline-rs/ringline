@@ -478,7 +478,7 @@ impl Default for Config {
             send_zc_threshold: 4096,
             send_slab_slots: 512,
             flush_interval_us: 100,
-            tick_timeout_us: 1000,
+            tick_timeout_us: 10_000,
             tls: None,
             listener_tls: Vec::new(),
             tls_client: None,
@@ -1243,10 +1243,21 @@ impl ConfigBuilder {
 
     /// Set the tick interval in microseconds: the longest a worker waits for
     /// I/O before calling [`on_tick`](crate::AsyncEventHandler::on_tick)
-    /// again (default 1000). 0 = no tick: the wait ends only at a completion
-    /// or the worker's earliest timer, TLS handshake or close deadline.
-    /// Timers fire at their own deadlines whatever this is. On mio the wait
-    /// is at most 10 ms, whatever this is.
+    /// again (default 10,000, 10 ms). 0 = no tick: the wait ends only at a
+    /// completion or the worker's earliest timer, TLS handshake or close
+    /// deadline. Timers fire at their own deadlines whatever this is. On mio
+    /// this setting has no effect: the wait is at most 10 ms.
+    ///
+    /// On io_uring the tick also sets how often a worker publishes its
+    /// connection count to the other workers, which merged accept mode reads
+    /// to place and park connections. On an idle worker it sets how long work
+    /// deferred by a full submission queue or a full peer channel waits for
+    /// its retry: one tick for a send, the eventfd read that carries
+    /// cross-thread wakes, a hangup poll or a park hand-off, and four ticks
+    /// for a Close or `shutdown`. A park drain lasts 64 loop iterations, so on
+    /// an idle worker 64 ticks. An idle worker wakes once per tick: at 1 ms
+    /// one pinned worker used 3.5% of a core, and at 10 ms 0.5% (Linux 6.12
+    /// VM).
     pub fn tick_timeout_us(mut self, us: u64) -> Self {
         self.config.tick_timeout_us = us;
         self
