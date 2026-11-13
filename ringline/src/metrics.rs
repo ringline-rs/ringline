@@ -318,6 +318,12 @@ pub mod bytes {
 /// Counter slot indices for ring utilization metrics.
 pub mod ring {
     pub const CQE_PROCESSED: usize = 0;
+    /// An SQE push the ring refused: the submit that frees room returned an
+    /// error (for example `EBUSY` while the CQ overflow list is non-empty),
+    /// or the SQ was still full after it. Sends and receive arms retry a
+    /// refused push every iteration (#830), so each retry that is refused
+    /// again counts once more. Also counts a provided-buffer-ring
+    /// unregistration that failed at worker exit.
     pub const SQE_SUBMIT_FAILURES: usize = 1;
     pub const CLOSE_SUBMIT_FAILURES: usize = 2;
     pub const RECV_ARM_FAILURES: usize = 3;

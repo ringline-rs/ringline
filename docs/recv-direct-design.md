@@ -375,7 +375,11 @@ counted (`ring::RECV_ARM_FAILURES`). A poll goes on
 `Driver::hangup_poll_retries`, and `retry_hangup_polls`, which runs before
 each wait for completions, submits it again while no park is pending. A
 peek goes on `hangup_rechecks`, and `recheck_hangups` submits it once
-nothing is buffered, armed or parking. Until the poll is armed, a FIN or
+nothing is buffered, armed or parking. A receive that cannot be pushed is
+counted the same way and closes nothing (#830): its buffer goes back to the
+accumulator or the TLS engine, the reader stays parked, and the connection
+goes on `Driver::recv_arm_retries`, which `retry_recv_arms` arms after each
+wait. The worker does not block while an entry is owed. Until the poll is armed, a FIN or
 reset is seen by the next receive to complete, which a read arms when it
 parks. A FIN closes nothing: a connection whose task only sends stays open
 until the task ends, and a peer that closed fully answers the next send with

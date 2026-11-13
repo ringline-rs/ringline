@@ -179,6 +179,11 @@ pub struct ConnectionState {
     /// while set, the connection has an entry on `Driver::hangup_poll_retries`.
     #[cfg(has_io_uring)]
     pub hangup_poll_retry: bool,
+    /// Set when the ring refused the connection's receive and cleared when
+    /// `retry_recv_arms` takes the entry; while set, the connection has an
+    /// entry on `Driver::recv_arm_retries`.
+    #[cfg(has_io_uring)]
+    pub recv_arm_retry: bool,
     /// A TLS connection's hangup poll completed: its peer sent a FIN or a
     /// reset, or the socket has an error. Its receive is then re-armed after
     /// every completion until the end is read, whether or not a read parks.
@@ -234,6 +239,8 @@ impl ConnectionState {
             hangup_recheck_due: false,
             #[cfg(has_io_uring)]
             hangup_poll_retry: false,
+            #[cfg(has_io_uring)]
+            recv_arm_retry: false,
             #[cfg(has_io_uring)]
             hangup_seen: false,
             #[cfg(has_io_uring)]
@@ -309,6 +316,7 @@ impl ConnectionState {
             self.hangup_recheck = false;
             self.hangup_recheck_due = false;
             self.hangup_poll_retry = false;
+            self.recv_arm_retry = false;
             self.hangup_seen = false;
             self.hangup_error = 0;
         }
@@ -575,6 +583,16 @@ mod tests {
         cs.hangup_poll_retry = true;
         cs.deactivate();
         assert!(!cs.hangup_poll_retry);
+    }
+
+    #[cfg(has_io_uring)]
+    #[test]
+    fn deactivate_clears_an_owed_recv_arm_retry() {
+        let mut cs = ConnectionState::new();
+        cs.activate();
+        cs.recv_arm_retry = true;
+        cs.deactivate();
+        assert!(!cs.recv_arm_retry);
     }
 
     #[test]
