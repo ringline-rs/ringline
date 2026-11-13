@@ -400,6 +400,19 @@ impl Driver {
 /// (`AsyncEventLoop::handle_send_backstop`).
 pub(crate) const SEND_BACKSTOP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// A worker's multishot accept on one merged listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceptArm {
+    /// No accept is armed: not yet, or the last one ended. The run loop arms
+    /// it (`AsyncEventLoop::arm_merged_accepts`).
+    Unarmed,
+    /// An accept is armed and has not ended.
+    Armed,
+    /// The accept ended with an error that means the listener cannot accept
+    /// again (shutdown took it out of the listening state); it is not re-armed.
+    Stopped,
+}
+
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
@@ -550,9 +563,17 @@ pub(crate) struct Driver {
     /// Goes true once `launch()` has called `listen(2)` on every merged socket.
     /// Arming an accept before that fails with `EINVAL`.
     pub(crate) merged_accept_live: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Whether this worker has already armed its multishot accepts, so the
-    /// arming runs once rather than on every loop iteration.
-    pub(crate) merged_accept_armed: bool,
+    /// The state of this worker's multishot accept on each merged listener,
+    /// indexed as `merged_listeners`.
+    pub(crate) merged_accept_arms: Vec<AcceptArm>,
+    /// After an accept ended with an error that a re-arm at once would meet
+    /// again (`AcceptErrorAction::Backoff`: a full fd table, no memory), no
+    /// unarmed listener is armed before this instant. It bounds the worker's
+    /// wait (`next_deadline`).
+    pub(crate) merged_accept_retry_at: Option<std::time::Instant>,
+    /// Test-only: how many multishot accepts this worker has pushed.
+    #[cfg(test)]
+    pub(crate) merged_accept_pushes: usize,
     /// This worker's index into `worker_loads` / `peer_accept`.
     pub(crate) worker_index: usize,
     /// Live connection count per worker, for accept-time placement.
@@ -1133,7 +1154,10 @@ impl Driver {
             accept_rx,
             merged_listeners: config.merged_listeners.clone(),
             merged_accept_live: config.merged_accept_live.clone(),
-            merged_accept_armed: false,
+            merged_accept_arms: vec![AcceptArm::Unarmed; config.merged_listeners.len()],
+            merged_accept_retry_at: None,
+            #[cfg(test)]
+            merged_accept_pushes: 0,
             worker_index: config.worker_index,
             worker_loads: config.worker_loads.clone(),
             worker_accepting: config.worker_accepting.clone(),
@@ -1422,8 +1446,9 @@ impl Driver {
     /// deadline at the front of the handshake queue (possibly a handshake
     /// that has since completed; the wait then ends early), the earliest
     /// close deadline (`close_notify_deadline`) of a connection still
-    /// waiting for its sends to drain, the next run of the send backstop, and
-    /// the earliest connect deadline. Takes `&mut self` to drop connect
+    /// waiting for its sends to drain, the next run of the send backstop, the
+    /// earliest connect deadline, and the end of a merged accept's backoff
+    /// (`merged_accept_retry_at`). Takes `&mut self` to drop connect
     /// deadlines that are no longer live.
     pub(crate) fn next_deadline(&mut self) -> Option<std::time::Instant> {
         let close = self
@@ -1439,10 +1464,27 @@ impl Driver {
             close,
             self.send_backstop_at,
             self.connect_deadlines.next_deadline(&self.connections),
+            self.merged_accept_retry_at,
         ]
         .into_iter()
         .flatten()
         .min()
+    }
+
+    /// Whether a merged listener's accept is unarmed and may be armed now:
+    /// the listeners are listening, no backoff is pending, and shutdown has
+    /// not begun. The run loop does not block while this holds, since the
+    /// arm is retried at the start of each iteration.
+    pub(crate) fn merged_accept_due(&self) -> bool {
+        self.merged_accept_arms.contains(&AcceptArm::Unarmed)
+            && self.merged_accept_retry_at.is_none()
+            && self
+                .merged_accept_live
+                .as_ref()
+                .is_some_and(|live| live.load(std::sync::atomic::Ordering::Acquire))
+            && !self
+                .shutdown_flag
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Request the close of `conn_index`: mark it `Closing`, set
@@ -2915,6 +2957,7 @@ impl Driver {
         // Each queued message holds an ack sender its registrar waits on.
         region_rx.try_iter().for_each(drop);
         self.merged_listeners.clear();
+        self.merged_accept_arms.clear();
     }
 
     /// The user_data of every fs, direct I/O and NVMe command in flight.

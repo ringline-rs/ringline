@@ -429,6 +429,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // bounds the wait below.
             self.arm_send_backstop();
 
+            // Arm a merged listener's accept that is unarmed: its re-arm's
+            // push failed, or its backoff has passed (#915, #826).
+            self.arm_merged_accepts();
+
             // The blocking wait itself is always performed; only the timing
             // around it is gated on `loop_diag`.
             let wait_start = if loop_diag {
@@ -494,9 +498,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             //
             // A blocking wait ends by the next tick, the earliest timer, and
             // the earliest deadline from `Driver::next_deadline` (a
-            // handshake, close or connect deadline, or the send backstop's
-            // next run). The bound is read
-            // here, after every task poll and orphan release of the
+            // handshake, close or connect deadline, the send backstop's next
+            // run, or the end of a merged accept's backoff). The bound is
+            // read here, after every task poll and orphan release of the
             // iteration, so a timer armed in this iteration bounds this wait.
             //
             // A zero bound (a deadline has passed) takes the non-blocking
@@ -1103,7 +1107,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// How long a blocking wait may last: until the next tick
     /// (`Driver::next_tick`), the earliest timer, or the earliest deadline
     /// from `Driver::next_deadline` (a handshake, close or connect deadline,
-    /// or the send backstop's next run), whichever is first.
+    /// the send backstop's next run, or the end of a merged accept's
+    /// backoff), whichever is first.
     /// Zero when that has passed. `None` when there is no tick and no
     /// deadline: the wait then lasts until a completion.
     fn wait_bound(&mut self) -> Option<std::time::Duration> {
@@ -1154,6 +1159,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// submitted, and with no tick timeout a blocking wait could outlast every
     /// other completion.
     ///
+    /// Merged accepts: an accept whose push failed is retried at the start of
+    /// the next iteration (`Driver::merged_accept_due`), and a blocking wait
+    /// could outlast every other completion. One waiting out a backoff
+    /// bounds the wait instead (`Driver::next_deadline`).
+    ///
     /// Deferred receives: the pre-wait arm skips them when
     /// `completion_pending()` is true, which can mean task work that posts no
     /// completion, so a blocking wait could hold an unarmed deferred receive
@@ -1165,6 +1175,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && self.driver.pending_finalize_closes.is_empty()
             && self.driver.deferred_recv_arms.is_empty()
             && !self.driver.udp_rearm_due()
+            && !self.driver.merged_accept_due()
             && !shutting_down
     }
 
@@ -2486,41 +2497,54 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.spawn_accept_task(conn_index);
     }
 
-    /// Arm this worker's multishot accepts, once `launch()` has listened.
+    /// Arm this worker's multishot accept on each merged listener whose
+    /// accept is unarmed, once `launch()` has listened and any backoff has
+    /// passed.
     ///
-    /// Cheap to call every iteration: it is a relaxed load and an early return
-    /// after the first arm.
+    /// The run loop calls it at the start of every iteration; with every
+    /// listener armed it returns after scanning `merged_accept_arms`. A push
+    /// that fails (the submission queue is full, Domain Invariant 7) leaves
+    /// that listener and the ones after it unarmed for the next iteration,
+    /// and `may_block` keeps the worker from waiting on them.
     fn arm_merged_accepts(&mut self) {
-        if self.driver.merged_accept_armed
-            || self.driver.merged_listeners.is_empty()
-            || self
-                .driver
-                .shutdown_flag
-                .load(std::sync::atomic::Ordering::Acquire)
+        if let Some(at) = self.driver.merged_accept_retry_at {
+            if std::time::Instant::now() < at {
+                return;
+            }
+            self.driver.merged_accept_retry_at = None;
+        }
+        if !self
+            .driver
+            .merged_accept_arms
+            .contains(&crate::backend::uring::driver::AcceptArm::Unarmed)
         {
             return;
         }
-        let live = match self.driver.merged_accept_live {
-            Some(ref flag) => flag.load(std::sync::atomic::Ordering::Acquire),
-            None => false,
-        };
-        if !live {
+        if !self.driver.merged_accept_due() {
             return;
         }
-        // Arm all or none: a partial arm would leave one listener unserved
-        // with no later trigger to retry, since the flag only rises once.
         for i in 0..self.driver.merged_listeners.len() {
+            if self.driver.merged_accept_arms[i]
+                != crate::backend::uring::driver::AcceptArm::Unarmed
+            {
+                continue;
+            }
             let (listener_index, ref sockets) = self.driver.merged_listeners[i];
             let fd = sockets.fd(self.driver.worker_index);
-            if let Err(error) = self.driver.ring.submit_accept_multi(listener_index, fd) {
-                // Submission queue full is backpressure, not failure
-                // (Domain Invariant 7) — leave `armed` false and retry next
-                // iteration, when the queue has drained.
-                let _ = error;
+            if self
+                .driver
+                .ring
+                .submit_accept_multi(listener_index, fd)
+                .is_err()
+            {
                 return;
             }
+            #[cfg(test)]
+            {
+                self.driver.merged_accept_pushes += 1;
+            }
+            self.driver.merged_accept_arms[i] = crate::backend::uring::driver::AcceptArm::Armed;
         }
-        self.driver.merged_accept_armed = true;
     }
 
     /// Publish this worker's live connection count for its peers to read.
@@ -2609,25 +2633,62 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// A multishot accept produced a connection (merged accept mode).
+    /// A multishot accept completed (merged accept mode): it produced a
+    /// connection, or it failed and the error is classified, and without
+    /// `IORING_CQE_F_MORE` it ended and its listener is re-armed or stopped.
     ///
     /// `ud`'s conn_index field carries the listener index — there is no
     /// connection yet. Multishot accept delivers no `sockaddr`, so the peer
     /// comes from `getpeername(2)` on the accepted fd.
     fn handle_accept_multi(&mut self, ud: UserData, result: i32, flags: u32) {
+        use crate::acceptor::AcceptErrorAction;
+        use crate::backend::uring::driver::AcceptArm;
         let listener_index = ud.conn_index();
+        let arm = self
+            .driver
+            .merged_listeners
+            .iter()
+            .position(|&(index, _)| index == listener_index);
 
         if result < 0 {
             let err = -result;
             // ECANCELED and EINVAL are what shutdown produces:
             // `ListenerSockets::shut_down` took the socket out of the
-            // listening state. EBADF is treated as terminal too. Anything else
-            // is worth re-arming for, since losing the arm silently stops the
-            // worker accepting.
-            let terminal = err == libc::ECANCELED || err == libc::EBADF || err == libc::EINVAL;
-            if terminal {
-                self.driver.merged_accept_armed = false;
-                return;
+            // listening state. EBADF and ENOTSOCK are terminal too. EMFILE,
+            // ENFILE, ENOBUFS and ENOMEM clear only when something else frees
+            // an fd or memory, and an errno the acceptor does not list is
+            // treated the same way. The kernel allocates the fd and the new
+            // socket before it takes a connection off the accept queue, so an
+            // accept re-armed at once fails again at once; the re-arm waits
+            // `ACCEPT_ERROR_BACKOFF`, as the pool acceptor does (#826). Any
+            // other error is transient (a signal, a connection that went away,
+            // an error passed through from the new socket), and the accept is
+            // re-armed at once.
+            let action = if err == libc::ECANCELED {
+                AcceptErrorAction::Stop
+            } else {
+                crate::acceptor::classify_accept_error(err)
+            };
+            match action {
+                AcceptErrorAction::Stop => {
+                    if !self
+                        .driver
+                        .shutdown_flag
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        metrics::CONNECTIONS.increment(metrics::conn::ACCEPTOR_STOPPED);
+                    }
+                    if let Some(i) = arm {
+                        self.driver.merged_accept_arms[i] = AcceptArm::Stopped;
+                    }
+                    return;
+                }
+                AcceptErrorAction::Backoff if !cqueue::more(flags) && arm.is_some() => {
+                    metrics::CONNECTIONS.increment(metrics::conn::ACCEPT_ERROR_BACKOFF);
+                    self.driver.merged_accept_retry_at =
+                        Some(std::time::Instant::now() + crate::acceptor::ACCEPT_ERROR_BACKOFF);
+                }
+                AcceptErrorAction::Backoff | AcceptErrorAction::Retry => {}
             }
         } else {
             let raw_fd = result;
@@ -2656,10 +2717,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.publish_load();
         }
 
-        // Without IORING_CQE_F_MORE the kernel has dropped the arm; re-arm or
-        // this worker silently stops accepting.
+        // Without IORING_CQE_F_MORE the kernel has dropped this listener's
+        // arm; re-arm it or this worker silently stops accepting on it. The
+        // other listeners' arms are unaffected (#827).
         if !cqueue::more(flags) {
-            self.driver.merged_accept_armed = false;
+            if let Some(i) = arm {
+                self.driver.merged_accept_arms[i] = AcceptArm::Unarmed;
+            }
             self.arm_merged_accepts();
         }
     }
@@ -5867,6 +5931,184 @@ mod tests {
             el.driver.park_blocker(conn_index),
             Some(crate::backend::uring::driver::ParkBlocker::Closing)
         );
+    }
+
+    /// A test loop serving merged listeners with the given listener indexes,
+    /// each on a real listening socket, with `launch()`'s listen done.
+    fn merged_accept_loop(
+        indexes: &[u32],
+    ) -> (AsyncEventLoop<NoopHandler>, Vec<std::net::TcpListener>) {
+        use crate::backend::uring::driver::AcceptArm;
+        let mut el = make_test_loop();
+        let mut listeners = Vec::new();
+        for &index in indexes {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let fd = std::os::fd::OwnedFd::from(listener.try_clone().expect("clone"));
+            el.driver.merged_listeners.push((
+                index,
+                crate::listener_sockets::ListenerSockets::new(vec![fd]),
+            ));
+            listeners.push(listener);
+        }
+        el.driver.worker_index = 0;
+        el.driver.merged_accept_arms = vec![AcceptArm::Unarmed; indexes.len()];
+        el.driver.merged_accept_live = Some(Arc::new(AtomicBool::new(true)));
+        (el, listeners)
+    }
+
+    /// A multishot accept ending: a CQE without `IORING_CQE_F_MORE`.
+    fn end_merged_accept(el: &mut AsyncEventLoop<NoopHandler>, listener_index: u32, errno: i32) {
+        el.handle_accept_multi(
+            UserData::encode(OpTag::AcceptMulti, listener_index, 0),
+            -errno,
+            0,
+        );
+    }
+
+    /// A merged accept whose push fails stays unarmed, keeps the worker from
+    /// blocking, and is armed by the next iteration's call (#915).
+    #[test]
+    fn a_merged_accept_whose_push_fails_is_armed_next_iteration() {
+        use crate::backend::uring::driver::AcceptArm;
+        let (mut el, _listeners) = merged_accept_loop(&[5]);
+        el.driver.ring.flush().unwrap();
+
+        el.driver.ring.force_push_failures(1);
+        el.arm_merged_accepts();
+        assert_eq!(el.driver.merged_accept_arms, vec![AcceptArm::Unarmed]);
+        assert_eq!(el.driver.merged_accept_pushes, 0);
+        assert!(el.driver.merged_accept_due());
+        assert!(
+            !el.may_block(),
+            "a worker owing an accept arm must not block"
+        );
+
+        el.arm_merged_accepts();
+        assert_eq!(el.driver.merged_accept_arms, vec![AcceptArm::Armed]);
+        assert_eq!(el.driver.merged_accept_pushes, 1);
+        assert!(el.may_block());
+
+        // Armed: further calls push nothing.
+        el.arm_merged_accepts();
+        assert_eq!(el.driver.merged_accept_pushes, 1);
+    }
+
+    /// The run loop arms an unpushed accept at the start of its first
+    /// iteration, before the wait, with no completion or eventfd wake to
+    /// prompt it (#915). The injected loop error stops `run` at the wait.
+    #[test]
+    fn the_run_loop_arms_an_unpushed_merged_accept_before_its_wait() {
+        use crate::backend::uring::driver::AcceptArm;
+        let (mut el, _listeners) = merged_accept_loop(&[1]);
+        let fault = Arc::new(crate::config::TestFault::default());
+        fault.error.store(true, Ordering::Release);
+        el.driver.test_fault = Some(fault);
+        // The arm at the start of `run` fails; the loop's is the only other.
+        el.driver.ring.force_push_failures(1);
+        assert!(el.run().is_err(), "the injected error ends run");
+        assert_eq!(el.driver.merged_accept_arms, vec![AcceptArm::Armed]);
+        assert_eq!(el.driver.merged_accept_pushes, 1);
+    }
+
+    /// Before `launch()` has listened, nothing is armed and the worker may
+    /// block: the eventfd wake arms the accepts.
+    #[test]
+    fn merged_accepts_wait_for_the_listen() {
+        use crate::backend::uring::driver::AcceptArm;
+        let (mut el, _listeners) = merged_accept_loop(&[0]);
+        el.driver.ring.flush().unwrap();
+        el.driver.merged_accept_live = Some(Arc::new(AtomicBool::new(false)));
+        el.arm_merged_accepts();
+        assert_eq!(el.driver.merged_accept_arms, vec![AcceptArm::Unarmed]);
+        assert_eq!(el.driver.merged_accept_pushes, 0);
+        assert!(el.may_block());
+    }
+
+    /// One listener's accept ending re-arms that listener only, and a
+    /// listener left unarmed is armed without pushing the armed one again
+    /// (#827).
+    #[test]
+    fn an_ended_merged_accept_rearms_only_its_listener() {
+        use crate::backend::uring::driver::AcceptArm;
+        let (mut el, _listeners) = merged_accept_loop(&[3, 7]);
+        el.arm_merged_accepts();
+        assert_eq!(el.driver.merged_accept_pushes, 2);
+
+        end_merged_accept(&mut el, 7, libc::ECONNABORTED);
+        assert_eq!(el.driver.merged_accept_pushes, 3, "one re-arm, not two");
+        assert_eq!(
+            el.driver.merged_accept_arms,
+            vec![AcceptArm::Armed, AcceptArm::Armed]
+        );
+
+        el.driver.merged_accept_arms[1] = AcceptArm::Unarmed;
+        el.arm_merged_accepts();
+        assert_eq!(el.driver.merged_accept_pushes, 4);
+    }
+
+    /// An accept that ends with EMFILE is re-armed after
+    /// `ACCEPT_ERROR_BACKOFF`, not at once, and the backoff bounds the
+    /// worker's wait instead of spinning it (#826).
+    #[test]
+    fn a_merged_accept_ended_by_emfile_waits_for_the_backoff() {
+        use crate::backend::uring::driver::AcceptArm;
+        let (mut el, _listeners) = merged_accept_loop(&[2]);
+        el.arm_merged_accepts();
+        el.driver.ring.flush().unwrap();
+        assert_eq!(el.driver.merged_accept_pushes, 1);
+
+        let counted = || {
+            crate::metrics::CONNECTIONS
+                .value(crate::metrics::conn::ACCEPT_ERROR_BACKOFF)
+                .unwrap_or(0)
+        };
+        let backoffs = counted();
+        let before = std::time::Instant::now();
+        end_merged_accept(&mut el, 2, libc::EMFILE);
+        // A process-wide counter other tests may also move.
+        assert!(counted() > backoffs, "the backoff is not counted");
+        assert_eq!(el.driver.merged_accept_arms, vec![AcceptArm::Unarmed]);
+        assert_eq!(el.driver.merged_accept_pushes, 1, "re-armed at once");
+        let retry_at = el.driver.merged_accept_retry_at.expect("a backoff");
+        assert!(retry_at >= before + crate::acceptor::ACCEPT_ERROR_BACKOFF);
+        assert!(el.may_block(), "the backoff is waited, not spun");
+        assert_eq!(el.driver.next_deadline(), Some(retry_at));
+        let bound = el.wait_bound().expect("the backoff bounds the wait");
+        assert!(bound <= crate::acceptor::ACCEPT_ERROR_BACKOFF);
+
+        // A deadline far off, so a descheduled test thread cannot pass it
+        // before the next check.
+        el.driver.merged_accept_retry_at =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        el.arm_merged_accepts();
+        assert_eq!(
+            el.driver.merged_accept_pushes, 1,
+            "armed before the backoff"
+        );
+
+        el.driver.merged_accept_retry_at = Some(std::time::Instant::now());
+        el.arm_merged_accepts();
+        assert_eq!(el.driver.merged_accept_pushes, 2);
+        assert_eq!(el.driver.merged_accept_arms, vec![AcceptArm::Armed]);
+        assert_eq!(el.driver.merged_accept_retry_at, None);
+    }
+
+    /// An accept that ends because the listener stopped listening is not
+    /// re-armed, and leaves the other listeners armed.
+    #[test]
+    fn a_stopped_merged_accept_is_not_rearmed() {
+        use crate::backend::uring::driver::AcceptArm;
+        let (mut el, _listeners) = merged_accept_loop(&[0, 1]);
+        el.arm_merged_accepts();
+        el.driver.ring.flush().unwrap();
+        end_merged_accept(&mut el, 0, libc::EINVAL);
+        assert_eq!(
+            el.driver.merged_accept_arms,
+            vec![AcceptArm::Stopped, AcceptArm::Armed]
+        );
+        el.arm_merged_accepts();
+        assert_eq!(el.driver.merged_accept_pushes, 2);
+        assert!(el.may_block());
     }
 
     /// A UDP re-arm that cannot be submitted stays listed, keeps the worker

@@ -1114,6 +1114,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- io_uring, with `unstable-accept` in `AcceptMode::Merged`: a worker whose
+  multishot accept ended with `EMFILE`, `ENFILE`, `ENOBUFS` or `ENOMEM`
+  re-armed it at once, each re-arm failed at once, and the worker ran at
+  full CPU until a file descriptor freed. It now re-arms after 10 ms, as the
+  pool acceptor does, and counts `accept_error_backoff` (#826). With
+  several merged listeners, an accept ending on one listener re-armed every
+  listener, adding a duplicate accept on each of the others (#827). A
+  re-arm that could not be pushed to a full submission queue was not
+  retried until the worker's eventfd fired, so the worker could stop
+  accepting on that listener (#915); it is now retried on the next loop
+  iteration.
 - Timers (#836, items 1 and 2):
   - A sleep or deadline too far out for the clock is never reached instead
     of failing. On io_uring, a `Duration` with more than `i64::MAX` seconds
