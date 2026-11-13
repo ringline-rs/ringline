@@ -1564,20 +1564,33 @@ mod tests {
     /// does, calling `compact_at_message_start` there when `compact` is set.
     /// With `hint`, it reserves the rest of a SET once its header has
     /// arrived, as `with_data` does for `NeedAtLeast`.
+    ///
+    /// The count starts once the first SET has been consumed. The buffer
+    /// grows from 4096 bytes while the first SET arrives, and whether
+    /// `append`'s `reserve` moves the contents then depends on whether the
+    /// allocator can grow the allocation in place, which varied from run to
+    /// run of the full lib suite (#916). The allocation is not resized after
+    /// the first SET, with or without the call.
     fn moved_per_value_byte_with(vlen: usize, compact: bool, chunk: usize, hint: bool) -> f64 {
-        // About 32 MiB of SET values, at least 50 and at most 2000 SETs, so
-        // the result is the steady state and not the first growths from
-        // 4096 bytes.
+        // About 32 MiB of SET values, at least 50 and at most 2000 SETs.
         let sets = ((32 << 20) / vlen).clamp(50, 2000);
         let (stream, lens) = resp_stream(vlen, sets);
+        // The first SET is command 4, after four GETs.
+        let warm = 5;
         let mut acc = RecvAccumulator::new_with_max(4096, usize::MAX);
-        let start = test_bytes_copied();
+        // `test_bytes_copied()` and the bytes appended when the count starts.
+        let mut start = None;
+        let mut appended = 0;
         let mut next = 0;
         for data in stream.chunks(chunk) {
             assert!(acc.append(data));
+            appended += data.len();
             while next < lens.len() && acc.len() >= lens[next] {
                 acc.consume(lens[next]);
                 next += 1;
+            }
+            if start.is_none() && next >= warm {
+                start = Some((test_bytes_copied(), appended));
             }
             if hint && next < lens.len() && lens[next] > 64 && acc.len() >= 64 {
                 acc.reserve(lens[next] - acc.len());
@@ -1587,8 +1600,9 @@ mod tests {
             }
         }
         assert_eq!(next, lens.len());
-        let moved = test_bytes_copied() - start - stream.len() as u64;
-        moved as f64 / (sets * vlen) as f64
+        let (copied, appended) = start.expect("the stream holds more than one SET");
+        let moved = test_bytes_copied() - copied - (stream.len() - appended) as u64;
+        moved as f64 / ((sets - 1) * vlen) as f64
     }
 
     /// A SET larger than an append arrives over several appends. Without the
@@ -1597,9 +1611,9 @@ mod tests {
     #[test]
     fn compact_at_message_start_moves_few_bytes() {
         // (value bytes, append size, NeedAtLeast hint, least moved without
-        // the call, most moved with it), per value byte. Measured in steady
-        // state: 0.87 -> 0.13, 0.86 -> 0.13, 0.75 -> 0.25, 0.98 -> 0.04 and
-        // about 1.0 -> 0.01.
+        // the call, most moved with it), per value byte. Measured after the
+        // first SET: 0.87 -> 0.12, 0.86 -> 0.13, 0.75 -> 0.25, 0.97 -> 0.04
+        // and about 1.0 -> 0.01.
         for (vlen, chunk, hint, least, most) in [
             (65536, 16384, false, 0.7, 0.2),
             (65536, 16384, true, 0.7, 0.2),
