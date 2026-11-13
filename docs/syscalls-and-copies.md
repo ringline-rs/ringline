@@ -77,7 +77,7 @@ Everything a request needs rides inside those batched enters as SQEs and CQEs:
 | Send a response | **0 dedicated** | `send()`/`send_nowait()` push an `opcode::Send` SQE (`MSG_DONTWAIT`, so a short send waits for `POLLOUT` and resubmits, one more ring pass each time), and a send wider than one send-pool slot goes out as `opcode::SendMsg` SQEs of up to 32 slots each (per-slot `opcode::Send`s if the send slab is full); coalesced sends are one `opcode::SendMsg` SQE gathering several queued sends; zero-copy sends are `opcode::SendMsgZc`. All are submitted by the iteration's shared enter. |
 | Zero-copy notification | **0** | The "DMA done, guard can drop" signal is a second CQE on the same SQE, not a syscall. |
 | Timer arm/fire | **0** | A deadline in the worker's heap. The earliest deadline, or the next tick if sooner, is the timeout of the blocking `io_uring_enter` (`IORING_ENTER_EXT_ARG`); no SQE or CQE. |
-| Outbound connect | **0 dedicated** | Connect SQE, and with a connect timeout a separate Timeout SQE whose expiry pushes an `ASYNC_CANCEL` of the connect. A plaintext connection then arms one `POLL_ADD(POLLRDHUP)` SQE (`docs/recv-direct-design.md`). |
+| Outbound connect | **0 dedicated** | Connect SQE. A connect timeout is a deadline that bounds the worker's wait; when it passes, an `ASYNC_CANCEL` of the connect. A plaintext connection then arms one `POLL_ADD(POLLRDHUP)` SQE (`docs/recv-direct-design.md`). |
 | Accept | 1 per connection | The dedicated acceptor thread runs blocking `accept4()` and hands the fd to a worker over a channel, waking it via eventfd write. The worker's side of that wake is an eventfd-read *SQE* — no syscall on the worker. This is one-time per connection, not per request. |
 
 So in steady state:

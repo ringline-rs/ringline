@@ -280,7 +280,7 @@ fn the_close_deadline_fires_without_a_tick(close: Close) -> bool {
 }
 
 /// After a handshake timeout the stalled send comes back short and waits for
-/// room, so on io_uring the 1 s retry timer for such sends wakes the worker.
+/// room, so on io_uring the 1 s send backstop wakes the worker.
 #[test]
 fn the_close_deadline_fires_without_a_tick_after_a_handshake_timeout() {
     assert!(
@@ -290,7 +290,7 @@ fn the_close_deadline_fires_without_a_tick_after_a_handshake_timeout() {
 }
 
 /// After the peer's FIN. The stalled flight still comes back short and waits
-/// for room, so on io_uring the 1 s retry timer wakes the worker here too;
+/// for room, so on io_uring the 1 s send backstop wakes the worker here too;
 /// without it the close deadline, which bounds the wait, would.
 #[test]
 fn the_close_deadline_fires_without_a_tick_after_a_fin() {

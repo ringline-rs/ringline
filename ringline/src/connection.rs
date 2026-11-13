@@ -116,8 +116,14 @@ pub struct ConnectionState {
     /// Which listener accepted this connection. `None` for outbound
     /// connections, which arrived through `connect*()` rather than a listener.
     pub listener: Option<crate::ListenerId>,
-    /// Whether a connect timeout SQE is armed for this connection.
-    pub connect_timeout_armed: bool,
+    /// io_uring only (mio keeps its connect deadlines in its driver's
+    /// `connect_deadlines`): the deadline of this connection's connect
+    /// timeout, while its connect is in progress and the timeout has not
+    /// fired. It is also in the uring `Driver::connect_deadlines` heap.
+    pub connect_deadline: Option<std::time::Instant>,
+    /// The connect timeout fired: the connect was cancelled and the
+    /// connection closed, so its Connect completion changes nothing.
+    pub connect_timed_out: bool,
     /// The socket was handed to another worker (a park install, #443), so
     /// closing this slot must not shut the socket down. Other closes link a shutdown
     /// (before Linux 6.13) or a cancel of the connection's requests (from
@@ -204,7 +210,8 @@ impl ConnectionState {
             established: false,
             peer_addr: None,
             listener: None,
-            connect_timeout_armed: false,
+            connect_deadline: None,
+            connect_timed_out: false,
             #[cfg(has_io_uring)]
             socket_handed_off: false,
             #[cfg(has_io_uring)]
@@ -287,7 +294,8 @@ impl ConnectionState {
         // Must clear with the rest of the slot: a stale id would attribute the
         // next occupant of this slot to whichever listener used it last.
         self.listener = None;
-        self.connect_timeout_armed = false;
+        self.connect_deadline = None;
+        self.connect_timed_out = false;
         #[cfg(has_io_uring)]
         {
             self.socket_handed_off = false;
@@ -541,7 +549,8 @@ mod tests {
         // Simulate connection becoming established.
         if let Some(cs) = table.get_mut(idx) {
             cs.established = true;
-            cs.connect_timeout_armed = true;
+            cs.connect_deadline = Some(std::time::Instant::now());
+            cs.connect_timed_out = true;
             cs.peer_addr = Some(PeerAddr::Tcp("127.0.0.1:8080".parse().unwrap()));
         }
 
@@ -552,7 +561,8 @@ mod tests {
         assert!(!cs.active);
         assert!(!cs.outbound);
         assert!(!cs.established);
-        assert!(!cs.connect_timeout_armed);
+        assert!(cs.connect_deadline.is_none());
+        assert!(!cs.connect_timed_out);
         assert!(cs.peer_addr.is_none());
         assert!(cs.lifecycle == Lifecycle::Inactive);
     }

@@ -317,9 +317,10 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) tcp_nodelay: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
-    /// Pre-allocated timespec storage for connect timeouts (io_uring only).
+    /// The worker's connect deadlines (io_uring only).
     #[cfg(has_io_uring)]
-    pub(crate) connect_timespecs: &'a mut Vec<crate::backend::uring::abi::Timespec>,
+    pub(crate) connect_deadlines:
+        &'a mut crate::backend::uring::connect_deadlines::ConnectDeadlines,
     /// Per-connection send chain tracking.
     pub(crate) chain_table: &'a mut crate::chain::SendChainTable,
     /// Maximum SQEs per chain (0 = disabled).
@@ -2610,32 +2611,24 @@ impl<'a> DriverCtx<'a> {
     /// not depend on the transport.
     ///
     /// The connect builders call this after the base connect (#528).
+    ///
+    /// The deadline goes into the worker's connect deadline heap, which bounds
+    /// the worker's wait; nothing is submitted. A deadline past what `Instant`
+    /// can hold is never reached and is not armed.
     #[cfg(has_io_uring)]
     pub(crate) fn arm_connect_timeout(&mut self, conn_index: u32, timeout_ms: u64) {
-        let ts = &mut self.connect_timespecs[conn_index as usize];
-        *ts = crate::backend::uring::abi::Timespec::new()
-            .sec(timeout_ms / 1000)
-            .nsec((timeout_ms % 1000) as u32 * 1_000_000);
-
-        // Carry the connection generation in the payload: a stale -ETIME
-        // deferred through CQ overflow could otherwise land after this slot
-        // was closed and reused for a NEW outbound connect (again in
-        // Connecting state) and kill it with a spurious TimedOut.
-        let generation = self
-            .connections
-            .get(conn_index)
-            .map(|c| c.generation)
-            .unwrap_or(0);
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::Timeout,
-            conn_index,
-            generation,
-        );
-        if self.ring.submit_timeout(ts as *const _, ud).is_ok()
-            && let Some(cs) = self.connections.get_mut(conn_index)
-        {
-            cs.connect_timeout_armed = true;
-        }
+        let Some(deadline) =
+            std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout_ms))
+        else {
+            return;
+        };
+        let Some(cs) = self.connections.get_mut(conn_index) else {
+            return;
+        };
+        cs.connect_deadline = Some(deadline);
+        let generation = cs.generation;
+        self.connect_deadlines
+            .arm(conn_index, generation, deadline, &*self.connections);
     }
 }
 

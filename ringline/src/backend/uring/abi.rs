@@ -1,43 +1,8 @@
 //! The parts of the io_uring kernel ABI the driver reads and writes: the
-//! timespec a TIMEOUT points at, the flags on a completion, and the layout
-//! of a multishot `recvmsg` buffer.
+//! flags on a completion and the layout of a multishot `recvmsg` buffer.
 //!
 //! Outside `engine/uring.rs`, only tests use the `io_uring` crate;
 //! the tests here check these definitions against it.
-
-/// `struct __kernel_timespec`, which a TIMEOUT operation points at.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub(crate) struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-
-impl Timespec {
-    pub(crate) const fn new() -> Self {
-        Timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        }
-    }
-
-    /// Seconds past `i64::MAX` are clamped to it: the kernel refuses a
-    /// negative `tv_sec` with `EINVAL`, and a timeout that far out never
-    /// expires either way.
-    pub(crate) const fn sec(mut self, sec: u64) -> Self {
-        self.tv_sec = if sec > i64::MAX as u64 {
-            i64::MAX
-        } else {
-            sec as i64
-        };
-        self
-    }
-
-    pub(crate) const fn nsec(mut self, nsec: u32) -> Self {
-        self.tv_nsec = nsec as i64;
-        self
-    }
-}
 
 /// The flags a completion carries (`IORING_CQE_F_*`).
 pub(crate) mod cqueue {
@@ -178,34 +143,6 @@ impl<'buf> RecvMsgOut<'buf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The kernel refuses a negative `tv_sec`; seconds past `i64::MAX`
-    /// clamp to it (#836).
-    #[test]
-    fn timespec_seconds_clamp_to_i64_max() {
-        assert_eq!(Timespec::new().sec(u64::MAX).tv_sec, i64::MAX);
-        assert_eq!(Timespec::new().sec(i64::MAX as u64).tv_sec, i64::MAX);
-        assert_eq!(Timespec::new().sec(5).tv_sec, 5);
-    }
-
-    #[test]
-    fn timespec_matches_the_kernel_layout() {
-        assert_eq!(
-            std::mem::size_of::<Timespec>(),
-            std::mem::size_of::<io_uring::types::Timespec>()
-        );
-        assert_eq!(
-            std::mem::align_of::<Timespec>(),
-            std::mem::align_of::<io_uring::types::Timespec>()
-        );
-        let ours = Timespec::new().sec(12).nsec(345_678_901);
-        let theirs = io_uring::types::Timespec::new().sec(12).nsec(345_678_901);
-        let bytes = |p: *const u8| unsafe { std::slice::from_raw_parts(p, 16).to_vec() };
-        assert_eq!(
-            bytes(&ours as *const Timespec as *const u8),
-            bytes(&theirs as *const io_uring::types::Timespec as *const u8)
-        );
-    }
 
     #[test]
     fn cqe_flags_read_like_the_io_uring_crate() {

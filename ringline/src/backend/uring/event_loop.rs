@@ -425,13 +425,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     .is_ok();
             }
 
-            // A full SQ leaves this unarmed for the next iteration.
-            if !self.driver.send_backstop_armed && !self.driver.send_backstop_list.is_empty() {
-                let ud = UserData::encode(OpTag::SendBackstop, 0, 0);
-                let ts = &raw const self.driver.send_backstop_ts;
-                self.driver.send_backstop_armed =
-                    self.driver.ring.submit_tick_timeout(ts, ud.raw()).is_ok();
-            }
+            // A send waiting for room arms the backstop's next run, which
+            // bounds the wait below.
+            self.arm_send_backstop();
 
             // The blocking wait itself is always performed; only the timing
             // around it is gated on `loop_diag`.
@@ -497,7 +493,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // shortcut) starves the whole worker of completions.
             //
             // A blocking wait ends by the next tick, the earliest timer, and
-            // the earliest handshake or close deadline. The bound is read
+            // the earliest deadline from `Driver::next_deadline` (a
+            // handshake, close or connect deadline, or the send backstop's
+            // next run). The bound is read
             // here, after every task poll and orphan release of the
             // iteration, so a timer armed in this iteration bounds this wait.
             //
@@ -593,6 +591,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // if a tick is due.
             self.executor.fire_expired_timers();
             self.tick_if_due();
+            // Resubmit the sends waiting for room if the backstop is due, and
+            // time out the connects whose deadline has passed.
+            self.run_send_backstop_if_due();
+            self.check_connect_deadlines();
 
             // Check close_notify deadlines: force-close a TLS connection whose
             // close requested a close_notify and whose Close is still not
@@ -1099,8 +1101,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// How long a blocking wait may last: until the next tick
-    /// (`Driver::next_tick`), the earliest timer, or the earliest handshake
-    /// or close deadline (`Driver::next_deadline`), whichever is first.
+    /// (`Driver::next_tick`), the earliest timer, or the earliest deadline
+    /// from `Driver::next_deadline` (a handshake, close or connect deadline,
+    /// or the send backstop's next run), whichever is first.
     /// Zero when that has passed. `None` when there is no tick and no
     /// deadline: the wait then lasts until a completion.
     fn wait_bound(&mut self) -> Option<std::time::Duration> {
@@ -1791,7 +1794,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::EventFdRead => self.handle_eventfd_read(),
             OpTag::TlsSend => self.handle_tls_send(ud, result),
             OpTag::Connect => self.handle_connect(ud, result),
-            OpTag::Timeout => self.handle_timeout(ud, result),
             OpTag::Cancel => {}
             OpTag::RecvMsgUdp => self.handle_recv_msg_udp(ud, result, flags),
             OpTag::SendMsgUdp => self.handle_send_msg_udp(ud, result),
@@ -1802,7 +1804,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::Fs => self.handle_fs(ud, result),
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
             OpTag::SendPollOut => self.handle_send_pollout(ud, result, flags),
-            OpTag::SendBackstop => self.handle_send_backstop(),
             OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
             // No notification follows a plain `send`.
             OpTag::SendMsgZcDrain => self.handle_send_msg_zc(ud, result, 0),
@@ -3110,12 +3111,31 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
+    /// Set the backstop's next run `SEND_BACKSTOP_INTERVAL` from now if a send
+    /// waits for room and no run is set.
+    fn arm_send_backstop(&mut self) {
+        if self.driver.send_backstop_at.is_none() && !self.driver.send_backstop_list.is_empty() {
+            self.driver.send_backstop_at =
+                Some(std::time::Instant::now() + super::driver::SEND_BACKSTOP_INTERVAL);
+        }
+    }
+
+    /// Run the backstop if its time has come. The next loop iteration arms
+    /// the next run if a send still waits.
+    fn run_send_backstop_if_due(&mut self) {
+        if let Some(at) = self.driver.send_backstop_at
+            && std::time::Instant::now() >= at
+        {
+            self.driver.send_backstop_at = None;
+            self.handle_send_backstop();
+        }
+    }
+
     /// Resubmit every waiting send, once a second. A send can wait with no
     /// `POLLOUT` to end it: a multishot poll's edge can be lost, and a poll does
     /// not report a Unix peer's `SHUT_RD`, where a send fails `EPIPE`. The
     /// interval is a guess, and the retry is unmeasured.
     fn handle_send_backstop(&mut self) {
-        self.driver.send_backstop_armed = false;
         std::mem::swap(
             &mut self.driver.send_backstop_list,
             &mut self.driver.send_backstop_scratch,
@@ -3682,51 +3702,37 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // end-of-iteration drain without waiting for this CQE, so it can
         // arrive after the slot was freed and reused and must not touch the
         // new occupant.
-        let generation = match self.driver.connections.get(conn_index) {
-            Some(conn) if conn.generation == ud.payload() => conn.generation,
+        match self.driver.connections.get(conn_index) {
+            Some(conn) if conn.generation == ud.payload() => {}
             _ => return,
-        };
+        }
+        // The connect timeout fired: it cancelled this Connect, woke the
+        // connect with `TimedOut` and closed the connection. A completion
+        // that raced it, cancelled or not, changes nothing.
+        if self
+            .driver
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| c.connect_timed_out)
+        {
+            return;
+        }
 
         if result < 0 {
             let errno = -result;
 
             if errno == libc::ECANCELED {
-                let timeout_armed = self
-                    .driver
-                    .connections
-                    .get(conn_index)
-                    .map(|c| c.connect_timeout_armed)
-                    .unwrap_or(false);
-                if !timeout_armed {
-                    let err = io::Error::from_raw_os_error(errno);
-                    self.executor.wake_connect(conn_index, Err(err));
-                    // Don't call remove_connection here — it would clear io_results
-                    // before the owning task can read the error via ConnectFuture.
-                    // handle_close (triggered by close_connection) will clean up.
-                    self.driver.close_connection(conn_index);
-                    return;
-                }
-                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.connect_timeout_armed = false;
-                }
+                let err = io::Error::from_raw_os_error(errno);
+                self.executor.wake_connect(conn_index, Err(err));
+                // Don't call remove_connection here — it would clear io_results
+                // before the owning task can read the error via ConnectFuture.
+                // handle_close (triggered by close_connection) will clean up.
+                self.driver.close_connection(conn_index);
                 return;
             }
 
-            if self
-                .driver
-                .connections
-                .get(conn_index)
-                .map(|c| c.connect_timeout_armed)
-                .unwrap_or(false)
-            {
-                let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, generation);
-                let _ = self
-                    .driver
-                    .ring
-                    .submit_async_cancel(timeout_ud.raw(), conn_index);
-                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.connect_timeout_armed = false;
-                }
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.connect_deadline = None;
             }
 
             if let Some(ref mut tls_table) = self.driver.tls_table {
@@ -3742,34 +3748,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             return;
         }
 
-        // Connect succeeded.
-        let timeout_was_armed = self
-            .driver
-            .connections
-            .get(conn_index)
-            .map(|c| c.connect_timeout_armed)
-            .unwrap_or(false);
-        if timeout_was_armed {
-            let still_connecting = self
-                .driver
-                .connections
-                .get(conn_index)
-                .map(|c| matches!(c.lifecycle, Lifecycle::Connecting))
-                .unwrap_or(false);
-            if !still_connecting {
-                if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                    cs.connect_timeout_armed = false;
-                }
-                return;
-            }
-            let timeout_ud = UserData::encode(OpTag::Timeout, conn_index, generation);
-            let _ = self
-                .driver
-                .ring
-                .submit_async_cancel(timeout_ud.raw(), conn_index);
-            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
-                cs.connect_timeout_armed = false;
-            }
+        // Connect succeeded: its deadline, if any, is dead from here on.
+        if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+            cs.connect_deadline = None;
         }
 
         self.driver.arrival[conn_index as usize].clear();
@@ -3861,42 +3842,68 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.executor.wake_connect(conn_index, Ok(()));
     }
 
-    fn handle_timeout(&mut self, ud: UserData, result: i32) {
-        let conn_index = ud.conn_index();
-
-        if result != -libc::ETIME {
-            return;
-        }
-
-        let conn = match self.driver.connections.get(conn_index) {
-            Some(c) => c,
-            None => return,
-        };
-
-        // Generation check (payload carries it): a stale -ETIME arriving
-        // after close + slot reuse must not kill the new occupant's connect.
-        if conn.generation != ud.payload() || !conn.connect_timeout_armed {
-            return;
-        }
-
-        if !matches!(conn.lifecycle, Lifecycle::Connecting) {
-            return;
-        }
-
-        let connect_ud = UserData::encode(OpTag::Connect, conn_index, ud.payload());
-        let _ = self
+    /// Time out every connect whose deadline has passed: cancel its Connect,
+    /// drop its TLS state, wake the connect with `TimedOut` and close the
+    /// connection. A cancel the SQ has no room for is retried on the next
+    /// iteration.
+    fn check_connect_deadlines(&mut self) {
+        self.retry_connect_cancels();
+        let now = std::time::Instant::now();
+        while let Some((conn_index, generation)) = self
             .driver
-            .ring
-            .submit_async_cancel(connect_ud.raw(), conn_index);
+            .connect_deadlines
+            .pop_expired(now, &self.driver.connections)
+        {
+            if let Some(cs) = self.driver.connections.get_mut(conn_index) {
+                cs.connect_deadline = None;
+                cs.connect_timed_out = true;
+            }
+            let connect_ud = UserData::encode(OpTag::Connect, conn_index, generation);
+            if self
+                .driver
+                .ring
+                .submit_async_cancel(connect_ud.raw(), conn_index)
+                .is_err()
+            {
+                self.driver
+                    .pending_connect_cancels
+                    .push((conn_index, generation));
+            }
 
-        if let Some(ref mut tls_table) = self.driver.tls_table {
-            tls_table.remove(conn_index);
+            if let Some(ref mut tls_table) = self.driver.tls_table {
+                tls_table.remove(conn_index);
+            }
+
+            let err = io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
+            self.executor.wake_connect(conn_index, Err(err));
+            // Don't call remove_connection here — handle_close will clean up.
+            self.driver.close_connection(conn_index);
         }
+    }
 
-        let err = io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
-        self.executor.wake_connect(conn_index, Err(err));
-        // Don't call remove_connection here — handle_close will clean up.
-        self.driver.close_connection(conn_index);
+    /// Push the connect cancels the SQ had no room for, for connections
+    /// still in the slot they timed out in.
+    fn retry_connect_cancels(&mut self) {
+        if self.driver.pending_connect_cancels.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.driver.pending_connect_cancels);
+        for (conn_index, generation) in pending {
+            if self.driver.connections.generation(conn_index) != generation {
+                continue;
+            }
+            let connect_ud = UserData::encode(OpTag::Connect, conn_index, generation);
+            if self
+                .driver
+                .ring
+                .submit_async_cancel(connect_ud.raw(), conn_index)
+                .is_err()
+            {
+                self.driver
+                    .pending_connect_cancels
+                    .push((conn_index, generation));
+            }
+        }
     }
 
     fn handle_close(&mut self, ud: UserData) {
@@ -11885,6 +11892,52 @@ mod tests {
         assert!(!el.driver.send_queues[conn_index as usize].on_send_backstop);
     }
 
+    /// A waiting send arms the backstop one interval ahead, that deadline
+    /// bounds the wait, and once it passes the backstop runs and the next
+    /// iteration arms it again while the send still waits.
+    #[test]
+    fn the_backstop_deadline_bounds_the_wait_and_runs_when_due() {
+        let mut el = make_test_loop();
+        let (conn_index, _slot, ud) = stage_send(&mut el, &[7u8; 100]);
+        el.test_dispatch_cqe(ud.raw(), 40, 0);
+        assert!(el.driver.send_backstop_at.is_none());
+        let before = Instant::now();
+        el.arm_send_backstop();
+        let at = el.driver.send_backstop_at.expect("a waiting send arms it");
+        assert!(at >= before + super::super::driver::SEND_BACKSTOP_INTERVAL);
+        assert_eq!(el.driver.next_deadline(), Some(at));
+
+        // Not due: nothing runs.
+        el.driver.ring.last_pushed = None;
+        el.run_send_backstop_if_due();
+        assert!(el.driver.ring.last_pushed.is_none());
+        assert_eq!(el.driver.send_backstop_at, Some(at));
+
+        // Due: the waiting send is resubmitted.
+        el.driver.send_backstop_at = Some(Instant::now());
+        el.run_send_backstop_if_due();
+        assert!(el.driver.send_backstop_at.is_none());
+        assert!(matches!(
+            last_pushed_op(&el),
+            crate::backend::uring::sqe::Op::Send { len: 60, .. }
+        ));
+        assert!(
+            el.driver.send_queues[conn_index as usize]
+                .waiting_send
+                .is_none()
+        );
+        el.arm_send_backstop();
+        assert!(el.driver.send_backstop_at.is_some(), "still on the list");
+
+        // Once nothing waits the list empties and nothing is armed.
+        el.test_dispatch_cqe(ud.raw(), 60, 0);
+        el.driver.send_backstop_at = Some(Instant::now());
+        el.run_send_backstop_if_due();
+        assert!(el.driver.send_backstop_list.is_empty());
+        el.arm_send_backstop();
+        assert!(el.driver.send_backstop_at.is_none());
+    }
+
     /// A poll the SQ had no room for is armed by the next drain, with no limit
     /// on the wait. An entry whose wait ended without it is dropped.
     #[test]
@@ -13099,10 +13152,10 @@ mod tests {
         assert_ne!(dio, nvme, "direct-I/O and NVMe keys must differ");
     }
 
-    /// An outbound slot whose Connect is in the kernel, with its timeout
-    /// armed as `arm_connect_timeout` leaves it and a task waiting on the
-    /// connect. The slot is used once first so its generation is not 0, the
-    /// value a payload that carries no generation would match by accident.
+    /// An outbound slot whose Connect is in the kernel and a task waiting on
+    /// the connect, with no timeout armed. The slot is used once first so its
+    /// generation is not 0, the value a payload that carries no generation
+    /// would match by accident.
     fn connecting_slot(el: &mut AsyncEventLoop<NoopHandler>) -> (u32, u32) {
         let first = el
             .driver
@@ -13120,18 +13173,48 @@ mod tests {
         assert_ne!(generation, 0);
         let cs = el.driver.connections.get_mut(conn_index).unwrap();
         cs.recv_direct = true;
-        cs.connect_timeout_armed = true;
         el.executor.connect_waiters[conn_index as usize] = true;
         (conn_index, generation)
     }
 
+    /// The kind of the error `conn_index`'s connect resolved with, if it
+    /// resolved with one.
+    fn connect_error_kind(
+        el: &AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+    ) -> Option<io::ErrorKind> {
+        match &el.executor.io_results[conn_index as usize] {
+            Some(crate::runtime::IoResult::Connect(Err(e))) => Some(e.kind()),
+            _ => None,
+        }
+    }
+
+    /// Arm `conn_index`'s connect timeout to expire `after` from now, as
+    /// `arm_connect_timeout` does.
+    fn arm_connect_deadline(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        conn_index: u32,
+        after: std::time::Duration,
+    ) -> Instant {
+        let deadline = Instant::now() + after;
+        let cs = el.driver.connections.get_mut(conn_index).unwrap();
+        cs.connect_deadline = Some(deadline);
+        let generation = cs.generation;
+        el.driver
+            .connect_deadlines
+            .arm(conn_index, generation, deadline, &el.driver.connections);
+        deadline
+    }
+
     /// A Connect CQE whose payload is not the slot's generation belongs to
     /// an earlier occupant and changes nothing: the connect in progress keeps
-    /// its waiter, its state and its flag, and nothing is cancelled.
+    /// its waiter, its state and its deadline, and nothing is cancelled.
     #[test]
     fn a_stale_connect_cqe_leaves_the_reused_slot_alone() {
         let mut el = make_test_loop();
         let (conn_index, generation) = connecting_slot(&mut el);
+        let deadline =
+            arm_connect_deadline(&mut el, conn_index, std::time::Duration::from_secs(60));
         let stale = UserData::encode(OpTag::Connect, conn_index, generation.wrapping_sub(1));
         for result in [0, -libc::ECANCELED, -libc::ECONNREFUSED] {
             el.test_dispatch_cqe(stale.raw(), result, 0);
@@ -13144,7 +13227,7 @@ mod tests {
                 matches!(conn.lifecycle, Lifecycle::Connecting),
                 "result {result}: the occupant left Connecting"
             );
-            assert!(conn.connect_timeout_armed);
+            assert_eq!(conn.connect_deadline, Some(deadline));
             assert!(el.executor.connect_waiters[conn_index as usize]);
             assert!(el.executor.io_results[conn_index as usize].is_none());
             assert!(el.driver.ring.pushed_cancels.is_empty());
@@ -13153,15 +13236,17 @@ mod tests {
 
     /// A close requested while the Connect is in the kernel (here by the
     /// connect timeout) is committed by the end-of-iteration drain without
-    /// waiting for the Connect's CQE. That CQE is matched to this occupant
-    /// by its generation when it lands before the Close CQE, and ignored
-    /// when it lands after.
+    /// waiting for the Connect's CQE. That CQE, matched to this occupant by
+    /// its generation, changes nothing when it lands before the Close CQE,
+    /// and is ignored when it lands after. The connect's result stays
+    /// `TimedOut`; `wake_connect` writes a result only while a waiter is
+    /// registered, so that part held before #838 too.
     #[test]
     fn a_close_on_a_connecting_slot_commits_without_the_connect_cqe() {
         let mut el = make_test_loop();
         let (conn_index, generation) = connecting_slot(&mut el);
-        let timeout = UserData::encode(OpTag::Timeout, conn_index, generation);
-        el.test_dispatch_cqe(timeout.raw(), -libc::ETIME, 0);
+        arm_connect_deadline(&mut el, conn_index, std::time::Duration::ZERO);
+        el.check_connect_deadlines();
         assert_eq!(
             el.driver.ring.pushed_cancels.len(),
             1,
@@ -13173,17 +13258,23 @@ mod tests {
         el.finalize_pending_closes();
         assert!(el.driver.send_queues[conn_index as usize].close_submitted);
 
-        // Before the Close CQE: the slot is still this occupant's, and the
-        // CQE settles the timeout flag and nothing else.
         let connect = UserData::encode(OpTag::Connect, conn_index, generation);
-        el.test_dispatch_cqe(connect.raw(), -libc::ECANCELED, 0);
-        let conn = el
-            .driver
-            .connections
-            .get(conn_index)
-            .expect("the slot is freed by the Close CQE, not before");
-        assert!(!conn.connect_timeout_armed);
-        assert!(conn.close_requested());
+        for result in [-libc::ECANCELED, -libc::ECONNREFUSED, 0] {
+            el.test_dispatch_cqe(connect.raw(), result, 0);
+            let conn = el
+                .driver
+                .connections
+                .get(conn_index)
+                .expect("the slot is freed by the Close CQE, not before");
+            assert!(conn.connect_timed_out);
+            assert!(conn.close_requested());
+            let err = connect_error_kind(&el, conn_index);
+            assert_eq!(
+                err,
+                Some(io::ErrorKind::TimedOut),
+                "result {result} replaced the timeout's result"
+            );
+        }
 
         let close = UserData::encode(OpTag::Close, conn_index, generation);
         el.test_dispatch_cqe(close.raw(), 0, 0);
@@ -13195,73 +13286,120 @@ mod tests {
     }
 
     /// The connect timeout cancels the Connect by the user_data the Connect
-    /// was submitted with, which carries the slot's generation.
+    /// was submitted with, which carries the slot's generation, and the
+    /// connect resolves `TimedOut`.
     #[test]
     fn the_connect_timeout_cancels_the_connect_by_its_generation() {
         let mut el = make_test_loop();
         let (conn_index, generation) = connecting_slot(&mut el);
-        let timeout = UserData::encode(OpTag::Timeout, conn_index, generation);
-        el.test_dispatch_cqe(timeout.raw(), -libc::ETIME, 0);
+        arm_connect_deadline(&mut el, conn_index, std::time::Duration::ZERO);
+        el.check_connect_deadlines();
         let connect = UserData::encode(OpTag::Connect, conn_index, generation);
         assert_eq!(el.driver.ring.pushed_cancels, vec![connect.raw()]);
+        let err = connect_error_kind(&el, conn_index);
+        assert_eq!(err, Some(io::ErrorKind::TimedOut));
     }
 
-    /// A Connect that completes with its timeout armed cancels the timeout
-    /// by the user_data `arm_connect_timeout` gave it, which carries the
-    /// slot's generation.
+    /// A connect cancel the SQ has no room for is kept and pushed on the next
+    /// iteration's check; the connect resolves `TimedOut` at once either way.
     #[test]
-    fn a_completed_connect_cancels_its_timeout_by_its_generation() {
+    fn a_connect_cancel_that_cannot_be_pushed_is_retried() {
         let mut el = make_test_loop();
         let (conn_index, generation) = connecting_slot(&mut el);
+        arm_connect_deadline(&mut el, conn_index, std::time::Duration::ZERO);
+        el.driver.ring.force_push_failures(1);
+        el.check_connect_deadlines();
+        assert!(el.driver.ring.pushed_cancels.is_empty());
+        assert_eq!(
+            el.driver.pending_connect_cancels,
+            vec![(conn_index, generation)]
+        );
+        assert!(!el.executor.connect_waiters[conn_index as usize]);
+        el.check_connect_deadlines();
         let connect = UserData::encode(OpTag::Connect, conn_index, generation);
-        el.test_dispatch_cqe(connect.raw(), 0, 0);
-        let timeout = UserData::encode(OpTag::Timeout, conn_index, generation);
-        assert_eq!(el.driver.ring.pushed_cancels, vec![timeout.raw()]);
-        let conn = el.driver.connections.get(conn_index).unwrap();
-        assert!(matches!(conn.lifecycle, Lifecycle::Open));
-        assert!(!conn.connect_timeout_armed);
+        assert_eq!(el.driver.ring.pushed_cancels, vec![connect.raw()]);
+        assert!(el.driver.pending_connect_cancels.is_empty());
     }
 
-    /// The same for a Connect that fails.
+    /// A Connect that completes, or fails, before its deadline pushes no
+    /// cancel for its timeout, and the deadline no longer fires or bounds the
+    /// wait once it passes.
     #[test]
-    fn a_failed_connect_cancels_its_timeout_by_its_generation() {
-        let mut el = make_test_loop();
-        let (conn_index, generation) = connecting_slot(&mut el);
-        let connect = UserData::encode(OpTag::Connect, conn_index, generation);
-        el.test_dispatch_cqe(connect.raw(), -libc::ECONNREFUSED, 0);
-        let timeout = UserData::encode(OpTag::Timeout, conn_index, generation);
-        assert_eq!(el.driver.ring.pushed_cancels, vec![timeout.raw()]);
-        let conn = el.driver.connections.get(conn_index).unwrap();
-        assert!(conn.close_requested());
+    fn a_completed_connect_pushes_nothing_for_its_timeout() {
+        for result in [0, -libc::ECONNREFUSED] {
+            let mut el = make_test_loop();
+            let (conn_index, generation) = connecting_slot(&mut el);
+            arm_connect_deadline(&mut el, conn_index, std::time::Duration::from_millis(20));
+            el.driver.ring.last_pushed = None;
+            let connect = UserData::encode(OpTag::Connect, conn_index, generation);
+            el.test_dispatch_cqe(connect.raw(), result, 0);
+            // A plaintext connect that completes arms its hangup poll, and
+            // nothing else.
+            if result == 0 {
+                assert!(
+                    el.driver
+                        .ring
+                        .last_pushed
+                        .as_ref()
+                        .is_none_or(|sqe| matches!(
+                            sqe.op,
+                            crate::backend::uring::sqe::Op::PollAdd { .. }
+                        )),
+                    "result {result}: pushed {:?}",
+                    el.driver.ring.last_pushed.as_ref().map(|sqe| sqe.op)
+                );
+            }
+            assert!(
+                el.driver.ring.pushed_cancels.is_empty(),
+                "result {result}: a cancel was pushed"
+            );
+            let conn = el.driver.connections.get(conn_index).unwrap();
+            assert!(conn.connect_deadline.is_none());
+            assert_eq!(
+                el.driver
+                    .connect_deadlines
+                    .next_deadline(&el.driver.connections),
+                None
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            el.check_connect_deadlines();
+            assert!(el.driver.ring.pushed_cancels.is_empty());
+            let err = connect_error_kind(&el, conn_index);
+            assert_ne!(err, Some(io::ErrorKind::TimedOut), "result {result}");
+        }
     }
 
+    /// The expired deadline of a slot's earlier occupant does not time out
+    /// the connect of its next occupant.
     #[test]
-    fn stale_connect_timeout_ignored_on_reused_slot() {
-        // A -ETIME deferred through CQ overflow can arrive after the slot
-        // was closed and reused for a NEW outbound connect. The generation
-        // in the payload must prevent it from killing the new connect.
+    fn a_stale_connect_deadline_spares_the_reused_slot() {
         let mut el = make_test_loop();
         let conn_index = el.driver.connections.allocate_outbound().unwrap();
-        let old_generation = el.driver.connections.generation(conn_index);
+        arm_connect_deadline(&mut el, conn_index, std::time::Duration::ZERO);
 
-        // Close + reuse: new outbound connect in the same slot.
+        // Close + reuse: a new outbound connect in the same slot.
         el.driver.close_connection(conn_index);
         let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
         el.inject_and_dispatch(close_ud.raw(), 0);
         let reused = el.driver.connections.allocate_outbound().unwrap();
         assert_eq!(reused, conn_index);
-        if let Some(cs) = el.driver.connections.get_mut(conn_index) {
-            cs.connect_timeout_armed = true;
-        }
+        el.executor.connect_waiters[conn_index as usize] = true;
+        let deadline =
+            arm_connect_deadline(&mut el, conn_index, std::time::Duration::from_secs(60));
 
-        // Stale -ETIME with the OLD generation: must be ignored.
-        let ud = UserData::encode(OpTag::Timeout, conn_index, old_generation);
-        el.inject_and_dispatch(ud.raw(), -62);
-
+        el.check_connect_deadlines();
         let conn = el.driver.connections.get(conn_index);
         assert!(
-            conn.is_some() && matches!(conn.unwrap().lifecycle, Lifecycle::Connecting),
-            "stale connect-timeout CQE must not kill the reused slot's connect"
+            conn.is_some_and(|c| matches!(c.lifecycle, Lifecycle::Connecting)),
+            "a stale connect deadline killed the reused slot's connect"
+        );
+        assert!(el.driver.ring.pushed_cancels.is_empty());
+        assert!(el.executor.connect_waiters[conn_index as usize]);
+        assert_eq!(
+            el.driver
+                .connect_deadlines
+                .next_deadline(&el.driver.connections),
+            Some(deadline)
         );
     }
 

@@ -318,6 +318,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   worker, Linux 6.12 VM, 5 runs). A handler that uses `on_tick` as a 1 ms
   periodic callback on io_uring sets `tick_timeout_us(1000)`. The setting
   has no effect on mio, whose wait is at most 10 ms.
+- io_uring: the connect timeout and the send backstop no longer use the ring
+  either (#838), so the worker submits no timeout of any kind. A connect
+  timeout is a deadline in a per-worker heap that bounds the wait for I/O,
+  as a timer's does; when it passes, the worker cancels the connect and it
+  resolves `TimedOut`, as before. A connect that completes before its
+  deadline pushes nothing, where it pushed an `ASYNC_CANCEL` of its Timeout
+  SQE. A connect with a timeout whose Connect is cancelled by something
+  other than the timeout now resolves `ECANCELED`; before, that completion
+  was ignored. The send backstop's next run, one second after a send starts
+  waiting for room and every second while one waits, is a deadline that
+  bounds the wait too. A connect cancel the submission queue has no room for
+  is retried on the next iteration.
 - io_uring: timers and the loop tick no longer use the ring (#838). A
   `sleep`, `timeout` or related timer records its deadline in a per-worker
   min-heap, the one the mio backend already used, and the worker passes the
@@ -951,8 +963,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
-- The `timer`, `tick_timeout` and `deadline` values of the `op` label on
-  `ringline/cqe_by_tag`: those completions no longer exist (#838).
+- The `timer`, `tick_timeout`, `deadline`, `timeout` and `send_backstop`
+  values of the `op` label on `ringline/cqe_by_tag`: those completions no
+  longer exist (#838).
 
 - **Breaking:** `DirectIoCompletion`, `NvmeCompletion` and `DirectIoOp` are
   no longer public. Nothing constructed the two completion types, and their
