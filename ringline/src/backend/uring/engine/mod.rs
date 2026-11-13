@@ -58,9 +58,9 @@ pub(crate) trait Engine: Sized {
     unsafe fn push_chain(&mut self, sqes: &[Sqe]) -> io::Result<()>;
 
     /// Start queued operations and block until at least `min_complete`
-    /// completions are ready. `EINTR` restarts; `EBUSY` (completions backed
-    /// up) and `EAGAIN` (no memory for a request) return `Ok` so the caller
-    /// reaps.
+    /// completions are ready. `EINTR` restarts; `EAGAIN` (no memory for a
+    /// request) and `EBUSY` return `Ok` so the caller reaps (see
+    /// `is_enter_backpressure` in `uring.rs`).
     fn submit_and_wait(&self, min_complete: u32) -> io::Result<()>;
 
     /// As [`submit_and_wait`](Self::submit_and_wait), but return once

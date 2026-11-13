@@ -103,9 +103,11 @@ fn probe_sizes(sq_entries: u32, cq_entries: u32) -> (u32, u32) {
 }
 
 /// Whether an `io_uring_enter` failure is temporary, so the caller carries on
-/// and reaps. `EBUSY`: the CQ is backed up (overflow list non-empty), and
-/// reaping frees it. `EAGAIN`: the kernel could not allocate a request for the
-/// first SQE (`io_submit_sqes`), which stays queued for the next enter.
+/// and reaps. `EAGAIN`: the kernel could not allocate a request for the first
+/// SQE (`io_submit_sqes`), which stays queued for the next enter. `EBUSY` is
+/// handled the same way in case a kernel refuses an enter while completions
+/// are backed up. Linux 6.12 and 7.1 do not: with 400 completions posted to a
+/// 16-entry CQ and not reaped, every submit and push succeeded.
 fn is_enter_backpressure(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EBUSY | libc::EAGAIN))
 }
