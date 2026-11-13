@@ -210,10 +210,11 @@ on the next loop iteration. Concretely:
   so a close requested while parked waits for the parked send to go out or
   for the retry cap to convert it into a terminal error. The existing
   close-notify deadline still bounds that wait. (#830 removed the cap. The
-  close deadline is armed only for a TLS close and for a connection whose
-  handshake or connect has not completed, so an application close of an
-  established plaintext connection behind a parked send now has no
-  deadline: it waits until the ring takes the send.)
+  close deadline is armed only by `DriverCtx::close` on a TLS connection
+  (the fatal-encrypt close) and for a connection whose handshake or connect
+  has not completed. An application close of an established connection,
+  plaintext or TLS, behind a parked send now has no deadline: it waits
+  until the ring takes the send.)
 
 After this, `DriverCtx::send` on io_uring can fail only before it has
 committed anything: stale token, or pool admission (Hole 1, now reserved

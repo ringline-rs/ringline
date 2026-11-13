@@ -89,7 +89,7 @@ length, as a TLS send does.
   (`WriteZero` for a zero-byte completion of a copy or zero-copy send).
 - A chain fails: its id settles with the first error, or `WriteZero` if it
   sent fewer bytes than it holds, and the connection closes.
-- A failure, close or give-up drains the connection's queue: every id on
+- A failure or close drains the connection's queue: every id on
   a drained entry settles `ConnectionAborted`.
 - A completion, or a dropped retry, that arrives after `close_submitted`:
   its id settles `ECANCELED`.
