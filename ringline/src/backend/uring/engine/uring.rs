@@ -285,7 +285,10 @@ impl UringEngine {
         // Try to push; if SQ is full, submit first to make room.
         unsafe {
             if self.ring.submission().push(&entry).is_err() {
-                self.make_sq_room(1)?;
+                if let Err(e) = self.make_sq_room(1) {
+                    crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+                    return Err(e);
+                }
                 if self.ring.submission().push(&entry).is_err() {
                     crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
                     return Err(io::Error::other("SQ still full after submit"));
@@ -346,7 +349,10 @@ impl UringEngine {
         let pair = [first, second];
         unsafe {
             if self.ring.submission().push_multiple(&pair).is_err() {
-                self.make_sq_room(2)?;
+                if let Err(e) = self.make_sq_room(2) {
+                    crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+                    return Err(e);
+                }
                 if self.ring.submission().push_multiple(&pair).is_err() {
                     crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
                     return Err(io::Error::other("SQ still full after submit"));
@@ -911,9 +917,16 @@ impl Engine for UringEngine {
             let sq = self.ring.submission();
             if sq.capacity() - sq.len() < entries128.len() {
                 drop(sq);
-                self.make_sq_room(entries128.len())?;
+                if let Err(e) = self.make_sq_room(entries128.len()) {
+                    crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+                    entries128.clear();
+                    self.chain_scratch = entries128;
+                    return Err(e);
+                }
                 let sq = self.ring.submission();
                 if sq.capacity() - sq.len() < entries128.len() {
+                    drop(sq);
+                    crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
                     entries128.clear();
                     self.chain_scratch = entries128;
                     return Err(io::Error::other("SQ too small for chain"));
@@ -931,6 +944,9 @@ impl Engine for UringEngine {
         // Return the scratch for reuse regardless of outcome.
         entries128.clear();
         self.chain_scratch = entries128;
+        if pushed.is_err() {
+            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+        }
         pushed?;
         Ok(())
     }

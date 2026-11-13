@@ -2697,8 +2697,9 @@ impl Driver {
             self.ring
                 .submit_recvmsg_multishot(fd_index, msghdr_ptr, bgid, ud)
         };
+        // A refused push is counted in `ring::SQE_SUBMIT_FAILURES` by the
+        // engine.
         if result.is_err() {
-            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
             self.udp_awaiting_buffers.push(udp_index);
         }
     }

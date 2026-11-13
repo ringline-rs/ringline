@@ -6093,6 +6093,50 @@ mod tests {
         );
     }
 
+    /// The run loop itself retries an owed receive: one iteration of `run()`
+    /// arms a receive the ring refused before the loop. A task polled in that
+    /// iteration, after the retry drains, sets the test fault, so `run()`
+    /// returns at the second iteration's fault check, before its wait.
+    #[test]
+    fn the_run_loop_arms_a_refused_receive() {
+        use std::os::fd::AsRawFd;
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let (_ours, peer) = attach_socketpair(&mut el, conn_index);
+        el.executor.recv_waiters[conn_index as usize] = true;
+        el.driver.ring.force_push_failures(1);
+        assert!(!el.arm_direct_recv(conn_index, None));
+        assert_eq!(el.driver.recv_arm_retries.len(), 1);
+
+        let fault = std::sync::Arc::new(crate::config::TestFault::default());
+        el.driver.test_fault = Some(fault.clone());
+        let stop = fault.clone();
+        let idx = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                stop.error.store(true, std::sync::atomic::Ordering::Release);
+            }))
+            .expect("free standalone slot");
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+
+        assert!(el.run().is_err(), "the fault ends the second iteration");
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(cs.recv_direct_armed, "the loop's retry armed the receive");
+        assert!(!cs.recv_arm_retry);
+        assert!(el.driver.recv_arm_retries.is_empty());
+
+        // The receive delivers the peer's bytes.
+        let n = unsafe { libc::write(peer.as_raw_fd(), b"ping".as_ptr().cast(), 4) };
+        assert_eq!(n, 4);
+        el.driver
+            .ring
+            .submit_and_wait(1)
+            .expect("submit_and_wait failed");
+        el.drain_completions();
+        assert_eq!(el.driver.recv_buffered(conn_index), 4);
+    }
+
     /// An owed receive is dropped when no receive is owed any more: the
     /// connection closed, or (plaintext) its reader is no longer parked.
     #[test]
@@ -12275,6 +12319,74 @@ mod tests {
             !el.driver.send_slab.in_use(0),
             "released after the notification"
         );
+    }
+
+    /// A zero-copy resubmit the ring keeps refusing stays on
+    /// `pending_zc_retries` with its slab entry and its send, the connection
+    /// open, until the ring takes it; the completion and notification of the
+    /// pushed send then settle it and release the entry (#830). Before #830
+    /// a third refusal failed the send and closed the connection.
+    #[test]
+    fn zc_retry_keeps_the_resubmit_until_the_ring_takes_it() {
+        const F_MORE: u32 = 2; // IORING_CQE_F_MORE
+        const F_NOTIF: u32 = 8; // IORING_CQE_F_NOTIF
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let data = Box::new([7u8; 100]);
+        let iovecs = [libc::iovec {
+            iov_base: data.as_ptr() as *mut _,
+            iov_len: 100,
+        }];
+        let guards = [const { None }; crate::buffer::send_slab::MAX_GUARDS];
+        let (slab_idx, _) = el
+            .driver
+            .send_slab
+            .allocate(conn_index, generation, &iovecs, u16::MAX, guards, 0, 100)
+            .unwrap();
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let id = await_slab(&mut el, conn_index, slab_idx, 100);
+
+        el.driver
+            .pending_zc_retries
+            .push((conn_index, generation, slab_idx));
+        el.driver.ring.force_push_failures(3);
+        el.driver.ring.last_pushed = None;
+        for retry in 1..=3 {
+            el.drain_zc_retries();
+            assert_eq!(
+                el.driver.pending_zc_retries,
+                vec![(conn_index, generation, slab_idx)],
+                "retry {retry}: the entry stays"
+            );
+            assert!(el.driver.send_slab.in_use(slab_idx), "retry {retry}");
+            assert!(el.driver.ring.last_pushed.is_none(), "retry {retry}");
+            assert!(send_result(&mut el, id).is_none(), "retry {retry}");
+            assert!(
+                !el.driver
+                    .connections
+                    .get(conn_index)
+                    .expect("the connection stays open")
+                    .close_requested(),
+                "retry {retry}: a refused push closes nothing"
+            );
+        }
+
+        el.drain_zc_retries();
+        assert!(el.driver.pending_zc_retries.is_empty());
+        let pushed = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
+        assert_eq!(pushed.tag(), Some(OpTag::SendMsgZc));
+        assert_eq!(pushed.payload() as u16, slab_idx);
+        el.test_dispatch_cqe(pushed.raw(), 100, F_MORE);
+        el.test_dispatch_cqe(pushed.raw(), 0, F_NOTIF);
+        assert_eq!(
+            send_result(&mut el, id)
+                .expect("the send completed")
+                .expect("the send succeeded"),
+            100
+        );
+        assert!(!el.driver.send_slab.in_use(slab_idx));
+        assert!(!el.driver.send_queues[conn_index as usize].in_flight);
     }
 
     /// A zero-copy send that gets `-ENOMEM` (its pages do not fit under

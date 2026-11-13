@@ -60,7 +60,8 @@ The codebase already has the right model for this condition next door:
 SQ as backpressure — the op is parked on `pending_copy_retries` /
 `pending_close_retries` and re-pushed on the next loop iteration; copy
 retries give up after two attempts by failing the waiter and closing the
-connection "so it isn't left open with a hole in its byte stream". mio never
+connection "so it isn't left open with a hole in its byte stream" (#830
+removed the cap). mio never
 fails a send on submission at all (queue, then write when writable). Queued
 sends are the odd one out.
 
@@ -208,7 +209,11 @@ on the next loop iteration. Concretely:
   machinery (`try_finalize_close` waits for `!in_flight && queue.is_empty()`),
   so a close requested while parked waits for the parked send to go out or
   for the retry cap to convert it into a terminal error. The existing
-  close-notify deadline still bounds that wait.
+  close-notify deadline still bounds that wait. (#830 removed the cap. The
+  close deadline is armed only for a TLS close and for a connection whose
+  handshake or connect has not completed, so an application close of an
+  established plaintext connection behind a parked send now has no
+  deadline: it waits until the ring takes the send.)
 
 After this, `DriverCtx::send` on io_uring can fail only before it has
 committed anything: stale token, or pool admission (Hole 1, now reserved
