@@ -164,7 +164,7 @@ fn a_late_disk_io_open_does_not_leak_its_fd() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(OPEN_ISSUED.load(Ordering::Acquire), "fs::open never issued");
-    if let Err(last) = wait_in_open("ringline-disk-i", Duration::from_secs(30)) {
+    if let Err(last) = wait_in_open("rl-disk-", Duration::from_secs(30)) {
         panic!("the disk-I/O thread never blocked in open(2); last syscall reads: {last}");
     }
 
@@ -173,7 +173,7 @@ fn a_late_disk_io_open_does_not_leak_its_fd() {
         h.join().expect("worker panicked").expect("worker error");
     }
     assert!(
-        thread_alive("ringline-disk-i"),
+        thread_alive("rl-disk-"),
         "the disk-I/O thread exited before the open completed; the test proves nothing"
     );
 
@@ -184,13 +184,10 @@ fn a_late_disk_io_open_does_not_leak_its_fd() {
         .open(&fifo)
         .expect("open fifo writer");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while thread_alive("ringline-disk-i") && Instant::now() < deadline {
+    while thread_alive("rl-disk-") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        !thread_alive("ringline-disk-i"),
-        "disk-I/O thread never exited"
-    );
+    assert!(!thread_alive("rl-disk-"), "disk-I/O thread never exited");
     drop(writer);
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -231,6 +228,7 @@ fn spawn_config() -> ringline::Config {
         .resolver_threads(0)
         .spawner_threads(1)
         .disk_io_threads(0)
+        .no_fs()
         .build()
         .expect("valid config")
 }
@@ -292,13 +290,10 @@ fn late_spawn_results_close_their_pidfds() {
     }
 
     let deadline = Instant::now() + Duration::from_secs(20);
-    while thread_alive("ringline-spawn") && Instant::now() < deadline {
+    while thread_alive("rl-spwn-") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        !thread_alive("ringline-spawn"),
-        "spawner thread never exited"
-    );
+    assert!(!thread_alive("rl-spwn-"), "spawner thread never exited");
     let deadline = Instant::now() + Duration::from_secs(5);
     while open_pidfds() > 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));

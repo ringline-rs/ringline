@@ -127,7 +127,13 @@ pub enum Error {
     ///   high-concurrency workloads. `ulimit -n 65536` or higher.
     /// - `RLIMIT_MEMLOCK` (io_uring): fixed buffers from
     ///   [`ConfigBuilder::registered_regions`](crate::ConfigBuilder::registered_regions)
-    ///   are pinned against it. `ulimit -l <KiB>`, or `CAP_IPC_LOCK`.
+    ///   are pinned against it, and from Linux 6.14 each worker's ring. A
+    ///   `cq_entries` left at its default is first lowered to fit (see
+    ///   [`ConfigBuilder::cq_entries`](crate::ConfigBuilder::cq_entries)), so
+    ///   this is returned when the rings do not fit even then, when
+    ///   `cq_entries` was set on the builder, or when an `sq_entries` or
+    ///   `max_connections` set there needs a larger CQ than fits.
+    ///   `ulimit -l <KiB>`, or `CAP_IPC_LOCK`.
     #[error("{0}")]
     ResourceLimit(String),
 
@@ -279,7 +285,18 @@ pub(crate) fn describe_ring_setup_failure(err: &io::Error, probe: &RingSetupProb
                 msg.push_str(&cause);
                 msg.push_str(", ");
             }
-            None => msg.push_str("Fix the underlying error, "),
+            // Before 6.10 the rings are one physically contiguous block, which
+            // can fail on fragmented memory; from 6.10 the kernel falls back to
+            // single pages.
+            None if probe.kernel.is_none_or(|k| (k.major, k.minor) < (6, 10)) => msg.push_str(
+                "Fix the underlying error (before Linux 6.10 the completion queue \
+                     is one physically contiguous block; a smaller \
+                     ConfigBuilder::cq_entries needs a smaller one), ",
+            ),
+            None => msg.push_str(
+                "Fix the underlying error (a smaller ConfigBuilder::cq_entries needs \
+                 less memory), ",
+            ),
         },
         _ => {
             msg.push_str("Fix the underlying error, ");
@@ -628,6 +645,18 @@ mod tests {
         assert!(text.contains("8192 KiB"), "{text}");
         assert!(text.contains("ulimit -l"), "{text}");
         assert!(text.contains("CAP_IPC_LOCK"), "{text}");
+    }
+
+    /// Before 6.10 the rings are one contiguous block, so the hint says so;
+    /// from 6.10 the kernel falls back to single pages (#831).
+    #[test]
+    fn setup_enomem_names_contiguous_memory_only_before_6_10() {
+        let old = describe_ring_setup_failure(&enomem(), &memlock_probe((6, 9), 8 << 20, false));
+        assert!(old.contains("physically contiguous"), "{old}");
+        assert!(old.contains("cq_entries"), "{old}");
+        let new = describe_ring_setup_failure(&enomem(), &memlock_probe((6, 12), 8 << 20, false));
+        assert!(!new.contains("contiguous"), "{new}");
+        assert!(new.contains("cq_entries"), "{new}");
     }
 
     #[test]

@@ -399,7 +399,7 @@ verify it on target machines.
 Ringline exposes the capacity decisions io_uring forces into the design:
 worker count, SQ and CQ sizing, connection slots, receive buffers, copied-send
 slots, zero-copy send slabs, and task slots. Timer slots are fixed at 65536
-per worker, the most the 16-bit slot field in a timer's completion can name.
+per worker.
 Configuration validation rejects zero or structurally invalid capacities.
 Runtime metrics report pool pressure and backend events so operators can distinguish a
 capacity limit from socket or kernel failure.

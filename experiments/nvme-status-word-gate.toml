@@ -1,0 +1,85 @@
+# Gate run for the file I/O audit's F7 (#871): a failed NVMe command's status
+# word reaches the caller as `NvmeStatus`, and the dead completion types are
+# gone. No NVMe device is available, so the mapping is pinned by a unit test
+# that runs on both backends (red when the word is mapped to `EIO`, checked on
+# macOS by mutation); this run compiles and gates the io_uring side
+# (`handle_nvme_cmd`, `DiskIoFuture`'s NVMe decode) in an ephemeral VM on the
+# `validation` agent, never by a login to a rig host.
+#
+# Prediction: unit_rc 0; every gate 0.
+#
+#   systemslab submit experiments/nvme-status-word-gate.toml
+name = "ringline nvme-status-word gate ({branch})"
+
+[params]
+branch = "fix-nvme-status-word"
+repo   = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "verify"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "z4.c"
+image = "debian-13-6.12"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 7200
+artifacts = ["/home/anvil/verify.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cat /etc/anvil-instance.json 2>/dev/null; echo
+rustc -V 2>/dev/null; uname -r
+cd /home/anvil
+{
+  uname -srm
+  echo "io_uring_disabled=$(sysctl -n kernel.io_uring_disabled 2>/dev/null || echo unset)"
+  cargo --version
+
+  git clone -q {repo} src && git -C src checkout -q {branch}
+  cd src && git log --oneline -3
+
+  ulimit -Sn 65536
+  echo "nofile_soft=$(ulimit -Sn)"
+
+  # This must be the io_uring build; a mio build would run none of the code
+  # under test and report green for it.
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  got=$(./target/debug/bench-server --print-backend)
+  [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; echo "gate_backend=1"; exit 1; }
+  echo "gate_backend=0 (backend=$got)"
+
+  # The uring gate, plus the lib tests of the two modules the change touches.
+  cargo test --locked -p ringline --lib -- nvme::tests direct_io::tests > /home/anvil/unit.out 2>&1; echo "unit_rc=$?"
+  grep -E '^test result' /home/anvil/unit.out
+  cargo fmt --all --check; echo "gate_fmt=$?"
+  cargo clippy --locked --all-targets -- -D warnings; echo "gate_clippy_uring=$?"
+  cargo clippy --locked --all-targets --features force-mio -- -D warnings; echo "gate_clippy_mio=$?"
+  cargo clippy --locked --all-targets --features tls-buffered -- -D warnings; echo "gate_clippy_tls=$?"
+  RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ringline; echo "gate_doc=$?"
+  cargo test --locked --all; echo "gate_test_uring=$?"
+} 2>&1 | tee /home/anvil/verify.log
+exit 0
+'''
+
+[[jobs.steps]]
+type = "shell"
+command = '''
+fail=0
+grep -q "^gate_backend=0" verify.log || { echo "FAIL gate_backend"; fail=1; }
+grep -q "^unit_rc=0" verify.log || { echo "FAIL unit tests"; fail=1; }
+for gate in gate_fmt gate_clippy_uring gate_clippy_mio gate_clippy_tls gate_doc gate_test_uring; do
+  if ! grep -q "^${gate}=0" verify.log; then
+    got=$(grep -oE "^${gate}=[0-9]+" verify.log | head -1)
+    echo "FAIL ${gate}: ${got:-never reached}"
+    fail=1
+  else
+    echo "ok   ${gate}"
+  fi
+done
+exit $fail
+'''

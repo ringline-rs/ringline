@@ -50,6 +50,7 @@ mod backend_mio;
 #[cfg(has_io_uring)]
 mod backend_uring;
 pub(crate) mod buffered;
+pub(crate) mod handshake_deadline;
 // The incoming-ciphertext buffer belongs to the unbuffered engine and has no
 // other consumer, so it shares the engine's gate; under `tls-buffered` every
 // item in the module would be dead code.
@@ -895,6 +896,15 @@ impl TlsTable {
 /// The error a reader sees for a record the TLS engine could not process.
 pub(crate) fn record_layer_error(e: ringline_tls::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+/// The error an outbound connect resolves with when the peer's FIN arrives
+/// before the TLS handshake completes.
+pub(crate) fn handshake_eof() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "peer closed the connection during the TLS handshake",
+    )
 }
 
 /// Result of feeding ciphertext into a TLS connection.

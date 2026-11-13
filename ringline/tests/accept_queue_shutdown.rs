@@ -103,6 +103,7 @@ fn test_config(workers: usize) -> ringline::Config {
         .resolver_threads(0)
         .spawner_threads(0)
         .disk_io_threads(0)
+        .no_fs()
         .build()
         .expect("valid config")
 }
@@ -128,13 +129,10 @@ fn assert_no_fds_left(baseline: &HashSet<RawFd>) {
 
 fn wait_for_acceptor_exit() {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while thread_alive("ringline-accept") && Instant::now() < deadline {
+    while thread_alive("rl-acpt-") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        !thread_alive("ringline-accept"),
-        "acceptor thread never exited"
-    );
+    assert!(!thread_alive("rl-acpt-"), "acceptor thread never exited");
 }
 
 /// Blocks the worker thread in `on_start` until `WORKER_RELEASED`, so it

@@ -106,8 +106,7 @@ fn open_fds() -> HashSet<RawFd> {
         .collect()
 }
 
-/// Whether a thread whose name starts with `prefix` is alive. The kernel
-/// truncates thread names to 15 bytes.
+/// Whether a thread whose name starts with `prefix` is alive.
 fn thread_alive(prefix: &str) -> bool {
     std::fs::read_dir("/proc/self/task")
         .expect("read /proc/self/task")
@@ -236,11 +235,11 @@ fn a_late_wake_does_not_write_into_a_reused_fd() {
     // The pool thread wakes the worker after the task returns and exits after
     // that, since its request channel has closed.
     let deadline = Instant::now() + STARVED;
-    while thread_alive("ringline-blocki") && Instant::now() < deadline {
+    while thread_alive("rl-blok-") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        !thread_alive("ringline-blocki"),
+        !thread_alive("rl-blok-"),
         "blocking pool thread never exited"
     );
 
@@ -319,6 +318,7 @@ fn a_running_worker_keeps_its_wake_fd_open() {
         .resolver_threads(0)
         .spawner_threads(0)
         .disk_io_threads(0)
+        .no_fs()
         .build()
         .expect("valid config");
     let baseline = open_fds();
@@ -439,7 +439,7 @@ fn a_late_disk_io_wake_does_not_write_into_a_reused_fd() {
         DISK_OPEN_ISSUED.load(Ordering::Acquire),
         "fs::open never issued"
     );
-    if let Err(last) = wait_in_open("ringline-disk-i", Duration::from_secs(30)) {
+    if let Err(last) = wait_in_open("rl-disk-", Duration::from_secs(30)) {
         panic!("the disk-I/O thread never blocked in open(2); last syscall reads: {last}");
     }
 
@@ -449,7 +449,7 @@ fn a_late_disk_io_wake_does_not_write_into_a_reused_fd() {
         h.join().expect("worker panicked").expect("worker error");
     }
     assert!(
-        thread_alive("ringline-disk-i"),
+        thread_alive("rl-disk-"),
         "the disk-I/O thread exited before the open completed; the test proves nothing"
     );
     let freed: Vec<RawFd> = before.iter().copied().filter(|&fd| !is_open(fd)).collect();
@@ -483,13 +483,10 @@ fn a_late_disk_io_wake_does_not_write_into_a_reused_fd() {
         .open(&fifo)
         .expect("open fifo writer");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while thread_alive("ringline-disk-i") && Instant::now() < deadline {
+    while thread_alive("rl-disk-") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        !thread_alive("ringline-disk-i"),
-        "disk-I/O thread never exited"
-    );
+    assert!(!thread_alive("rl-disk-"), "disk-I/O thread never exited");
     drop(writer);
 
     let mut stray = Vec::new();

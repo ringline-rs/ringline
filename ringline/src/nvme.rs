@@ -10,12 +10,19 @@
 //! - Linux 5.19+ for `IORING_OP_URING_CMD`
 //! - Linux 6.1+ already required by ringline for `SendMsgZc`
 //! - NVMe device accessible via `/dev/ng*` (requires `CAP_SYS_ADMIN` or udev rules)
+//!
+//! io_uring only: on the mio backend every NVMe call returns `Unsupported`.
+//! On io_uring a call that finds the ring's submission queue full submits the
+//! queue inline before pushing, and returns the error if that submit fails,
+//! leaving nothing in flight (see the `fs` module docs).
 
 use std::marker::PhantomData;
 
-/// NVMe I/O command opcodes (NVM command set).
+/// NVM command set opcode: flush.
 pub const NVME_CMD_FLUSH: u8 = 0x00;
+/// NVM command set opcode: write.
 pub const NVME_CMD_WRITE: u8 = 0x01;
+/// NVM command set opcode: read.
 pub const NVME_CMD_READ: u8 = 0x02;
 
 /// NVMe uring_cmd opcode passed as `cmd_op` to `IORING_OP_URING_CMD`.
@@ -88,6 +95,10 @@ impl NvmeUringCmd {
     /// - `num_blocks`: Number of blocks to read (1-based; 1 = one block)
     /// - `buf_addr`: Userspace buffer address for the read data
     /// - `buf_len`: Buffer length in bytes
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_blocks` is 0.
     pub fn read(nsid: u32, lba: u64, num_blocks: u16, buf_addr: u64, buf_len: u32) -> Self {
         NvmeUringCmd {
             opcode: NVME_CMD_READ,
@@ -119,6 +130,10 @@ impl NvmeUringCmd {
     /// - `num_blocks`: Number of blocks to write (1-based; 1 = one block)
     /// - `buf_addr`: Userspace buffer address containing write data
     /// - `buf_len`: Buffer length in bytes
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_blocks` is 0.
     pub fn write(nsid: u32, lba: u64, num_blocks: u16, buf_addr: u64, buf_len: u32) -> Self {
         NvmeUringCmd {
             opcode: NVME_CMD_WRITE,
@@ -204,7 +219,7 @@ impl NvmeUringCmd {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct NvmeDevice {
     pub(crate) index: u16,
-    pub(crate) generation: u16,
+    pub(crate) generation: u32,
     /// Makes the handle `!Send`.
     _not_send: PhantomData<*const ()>,
 }
@@ -219,7 +234,7 @@ impl std::fmt::Debug for NvmeDevice {
 }
 
 impl NvmeDevice {
-    pub(crate) fn new(index: u16, generation: u16) -> Self {
+    pub(crate) fn new(index: u16, generation: u32) -> Self {
         NvmeDevice {
             index,
             generation,
@@ -242,7 +257,7 @@ pub(crate) struct NvmeDeviceState {
     /// Whether this slot is in use.
     pub active: bool,
     /// Generation counter for stale-handle detection.
-    pub generation: u16,
+    pub generation: u32,
     /// Number of commands currently in flight.
     pub in_flight: u32,
     /// Closed with commands in flight: the last completion unregisters the
@@ -319,6 +334,8 @@ struct NvmeCmdEntry {
     device_index: u16,
     /// Whether this slot is in use.
     in_use: bool,
+    /// The SQE's user_data, recorded before the SQE is pushed.
+    user_data: u64,
 }
 
 impl NvmeCmdSlab {
@@ -329,6 +346,7 @@ impl NvmeCmdSlab {
             entries.push(NvmeCmdEntry {
                 device_index: 0,
                 in_use: false,
+                user_data: 0,
             });
             free_list.push(i);
         }
@@ -361,28 +379,88 @@ impl NvmeCmdSlab {
     pub fn in_use(&self, idx: u16) -> bool {
         self.entries.get(idx as usize).is_some_and(|e| e.in_use)
     }
+
+    /// Whether any command holds a slot, so its operation has not completed.
+    pub fn has_in_flight(&self) -> bool {
+        self.free_list.len() < self.entries.len()
+    }
+
+    /// Record the user_data of slot `idx`'s SQE, which worker exit cancels.
+    pub fn set_user_data(&mut self, idx: u16, user_data: u64) {
+        self.entries[idx as usize].user_data = user_data;
+    }
+
+    /// The user_data of every command that holds a slot.
+    pub fn in_flight_user_data(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries
+            .iter()
+            .filter(|e| e.in_use)
+            .map(|e| e.user_data)
+    }
 }
 
-/// Result of an NVMe command completion.
+/// The status word of an NVMe command the device failed.
 ///
-/// Delivered to the NVMe completion handler.
-#[derive(Debug, Clone)]
-pub struct NvmeCompletion {
-    /// The device this command was submitted to.
-    pub device: NvmeDevice,
-    /// Command slab sequence number (from the payload of `nvme_read`/`nvme_write`).
-    pub seq: u32,
-    /// io_uring result code. Negative values are -errno.
-    pub result: i32,
+/// The inner error of the `io::Error` of kind `Other` that [`nvme_read`](crate::nvme_read),
+/// [`nvme_write`](crate::nvme_write) and [`nvme_flush`](crate::nvme_flush)
+/// resolve to for such a command: `error.get_ref()` or `error.into_inner()`
+/// gives it, and it downcasts to this type. It is not in the `source()` chain.
+/// A command that failed in transport resolves to the errno's `io::Error`
+/// instead. The word is the 15-bit status field of the completion queue
+/// entry: status code type in bits 8 to 10, status code in bits 0 to 7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvmeStatus(u16);
+
+impl NvmeStatus {
+    /// The status word.
+    pub fn word(&self) -> u16 {
+        self.0
+    }
+
+    /// Bits 8 to 10: the status code type (0 generic, 1 command-specific,
+    /// 2 media and data integrity, 3 path, 7 vendor-specific).
+    pub fn code_type(&self) -> u8 {
+        ((self.0 >> 8) & 0x7) as u8
+    }
+
+    /// Bits 0 to 7: the status code within its type.
+    pub fn code(&self) -> u8 {
+        (self.0 & 0xFF) as u8
+    }
 }
 
-impl NvmeCompletion {
-    /// Whether the command completed successfully.
-    pub fn is_success(&self) -> bool {
-        // 0 is success. Positive values are the NVMe status word (SCT/SC,
-        // e.g. 0x281 media error) placed in cqe->res by the kernel's
-        // passthrough completion; negative values are transport errnos.
-        self.result == 0
+impl std::fmt::Display for NvmeStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NVMe status 0x{:x}", self.0)
+    }
+}
+
+impl std::error::Error for NvmeStatus {}
+
+/// Below this (negated) the disk-I/O result of an NVMe command is an errno;
+/// at or above it, a status word.
+const STATUS_RESULT_BASE: i32 = 0x1_0000;
+
+/// The disk-I/O result of an NVMe command's `cqe->res`: 0 and a negative
+/// errno pass through, and a positive status word (the device failed the
+/// command) becomes a negative value at or below `-0x1_0000`, past every
+/// errno, so the result stays an error and keeps the word.
+pub(crate) fn status_result(res: i32) -> i32 {
+    if res > 0 {
+        -(STATUS_RESULT_BASE | (res & 0xFFFF))
+    } else {
+        res
+    }
+}
+
+/// The error a negative disk-I/O result of an NVMe command resolves to.
+pub(crate) fn error_from_result(result: i32) -> std::io::Error {
+    debug_assert!(result < 0);
+    if result <= -STATUS_RESULT_BASE {
+        let word = ((-result) & 0xFFFF) as u16;
+        std::io::Error::other(NvmeStatus(word))
+    } else {
+        std::io::Error::from_raw_os_error(-result)
     }
 }
 
@@ -415,6 +493,16 @@ impl NvmeConfig {
     }
 
     /// Set the most NVMe commands in flight across all devices, per worker. Defaults to 256.
+    ///
+    /// Each command slot has 16,384 operation keys. A future holds one from
+    /// submission until it takes its result or is dropped on the worker that
+    /// created it. A future that is neither polled to completion nor dropped
+    /// keeps its key after its command completes, and one dropped on another
+    /// thread keeps it for the life of that worker. The slot freed last is
+    /// reused first, so in a serial workload 16,384 such futures make every
+    /// later operation fail with `every disk-I/O key for this slab slot is held
+    /// by a future`, until one of them takes its result or is dropped on that
+    /// worker, while other slots are free.
     pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
         self.max_commands_in_flight = max_commands_in_flight;
         self
@@ -424,6 +512,31 @@ impl NvmeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A positive `cqe->res` is the status word the device returned; it
+    /// resolves to an error that carries the word. Zero and a negative errno
+    /// resolve as before.
+    #[test]
+    fn a_status_word_reaches_the_caller_as_the_errors_inner_error() {
+        assert_eq!(status_result(0), 0);
+        assert_eq!(status_result(-libc::EINVAL), -libc::EINVAL);
+        let encoded = status_result(0x281);
+        assert!(encoded < 0, "a status word is an error");
+        let err = error_from_result(encoded);
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        let status = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<NvmeStatus>())
+            .copied()
+            .expect("the error's inner error is the status word");
+        assert_eq!(status.word(), 0x281);
+        assert_eq!(status.code_type(), 2, "media and data integrity");
+        assert_eq!(status.code(), 0x81, "unrecovered read error");
+        assert_eq!(err.to_string(), "NVMe status 0x281");
+        let errno = error_from_result(-libc::EINVAL);
+        assert_eq!(errno.raw_os_error(), Some(libc::EINVAL));
+        assert!(errno.get_ref().is_none());
+    }
 
     #[test]
     fn builder_sets_each_field_and_default_keeps_the_rest() {
@@ -503,6 +616,20 @@ mod tests {
         assert_eq!(c, a);
         // Generation incremented.
         assert_eq!(table.get(c).unwrap().generation, 1);
+    }
+
+    /// A slot reused 65,536 times does not repeat its first generation, so a
+    /// handle kept from the first open stays stale (#862).
+    #[test]
+    fn generation_does_not_repeat_after_65536_releases() {
+        let mut table = NvmeDeviceTable::new(1);
+        let index = table.allocate().unwrap();
+        let first = table.get(index).unwrap().generation;
+        for _ in 0..65_536 {
+            table.release(index);
+            assert_eq!(table.allocate(), Some(index));
+        }
+        assert_ne!(table.get(index).unwrap().generation, first);
     }
 
     #[test]

@@ -26,6 +26,21 @@ pub(crate) struct TestFault {
     /// Panic in the drain that follows.
     #[cfg(has_io_uring)]
     pub(crate) panic_in_drain: std::sync::atomic::AtomicBool,
+    /// Submit no cancels for disk commands at worker exit, standing in for
+    /// an operation a cancel cannot end.
+    #[cfg(has_io_uring)]
+    pub(crate) keep_disk_commands_at_exit: std::sync::atomic::AtomicBool,
+    /// Hold every disk-I/O pool request a thread starts until cleared, after
+    /// it is marked running, standing in for a slow `pread`.
+    #[cfg(not(has_io_uring))]
+    pub(crate) hold_disk_io: std::sync::atomic::AtomicBool,
+    /// Set by a disk-I/O pool thread once it holds a request.
+    #[cfg(not(has_io_uring))]
+    pub(crate) disk_io_held: std::sync::atomic::AtomicBool,
+    /// Requests a disk-I/O pool thread answered without running, after the
+    /// worker exited.
+    #[cfg(not(has_io_uring))]
+    pub(crate) disk_io_skipped: std::sync::atomic::AtomicU32,
 }
 
 #[cfg(test)]
@@ -61,11 +76,38 @@ impl TestFault {
     }
 }
 
+/// The largest `sq_entries` Linux accepts (`IORING_MAX_ENTRIES`).
+const MAX_SQ_ENTRIES: u32 = 32768;
+
+/// The largest `cq_entries` Linux accepts (`IORING_MAX_CQ_ENTRIES`), and the
+/// default.
+pub(crate) const MAX_CQ_ENTRIES: u32 = 65536;
+
+/// The default `sq_entries`.
+pub(crate) const DEFAULT_SQ_ENTRIES: u32 = 4096;
+
+/// The default `max_connections`.
+pub(crate) const DEFAULT_MAX_CONNECTIONS: u32 = 16000;
+
+/// Which of the sizes launch may lower to fit `RLIMIT_MEMLOCK` the caller
+/// set on the builder (see `crate::memlock::fit_ring_sizes`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SizesSet {
+    pub(crate) max_connections: bool,
+    pub(crate) sq_entries: bool,
+    pub(crate) cq_entries: bool,
+}
+
 /// Configuration for the io_uring driver.
 #[derive(Clone)]
 pub struct Config {
-    /// Number of SQ entries. CQ will be 4x this.
+    /// Number of SQ entries.
     pub(crate) sq_entries: u32,
+    /// Number of CQ entries.
+    pub(crate) cq_entries: u32,
+    /// Which of `max_connections`, `sq_entries` and `cq_entries` the caller
+    /// set, so launch lowers only the others to fit `RLIMIT_MEMLOCK`.
+    pub(crate) sizes_set: SizesSet,
     /// Enable SQPOLL mode (kernel-side submission polling).
     pub(crate) sqpoll: bool,
     /// SQPOLL idle timeout in milliseconds.
@@ -217,6 +259,9 @@ pub struct Config {
     pub(crate) listener_tls: Vec<Option<TlsConfig>>,
     /// Optional TLS client configuration for outbound `connect(addr).tls(..)` calls.
     pub(crate) tls_client: Option<TlsClientConfig>,
+    /// How long a TLS handshake may take, inbound or outbound, before the
+    /// connection is closed. See [`ConfigBuilder::tls_handshake_timeout`].
+    pub(crate) tls_handshake_timeout: std::time::Duration,
     /// Enable TCP_NODELAY on all connections (accepted and outbound).
     pub(crate) tcp_nodelay: bool,
     /// Where connections are accepted. Always `Pool` without the
@@ -378,20 +423,27 @@ pub struct Config {
     /// 0 = disabled (no blocking pool; [`spawn_blocking()`](crate::spawn_blocking)
     /// will return an error). Default: 4.
     pub(crate) blocking_threads: usize,
-    /// Number of dedicated disk I/O threads (mio backend only). The disk I/O
-    /// pool executes blocking filesystem syscalls (pread, pwrite, fsync, stat,
-    /// rename, unlink, mkdir) on background threads, enabling async file I/O
-    /// on non-Linux platforms.
+    /// Number of disk I/O threads per worker (mio backend only). Each worker's
+    /// pool runs the blocking file syscalls (open, pread, pwrite, fsync, stat,
+    /// lstat, rename, unlink, mkdir) off the event loop.
     ///
-    /// 0 = disabled (filesystem/direct I/O operations return `Unsupported`).
+    /// 0 = no pool. On the mio backend `validate` refuses 0 while `fs` (on by
+    /// default) or `direct_io` is set. On io_uring the pool is not used.
     /// Default: 2.
     pub(crate) disk_io_threads: usize,
 }
 
+/// Default for [`ConfigBuilder::tls_handshake_timeout`].
+const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Largest value [`ConfigBuilder::tls_handshake_timeout`] accepts.
+const MAX_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            sq_entries: 256,
+            sq_entries: DEFAULT_SQ_ENTRIES,
+            cq_entries: MAX_CQ_ENTRIES,
+            sizes_set: SizesSet::default(),
             sqpoll: false,
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
@@ -407,7 +459,7 @@ impl Default for Config {
             max_registered_regions: 64,
             worker: WorkerConfig::default(),
             backlog: 65535,
-            max_connections: 16000,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             recv_accumulator_capacity: 4096,
             recv_accumulator_max: 1024 * 1024 * 1024,
             recv_direct_region: 32 * 1024,
@@ -426,10 +478,11 @@ impl Default for Config {
             send_zc_threshold: 4096,
             send_slab_slots: 512,
             flush_interval_us: 100,
-            tick_timeout_us: 1000,
+            tick_timeout_us: 10_000,
             tls: None,
             listener_tls: Vec::new(),
             tls_client: None,
+            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             tcp_nodelay: true,
             accept_mode: AcceptMode::Pool,
             task_panic_policy: crate::TaskPanicPolicy::Contain,
@@ -574,6 +627,13 @@ impl Config {
             ));
         }
         self.validate_tls_slot_size()?;
+        if self.tls_handshake_timeout.is_zero()
+            || self.tls_handshake_timeout > MAX_TLS_HANDSHAKE_TIMEOUT
+        {
+            return Err(crate::error::Error::RingSetup(
+                "tls_handshake_timeout must be > 0 and at most 60 s".into(),
+            ));
+        }
         // A cap of 0 would stop a forward's source before it queues its first
         // send, so the forward never makes progress.
         if self.forward_hold_cap == 0 {
@@ -587,6 +647,24 @@ impl Config {
             return Err(crate::error::Error::RingSetup(
                 "sq_entries must be at least 2 and a power of two".into(),
             ));
+        }
+        // Linux refuses larger queues, and a CQ smaller than the SQ, with
+        // EINVAL, which the setup error would blame on the kernel version.
+        if self.sq_entries > MAX_SQ_ENTRIES {
+            return Err(crate::error::Error::RingSetup(format!(
+                "sq_entries must be at most {MAX_SQ_ENTRIES}, the largest submission \
+                 queue Linux allows"
+            )));
+        }
+        if !self.cq_entries.is_power_of_two()
+            || self.cq_entries < self.sq_entries
+            || self.cq_entries > MAX_CQ_ENTRIES
+        {
+            return Err(crate::error::Error::RingSetup(format!(
+                "cq_entries must be a power of two, at least sq_entries ({}) and at \
+                 most {MAX_CQ_ENTRIES}, the largest completion queue Linux allows",
+                self.sq_entries
+            )));
         }
         // The kernel rejects a limit above INT_MAX.
         if self.iowq_max_workers > i32::MAX as u32 {
@@ -662,6 +740,25 @@ impl Config {
                 return Err(crate::error::Error::RingSetup(
                     "udp_recv_buffer.buffer_size must be >= 66048 when udp_gro is enabled \
                      (a coalesced GRO datagram is up to ~64 KiB plus recvmsg metadata)"
+                        .into(),
+                ));
+            }
+        }
+        // On mio every fs operation, and every direct I/O read, write and
+        // fsync, runs on the disk-I/O pool, so a file subsystem with no pool
+        // would fail at the first operation that needs it.
+        if !cfg!(has_io_uring) && self.disk_io_threads == 0 {
+            if self.fs.is_some() {
+                return Err(crate::error::Error::RingSetup(
+                    "disk_io_threads is 0 with fs enabled; the mio backend runs file \
+                     operations on that pool: set disk_io_threads or call no_fs()"
+                        .into(),
+                ));
+            }
+            if self.direct_io.is_some() {
+                return Err(crate::error::Error::RingSetup(
+                    "disk_io_threads is 0 with direct_io enabled; the mio backend runs \
+                     direct I/O on that pool: set disk_io_threads or leave direct_io unset"
                         .into(),
                 ));
             }
@@ -770,9 +867,15 @@ impl ConfigBuilder {
 
     // ── Connection settings ──────────────────────────────────────────
 
-    /// Set the maximum number of direct file descriptors (connections).
+    /// Set the maximum number of direct file descriptors (connections) per
+    /// worker. Default: 16000.
+    ///
+    /// Left at the default, launch on io_uring may lower it, with
+    /// [`cq_entries`](Self::cq_entries), when `RLIMIT_MEMLOCK` is too low for
+    /// the default rings. A value set here is kept.
     pub fn max_connections(mut self, n: u32) -> Self {
         self.config.max_connections = n;
+        self.config.sizes_set.max_connections = true;
         self
     }
 
@@ -859,10 +962,58 @@ impl ConfigBuilder {
 
     // ── io_uring settings ────────────────────────────────────────────
 
-    /// Set the number of SQ entries. CQ will be 4x this. Must be a power of 2
-    /// and at least 2.
+    /// Set the number of SQ entries. Must be a power of 2, at least 2 and at
+    /// most 32768, the largest submission queue Linux allows, and at most
+    /// [`cq_entries`](Self::cq_entries). Default: 4096.
+    ///
+    /// An operation submitted when the SQ is full submits the queue inline
+    /// first, so a larger SQ means fewer of those submits.
+    ///
+    /// Left at the default, launch may lower it, with
+    /// [`cq_entries`](Self::cq_entries), when `RLIMIT_MEMLOCK` is too low for
+    /// the default rings. A value set here is kept.
     pub fn sq_entries(mut self, n: u32) -> Self {
         self.config.sq_entries = n;
+        self.config.sizes_set.sq_entries = true;
+        self
+    }
+
+    /// Set the number of CQ entries (io_uring backend only). Must be a power
+    /// of 2, at least [`sq_entries`](Self::sq_entries) and at most 65536, the
+    /// largest completion queue Linux allows. Default: 65536.
+    ///
+    /// Completions that do not fit in the CQ wait in a kernel overflow list,
+    /// which the kernel allocates as they arrive. When that allocation fails,
+    /// the completion is dropped and the operation it belonged to never
+    /// completes; the `ring` metrics count both (`cq_overflow`,
+    /// `cqe_dropped`). A large CQ keeps completions out of that list.
+    ///
+    /// Each CQ entry is 32 bytes, so the default CQ is 2 MiB per worker. From
+    /// Linux 6.14 the kernel charges each ring to `RLIMIT_MEMLOCK`, summed
+    /// over every process of the user. Launch raises the soft limit when the
+    /// hard limit allows. When the hard limit is too low for the workers'
+    /// rings and this is left at the default, launch halves it until the
+    /// rings fit, down to 1024 entries, and lowers the
+    /// [`sq_entries`](Self::sq_entries) and
+    /// [`max_connections`](Self::max_connections) left at their defaults in
+    /// proportion: a CQ of `c` gives an SQ of `c / 16` and
+    /// `c * 16000 / 65536` connections. An `sq_entries` or `max_connections`
+    /// set on the builder that a smaller CQ cannot hold in that proportion
+    /// stops the fit. A fitted launch writes one line to stderr naming the
+    /// sizes, and [`Runtime::cq_entries`](crate::Runtime::cq_entries) and the
+    /// related accessors report them. When nothing fits, launch fails with
+    /// [`Error::ResourceLimit`](crate::Error::ResourceLimit). To have launch
+    /// fail instead of running at smaller sizes, set `cq_entries` here. When
+    /// launch fails, raise the limit, run with `CAP_IPC_LOCK`, or set a
+    /// smaller `cq_entries`.
+    ///
+    /// Before Linux 6.10 the kernel allocates the CQ and its ring header as
+    /// one physically contiguous block, 4 MiB at the default, which can fail
+    /// with `ENOMEM` on a host whose memory is fragmented; 32768 entries fit
+    /// in 2 MiB.
+    pub fn cq_entries(mut self, n: u32) -> Self {
+        self.config.cq_entries = n;
+        self.config.sizes_set.cq_entries = true;
         self
     }
 
@@ -1090,7 +1241,23 @@ impl ConfigBuilder {
 
     // ── Timing settings ──────────────────────────────────────────────
 
-    /// Set the tick timeout in microseconds. 0 = block indefinitely.
+    /// Set the tick interval in microseconds: the longest a worker waits for
+    /// I/O before calling [`on_tick`](crate::AsyncEventHandler::on_tick)
+    /// again (default 10,000, 10 ms). 0 = no tick: the wait ends only at a
+    /// completion or the worker's earliest timer, TLS handshake or close
+    /// deadline. Timers fire at their own deadlines whatever this is. On mio
+    /// this setting has no effect: the wait is at most 10 ms.
+    ///
+    /// On io_uring the tick also sets how often a worker publishes its
+    /// connection count to the other workers, which merged accept mode reads
+    /// to place and park connections. On an idle worker it sets how long work
+    /// deferred by a full submission queue or a full peer channel waits for
+    /// its retry: one tick for a send, the eventfd read that carries
+    /// cross-thread wakes, a hangup poll or a park hand-off, and four ticks
+    /// for a Close or `shutdown`. A park drain lasts 64 loop iterations, so on
+    /// an idle worker 64 ticks. An idle worker wakes once per tick: at 1 ms
+    /// one pinned worker used 3.5% of a core, and at 10 ms 0.5% (Linux 6.12
+    /// VM).
     pub fn tick_timeout_us(mut self, us: u64) -> Self {
         self.config.tick_timeout_us = us;
         self
@@ -1192,19 +1359,30 @@ impl ConfigBuilder {
 
     // ── Optional subsystems ──────────────────────────────────────────
 
-    /// Set NVMe passthrough configuration.
+    /// Enable NVMe passthrough (io_uring only). On io_uring each worker
+    /// reserves `max_devices` fixed-file slots and allocates its device table
+    /// and command slab; on mio the config is accepted and every NVMe call
+    /// returns `Unsupported`.
     pub fn nvme(mut self, config: crate::nvme::NvmeConfig) -> Self {
         self.config.nvme = Some(config);
         self
     }
 
-    /// Set direct I/O configuration.
+    /// Enable direct I/O. On io_uring each worker reserves `max_files`
+    /// fixed-file slots and allocates its file table and command slab; on
+    /// mio the files open with `O_DIRECT` (`F_NOCACHE` on macOS) and their
+    /// operations run on the disk-I/O pool.
     pub fn direct_io(mut self, config: crate::direct_io::DirectIoConfig) -> Self {
         self.config.direct_io = Some(config);
         self
     }
 
-    /// Set filesystem I/O configuration.
+    /// Configure filesystem I/O, which is on by default with
+    /// `FsConfig::default()`. On io_uring each worker reserves `max_files`
+    /// fixed-file slots and allocates its file table and command slab; on
+    /// mio the operations run on the disk-I/O pool, at most
+    /// [`max_commands_in_flight`](crate::fs::FsConfig::max_commands_in_flight)
+    /// in flight. [`no_fs`](Self::no_fs) turns it off.
     pub fn fs(mut self, config: crate::fs::FsConfig) -> Self {
         self.config.fs = Some(config);
         self
@@ -1240,7 +1418,13 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the number of disk I/O threads (mio backend only). 0 = disabled.
+    /// Set the number of disk I/O threads per worker (mio backend only): each
+    /// worker with fs or direct I/O configured runs its own pool, so a runtime
+    /// runs `workers × threads` of them, named `rl-disk-<worker>-<thread>`.
+    ///
+    /// 0 means no pool: on the mio backend `build()` then fails while `fs`
+    /// (on by default; see [`no_fs`](Self::no_fs)) or `direct_io` is set. On
+    /// io_uring the value is accepted and unused.
     pub fn disk_io_threads(mut self, threads: usize) -> Self {
         self.config.disk_io_threads = threads;
         self
@@ -1249,6 +1433,28 @@ impl ConfigBuilder {
     /// Set TLS server configuration.
     pub fn tls(mut self, config: TlsConfig) -> Self {
         self.config.tls = Some(config);
+        self
+    }
+
+    /// How long a TLS handshake may take before the connection is closed.
+    ///
+    /// An inbound connection's timeout starts when its worker registers it,
+    /// and an outbound one's when its TCP connect completes. A connection
+    /// whose handshake has not completed by then is closed, and an outbound
+    /// `connect(..).tls(..)` resolves
+    /// [`TimedOut`](std::io::ErrorKind::TimedOut). No task holds an inbound
+    /// connection before its handshake completes, so a peer that keeps the
+    /// socket open and sends nothing would otherwise hold it until the worker
+    /// exits.
+    /// [`metrics::conn::TLS_HANDSHAKE_TIMEOUT`](crate::metrics::conn::TLS_HANDSHAKE_TIMEOUT)
+    /// counts the closes. [`TcpConnect::timeout`] covers the TCP connect
+    /// only.
+    ///
+    /// Must be greater than zero and at most 60 s. Default: 10 s.
+    ///
+    /// [`TcpConnect::timeout`]: crate::TcpConnect::timeout
+    pub fn tls_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.config.tls_handshake_timeout = timeout;
         self
     }
 
@@ -1286,6 +1492,7 @@ impl ConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Helper: create a Config with a single field override.
     /// Avoids clippy::field_reassign_with_default on the multi-field Config struct.
@@ -1293,6 +1500,33 @@ mod tests {
         let mut c = Config::default();
         f(&mut c);
         c
+    }
+
+    /// On mio, `disk_io_threads(0)` with the file subsystems on is refused at
+    /// `build()`, since every file operation would fail; with `no_fs` it
+    /// builds.
+    #[cfg(not(has_io_uring))]
+    #[test]
+    fn disk_io_threads_zero_with_fs_is_rejected_on_mio() {
+        let err = ConfigBuilder::new()
+            .disk_io_threads(0)
+            .build()
+            .err()
+            .expect("fs is on by default, so no pool to run it on is an error");
+        assert!(err.to_string().contains("no_fs"), "{err}");
+        let err = ConfigBuilder::new()
+            .no_fs()
+            .direct_io(crate::direct_io::DirectIoConfig::default())
+            .disk_io_threads(0)
+            .build()
+            .err()
+            .expect("direct I/O with no pool is an error");
+        assert!(err.to_string().contains("direct_io"), "{err}");
+        ConfigBuilder::new()
+            .no_fs()
+            .disk_io_threads(0)
+            .build()
+            .expect("no file subsystem needs the pool");
     }
 
     #[test]
@@ -1328,6 +1562,21 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn tls_handshake_timeout_defaults_to_10_s() {
+        let config = ConfigBuilder::new().build().expect("default config");
+        assert_eq!(config.tls_handshake_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn tls_handshake_timeout_is_bounded() {
+        let build = |t| ConfigBuilder::new().tls_handshake_timeout(t).build();
+        assert!(build(Duration::ZERO).is_err());
+        assert!(build(Duration::from_nanos(1)).is_ok());
+        assert!(build(Duration::from_secs(60)).is_ok());
+        assert!(build(Duration::from_secs(60) + Duration::from_nanos(1)).is_err());
     }
 
     #[test]
@@ -1409,6 +1658,42 @@ mod tests {
     #[test]
     fn validate_sq_entries_not_power_of_two_rejected() {
         assert!(config_with(|c| c.sq_entries = 3).validate().is_err());
+    }
+
+    /// Linux refuses an SQ above 32768 entries, a CQ above 65536, and a CQ
+    /// smaller than the SQ, with EINVAL (#835, #831).
+    #[test]
+    fn validate_queue_sizes_past_the_kernel_limits_rejected() {
+        assert!(
+            config_with(|c| {
+                c.sq_entries = 32768;
+                c.cq_entries = 65536;
+            })
+            .validate()
+            .is_ok()
+        );
+        let err = config_with(|c| c.sq_entries = 65536)
+            .validate()
+            .expect_err("an SQ of 65536 entries");
+        assert!(err.to_string().contains("at most 32768"), "{err}");
+        let err = config_with(|c| c.cq_entries = 131072)
+            .validate()
+            .expect_err("a CQ of 131072 entries");
+        assert!(err.to_string().contains("at most 65536"), "{err}");
+        let err = config_with(|c| {
+            c.sq_entries = 1024;
+            c.cq_entries = 512;
+        })
+        .validate()
+        .expect_err("a CQ smaller than the SQ");
+        assert!(err.to_string().contains("at least sq_entries"), "{err}");
+        assert!(config_with(|c| c.cq_entries = 3000).validate().is_err());
+    }
+
+    #[test]
+    fn the_default_queues_are_4096_and_65536() {
+        let config = ConfigBuilder::new().build().expect("defaults are valid");
+        assert_eq!((config.sq_entries, config.cq_entries), (4096, 65536));
     }
 
     #[test]

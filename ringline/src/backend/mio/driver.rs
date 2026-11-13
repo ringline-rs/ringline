@@ -140,6 +140,10 @@ pub(crate) fn clear_pending_sends_into(
     }
 }
 
+/// The longest worker exit waits for disk-I/O operations already running,
+/// the same bound the io_uring exit drain uses.
+const DISK_IO_EXIT_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Per-worker mio driver state.
 pub(crate) struct Driver {
     pub(crate) connections: ConnectionTable,
@@ -153,6 +157,10 @@ pub(crate) struct Driver {
     pub(crate) send_queues: Vec<ConnSendState>,
     pub(crate) accept_rx: Option<crate::handoff::Receiver<crate::acceptor::AcceptedConn>>,
     pub(crate) wake_handle: crate::wakeup::WakeFd,
+    /// Set by a disk-I/O pool thread that wrote the wake pipe, cleared by
+    /// `drain_channels` before it reads the responses, so a burst of
+    /// completions writes the pipe once (`disk_io_pool::wake_coalesced`).
+    pub(crate) disk_io_wake_pending: Arc<AtomicBool>,
     pub(crate) shutdown_flag: Arc<AtomicBool>,
     pub(crate) shutdown_local: bool,
     /// Handles task panics caught on this worker, under the runtime's policy.
@@ -196,6 +204,8 @@ pub(crate) struct Driver {
     pub(crate) writable: Vec<bool>,
     /// Per-connection connect timeout deadline (None if no timeout or not connecting).
     pub(crate) connect_deadlines: Vec<Option<std::time::Instant>>,
+    /// TLS handshakes in progress and their deadlines.
+    pub(crate) handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines,
     /// The wake pipe's read end, registered with mio as `WAKE_TOKEN`. Not
     /// owned: the worker's `WakeHandle` owns it, and `Config::wake_keep_alive`
     /// holds that handle until the worker exits.
@@ -278,7 +288,22 @@ pub(crate) struct Driver {
     /// not been drained yet. Not reissued: with no slab slot to keep a key
     /// busy, a dropped future's key would otherwise be handed out while its
     /// operation still runs (#574).
-    pub(crate) disk_io_in_flight: std::collections::HashSet<u32>,
+    pub(crate) disk_io_in_flight:
+        std::collections::HashMap<u32, crate::disk_io_pool::PoolSubsystem>,
+    /// Entries of `disk_io_in_flight` per subsystem, indexed by
+    /// `PoolSubsystem`.
+    pub(crate) disk_io_counts: [u16; 2],
+    /// Each subsystem's `max_commands_in_flight`, indexed by `PoolSubsystem`;
+    /// `None` when it is not configured. A submit at the bound fails.
+    pub(crate) disk_io_limits: [Option<u16>; 2],
+    /// The keys in `disk_io_in_flight` whose request reads or writes through
+    /// a caller's buffer address: `fs::read`/`fs::write` and
+    /// `direct_io_read`/`direct_io_write`. Worker exit waits for these.
+    pub(crate) disk_io_borrowing: std::collections::HashSet<u32>,
+    /// Set by [`drain_disk_io_at_exit`](Self::drain_disk_io_at_exit) when an
+    /// operation was still running at its bound. A pool thread can still use
+    /// the operation's buffer, so the worker leaks its event loop (#856).
+    pub(crate) disk_io_outstanding: bool,
 
     // ── Direct I/O file management ──────────��───────────────────────
     /// Direct I/O file table (allocates file slots and generations).
@@ -296,13 +321,51 @@ pub(crate) struct Driver {
     pub(crate) fs_fds: Vec<Option<Arc<OwnedFd>>>,
     /// Pending fs_open requests: maps seq → file_index. On completion, the
     /// opened fd (`DiskIoResponse::opened`) is stored in `fs_fds[file_index]`.
-    /// On failure, the file slot is released. If the seq is in
-    /// `Executor::abandoned_fs_opens`, the fd is dropped and the slot released
-    /// instead.
+    /// On failure, the file slot is released. If the open was abandoned
+    /// (`Executor::take_abandoned_open` returns true), the fd is dropped and
+    /// the slot released instead.
     pub(crate) pending_fs_opens: std::collections::HashMap<u32, u16>,
 }
 
 impl Driver {
+    /// At worker exit: tell the disk-I/O pool to answer the requests it has
+    /// not started with `-ECANCELED`, then wait up to [`DISK_IO_EXIT_BOUND`]
+    /// for the started ones that use a caller's buffer (`disk_io_borrowing`).
+    /// Any other request uses only memory its closure owns, which outlives
+    /// the worker. Responses are dropped: no task is polled again. Sets
+    /// `disk_io_outstanding` if one is still running at the bound.
+    pub(crate) fn drain_disk_io_at_exit(&mut self) {
+        let Some(pool) = self.disk_io_pool.as_ref() else {
+            return;
+        };
+        let mut wait: std::collections::HashSet<u32> = {
+            let mut state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.abandon = true;
+            state
+                .running
+                .iter()
+                .filter(|seq| self.disk_io_borrowing.contains(seq))
+                .copied()
+                .collect()
+        };
+        if let Some(rx) = self.disk_io_rx.as_ref() {
+            let deadline = std::time::Instant::now() + DISK_IO_EXIT_BOUND;
+            while !wait.is_empty() {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(left) {
+                    Ok(response) => {
+                        wait.remove(&response.seq);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        self.disk_io_outstanding = !wait.is_empty();
+    }
+
     /// Bytes the connection holds that no consumer has taken: the
     /// accumulator. The arrival log takes the first unread stream offset as
     /// `delivered - recv_buffered`.
@@ -469,6 +532,7 @@ impl Driver {
             // it used to be wrapped here, making every pool wake an EBADF
             // no-op observed only at the poll timeout (~10 ms).
             wake_handle: wake_fd,
+            disk_io_wake_pending: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_fault: config.test_fault.clone(),
             panic_reporter: crate::task_panic::PanicReporter::new(
@@ -499,6 +563,10 @@ impl Driver {
             connect_pending: 0,
             writable: vec![false; max_conn],
             connect_deadlines: vec![None; max_conn],
+            handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines::new(
+                config.tls_handshake_timeout,
+                config.max_connections,
+            ),
             wake_pipe_fd: eventfd,
             tcp_nodelay: config.tcp_nodelay,
             forward_conn: (0..max_conn).map(|_| None).collect(),
@@ -519,7 +587,14 @@ impl Driver {
             disk_io_tx,
             disk_io_pool,
             next_disk_io_seq: 0,
-            disk_io_in_flight: std::collections::HashSet::new(),
+            disk_io_in_flight: std::collections::HashMap::new(),
+            disk_io_counts: [0; 2],
+            disk_io_limits: [
+                config.fs.as_ref().map(|f| f.max_commands_in_flight),
+                config.direct_io.as_ref().map(|d| d.max_commands_in_flight),
+            ],
+            disk_io_borrowing: std::collections::HashSet::new(),
+            disk_io_outstanding: false,
             direct_io_files: config
                 .direct_io
                 .as_ref()
@@ -572,8 +647,12 @@ impl Driver {
             disk_io_pool: &self.disk_io_pool,
             disk_io_tx: &self.disk_io_tx,
             wake_handle: self.wake_handle,
+            disk_io_wake_pending: &self.disk_io_wake_pending,
             next_disk_io_seq: &mut self.next_disk_io_seq,
             disk_io_in_flight: &mut self.disk_io_in_flight,
+            disk_io_counts: &mut self.disk_io_counts,
+            disk_io_limits: self.disk_io_limits,
+            disk_io_borrowing: &mut self.disk_io_borrowing,
             direct_io_files: &mut self.direct_io_files,
             direct_io_fds: &mut self.direct_io_fds,
             fs_files: &mut self.fs_files,
@@ -606,15 +685,25 @@ impl Driver {
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
-        if let Some(conn) = self.connections.get_mut(conn_index) {
+        let established = if let Some(conn) = self.connections.get_mut(conn_index) {
             if conn.close_requested() {
                 return; // already closing
             }
             conn.lifecycle = Lifecycle::Closing;
+            conn.established
         } else {
             return;
-        }
+        };
         self.send_queues[idx].close_pending = true;
+        // Before its handshake (or connect) completes, a connection drains its
+        // queue, so the peer receives the rest of the handshake flight and any
+        // alert, but only until the close deadline: a peer that stopped
+        // reading would otherwise hold the slot while the flight waits for
+        // room. `drain_pending_closes` stops waiting once it passes.
+        if !established {
+            self.send_queues[idx].close_notify_deadline =
+                Some(std::time::Instant::now() + crate::handler::CLOSE_NOTIFY_TIMEOUT);
+        }
         self.pending_closes.push(conn_index);
     }
 
@@ -650,11 +739,17 @@ impl Driver {
         // above issued the FIN when it drained the queue, and a write after
         // it fails with `EPIPE`. A shutdown still pending here has no stream
         // to write to. `queue_tls_close_notify` and `DriverCtx::close` apply
-        // the rule on io_uring.
-        let alert_allowed = self
-            .connections
-            .get(conn_index)
-            .is_some_and(|c| matches!(c.write, WriteHalf::Open));
+        // the rule on io_uring. No alert either while sends are still queued
+        // or the flush failed: the alert would follow an unsent or partly
+        // written record, and the peer would read a corrupt stream. That is
+        // the case for a connection closed before its handshake completed
+        // whose close deadline passed.
+        let alert_allowed = flush_error.is_none()
+            && self.pending_sends[idx].is_empty()
+            && self
+                .connections
+                .get(conn_index)
+                .is_some_and(|c| matches!(c.write, WriteHalf::Open));
 
         if let Some(ref mut stream) = self.tcp_streams[idx] {
             use std::io::Write;
@@ -714,6 +809,7 @@ impl Driver {
         self.send_queues[idx].queue.clear();
         self.send_queues[idx].in_flight = false;
         self.send_queues[idx].close_pending = false;
+        self.send_queues[idx].close_notify_deadline = None;
 
         // The future dropped at teardown may have owned a half, whose `Drop`
         // queues an orphan that finds a changed generation. Clear the flags

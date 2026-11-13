@@ -1,31 +1,25 @@
-//! Direct I/O via io_uring (`O_DIRECT` + `IORING_OP_READ` / `IORING_OP_WRITE`).
+//! Direct I/O: reads, writes and fsync on a file or block device opened
+//! with `O_DIRECT`, which bypasses the page cache.
 //!
-//! This module provides types for submitting asynchronous file I/O through
-//! io_uring using `O_DIRECT`, bypassing the page cache while still going
-//! through the kernel block layer. This is a more portable alternative to
-//! NVMe passthrough — it works on any file or block device, not just NVMe
-//! character devices.
+//! On io_uring the operations are `IORING_OP_READ`, `IORING_OP_WRITE` and
+//! `IORING_OP_FSYNC` on a fixed file. On mio they are `pread`, `pwrite` and
+//! `fsync` on the disk-I/O pool, with `F_NOCACHE` in place of `O_DIRECT` on
+//! macOS. On io_uring a call that finds the ring's submission queue full
+//! submits the queue inline before pushing, and returns the error if that
+//! submit fails, leaving nothing in flight (see the `fs` module docs).
 //!
 //! # Alignment requirements
 //!
-//! `O_DIRECT` requires that:
-//! - Buffer addresses are aligned to the logical block size (typically 512 or 4096 bytes)
-//! - I/O sizes are multiples of the logical block size
-//! - File offsets are multiples of the logical block size
-//!
-//! The caller is responsible for meeting these alignment requirements.
-//! Violating them results in `-EINVAL` from the kernel.
-//!
-//! # Kernel requirements
-//!
-//! - Linux 5.6+ for basic io_uring read/write
-//! - Linux 6.1+ already required by ringline for `SendMsgZc`
+//! With `O_DIRECT` (Linux) the buffer address, the length and the file
+//! offset of a read or write must each be a multiple of the device's logical
+//! block size (typically 512 or 4096 bytes), or the kernel returns `EINVAL`.
+//! `F_NOCACHE` on macOS has no such requirement.
 
 use std::marker::PhantomData;
 
-/// Operation type for tracking what kind of I/O was submitted.
+/// The operation a command slab entry holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirectIoOp {
+pub(crate) enum DirectIoOp {
     Read,
     Write,
     Fsync,
@@ -96,7 +90,7 @@ impl DirectIoOpenOptions {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DirectIoFile {
     pub(crate) index: u16,
-    pub(crate) generation: u16,
+    pub(crate) generation: u32,
     /// Makes the handle `!Send`.
     _not_send: PhantomData<*const ()>,
 }
@@ -111,7 +105,7 @@ impl std::fmt::Debug for DirectIoFile {
 }
 
 impl DirectIoFile {
-    pub(crate) fn new(index: u16, generation: u16) -> Self {
+    pub(crate) fn new(index: u16, generation: u32) -> Self {
         DirectIoFile {
             index,
             generation,
@@ -133,7 +127,7 @@ pub(crate) struct DirectIoFileState {
     /// Whether this slot is in use.
     pub active: bool,
     /// Generation counter for stale-handle detection.
-    pub generation: u16,
+    pub generation: u32,
     /// Number of commands currently in flight.
     pub in_flight: u32,
     /// Closed with commands in flight: the last completion unregisters the
@@ -205,6 +199,8 @@ struct DirectIoCmdEntry {
     op: DirectIoOp,
     /// Whether this slot is in use.
     in_use: bool,
+    /// The SQE's user_data, recorded before the SQE is pushed.
+    user_data: u64,
 }
 
 /// Tracks in-flight direct I/O commands for resource cleanup on completion.
@@ -222,6 +218,7 @@ impl DirectIoCmdSlab {
                 file_index: 0,
                 op: DirectIoOp::Read,
                 in_use: false,
+                user_data: 0,
             });
             free_list.push(i);
         }
@@ -251,37 +248,23 @@ impl DirectIoCmdSlab {
     pub fn in_use(&self, idx: u16) -> bool {
         self.entries.get(idx as usize).is_some_and(|e| e.in_use)
     }
-}
 
-/// Result of a direct I/O command completion.
-///
-/// Delivered to the direct I/O completion handler.
-#[derive(Debug, Clone)]
-pub struct DirectIoCompletion {
-    /// The file this command was submitted to.
-    pub file: DirectIoFile,
-    /// The operation type (read, write, or fsync).
-    pub op: DirectIoOp,
-    /// Command slab sequence number (from the return value of the submit method).
-    pub seq: u32,
-    /// io_uring result code. For read/write: bytes transferred on success.
-    /// Negative values are -errno.
-    pub result: i32,
-}
-
-impl DirectIoCompletion {
-    /// Whether the command completed successfully.
-    pub fn is_success(&self) -> bool {
-        self.result >= 0
+    /// Whether any command holds a slot, so its operation has not completed.
+    pub fn has_in_flight(&self) -> bool {
+        self.free_list.len() < self.entries.len()
     }
 
-    /// Returns the number of bytes transferred, if the operation succeeded.
-    pub fn bytes_transferred(&self) -> Option<u32> {
-        if self.result >= 0 {
-            Some(self.result as u32)
-        } else {
-            None
-        }
+    /// Record the user_data of slot `idx`'s SQE, which worker exit cancels.
+    pub fn set_user_data(&mut self, idx: u16, user_data: u64) {
+        self.entries[idx as usize].user_data = user_data;
+    }
+
+    /// The user_data of every command that holds a slot.
+    pub fn in_flight_user_data(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries
+            .iter()
+            .filter(|e| e.in_use)
+            .map(|e| e.user_data)
     }
 }
 
@@ -314,6 +297,20 @@ impl DirectIoConfig {
     }
 
     /// Set the most I/O commands in flight across all files, per worker. Defaults to 256.
+    ///
+    /// Reads, writes and fsyncs count from submission until their completion
+    /// is processed. One submitted at the limit fails with
+    /// `direct I/O command slab exhausted`, on both backends.
+    ///
+    /// On io_uring each command slot has 16,384 operation keys. A future holds
+    /// one from submission until it takes its result or is dropped on the
+    /// worker that created it. A future that is neither polled to completion
+    /// nor dropped keeps its key after its command completes, and one dropped
+    /// on another thread keeps it for the life of that worker. The slot freed
+    /// last is reused first, so in a serial workload 16,384 such futures make
+    /// every later operation fail with `every disk-I/O key for this slab slot
+    /// is held by a future`, until one of them takes its result or is dropped
+    /// on that worker, while other slots are free.
     pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
         self.max_commands_in_flight = max_commands_in_flight;
         self
@@ -368,6 +365,20 @@ mod tests {
         assert_eq!(table.get(c).unwrap().generation, 1);
     }
 
+    /// A slot reused 65,536 times does not repeat its first generation, so a
+    /// handle kept from the first open stays stale (#862).
+    #[test]
+    fn generation_does_not_repeat_after_65536_releases() {
+        let mut table = DirectIoFileTable::new(1);
+        let index = table.allocate().unwrap();
+        let first = table.get(index).unwrap().generation;
+        for _ in 0..65_536 {
+            table.release(index);
+            assert_eq!(table.allocate(), Some(index));
+        }
+        assert_ne!(table.get(index).unwrap().generation, first);
+    }
+
     #[test]
     fn cmd_slab_alloc_release() {
         let mut slab = DirectIoCmdSlab::new(8);
@@ -401,26 +412,5 @@ mod tests {
         assert!(table.allocate().is_some());
         assert!(table.allocate().is_some());
         assert!(table.allocate().is_none());
-    }
-
-    #[test]
-    fn completion_bytes_transferred() {
-        let success = DirectIoCompletion {
-            file: DirectIoFile::new(0, 0),
-            op: DirectIoOp::Read,
-            seq: 0,
-            result: 4096,
-        };
-        assert!(success.is_success());
-        assert_eq!(success.bytes_transferred(), Some(4096));
-
-        let failure = DirectIoCompletion {
-            file: DirectIoFile::new(0, 0),
-            op: DirectIoOp::Write,
-            seq: 1,
-            result: -libc::EINVAL,
-        };
-        assert!(!failure.is_success());
-        assert_eq!(failure.bytes_transferred(), None);
     }
 }

@@ -5,7 +5,8 @@ use crate::buffer::fixed::RegionId;
 /// Trait for user-provided zero-copy send guards.
 ///
 /// The guard keeps registered memory alive until the kernel ZC notification
-/// arrives. Implement this for your cache/storage types (e.g., ValueRef).
+/// arrives, or, on a Unix-domain connection (io_uring) and on the mio backend,
+/// until the send has copied it. Implement this for your cache/storage types (e.g., ValueRef).
 pub trait SendGuard: Send + 'static {
     /// Pointer and length of the data to send.
     fn as_ptr_len(&self) -> (*const u8, u32);

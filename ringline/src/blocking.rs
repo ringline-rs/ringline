@@ -47,7 +47,7 @@ impl BlockingPool {
             let rx = request_rx.clone();
             let keep_alive = std::sync::Arc::clone(&wake_keep_alive);
             let handle = thread::Builder::new()
-                .name(format!("ringline-blocking-{i}"))
+                .name(format!("rl-blok-{i}"))
                 .spawn(move || {
                     // Set SCHED_IDLE priority — lowest possible (Linux only).
                     #[cfg(target_os = "linux")]

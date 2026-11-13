@@ -26,6 +26,9 @@ pub(crate) struct AsyncEventLoop<A: AsyncEventHandler> {
     driver: Driver,
     handler: A,
     executor: Executor,
+    /// The iteration's events, copied out of `driver.events` so the handlers
+    /// can borrow the driver; kept across iterations for its capacity.
+    event_list: Vec<(mio::Token, bool, bool, bool)>,
 }
 
 impl<A: AsyncEventHandler> AsyncEventLoop<A> {
@@ -60,17 +63,52 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.panic_reporter.report_worker_drained(worker);
     }
 
-    /// The mio backend has nothing in the kernel to wait for; the connections
-    /// still open are counted out before the event loop is dropped.
+    /// Wait for the disk-I/O operations in flight, and count out the
+    /// connections still open, before the event loop is dropped.
     pub(crate) fn drain_after_failure(&mut self) {
+        self.driver.drain_disk_io_at_exit();
         self.driver.count_out_open_connections();
     }
 
-    /// The mio backend has no ring.
+    /// Whether exit left a raw-pointer read or write (`disk_io_borrowing`)
+    /// running on a pool thread, which can still use memory the event loop and
+    /// its tasks own; the caller must then leak the event loop (#856).
+    pub(crate) fn memory_in_use_at_exit(&self) -> bool {
+        self.driver.disk_io_outstanding
+    }
+
+    /// Release what a leaked event loop would otherwise hold for the life of
+    /// the process. The mio backend has no ring; the name matches the io_uring
+    /// backend.
     ///
     /// # Safety
     /// No requirement; the signature matches the io_uring backend.
-    pub(crate) unsafe fn close_ring(&mut self) {}
+    pub(crate) unsafe fn close_ring(&mut self) {
+        // Close the connections queued for this worker, as `Driver::drop`
+        // would, so the acceptor sees the worker gone and routes around it.
+        drop(self.driver.accept_rx.take());
+        // Close this worker's sockets: no task reads or writes them again,
+        // and a peer then sees the connection end.
+        for stream in self.driver.tcp_streams.iter_mut() {
+            drop(stream.take());
+        }
+        self.driver.udp_sockets.clear();
+        self.executor.wakes.deregister();
+        // A pool's threads exit when the last reference to it goes; the
+        // blocking, resolver and spawner pools are shared by the workers. A
+        // disk-I/O thread still running an operation finishes it first, into
+        // memory the leaked loop keeps valid. Dropping the receiver closes an
+        // fd that a late open sends.
+        self.driver.blocking_pool = None;
+        self.driver.resolver = None;
+        self.driver.spawner = None;
+        self.driver.disk_io_pool = None;
+        self.driver.blocking_tx = None;
+        self.driver.resolve_tx = None;
+        self.driver.spawn_tx = None;
+        self.driver.disk_io_tx = None;
+        self.driver.disk_io_rx = None;
+    }
 
     /// The first task panic recorded under `TaskPanicPolicy::Shutdown`.
     pub(crate) fn take_task_panic(&mut self) -> Option<crate::JoinError> {
@@ -104,12 +142,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             && (config.direct_io.is_some() || config.fs.is_some())
         {
             let pool = Arc::new(crate::disk_io_pool::DiskIoPool::start(
+                config.worker_index,
                 config.disk_io_threads,
                 // `None` only in unit tests, which hold their own `WakeHandle`.
                 config
                     .wake_keep_alive
                     .clone()
                     .unwrap_or_else(|| Arc::from(Vec::new())),
+                #[cfg(test)]
+                config.test_fault.clone(),
             ));
             let (tx, rx) = crossbeam_channel::unbounded::<crate::disk_io_pool::DiskIoResponse>();
             (Some(rx), Some(tx), Some(pool))
@@ -157,6 +198,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             driver,
             handler,
             executor,
+            event_list: Vec::with_capacity(1024),
         })
     }
 
@@ -222,8 +264,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let mut recv_buf = vec![0u8; 8192];
 
         loop {
-            // 1. Fire expired timers.
+            // 1. Fire expired timers, and close TLS connections whose
+            // handshake deadline has passed.
             self.fire_expired_timers();
+            self.check_handshake_deadlines();
 
             // 2. Compute poll timeout from nearest timer deadline. Don't
             // block at all while tasks are already runnable (woken after the
@@ -269,10 +313,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.driver.recv_batch.begin();
 
             // 4. Handle events.
-            // Collect events into a temporary vec to avoid borrow conflict
-            // (self.driver.events borrows driver, but handlers need &mut driver).
-            let mut event_list: Vec<(mio::Token, bool, bool, bool)> =
-                Vec::with_capacity(self.driver.events.iter().count());
+            // Copy the events out so the handlers can borrow the driver
+            // (`self.driver.events` borrows it). The Vec is kept on `self`
+            // for its capacity, so no iteration allocates.
+            let mut event_list = std::mem::take(&mut self.event_list);
+            event_list.clear();
             for event in self.driver.events.iter() {
                 let is_err = event.is_error()
                     || event.is_read_closed()
@@ -286,7 +331,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 ));
             }
 
-            for (token, readable, writable, is_err) in event_list {
+            for (token, readable, writable, is_err) in event_list.drain(..) {
                 match token {
                     WAKE_TOKEN => {
                         if readable {
@@ -335,6 +380,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     }
                 }
             }
+            self.event_list = event_list;
 
             // 5. Drain cross-thread channels unconditionally (not just on wake
             //    events). On macOS/kqueue, SourceFd edge-triggered semantics can
@@ -443,6 +489,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
             // 9. Check shutdown.
             if self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed) {
+                self.driver.drain_disk_io_at_exit();
                 self.driver.count_out_open_connections();
                 return Ok(());
             }
@@ -477,6 +524,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// Called unconditionally on every event loop iteration (not just on wake
     /// pipe events) to avoid missed wakeups on macOS/kqueue.
     fn drain_channels(&mut self) {
+        // A disk-I/O completion queued from here on writes the wake pipe
+        // again; one queued before is read below. A swap, not a store: if a
+        // pool thread's swap comes first in the flag's order, its release
+        // synchronizes with this acquire, so the channel read below sees its
+        // response; otherwise that thread reads `false` and writes the pipe.
+        // The load skips the swap on an iteration with no disk-I/O wake. If it
+        // reads `false` while the flag is set, the pool thread that set it first
+        // wrote the pipe and that byte has not been read here (reading it would
+        // make the set visible to this load), so the next poll returns and the
+        // next iteration swaps.
+        if self.driver.disk_io_wake_pending.load(Ordering::Relaxed) {
+            self.driver
+                .disk_io_wake_pending
+                .swap(false, Ordering::AcqRel);
+        }
         // Drain accept channel (server mode).
         loop {
             let item = match self.driver.accept_rx {
@@ -562,6 +624,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 if tls_table.create(conn_index, Some(listener)).is_err() {
                     self.driver.close_connection(conn_index);
+                } else {
+                    let generation = self.driver.connections.generation(conn_index);
+                    let driver = &mut self.driver;
+                    driver
+                        .handshake_deadlines
+                        .arm(conn_index, generation, |i, g| {
+                            crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+                        });
                 }
                 continue;
             }
@@ -610,11 +680,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Drain disk I/O responses.
         if let Some(ref rx) = self.driver.disk_io_rx {
             while let Ok(response) = rx.try_recv() {
-                // The operation is done: its key may be handed out again.
-                self.driver.disk_io_in_flight.remove(&response.seq);
+                // The operation is done: its key may be handed out again, and
+                // it no longer counts against its subsystem's bound.
+                if let Some(subsystem) = self.driver.disk_io_in_flight.remove(&response.seq) {
+                    self.driver.disk_io_counts[subsystem as usize] -= 1;
+                }
+                self.driver.disk_io_borrowing.remove(&response.seq);
                 // Handle fs_open completions: install fd or release slot.
                 if let Some(file_index) = self.driver.pending_fs_opens.remove(&response.seq) {
-                    if self.executor.abandoned_fs_opens.remove(&response.seq) {
+                    if self.executor.take_abandoned_open(response.seq) {
                         // Nothing holds a handle to this file: drop the fd, if
                         // the open succeeded, and free the slot.
                         drop(response.opened);
@@ -640,11 +714,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     continue;
                 }
 
-                // If the response carries metadata (stat), store it.
-                if let Some(metadata) = response.metadata {
-                    self.executor.fs_stat_results.insert(response.seq, metadata);
-                }
-                self.executor.wake_disk_io(response.seq, response.result);
+                // A stat's metadata travels with the result.
+                self.executor
+                    .wake_disk_io_with(response.seq, response.result, response.metadata);
             }
         }
 
@@ -872,6 +944,22 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         self.finish_forward_at_eof(conn_index);
                         if let Some(cs) = self.driver.connections.get_mut(conn_index) {
                             cs.note_eof(!close_notify_seen);
+                        }
+                        let established = self
+                            .driver
+                            .connections
+                            .get(conn_index)
+                            .is_some_and(|c| c.established);
+                        if !established {
+                            // The handshake has not completed, so no task
+                            // holds the connection and nothing else would
+                            // close it. Close it here. An outbound connect
+                            // resolves with `handshake_eof()`; an inbound
+                            // connection has no task to report to.
+                            self.executor
+                                .wake_connect(conn_index, Err(crate::tls::handshake_eof()));
+                            self.driver.close_connection(conn_index);
+                            break;
                         }
                         self.executor.wake_recv(conn_index);
                         break;
@@ -1174,6 +1262,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                         self.driver.mark_send_dirty(idx);
                     }
                     let _ = self.driver.flush_sends(conn_index);
+                    let generation = self.driver.connections.generation(conn_index);
+                    let driver = &mut self.driver;
+                    driver
+                        .handshake_deadlines
+                        .arm(conn_index, generation, |i, g| {
+                            crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+                        });
                     return;
                 }
 
@@ -1402,10 +1497,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// the loop back here. A write error clears `pending_sends`
     /// (`fail_connection_on_send_error`), which ends the deferral.
     ///
-    /// The deferral is unbounded, as on io_uring for plaintext; mio has no
-    /// equivalent of io_uring's TLS `close_notify_deadline`, so a TLS peer
-    /// that half-closes and stops reading holds its slot until the write
-    /// errors.
+    /// The deferral is unbounded, as on io_uring for plaintext, except for a
+    /// connection closed before its handshake or connect completed: its
+    /// `close_notify_deadline` ends the wait, and `finish_close` then writes
+    /// what the socket takes and drops the rest. mio sets no deadline for a
+    /// task's close, so a TLS peer that half-closes and stops reading holds
+    /// its slot until the write errors.
     ///
     /// Executor cleanup runs first — the slot must not be released (and
     /// reusable) while a stale parked future, waiter flags, or a recv-sink
@@ -1419,8 +1516,11 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.send_queues[idx].close_pending,
                 "pending_closes entry {conn_index} without close_pending"
             );
-            let sends_drained =
-                self.driver.pending_sends[idx].is_empty() || self.driver.tcp_streams[idx].is_none();
+            let sends_drained = self.driver.pending_sends[idx].is_empty()
+                || self.driver.tcp_streams[idx].is_none()
+                || self.driver.send_queues[idx]
+                    .close_notify_deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline);
             if !sends_drained {
                 self.driver.mark_send_dirty(idx);
                 i += 1;
@@ -1505,19 +1605,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Fire all expired timers and push the associated tasks to the ready queue.
     fn fire_expired_timers(&mut self) {
-        let now = Instant::now();
-        // Heap-driven expiry: O(log n) per fired timer instead of a full
-        // pool scan per loop iteration.
-        while let Some((slot, generation)) = self.executor.timer_pool.pop_expired(now) {
-            if let Some(waker_id) = self.executor.timer_pool.fire(slot, generation) {
-                self.executor.wake_task(waker_id);
-            }
-        }
+        self.executor.fire_expired_timers();
 
         // Check for timed-out connect operations. `connect_pending` counts
         // armed deadlines so the common no-outbound-connects case skips the
         // scan entirely.
         if self.driver.connect_pending > 0 {
+            let now = Instant::now();
             let mut timed_out: Vec<u32> = Vec::new();
             for (idx, deadline) in self.driver.connect_deadlines.iter().enumerate() {
                 if let Some(dl) = deadline
@@ -1540,11 +1634,38 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// peek — no pool scan).
     fn compute_poll_timeout(&mut self) -> Duration {
         let default = Duration::from_millis(10); // default tick interval
-        match self.executor.timer_pool.next_deadline() {
-            Some(deadline) => deadline
-                .saturating_duration_since(Instant::now())
-                .min(default),
-            None => default,
+        let deadline = match (
+            self.executor.timer_pool.next_deadline(),
+            self.driver.handshake_deadlines.next_deadline(),
+        ) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(d), None) | (None, Some(d)) => d,
+            (None, None) => return default,
+        };
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(default)
+    }
+
+    /// Close every TLS connection whose handshake has not completed by its
+    /// deadline (`ConfigBuilder::tls_handshake_timeout`). An outbound connect
+    /// resolves `TimedOut`; an inbound connection has no task to report to.
+    fn check_handshake_deadlines(&mut self) {
+        if self.driver.handshake_deadlines.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        loop {
+            let driver = &mut self.driver;
+            let Some(conn_index) = driver.handshake_deadlines.pop_expired(now, |i, g| {
+                crate::tls::handshake_deadline::in_progress(&driver.connections, i, g)
+            }) else {
+                return;
+            };
+            metrics::CONNECTIONS.increment(metrics::conn::TLS_HANDSHAKE_TIMEOUT);
+            self.executor
+                .wake_connect(conn_index, Err(crate::tls::handshake_deadline::timed_out()));
+            self.driver.close_connection(conn_index);
         }
     }
 
@@ -2009,6 +2130,23 @@ mod tests {
         (event_loop, handle)
     }
 
+    /// `drain_channels` clears the disk-I/O wake flag, so a completion queued
+    /// after it writes the wake pipe.
+    #[test]
+    fn drain_channels_clears_the_disk_io_wake_flag() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        el.driver
+            .disk_io_wake_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        el.drain_channels();
+        assert!(
+            !el.driver
+                .disk_io_wake_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
     /// A key whose operation is still in the disk-I/O pool is not handed
     /// out again when the sequence comes round, even with no future holding
     /// it (a dropped future gives its key up while its operation runs).
@@ -2039,7 +2177,7 @@ mod tests {
                 .expect("submit open");
             // Stand in for the u32 sequence coming round to it.
             *ctx.next_disk_io_seq = open_seq;
-            let stat_seq = ctx.fs_stat(&dir).expect("submit stat");
+            let stat_seq = ctx.fs_stat(&dir, false).expect("submit stat");
             (open_seq, stat_seq)
         };
         // Release the pool thread before the loop, and the pool, drop.
@@ -3069,6 +3207,63 @@ mod tests {
         let mut recv_buf = vec![0u8; 4096];
         el.handle_readable(conn_index, &mut recv_buf, false);
         assert_half_open(&el, conn_index, true);
+    }
+
+    /// Deliver a FIN to a TLS connection whose handshake has not completed.
+    /// `outbound` registers a connect waiter first, as a parked
+    /// `connect(..).tls(..)` does.
+    fn fin_before_the_tls_handshake_completes(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        outbound: bool,
+    ) -> u32 {
+        let (conn_index, client) = attach_conn(&mut el.driver);
+        let _peer = install_handshaked_tls(el, conn_index);
+        let cs = el.driver.connections.get_mut(conn_index).unwrap();
+        cs.established = false;
+        cs.outbound = outbound;
+        if outbound {
+            el.executor.connect_waiters[conn_index as usize] = true;
+        }
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("peer half-close");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut recv_buf = vec![0u8; 4096];
+        el.handle_readable(conn_index, &mut recv_buf, false);
+        conn_index
+    }
+
+    /// A FIN before the TLS handshake completes closes the connection. No
+    /// task holds an inbound connection until its handshake completes, so
+    /// nothing else would close it and the slot would be held until the
+    /// worker exits.
+    #[test]
+    fn a_tls_fin_before_the_handshake_completes_closes_the_connection() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let conn_index = fin_before_the_tls_handshake_completes(&mut el, false);
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert_eq!(cs.read, ReadHalf::Eof { truncated: true });
+        assert!(cs.close_requested(), "no task holds it to close it");
+        assert!(el.driver.pending_closes.contains(&conn_index));
+    }
+
+    /// The same FIN on an outbound connection resolves the connect with
+    /// `UnexpectedEof` and closes the connection.
+    #[test]
+    fn a_tls_fin_before_the_handshake_completes_fails_the_connect() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let conn_index = fin_before_the_tls_handshake_completes(&mut el, true);
+        assert!(!el.executor.connect_waiters[conn_index as usize]);
+        match el.executor.io_results[conn_index as usize].take() {
+            Some(crate::runtime::IoResult::Connect(Err(e))) => {
+                assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+            }
+            _ => panic!("the connect waiter was not given an error"),
+        }
+        let cs = el.driver.connections.get(conn_index).unwrap();
+        assert!(cs.close_requested(), "the failed connect holds no slot");
     }
 
     /// `on_accept` queues an awaited send, hands the unpolled future to a

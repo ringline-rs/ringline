@@ -1,9 +1,25 @@
 //! Async filesystem I/O.
 //!
-//! Provides buffered file read/write and metadata operations (stat, rename,
-//! remove, mkdir). File operations do not block the worker thread: on
-//! io_uring the kernel completes them inline or on its own threads (see
-//! below); on mio they run on a thread pool.
+//! Provides buffered file read/write and metadata operations (stat,
+//! symlink_metadata, rename, remove, mkdir). Apart from [`close`], which is
+//! synchronous, file operations do not block the worker thread: on io_uring
+//! the kernel completes them inline or on its own threads (see below); on mio
+//! they run on a thread pool.
+//!
+//! Operations are independent of each other on both backends, including
+//! operations on one file: io_uring does not order independent submissions,
+//! and the mio pool's threads take requests from one queue. A write is in the
+//! file when its future resolves, not when `write` returns, and [`fsync`]
+//! covers the writes whose futures have resolved when it is called. To order
+//! two operations, await the first before submitting the second.
+//!
+//! On io_uring a call that finds the ring's submission queue full submits the
+//! queue inline before pushing (under [`sqpoll`](crate::ConfigBuilder::sqpoll)
+//! it waits for the SQ thread to free an entry); if that submit
+//! (`io_uring_enter(2)`) fails, for example with `Interrupted`, `EBUSY` or
+//! `EAGAIN`, the call returns the error and leaves nothing in flight. The
+//! submission queue holds `sq_entries` entries per worker, shared by every
+//! operation on it.
 //!
 //! ## Blocking file I/O and connection closes (io_uring)
 //!
@@ -14,15 +30,18 @@
 //! File and path operations go to the bounded one, whose size limit is given
 //! below. These are the pool operations:
 //!
-//! - always: [`fsync`], [`stat`], [`rename`], [`remove`], [`mkdir`], and
-//!   [`open`] with `CREATE` or `TRUNCATE` (including [`create`]);
+//! - always: [`fsync`], [`stat`], [`symlink_metadata`], [`rename`],
+//!   [`remove`], [`mkdir`], and [`open`] with `CREATE` or `TRUNCATE`
+//!   (including [`create`]);
 //! - on overlayfs (the usual root filesystem of a Docker or Kubernetes
 //!   container; a mounted volume usually is not) and tmpfs: every read and
 //!   write;
 //! - on a filesystem that cannot run buffered writes asynchronously, such as
 //!   ext4 or f2fs (XFS and btrfs can): every write;
-//! - otherwise, when the kernel cannot finish them without blocking: other
-//!   opens, reads and writes.
+//! - otherwise, opens, reads and writes the kernel cannot finish without
+//!   blocking, except that a buffered read that misses the page cache on
+//!   ext4, XFS or btrfs waits for the page in task work rather than on the
+//!   pool.
 //!
 //! [`direct_io_fsync`](crate::direct_io_fsync) always
 //! uses the pool too. Direct I/O reads and writes use it always on overlayfs
@@ -30,8 +49,8 @@
 //!
 //! The pool has `min(sq_entries, 4 × the host's online CPUs)` threads per
 //! worker; a container's CPU limit does not lower it. With the default
-//! [`sq_entries`](crate::ConfigBuilder::sq_entries) of 256 that is 4 × the
-//! CPU count on hosts with up to 64 CPUs, and 256 on larger hosts.
+//! [`sq_entries`](crate::ConfigBuilder::sq_entries) of 4096 that is 4 × the
+//! CPU count on hosts with up to 1024 CPUs.
 //! [`ConfigBuilder::iowq_max_workers`](crate::ConfigBuilder::iowq_max_workers)
 //! lowers it.
 //!
@@ -109,7 +128,7 @@ use crate::runtime::waker::pending;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct File {
     pub(crate) index: u16,
-    pub(crate) generation: u16,
+    pub(crate) generation: u32,
     /// Makes the handle `!Send`.
     _not_send: PhantomData<*const ()>,
 }
@@ -124,7 +143,7 @@ impl std::fmt::Debug for File {
 }
 
 impl File {
-    pub(crate) fn new(index: u16, generation: u16) -> Self {
+    pub(crate) fn new(index: u16, generation: u32) -> Self {
         File {
             index,
             generation,
@@ -138,16 +157,37 @@ impl File {
     }
 }
 
-/// Flags for [`open()`].
-#[derive(Debug, Clone, Copy)]
+/// Flags for [`open()`]: one access mode, combined with `|` with any of the
+/// other flags.
+///
+/// The access modes are the `open(2)` values, not bits: `READ` is 0 and
+/// `WRITE` is 1, so `READ | WRITE` is `WRITE`, which opens the file
+/// write-only and fails every read with `EBADF`. The read-write mode is
+/// [`READ_WRITE`](Self::READ_WRITE).
+///
+/// ```
+/// use ringline::fs::OpenFlags;
+/// assert_eq!(OpenFlags::READ | OpenFlags::WRITE, OpenFlags::WRITE);
+/// assert_ne!(OpenFlags::READ_WRITE, OpenFlags::WRITE);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenFlags(pub(crate) i32);
 
 impl OpenFlags {
+    /// Open for reading only (`O_RDONLY`).
     pub const READ: Self = Self(libc::O_RDONLY);
+    /// Open for writing only (`O_WRONLY`).
     pub const WRITE: Self = Self(libc::O_WRONLY);
+    /// Open for reading and writing (`O_RDWR`).
     pub const READ_WRITE: Self = Self(libc::O_RDWR);
+    /// Create the file if it does not exist (`O_CREAT`), with the permission
+    /// bits [`open()`]'s `mode` gives.
     pub const CREATE: Self = Self(libc::O_CREAT);
+    /// Truncate an existing regular file to zero length (`O_TRUNC`).
     pub const TRUNCATE: Self = Self(libc::O_TRUNC);
+    /// Append every write to the end of the file (`O_APPEND`). On Linux the
+    /// `offset` argument of [`write()`] and [`write_from()`] is then ignored, on
+    /// both backends; on macOS `pwrite` writes at `offset` regardless.
     pub const APPEND: Self = Self(libc::O_APPEND);
 }
 
@@ -158,18 +198,34 @@ impl std::ops::BitOr for OpenFlags {
     }
 }
 
-/// File metadata returned by [`stat()`].
+/// File metadata returned by [`stat()`] and [`symlink_metadata()`].
 #[derive(Debug, Clone)]
 pub struct Metadata {
+    /// Size in bytes (`st_size`). For a symbolic link from
+    /// [`symlink_metadata()`], the length of the path it holds.
     pub size: u64,
+    /// `st_mode`: the file type bits (`S_IFMT`), the setuid, setgid and
+    /// sticky bits, and the permission bits.
     pub mode: u32,
+    /// Owner's user ID.
     pub uid: u32,
+    /// Owner's group ID.
     pub gid: u32,
+    /// Last access time, as the time since the Unix epoch. A time before 1970
+    /// has negative seconds, which are cast to `u64` and wrap.
     pub atime: Duration,
+    /// Last modification time, as the time since the Unix epoch. A time before
+    /// 1970 has negative seconds, which are cast to `u64` and wrap.
     pub mtime: Duration,
+    /// Last status change time, as the time since the Unix epoch. A time before
+    /// 1970 has negative seconds, which are cast to `u64` and wrap.
     pub ctime: Duration,
+    /// A regular file.
     pub is_file: bool,
+    /// A directory.
     pub is_dir: bool,
+    /// A symbolic link. Only [`symlink_metadata()`] reports one; [`stat()`]
+    /// follows the link.
     pub is_symlink: bool,
 }
 
@@ -250,6 +306,20 @@ impl FsConfig {
     }
 
     /// Set the most I/O commands in flight across all files, per worker. Defaults to 256.
+    ///
+    /// Every operation of this module except `close` counts from submission
+    /// until its completion is processed. One submitted at the limit fails
+    /// with `filesystem command slab exhausted`, on both backends.
+    ///
+    /// On io_uring each command slot has 16,384 operation keys. A future holds
+    /// one from submission until it takes its result or is dropped on the
+    /// worker that created it. A future that is neither polled to completion
+    /// nor dropped keeps its key after its command completes, and one dropped
+    /// on another thread keeps it for the life of that worker. The slot freed
+    /// last is reused first, so in a serial workload 16,384 such futures make
+    /// every later operation fail with `every disk-I/O key for this slab slot
+    /// is held by a future`, until one of them takes its result or is dropped
+    /// on that worker, while other slots are free.
     pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
         self.max_commands_in_flight = max_commands_in_flight;
         self
@@ -279,9 +349,14 @@ pub(crate) struct FsFileState {
     /// Whether this slot is in use.
     pub active: bool,
     /// Generation counter for stale-handle detection.
-    pub generation: u16,
-    /// Number of commands currently in flight.
+    pub generation: u32,
+    /// Number of read, write and fsync commands pushed to the SQ and not
+    /// completed (io_uring).
     pub in_flight: u32,
+    /// `close` was called while commands were in flight (io_uring): the
+    /// handle is refused, and the last completion unregisters the file and
+    /// releases the slot (#859).
+    pub closing: bool,
 }
 
 impl FsFileState {
@@ -291,6 +366,7 @@ impl FsFileState {
             active: false,
             generation: 0,
             in_flight: 0,
+            closing: false,
         }
     }
 }
@@ -324,6 +400,7 @@ impl FsFileTable {
         slot.active = false;
         slot.fd_index = u32::MAX;
         slot.in_flight = 0;
+        slot.closing = false;
         slot.generation = slot.generation.wrapping_add(1);
         self.free_list.push(index);
     }
@@ -342,17 +419,22 @@ pub(crate) struct FsCmdEntry {
     file_index: u16,
     pub(crate) op: FsOp,
     in_use: bool,
+    /// The SQE's user_data, recorded before the SQE is pushed.
+    user_data: u64,
     /// Owned path for open/stat/unlink/mkdir (kept alive until CQE).
     pub path: Option<CString>,
     /// Second path for rename (kept alive until CQE).
     pub path2: Option<CString>,
-    /// Heap-allocated statx buffer (kept alive until CQE).
+    /// The statx buffer of a stat; the kernel writes it until the CQE through
+    /// a pointer into this entry.
     #[cfg(target_os = "linux")]
-    pub statx_buf: Option<Box<libc::statx>>,
+    pub statx_buf: libc::statx,
 }
 
 /// Tracks in-flight filesystem commands for resource cleanup on completion.
 pub(crate) struct FsCmdSlab {
+    /// Filled in `new` and never resized: an in-flight stat holds a pointer
+    /// into its entry.
     entries: Vec<FsCmdEntry>,
     free_list: Vec<u16>,
 }
@@ -366,10 +448,11 @@ impl FsCmdSlab {
                 file_index: 0,
                 op: FsOp::Read,
                 in_use: false,
+                user_data: 0,
                 path: None,
                 path2: None,
                 #[cfg(target_os = "linux")]
-                statx_buf: None,
+                statx_buf: unsafe { std::mem::zeroed() },
             });
             free_list.push(i);
         }
@@ -394,16 +477,30 @@ impl FsCmdSlab {
         entry.in_use = false;
         entry.path = None;
         entry.path2 = None;
-        #[cfg(target_os = "linux")]
-        {
-            entry.statx_buf = None;
-        }
         self.free_list.push(idx);
         (file_index, op)
     }
 
     pub fn in_use(&self, idx: u16) -> bool {
         self.entries.get(idx as usize).is_some_and(|e| e.in_use)
+    }
+
+    /// Whether any command holds a slot, so its operation has not completed.
+    pub fn has_in_flight(&self) -> bool {
+        self.free_list.len() < self.entries.len()
+    }
+
+    /// Record the user_data of slot `idx`'s SQE, which worker exit cancels.
+    pub fn set_user_data(&mut self, idx: u16, user_data: u64) {
+        self.entries[idx as usize].user_data = user_data;
+    }
+
+    /// The user_data of every command that holds a slot.
+    pub fn in_flight_user_data(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries
+            .iter()
+            .filter(|e| e.in_use)
+            .map(|e| e.user_data)
     }
 
     /// Get a reference to an entry (must be in use).
@@ -426,12 +523,17 @@ pub(crate) fn path_to_cstring(path: &std::path::Path) -> io::Result<CString> {
 
 // ── Async public API ──────────────────────────────────────────────────
 
-/// Open a file asynchronously via io_uring.
+/// Open a file.
 ///
 /// On io_uring this can run on the worker's io-wq pool; before Linux 6.13
 /// that can delay the worker's connection closes. See
 /// [the module docs](self#blocking-file-io-and-connection-closes-io_uring)
 /// for when.
+///
+/// `flags` is one access mode with any other [`OpenFlags`] or'ed in;
+/// `mode` is the permission bits (for example `0o644`) a file created with
+/// [`OpenFlags::CREATE`] gets, less the process umask, and is ignored
+/// otherwise.
 ///
 /// Returns an [`OpenFuture`] that resolves to a [`File`] handle on success.
 ///
@@ -481,12 +583,14 @@ pub fn create(path: impl AsRef<std::path::Path>) -> io::Result<OpenFuture> {
 /// event loop's next iteration if the open has completed, otherwise when it
 /// completes.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it.
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaves the file open
+/// and its slot taken until the owning worker exits.
 pub struct OpenFuture {
     seq: u32,
     file_index: u16,
-    generation: u16,
+    generation: u32,
     /// Set once `poll` has returned `Ready`: the caller owns the outcome.
     done: bool,
     /// The worker whose executor holds `seq`.
@@ -504,16 +608,13 @@ impl Future for OpenFuture {
             if self.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            match executor.take_disk_io_result(self.seq) {
-                Some(result) if result < 0 => {
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(self.seq, task_id) {
+                Some((result, _)) if result < 0 => {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
                 }
                 Some(_) => Poll::Ready(Ok(File::new(self.file_index, self.generation))),
-                None => {
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(self.seq, task_id);
-                    pending(cx)
-                }
+                None => pending(cx),
             }
         });
         if poll.is_ready() {
@@ -545,7 +646,7 @@ impl Drop for OpenFuture {
 thread_local! {
     // Opens whose `OpenFuture` was dropped before it resolved, as `(disk I/O
     // key, file slot, generation)`. Nothing holds a handle to these files.
-    static ORPHANED_OPENS: std::cell::RefCell<Vec<(u32, u16, u16)>> =
+    static ORPHANED_OPENS: std::cell::RefCell<Vec<(u32, u16, u32)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     // Disk-I/O keys of operations whose future (`DiskIoFuture`,
     // `StatFuture`) was dropped outside the executor, before it resolved.
@@ -564,8 +665,8 @@ struct OrphanedBuffers(Vec<(u32, u16, BytesMut)>);
 impl Drop for OrphanedBuffers {
     fn drop(&mut self) {
         // Dropped when the worker thread exits. The operations may still be
-        // using these buffers, so leak them, as the executor's graveyard does
-        // at exit.
+        // using these buffers, so leak them, as the executor does with parked
+        // buffers at exit.
         for (_, _, buf) in self.0.drain(..) {
             std::mem::forget(buf);
         }
@@ -582,10 +683,10 @@ impl Drop for OrphanedBuffers {
 /// writes. Called by the event loop at the start of every task-poll pass,
 /// after the first pass, and before the worker waits for I/O.
 ///
-/// An open that has completed is closed now. One still in flight is marked in
-/// `abandoned_fs_opens`, and its completion handler closes it. A buffer whose
-/// operation has completed is dropped now; one still in flight is parked in
-/// the graveyard until the completion arrives.
+/// An open that has completed is closed now. One still in flight is marked
+/// abandoned (`Executor::abandon_disk_io_open`), and its completion handler
+/// closes it. A buffer whose operation has completed is dropped now; one still
+/// in flight is parked (`DiskIoEntry::Parked`) until the completion arrives.
 pub(crate) fn release_orphans(
     driver: &mut crate::backend::Driver,
     executor: &mut crate::runtime::Executor,
@@ -620,17 +721,13 @@ pub(crate) fn release_orphans(
         }
     });
     for (seq, index, generation) in orphans {
-        executor.disk_io_waiters.remove(&seq);
         match executor.take_disk_io_result(seq) {
             Some(result) if result >= 0 => {
                 let _ = driver.make_ctx().fs_close(File::new(index, generation));
             }
             // The open failed, and its slot is already free.
             Some(_) => {}
-            None => {
-                crate::runtime::untrack_disk_io(seq);
-                executor.abandoned_fs_opens.insert(seq);
-            }
+            None => executor.abandon_disk_io_open(seq),
         }
     }
 }
@@ -647,7 +744,11 @@ pub(crate) fn release_orphans(
 /// # Safety
 ///
 /// `buf` must point to writable memory of at least `len` bytes that remains
-/// valid until the returned future completes.
+/// valid until the operation completes. The operation keeps using the memory
+/// after the future is dropped, and a dropped future gives no way to learn
+/// when the operation completes, so after a drop the memory must not be freed
+/// or reused: leak it, or use an owned-buffer variant where one exists (#825).
+/// Here that is [`read_into`].
 ///
 /// # Panics
 ///
@@ -677,7 +778,11 @@ pub unsafe fn read(file: File, offset: u64, buf: *mut u8, len: u32) -> io::Resul
 /// # Safety
 ///
 /// `buf` must point to readable memory of at least `len` bytes that remains
-/// valid until the returned future completes.
+/// valid until the operation completes. The operation keeps using the memory
+/// after the future is dropped, and a dropped future gives no way to learn
+/// when the operation completes, so after a drop the memory must not be freed
+/// or reused: leak it, or use an owned-buffer variant where one exists (#825).
+/// Here that is [`write_from`].
 ///
 /// # Panics
 ///
@@ -710,12 +815,14 @@ pub unsafe fn write(file: File, offset: u64, buf: *const u8, len: u32) -> io::Re
 ///
 /// If the future is dropped before the I/O completes, the buffer is kept
 /// until the operation completes and then freed. On io_uring a best-effort
-/// `ASYNC_CANCEL` is also submitted. If the worker exits first, the buffer
-/// is leaked. This avoids the use-after-free that motivates the `unsafe` on
-/// [`read()`].
+/// `ASYNC_CANCEL` is also submitted. If the worker exits first, or the future
+/// is dropped on a thread other than the worker that created it, the buffer
+/// is leaked.
 ///
 /// Returns [`io::ErrorKind::InvalidInput`] if `buf` has no spare capacity
-/// or if spare capacity exceeds `u32::MAX`.
+/// or if spare capacity exceeds `u32::MAX`. A spare capacity above
+/// `i32::MAX` is refused by macOS with `EINVAL` and read short by Linux,
+/// which reads at most `0x7ffff000` bytes per call.
 ///
 /// # Panics
 ///
@@ -745,7 +852,7 @@ pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadF
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
         // Safety: caller-side invariant is upheld by ReadFuture's ownership +
-        // graveyard-on-drop (see ReadFuture::Drop).
+        // parking on drop (see ReadFuture::Drop).
         let seq = unsafe { ctx.fs_read(file, offset, ptr, len)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.wait_disk_io(seq, task_id);
@@ -771,10 +878,13 @@ pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadF
 ///
 /// If the future is dropped before the I/O completes, the buffer is kept
 /// until the operation completes and then freed. On io_uring a best-effort
-/// `ASYNC_CANCEL` is also submitted. If the worker exits first, the buffer
+/// `ASYNC_CANCEL` is also submitted. If the worker exits first, or the future
+/// is dropped on a thread other than the worker that created it, the buffer
 /// is leaked.
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] if `buf.len() > u32::MAX`.
+/// Returns [`io::ErrorKind::InvalidInput`] if `buf.len() > u32::MAX`. A
+/// length above `i32::MAX` is refused by macOS with `EINVAL` and written
+/// short by Linux, which writes at most `0x7ffff000` bytes per call.
 ///
 /// # Panics
 ///
@@ -793,7 +903,7 @@ pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFut
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
         // Safety: caller-side invariant is upheld by WriteFuture's ownership +
-        // graveyard-on-drop (see WriteFuture::Drop).
+        // parking on drop (see WriteFuture::Drop).
         let seq = unsafe { ctx.fs_write(file, offset, ptr, len_u32)? };
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.wait_disk_io(seq, task_id);
@@ -811,8 +921,10 @@ pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFut
 /// Resolves to `(io::Result<usize>, BytesMut)`. On success `buf.len()` is
 /// extended by the number of bytes read.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it.
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaks the buffer and
+/// leaves its result slot on the owning worker taken until that worker exits.
 pub struct ReadFuture {
     seq: u32,
     file_index: u16,
@@ -834,12 +946,13 @@ impl Future for ReadFuture {
             if me.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            match executor.take_disk_io_result(me.seq) {
-                Some(result) if result < 0 => {
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(me.seq, task_id) {
+                Some((result, _)) if result < 0 => {
                     let buf = me.buf.take().expect("ReadFuture polled after completion");
                     Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
                 }
-                Some(result) => {
+                Some((result, _)) => {
                     let mut buf = me.buf.take().expect("ReadFuture polled after completion");
                     let n = result as usize;
                     let max_n = buf.capacity() - me.initial_len;
@@ -849,11 +962,7 @@ impl Future for ReadFuture {
                     unsafe { buf.set_len(me.initial_len + n) };
                     Poll::Ready((Ok(n), buf))
                 }
-                None => {
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(me.seq, task_id);
-                    pending(cx)
-                }
+                None => pending(cx),
             }
         })
     }
@@ -871,8 +980,10 @@ impl Drop for ReadFuture {
 /// Resolves to `(io::Result<usize>, BytesMut)`. The buffer is returned
 /// unchanged regardless of success or failure.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it.
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaks the buffer and
+/// leaves its result slot on the owning worker taken until that worker exits.
 pub struct WriteFuture {
     seq: u32,
     file_index: u16,
@@ -893,20 +1004,17 @@ impl Future for WriteFuture {
             if me.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            match executor.take_disk_io_result(me.seq) {
-                Some(result) if result < 0 => {
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(me.seq, task_id) {
+                Some((result, _)) if result < 0 => {
                     let buf = me.buf.take().expect("WriteFuture polled after completion");
                     Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
                 }
-                Some(result) => {
+                Some((result, _)) => {
                     let buf = me.buf.take().expect("WriteFuture polled after completion");
                     Poll::Ready((Ok(result as usize), buf))
                 }
-                None => {
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(me.seq, task_id);
-                    pending(cx)
-                }
+                None => pending(cx),
             }
         })
     }
@@ -959,9 +1067,9 @@ fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
     park_buffer(driver, executor, seq, file_index, buf);
 }
 
-/// Drop `buf` if its operation has completed (its result is in
-/// `disk_io_results`), otherwise park it in `disk_io_graveyard` keyed by
-/// `seq`; `wake_disk_io` frees it when the operation completes.
+/// Drop `buf` if its operation has completed (its result has arrived),
+/// otherwise park it under `seq`; `wake_disk_io` frees it when the
+/// operation completes.
 ///
 /// On io_uring, also submit a best-effort `ASYNC_CANCEL` to speed up the
 /// completion, which then arrives with `-ECANCELED` or the natural result.
@@ -975,16 +1083,12 @@ fn park_buffer(
     file_index: u16,
     buf: BytesMut,
 ) {
-    executor.disk_io_waiters.remove(&seq);
     if executor.take_disk_io_result(seq).is_some() {
         // The operation has completed and released the buffer.
         drop(buf);
         return;
     }
-    // The graveyard now holds the key; `wake_disk_io` frees the buffer
-    // before it checks whether the key is held.
-    crate::runtime::untrack_disk_io(seq);
-    executor.disk_io_graveyard.insert(seq, buf);
+    executor.park_disk_io(seq, buf);
     #[cfg(has_io_uring)]
     {
         let target = crate::completion::UserData::encode(
@@ -999,7 +1103,9 @@ fn park_buffer(
     }
 }
 
-/// Fsync a file, flushing all data and metadata to disk.
+/// Fsync a file: `fsync(2)`, which persists the writes to it whose futures
+/// have resolved. A write whose future has not resolved may not be covered;
+/// await it first. On macOS `fsync(2)` does not flush the drive's own cache.
 ///
 /// On io_uring this always runs on the worker's io-wq pool; before Linux 6.13
 /// that can delay the worker's connection closes. See
@@ -1020,10 +1126,12 @@ pub fn fsync(file: File) -> io::Result<DiskIoFuture> {
 
 /// Close a file handle.
 ///
-/// Synchronous: on success the handle is invalid and its slot is free when
-/// this returns. On io_uring it removes the file from the ring's fixed-file
-/// table. On mio the fd closes once the operations already queued on it have
-/// finished.
+/// Synchronous: on success the handle is invalid when this returns. A read,
+/// write or fsync already issued on it completes against the file. On
+/// io_uring the file leaves the ring's fixed-file table and its slot is freed
+/// when this returns or, if such operations are in flight, when the last of
+/// them completes. On mio the slot is free when this returns, and the fd
+/// closes once the operations already queued on it have finished.
 ///
 /// # Panics
 ///
@@ -1035,7 +1143,9 @@ pub fn close(file: File) -> io::Result<()> {
     })
 }
 
-/// Get file metadata (stat) for a path.
+/// Get file metadata (stat) for a path. A symbolic link is followed, so the
+/// metadata is the target's and [`Metadata::is_symlink`] is false; see
+/// [`symlink_metadata`] for the link's own.
 ///
 /// On io_uring this always runs on the worker's io-wq pool; before Linux 6.13
 /// that can delay the worker's connection closes. See
@@ -1047,9 +1157,28 @@ pub fn close(file: File) -> io::Result<()> {
 ///
 /// Panics if called outside the ringline async executor.
 pub fn stat(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
+    stat_with(path.as_ref(), false)
+}
+
+/// Get file metadata for a path without following a final symbolic link
+/// (`lstat`; on io_uring a statx with `AT_SYMLINK_NOFOLLOW`). If the path
+/// names a link, the metadata is the link's own and [`Metadata::is_symlink`]
+/// is true; a trailing `/` makes the link be followed, as it does for `lstat`.
+/// Any other path gives what [`stat`] gives.
+///
+/// Runs where [`stat`] runs, with the same effect on connection closes.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor.
+pub fn symlink_metadata(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
+    stat_with(path.as_ref(), true)
+}
+
+fn stat_with(path: &std::path::Path, nofollow: bool) -> io::Result<StatFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        let seq = ctx.fs_stat(path.as_ref())?;
+        let seq = ctx.fs_stat(path, nofollow)?;
         let task_id = CURRENT_TASK_ID.with(|c| c.get());
         executor.wait_disk_io(seq, task_id);
         Ok(StatFuture {
@@ -1063,12 +1192,13 @@ pub fn stat(path: impl AsRef<std::path::Path>) -> io::Result<StatFuture> {
 /// Future that resolves to the file's [`Metadata`]. Dropping it before it
 /// resolves discards the result.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it.
-// On io_uring the statx buffer is owned by the command slab entry, and on
-// completion the handler converts it to `Metadata` and stores it in
-// `Executor::fs_stat_results` before releasing the slab entry. On mio the
-// disk-I/O pool returns the `Metadata`.
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaves its result slot
+/// on the owning worker taken until that worker exits.
+// On io_uring the statx buffer is the command slab entry's, and on
+// completion the handler converts it to `Metadata` and delivers it with the
+// result. On mio the disk-I/O pool returns the `Metadata`.
 pub struct StatFuture {
     seq: u32,
     /// Set once `poll` has returned `Ready`: the result has been taken.
@@ -1088,28 +1218,16 @@ impl Future for StatFuture {
             if self.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            // First check if there's a normal error result (negative).
-            match executor.take_disk_io_result(self.seq) {
-                Some(result) if result < 0 => {
-                    // Also remove any stat result that might have been stored.
-                    executor.fs_stat_results.remove(&self.seq);
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(self.seq, task_id) {
+                Some((result, _)) if result < 0 => {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
                 }
-                Some(_) => {
-                    // Success — read the Metadata from the stat results map.
-                    match executor.fs_stat_results.remove(&self.seq) {
-                        Some(metadata) => Poll::Ready(Ok(metadata)),
-                        None => {
-                            // Should not happen — handle_fs stores it before waking.
-                            Poll::Ready(Err(io::Error::other("stat result missing")))
-                        }
-                    }
-                }
-                None => {
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(self.seq, task_id);
-                    pending(cx)
-                }
+                Some((_, Some(metadata))) => Poll::Ready(Ok(metadata)),
+                // Unreachable: a successful stat's completion carries its
+                // metadata.
+                Some((_, None)) => Poll::Ready(Err(io::Error::other("stat result missing"))),
+                None => pending(cx),
             }
         });
         if poll.is_ready() {
@@ -1239,6 +1357,20 @@ mod tests {
         assert_eq!(table.get(c).unwrap().generation, 1);
     }
 
+    /// A slot reused 65,536 times does not repeat its first generation, so a
+    /// handle kept from the first open stays stale (#862).
+    #[test]
+    fn generation_does_not_repeat_after_65536_releases() {
+        let mut table = FsFileTable::new(1);
+        let index = table.allocate().unwrap();
+        let first = table.get(index).unwrap().generation;
+        for _ in 0..65_536 {
+            table.release(index);
+            assert_eq!(table.allocate(), Some(index));
+        }
+        assert_ne!(table.get(index).unwrap().generation, first);
+    }
+
     #[test]
     fn cmd_slab_alloc_release() {
         let mut slab = FsCmdSlab::new(8);
@@ -1264,20 +1396,14 @@ mod tests {
         {
             let entry = slab.get_mut(a).unwrap();
             entry.path = Some(CString::new("/tmp/test").unwrap());
-            #[cfg(target_os = "linux")]
-            {
-                entry.statx_buf = Some(Box::new(unsafe { std::mem::zeroed() }));
-            }
         }
         slab.release(a);
-        // After release, the entry is not in use but the path/statx_buf should be None.
+        // After release, the entry is not in use and its path is None.
         // We can verify by re-allocating and checking.
         let b = slab.allocate(0, FsOp::Read).unwrap();
         assert_eq!(b, a);
         let entry = slab.get(b).unwrap();
         assert!(entry.path.is_none());
-        #[cfg(target_os = "linux")]
-        assert!(entry.statx_buf.is_none());
     }
 
     #[test]

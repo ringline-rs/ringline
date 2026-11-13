@@ -1,5 +1,7 @@
-//! A buffer whose read was abandoned must stay allocated while the read can
-//! still write into it, including after its worker has exited.
+//! A buffer whose read was abandoned and is still queued when its worker exits
+//! stays allocated: `Executor::drop` leaks the graveyard. The disk-I/O pool
+//! then answers the queued read without running it (checked by
+//! `worker::disk_exit_tests`, not here).
 //!
 //! Its own test binary: it installs a global allocator that counts frees of
 //! one distinctive allocation size. mio only: the read is queued on the
@@ -16,8 +18,8 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use ringline::fs::{FsConfig, OpenFlags};
@@ -48,6 +50,9 @@ static ALLOC: CountingAlloc = CountingAlloc;
 
 static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static OUTCOME: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+/// Set by the test once the pool thread is inside the FIFO's open, so the
+/// worker does not exit before the pool has started it.
+static RELEASE: AtomicBool = AtomicBool::new(false);
 
 struct AbandonsRead;
 
@@ -56,6 +61,9 @@ impl AsyncEventHandler for AbandonsRead {
         Some(Box::pin(async {
             let outcome = abandon_a_queued_read().await;
             *OUTCOME.lock().unwrap() = Some(outcome);
+            while !RELEASE.load(Ordering::SeqCst) {
+                ringline::sleep(Duration::from_millis(1)).await;
+            }
             ringline::request_shutdown().ok();
         }))
     }
@@ -82,6 +90,50 @@ async fn abandon_a_queued_read() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     drop(read);
     Ok(())
+}
+
+/// Waits until a thread whose name starts with `prefix` is inside open(2), or
+/// `limit` has passed. A FIFO open with no writer does not return, so once the
+/// thread is inside the call it stays there until the test opens the writer.
+/// On timeout, returns what the last poll read from each matching thread's
+/// `/proc/self/task/<tid>/syscall`.
+fn wait_in_open(prefix: &str, limit: Duration) -> Result<(), String> {
+    // musl's open() makes the open syscall on archs that have it, of which
+    // only x86_64 is built here; glibc's makes openat.
+    #[cfg(target_arch = "x86_64")]
+    let open_calls = [libc::SYS_openat, libc::SYS_open];
+    #[cfg(not(target_arch = "x86_64"))]
+    let open_calls = [libc::SYS_openat];
+    let deadline = Instant::now() + limit;
+    loop {
+        let reads: Vec<std::io::Result<String>> = std::fs::read_dir("/proc/self/task")
+            .expect("read /proc/self/task")
+            .filter_map(|t| t.ok())
+            .filter(|t| {
+                std::fs::read_to_string(t.path().join("comm"))
+                    .is_ok_and(|name| name.trim_end().starts_with(prefix))
+            })
+            .map(|t| std::fs::read_to_string(t.path().join("syscall")))
+            .collect();
+        // While the thread is blocked in a syscall the first field is its
+        // number; blocked outside one, `-1`; on a CPU, the file reads
+        // `running`.
+        let in_open = reads.iter().any(|read| {
+            read.as_ref().is_ok_and(|s| {
+                s.split_whitespace()
+                    .next()
+                    .and_then(|nr| nr.parse::<libc::c_long>().ok())
+                    .is_some_and(|nr| open_calls.contains(&nr))
+            })
+        });
+        if in_open {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{reads:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[test]
@@ -111,6 +163,10 @@ fn an_abandoned_reads_buffer_outlives_its_worker() {
     let (runtime, handles) = RinglineBuilder::new(config)
         .launch::<AbandonsRead>()
         .expect("launch");
+    if let Err(last) = wait_in_open("rl-disk-", Duration::from_secs(30)) {
+        panic!("the disk-I/O thread never blocked in open(2); last syscall reads: {last}");
+    }
+    RELEASE.store(true, Ordering::SeqCst);
     common::join_workers(&runtime, handles);
     drop(runtime);
     OUTCOME
@@ -122,8 +178,14 @@ fn an_abandoned_reads_buffer_outlives_its_worker() {
     // The read is still queued behind the parked open.
     let frees = BUF_FREES.load(Ordering::SeqCst);
 
-    // Let the pool run the open and then the read.
-    let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+    // Let the pool finish the open; the read queued behind it is then answered
+    // without running, since its worker has exited. Read-write, so this open
+    // does not wait for a reader.
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .unwrap();
     std::thread::sleep(Duration::from_millis(200));
     drop(writer);
     let _ = std::fs::remove_dir_all(&dir);

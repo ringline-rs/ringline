@@ -116,8 +116,8 @@ pub(crate) enum DirectRecvBuf {
 /// before it closes the connection with an RST (#607).
 const ABORT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The longest worker exit waits for connections to close and send slab entries
-/// to be released.
+/// The longest worker exit waits for connections to close, send slab entries
+/// to be released and fs, direct I/O and NVMe commands to complete.
 const SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Driver {
@@ -396,6 +396,10 @@ impl Driver {
     }
 }
 
+/// How often the send backstop resubmits every send waiting for room
+/// (`AsyncEventLoop::handle_send_backstop`).
+pub(crate) const SEND_BACKSTOP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// I/O driver encapsulating all infrastructure state (ring, buffers, connections).
 ///
 /// `AsyncEventLoop` is composed of a `Driver` + handler + executor.
@@ -434,6 +438,14 @@ pub(crate) struct Driver {
     /// reports consuming, because the forward already removed those bytes
     /// (see `ConnCtx::forward_recv_buf`).
     pub(crate) forward_zc_consumed: Vec<u32>,
+    /// Per-connection: the bytes the last whole-accumulator
+    /// `forward_recv_buf` detached. The slice the reader closure was given
+    /// points into them, and a forward that is copied (below
+    /// `send_zc_threshold`, or encrypted on TLS) drops its guard before the
+    /// closure returns. This handle keeps them allocated until a delivery
+    /// path reads a non-zero `forward_zc_consumed` after the closure returns,
+    /// or until `handle_close` releases the slot.
+    pub(crate) forward_zc_held: Vec<Option<bytes::Bytes>>,
     /// Send slab entries a connection that forwards its receive buffers may
     /// hold before it stops receiving, once the slab is over half used. See
     /// `ConfigBuilder::forward_hold_cap`.
@@ -571,8 +583,11 @@ pub(crate) struct Driver {
     pub(crate) tls_table: Option<crate::tls::TlsTable>,
     /// Pre-allocated sockaddr storage for outbound connect SQEs.
     pub(crate) connect_addrs: Vec<libc::sockaddr_storage>,
-    /// Pre-allocated timespec storage for connect timeouts.
-    pub(crate) connect_timespecs: Vec<crate::backend::uring::abi::Timespec>,
+    /// Deadlines of outbound connects with a timeout.
+    pub(crate) connect_deadlines: crate::backend::uring::connect_deadlines::ConnectDeadlines,
+    /// Connect cancels for connects whose timeout fired, which the SQ had no
+    /// room for: (conn_index, generation). Retried each iteration.
+    pub(crate) pending_connect_cancels: Vec<(u32, u32)>,
     /// Pre-allocated batch buffer for draining CQEs.
     /// Tuple: (user_data, result, flags).
     pub(crate) cqe_batch: Vec<(u64, i32, u32)>,
@@ -670,11 +685,13 @@ pub(crate) struct Driver {
     /// drain batch. One clock read per batch instead of one per datagram;
     /// precision loss is bounded by the drain duration (microseconds).
     pub(crate) udp_batch_recv_at: std::time::Instant,
-    /// Tick timeout duration. When set, a timeout SQE ensures the event loop
-    /// wakes periodically even when no I/O completions are pending.
-    pub(crate) tick_timeout_ts: Option<crate::backend::uring::abi::Timespec>,
-    /// Whether a tick timeout SQE is currently in-flight.
-    pub(crate) tick_timeout_armed: bool,
+    /// The tick interval (`ConfigBuilder::tick_timeout_us`), or `None` for
+    /// 0: the wait is then bounded only by deadlines.
+    pub(crate) tick_interval: Option<std::time::Duration>,
+    /// When the next tick is due. The run loop's wait ends by then, and the
+    /// iteration that finds it passed publishes the worker's load and sets
+    /// the next one a `tick_interval` later.
+    pub(crate) next_tick: Option<std::time::Instant>,
     /// Monotonic tick counter for backoff-based retry scheduling.
     pub(crate) tick_count: u64,
     /// Whether the eventfd read SQE is currently armed.
@@ -687,15 +704,17 @@ pub(crate) struct Driver {
     /// Drained each tick.
     pub(crate) pending_send_pollout_retries: Vec<(u32, u32, bool)>,
     /// Connections with a send waiting for room, as (conn_index, generation),
-    /// for `handle_send_backstop`. An entry leaves when the timer finds nothing
+    /// for `handle_send_backstop`. An entry leaves when the backstop finds nothing
     /// waiting.
     pub(crate) send_backstop_list: Vec<(u32, u32)>,
-    /// Scratch swapped with `send_backstop_list` while the timer walks it.
+    /// Scratch swapped with `send_backstop_list` while the backstop walks it.
     pub(crate) send_backstop_scratch: Vec<(u32, u32)>,
-    /// The `SendBackstop` timer's interval.
-    pub(crate) send_backstop_ts: crate::backend::uring::abi::Timespec,
-    /// Whether the `SendBackstop` timer is armed.
-    pub(crate) send_backstop_armed: bool,
+    /// When the backstop next runs: set one `SEND_BACKSTOP_INTERVAL` ahead
+    /// when `send_backstop_list` is non-empty and none is set, and taken when
+    /// it runs. It bounds the run loop's wait (`next_deadline`).
+    pub(crate) send_backstop_at: Option<std::time::Instant>,
+    /// TLS handshakes in progress and their deadlines.
+    pub(crate) handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines,
     /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
     /// Drained each tick — used when resubmitting a coalesced `sendmsg` found
     /// the SQ full.
@@ -798,6 +817,11 @@ pub(crate) struct Driver {
     pub(crate) fs_cmd_slab: Option<crate::fs::FsCmdSlab>,
     /// Base offset in the fixed file table for filesystem file fds.
     pub(crate) fs_fd_base: u32,
+    /// Set by [`run_shutdown`](Self::run_shutdown) when its drain ended, at
+    /// the bound or on a ring error, with an fs, direct I/O or NVMe command
+    /// still in flight. The kernel can still use the command's buffer or statx
+    /// box, so the worker leaks its event loop instead of dropping it (#824).
+    pub(crate) disk_io_outstanding: bool,
 }
 
 /// A park in flight: the `FixedFdInstall` has been submitted and its CQE has
@@ -1053,12 +1077,6 @@ impl Driver {
             std::mem::zeroed()
         });
 
-        let mut connect_timespecs = Vec::with_capacity(config.max_connections as usize);
-        connect_timespecs.resize(
-            config.max_connections as usize,
-            crate::backend::uring::abi::Timespec::new(),
-        );
-
         let mut send_queues = Vec::with_capacity(config.max_connections as usize);
         for _ in 0..config.max_connections {
             send_queues.push(ConnSendState::new());
@@ -1092,6 +1110,7 @@ impl Driver {
             send_slab,
             accumulators,
             forward_zc_consumed: vec![0; config.max_connections as usize],
+            forward_zc_held: vec![None; config.max_connections as usize],
             forward_hold_cap: config.forward_hold_cap,
             forwards_recv_buf: vec![false; config.max_connections as usize],
             forward_recv_held: vec![false; config.max_connections as usize],
@@ -1134,7 +1153,8 @@ impl Driver {
             shutdown_local: false,
             tls_table,
             connect_addrs,
-            connect_timespecs,
+            connect_deadlines: crate::backend::uring::connect_deadlines::ConnectDeadlines::new(),
+            pending_connect_cancels: Vec::new(),
             cqe_batch: Vec::with_capacity(config.sq_entries as usize * 4),
             cqe_cursor: 0,
             tcp_nodelay: config.tcp_nodelay,
@@ -1155,16 +1175,11 @@ impl Driver {
             defer_recv_arm: config.defer_recv_arm,
             deferred_recv_arms: Vec::new(),
             udp_batch_recv_at: std::time::Instant::now(),
-            tick_timeout_ts: if config.tick_timeout_us > 0 {
-                Some(
-                    crate::backend::uring::abi::Timespec::new()
-                        .sec(config.tick_timeout_us / 1_000_000)
-                        .nsec((config.tick_timeout_us % 1_000_000) as u32 * 1000),
-                )
-            } else {
-                None
-            },
-            tick_timeout_armed: false,
+            tick_interval: (config.tick_timeout_us > 0)
+                .then(|| std::time::Duration::from_micros(config.tick_timeout_us)),
+            next_tick: (config.tick_timeout_us > 0).then(|| {
+                std::time::Instant::now() + std::time::Duration::from_micros(config.tick_timeout_us)
+            }),
             tick_count: 0,
             eventfd_armed: false,
             pending_zc_retries: Vec::new(),
@@ -1172,8 +1187,11 @@ impl Driver {
             pending_send_pollout_retries: Vec::new(),
             send_backstop_list: Vec::new(),
             send_backstop_scratch: Vec::new(),
-            send_backstop_ts: crate::backend::uring::abi::Timespec::new().sec(1),
-            send_backstop_armed: false,
+            send_backstop_at: None,
+            handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines::new(
+                config.tls_handshake_timeout,
+                config.max_connections,
+            ),
             pending_coalesced_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             pending_shutdown_retries: Vec::new(),
@@ -1214,6 +1232,7 @@ impl Driver {
                 .as_ref()
                 .map(|f| crate::fs::FsCmdSlab::new(f.max_commands_in_flight)),
             fs_fd_base: config.max_connections + udp_count + nvme_max + direct_io_max,
+            disk_io_outstanding: false,
             resolve_rx,
             resolve_tx,
             resolver,
@@ -1278,7 +1297,7 @@ impl Driver {
             connect_addrs: &mut self.connect_addrs,
             tcp_nodelay: self.tcp_nodelay,
             send_zc_threshold: self.send_zc_threshold,
-            connect_timespecs: &mut self.connect_timespecs,
+            connect_deadlines: &mut self.connect_deadlines,
             chain_table: &mut self.chain_table,
             max_chain_length: self.max_chain_length,
             send_queues: &mut self.send_queues,
@@ -1399,6 +1418,33 @@ impl Driver {
         *slot = drain;
     }
 
+    /// The worker's earliest deadline, other than its timers and tick: the
+    /// deadline at the front of the handshake queue (possibly a handshake
+    /// that has since completed; the wait then ends early), the earliest
+    /// close deadline (`close_notify_deadline`) of a connection still
+    /// waiting for its sends to drain, the next run of the send backstop, and
+    /// the earliest connect deadline. Takes `&mut self` to drop connect
+    /// deadlines that are no longer live.
+    pub(crate) fn next_deadline(&mut self) -> Option<std::time::Instant> {
+        let close = self
+            .close_notify_armed
+            .iter()
+            .filter_map(|&i| {
+                let state = &self.send_queues[i as usize];
+                state.close_pending.then_some(state.close_notify_deadline)?
+            })
+            .min();
+        [
+            self.handshake_deadlines.next_deadline(),
+            close,
+            self.send_backstop_at,
+            self.connect_deadlines.next_deadline(&self.connections),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
     /// Request the close of `conn_index`: mark it `Closing`, set
     /// `close_pending`, and leave its send queue to drain through
     /// `submit_next_queued`. The send handlers register the connection for
@@ -1409,14 +1455,15 @@ impl Driver {
     /// that is never reused would hold a `ParkState` for the life of the
     /// process.
     pub(crate) fn close_connection(&mut self, conn_index: u32) {
-        if let Some(conn) = self.connections.get_mut(conn_index) {
+        let established = if let Some(conn) = self.connections.get_mut(conn_index) {
             if conn.close_requested() {
                 return; // already closing — avoid double Close SQE
             }
             conn.lifecycle = Lifecycle::Closing;
+            conn.established
         } else {
             return;
-        }
+        };
         self.forward_zc_consumed[conn_index as usize] = 0;
         // Release handler state here rather than waiting for the slot to be
         // reused: a `ParkState` is an arbitrary user value, and a slot that is
@@ -1434,6 +1481,19 @@ impl Driver {
         // submitted carry bytes the peer is owed, and io_uring does not
         // order independent SQEs (Domain Invariant 2), so they go out one
         // at a time through `submit_next_queued`.
+        //
+        // Before its handshake (or connect) completes, a connection drains its
+        // queue, so the peer receives the rest of the handshake flight and any
+        // alert, but only until the close deadline: a peer that stopped
+        // reading would otherwise hold the slot while the flight waits for
+        // room. `check_close_notify_deadlines` then force-finalizes it.
+        if !established {
+            self.send_queues[conn_index as usize].close_notify_deadline =
+                Some(std::time::Instant::now() + crate::handler::CLOSE_NOTIFY_TIMEOUT);
+            if !self.close_notify_armed.contains(&conn_index) {
+                self.close_notify_armed.push(conn_index);
+            }
+        }
         let state = &mut self.send_queues[conn_index as usize];
         state.close_pending = true;
         if state.in_flight {
@@ -1762,7 +1822,7 @@ impl Driver {
         }
         state.send_poll = SendPoll::None;
         let lead = self.close_lead(conn_index);
-        self.ring.submit_close(conn_index, lead)
+        self.ring.submit_close(conn_index, generation, lead)
     }
 
     /// Register a connection whose close is pending on
@@ -2684,19 +2744,12 @@ impl Driver {
     }
 
     /// Handle one completion in `run_shutdown`.
-    fn handle_shutdown_cqe(
-        &mut self,
-        user_data_raw: u64,
-        result: i32,
-        flags: u32,
-        timeout_armed: &mut bool,
-    ) {
+    fn handle_shutdown_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
         let ud = UserData(user_data_raw);
         let Some(tag) = ud.tag() else {
             return;
         };
         match tag {
-            OpTag::TickTimeout => *timeout_armed = false,
             OpTag::Send | OpTag::TlsSend => {
                 self.release_slot_at_shutdown(UserData::send_payload_slot(ud.payload()));
             }
@@ -2776,6 +2829,32 @@ impl Driver {
                     metrics::CONNECTIONS_ACTIVE.decrement();
                 }
             }
+            // A disk command's completion: the kernel is done with its
+            // memory. No task is polled again, so nothing is delivered.
+            OpTag::Fs => {
+                let slab_idx = ud.payload() as u16;
+                if let Some(slab) = self.fs_cmd_slab.as_mut()
+                    && slab.in_use(slab_idx)
+                {
+                    slab.release(slab_idx);
+                }
+            }
+            OpTag::DirectIo => {
+                let slab_idx = ud.payload() as u16;
+                if let Some(slab) = self.direct_io_cmd_slab.as_mut()
+                    && slab.in_use(slab_idx)
+                {
+                    slab.release(slab_idx);
+                }
+            }
+            OpTag::NvmeCmd => {
+                let slab_idx = ud.payload() as u16;
+                if let Some(slab) = self.nvme_cmd_slab.as_mut()
+                    && slab.in_use(slab_idx)
+                {
+                    slab.release(slab_idx);
+                }
+            }
             // Merged accept: nothing will serve the connection.
             OpTag::AcceptMulti if result >= 0 => unsafe {
                 libc::close(result);
@@ -2836,6 +2915,35 @@ impl Driver {
         // Each queued message holds an ack sender its registrar waits on.
         region_rx.try_iter().for_each(drop);
         self.merged_listeners.clear();
+    }
+
+    /// The user_data of every fs, direct I/O and NVMe command in flight.
+    fn disk_command_user_data(&self) -> Vec<u64> {
+        let mut uds = Vec::new();
+        if let Some(s) = self.fs_cmd_slab.as_ref() {
+            uds.extend(s.in_flight_user_data());
+        }
+        if let Some(s) = self.direct_io_cmd_slab.as_ref() {
+            uds.extend(s.in_flight_user_data());
+        }
+        if let Some(s) = self.nvme_cmd_slab.as_ref() {
+            uds.extend(s.in_flight_user_data());
+        }
+        uds
+    }
+
+    /// Whether an fs, direct I/O or NVMe command has not completed. Its
+    /// operation can still read or write memory this worker owns.
+    fn disk_commands_in_flight(&self) -> bool {
+        self.fs_cmd_slab.as_ref().is_some_and(|s| s.has_in_flight())
+            || self
+                .direct_io_cmd_slab
+                .as_ref()
+                .is_some_and(|s| s.has_in_flight())
+            || self
+                .nvme_cmd_slab
+                .as_ref()
+                .is_some_and(|s| s.has_in_flight())
     }
 
     /// Shutdown: close all connections and drain remaining CQEs. The eventfd
@@ -2903,7 +3011,7 @@ impl Driver {
                     holding_sends.push(i);
                 } else if self
                     .ring
-                    .submit_close(i, super::ring::CloseLead::CancelAll)
+                    .submit_close(i, generation, super::ring::CloseLead::CancelAll)
                     .is_err()
                 {
                     // The push was refused (the SQ still full after a
@@ -2915,12 +3023,33 @@ impl Driver {
             }
         }
 
+        // Cancel every fs, direct I/O and NVMe command. A read or write
+        // waiting for a pipe or FIFO to become ready ends at once and
+        // transfers nothing. An operation already in progress, on io-wq or in
+        // the device (direct I/O, NVMe), completes in its own time and the
+        // loop below waits for it.
+        let mut disk_cancels_to_retry: Vec<u64> = Vec::new();
+        #[cfg(test)]
+        let keep_disk_commands = self.test_fault.as_ref().is_some_and(|f| {
+            f.keep_disk_commands_at_exit
+                .load(std::sync::atomic::Ordering::Acquire)
+        });
+        #[cfg(not(test))]
+        let keep_disk_commands = false;
+        if !keep_disk_commands {
+            for ud in self.disk_command_user_data() {
+                if self.ring.submit_async_cancel(ud, 0).is_err() {
+                    disk_cancels_to_retry.push(ud);
+                }
+            }
+        }
+
         // 3. Submit + drain loop until every connection's Close has
-        //    completed and every slab entry is released, for at most
-        //    `SHUTDOWN_BOUND`. Keep one timeout SQE armed so
-        //    submit_and_wait(1) never blocks indefinitely (the tick timeout
-        //    from the main loop is not armed here). A pass ends at any CQE, so
-        //    neither the pass count nor one timeout per pass measures time.
+        //    completed, every slab entry is released and every fs, direct I/O
+        //    and NVMe command has completed, for at most `SHUTDOWN_BOUND`.
+        //    Each wait ends after at most 100 ms, so a pass never blocks
+        //    indefinitely. A pass ends at any CQE, so neither the pass count
+        //    nor one timeout per pass measures time.
         //
         //    A zero-copy entry is released only once its notifications land,
         //    and the kernel posts those when the peer has acknowledged the data
@@ -2932,9 +3061,7 @@ impl Driver {
         //    io_uring (below 6.7), or when its connection had closed before
         //    exit began, so nothing can abort it. Its guards and the send pool's
         //    memory are then leaked, because the kernel can still read them.
-        let shutdown_ts = crate::backend::uring::abi::Timespec::new().nsec(100_000_000); // 100ms
         let started = std::time::Instant::now();
-        let mut timeout_armed = false;
         // A panic in a handler left these undispatched.
         // In place, with the cursor kept up to date: a panic here leaves
         // the rest of the tail for `close_fds_in_unhandled_completions`.
@@ -2942,12 +3069,18 @@ impl Driver {
         for i in cursor..self.cqe_batch.len() {
             let (user_data_raw, result, flags) = self.cqe_batch[i];
             self.cqe_cursor = i + 1;
-            self.handle_shutdown_cqe(user_data_raw, result, flags, &mut timeout_armed);
+            self.handle_shutdown_cqe(user_data_raw, result, flags);
         }
         while started.elapsed() < SHUTDOWN_BOUND {
             for i in std::mem::take(&mut cancels_to_retry) {
                 if self.ring.submit_cancel_all(i).is_err() {
                     cancels_to_retry.push(i);
+                }
+            }
+            // A cancel for a command that has completed since finds nothing.
+            for ud in std::mem::take(&mut disk_cancels_to_retry) {
+                if self.ring.submit_async_cancel(ud, 0).is_err() {
+                    disk_cancels_to_retry.push(ud);
                 }
             }
             for i in std::mem::take(&mut holding_sends) {
@@ -2961,24 +3094,23 @@ impl Driver {
                     }
                 };
                 // A full SQ tries again next round.
-                if self.ring.submit_close(i, lead).is_err() {
+                let generation = self.connections.generation(i);
+                if self.ring.submit_close(i, generation, lead).is_err() {
                     holding_sends.push(i);
                 }
             }
             if self.connections.active_count() == 0
                 && !self.send_slab.has_in_flight()
                 && self.direct_recvs.iter().all(Option::is_none)
+                && !self.disk_commands_in_flight()
             {
                 break;
             }
-            if !timeout_armed {
-                let ud = UserData::encode(OpTag::TickTimeout, 0, 0);
-                timeout_armed = self
-                    .ring
-                    .submit_tick_timeout(&shutdown_ts, ud.raw())
-                    .is_ok();
-            }
-            if self.ring.submit_and_wait(1).is_err() {
+            if self
+                .ring
+                .submit_and_wait_timeout(1, std::time::Duration::from_millis(100))
+                .is_err()
+            {
                 break;
             }
 
@@ -2989,7 +3121,7 @@ impl Driver {
             for i in 0..self.cqe_batch.len() {
                 let (user_data_raw, result, flags) = self.cqe_batch[i];
                 self.cqe_cursor = i + 1;
-                self.handle_shutdown_cqe(user_data_raw, result, flags, &mut timeout_armed);
+                self.handle_shutdown_cqe(user_data_raw, result, flags);
             }
         }
 
@@ -2997,6 +3129,11 @@ impl Driver {
             self.send_slab.leak_in_flight();
             self.send_copy_pool.leak_backing();
         }
+        // The memory of a disk command still in flight is spread over this
+        // driver (the statx box) and the tasks (the caller's buffer behind
+        // `fs::read`, `direct_io_read`, `nvme_read` and their writes), so the
+        // worker leaks the whole event loop rather than this one entry.
+        self.disk_io_outstanding = self.disk_commands_in_flight();
 
         // 4. Unregister the UDP provided buffer rings before Driver is dropped
         // (which munmaps the ring memory). Unregistering releases the

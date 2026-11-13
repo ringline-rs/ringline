@@ -75,8 +75,10 @@
 //!
 //! Each worker runs `AsyncEventLoop::run()`:
 //!
-//! 1. `submit_and_wait(1)` — block until a CQE arrives
-//! 2. `drain_completions()` — decode CQEs via `OpTag` + `UserData`, dispatch to handlers
+//! 1. Block until a CQE arrives or the earliest of the next tick, the earliest
+//!    timer and the earliest TLS handshake or close deadline passes
+//! 2. `drain_completions()` — decode CQEs via `OpTag` + `UserData`, dispatch to
+//!    handlers, then wake the tasks whose timers have passed
 //! 3. `collect_wakeups()` — drain thread-local `READY_QUEUE` and the cross-thread wake inbox into executor's ready list
 //! 4. `poll_ready_tasks()` — poll all Ready futures (sets `CURRENT_DRIVER` thread-local)
 //! 5. `on_tick()` — call handler's sync tick callback
@@ -139,8 +141,8 @@
 //! dedicated thread pool.
 
 // A stub-engine build (`RINGLINE_STUB_ENGINE=1`) only checks that the
-// driver compiles without the `io_uring` crate; nothing reads the
-// operations it builds.
+// driver compiles without `UringEngine`; nothing reads the operations it
+// builds.
 #![cfg_attr(all(has_io_uring, not(uring_engine)), allow(dead_code))]
 
 // ── Internal modules ────────────────────────────────────────────────────
@@ -467,26 +469,22 @@ pub use buffer::fixed::RegionId;
 pub use config::Config;
 /// Builder for [`Config`] with discoverable methods and `build()` validation.
 pub use config::ConfigBuilder;
-/// Direct I/O completion result.
-pub use direct_io::DirectIoCompletion;
 /// Direct I/O configuration.
 pub use direct_io::DirectIoConfig;
 /// Direct I/O file handle.
 pub use direct_io::DirectIoFile;
-/// Direct I/O operation type.
-pub use direct_io::DirectIoOp;
 /// Options for opening a direct I/O file.
 pub use direct_io::DirectIoOpenOptions;
 /// Runtime errors.
 pub use error::Error;
 /// Zero-copy send guard trait.
 pub use guard::{GuardBox, SendGuard};
-/// NVMe passthrough completion result.
-pub use nvme::NvmeCompletion;
 /// NVMe passthrough configuration.
 pub use nvme::NvmeConfig;
 /// NVMe passthrough device handle.
 pub use nvme::NvmeDevice;
+/// The status word of an NVMe command the device failed.
+pub use nvme::NvmeStatus;
 /// Refcounted handle for waking a worker thread from any thread.
 pub use wakeup::WakeHandle;
 /// Builder for launching ringline workers.

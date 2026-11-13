@@ -71,12 +71,17 @@ fn iou_threads() -> usize {
 }
 
 fn config(send_slots: u16) -> Config {
+    config_with_tick(send_slots, 1000)
+}
+
+fn config_with_tick(send_slots: u16, tick_us: u64) -> Config {
     ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
         .sq_entries(256)
         .max_connections(64)
         .send_pool(send_slots, SLOT)
+        .tick_timeout_us(tick_us)
         .build()
         .expect("valid config")
 }
@@ -377,7 +382,8 @@ fn tls_sends_to_half_closed_peers_hold_no_thread() {
 
 /// A zero-copy send to a half-closed peer, small enough to fit under
 /// `RLIMIT_MEMLOCK`, stalls with no thread and arrives intact. Under a limit of at
-/// least 64 MiB, which is CI's, it also checks that the send stayed zero-copy.
+/// least 64 MiB, which CI's unlimited limit meets, it also checks that the send
+/// stayed zero-copy.
 #[test]
 fn a_zero_copy_send_to_a_half_closed_peer_holds_no_thread() {
     use ringline::metrics::{POOL, pool};
@@ -521,12 +527,23 @@ fn a_connection_with_a_multishot_poll_closes() {
 /// The backstop finds it.
 #[test]
 fn a_unix_peers_shut_rd_fails_the_send() {
+    unix_peers_shut_rd_fails_the_send(1000);
+}
+
+/// The same with no tick: nothing but the backstop's own deadline ends the
+/// worker's wait, so the send fails only if that deadline bounds it.
+#[test]
+fn a_unix_peers_shut_rd_fails_the_send_without_a_tick() {
+    unix_peers_shut_rd_fails_the_send(0);
+}
+
+fn unix_peers_shut_rd_fails_the_send(tick_us: u64) {
     let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset(8 << 20);
-    let dir = std::env::temp_dir().join(format!("ringline-605-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("ringline-605-{}-{tick_us}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("sock");
-    let (runtime, handles) = RinglineBuilder::new(config(64))
+    let (runtime, handles) = RinglineBuilder::new(config_with_tick(64, tick_us))
         .bind_unix(&path)
         .launch::<SendOnByte<SINGLE_SLOT>>()
         .expect("launch");

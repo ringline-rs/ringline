@@ -13,12 +13,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use crate::backend::Driver;
-#[cfg(has_io_uring)]
-use crate::completion::{OpTag, UserData};
 use crate::error::TimerExhausted;
 use crate::handler::ConnId;
-#[cfg(has_io_uring)]
-use crate::runtime::TimerSlotPool;
 use crate::runtime::send_completion::SendId;
 use crate::runtime::task::TaskId;
 use crate::runtime::waker::{STANDALONE_BIT, pending};
@@ -695,8 +691,13 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// destination is the buffer rustls processes records in, so no copy is made
 /// before decryption; with the `tls-buffered` feature it is a buffer rustls
 /// copies the ciphertext from. Decrypted plaintext goes to the accumulator.
-/// During the handshake a receive is re-armed after each completion. After
-/// it, a receive is armed when a read parks, as on a plaintext connection.
+/// During the handshake a receive is re-armed after each completion. A FIN
+/// before the handshake completes closes the connection, and an outbound
+/// connect resolves `UnexpectedEof`. A handshake that has not completed
+/// within [`ConfigBuilder::tls_handshake_timeout`](crate::ConfigBuilder::tls_handshake_timeout)
+/// also closes the connection, and an outbound connect resolves `TimedOut`.
+/// After the handshake, a receive is armed
+/// when a read parks, as on a plaintext connection.
 /// When the `POLLRDHUP` poll fires because the peer sent a FIN or reset while
 /// nothing reads, the runtime arms one and re-arms it after each completion
 /// until the receive reads the close_notify, returns 0 at the FIN, or fails.
@@ -778,6 +779,13 @@ impl TcpConnect {
     /// Requires a client configuration from
     /// [`ConfigBuilder::tls_client`](crate::ConfigBuilder::tls_client); without
     /// one the connect fails when awaited.
+    ///
+    /// If the peer's FIN arrives before the handshake completes, the connect
+    /// resolves [`UnexpectedEof`](io::ErrorKind::UnexpectedEof). If the
+    /// handshake has not completed within
+    /// [`ConfigBuilder::tls_handshake_timeout`](crate::ConfigBuilder::tls_handshake_timeout)
+    /// of the TCP connect completing, it resolves
+    /// [`TimedOut`](io::ErrorKind::TimedOut).
     pub fn tls(mut self, server_name: impl Into<String>) -> Self {
         self.server_name = Some(server_name.into());
         self
@@ -786,7 +794,9 @@ impl TcpConnect {
     /// Fail the connect if it has not completed within `timeout`.
     ///
     /// On a TLS connection the window covers the TCP connect only, not the
-    /// handshake that follows.
+    /// handshake that follows;
+    /// [`ConfigBuilder::tls_handshake_timeout`](crate::ConfigBuilder::tls_handshake_timeout)
+    /// bounds the handshake.
     ///
     /// The duration is truncated to whole milliseconds, because both backends
     /// arm in milliseconds. `Duration::ZERO` arms a timeout that fires
@@ -1029,7 +1039,12 @@ fn arrival_settle(driver: &mut Driver, conn_index: u32, before: usize, report: b
 #[cfg(has_io_uring)]
 #[inline]
 fn take_forward_zc_consumed(driver: &mut crate::backend::Driver, conn_index: u32) -> usize {
-    std::mem::replace(&mut driver.forward_zc_consumed[conn_index as usize], 0) as usize
+    let forwarded = std::mem::replace(&mut driver.forward_zc_consumed[conn_index as usize], 0);
+    if forwarded != 0 {
+        // The closure has returned, so nothing borrows the forwarded bytes.
+        driver.forward_zc_held[conn_index as usize] = None;
+    }
+    forwarded as usize
 }
 
 /// Zero-copy send guard over a detached slice of a connection's receive
@@ -1037,8 +1052,9 @@ fn take_forward_zc_consumed(driver: &mut crate::backend::Driver, conn_index: u32
 ///
 /// `forward_recv_buf` uses this when the bytes it was handed are
 /// accumulator-backed rather than a single kernel buffer. Holding the `Bytes`
-/// keeps the allocation alive until the kernel posts the ZC notification, so
-/// the message reaches the wire without being copied into a send-pool slot.
+/// keeps the allocation alive until the kernel posts the ZC notification (on
+/// a Unix-domain connection, until the plain `sendmsg` completes), so the
+/// message reaches the wire without being copied into a send-pool slot.
 /// The memory is a plain heap allocation, not a registered region.
 #[cfg(has_io_uring)]
 struct AccumulatorGuard(bytes::Bytes);
@@ -1240,7 +1256,9 @@ impl ConnCtx {
                     driver.forward_zc_consumed[conn_index as usize] = frozen.len() as u32;
                     let token = self.id();
                     // A refused send drops the guard; this handle puts the
-                    // bytes back, so nothing is committed on `Err`.
+                    // bytes back, so nothing is committed on `Err`. After a
+                    // send that copied and dropped the guard, it is what
+                    // keeps `data` allocated while the caller's closure runs.
                     let keep = frozen.clone();
                     // `guard()` honours `send_zc_threshold`, so a forward below
                     // it still folds into a copy exactly as before.
@@ -1253,6 +1271,7 @@ impl ConnCtx {
                         driver.accumulators.put_back(conn_index, keep);
                         driver.forward_zc_consumed[conn_index as usize] = 0;
                     } else {
+                        driver.forward_zc_held[conn_index as usize] = Some(keep);
                         driver.forwards_recv_buf[conn_index as usize] = true;
                     }
                     return result;
@@ -3016,9 +3035,16 @@ impl Connection {
     }
 
     /// Whether the peer has finished sending: its FIN or close_notify has
-    /// arrived, or the read side failed. The runtime sees the end whether or
-    /// not a read is parked (on io_uring through the `POLLRDHUP` poll, see
-    /// [`connect`]), so this turns true while a task does other work.
+    /// arrived, or the read side failed. The runtime sees a FIN or a read
+    /// error whether or not a read is parked (on io_uring through the
+    /// `POLLRDHUP` poll, see [`connect`]), so this turns true while a task
+    /// does other work. A close_notify is seen when a receive reads it. On
+    /// mio the runtime receives whenever the socket is readable, except
+    /// while a forward from the connection waits on its sink. On io_uring a
+    /// receive is armed during the handshake, when a read parks, and after
+    /// each completion once the peer's FIN or a reset has arrived; a
+    /// close_notify that arrives after the last receive, while the TCP
+    /// stream stays open and no read is parked, is seen once a read parks.
     ///
     /// The peer's end does not close the connection. The task may keep
     /// sending, and the connection closes when the task returns, drops the
@@ -4538,8 +4564,11 @@ mod yield_now_tests {
 
 /// Create a future that completes after the given duration.
 ///
-/// On io_uring, uses a timeout SQE internally — no busy-waiting, no timer
-/// thread. The timer fires on the same worker thread as the calling task.
+/// The first poll records the deadline in the worker's timer heap. The worker
+/// bounds each wait for I/O by its earliest deadline and wakes the task on the
+/// calling task's worker once the deadline passes: there is no busy-waiting,
+/// no timer thread, and no system call per timer. The duration counts from
+/// the first poll.
 ///
 /// # Panics
 ///
@@ -4563,7 +4592,8 @@ pub fn sleep(duration: Duration) -> SleepFuture {
 /// drives it.
 pub struct SleepFuture {
     duration: Duration,
-    /// None until first poll, then Some(slot_index).
+    /// None until the timer is armed, then Some(slot_index). The slot's
+    /// deadline is recorded when it is allocated.
     timer_slot: Option<u32>,
     /// Generation when the slot was allocated.
     generation: u16,
@@ -4573,89 +4603,63 @@ pub struct SleepFuture {
     owner: u32,
 }
 
+impl SleepFuture {
+    /// Take a timer slot for the current task and record its deadline.
+    /// `None` when every slot is held.
+    fn arm(&mut self, executor: &mut crate::runtime::Executor) -> Option<()> {
+        let waker_id = CURRENT_TASK_ID.with(|c| c.get());
+        let (slot, generation) = executor.timer_pool.allocate(waker_id)?;
+        if let Some(deadline) = self.absolute {
+            executor
+                .timer_pool
+                .set_absolute(slot, deadline.secs, deadline.nsecs);
+        } else {
+            executor.timer_pool.set_relative(slot, self.duration);
+        }
+        self.timer_slot = Some(slot);
+        self.generation = generation;
+        self.owner = crate::runtime::waker::current_worker();
+        Some(())
+    }
+}
+
 impl Future for SleepFuture {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        with_state(|driver, executor| {
-            let _ = driver; // used only on io_uring path
-            if let Some(slot) = self.timer_slot {
-                // On another worker this slot is that worker's timer.
-                if self.owner != crate::runtime::waker::current_worker() {
-                    return pending(cx);
+        with_state(|_driver, executor| {
+            match self.timer_slot {
+                Some(slot) => {
+                    // On another worker this slot is that worker's timer.
+                    if self.owner != crate::runtime::waker::current_worker() {
+                        return pending(cx);
+                    }
+                    if executor.timer_pool.is_fired(slot) {
+                        executor.timer_pool.release(slot);
+                        // Polled again, the sleep takes a new slot and arms it.
+                        self.timer_slot = None;
+                        return Poll::Ready(());
+                    }
+                    // A `Shared` can pass this future between tasks of a worker.
+                    executor.timer_pool.waker_ids[slot as usize] =
+                        CURRENT_TASK_ID.with(|c| c.get());
                 }
-                // Already submitted — check if fired.
-                if executor.timer_pool.is_fired(slot) {
-                    executor.timer_pool.release(slot);
-                    self.timer_slot = None;
-                    return Poll::Ready(());
-                }
-                // A `Shared` can pass this future between tasks of a worker.
-                executor.timer_pool.waker_ids[slot as usize] = CURRENT_TASK_ID.with(|c| c.get());
-                return pending(cx);
-            }
-
-            // First poll — allocate slot, fill timespec, submit SQE.
-            let waker_id = CURRENT_TASK_ID.with(|c| c.get());
-            let (slot, generation) = match executor.timer_pool.allocate(waker_id) {
-                Some(pair) => pair,
                 None => {
-                    // Documented contract: the infallible variants panic on
-                    // pool exhaustion (try_sleep/try_timeout are the fallible
-                    // API). Completing immediately instead was far worse than
-                    // the panic: every timeout() fired a spurious
-                    // zero-duration Elapsed that cancelled healthy I/O, and a
-                    // sleep() loop became a busy-spin keeping the pool
-                    // exhausted.
-                    panic!(
-                        "timer slot pool exhausted ({} slots) — use try_sleep()/try_timeout() to handle it",
-                        executor.timer_pool.capacity()
-                    );
-                }
-            };
-
-            #[cfg(has_io_uring)]
-            {
-                let payload = TimerSlotPool::encode_payload(slot, generation);
-                let ud = UserData::encode(OpTag::Timer, 0, payload);
-
-                let submit_result = if let Some(deadline) = self.absolute {
-                    let ts_ptr =
-                        executor
-                            .timer_pool
-                            .set_absolute(slot, deadline.secs, deadline.nsecs);
-                    driver.ring.submit_timeout_abs(ts_ptr, ud)
-                } else {
-                    let ts_ptr = executor.timer_pool.set_relative(slot, self.duration);
-                    driver.ring.submit_timeout(ts_ptr, ud)
-                };
-
-                if let Err(e) = submit_result {
-                    executor.timer_pool.release(slot);
-                    // SQ full at timer-arm time. Completing immediately would
-                    // fire a spurious zero-duration timeout; panicking matches
-                    // the documented infallible contract.
-                    panic!(
-                        "timer SQE submission failed: {e} — use try_sleep()/try_timeout() for fallible arming"
-                    );
+                    if self.arm(executor).is_none() {
+                        // Documented contract: the infallible variants panic
+                        // on pool exhaustion (try_sleep/try_timeout are the
+                        // fallible API). Completing immediately instead was
+                        // far worse than the panic: every timeout() fired a
+                        // spurious zero-duration Elapsed that cancelled
+                        // healthy I/O, and a sleep() loop became a busy-spin
+                        // keeping the pool exhausted.
+                        panic!(
+                            "timer slot pool exhausted ({} slots) — use try_sleep()/try_timeout() to handle it",
+                            executor.timer_pool.capacity()
+                        );
+                    }
                 }
             }
-
-            #[cfg(not(has_io_uring))]
-            {
-                // Mio backend: store deadline; the event loop polls timer expiry.
-                if let Some(deadline) = self.absolute {
-                    executor
-                        .timer_pool
-                        .set_absolute(slot, deadline.secs, deadline.nsecs);
-                } else {
-                    executor.timer_pool.set_relative(slot, self.duration);
-                }
-            }
-
-            self.timer_slot = Some(slot);
-            self.generation = generation;
-            self.owner = crate::runtime::waker::current_worker();
             pending(cx)
         })
     }
@@ -4672,39 +4676,13 @@ impl Drop for SleepFuture {
         match CURRENT_DRIVER.with(|c| c.get()) {
             Some(mut non_null) => {
                 let state = unsafe { non_null.as_mut() };
-                let driver = unsafe { &mut *state.driver.as_mut() };
                 let executor = unsafe { &mut *state.executor.as_mut() };
-                release_timer_slot(driver, executor, slot, self.generation);
+                executor.timer_pool.release(slot);
             }
             // Outside a task poll (a connection's task dropped at teardown).
-            None => crate::runtime::defer_release(crate::runtime::Orphan::TimerSlot {
-                slot,
-                generation: self.generation,
-            }),
+            None => crate::runtime::defer_release(crate::runtime::Orphan::TimerSlot(slot)),
         }
     }
-}
-
-/// Release a sleep's timer slot. On io_uring, cancels the timer first if it
-/// has not fired; a timer CQE that arrives after the release is
-/// rejected by its generation. On mio, releasing clears the deadline.
-#[cfg_attr(not(has_io_uring), allow(unused_variables))]
-pub(crate) fn release_timer_slot(
-    driver: &mut crate::backend::Driver,
-    executor: &mut crate::runtime::Executor,
-    slot: u32,
-    generation: u16,
-) {
-    if !executor.timer_pool.is_fired(slot) {
-        #[cfg(has_io_uring)]
-        {
-            let payload = TimerSlotPool::encode_payload(slot, generation);
-            let target_ud = UserData::encode(OpTag::Timer, 0, payload);
-            // Best effort cancel; timer fires harmlessly if already expired.
-            let _ = driver.ring.submit_async_cancel(target_ud.raw(), 0);
-        }
-    }
-    executor.timer_pool.release(slot);
 }
 
 /// Create a sleep future, returning an error if the timer pool is exhausted.
@@ -4712,52 +4690,31 @@ pub(crate) fn release_timer_slot(
 /// Unlike [`sleep()`] which panics on pool exhaustion, this returns
 /// `Err(TimerExhausted)` so callers can handle capacity limits gracefully.
 ///
-/// The timer slot is allocated eagerly (at call time, not on first poll).
+/// The timer slot is allocated and the deadline recorded at call time, not
+/// on first poll, so the duration counts from this call.
 ///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
 pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
-    with_state(|driver, executor| {
-        let _ = driver; // used only on io_uring path
-        let waker_id = CURRENT_TASK_ID.with(|c| c.get());
-        let (slot, generation) = executor.timer_pool.allocate(waker_id).ok_or_else(|| {
+    try_arm(SleepFuture {
+        duration,
+        timer_slot: None,
+        owner: 0,
+        generation: 0,
+        absolute: None,
+    })
+}
+
+/// Allocate `sleep`'s timer slot now and record its deadline, for
+/// [`try_sleep`] and [`try_sleep_until`].
+fn try_arm(mut sleep: SleepFuture) -> Result<SleepFuture, TimerExhausted> {
+    with_state(|_driver, executor| {
+        sleep.arm(executor).ok_or_else(|| {
             crate::metrics::POOL.increment(crate::metrics::pool::TIMER_EXHAUSTED);
             TimerExhausted
         })?;
-
-        #[cfg(has_io_uring)]
-        {
-            let payload = TimerSlotPool::encode_payload(slot, generation);
-            let ud = UserData::encode(OpTag::Timer, 0, payload);
-            let ts_ptr = executor.timer_pool.set_relative(slot, duration);
-
-            if let Err(_e) = driver.ring.submit_timeout(ts_ptr, ud) {
-                executor.timer_pool.release(slot);
-                // SQE submission failure — complete immediately (`sleep()`
-                // panics instead).
-                return Ok(SleepFuture {
-                    duration,
-                    timer_slot: None,
-                    owner: 0,
-                    generation: 0,
-                    absolute: None,
-                });
-            }
-        }
-
-        #[cfg(not(has_io_uring))]
-        {
-            executor.timer_pool.set_relative(slot, duration);
-        }
-
-        Ok(SleepFuture {
-            duration,
-            timer_slot: Some(slot),
-            owner: crate::runtime::waker::current_worker(),
-            generation,
-            absolute: None,
-        })
+        Ok(sleep)
     })
 }
 
@@ -4766,7 +4723,7 @@ pub fn try_sleep(duration: Duration) -> Result<SleepFuture, TimerExhausted> {
 /// A monotonic clock deadline for use with absolute timers.
 ///
 /// Created via [`Deadline::after()`] or [`Deadline::now()`].
-/// Uses `CLOCK_MONOTONIC` to match io_uring's default clock.
+/// Uses `CLOCK_MONOTONIC`, the clock [`std::time::Instant`] reads on Linux.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Deadline {
     pub(crate) secs: u64,
@@ -4793,11 +4750,12 @@ impl Deadline {
     /// Create a deadline `duration` from now.
     pub fn after(duration: Duration) -> Self {
         let now = Self::now();
-        let mut secs = now.secs + duration.as_secs();
+        // Saturates: a deadline that far out is never reached.
+        let mut secs = now.secs.saturating_add(duration.as_secs());
         let mut nsecs = now.nsecs + duration.subsec_nanos();
         if nsecs >= 1_000_000_000 {
             nsecs -= 1_000_000_000;
-            secs += 1;
+            secs = secs.saturating_add(1);
         }
         Deadline { secs, nsecs }
     }
@@ -4821,8 +4779,8 @@ impl Deadline {
 
 /// Create a future that completes at the given absolute deadline.
 ///
-/// Uses io_uring's `TIMEOUT_ABS` flag with `CLOCK_MONOTONIC` for
-/// precise deadline-based timing without accumulated drift.
+/// The deadline is fixed when the future is created, so a loop of
+/// `sleep_until` calls on deadlines a fixed interval apart does not drift.
 ///
 /// # Panics
 ///
@@ -4843,54 +4801,18 @@ pub fn sleep_until(deadline: Deadline) -> SleepFuture {
 /// Unlike [`sleep_until()`] which panics on pool exhaustion, this returns
 /// `Err(TimerExhausted)` so callers can handle capacity limits gracefully.
 ///
-/// The timer slot is allocated eagerly (at call time, not on first poll).
+/// The timer slot is allocated at call time, not on first poll.
 ///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
 pub fn try_sleep_until(deadline: Deadline) -> Result<SleepFuture, TimerExhausted> {
-    with_state(|driver, executor| {
-        let _ = driver; // used only on io_uring path
-        let waker_id = CURRENT_TASK_ID.with(|c| c.get());
-        let (slot, generation) = executor.timer_pool.allocate(waker_id).ok_or_else(|| {
-            crate::metrics::POOL.increment(crate::metrics::pool::TIMER_EXHAUSTED);
-            TimerExhausted
-        })?;
-
-        #[cfg(has_io_uring)]
-        {
-            let payload = TimerSlotPool::encode_payload(slot, generation);
-            let ud = UserData::encode(OpTag::Timer, 0, payload);
-            let ts_ptr = executor
-                .timer_pool
-                .set_absolute(slot, deadline.secs, deadline.nsecs);
-
-            if let Err(_e) = driver.ring.submit_timeout_abs(ts_ptr, ud) {
-                executor.timer_pool.release(slot);
-                return Ok(SleepFuture {
-                    duration: Duration::ZERO,
-                    timer_slot: None,
-                    owner: 0,
-                    generation: 0,
-                    absolute: Some(deadline),
-                });
-            }
-        }
-
-        #[cfg(not(has_io_uring))]
-        {
-            executor
-                .timer_pool
-                .set_absolute(slot, deadline.secs, deadline.nsecs);
-        }
-
-        Ok(SleepFuture {
-            duration: Duration::ZERO,
-            timer_slot: Some(slot),
-            owner: crate::runtime::waker::current_worker(),
-            generation,
-            absolute: Some(deadline),
-        })
+    try_arm(SleepFuture {
+        duration: Duration::ZERO, // unused for absolute timers
+        timer_slot: None,
+        owner: 0,
+        generation: 0,
+        absolute: Some(deadline),
     })
 }
 
@@ -4953,8 +4875,6 @@ pub fn try_timeout<F: Future>(
 
 /// Wrap a future with an absolute deadline. If the future does not complete
 /// before `deadline`, returns `Err(Elapsed)`.
-///
-/// Uses io_uring's `TIMEOUT_ABS` flag with `CLOCK_MONOTONIC`.
 ///
 /// # Panics
 ///
@@ -5019,8 +4939,18 @@ impl<F: Future> Future for TimeoutFuture<F> {
 /// I/O. The operation was submitted before this future was created;
 /// its completion stores the result and wakes the task.
 ///
-/// Polled on another worker it stays pending until a task on the owning worker
-/// drives it.
+/// Resolves to the operation's result: the bytes read or written for
+/// `fs::read`, `fs::write`, `direct_io_read` and `direct_io_write` (a short
+/// count is not an error), and `0` for `fs::fsync`, `fs::rename`,
+/// `fs::remove`, `fs::mkdir`, `direct_io_fsync` and every NVMe command. A
+/// failure resolves to the errno's `io::Error`; an NVMe command the device
+/// failed resolves to an `io::Error` of kind `Other` whose inner error is the
+/// [`NvmeStatus`](crate::NvmeStatus).
+///
+/// Polled from a task on another worker it stays pending until a task on the
+/// owning worker drives it; polled outside the ringline executor it panics.
+/// Dropped on a thread other than the owning worker, it leaves its result slot
+/// on the owning worker taken until that worker exits.
 pub struct DiskIoFuture {
     pub(crate) seq: u32,
     /// Set once `poll` has returned `Ready`: the result has been taken.
@@ -5050,17 +4980,13 @@ impl Future for DiskIoFuture {
             if self.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
-            match executor.take_disk_io_result(self.seq) {
-                Some(result) if result < 0 => {
-                    Poll::Ready(Err(io::Error::from_raw_os_error(-result)))
+            let task_id = CURRENT_TASK_ID.with(|c| c.get());
+            match executor.poll_disk_io(self.seq, task_id) {
+                Some((result, _)) if result < 0 => {
+                    Poll::Ready(Err(disk_io_error(self.seq, result)))
                 }
-                Some(result) => Poll::Ready(Ok(result)),
-                None => {
-                    // Re-register waiter (polled before CQE arrived or after spurious wake).
-                    let task_id = CURRENT_TASK_ID.with(|c| c.get());
-                    executor.wait_disk_io(self.seq, task_id);
-                    pending(cx)
-                }
+                Some((result, _)) => Poll::Ready(Ok(result)),
+                None => pending(cx),
             }
         });
         if poll.is_ready() {
@@ -5068,6 +4994,17 @@ impl Future for DiskIoFuture {
         }
         poll
     }
+}
+
+/// The error a negative disk-I/O result resolves to: for an NVMe command, a
+/// status word the device returned or an errno; otherwise an errno.
+fn disk_io_error(key: u32, result: i32) -> io::Error {
+    #[cfg(has_io_uring)]
+    if key >> 30 == crate::handler::DiskIoKind::Nvme as u32 {
+        return crate::nvme::error_from_result(result);
+    }
+    let _ = key;
+    io::Error::from_raw_os_error(-result)
 }
 
 impl Drop for DiskIoFuture {
@@ -5080,10 +5017,16 @@ impl Drop for DiskIoFuture {
     }
 }
 
-/// Open a Direct I/O file from any async task.
+/// Open a file for direct I/O: `O_RDWR | O_DIRECT | O_CLOEXEC` on Linux,
+/// `O_RDWR | O_CLOEXEC` with `F_NOCACHE` on macOS.
 ///
-/// Returns a [`DirectIoFile`](crate::direct_io::DirectIoFile) handle
-/// for use with [`direct_io_read()`].
+/// The open runs on the worker thread: `open(2)`, and on io_uring a
+/// synchronous registration of the fd as a fixed file, so every connection
+/// on the worker waits for it (#845).
+///
+/// Returns a [`DirectIoFile`](crate::direct_io::DirectIoFile) handle for
+/// [`direct_io_read()`], [`direct_io_write()`], [`direct_io_fsync()`] and
+/// [`close_direct_io_file()`].
 ///
 /// # Panics
 ///
@@ -5144,10 +5087,16 @@ pub fn close_nvme_device(device: crate::nvme::NvmeDevice) -> io::Result<()> {
     })
 }
 
-/// Open an NVMe device from any async task.
+/// Open an NVMe generic character device (`/dev/ng<X>n<Y>`) for passthrough
+/// commands on namespace `nsid`.
 ///
-/// Returns an [`NvmeDevice`](crate::nvme::NvmeDevice) handle
-/// for use with [`nvme_read()`], [`nvme_write()`], and [`nvme_flush()`].
+/// io_uring only: on mio this returns `Unsupported`. The open runs on the
+/// worker thread, `open(2)` and a synchronous registration of the fd as a
+/// fixed file, so every connection on the worker waits for it (#845).
+///
+/// Returns an [`NvmeDevice`](crate::nvme::NvmeDevice) handle for
+/// [`nvme_read()`], [`nvme_write()`], [`nvme_flush()`] and
+/// [`close_nvme_device()`].
 ///
 /// # Panics
 ///
@@ -5161,13 +5110,18 @@ pub fn open_nvme_device(path: &str, nsid: u32) -> io::Result<crate::nvme::NvmeDe
 
 /// Submit a Direct I/O read and return a future for the result.
 ///
-/// Reads `len` bytes from `offset` into the buffer at `buf`.
-/// The returned future completes when the io_uring CQE arrives.
+/// Reads `len` bytes from `offset` into the buffer at `buf`. The returned
+/// future completes when the operation does: the io_uring completion, or on
+/// mio the pool's `pread`.
 ///
 /// # Safety
 ///
-/// `buf` must point to aligned, writable memory of at least `len` bytes
-/// that remains valid until the future completes.
+/// `buf` must point to aligned, writable memory of at least `len` bytes that
+/// remains valid until the operation completes. The operation keeps using the
+/// memory after the future is dropped, and a dropped future gives no way to
+/// learn when the operation completes, so after a drop the memory must not be
+/// freed or reused: leak it, or use an owned-buffer variant where one exists
+/// (#825). Direct I/O has no owned-buffer variant.
 ///
 /// # Panics
 ///
@@ -5194,12 +5148,19 @@ pub unsafe fn direct_io_read(
 ///
 /// Reads `num_blocks` logical blocks starting at `lba` into the buffer
 /// at `buf_addr` with length `buf_len`. The returned future completes
-/// when the io_uring CQE arrives.
+/// when the io_uring CQE arrives, with `Ok(0)` for a command the device
+/// completed, an `io::Error` of kind `Other` whose inner error (`get_ref()`,
+/// `into_inner()`) is the [`NvmeStatus`](crate::NvmeStatus) for one the
+/// device failed, and the errno's `io::Error` for a transport failure.
 ///
 /// # Safety
 ///
-/// `buf_addr` must point to valid, aligned memory of at least `buf_len`
-/// bytes that remains valid until the returned future completes.
+/// `buf_addr` must point to valid, aligned memory of at least `buf_len` bytes
+/// that remains valid until the operation completes. The operation keeps using
+/// the memory after the future is dropped, and a dropped future gives no way
+/// to learn when the operation completes, so after a drop the memory must not
+/// be freed or reused: leak it, or use an owned-buffer variant where one
+/// exists (#825). NVMe has no owned-buffer variant.
 ///
 /// # Panics
 ///
@@ -5224,13 +5185,18 @@ pub unsafe fn nvme_read(
 
 /// Submit a Direct I/O write and return a future for the result.
 ///
-/// Writes `len` bytes from the buffer at `buf` to `offset` in the file.
-/// The returned future completes when the io_uring CQE arrives.
+/// Writes `len` bytes from the buffer at `buf` to `offset` in the file. The
+/// returned future completes when the operation does: the io_uring
+/// completion, or on mio the pool's `pwrite`.
 ///
 /// # Safety
 ///
-/// `buf` must point to aligned, readable memory of at least `len` bytes
-/// that remains valid until the future completes.
+/// `buf` must point to aligned, readable memory of at least `len` bytes that
+/// remains valid until the operation completes. The operation keeps using the
+/// memory after the future is dropped, and a dropped future gives no way to
+/// learn when the operation completes, so after a drop the memory must not be
+/// freed or reused: leak it, or use an owned-buffer variant where one exists
+/// (#825). Direct I/O has no owned-buffer variant.
 ///
 /// # Panics
 ///
@@ -5284,7 +5250,8 @@ pub fn direct_io_fsync(file: crate::direct_io::DirectIoFile) -> io::Result<DiskI
 ///
 /// Flushes volatile write caches on the device, ensuring all previously
 /// written data is persisted to non-volatile storage. The returned future
-/// completes when the io_uring CQE arrives.
+/// completes when the io_uring CQE arrives, with the outcomes
+/// [`nvme_read`] describes.
 ///
 /// # Panics
 ///
@@ -5303,12 +5270,17 @@ pub fn nvme_flush(device: crate::nvme::NvmeDevice) -> io::Result<DiskIoFuture> {
 ///
 /// Writes `num_blocks` logical blocks starting at `lba` from the buffer
 /// at `buf_addr` with length `buf_len`. The returned future completes
-/// when the io_uring CQE arrives.
+/// when the io_uring CQE arrives, with the outcomes [`nvme_read`]
+/// describes.
 ///
 /// # Safety
 ///
-/// `buf_addr` must point to valid, aligned memory of at least `buf_len`
-/// bytes that remains valid until the returned future completes.
+/// `buf_addr` must point to valid, aligned memory of at least `buf_len` bytes
+/// that remains valid until the operation completes. The operation keeps using
+/// the memory after the future is dropped, and a dropped future gives no way
+/// to learn when the operation completes, so after a drop the memory must not
+/// be freed or reused: leak it, or use an owned-buffer variant where one
+/// exists (#825). NVMe has no owned-buffer variant.
 ///
 /// # Panics
 ///

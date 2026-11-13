@@ -120,11 +120,6 @@ pub(crate) enum Op {
         addr: *const libc::sockaddr,
         addrlen: libc::socklen_t,
     },
-    /// A timeout, relative or (`abs`) absolute `CLOCK_MONOTONIC`.
-    Timeout {
-        ts: *const super::abi::Timespec,
-        abs: bool,
-    },
     /// Install a real fd for registered file `index` (`FIXED_FD_INSTALL`).
     FixedFdInstall {
         index: u32,
@@ -143,10 +138,12 @@ pub(crate) enum Op {
         mode: u32,
         file_index: u32,
     },
-    /// `statx(AT_FDCWD, path, AT_STATX_SYNC_AS_STAT, STATX_BASIC_STATS)`.
+    /// `statx(AT_FDCWD, path, AT_STATX_SYNC_AS_STAT, STATX_BASIC_STATS)`,
+    /// with `AT_SYMLINK_NOFOLLOW` added when `nofollow` is set.
     Statx {
         path: *const libc::c_char,
         buf: *mut libc::statx,
+        nofollow: bool,
     },
     RenameAt {
         old: *const libc::c_char,
@@ -207,6 +204,33 @@ impl Sqe {
                 buf,
                 len,
                 flags: crate::completion::CHAIN_SEND_FLAGS,
+            },
+            user_data,
+        )
+    }
+
+    /// A plain `sendmsg` on registered file `index`: the kernel copies the
+    /// iovecs into the socket. For a socket that refuses `SENDMSG_ZC`, such as
+    /// a Unix-domain one (#829).
+    pub(crate) fn send_msg(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
+        Sqe::new(
+            Op::SendMsg {
+                fd: Fd::Fixed(index),
+                msg,
+                flags: crate::completion::STREAM_SEND_FLAGS as u32,
+            },
+            user_data,
+        )
+    }
+
+    /// A plain `sendmsg` in a linked chain. See [`Sqe::send_msg`] and
+    /// [`Sqe::chain_send_msg_zc`].
+    pub(crate) fn chain_send_msg(index: u32, msg: *const libc::msghdr, user_data: u64) -> Self {
+        Sqe::new(
+            Op::SendMsg {
+                fd: Fd::Fixed(index),
+                msg,
+                flags: crate::completion::CHAIN_SEND_FLAGS as u32,
             },
             user_data,
         )

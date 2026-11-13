@@ -1,9 +1,8 @@
 //! A `launch()` that fails after a deferred listener's acceptor has started
 //! must release that acceptor.
 //!
-//! This is its own test binary because it counts the process's threads whose
-//! name starts with `ringline-accept`, and acceptors started by any other test
-//! in the same process would be counted too.
+//! This is its own test binary because it counts the process's threads, and
+//! threads started by any other test in the same process would be counted too.
 //!
 //! It fails the second bind, so it covers the bind-failure rollback. The
 //! register and acceptor-spawn failure paths shut the runtime down the same
@@ -43,15 +42,23 @@ impl AsyncEventHandler for Idle {
     }
 }
 
-/// The number of live acceptor threads in this process. The kernel truncates
-/// a thread name to 15 bytes, so `ringline-acceptor-0` reads back as
-/// `ringline-accept`.
-fn acceptor_threads() -> usize {
+/// The number of live threads in this process. The test counts every thread
+/// rather than those named `rl-acpt-…`: a thread sets its own name
+/// once it runs, so an acceptor spawned just before `launch()` returned can
+/// still carry the name of the thread that spawned it.
+fn threads() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .expect("read /proc/self/task")
+        .count()
+}
+
+/// The names of this process's live threads, for the failure message.
+fn thread_names() -> Vec<String> {
     std::fs::read_dir("/proc/self/task")
         .expect("read /proc/self/task")
         .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
-        .filter(|name| name.trim_end().starts_with("ringline-accept"))
-        .count()
+        .map(|name| name.trim_end().to_string())
+        .collect()
 }
 
 /// The first listener is deferred, so its acceptor parks on the gate. The
@@ -61,6 +68,7 @@ fn acceptor_threads() -> usize {
 fn a_failed_launch_releases_a_parked_acceptor() {
     let taken = TcpListener::bind("127.0.0.1:0").expect("bind");
     let taken_addr = taken.local_addr().expect("local_addr");
+    let before = threads();
 
     let result = RinglineBuilder::new(test_config())
         .bind("127.0.0.1:0".parse().unwrap())
@@ -70,13 +78,14 @@ fn a_failed_launch_releases_a_parked_acceptor() {
     assert!(result.is_err(), "the second bind must fail");
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    while acceptor_threads() > 0 && Instant::now() < deadline {
+    while threads() > before && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        acceptor_threads(),
-        0,
-        "an acceptor thread outlived the failed launch"
+        threads(),
+        before,
+        "a thread the failed launch started outlived it: {:?}",
+        thread_names()
     );
     drop(taken);
 }

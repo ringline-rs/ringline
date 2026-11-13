@@ -114,6 +114,51 @@ fn sleeps_complete_in_futures_unordered() {
     });
 }
 
+/// A sleep polled again after it completed runs again, as a new timer.
+#[test]
+fn a_sleep_polled_after_it_completed_runs_again() {
+    run_on_start(|| {
+        Box::pin(async {
+            let mut sleep = ringline::sleep(Duration::from_millis(5));
+            (&mut sleep).await;
+            let again = ringline::timeout(LIMIT, poll_fn(|cx| Pin::new(&mut sleep).poll(cx))).await;
+            assert!(
+                again.is_ok(),
+                "a sleep polled after Ready never completed again"
+            );
+        })
+    });
+}
+
+/// A sleep or deadline too far out for the clock does not fire and does not
+/// panic: `Duration::MAX` overflowed the timespec on io_uring, which the kernel
+/// refused, and `Instant` on mio (#836).
+#[test]
+fn a_sleep_of_duration_max_stays_pending() {
+    run_on_start(|| {
+        Box::pin(async {
+            let short = Duration::from_millis(20);
+            assert!(
+                ringline::timeout(short, ringline::sleep(Duration::MAX))
+                    .await
+                    .is_err(),
+                "sleep(Duration::MAX) completed"
+            );
+            let far = ringline::Deadline::after(Duration::MAX);
+            assert!(
+                ringline::timeout(short, ringline::sleep_until(far))
+                    .await
+                    .is_err(),
+                "sleep_until(after(Duration::MAX)) completed"
+            );
+            assert_eq!(
+                ringline::timeout(Duration::MAX, async { 7 }).await.ok(),
+                Some(7)
+            );
+        })
+    });
+}
+
 /// A connection task woken during its own poll is polled again: the wake is
 /// recorded in its slot, and parking the task queues it.
 #[test]

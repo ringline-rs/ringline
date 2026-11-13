@@ -58,9 +58,13 @@ struct InFlightSendEntry {
     sends: SendRun,
     /// Bytes of the entry the kernel has sent so far (`try_advance`).
     sent: u32,
-    /// A `SendMsgZc` of this entry returned `-ENOMEM`: the rest of the entry
-    /// is sent with plain `send`s, which pin no pages.
+    /// A `SendMsgZc` or plain `sendmsg` of this entry returned `-ENOMEM`: the
+    /// rest of the entry is sent with plain `send`s, which pin no pages.
     plain_send: bool,
+    /// The connection's socket refuses `SENDMSG_ZC` (a Unix-domain socket,
+    /// #829): the entry is sent, and resent after a partial send, with a plain
+    /// `sendmsg`.
+    plain_msg: bool,
     /// One per main CQE with `IORING_CQE_F_MORE`, so a short send adds one.
     pending_notifs: u32,
     awaiting_notifications: bool,
@@ -91,6 +95,7 @@ impl InFlightSendSlab {
                 sends: SendRun::EMPTY,
                 sent: 0,
                 plain_send: false,
+                plain_msg: false,
                 pending_notifs: 0,
                 awaiting_notifications: false,
                 in_use: false,
@@ -143,6 +148,7 @@ impl InFlightSendSlab {
         entry.sends.clear();
         entry.sent = 0;
         entry.plain_send = false;
+        entry.plain_msg = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -195,6 +201,7 @@ impl InFlightSendSlab {
         }
         entry.sent = 0;
         entry.plain_send = false;
+        entry.plain_msg = false;
         entry.pending_notifs = 0;
         entry.awaiting_notifications = false;
         entry.in_use = true;
@@ -218,7 +225,6 @@ impl InFlightSendSlab {
     /// Advance past `bytes_sent` bytes in the iovec array.
     /// Returns `Some(msghdr_ptr)` if there are remaining bytes to send (partial resubmit).
     /// Returns `None` if all data has been sent.
-    #[allow(clippy::mut_range_bound)]
     pub fn try_advance(&mut self, idx: u16, bytes_sent: u32) -> Option<*const libc::msghdr> {
         let entry = &mut self.entries[idx as usize];
         debug_assert!(entry.in_use);
@@ -226,17 +232,17 @@ impl InFlightSendSlab {
         entry.sent = entry.sent.saturating_add(bytes_sent);
         let mut skip = bytes_sent as usize;
         let count = entry.iov_count as usize;
-        let mut new_start = entry.iov_start as usize;
+        let start = entry.iov_start as usize;
+        let mut new_start = start;
 
-        for i in new_start..count {
-            if skip >= entry.iovecs[i].iov_len {
-                skip -= entry.iovecs[i].iov_len;
+        for (i, iov) in entry.iovecs.iter_mut().enumerate().take(count).skip(start) {
+            if skip >= iov.iov_len {
+                skip -= iov.iov_len;
                 new_start = i + 1;
             } else {
                 // Partial iovec — adjust in place
-                entry.iovecs[i].iov_base =
-                    (entry.iovecs[i].iov_base as *mut u8).wrapping_add(skip) as *mut _;
-                entry.iovecs[i].iov_len -= skip;
+                iov.iov_base = (iov.iov_base as *mut u8).wrapping_add(skip) as *mut _;
+                iov.iov_len -= skip;
                 new_start = i;
                 break;
             }
@@ -284,6 +290,18 @@ impl InFlightSendSlab {
     /// ([`set_plain_send`](Self::set_plain_send)).
     pub fn plain_send(&self, idx: u16) -> bool {
         self.entries[idx as usize].plain_send
+    }
+
+    /// Send entry `idx`, and its rest after a partial send, with a plain
+    /// `sendmsg` instead of `SendMsgZc`.
+    pub fn set_plain_msg(&mut self, idx: u16) {
+        self.entries[idx as usize].plain_msg = true;
+    }
+
+    /// Whether entry `idx` is sent with a plain `sendmsg`
+    /// ([`set_plain_msg`](Self::set_plain_msg)).
+    pub fn plain_msg(&self, idx: u16) -> bool {
+        self.entries[idx as usize].plain_msg
     }
 
     /// Get the msghdr pointer for a slab entry (for resubmission retries).
@@ -534,9 +552,10 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A recycled entry is sent zero-copy again: every allocate clears the
-    /// `plain_send` an earlier occupant's `-ENOMEM` set.
+    /// `plain_send` an earlier occupant's `-ENOMEM` set, and the `plain_msg` an
+    /// earlier occupant on a Unix connection set.
     #[test]
-    fn every_allocate_clears_plain_send() {
+    fn every_allocate_clears_plain_send_and_plain_msg() {
         let iov = [libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 4,
@@ -544,6 +563,7 @@ mod tests {
         let mut slab = InFlightSendSlab::new(1);
         let mark_and_release = |slab: &mut InFlightSendSlab, idx: u16| {
             slab.set_plain_send(idx);
+            slab.set_plain_msg(idx);
             slab.release(idx);
         };
 
@@ -557,10 +577,12 @@ mod tests {
             .allocate(0, 0, &iov, u16::MAX, [const { None }; MAX_GUARDS], 0, 4)
             .unwrap();
         assert!(!slab.plain_send(idx), "allocate");
+        assert!(!slab.plain_msg(idx), "allocate");
         mark_and_release(&mut slab, idx);
 
         let (idx, _) = slab.allocate_coalesced(0, 0, &iov, &[0], 4, []).unwrap();
         assert!(!slab.plain_send(idx), "allocate_coalesced");
+        assert!(!slab.plain_msg(idx), "allocate_coalesced");
     }
 
     struct TestGuard {

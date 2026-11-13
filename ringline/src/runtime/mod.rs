@@ -30,6 +30,7 @@ pub(crate) mod task;
 pub(crate) mod waker;
 
 use std::cell::Cell;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::io as stdio;
 
@@ -178,33 +179,36 @@ thread_local! {
 
 /// Timer slots per worker: the most [`sleep()`](crate::sleep),
 /// [`timeout()`](crate::timeout) and related timers one worker can have
-/// pending at once. A timer's io_uring completion carries its slot in 16 bits,
-/// which this fills. On io_uring the pool takes about 1.7 MiB per worker; on
-/// mio, a heap entry per pending timer adds up to about 1.5 MiB more.
+/// pending at once. The pool takes about 1.7 MiB per worker, and its deadline
+/// heap up to about 3 MiB more while that many timers are pending.
 pub const TIMER_SLOTS: u32 = 1 << 16;
 
-/// Pool of timer slots backed by stable memory for the I/O backend.
+/// The deadline heap is compacted when it reaches this many entries, or
+/// twice the entries left by the previous compaction if that is more.
+const TIMER_HEAP_COMPACT_MIN: usize = 1024;
+
+/// Pool of timer slots and the deadline heap the event loop waits on.
 ///
-/// Each `sleep()` call allocates a slot and metadata. Generation counters
-/// prevent stale completions from waking the wrong task after slot reuse.
+/// Each `sleep()` call allocates a slot and records its deadline. Generation
+/// counters keep a heap entry left by a released slot from firing a later
+/// occupant.
 pub(crate) struct TimerSlotPool {
-    /// Timespec values — must remain at stable addresses for io_uring.
-    #[cfg(has_io_uring)]
-    pub(crate) timespecs: Vec<crate::backend::uring::abi::Timespec>,
-    /// Deadline instants for the mio backend timer expiry.
-    #[cfg(not(has_io_uring))]
+    /// Each slot's deadline, or `None` for a free slot or a timer that never
+    /// fires.
     pub(crate) deadlines: Vec<Option<std::time::Instant>>,
-    /// Min-heap of (deadline, slot, generation) for O(log n) expiry checks
-    /// on the mio backend (replaces full-pool scans per loop iteration).
-    /// Entries are lazily invalidated: a popped/peeked entry only counts if
-    /// the slot's generation and exact deadline still match.
-    #[cfg(not(has_io_uring))]
+    /// Min-heap of (deadline, slot, generation). The event loop reads its
+    /// earliest live entry to bound its wait, and pops expired entries to
+    /// fire them. Entries are invalidated lazily: a popped or peeked entry
+    /// counts only if the slot's generation and exact deadline still match
+    /// (`heap_entry_live`).
     expiry_heap: std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u32, u16)>>,
+    /// The heap length at which `set_deadline` drops the dead entries.
+    compact_at: usize,
     /// Which task (with STANDALONE_BIT encoding) to wake when this timer fires.
     pub(crate) waker_ids: Vec<u32>,
-    /// Whether the CQE/event has arrived for this timer.
+    /// Whether this timer's deadline has passed and the event loop fired it.
     pub(crate) fired: Vec<bool>,
-    /// Generation counter per slot to prevent stale event races.
+    /// Generation counter per slot, incremented on release.
     pub(crate) generations: Vec<u16>,
     /// Free slot indices for O(1) allocation.
     free_list: Vec<u32>,
@@ -219,12 +223,9 @@ impl TimerSlotPool {
             free_list.push(i);
         }
         TimerSlotPool {
-            #[cfg(has_io_uring)]
-            timespecs: vec![crate::backend::uring::abi::Timespec::new(); cap],
-            #[cfg(not(has_io_uring))]
             deadlines: vec![None; cap],
-            #[cfg(not(has_io_uring))]
             expiry_heap: std::collections::BinaryHeap::new(),
+            compact_at: TIMER_HEAP_COMPACT_MIN,
             waker_ids: vec![0; cap],
             fired: vec![false; cap],
             generations: vec![0; cap],
@@ -242,19 +243,13 @@ impl TimerSlotPool {
         Some((slot, generation))
     }
 
-    /// Release a timer slot back to the free list.
+    /// Release a timer slot back to the free list. Its heap entry, if any,
+    /// is dead from here on: the generation no longer matches.
     pub(crate) fn release(&mut self, slot: u32) {
         let idx = slot as usize;
         if idx < self.generations.len() {
             self.generations[idx] = self.generations[idx].wrapping_add(1);
-            // Clear the mio deadline: the expiry scan reads the slot's
-            // *current* generation, so a stale deadline on a free slot would
-            // pass fire()'s generation check, spuriously wake the old
-            // waker_id, and keep shortening the poll timeout until it passes.
-            #[cfg(not(has_io_uring))]
-            {
-                self.deadlines[idx] = None;
-            }
+            self.deadlines[idx] = None;
             self.free_list.push(slot);
         }
     }
@@ -263,7 +258,7 @@ impl TimerSlotPool {
     pub(crate) fn fire(&mut self, slot: u32, generation: u16) -> Option<u32> {
         let idx = slot as usize;
         if idx >= self.generations.len() || self.generations[idx] != generation {
-            return None; // stale CQE
+            return None; // the slot was released since
         }
         self.fired[idx] = true;
         Some(self.waker_ids[idx])
@@ -274,71 +269,62 @@ impl TimerSlotPool {
         self.generations.len()
     }
 
+    /// Number of slots not held.
+    #[cfg(test)]
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub(crate) fn free_slots(&self) -> usize {
+        self.free_list.len()
+    }
+
+    /// Number of heap entries, live and dead.
+    #[cfg(test)]
+    pub(crate) fn heap_len(&self) -> usize {
+        self.expiry_heap.len()
+    }
+
     /// Check if a timer slot has fired.
     pub(crate) fn is_fired(&self, slot: u32) -> bool {
         self.fired.get(slot as usize).copied().unwrap_or(false)
     }
 
-    /// Encode `(slot_index, generation)` into a 32-bit payload for UserData.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
-    pub(crate) fn encode_payload(slot: u32, generation: u16) -> u32 {
-        (slot & 0xFFFF) | ((generation as u32) << 16)
-    }
-
-    /// Decode payload back to `(slot_index, generation)`.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
-    pub(crate) fn decode_payload(payload: u32) -> (u32, u16) {
-        let slot = payload & 0xFFFF;
-        let generation = (payload >> 16) as u16;
-        (slot, generation)
-    }
-
-    /// Store a relative duration into the timer slot and return a raw pointer
-    /// to the timespec for io_uring submission.
-    #[cfg(has_io_uring)]
-    pub(crate) fn set_relative(
-        &mut self,
-        slot: u32,
-        duration: std::time::Duration,
-    ) -> *const crate::backend::uring::abi::Timespec {
-        let idx = slot as usize;
-        self.timespecs[idx] = crate::backend::uring::abi::Timespec::new()
-            .sec(duration.as_secs())
-            .nsec(duration.subsec_nanos());
-        &self.timespecs[idx] as *const _
-    }
-
-    /// Store an absolute deadline into the timer slot and return a raw pointer
-    /// to the timespec for io_uring submission.
-    #[cfg(has_io_uring)]
-    pub(crate) fn set_absolute(
-        &mut self,
-        slot: u32,
-        secs: u64,
-        nsecs: u32,
-    ) -> *const crate::backend::uring::abi::Timespec {
-        let idx = slot as usize;
-        self.timespecs[idx] = crate::backend::uring::abi::Timespec::new()
-            .sec(secs)
-            .nsec(nsecs);
-        &self.timespecs[idx] as *const _
-    }
-
-    /// Store a relative duration as a deadline (mio backend).
-    #[cfg(not(has_io_uring))]
+    /// Store a deadline `duration` from now. A deadline past what `Instant`
+    /// can hold is never reached: the slot gets no deadline and never fires.
     pub(crate) fn set_relative(&mut self, slot: u32, duration: std::time::Duration) {
-        let idx = slot as usize;
-        let deadline = std::time::Instant::now() + duration;
-        self.deadlines[idx] = Some(deadline);
-        self.expiry_heap
-            .push(std::cmp::Reverse((deadline, slot, self.generations[idx])));
+        let deadline = std::time::Instant::now().checked_add(duration);
+        self.set_deadline(slot, deadline);
     }
 
-    /// Store an absolute deadline (mio backend).
-    /// The secs/nsecs are CLOCK_MONOTONIC values; convert to Instant.
-    #[cfg(not(has_io_uring))]
-    pub(crate) fn set_absolute(&mut self, slot: u32, secs: u64, nsecs: u32) {
+    /// Store `deadline`, or none for a timer that never fires.
+    fn set_deadline(&mut self, slot: u32, deadline: Option<std::time::Instant>) {
         let idx = slot as usize;
+        self.deadlines[idx] = deadline;
+        if let Some(deadline) = deadline {
+            if self.expiry_heap.len() >= self.compact_at {
+                self.compact();
+            }
+            self.expiry_heap
+                .push(std::cmp::Reverse((deadline, slot, self.generations[idx])));
+        }
+    }
+
+    /// Drop every dead heap entry. A timer released before its deadline,
+    /// such as the timer of a `timeout()` whose future completed first,
+    /// leaves its entry behind until the entry reaches the top of the heap,
+    /// so without this the heap would grow with every such timer until its
+    /// deadline passes. Compacting at twice the entries the last compaction
+    /// kept makes the cost O(1) per push, amortized.
+    fn compact(&mut self) {
+        let mut heap = std::mem::take(&mut self.expiry_heap).into_vec();
+        heap.retain(|&std::cmp::Reverse((deadline, slot, generation))| {
+            self.heap_entry_live(deadline, slot, generation)
+        });
+        self.compact_at = (2 * heap.len()).max(TIMER_HEAP_COMPACT_MIN);
+        self.expiry_heap = heap.into();
+    }
+
+    /// Store an absolute deadline, given as `CLOCK_MONOTONIC` seconds and
+    /// nanoseconds ([`Deadline`](crate::Deadline)).
+    pub(crate) fn set_absolute(&mut self, slot: u32, secs: u64, nsecs: u32) {
         // Approximate: compute offset from current monotonic clock to the deadline.
         let mut ts = libc::timespec {
             tv_sec: 0,
@@ -349,21 +335,20 @@ impl TimerSlotPool {
         }
         let now_ns = ts.tv_sec as u128 * 1_000_000_000 + ts.tv_nsec as u128;
         let deadline_ns = secs as u128 * 1_000_000_000 + nsecs as u128;
+        // A deadline past what `Instant` can hold is never reached.
         let deadline = if deadline_ns > now_ns {
-            std::time::Instant::now()
-                + std::time::Duration::from_nanos((deadline_ns - now_ns) as u64)
+            u64::try_from(deadline_ns - now_ns).ok().and_then(|ns| {
+                std::time::Instant::now().checked_add(std::time::Duration::from_nanos(ns))
+            })
         } else {
-            std::time::Instant::now()
+            Some(std::time::Instant::now())
         };
-        self.deadlines[idx] = Some(deadline);
-        self.expiry_heap
-            .push(std::cmp::Reverse((deadline, slot, self.generations[idx])));
+        self.set_deadline(slot, deadline);
     }
 
     /// A heap entry is live iff the slot still holds this exact deadline in
     /// the same generation and hasn't fired. Anything else is a stale entry
     /// left behind by release/re-arm and is skipped (lazy deletion).
-    #[cfg(not(has_io_uring))]
     fn heap_entry_live(&self, deadline: std::time::Instant, slot: u32, generation: u16) -> bool {
         let idx = slot as usize;
         idx < self.generations.len()
@@ -373,7 +358,6 @@ impl TimerSlotPool {
     }
 
     /// Earliest live deadline, discarding stale heap heads.
-    #[cfg(not(has_io_uring))]
     pub(crate) fn next_deadline(&mut self) -> Option<std::time::Instant> {
         while let Some(&std::cmp::Reverse((deadline, slot, generation))) = self.expiry_heap.peek() {
             if self.heap_entry_live(deadline, slot, generation) {
@@ -386,7 +370,6 @@ impl TimerSlotPool {
 
     /// Pop the next timer whose deadline is <= `now`. Returns
     /// `(slot, generation)` ready to pass to [`fire`](Self::fire).
-    #[cfg(not(has_io_uring))]
     pub(crate) fn pop_expired(&mut self, now: std::time::Instant) -> Option<(u32, u16)> {
         while let Some(&std::cmp::Reverse((deadline, slot, generation))) = self.expiry_heap.peek() {
             if !self.heap_entry_live(deadline, slot, generation) {
@@ -401,6 +384,63 @@ impl TimerSlotPool {
         }
         None
     }
+
+    /// Whether the heap holds no entry, live or dead.
+    pub(crate) fn heap_is_empty(&self) -> bool {
+        self.expiry_heap.is_empty()
+    }
+}
+
+/// Hasher for the 32-bit disk-I/O keys: one multiply and a fold, where the
+/// default hasher runs SipHash over the four bytes. The low bits of a product
+/// depend only on the low bits of the key, which on io_uring are the slab
+/// index, and hashbrown takes the bucket from the low bits of the hash; so
+/// `finish` folds the high half of the product, which depends on every key
+/// bit, into the low half. Without the fold every key of one slab slot would
+/// start its probe at the same bucket.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.0 = u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+/// A map keyed by disk-I/O keys.
+pub(crate) type KeyMap<V> = HashMap<u32, V, std::hash::BuildHasherDefault<KeyHasher>>;
+/// A set of disk-I/O keys.
+pub(crate) type KeySet = std::collections::HashSet<u32, std::hash::BuildHasherDefault<KeyHasher>>;
+
+/// What the executor holds for one disk-I/O key, from the future's creation
+/// until the future takes its result or is dropped, or until the completion
+/// releases what a dropped future left behind.
+pub(crate) enum DiskIoEntry {
+    /// A future holds the key: the task to wake when the operation
+    /// completes, and the result and stat metadata once it has.
+    Held {
+        waiter: Option<u32>,
+        result: Option<i32>,
+        metadata: Option<crate::fs::Metadata>,
+    },
+    /// The future was dropped with its read or write in flight; the buffer
+    /// stays here until the completion frees it, so the kernel's pointer
+    /// stays valid. Buffers still here when the executor drops are leaked;
+    /// see `impl Drop for Executor`.
+    Parked(bytes::BytesMut),
+    /// The `OpenFuture` was dropped with its open in flight; the completion
+    /// closes the file and releases its slot instead of delivering a result.
+    AbandonedOpen,
 }
 
 thread_local! {
@@ -409,8 +449,8 @@ thread_local! {
     // stores a result only for a held key, and the key allocators, which
     // have the driver but not the executor, do not hand out a held key, so
     // a result is never taken by an operation it does not belong to (#574).
-    static DISK_IO_LIVE: std::cell::RefCell<std::collections::HashSet<u32>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
+    static DISK_IO_LIVE: std::cell::RefCell<KeySet> =
+        std::cell::RefCell::new(KeySet::default());
 }
 
 /// Something a future owned by a connection's task must release when the
@@ -418,11 +458,12 @@ thread_local! {
 /// driver is not reachable (#575).
 pub(crate) enum Orphan {
     /// A `SleepFuture`'s timer slot.
-    TimerSlot { slot: u32, generation: u16 },
+    TimerSlot(u32),
     /// A `SpawnFuture`'s `pending_spawns` entry, and with it a delivered
     /// child's pidfd.
     Spawn(u64),
-    /// A `WaitFuture`'s `pidfd_waiters` and `pidfd_results` entries.
+    /// A `WaitFuture`'s `pidfd_waiters` and `pidfd_results` entries, and its
+    /// pidfd poll if it is still armed.
     Wait(u32),
     /// A `ConnectFuture`'s outbound connection.
     Connect { conn_index: u32, generation: u32 },
@@ -462,15 +503,12 @@ pub(crate) fn release_orphans(driver: &mut crate::backend::Driver, executor: &mu
     let orphans = ORPHANS.with(|orphans| std::mem::take(&mut *orphans.borrow_mut()));
     for orphan in orphans {
         match orphan {
-            Orphan::TimerSlot { slot, generation } => {
-                io::release_timer_slot(driver, executor, slot, generation);
-            }
+            Orphan::TimerSlot(slot) => executor.timer_pool.release(slot),
             Orphan::Spawn(request_id) => {
                 executor.pending_spawns.remove(&request_id);
             }
             Orphan::Wait(seq) => {
-                executor.pidfd_waiters.remove(&seq);
-                executor.pidfd_results.remove(&seq);
+                crate::process::release_wait(driver, executor, seq);
             }
             Orphan::Connect {
                 conn_index,
@@ -587,23 +625,10 @@ pub(crate) struct Executor {
     /// empty because sends are synchronous and never suspend.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub(crate) udp_send_ready_waiters: Vec<Option<u32>>,
-    /// Disk I/O: maps disk-I/O key → task_id to wake on completion.
-    pub(crate) disk_io_waiters: HashMap<u32, u32>,
-    /// Disk I/O: maps disk-I/O key → i32 result of the completed operation.
-    pub(crate) disk_io_results: HashMap<u32, i32>,
-    /// Disk I/O buffer graveyard: holds buffers whose owning future was dropped
-    /// before its operation completed. Entry is removed (and the buffer freed) when
-    /// `wake_disk_io` fires, ensuring the kernel's pointer remains valid for
-    /// the entire op even after the future goes away. Buffers still here when
-    /// the executor drops are leaked; see `impl Drop for Executor`.
-    pub(crate) disk_io_graveyard: HashMap<u32, bytes::BytesMut>,
-    /// Filesystem stat results: maps disk-I/O key → Metadata (populated by
-    /// handle_fs for Statx ops).
-    pub(crate) fs_stat_results: HashMap<u32, crate::fs::Metadata>,
-    /// Disk I/O keys of opens whose `OpenFuture` was dropped before the open
-    /// completed. The backend's completion handler closes the file and
-    /// releases its slot instead of delivering the result.
-    pub(crate) abandoned_fs_opens: std::collections::HashSet<u32>,
+    /// Disk I/O: what the executor holds per key ([`DiskIoEntry`]); each step
+    /// of an operation is one lookup in this map, plus an update of the held
+    /// set (`DISK_IO_LIVE`) when the step begins or ends the future's hold.
+    pub(crate) disk_io: KeyMap<DiskIoEntry>,
     /// Pending DNS resolve requests: request_id -> (task_id to wake, result slot).
     pub(crate) pending_resolves: HashMap<u64, (u32, Option<stdio::Result<std::net::SocketAddr>>)>,
     /// Monotonic counter for resolve request IDs.
@@ -651,15 +676,16 @@ pub(crate) struct Executor {
 
 impl Drop for Executor {
     fn drop(&mut self) {
-        // A buffer still in the graveyard belongs to an operation that has
-        // not completed: a read or write the kernel (io_uring) or a disk-I/O
-        // pool thread (mio) can still perform through its raw pointer, after
-        // this worker has exited. Neither backend waits for those at
-        // shutdown, so freeing the buffer here would let that operation write
-        // into freed memory. Leak it instead; the leak is bounded by the
-        // operations in flight when the worker exits.
-        for (_, buf) in self.disk_io_graveyard.drain() {
-            std::mem::forget(buf);
+        // A buffer still parked belongs to an operation whose
+        // completion this executor has not seen. The exit drain waited for the
+        // operation, or on mio had the pool skip it, or the worker leaked this
+        // executor; the drain delivers no completions, so the buffer is here
+        // all the same. Leak it; the leak is bounded by the operations in
+        // flight when the worker exits.
+        for (_, entry) in self.disk_io.drain() {
+            if let DiskIoEntry::Parked(buf) = entry {
+                std::mem::forget(buf);
+            }
         }
     }
 }
@@ -702,11 +728,7 @@ impl Executor {
             udp_recv_queue_capacity,
             udp_recv_waiters: vec![None; udp],
             udp_send_ready_waiters: vec![None; udp],
-            disk_io_waiters: HashMap::new(),
-            disk_io_results: HashMap::new(),
-            disk_io_graveyard: HashMap::new(),
-            fs_stat_results: HashMap::new(),
-            abandoned_fs_opens: std::collections::HashSet::new(),
+            disk_io: KeyMap::default(),
             pending_resolves: HashMap::new(),
             next_resolve_id: 0,
             pending_spawns: HashMap::new(),
@@ -815,6 +837,20 @@ impl Executor {
         }
     }
 
+    /// Fire every timer whose deadline is at or before now and wake its
+    /// task. Both event loops call this after each wait.
+    pub(crate) fn fire_expired_timers(&mut self) {
+        if self.timer_pool.heap_is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        while let Some((slot, generation)) = self.timer_pool.pop_expired(now) {
+            if let Some(waker_id) = self.timer_pool.fire(slot, generation) {
+                self.wake_task(waker_id);
+            }
+        }
+    }
+
     /// Fire the task's kept wakers, then queue it. Leaf completions, which
     /// wake a task by the ID it registered, call this.
     ///
@@ -919,55 +955,160 @@ impl Executor {
         }
     }
 
-    /// Register `task_id` to be woken when the operation `seq` completes,
-    /// and mark `seq` as one a future is waiting on.
+    /// Hold the key `seq` for a future created by `task_id`'s task, which is
+    /// woken when the operation completes.
     pub(crate) fn wait_disk_io(&mut self, seq: u32, task_id: u32) {
-        self.disk_io_waiters.insert(seq, task_id);
+        match self.disk_io.entry(seq) {
+            Entry::Occupied(mut e) => match e.get_mut() {
+                DiskIoEntry::Held { waiter, .. } => *waiter = Some(task_id),
+                // A parked buffer or abandoned open keeps its entry until its
+                // completion; until then no new future can be given its key,
+                // because on io_uring the key's slab slot stays allocated and
+                // on mio the allocator skips a key in `disk_io_in_flight`.
+                _ => debug_assert!(false, "disk-I/O key {seq:#x} reused while in flight"),
+            },
+            Entry::Vacant(e) => {
+                e.insert(DiskIoEntry::Held {
+                    waiter: Some(task_id),
+                    result: None,
+                    metadata: None,
+                });
+            }
+        }
         DISK_IO_LIVE.with(|live| live.borrow_mut().insert(seq));
+    }
+
+    /// One poll of the future holding `seq` from `task_id`'s task: the result
+    /// and stat metadata if the operation has completed, which ends the
+    /// future's interest in the key; otherwise `task_id` becomes the task to
+    /// wake.
+    pub(crate) fn poll_disk_io(
+        &mut self,
+        seq: u32,
+        task_id: u32,
+    ) -> Option<(i32, Option<crate::fs::Metadata>)> {
+        let Entry::Occupied(mut e) = self.disk_io.entry(seq) else {
+            return None;
+        };
+        match e.get_mut() {
+            DiskIoEntry::Held {
+                result: Some(_), ..
+            } => {}
+            DiskIoEntry::Held { waiter, .. } => {
+                *waiter = Some(task_id);
+                return None;
+            }
+            // A parked or abandoned key: no future polls it.
+            _ => return None,
+        }
+        let DiskIoEntry::Held {
+            result: Some(result),
+            metadata,
+            ..
+        } = e.remove()
+        else {
+            unreachable!("checked above");
+        };
+        untrack_disk_io(seq);
+        Some((result, metadata))
     }
 
     /// Take the result of the operation `seq`, if it has completed. Taking
     /// it ends the future's interest in the key.
     pub(crate) fn take_disk_io_result(&mut self, seq: u32) -> Option<i32> {
-        let result = self.disk_io_results.remove(&seq);
-        if result.is_some() {
-            untrack_disk_io(seq);
-        }
-        result
+        let Entry::Occupied(e) = self.disk_io.entry(seq) else {
+            return None;
+        };
+        let DiskIoEntry::Held {
+            result: Some(result),
+            ..
+        } = *e.get()
+        else {
+            return None;
+        };
+        e.remove();
+        untrack_disk_io(seq);
+        Some(result)
     }
 
     /// Forget the operation `seq`, whose future was dropped before it took
-    /// its result: remove its waiter, its result and stat metadata if they
-    /// have arrived, and its key from the held set, so `wake_disk_io`
-    /// discards a result that arrives later.
+    /// its result: drop its entry, result and stat metadata included, and
+    /// its key from the held set, so `wake_disk_io` discards a result that
+    /// arrives later.
     pub(crate) fn abandon_disk_io(&mut self, seq: u32) {
-        self.disk_io_waiters.remove(&seq);
-        self.disk_io_results.remove(&seq);
-        self.fs_stat_results.remove(&seq);
+        if let Entry::Occupied(e) = self.disk_io.entry(seq)
+            && matches!(e.get(), DiskIoEntry::Held { .. })
+        {
+            e.remove();
+        }
         untrack_disk_io(seq);
     }
 
-    /// Wake a task that was waiting for a disk I/O completion.
-    ///
-    /// If the key's buffer is in `disk_io_graveyard` (its future was dropped
-    /// before the operation completed), frees the buffer and discards the
-    /// result. Otherwise, if a future holds the key ([`disk_io_key_held`]),
-    /// stores the result and wakes the waiting task; if not (its future was
-    /// dropped), discards the result.
-    /// Waiters and results are keyed by the disk-I/O key, not the
-    /// connection.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    /// Park `buf`, the buffer of a dropped read or write whose operation
+    /// `seq` is still in flight, until the completion frees it.
+    pub(crate) fn park_disk_io(&mut self, seq: u32, buf: bytes::BytesMut) {
+        self.disk_io.insert(seq, DiskIoEntry::Parked(buf));
+        untrack_disk_io(seq);
+    }
+
+    /// Mark the open `seq` as abandoned: its `OpenFuture` was dropped while
+    /// the open was in flight, and the completion handler closes the file.
+    pub(crate) fn abandon_disk_io_open(&mut self, seq: u32) {
+        self.disk_io.insert(seq, DiskIoEntry::AbandonedOpen);
+        untrack_disk_io(seq);
+    }
+
+    /// Whether the open `seq` was abandoned; if so, forget it.
+    pub(crate) fn take_abandoned_open(&mut self, seq: u32) -> bool {
+        match self.disk_io.entry(seq) {
+            Entry::Occupied(e) if matches!(e.get(), DiskIoEntry::AbandonedOpen) => {
+                e.remove();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Deliver the completion of the operation `seq`: see
+    /// [`wake_disk_io_with`](Self::wake_disk_io_with).
     pub(crate) fn wake_disk_io(&mut self, seq: u32, result: i32) {
-        if self.disk_io_graveyard.remove(&seq).is_some() {
+        self.wake_disk_io_with(seq, result, None);
+    }
+
+    /// Deliver the completion of the operation `seq`, with the stat metadata
+    /// of a completed stat.
+    ///
+    /// A parked buffer (its future was dropped before the operation
+    /// completed) is freed and the result discarded. A held key stores the
+    /// result and wakes the waiting task. Any other key has no future to
+    /// take the result, which is discarded. Keyed by the disk-I/O key, not
+    /// the connection.
+    pub(crate) fn wake_disk_io_with(
+        &mut self,
+        seq: u32,
+        result: i32,
+        metadata: Option<crate::fs::Metadata>,
+    ) {
+        let Entry::Occupied(mut e) = self.disk_io.entry(seq) else {
             return;
-        }
-        if !disk_io_key_held(seq) {
-            // Nothing will take this result: its future was dropped.
-            self.fs_stat_results.remove(&seq);
-            return;
-        }
-        self.disk_io_results.insert(seq, result);
-        if let Some(task_id) = self.disk_io_waiters.remove(&seq) {
+        };
+        let task_id = match e.get_mut() {
+            DiskIoEntry::Parked(_) => {
+                e.remove();
+                return;
+            }
+            DiskIoEntry::Held {
+                waiter,
+                result: slot,
+                metadata: slot_metadata,
+            } => {
+                *slot = Some(result);
+                *slot_metadata = metadata;
+                waiter.take()
+            }
+            DiskIoEntry::AbandonedOpen => return,
+        };
+        if let Some(task_id) = task_id {
             self.wake_task(task_id);
         }
     }
@@ -1167,11 +1308,10 @@ mod tests {
         assert!(exec.take_recv_error(200, 1).is_none());
     }
 
-    #[cfg(not(has_io_uring))]
     #[test]
-    fn timer_release_clears_mio_deadline() {
-        // The mio expiry scan reads the slot's current generation, so a
-        // deadline left on a free slot would self-satisfy fire()'s check.
+    fn timer_release_clears_deadline() {
+        // A deadline left on a free slot would make its heap entry live
+        // again for the slot's next occupant.
         let mut pool = TimerSlotPool::new(4);
         let (slot, _gen) = pool.allocate(42).unwrap();
         pool.deadlines[slot as usize] =
@@ -1537,45 +1677,83 @@ mod tests {
         assert_eq!(generation, 0); // wrapped from u16::MAX
     }
 
+    /// Every slot of a full-size pool is distinct.
     #[test]
-    fn timer_encode_decode_round_trip() {
-        let slot = 1234u32;
-        let generation = 5678u16;
-        let payload = TimerSlotPool::encode_payload(slot, generation);
-        let (decoded_slot, decoded_gen) = TimerSlotPool::decode_payload(payload);
-        assert_eq!(decoded_slot, slot);
-        assert_eq!(decoded_gen, generation);
-    }
-
-    #[test]
-    fn timer_encode_decode_boundary_values() {
-        // Max slot (16 bits) and max generation (16 bits).
-        let payload = TimerSlotPool::encode_payload(0xFFFF, 0xFFFF);
-        let (slot, generation) = TimerSlotPool::decode_payload(payload);
-        assert_eq!(slot, 0xFFFF);
-        assert_eq!(generation, 0xFFFF);
-
-        // Zero values.
-        let payload = TimerSlotPool::encode_payload(0, 0);
-        let (slot, generation) = TimerSlotPool::decode_payload(payload);
-        assert_eq!(slot, 0);
-        assert_eq!(generation, 0);
-    }
-
-    /// Every slot of a full-size pool is distinct and survives the 16-bit
-    /// slot field of the completion payload.
-    #[test]
-    fn every_timer_slot_round_trips_through_the_payload() {
+    fn every_timer_slot_is_allocated_once() {
         let mut pool = TimerSlotPool::new(TIMER_SLOTS);
         let mut seen = vec![false; TIMER_SLOTS as usize];
         for _ in 0..TIMER_SLOTS {
-            let (slot, generation) = pool.allocate(0).unwrap();
-            let payload = TimerSlotPool::encode_payload(slot, generation);
-            assert_eq!(TimerSlotPool::decode_payload(payload), (slot, generation));
+            let (slot, _) = pool.allocate(0).unwrap();
             assert!(!seen[slot as usize], "slot {slot} allocated twice");
             seen[slot as usize] = true;
         }
         assert!(pool.allocate(0).is_none());
+    }
+
+    /// The heap entry of a released slot does not fire the slot's next
+    /// occupant, even when that occupant's deadline is later, and the
+    /// occupant fires at its own deadline.
+    #[test]
+    fn a_released_timers_heap_entry_does_not_fire_the_next_occupant() {
+        use std::time::{Duration, Instant};
+        let mut pool = TimerSlotPool::new(1);
+        let (slot, _) = pool.allocate(1).unwrap();
+        pool.set_relative(slot, Duration::ZERO);
+        pool.release(slot);
+        let (slot2, gen2) = pool.allocate(2).unwrap();
+        assert_eq!(slot2, slot);
+        pool.set_relative(slot2, Duration::from_secs(60));
+        let now = Instant::now() + Duration::from_millis(1);
+        assert_eq!(pool.pop_expired(now), None, "the dead entry fired");
+        let next = pool.next_deadline().expect("the live entry");
+        assert!(next > now + Duration::from_secs(59));
+        assert_eq!(
+            pool.pop_expired(now + Duration::from_secs(61)),
+            Some((slot2, gen2))
+        );
+        assert_eq!(pool.fire(slot2, gen2), Some(2));
+    }
+
+    /// Expired timers pop in deadline order, and a timer that never expires
+    /// (`Duration::MAX`) has no heap entry.
+    #[test]
+    fn timers_pop_in_deadline_order() {
+        use std::time::{Duration, Instant};
+        let mut pool = TimerSlotPool::new(4);
+        let (a, ga) = pool.allocate(1).unwrap();
+        let (b, gb) = pool.allocate(2).unwrap();
+        let (c, _) = pool.allocate(3).unwrap();
+        pool.set_relative(a, Duration::from_millis(20));
+        pool.set_relative(b, Duration::from_millis(10));
+        pool.set_relative(c, Duration::MAX);
+        assert_eq!(pool.heap_len(), 2);
+        let later = Instant::now() + Duration::from_secs(1);
+        assert_eq!(pool.pop_expired(later), Some((b, gb)));
+        assert_eq!(pool.pop_expired(later), Some((a, ga)));
+        assert_eq!(pool.pop_expired(later), None);
+        assert_eq!(pool.next_deadline(), None);
+    }
+
+    /// Timers released before their deadline, as a `timeout()` whose future
+    /// wins releases its timer, leave dead heap entries; compaction keeps the
+    /// heap from growing with them.
+    #[test]
+    fn released_timers_do_not_grow_the_heap() {
+        use std::time::Duration;
+        let mut pool = TimerSlotPool::new(4);
+        let (held, _) = pool.allocate(0).unwrap();
+        pool.set_relative(held, Duration::from_secs(3600));
+        for _ in 0..100_000 {
+            let (slot, _) = pool.allocate(1).unwrap();
+            pool.set_relative(slot, Duration::from_secs(60));
+            pool.release(slot);
+        }
+        assert!(
+            pool.heap_len() <= TIMER_HEAP_COMPACT_MIN,
+            "heap holds {} entries",
+            pool.heap_len()
+        );
+        assert!(pool.next_deadline().is_some(), "the held timer was dropped");
     }
 
     #[test]
@@ -1617,5 +1795,87 @@ mod tests {
         let (slot2, _) = pool.allocate(2).unwrap();
         assert_eq!(slot2, slot);
         assert!(!pool.is_fired(slot2)); // fired flag reset on allocate
+    }
+
+    // The disk-I/O entry map: one entry per key from the future's creation
+    // until the result is taken or the completion frees what a drop left.
+
+    #[test]
+    fn a_disk_io_result_delivered_before_the_poll_is_taken_once() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        let key = 0x4000_0101;
+        exec.wait_disk_io(key, 0);
+        assert!(disk_io_key_held(key));
+        exec.wake_disk_io(key, 7);
+        assert!(matches!(exec.poll_disk_io(key, 0), Some((7, None))));
+        assert!(!disk_io_key_held(key), "taking the result releases the key");
+        assert!(!exec.disk_io.contains_key(&key));
+        assert!(
+            exec.poll_disk_io(key, 0).is_none(),
+            "a result is taken once"
+        );
+    }
+
+    #[test]
+    fn a_disk_io_completion_wakes_the_task_that_polled_last() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        exec.task_slab.spawn(2, Box::pin(async {}));
+        let fut = exec.task_slab.take_ready(2).unwrap();
+        exec.task_slab.park(2, fut);
+        let key = 0x4000_0102;
+        exec.wait_disk_io(key, 5);
+        // The poll before the completion records the polling task.
+        assert!(exec.poll_disk_io(key, 2).is_none());
+        exec.wake_disk_io(key, 3);
+        assert!(
+            exec.task_slab.take_ready(2).is_some(),
+            "the completion wakes the task that polled last"
+        );
+        assert!(matches!(exec.poll_disk_io(key, 2), Some((3, None))));
+    }
+
+    #[test]
+    fn a_parked_disk_io_buffer_is_freed_by_its_completion() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        let key = 0x4000_0103;
+        exec.wait_disk_io(key, 0);
+        exec.park_disk_io(key, bytes::BytesMut::with_capacity(16));
+        assert!(!disk_io_key_held(key), "a parked key is not held");
+        assert!(matches!(
+            exec.disk_io.get(&key),
+            Some(DiskIoEntry::Parked(_))
+        ));
+        exec.wake_disk_io(key, 0);
+        assert!(
+            !exec.disk_io.contains_key(&key),
+            "the completion frees the parked buffer"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_disk_io_open_is_taken_once_and_its_result_discarded() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        let key = 0x4000_0104;
+        exec.wait_disk_io(key, 0);
+        exec.abandon_disk_io_open(key);
+        assert!(!disk_io_key_held(key));
+        assert!(exec.take_abandoned_open(key));
+        assert!(!exec.take_abandoned_open(key), "taken once");
+        assert!(!exec.disk_io.contains_key(&key));
+        // A completion for a key nothing holds is discarded.
+        exec.wake_disk_io(key, 9);
+        assert!(!exec.disk_io.contains_key(&key));
+    }
+
+    #[test]
+    fn an_abandoned_disk_io_key_discards_a_later_result() {
+        let mut exec = Executor::new(8, 8, 8, 0, 0);
+        let key = 0x4000_0105;
+        exec.wait_disk_io(key, 0);
+        exec.abandon_disk_io(key);
+        assert!(!disk_io_key_held(key));
+        exec.wake_disk_io(key, 9);
+        assert!(!exec.disk_io.contains_key(&key));
+        assert_eq!(exec.take_disk_io_result(key), None);
     }
 }

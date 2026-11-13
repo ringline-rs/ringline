@@ -128,9 +128,36 @@ pub struct Runtime {
     /// zero port replaced by the port the kernel chose, `None` for a connected
     /// zero-port bind, whose workers each have their own port.
     udp_addrs: Vec<Option<SocketAddr>>,
+    /// Each worker's `max_connections`, `sq_entries` and `cq_entries`, after
+    /// launch fitted them to `RLIMIT_MEMLOCK`.
+    max_connections: u32,
+    sq_entries: u32,
+    cq_entries: u32,
 }
 
 impl Runtime {
+    /// Each worker's connection limit: the configured
+    /// [`max_connections`](crate::ConfigBuilder::max_connections), or the
+    /// lower value launch chose to fit `RLIMIT_MEMLOCK` when it was left at
+    /// the default (see [`cq_entries`](crate::ConfigBuilder::cq_entries)).
+    pub fn max_connections(&self) -> u32 {
+        self.max_connections
+    }
+
+    /// Each worker's SQ size: the configured
+    /// [`sq_entries`](crate::ConfigBuilder::sq_entries), or the lower value
+    /// launch chose to fit `RLIMIT_MEMLOCK`. Unused on the mio backend.
+    pub fn sq_entries(&self) -> u32 {
+        self.sq_entries
+    }
+
+    /// Each worker's CQ size: the configured
+    /// [`cq_entries`](crate::ConfigBuilder::cq_entries), or the lower value
+    /// launch chose to fit `RLIMIT_MEMLOCK`. Unused on the mio backend.
+    pub fn cq_entries(&self) -> u32 {
+        self.cq_entries
+    }
+
     /// The actual TCP address of the **first** TCP listener, if any. Returns
     /// `Some` for a TCP `bind()` (the port may have been zero-resolved) and
     /// `None` for client-only mode or when every listener is a Unix socket.
@@ -402,22 +429,36 @@ impl Runtime {
     ///
     /// Workers stop accepting new connections, close all active connections (on
     /// io_uring, cancelling each connection's operations in flight and waiting up
-    /// to 10 s for the connections to close), and exit their event loops
-    /// returning `Ok(())`, or [`Error::TaskPanicked`](crate::Error::TaskPanicked)
-    /// under [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) for
-    /// a worker on which a task panicked.
+    /// to 10 s for the connections to close and for file, direct I/O and NVMe
+    /// operations in flight to complete or be cancelled; on mio, waiting up to
+    /// 10 s for the disk-I/O pool's raw-pointer reads and writes already
+    /// running), and exit their event loops returning `Ok(())`, or
+    /// [`Error::TaskPanicked`](crate::Error::TaskPanicked) under
+    /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) for a
+    /// worker on which a task panicked.
     ///
     /// A worker checks for shutdown once per event-loop iteration. Once it sees
-    /// the request it polls no task again and drops every task's future. The
-    /// futures' `Drop` implementations run, and a task does not resume from the
-    /// `.await` it is suspended at. A task woken after the worker's last poll
-    /// pass is dropped even when what it awaited is ready. On both backends a
-    /// task can be woken after the iteration's last poll pass, for example from
-    /// `on_tick`, by a send result, by released send capacity or from another
-    /// thread. On io_uring the check also comes after the completions its wait
-    /// returned are drained, so a task woken by one of those completions is
-    /// dropped too. Work that must finish before exit has to complete before
-    /// shutdown is requested.
+    /// the request it polls no task again and, unless it leaks them (below),
+    /// drops every task's future. The futures' `Drop` implementations run, and
+    /// a task does not resume from the `.await` it is suspended at.
+    ///
+    /// An io_uring worker cancels its file, direct I/O and NVMe operations in
+    /// flight; a mio worker has its disk-I/O pool skip the requests it has not
+    /// started. If an io_uring operation, or a raw-pointer read or write a mio
+    /// pool thread has started, is still running when the 10 s run out, or an
+    /// io_uring worker's ring fails during that wait, the worker does not drop
+    /// its tasks or its event loop: it leaks them, since the operation can
+    /// still use their memory, closes its sockets, and writes a line to
+    /// stderr. Its join result is the same as without the leak.
+    ///
+    /// A task woken after the worker's last poll pass is dropped even when
+    /// what it awaited is ready. On both backends a task can be woken after the
+    /// iteration's last poll pass, for example from `on_tick`, by a send
+    /// result, by released send capacity or from another thread. On io_uring
+    /// the check also comes after the completions its wait returned are
+    /// drained, so a task woken by one of those completions is dropped too.
+    /// Work that must finish before exit has to complete before shutdown is
+    /// requested.
     ///
     /// The listeners stop accepting at once on Linux, and within about 100 ms
     /// elsewhere. A listener's sockets close, and its port is free, once the
@@ -1230,23 +1271,41 @@ impl RinglineBuilder {
                     Ok(Err(e)) => Some(e.to_string()),
                     Err(payload) => Some(format!("panic: {}", panic_payload(&**payload))),
                 };
+                let mut drain_panicked = false;
                 if let Some(cause) = cause {
                     event_loop.report_worker_exit(worker_id, &cause);
                     let drained =
                         catch_unwind(AssertUnwindSafe(|| event_loop.drain_after_failure()));
                     event_loop.report_worker_drained(worker_id);
-                    if drained.is_err() {
-                        let task_panic = event_loop.take_task_panic();
-                        // Safety: `event_loop` is leaked on the next line, so
-                        // nothing uses the ring again.
-                        unsafe { event_loop.close_ring() };
-                        std::mem::forget(event_loop);
-                        return match (task_panic, run_result) {
-                            (Some(panic), _) => Err(crate::error::Error::TaskPanicked(panic)),
-                            (None, Ok(result)) => result,
-                            (None, Err(payload)) => std::panic::resume_unwind(payload),
-                        };
-                    }
+                    drain_panicked = drained.is_err();
+                }
+                // A drain that panicked, or that ended with a disk operation
+                // in flight, leaves memory the kernel (io_uring) or a disk-I/O
+                // pool thread (mio) can still use: leak the event loop, tasks
+                // included, since a task can own the buffer of an `fs::read`,
+                // `direct_io_read` or `nvme_read` (#824, #856).
+                let memory_in_use = !drain_panicked && event_loop.memory_in_use_at_exit();
+                if memory_in_use {
+                    // Not `eprintln!`, which panics if stderr fails.
+                    let _ = std::io::Write::write_fmt(
+                        &mut std::io::stderr(),
+                        format_args!(
+                            "ringline: worker {worker_id} exited with a disk operation still \
+                             in flight; leaking its tasks and event loop\n"
+                        ),
+                    );
+                }
+                if drain_panicked || memory_in_use {
+                    let task_panic = event_loop.take_task_panic();
+                    // Safety: `event_loop` is leaked on the next line, so
+                    // nothing uses the ring again.
+                    unsafe { event_loop.close_ring() };
+                    std::mem::forget(event_loop);
+                    return match (task_panic, run_result) {
+                        (Some(panic), _) => Err(crate::error::Error::TaskPanicked(panic)),
+                        (None, Ok(result)) => result,
+                        (None, Err(payload)) => std::panic::resume_unwind(payload),
+                    };
                 }
                 event_loop.drop_tasks();
                 // Under `TaskPanicPolicy::Shutdown`, a panic on this worker
@@ -1326,9 +1385,11 @@ impl RinglineBuilder {
             .collect::<Vec<_>>()
             .into();
 
-        ensure_nofile_limit(self.config.max_connections, num_threads)?;
+        // Before the descriptor check: fitting the rings to `RLIMIT_MEMLOCK`
+        // can lower `max_connections`.
         #[cfg(has_io_uring)]
-        ensure_memlock_limit(&self.config, num_threads)?;
+        ensure_memlock_limit(&mut self.config, num_threads)?;
+        ensure_nofile_limit(self.config.max_connections, num_threads)?;
 
         crate::metrics::init_metadata();
 
@@ -1665,7 +1726,7 @@ impl RinglineBuilder {
             };
 
             let spawn_result = thread::Builder::new()
-                .name(format!("ringline-worker-{worker_id}"))
+                .name(format!("rl-work-{worker_id}"))
                 .spawn(move || {
                     if config.worker.pin_to_core {
                         let core = pin_cpu;
@@ -1892,7 +1953,7 @@ impl RinglineBuilder {
                         conn_chunk_size: self.config.conn_chunk_size,
                     };
                     thread::Builder::new()
-                        .name(format!("ringline-acceptor-{idx}"))
+                        .name(format!("rl-acpt-{idx}"))
                         .spawn(move || {
                             run_acceptor(acceptor_config);
                             // An acceptor that stops on its own, because every
@@ -1949,6 +2010,9 @@ impl RinglineBuilder {
             region_registrar,
             listen_gates,
             udp_addrs,
+            max_connections: self.config.max_connections,
+            sq_entries: self.config.sq_entries,
+            cq_entries: self.config.cq_entries,
         };
 
         Ok((runtime, handles))
@@ -2031,15 +2095,22 @@ fn ensure_nofile_limit(
 /// limit, which leaves room for the charges it cannot count. Otherwise it
 /// fails with the fix spelled out.
 ///
+/// When the hard limit is too low and the CQ was left at its default, the
+/// rings are fitted to the hard limit instead (`fit_ring_sizes`), which lowers
+/// `cq_entries`, and the `sq_entries` and `max_connections` left at their
+/// defaults, in `config`, and writes one line to stderr naming the sizes.
+///
 /// The kernel compares the limit with everything the same user has charged in
 /// any process, which this cannot see, so passing here does not rule out an
 /// `ENOMEM` at setup; the setup error names the limit in that case. A region
 /// added later through `Runtime::register_region` is not counted here; if that
 /// call fails with `ENOMEM`, its error names the limit.
 #[cfg(has_io_uring)]
-fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::error::Error> {
+fn ensure_memlock_limit(config: &mut Config, workers: usize) -> Result<(), crate::error::Error> {
     use crate::error::{MemlockLimit, MemlockPlan, describe_memlock_shortfall, memlock_plan};
-    use crate::memlock::{KernelVersion, charges_rings, has_cap_ipc_lock};
+    use crate::memlock::{
+        FitStop, KernelVersion, RingSizes, charges_rings, fit_ring_sizes, has_cap_ipc_lock,
+    };
 
     if has_cap_ipc_lock() {
         return Ok(());
@@ -2064,6 +2135,60 @@ fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::er
             Ok(())
         }
         MemlockPlan::HardTooLow => {
+            let current = RingSizes {
+                max_connections: config.max_connections,
+                sq_entries: config.sq_entries,
+                cq_entries: config.cq_entries,
+            };
+            let fit = charges_rings(kernel).then(|| {
+                fit_ring_sizes(current, config.sizes_set, |sizes| {
+                    memlock_required_for(
+                        config,
+                        sizes.sq_entries,
+                        sizes.cq_entries,
+                        workers,
+                        true,
+                        page,
+                    ) <= limit.hard
+                })
+            });
+            if let Some(Ok(sizes)) = fit {
+                let rlim = libc::rlimit {
+                    rlim_cur: limit.hard,
+                    rlim_max: limit.hard,
+                };
+                if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) } != 0 {
+                    return Err(crate::error::Error::Io(io::Error::last_os_error()));
+                }
+                config.max_connections = sizes.max_connections;
+                config.sq_entries = sizes.sq_entries;
+                config.cq_entries = sizes.cq_entries;
+                // Not `eprintln!`, which panics if stderr fails.
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!(
+                        "ringline: RLIMIT_MEMLOCK hard limit {} KiB is below the {} KiB that \
+                         {workers} worker(s) need at max_connections {}, sq_entries {}, \
+                         cq_entries {}; using max_connections {}, sq_entries {}, cq_entries {} \
+                         per worker. Raise the limit (`ulimit -l`, or `LimitMEMLOCK=`) to run \
+                         at max_connections {}, sq_entries {}, cq_entries {}, or set \
+                         cq_entries on the builder to fail instead of running smaller.\n",
+                        limit.hard.div_ceil(1024),
+                        required.div_ceil(1024),
+                        current.max_connections,
+                        current.sq_entries,
+                        current.cq_entries,
+                        sizes.max_connections,
+                        sizes.sq_entries,
+                        sizes.cq_entries,
+                        current.max_connections,
+                        current.sq_entries,
+                        current.cq_entries,
+                    ),
+                );
+                return Ok(());
+            }
+            let stop = fit.and_then(Result::err);
             let mut what = format!("{workers} worker(s)");
             if charges_rings(kernel) {
                 what.push_str(&match kernel {
@@ -2077,9 +2202,35 @@ fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::er
                     config.registered_regions.len()
                 ));
             }
-            Err(crate::error::Error::ResourceLimit(
-                describe_memlock_shortfall(required, &limit, &what),
-            ))
+            let mut message = describe_memlock_shortfall(required, &limit, &what);
+            match stop {
+                None => {}
+                Some(FitStop::CqSet) => message.push_str(
+                    " cq_entries was set on the builder, so launch did not lower it to fit the \
+                     limit; left at its default, launch would have tried smaller CQs.",
+                ),
+                Some(FitStop::MaxConnections {
+                    max_connections,
+                    needs_cq,
+                }) => message.push_str(&format!(
+                    " Launch lowers cq_entries left at its default to fit the limit, but \
+                     max_connections {max_connections}, set on the builder, needs a CQ of at \
+                     least {needs_cq} entries (16000 connections per 65536), and that does not \
+                     fit; set a lower max_connections, or leave it at its default."
+                )),
+                Some(FitStop::SqEntries { sq_entries }) => message.push_str(&format!(
+                    " Launch lowers cq_entries left at its default to fit the limit, but \
+                     sq_entries {sq_entries}, set on the builder, needs a CQ at least that \
+                     large, and that does not fit; set a lower sq_entries, or leave it at its \
+                     default."
+                )),
+                Some(FitStop::Floor) => message.push_str(&format!(
+                    " Lowering cq_entries, and the sq_entries and max_connections left at \
+                     their defaults, did not fit the rings either, down to {} CQ entries.",
+                    crate::memlock::FIT_MIN_CQ_ENTRIES
+                )),
+            }
+            Err(crate::error::Error::ResourceLimit(message))
         }
     }
 }
@@ -2089,6 +2240,26 @@ fn ensure_memlock_limit(config: &Config, workers: usize) -> Result<(), crate::er
 /// ring per UDP socket when the kernel charges those (`charges_rings`).
 #[cfg(any(has_io_uring, test))]
 fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: u64) -> u64 {
+    memlock_required_for(
+        config,
+        config.sq_entries,
+        config.cq_entries,
+        workers,
+        charges_rings,
+        page,
+    )
+}
+
+/// [`memlock_required`] with the rings sized `sq_entries` and `cq_entries`.
+#[cfg(any(has_io_uring, test))]
+fn memlock_required_for(
+    config: &Config,
+    sq_entries: u32,
+    cq_entries: u32,
+    workers: usize,
+    charges_rings: bool,
+    page: u64,
+) -> u64 {
     use crate::memlock::{provided_ring_bytes, ring_bytes};
 
     // The kernel pins every page the region touches. This assumes base pages:
@@ -2102,7 +2273,7 @@ fn memlock_required(config: &Config, workers: usize, charges_rings: bool, page: 
         })
         .sum();
     let rings = if charges_rings {
-        let mut bytes = ring_bytes(config.sq_entries, page);
+        let mut bytes = ring_bytes(sq_entries, cq_entries, page);
         bytes += config.udp_bind.len() as u64
             * provided_ring_bytes(config.udp_recv_buffer.ring_size, page);
         bytes
@@ -2443,6 +2614,7 @@ mod startup_gate_tests {
             .spawner_threads(0)
             .blocking_threads(0)
             .disk_io_threads(0)
+            .no_fs()
             .build()
             .unwrap()
     }
@@ -2643,7 +2815,8 @@ mod memlock_required_tests {
     const PAGE: u64 = 4096;
 
     fn builder() -> ConfigBuilder {
-        ConfigBuilder::new().sq_entries(64)
+        // The charges below are worked out for a CQ of 4 × the SQ.
+        ConfigBuilder::new().sq_entries(64).cq_entries(256)
     }
 
     #[test]
@@ -3500,5 +3673,404 @@ mod worker_exit_tests {
         for handle in handles {
             let _ = handle.join();
         }
+    }
+}
+
+/// Worker exit and the fs, direct I/O and NVMe operations in flight (#824 on
+/// io_uring, #856 on mio).
+#[cfg(test)]
+mod disk_exit_tests {
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use crate::config::{ConfigBuilder, TestFault};
+    use crate::error::Error;
+    use crate::fs::{FsConfig, OpenFlags};
+    use crate::{AsyncEventHandler, Connection, RinglineBuilder, Runtime};
+
+    /// The tests share the statics below, and `cargo test` runs them on
+    /// parallel threads.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    /// The file the task reads: a FIFO on io_uring, where the read waits in
+    /// the kernel for data; a regular file on mio, where the pool's hold
+    /// (`TestFault::hold_disk_io`) keeps the read from finishing.
+    static TARGET: Mutex<Option<PathBuf>> = Mutex::new(None);
+    /// mio: a second file, read after the first when set. With one disk-I/O
+    /// pool thread, its read waits in the pool's queue behind the first.
+    static SECOND_TARGET: Mutex<Option<PathBuf>> = Mutex::new(None);
+    /// mio: the task has opened its files and waits for `GO` to read.
+    static OPENED: AtomicBool = AtomicBool::new(false);
+    static GO: AtomicBool = AtomicBool::new(false);
+    static READ_QUEUED: AtomicBool = AtomicBool::new(false);
+    static TASK_DROPPED: AtomicBool = AtomicBool::new(false);
+    /// The read's result, once it resolves.
+    static READ_RESULT: Mutex<Option<String>> = Mutex::new(None);
+
+    /// Records that the connection's task, which owns it, was dropped.
+    struct OnDrop;
+
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            TASK_DROPPED.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Reads through the raw-pointer `fs::read` into a buffer the task owns:
+    /// memory a worker that dropped its tasks too early would free while the
+    /// kernel (io_uring) or a pool thread (mio) can still write to it.
+    struct ReadsIntoTaskBuffer;
+
+    impl AsyncEventHandler for ReadsIntoTaskBuffer {
+        #[allow(clippy::manual_async_fn)]
+        fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+            async move {
+                // Held for the task's life: dropping the connection closes it,
+                // and closing it drops this task.
+                let _conn = conn;
+                let _guard = OnDrop;
+                let target = TARGET.lock().unwrap().clone().unwrap();
+                let second = SECOND_TARGET.lock().unwrap().clone();
+                // Read-write, so the open of a FIFO does not wait for a
+                // writer and the read waits for data.
+                let file = crate::fs::open(&target, OpenFlags::READ_WRITE, 0)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let file2 = match second {
+                    Some(path) => Some(
+                        crate::fs::open(&path, OpenFlags::READ_WRITE, 0)
+                            .unwrap()
+                            .await
+                            .unwrap(),
+                    ),
+                    None => None,
+                };
+                // mio: the test holds the pool before the reads are queued, so
+                // the opens above are not held.
+                OPENED.store(true, Ordering::SeqCst);
+                while !GO.load(Ordering::SeqCst) {
+                    crate::sleep(Duration::from_millis(1)).await;
+                }
+                let mut buf = vec![0u8; 4096];
+                let mut buf2 = vec![0u8; 4096];
+                // SAFETY: `buf` and `buf2` are owned by this task and outlive
+                // the reads unless the task is dropped first, which is what
+                // these tests check the worker does not do while a read is in
+                // flight.
+                let read = unsafe { crate::fs::read(file, 0, buf.as_mut_ptr(), buf.len() as u32) }
+                    .unwrap();
+                let read2 = file2.map(|f| {
+                    unsafe { crate::fs::read(f, 0, buf2.as_mut_ptr(), buf2.len() as u32) }.unwrap()
+                });
+                READ_QUEUED.store(true, Ordering::SeqCst);
+                let result = read.await;
+                *READ_RESULT.lock().unwrap() = Some(format!("{result:?}"));
+                if let Some(read2) = read2 {
+                    let _ = read2.await;
+                }
+                drop(buf);
+                drop(buf2);
+            }
+        }
+        fn create_for_worker(_id: usize) -> Self {
+            ReadsIntoTaskBuffer
+        }
+    }
+
+    /// What ends the read in flight: a write to the FIFO (io_uring), or
+    /// clearing the pool's hold (mio).
+    #[derive(Clone)]
+    struct Completer {
+        #[cfg(has_io_uring)]
+        fifo: PathBuf,
+        #[cfg(not(has_io_uring))]
+        fault: Arc<TestFault>,
+    }
+
+    impl Completer {
+        /// Best effort on io_uring: once the worker has closed its end of the
+        /// FIFO the open fails with `ENXIO`, and the caller's assertions report
+        /// what happened.
+        fn complete(&self) {
+            #[cfg(has_io_uring)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                // Without waiting: the worker's open is a reader.
+                if let Ok(mut w) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&self.fifo)
+                {
+                    let _ = w.write_all(b"done");
+                }
+            }
+            #[cfg(not(has_io_uring))]
+            self.fault.hold_disk_io.store(false, Ordering::Release);
+        }
+    }
+
+    struct Launched {
+        dir: PathBuf,
+        runtime: Runtime,
+        handles: Vec<JoinHandle<Result<(), Error>>>,
+        completer: Completer,
+        _client: std::net::TcpStream,
+    }
+
+    /// Starts a one-worker runtime whose one connection's task has a read in
+    /// flight. On io_uring the read waits on a FIFO, and with `keep` the
+    /// worker's exit submits no cancel for it, standing in for an operation a
+    /// cancel cannot end. On mio the read is held on the pool's one thread
+    /// after it has started, and a started request cannot be cancelled. With
+    /// `second` (mio), a second read waits in the pool's queue.
+    fn launch_with_read_in_flight(name: &str, keep: bool, second: bool) -> Launched {
+        OPENED.store(false, Ordering::SeqCst);
+        GO.store(false, Ordering::SeqCst);
+        READ_QUEUED.store(false, Ordering::SeqCst);
+        TASK_DROPPED.store(false, Ordering::SeqCst);
+        *READ_RESULT.lock().unwrap() = None;
+        let dir = std::env::temp_dir().join(format!("ringline-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        #[cfg(has_io_uring)]
+        {
+            let c = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }
+        #[cfg(not(has_io_uring))]
+        std::fs::write(&target, [7u8; 4096]).unwrap();
+        *TARGET.lock().unwrap() = Some(target.clone());
+        *SECOND_TARGET.lock().unwrap() = second.then(|| {
+            let path = dir.join("target2");
+            std::fs::write(&path, [9u8; 4096]).unwrap();
+            path
+        });
+
+        let mut config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .sq_entries(64)
+            .max_connections(16)
+            .send_pool(16, 16384)
+            .blocking_threads(0)
+            .resolver_threads(0)
+            .spawner_threads(0)
+            .fs(FsConfig::default().max_files(4).max_commands_in_flight(64))
+            .disk_io_threads(1)
+            .build()
+            .expect("valid config");
+        let fault = Arc::new(TestFault::default());
+        #[cfg(has_io_uring)]
+        fault
+            .keep_disk_commands_at_exit
+            .store(keep, Ordering::Release);
+        #[cfg(not(has_io_uring))]
+        let _ = keep;
+        config.test_fault = Some(Arc::clone(&fault));
+        let (runtime, handles) = RinglineBuilder::new(config)
+            .bind("127.0.0.1:0".parse().unwrap())
+            .launch::<ReadsIntoTaskBuffer>()
+            .expect("launch");
+        let client = std::net::TcpStream::connect(runtime.bound_addr().unwrap()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !OPENED.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the files were never opened");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        #[cfg(not(has_io_uring))]
+        fault.hold_disk_io.store(true, Ordering::Release);
+        GO.store(true, Ordering::SeqCst);
+        while !READ_QUEUED.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the read was never queued");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // io_uring: the read's SQE is submitted at the loop's next flush.
+        #[cfg(has_io_uring)]
+        std::thread::sleep(Duration::from_millis(100));
+        // mio: the pool thread has started the read and is holding it.
+        #[cfg(not(has_io_uring))]
+        while !fault.disk_io_held.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the pool never started the read");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            *READ_RESULT.lock().unwrap(),
+            None,
+            "the read resolved before shutdown"
+        );
+        assert!(
+            !TASK_DROPPED.load(Ordering::SeqCst),
+            "the task ended before shutdown"
+        );
+        Launched {
+            dir,
+            runtime,
+            handles,
+            completer: Completer {
+                #[cfg(has_io_uring)]
+                fifo: target,
+                #[cfg(not(has_io_uring))]
+                fault,
+            },
+            _client: client,
+        }
+    }
+
+    /// Shuts the runtime down and returns how long its workers took to exit.
+    fn shut_down_and_join(launched: &mut Launched) -> Duration {
+        let start = Instant::now();
+        launched.runtime.shutdown();
+        for h in std::mem::take(&mut launched.handles) {
+            h.join().expect("worker panicked").expect("worker failed");
+        }
+        start.elapsed()
+    }
+
+    fn remove(launched: &Launched) {
+        *SECOND_TARGET.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&launched.dir);
+    }
+
+    /// Ends the read `delay` from now, on another thread.
+    fn complete_after(launched: &Launched, delay: Duration) -> JoinHandle<()> {
+        let completer = launched.completer.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            completer.complete();
+        })
+    }
+
+    /// A read the exit's cancel ends does not hold the worker: it exits at
+    /// once and drops its tasks. io_uring only: on mio a started pool request
+    /// cannot be cancelled.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn worker_exit_cancels_a_disk_read_in_flight() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut launched = launch_with_read_in_flight("exit-cancels", false, false);
+        let waited = shut_down_and_join(&mut launched);
+        remove(&launched);
+
+        assert!(
+            waited < Duration::from_secs(5),
+            "the worker took {waited:?} to exit: the read was not cancelled"
+        );
+        assert!(
+            TASK_DROPPED.load(Ordering::SeqCst),
+            "the worker leaked its tasks although the read was cancelled"
+        );
+    }
+
+    /// A read the exit does not cancel, which completes during the drain, is
+    /// waited for, and the worker then drops its tasks.
+    #[test]
+    fn worker_exit_waits_for_a_disk_read_it_does_not_cancel() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut launched = launch_with_read_in_flight("exit-waits", true, false);
+
+        const DELAY: Duration = Duration::from_millis(500);
+        let start = Instant::now();
+        let completer = complete_after(&launched, DELAY);
+        launched.runtime.shutdown();
+        for h in std::mem::take(&mut launched.handles) {
+            h.join().expect("worker panicked").expect("worker failed");
+        }
+        let waited = start.elapsed();
+        completer.join().unwrap();
+        remove(&launched);
+
+        assert!(
+            waited >= DELAY,
+            "the worker exited after {waited:?}, before the read completed at {DELAY:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the worker took {waited:?}: the read's completion did not end the wait"
+        );
+        assert!(
+            TASK_DROPPED.load(Ordering::SeqCst),
+            "the worker leaked its tasks although the read completed"
+        );
+    }
+
+    /// A read still in flight at the drain's 10 s bound leaves the task that
+    /// owns its buffer undropped: the worker leaks its event loop.
+    #[test]
+    fn worker_exit_leaks_its_tasks_when_a_disk_read_outlasts_the_drain() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut launched = launch_with_read_in_flight("exit-leaks", true, false);
+        let waited = shut_down_and_join(&mut launched);
+        let dropped = TASK_DROPPED.load(Ordering::SeqCst);
+        launched.completer.complete();
+        remove(&launched);
+
+        assert!(
+            waited >= Duration::from_secs(9),
+            "the worker exited after {waited:?} with a read in flight"
+        );
+        assert!(
+            !dropped,
+            "the task owning the in-flight read's buffer was dropped"
+        );
+    }
+
+    /// mio: a read still queued for the pool's one thread when the worker exits
+    /// is answered without running, so exit waits only for the read the thread
+    /// is running.
+    #[cfg(not(has_io_uring))]
+    #[test]
+    fn worker_exit_skips_a_disk_read_the_pool_has_not_started() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut launched = launch_with_read_in_flight("exit-skips", true, true);
+
+        const DELAY: Duration = Duration::from_millis(500);
+        let start = Instant::now();
+        let completer = complete_after(&launched, DELAY);
+        launched.runtime.shutdown();
+        for h in std::mem::take(&mut launched.handles) {
+            h.join().expect("worker panicked").expect("worker failed");
+        }
+        let waited = start.elapsed();
+        completer.join().unwrap();
+        // The pool thread reaches the queued read once the first one ends,
+        // which can be after the worker has exited.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while launched
+            .completer
+            .fault
+            .disk_io_skipped
+            .load(Ordering::Acquire)
+            == 0
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let skipped = launched
+            .completer
+            .fault
+            .disk_io_skipped
+            .load(Ordering::Acquire);
+        remove(&launched);
+
+        assert_eq!(skipped, 1, "the queued read ran after the worker exited");
+        assert!(
+            waited >= DELAY,
+            "the worker exited after {waited:?}, before the running read completed"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the worker took {waited:?}: the drain waited for a request that was not running"
+        );
+        assert!(
+            TASK_DROPPED.load(Ordering::SeqCst),
+            "the worker leaked its tasks although no read was left running"
+        );
     }
 }

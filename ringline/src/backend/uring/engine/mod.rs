@@ -1,8 +1,8 @@
 //! The engine executes the operations the driver submits and reports their
 //! completions. `UringEngine` runs them on the kernel's io_uring. Building
 //! with the environment variable `RINGLINE_STUB_ENGINE=1` selects
-//! `StubEngine` instead, which compiles the driver without using the
-//! `io_uring` crate and fails at setup.
+//! `StubEngine` instead, which compiles the driver without `UringEngine`
+//! and fails at setup.
 
 use std::io;
 use std::os::fd::RawFd;
@@ -62,6 +62,16 @@ pub(crate) trait Engine: Sized {
     /// up) and `EAGAIN` (no memory for a request) return `Ok` so the caller
     /// reaps.
     fn submit_and_wait(&self, min_complete: u32) -> io::Result<()>;
+
+    /// As [`submit_and_wait`](Self::submit_and_wait), but return once
+    /// `timeout` has passed, whether or not `min_complete` completions are
+    /// ready. Expiry returns `Ok`, and so does `EINTR`, without restarting
+    /// the wait.
+    fn submit_and_wait_timeout(
+        &self,
+        min_complete: u32,
+        timeout: std::time::Duration,
+    ) -> io::Result<()>;
 
     /// Start queued operations and make ready completions reapable, without
     /// blocking.

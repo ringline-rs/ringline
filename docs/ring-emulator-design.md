@@ -172,12 +172,15 @@ one engine call:
 
 | Today (`event_loop.rs`) | Engine call | Meaning |
 |---|---|---|
-| `submit_and_wait(1)` when nothing is runnable | `wait(None)` | Start queued work; block until a completion is ready. |
+| `submit_and_wait_timeout(1, bound)` when nothing is runnable, or `submit_and_wait(1)` when nothing bounds the wait | `wait(Some(bound))`, `wait(None)` | Start queued work; block until a completion is ready or the bound passes. |
 | `submit_and_get_events()` when a task is runnable | `wait(Some(ZERO))` | Start queued work and collect what is ready, without blocking. The emulator polls readiness with a zero timeout here; otherwise it reproduces the worker starvation the comment above that call describes. |
-| `flush()` after the poll pass, and mid-batch | `submit()` | Start queued work: each readiness-driven op that is not linked behind an op still in flight (rule 4) makes its first attempt (rule 2; a multishot recv runs one capped pass), disk-pool ops are handed to the pool, cancels, Close, Shutdown and ParkInstall run at once, and timeouts join the deadline heap; `submit` then fires every deadline that has passed (Timeout row). Completions posted by any of these, and disk-pool results already on the channel (rule 5), become visible to the next `reap`. `submit` does not poll readiness and does not resume passes on the cap list. The kernel's `flush()` runs deferred task_work when the SQ is non-empty, including a capped receive's requeue and the recv completions of sockets that became readable. The driver needs neither for correctness: the next `wait` delivers both. |
+| `flush()` after the poll pass, and mid-batch | `submit()` | Start queued work: each readiness-driven op that is not linked behind an op still in flight (rule 4) makes its first attempt (rule 2; a multishot recv runs one capped pass), disk-pool ops are handed to the pool, and cancels, Close, Shutdown and ParkInstall run at once. Completions posted by any of these, and disk-pool results already on the channel (rule 5), become visible to the next `reap`. `submit` does not poll readiness and does not resume passes on the cap list. The kernel's `flush()` runs deferred task_work when the SQ is non-empty, including a capped receive's requeue and the recv completions of sockets that became readable. The driver needs neither for correctness: the next `wait` delivers both. |
 
-The loop arms its own wake-up deadline as a TickTimeout SQE, and
-`run_shutdown` arms its own, so `wait` needs no timeout of its own.
+The loop passes its own wake-up deadline (the next tick, the earliest timer,
+the earliest handshake, close or connect deadline, and the send backstop's
+next run) as the timeout of
+`submit_and_wait_timeout`, and `run_shutdown` waits at most 100 ms per pass,
+so `wait` takes a timeout: `wait(Some(bound))`.
 
 ```rust
 pub(crate) trait Engine {
@@ -312,7 +315,6 @@ conformance tests confirm against the real ring first.
 | Shutdown, CloseShutdown | SHUTDOWN | `shutdown(2)` on the op's fd. | A |
 | Close | CLOSE (fixed) | See the fixed-file table: cancel the slot's pending ops, then drop the emulator's fd. | C |
 | CloseCancel, Cancel | ASYNC_CANCEL (by user_data; by fixed fd, all) | Exact 64-bit user_data match, or every pending request on the fixed slot. The cancelled request posts `-ECANCELED`; the cancel posts `0` or `-ENOENT`. | B |
-| Timeout, TickTimeout, Timer | TIMEOUT (relative, `ABS`) | A min-heap of deadlines, computed from the timespec at push (the caller's timespec need not outlive the push, as with the kernel). Fires post `-ETIME`; a cancel posts `-ECANCELED`. `wait` and `submit` each fire every deadline that has passed. `wait` blocks no later than the earliest deadline. | B |
 | EventFdRead | READ on the eventfd | The worker's wake fd (a pipe on macOS). Try at arm, then on readable. | A |
 | AcceptMulti | ACCEPT multishot | Try at arm, then on readable: `accept` (with `SOCK_NONBLOCK\|SOCK_CLOEXEC`, or `fcntl` after `accept` where `accept4` is missing) until `EAGAIN`, one CQE per fd with `F_MORE`. | B, P |
 | ParkInstall | FIXED_FD_INSTALL | `fcntl(F_DUPFD_CLOEXEC)` on the slot's fd; post the new fd. The kernel installs it close-on-exec, which #460 relies on. | A |
@@ -460,7 +462,7 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
 3. **First emulated slice.** `EmulatedEngine` on Linux behind a
    `ring-emulator` feature, with RecvMulti on both ring kinds (incremental
    offsets, `F_BUF_MORE` and `SOCK_NONEMPTY` included), Send,
-   Connect, Close, the close leads, Cancel, Timeout/TickTimeout/Timer and
+   Connect, Close, the close leads, Cancel and
    EventFdRead. Acceptance: the conformance tests for those ops pass on
    both engines, and the `tests/echo.rs` tests that use only those ops
    pass on the emulator (the PR names the filter).
@@ -512,13 +514,8 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
 
 ## Found while surveying
 
-- **The connect-timeout cancel never matches.** `arm_connect_timeout`
-  (`handler.rs`) arms the timeout with `payload = generation`, but the
-  three cancels of it (one in `handler.rs`, two in `event_loop.rs`)
-  encode payload 0, and `ASYNC_CANCEL` matches the whole user_data. The
-  timeout therefore always runs to `-ETIME`. `handle_timeout` ignores it,
-  because it checks the generation and `connect_timeout_armed`. Harmless
-  today; the emulator's exact-match cancel must not hide it.
+- Fixed: the connect timeout is a userspace deadline (#838) and no
+  Timeout SQE is submitted.
 - **A stale comment** in `ring.rs` above `submit_park_recv_cancel`
   describes an `IO_LINK` from the park recv-cancel to the install, which
   the code no longer has. The same block carries `submit_async_cancel`'s

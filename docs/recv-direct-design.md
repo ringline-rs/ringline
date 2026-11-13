@@ -379,7 +379,9 @@ nothing is buffered, armed or parking. Until the poll is armed, a FIN or
 reset is seen by the next receive to complete, which a read arms when it
 parks. A FIN closes nothing: a connection whose task only sends stays open
 until the task ends, and a peer that closed fully answers the next send with
-a reset, which the send reports.
+a reset, which the send reports. The exception is a FIN on a TLS connection
+whose handshake has not completed, which closes it
+(`docs/half-close-design.md`).
 
 Cost: one `POLL_ADD` SQE per connection, its completion at a hangup or at
 the close's lead (`shutdown` before 6.13 completes it with `POLLHUP`, the

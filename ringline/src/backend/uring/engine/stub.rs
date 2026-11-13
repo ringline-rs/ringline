@@ -1,6 +1,6 @@
 //! An engine that executes nothing: it lets the io_uring driver compile
-//! without using the `io_uring` crate (`RINGLINE_STUB_ENGINE=1`). Setup fails, so
-//! no other method is reached; each panics if it is.
+//! without `UringEngine` (`RINGLINE_STUB_ENGINE=1`). Setup fails, so no other
+//! method is reached; each panics if it is.
 
 use std::io;
 use std::os::fd::RawFd;
@@ -36,6 +36,14 @@ impl Engine for StubEngine {
     }
 
     fn submit_and_wait(&self, _min_complete: u32) -> io::Result<()> {
+        unreachable!("the stub engine fails at setup")
+    }
+
+    fn submit_and_wait_timeout(
+        &self,
+        _min_complete: u32,
+        _timeout: std::time::Duration,
+    ) -> io::Result<()> {
         unreachable!("the stub engine fails at setup")
     }
 

@@ -29,14 +29,8 @@ pub enum OpTag {
     TlsSend = 7,
     /// Outbound TCP connect.
     Connect = 8,
-    /// Timeout (e.g., connect timeout).
-    Timeout = 9,
     /// Async cancel (informational CQE only).
     Cancel = 10,
-    /// Periodic tick timeout to prevent submit_and_wait from blocking indefinitely.
-    TickTimeout = 11,
-    /// Standalone timer (sleep/timeout) for async tasks.
-    Timer = 12,
     /// Single-shot recvmsg for UDP sockets.
     RecvMsgUdp = 13,
     /// Copying sendmsg for UDP sockets.
@@ -105,9 +99,6 @@ pub enum OpTag {
     /// The non-blocking one-byte `MSG_PEEK` receive a completed hangup poll
     /// submits when no receive is in flight. Payload = connection generation.
     HangupPeek = 38,
-    /// The worker's timer that retries sends waiting for room, as
-    /// `AsyncEventLoop::handle_send_backstop` describes.
-    SendBackstop = 25,
 }
 
 impl OpTag {
@@ -120,10 +111,7 @@ impl OpTag {
             6 => Some(OpTag::EventFdRead),
             7 => Some(OpTag::TlsSend),
             8 => Some(OpTag::Connect),
-            9 => Some(OpTag::Timeout),
             10 => Some(OpTag::Cancel),
-            11 => Some(OpTag::TickTimeout),
-            12 => Some(OpTag::Timer),
             13 => Some(OpTag::RecvMsgUdp),
             14 => Some(OpTag::SendMsgUdp),
             15 => Some(OpTag::NvmeCmd),
@@ -134,7 +122,6 @@ impl OpTag {
             22 => Some(OpTag::RecvUdp),
             23 => Some(OpTag::SendUdp),
             24 => Some(OpTag::SendMsgCoalesced),
-            25 => Some(OpTag::SendBackstop),
             31 => Some(OpTag::AcceptMulti),
             32 => Some(OpTag::ParkInstall),
             33 => Some(OpTag::CloseShutdown),
@@ -163,10 +150,7 @@ impl OpTag {
             OpTag::EventFdRead => "event_fd_read",
             OpTag::TlsSend => "tls_send",
             OpTag::Connect => "connect",
-            OpTag::Timeout => "timeout",
             OpTag::Cancel => "cancel",
-            OpTag::TickTimeout => "tick_timeout",
-            OpTag::Timer => "timer",
             OpTag::RecvMsgUdp => "recv_msg_udp",
             OpTag::SendMsgUdp => "send_msg_udp",
             OpTag::NvmeCmd => "nvme_cmd",
@@ -185,7 +169,6 @@ impl OpTag {
             OpTag::RecvDirect => "recv_direct",
             OpTag::HangupPoll => "hangup_poll",
             OpTag::HangupPeek => "hangup_peek",
-            OpTag::SendBackstop => "send_backstop",
         }
     }
 }
@@ -212,7 +195,7 @@ mod optag_label_tests {
         }
         // Sanity: the walk found the tags, rather than silently finding none.
         assert!(
-            seen.len() >= 30,
+            seen.len() >= 26,
             "expected the full tag set, found {}",
             seen.len()
         );

@@ -38,6 +38,36 @@ error, a write error or a TLS failure (`abort_connection`,
 Read errors are unchanged: a reset or a socket error still sets
 `ReadHalf::Error`, reports to the reader and closes.
 
+One FIN still closes: a FIN on a TLS connection whose handshake has not
+completed. No task holds the connection until then (an inbound connection's
+`on_accept` task is spawned at completion, and an outbound
+`connect(..).tls(..)` is still parked), so nothing would close it. The FIN
+sets `ReadHalf::Eof { truncated: true }`, an outbound connect resolves
+`UnexpectedEof`, and the connection closes (`handle_tls_recv_direct` on
+io_uring, the TLS `Ok(0)` arm of `handle_readable` on mio). Without the
+close, an inbound slot would be held until `tls_handshake_timeout` elapses,
+and an outbound connect would resolve `TimedOut` then.
+
+A connection closed before its handshake completes, by this FIN, by a TLS
+error or by `tls_handshake_timeout`, drains its queued sends, so a peer that
+reads receives the rest of the handshake flight and any alert. The drain is
+bounded by a close deadline, `CLOSE_NOTIFY_TIMEOUT` (5 s), set in
+`close_connection` on both backends. When it passes the connection is closed
+without the sends still queued (`check_close_notify_deadlines` and
+`force_finalize_close` on io_uring; `drain_pending_closes` and
+`finish_close` on mio), so a peer that stopped reading does not hold the
+slot while the flight waits for room.
+
+A close_notify received before the handshake completes is not recorded as a
+close: ringline-tls records one only once application data may be received.
+A warning-level one is ignored until TLS 1.3 is negotiated; after that it is
+an error, which ringline-tls answers with a fatal `decode_error` alert. A
+fatal-level one is an error. So `TlsRecvResult::Closed` is not produced
+before the handshake completes, and the `Closed` arms need no such check. A
+peer whose alert is ignored and that keeps the socket open is treated as a
+peer that sends nothing: its connection is closed when
+`ConfigBuilder::tls_handshake_timeout` elapses (10 s by default).
+
 There is no knob to restore the old policy. 0.7 is a breaking release, and
 a handler that wants the old behaviour returns when a read resolves `0`.
 

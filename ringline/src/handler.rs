@@ -54,10 +54,12 @@ pub(crate) struct ConnSendState {
     /// the Close SQE is committed.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub close_submitted: bool,
-    /// Set by `DriverCtx::close` on a TLS connection, whether or not it
-    /// queued an alert. When the deadline passes with `close_pending` still
-    /// true, the runtime force-closes the connection.
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    /// Set to `CLOSE_NOTIFY_TIMEOUT` from now by `DriverCtx::close` on a TLS
+    /// connection (io_uring), whether or not it queued an alert, and by
+    /// `close_connection` on a connection whose handshake or connect has not
+    /// completed (both backends). When the deadline passes with
+    /// `close_pending` still true, the runtime closes the connection without
+    /// its queued sends.
     pub close_notify_deadline: Option<std::time::Instant>,
     /// Whether a `Shutdown` for the current occupant has been requested and
     /// its CQE has not arrived: the SQE is in the kernel, or parked on
@@ -165,10 +167,12 @@ impl ConnId {
     }
 }
 
-/// How long a TLS close after a fatal encrypt error waits for its queued sends and
-/// close_notify to drain before the connection is closed without them.
-#[cfg(has_io_uring)]
-const CLOSE_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a close waits for its queued sends to drain before the
+/// connection is closed without them: a close after a fatal encrypt error
+/// (io_uring), with its close_notify, and a close before the handshake
+/// completes (both backends), with the rest of the handshake flight and any
+/// alert.
+pub(crate) const CLOSE_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Identifies which listener a connection arrived on.
 ///
@@ -313,9 +317,10 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) tcp_nodelay: bool,
     /// Guard sends below this total length fall back to copy (0 = always ZC).
     pub(crate) send_zc_threshold: u32,
-    /// Pre-allocated timespec storage for connect timeouts (io_uring only).
+    /// The worker's connect deadlines (io_uring only).
     #[cfg(has_io_uring)]
-    pub(crate) connect_timespecs: &'a mut Vec<crate::backend::uring::abi::Timespec>,
+    pub(crate) connect_deadlines:
+        &'a mut crate::backend::uring::connect_deadlines::ConnectDeadlines,
     /// Per-connection send chain tracking.
     pub(crate) chain_table: &'a mut crate::chain::SendChainTable,
     /// Maximum SQEs per chain (0 = disabled).
@@ -402,6 +407,15 @@ impl<'a> DriverCtx<'a> {
     /// polling tasks.
     pub fn request_shutdown(&mut self) {
         *self.shutdown_requested = true;
+    }
+
+    /// Whether the connection is Unix-domain. The kernel refuses `SENDMSG_ZC`
+    /// on a Unix socket with `EOPNOTSUPP`, so its guard sends go out as plain
+    /// `sendmsg`s (#829).
+    pub(crate) fn conn_is_unix(&self, conn_index: u32) -> bool {
+        self.connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.peer_addr, Some(crate::connection::PeerAddr::Unix(_))))
     }
 
     /// Get TLS session information for a connection.
@@ -907,10 +921,9 @@ impl<'a> DriverCtx<'a> {
 
     /// Allocate a 32-bit disk-I/O completion key: the subsystem in the top 2
     /// bits, a 14-bit sequence below it, and the slab index in the low 16.
-    /// fs, NVMe and direct I/O share the executor's completion and graveyard
-    /// maps but have independent slabs, each numbering its slots from 0.
-    /// CQE handlers extract the slab index from the low 16 bits and wake with
-    /// the full key.
+    /// fs, NVMe and direct I/O share the executor's disk-I/O entry map but
+    /// have independent slabs, each numbering its slots from 0. CQE handlers
+    /// extract the slab index from the low 16 bits and wake with the full key.
     ///
     /// A key is held from submission until its future takes the result or is
     /// dropped, which can be long after the slab slot is freed. A key a
@@ -1497,13 +1510,14 @@ impl<'a> DriverCtx<'a> {
             .as_mut()
             .ok_or_else(|| io::Error::other("NVMe not configured"))?;
 
+        // Convert the path before allocating, so a bad path holds no slot.
+        let c_path =
+            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid device path"))?;
         let index = devices
             .allocate()
             .ok_or_else(|| io::Error::other("NVMe device table full"))?;
 
         // Open the NVMe-generic character device.
-        let c_path =
-            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid device path"))?;
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if fd < 0 {
             devices.release(index);
@@ -1582,6 +1596,9 @@ impl<'a> DriverCtx<'a> {
             device.index as u32,
             key,
         );
+        if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
             Ok(()) => {
@@ -1650,6 +1667,9 @@ impl<'a> DriverCtx<'a> {
             device.index as u32,
             key,
         );
+        if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
             Ok(()) => {
@@ -1699,6 +1719,9 @@ impl<'a> DriverCtx<'a> {
             device.index as u32,
             key,
         );
+        if let Some(slab) = self.nvme_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_nvme_cmd(fd_index, &cmd, ud) } {
             Ok(()) => {
@@ -1785,13 +1808,14 @@ impl<'a> DriverCtx<'a> {
             .as_mut()
             .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
 
+        // Convert the path before allocating, so a bad path holds no slot.
+        let c_path =
+            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
         let index = files
             .allocate()
             .ok_or_else(|| io::Error::other("direct I/O file table full"))?;
 
         // Open with O_DIRECT | O_RDWR.
-        let c_path =
-            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr(),
@@ -1868,6 +1892,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) } {
             Ok(()) => {
@@ -1930,6 +1957,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe {
             self.ring
@@ -1981,6 +2011,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match self.ring.submit_direct_fsync(fd_index, ud) {
             Ok(()) => {
@@ -2052,7 +2085,7 @@ impl<'a> DriverCtx<'a> {
         path: &std::path::Path,
         flags: crate::fs::OpenFlags,
         mode: u32,
-    ) -> io::Result<(u16, u16, u32)> {
+    ) -> io::Result<(u16, u32, u32)> {
         let files = self
             .fs_files
             .as_mut()
@@ -2119,6 +2152,9 @@ impl<'a> DriverCtx<'a> {
             file_index as u32,
             key,
         );
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe {
             self.ring
@@ -2173,6 +2209,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) } {
             Ok(()) => {
@@ -2228,6 +2267,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe {
             self.ring
@@ -2276,6 +2318,9 @@ impl<'a> DriverCtx<'a> {
             file.index as u32,
             key,
         );
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match self.ring.submit_direct_fsync(fd_index, ud) {
             Ok(()) => {
@@ -2297,9 +2342,22 @@ impl<'a> DriverCtx<'a> {
 
     /// Close a filesystem file.
     ///
-    /// Deregisters the fd from the fixed file table and releases the file slot.
+    /// Deregisters the fd from the fixed file table and releases the file
+    /// slot. With reads, writes or fsyncs in flight, the handle goes stale at
+    /// once and the last completion does both: an operation pushed earlier in
+    /// the same task poll may not be submitted until the loop flushes, and the
+    /// kernel resolves its fixed file then (#859).
     pub(crate) fn fs_close(&mut self, file: crate::fs::File) -> io::Result<()> {
         let fd_index = self.validate_fs_file(file)?;
+
+        if let Some(files) = self.fs_files.as_mut()
+            && let Some(f) = files.get_mut(file.index)
+            && f.in_flight > 0
+        {
+            f.closing = true;
+            f.generation = f.generation.wrapping_add(1);
+            return Ok(());
+        }
 
         // Unregister from the fixed file table.
         self.ring.register_files_update(fd_index, &[-1i32])?;
@@ -2311,10 +2369,11 @@ impl<'a> DriverCtx<'a> {
         Ok(())
     }
 
-    /// Submit a statx via io_uring.
+    /// Submit a statx via io_uring. With `nofollow`, a final symbolic link in
+    /// `path` is not followed.
     ///
     /// Returns the slab_idx (seq number for DiskIoFuture).
-    pub(crate) fn fs_stat(&mut self, path: &std::path::Path) -> io::Result<u32> {
+    pub(crate) fn fs_stat(&mut self, path: &std::path::Path, nofollow: bool) -> io::Result<u32> {
         let c_path = crate::fs::path_to_cstring(path)?;
 
         let slab = self
@@ -2325,14 +2384,15 @@ impl<'a> DriverCtx<'a> {
             .allocate(0, crate::fs::FsOp::Statx)
             .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
 
-        // Allocate the statx buffer and store it in the slab entry.
-        let statx_buf: Box<libc::statx> = Box::new(unsafe { std::mem::zeroed() });
-        let statx_ptr = &*statx_buf as *const libc::statx as *mut libc::statx;
-
-        if let Some(entry) = slab.get_mut(slab_idx) {
-            entry.path = Some(c_path);
-            entry.statx_buf = Some(statx_buf);
-        }
+        // The kernel writes into the slab entry's statx buffer; the slab
+        // never moves an entry, so the pointer stays valid until the CQE.
+        let statx_ptr = match slab.get_mut(slab_idx) {
+            Some(entry) => {
+                entry.path = Some(c_path);
+                &mut entry.statx_buf as *mut libc::statx
+            }
+            None => unreachable!("the slab entry was just allocated"),
+        };
 
         let path_ptr = self
             .fs_cmd_slab
@@ -2355,8 +2415,14 @@ impl<'a> DriverCtx<'a> {
             }
         };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
-        match unsafe { self.ring.submit_statx(path_ptr, statx_ptr, ud.raw()) } {
+        match unsafe {
+            self.ring
+                .submit_statx(path_ptr, statx_ptr, nofollow, ud.raw())
+        } {
             Ok(()) => Ok(key),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
@@ -2407,6 +2473,9 @@ impl<'a> DriverCtx<'a> {
             }
         };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_renameat(old_ptr, new_ptr, ud.raw()) } {
             Ok(()) => Ok(key),
@@ -2456,6 +2525,9 @@ impl<'a> DriverCtx<'a> {
             }
         };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_unlinkat(path_ptr, 0, ud.raw()) } {
             Ok(()) => Ok(key),
@@ -2505,6 +2577,9 @@ impl<'a> DriverCtx<'a> {
             }
         };
         let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        if let Some(slab) = self.fs_cmd_slab.as_mut() {
+            slab.set_user_data(slab_idx, ud.raw());
+        }
 
         match unsafe { self.ring.submit_mkdirat(path_ptr, mode, ud.raw()) } {
             Ok(()) => Ok(key),
@@ -2526,7 +2601,7 @@ impl<'a> DriverCtx<'a> {
         let f = files
             .get(file.index)
             .ok_or_else(|| io::Error::other("invalid filesystem file handle"))?;
-        if f.generation != file.generation {
+        if f.closing || f.generation != file.generation {
             return Err(io::Error::other("stale filesystem file handle"));
         }
         Ok(f.fd_index)
@@ -2536,32 +2611,24 @@ impl<'a> DriverCtx<'a> {
     /// not depend on the transport.
     ///
     /// The connect builders call this after the base connect (#528).
+    ///
+    /// The deadline goes into the worker's connect deadline heap, which bounds
+    /// the worker's wait; nothing is submitted. A deadline past what `Instant`
+    /// can hold is never reached and is not armed.
     #[cfg(has_io_uring)]
     pub(crate) fn arm_connect_timeout(&mut self, conn_index: u32, timeout_ms: u64) {
-        let ts = &mut self.connect_timespecs[conn_index as usize];
-        *ts = crate::backend::uring::abi::Timespec::new()
-            .sec(timeout_ms / 1000)
-            .nsec((timeout_ms % 1000) as u32 * 1_000_000);
-
-        // Carry the connection generation in the payload: a stale -ETIME
-        // deferred through CQ overflow could otherwise land after this slot
-        // was closed and reused for a NEW outbound connect (again in
-        // Connecting state) and kill it with a spurious TimedOut.
-        let generation = self
-            .connections
-            .get(conn_index)
-            .map(|c| c.generation)
-            .unwrap_or(0);
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::Timeout,
-            conn_index,
-            generation,
-        );
-        if self.ring.submit_timeout(ts as *const _, ud).is_ok()
-            && let Some(cs) = self.connections.get_mut(conn_index)
-        {
-            cs.connect_timeout_armed = true;
-        }
+        let Some(deadline) =
+            std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout_ms))
+        else {
+            return;
+        };
+        let Some(cs) = self.connections.get_mut(conn_index) else {
+            return;
+        };
+        cs.connect_deadline = Some(deadline);
+        let generation = cs.generation;
+        self.connect_deadlines
+            .arm(conn_index, generation, deadline, &*self.connections);
     }
 }
 
@@ -2606,17 +2673,26 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) sends_dirty: &'a mut Vec<u32>,
     pub(crate) sends_dirty_flag: &'a mut Vec<bool>,
     pub(crate) connect_pending: &'a mut u32,
-    /// Shared disk I/O pool for filesystem operations.
+    /// This worker's disk I/O pool.
     pub(crate) disk_io_pool: &'a Option<std::sync::Arc<crate::disk_io_pool::DiskIoPool>>,
     /// Per-worker disk I/O response send channel (included in each request).
     pub(crate) disk_io_tx:
         &'a Option<crossbeam_channel::Sender<crate::disk_io_pool::DiskIoResponse>>,
     /// Wake handle for this worker (used to wake after disk I/O completion).
     pub(crate) wake_handle: crate::wakeup::WakeFd,
+    /// See `Driver::disk_io_wake_pending`.
+    pub(crate) disk_io_wake_pending: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Monotonic sequence counter for disk I/O requests.
     pub(crate) next_disk_io_seq: &'a mut u32,
     /// Keys of pool operations not yet drained; see `Driver::disk_io_in_flight`.
-    pub(crate) disk_io_in_flight: &'a mut std::collections::HashSet<u32>,
+    pub(crate) disk_io_in_flight:
+        &'a mut std::collections::HashMap<u32, crate::disk_io_pool::PoolSubsystem>,
+    /// See `Driver::disk_io_counts`.
+    pub(crate) disk_io_counts: &'a mut [u16; 2],
+    /// See `Driver::disk_io_limits`.
+    pub(crate) disk_io_limits: [Option<u16>; 2],
+    /// See `Driver::disk_io_borrowing`.
+    pub(crate) disk_io_borrowing: &'a mut std::collections::HashSet<u32>,
     /// Direct I/O file table.
     pub(crate) direct_io_files: &'a mut Option<crate::direct_io::DirectIoFileTable>,
     /// Direct I/O fds, indexed by file slot.
@@ -3157,25 +3233,39 @@ impl<'a> DriverCtx<'a> {
     // ── Direct I/O methods ────────────────────────────────────────────
 
     /// Allocate a sequence number and submit work to the disk I/O pool.
+    /// `borrows` is true when `work` reads or writes through a caller's
+    /// buffer address, which worker exit must then wait for. Fails when
+    /// `subsystem` is not configured, or already has its
+    /// `max_commands_in_flight` operations submitted and not drained.
     fn submit_disk_io(
         &mut self,
+        subsystem: crate::disk_io_pool::PoolSubsystem,
         work: Box<dyn FnOnce() -> crate::disk_io_pool::DiskIoResult + Send>,
+        borrows: bool,
     ) -> io::Result<u32> {
-        let pool = self
-            .disk_io_pool
-            .as_ref()
-            .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
-        let tx = self
-            .disk_io_tx
-            .as_ref()
-            .ok_or_else(|| io::Error::other("disk I/O pool not configured"))?;
+        // An unconfigured subsystem fails first, with io_uring's error, even
+        // when this worker has no pool. A missing pool with the subsystem
+        // configured is unreachable through `ConfigBuilder`, which refuses it
+        // on this backend.
+        let limit =
+            self.disk_io_limits[subsystem as usize].ok_or_else(|| subsystem.not_configured())?;
+        let pool = self.disk_io_pool.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "disk I/O pool not configured")
+        })?;
+        let tx = self.disk_io_tx.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "disk I/O pool not configured")
+        })?;
+        if self.disk_io_counts[subsystem as usize] >= limit {
+            return Err(subsystem.exhausted());
+        }
 
         // Skip a key a future still holds, or whose operation is still in the
         // pool; the u32 sequence can wrap on a long-running worker.
         let seq = loop {
             let seq = *self.next_disk_io_seq;
             *self.next_disk_io_seq = seq.wrapping_add(1);
-            if !crate::runtime::disk_io_key_held(seq) && !self.disk_io_in_flight.contains(&seq) {
+            if !crate::runtime::disk_io_key_held(seq) && !self.disk_io_in_flight.contains_key(&seq)
+            {
                 break seq;
             }
         };
@@ -3186,9 +3276,14 @@ impl<'a> DriverCtx<'a> {
                 seq,
                 response_tx: tx.clone(),
                 wake_handle: self.wake_handle,
+                wake_pending: std::sync::Arc::clone(self.disk_io_wake_pending),
             })
             .map_err(|_| io::Error::other("disk I/O pool shut down"))?;
-        self.disk_io_in_flight.insert(seq);
+        self.disk_io_in_flight.insert(seq, subsystem);
+        self.disk_io_counts[subsystem as usize] += 1;
+        if borrows {
+            self.disk_io_borrowing.insert(seq);
+        }
 
         Ok(seq)
     }
@@ -3217,12 +3312,12 @@ impl<'a> DriverCtx<'a> {
             .as_mut()
             .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
 
+        // Convert the path before allocating, so a bad path holds no slot.
+        let c_path =
+            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
         let index = files
             .allocate()
             .ok_or_else(|| io::Error::other("direct I/O file table full"))?;
-
-        let c_path =
-            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
 
         #[cfg(target_os = "linux")]
         let flags = libc::O_RDWR | libc::O_DIRECT;
@@ -3291,7 +3386,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::DirectIo, work, true)
     }
 
     /// Submit a direct I/O write via the disk I/O pool.
@@ -3329,7 +3424,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::DirectIo, work, true)
     }
 
     /// Submit an fsync for a direct I/O file via the disk I/O pool.
@@ -3350,7 +3445,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::DirectIo, work, false)
     }
 
     /// Close a direct I/O file and release its slot.
@@ -3400,7 +3495,7 @@ impl<'a> DriverCtx<'a> {
         path: &std::path::Path,
         flags: crate::fs::OpenFlags,
         mode: u32,
-    ) -> io::Result<(u16, u16, u32)> {
+    ) -> io::Result<(u16, u32, u32)> {
         let files = self
             .fs_files
             .as_mut()
@@ -3446,7 +3541,7 @@ impl<'a> DriverCtx<'a> {
             }
         });
 
-        match self.submit_disk_io(work) {
+        match self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false) {
             Ok(seq) => {
                 self.pending_fs_opens.insert(seq, file_index);
                 Ok((file_index, generation, seq))
@@ -3490,7 +3585,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, true)
     }
 
     /// Submit a filesystem write via the disk I/O pool.
@@ -3525,7 +3620,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, true)
     }
 
     /// Submit an fsync for a filesystem file via the disk I/O pool.
@@ -3546,7 +3641,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
     }
 
     /// Close a filesystem file and release its slot.
@@ -3562,16 +3657,20 @@ impl<'a> DriverCtx<'a> {
         Ok(())
     }
 
-    /// Submit a stat via the disk I/O pool.
+    /// Submit a stat via the disk I/O pool; with `nofollow`, an lstat.
     ///
     /// Uses `libc::stat` (portable) instead of `statx` (Linux-only). The
     /// result is converted to `crate::fs::Metadata` inside the pool closure
     /// and delivered via `DiskIoResponse::metadata`.
-    pub(crate) fn fs_stat(&mut self, path: &std::path::Path) -> io::Result<u32> {
+    pub(crate) fn fs_stat(&mut self, path: &std::path::Path, nofollow: bool) -> io::Result<u32> {
         let c_path = crate::fs::path_to_cstring(path)?;
         let work = Box::new(move || {
             let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
-            let result = unsafe { libc::stat(c_path.as_ptr(), &mut stat_buf) };
+            let result = if nofollow {
+                unsafe { libc::lstat(c_path.as_ptr(), &mut stat_buf) }
+            } else {
+                unsafe { libc::stat(c_path.as_ptr(), &mut stat_buf) }
+            };
             if result < 0 {
                 let errno = io::Error::last_os_error()
                     .raw_os_error()
@@ -3590,7 +3689,7 @@ impl<'a> DriverCtx<'a> {
                 }
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
     }
 
     /// Submit a rename via the disk I/O pool.
@@ -3616,7 +3715,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
     }
 
     /// Submit an unlink via the disk I/O pool.
@@ -3637,7 +3736,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
     }
 
     /// Submit a mkdir via the disk I/O pool.
@@ -3658,7 +3757,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(work)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
     }
 
     /// Validate a filesystem file handle and return a hold on its fd.
@@ -3759,7 +3858,8 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     }
 
     /// Add a zero-copy guard part. The guard keeps the memory alive until the kernel
-    /// releases it via the ZC notification.
+    /// releases it via the ZC notification, or, on a Unix-domain connection, until
+    /// the plain `sendmsg` that sends it completes.
     pub fn guard(mut self, guard: GuardBox) -> Self {
         if self.error.is_some() {
             return self;
@@ -4026,11 +4126,20 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 self.conn.index,
                 slab_idx as u32,
             );
-            let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(
-                self.conn.index,
-                msg_ptr,
-                user_data.raw(),
-            );
+            // A Unix socket refuses `SENDMSG_ZC`: send the entry with a plain
+            // `sendmsg`, and mark it so a partial send is resent the same way.
+            // The completion is handled as a zero-copy send that owes no
+            // notification.
+            let entry = if self.ctx.conn_is_unix(self.conn.index) {
+                self.ctx.send_slab.set_plain_msg(slab_idx);
+                crate::backend::uring::sqe::Sqe::send_msg(self.conn.index, msg_ptr, user_data.raw())
+            } else {
+                crate::backend::uring::sqe::Sqe::send_msg_zc(
+                    self.conn.index,
+                    msg_ptr,
+                    user_data.raw(),
+                )
+            };
 
             Ok(BuiltSend {
                 entry,
@@ -4085,11 +4194,20 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 self.conn.index,
                 slab_idx as u32,
             );
-            let entry = crate::backend::uring::sqe::Sqe::send_msg_zc(
-                self.conn.index,
-                msg_ptr,
-                user_data.raw(),
-            );
+            // A Unix socket refuses `SENDMSG_ZC`: send the entry with a plain
+            // `sendmsg`, and mark it so a partial send is resent the same way.
+            // The completion is handled as a zero-copy send that owes no
+            // notification.
+            let entry = if self.ctx.conn_is_unix(self.conn.index) {
+                self.ctx.send_slab.set_plain_msg(slab_idx);
+                crate::backend::uring::sqe::Sqe::send_msg(self.conn.index, msg_ptr, user_data.raw())
+            } else {
+                crate::backend::uring::sqe::Sqe::send_msg_zc(
+                    self.conn.index,
+                    msg_ptr,
+                    user_data.raw(),
+                )
+            };
 
             Ok(BuiltSend {
                 entry,
@@ -4754,11 +4872,20 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                                     conn_index,
                                     slab_idx as u32,
                                 );
-                                let entry = crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
-                                    conn_index,
-                                    msg_ptr,
-                                    user_data.raw(),
-                                );
+                                // A Unix socket refuses `SENDMSG_ZC` (#829).
+                                let entry = if self.chain.ctx.conn_is_unix(conn_index) {
+                                    crate::backend::uring::sqe::Sqe::chain_send_msg(
+                                        conn_index,
+                                        msg_ptr,
+                                        user_data.raw(),
+                                    )
+                                } else {
+                                    crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
+                                        conn_index,
+                                        msg_ptr,
+                                        user_data.raw(),
+                                    )
+                                };
 
                                 BuiltSend {
                                     entry,
@@ -4825,11 +4952,20 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
                             conn_index,
                             slab_idx as u32,
                         );
-                        let entry = crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
-                            conn_index,
-                            msg_ptr,
-                            user_data.raw(),
-                        );
+                        // A Unix socket refuses `SENDMSG_ZC` (#829).
+                        let entry = if self.chain.ctx.conn_is_unix(conn_index) {
+                            crate::backend::uring::sqe::Sqe::chain_send_msg(
+                                conn_index,
+                                msg_ptr,
+                                user_data.raw(),
+                            )
+                        } else {
+                            crate::backend::uring::sqe::Sqe::chain_send_msg_zc(
+                                conn_index,
+                                msg_ptr,
+                                user_data.raw(),
+                            )
+                        };
 
                         BuiltSend {
                             entry,

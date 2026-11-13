@@ -90,7 +90,9 @@ cannot finish waits in ringline:
    poll armed for step 2 costs one ignored CQE per edge. Cancelling when each send
    finishes would race the next send's arm: every poll of a connection has the same
    user_data.
-7. A timer resubmits every waiting send once a second, whichever poll it waits on.
+7. A backstop resubmits every waiting send once a second, whichever poll it waits on.
+   Its next run is a deadline (`Driver::send_backstop_at`) that bounds the worker's
+   wait for I/O, so it runs with no tick too.
    It covers a lost edge, and a Unix peer's `SHUT_RD`, which a send reports as `-EPIPE`
    and a poll does not report. The interval is a guess, and this retry is unmeasured.
 
@@ -223,8 +225,9 @@ The threads count against `RLIMIT_NPROC`, and a client controls how many.
 A close with a send waiting behaves as it did, and waits for the peer. Completion
 semantics do not change: a short result stays inside its handler, and the send settles
 once with its full length. `SEND_EAGAIN` is now a normal backpressure count. A chain
-part is built with `Sqe::chain_send` or `Sqe::chain_send_msg_zc`, and `push_sqe_chain`
-debug-asserts it, because a chain part with `MSG_DONTWAIT` restores #734.
+part is built with `Sqe::chain_send`, `Sqe::chain_send_msg` or `Sqe::chain_send_msg_zc`,
+and `push_sqe_chain` debug-asserts it, because a chain part with `MSG_DONTWAIT` restores
+#734.
 
 ## Tests
 
@@ -244,8 +247,9 @@ debug-asserts it, because a chain part with `MSG_DONTWAIT` restores #734.
   `Ring::submit_send_msg_zc`, the resubmit: `MSG_WAITALL` there passes every test.
   Under a small `RLIMIT_MEMLOCK` a guard send takes `-ENOMEM` and continues as plain
   sends. The test fails on `-ENOMEM` under a limit of at least 64 MiB.
-- A half-closed peer reading 64 MiB finishes within a limit the 1 s timer cannot meet.
-- A Unix peer's `SHUT_RD` fails the send within the timer's interval.
+- A half-closed peer reading 64 MiB finishes within a limit the 1 s backstop cannot meet.
+- A Unix peer's `SHUT_RD` fails the send within the backstop's interval, with a
+  1 ms tick and with none.
 - A close with a multishot poll armed: the peer sees EOF, and the socket leaves
   `/proc/net/tcp`. Unit tests check the cancel, including with no close lead.
 - A control: a chain with a part waiting on a half-closed peer holds a thread.

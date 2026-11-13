@@ -90,13 +90,12 @@ impl AsyncEventHandler for SlowBlocking {
     }
 }
 
-/// Whether a blocking-pool thread is alive. The kernel truncates thread names
-/// to 15 bytes, so `ringline-blocking-0` reads back as `ringline-blocki`.
+/// Whether a blocking-pool thread is alive.
 fn blocking_thread_alive() -> bool {
     std::fs::read_dir("/proc/self/task")
         .expect("read /proc/self/task")
         .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
-        .any(|name| name.trim_end().starts_with("ringline-blocki"))
+        .any(|name| name.trim_end().starts_with("rl-blok-"))
 }
 
 /// Waits until `flag` is set or `limit` has passed.

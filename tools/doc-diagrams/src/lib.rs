@@ -21,13 +21,28 @@ const CLAIMS: &[Claim] = &[
     },
     Claim {
         path: "ringline/src/worker.rs",
-        needle: ".name(format!(\"ringline-worker-{worker_id}\"))",
+        needle: ".name(format!(\"rl-work-{worker_id}\"))",
         meaning: "literal worker thread name",
     },
     Claim {
         path: "ringline/src/worker.rs",
-        needle: ".name(format!(\"ringline-acceptor-{idx}\"))",
+        needle: ".name(format!(\"rl-acpt-{idx}\"))",
         meaning: "literal acceptor thread name",
+    },
+    Claim {
+        path: "ringline/src/resolver.rs",
+        needle: ".name(format!(\"rl-rslv-{i}\"))",
+        meaning: "literal resolver thread name",
+    },
+    Claim {
+        path: "ringline/src/spawner.rs",
+        needle: ".name(format!(\"rl-spwn-{i}\"))",
+        meaning: "literal spawner thread name",
+    },
+    Claim {
+        path: "ringline/src/blocking.rs",
+        needle: ".name(format!(\"rl-blok-{i}\"))",
+        meaning: "literal blocking thread name",
     },
     Claim {
         path: "ringline/src/worker.rs",
@@ -121,12 +136,12 @@ const CLAIMS: &[Claim] = &[
     },
     Claim {
         path: "ringline/src/disk_io_pool.rs",
-        needle: ".name(format!(\"ringline-disk-io-{i}\"))",
+        needle: ".name(format!(\"rl-disk-{worker_index}-{i}\"))",
         meaning: "literal Mio disk I/O thread name",
     },
     Claim {
         path: "ringline/src/disk_io_pool.rs",
-        needle: "req.wake_handle.wake()",
+        needle: "wake_coalesced(&req.wake_pending, &req.wake_handle)",
         meaning: "Mio disk I/O response wake",
     },
     Claim {
@@ -212,7 +227,7 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     require_order(
         &worker,
         "create_listener(*addr)",
-        ".name(format!(\"ringline-acceptor-{idx}\"))",
+        ".name(format!(\"rl-acpt-{idx}\"))",
         "each listener is bound before its acceptor thread starts",
     )?;
     // `create_listener` binds but does not listen; the gate owns `listen(2)`,
@@ -221,7 +236,7 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     require_order(
         &worker,
         "listen_gates.register(idx as u32, Arc::clone(&sockets))",
-        ".name(format!(\"ringline-acceptor-{idx}\"))",
+        ".name(format!(\"rl-acpt-{idx}\"))",
         "a listener's sockets are registered with its gate before its acceptor starts",
     )?;
 
@@ -274,7 +289,8 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
         "Mio drains disk I/O responses in the worker loop",
     )?;
     // Both ring-entry branches must precede the drain, and both must carry
-    // GETEVENTS: `submit_and_wait(1)` when the loop blocks, and
+    // GETEVENTS: `submit_and_wait(1)` (or `submit_and_wait_timeout`, which
+    // the matched branch sits beside) when the loop blocks, and
     // `submit_and_get_events()` when it declines to because a task is
     // runnable. A plain `submit_and_wait(0)` here would set no GETEVENTS and,
     // under DEFER_TASKRUN, strand task_work indefinitely.
@@ -619,16 +635,7 @@ fn render_runtime() -> String {
     arrow(&mut svg, 530, 170, 610, 140, "spawn");
     arrow(&mut svg, 735, 175, 735, 205, "all ready");
 
-    box_(
-        &mut svg,
-        935,
-        205,
-        260,
-        70,
-        "ringline-acceptor",
-        "#F2F2F2",
-        true,
-    );
+    box_(&mut svg, 935, 205, 260, 70, "rl-acpt-i", "#F2F2F2", true);
     arrow(&mut svg, 860, 240, 935, 240, "listener fd");
     external_box(&mut svg, 935, 105, 260, 60, "network peers");
     arrow(&mut svg, 1065, 165, 1065, 205, "TCP bytes");
@@ -636,16 +643,7 @@ fn render_runtime() -> String {
     queue(&mut svg, 930, 345, 270, 62, "bounded fd queue + wake");
     arrow(&mut svg, 1065, 275, 1065, 345, "send + wake");
 
-    group_box(
-        &mut svg,
-        540,
-        470,
-        660,
-        190,
-        "ringline-worker-i",
-        "#F2F2F2",
-        true,
-    );
+    group_box(&mut svg, 540, 470, 660, 190, "rl-work-i", "#F2F2F2", true);
     box_(
         &mut svg,
         575,
@@ -681,10 +679,10 @@ fn render_runtime() -> String {
         "#F2F2F2",
         false,
     );
-    text(&mut svg, 90, 520, "ringline-resolver-i", 17, true);
-    text(&mut svg, 90, 555, "ringline-spawner-i", 17, true);
-    text(&mut svg, 90, 590, "ringline-blocking-i", 17, true);
-    text(&mut svg, 90, 625, "ringline-disk-io-i (Mio)", 17, true);
+    text(&mut svg, 90, 520, "rl-rslv-i", 17, true);
+    text(&mut svg, 90, 555, "rl-spwn-i", 17, true);
+    text(&mut svg, 90, 590, "rl-blok-i", 17, true);
+    text(&mut svg, 90, 625, "rl-disk-w-i (Mio)", 17, true);
     arrow(&mut svg, 450, 565, 540, 565, "response queue + wake");
 
     text(
@@ -1029,8 +1027,8 @@ mod tests {
         let second = render_all(&root).unwrap();
         assert_eq!(first.runtime, second.runtime);
         assert_eq!(first.request_flow, second.request_flow);
-        assert!(first.runtime.contains("ringline-acceptor"));
-        assert!(first.runtime.contains("ringline-worker-i"));
+        assert!(first.runtime.contains("rl-acpt-i"));
+        assert!(first.runtime.contains("rl-work-i"));
         assert!(first.request_flow.contains("submit_and_wait"));
         assert!(first.request_flow.contains("on_accept"));
         assert_eq!(first.runtime.matches("<svg").count(), 1);
@@ -1161,7 +1159,7 @@ mod tests {
     fn nested_layers_separate_parent_labels_and_contain_children() {
         let runtime = render_runtime();
         for expected in [
-            "x=\"870\" y=\"452\" text-anchor=\"middle\" data-role=\"group-label\" font-family=\"monospace\" font-size=\"17\" fill=\"#222\">ringline-worker-i",
+            "x=\"870\" y=\"452\" text-anchor=\"middle\" data-role=\"group-label\" font-family=\"monospace\" font-size=\"17\" fill=\"#222\">rl-work-i",
             "x=\"255\" y=\"452\" text-anchor=\"middle\" data-role=\"group-label\" font-family=\"sans-serif\" font-size=\"17\" fill=\"#222\">optional auxiliary pools",
         ] {
             assert!(

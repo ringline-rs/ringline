@@ -47,15 +47,18 @@ entry point; `on_tick` is a synchronous callback inside the worker loop.
    worker. The channel carries `(RawFd, SocketAddr)`.
 3. Start configured resolver, process-spawner, and blocking pools. Mio can also
    create per-worker disk-I/O pools.
-4. Spawn `ringline-worker-{worker_id}` threads. Each optionally pins itself to a
+4. Spawn `rl-work-{worker_id}` threads. Each optionally pins itself to a
    CPU, creates its handler, `Driver`, and `Executor`, calls `prepare_run`, and
    reports startup success or failure to the launching thread.
 5. Wait for every worker to finish fallible preparation. Only then create the
-   TCP or Unix listener and spawn the `ringline-acceptor` thread.
+   TCP or Unix listener and spawn its `rl-acpt-{listener_index}` thread.
 
-The auxiliary thread names are `ringline-resolver-{i}`,
-`ringline-spawner-{i}`, `ringline-blocking-{i}`, and, on Mio,
-`ringline-disk-io-{i}`.
+The auxiliary thread names are `rl-rslv-{i}` (resolver), `rl-spwn-{i}`
+(process spawner), `rl-blok-{i}` (blocking pool), and, on Mio,
+`rl-disk-{worker_index}-{i}`, since each worker has its own disk-I/O pool.
+Linux keeps the first 15 bytes of a thread name. A name with one index fits
+up to a 7-digit index; a disk-I/O name fits while its two indexes have 6
+digits between them.
 
 ![Runtime topology](diagrams/runtime.svg)
 
@@ -135,7 +138,7 @@ task-waker scheme are shared. The I/O mechanisms are not:
 | File descriptors | Fixed-file table for connections | Registered ordinary sockets |
 | Sends | Copy pool plus guarded `SendMsgZc` scatter/gather | Owned/copy pending-send buffers |
 | Send retry | CQE handling, retry lists, and drain sends after `EAGAIN` | Writable readiness and dirty lists |
-| Timers | Timeout SQEs and completion generations | Deadline min-heap |
+| Timers | Deadline min-heap; the earliest deadline bounds `io_uring_enter` | Deadline min-heap; the earliest deadline bounds `epoll_wait` |
 | File/direct I/O | Submitted through the ring | Dedicated disk-I/O pool |
 | NVMe and registered regions | Supported | Unsupported |
 
@@ -322,8 +325,10 @@ the other workers keep serving. A worker is not replaced. Under
 `run_shutdown` panics, the worker drops its ring and leaks the heap memory its
 event loop owns, which the kernel can still be using.
 
-Fatal accept errors stop the acceptor, while `EINTR`, `EAGAIN` and aborted connections retry and descriptor exhaustion
-backs off briefly.
+The acceptor stops only on `EBADF`, `ENOTSOCK` or `EINVAL` outside shutdown, writing the error to
+stderr and counting `acceptor_stopped`. Errors that end one pending connection retry at once.
+`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` and errors it does not classify wait 10 ms and count
+`accept_error_backoff`.
 
 ## Architectural invariants
 

@@ -176,6 +176,15 @@ impl Ring {
         self.engine.submit_and_wait(min_complete)
     }
 
+    /// See [`Engine::submit_and_wait_timeout`].
+    pub fn submit_and_wait_timeout(
+        &self,
+        min_complete: u32,
+        timeout: std::time::Duration,
+    ) -> io::Result<()> {
+        self.engine.submit_and_wait_timeout(min_complete, timeout)
+    }
+
     /// See [`Engine::submit_and_get_events`].
     pub fn submit_and_get_events(&self) -> io::Result<()> {
         self.engine.submit_and_get_events()
@@ -369,6 +378,19 @@ impl Ring {
         Ok(())
     }
 
+    /// Submit a plain `sendmsg` of slab entry `slab_idx`, tagged `SendMsgZc`
+    /// like the zero-copy form, for an entry marked `plain_msg` (#829).
+    pub fn submit_send_msg(
+        &mut self,
+        conn_index: u32,
+        msg: *const libc::msghdr,
+        slab_idx: u16,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::SendMsgZc, conn_index, slab_idx as u32);
+        let entry = Sqe::send_msg(conn_index, msg, user_data.raw());
+        unsafe { self.push_sqe(&entry) }
+    }
+
     /// Submit a SendMsgZc operation.
     /// The slab index is stored in the payload for lookup on CQE.
     pub fn submit_send_msg_zc(
@@ -496,9 +518,16 @@ impl Ring {
     }
 
     /// Submit the `Close` of a connection's fixed (direct) descriptor,
-    /// hard-linked behind `lead` unless it is `Nothing`.
-    pub fn submit_close(&mut self, conn_index: u32, lead: CloseLead) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::Close, conn_index, 0);
+    /// hard-linked behind `lead` unless it is `Nothing`. The payload carries
+    /// the connection's generation, which `handle_close` checks against the
+    /// slot's.
+    pub fn submit_close(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        lead: CloseLead,
+    ) -> io::Result<()> {
+        let user_data = UserData::encode(OpTag::Close, conn_index, generation);
         let close = Sqe::new(
             Op::Close {
                 fd: sqe::Fd::Fixed(conn_index),
@@ -559,7 +588,7 @@ impl Ring {
 
     /// Submit an async connect for a direct file descriptor. The payload
     /// carries the connection's generation, which `handle_connect` checks
-    /// against the slot's, and the cancel from `handle_timeout` names.
+    /// against the slot's, and the cancel from `check_connect_deadlines` names.
     pub fn submit_connect(
         &mut self,
         conn_index: u32,
@@ -573,46 +602,6 @@ impl Ring {
                 fd: sqe::Fd::Fixed(conn_index),
                 addr,
                 addrlen,
-            },
-            user_data.raw(),
-        );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
-    }
-
-    /// Submit a timeout SQE. The timespec must remain valid until the CQE arrives.
-    pub fn submit_timeout(
-        &mut self,
-        timespec: *const crate::backend::uring::abi::Timespec,
-        user_data: UserData,
-    ) -> io::Result<()> {
-        let entry = Sqe::new(
-            Op::Timeout {
-                ts: timespec,
-                abs: false,
-            },
-            user_data.raw(),
-        );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
-    }
-
-    /// Submit an absolute timeout SQE. The timespec contains absolute
-    /// `CLOCK_MONOTONIC` seconds/nanoseconds. The timespec must remain valid
-    /// until the CQE arrives.
-    pub fn submit_timeout_abs(
-        &mut self,
-        timespec: *const crate::backend::uring::abi::Timespec,
-        user_data: UserData,
-    ) -> io::Result<()> {
-        let entry = Sqe::new(
-            Op::Timeout {
-                ts: timespec,
-                abs: true,
             },
             user_data.raw(),
         );
@@ -849,21 +838,6 @@ impl Ring {
         unsafe { self.push_sqe(&entry) }
     }
 
-    /// Submit a timeout SQE that fires after the given duration.
-    /// Produces a CQE with the given user_data when it fires (-ETIME)
-    /// or is cancelled (-ECANCELED).
-    pub fn submit_tick_timeout(
-        &mut self,
-        ts: *const crate::backend::uring::abi::Timespec,
-        user_data: u64,
-    ) -> io::Result<()> {
-        let entry = Sqe::new(Op::Timeout { ts, abs: false }, user_data);
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
-        Ok(())
-    }
-
     /// Push an operation to the submission queue.
     ///
     /// # Safety
@@ -900,7 +874,7 @@ impl Ring {
         debug_assert!(
             entries.iter().all(|entry| match entry.op {
                 Op::Send { flags, .. } => flags == crate::completion::CHAIN_SEND_FLAGS,
-                Op::SendMsgZc { flags, .. } => {
+                Op::SendMsg { flags, .. } | Op::SendMsgZc { flags, .. } => {
                     flags == crate::completion::CHAIN_SEND_FLAGS as u32
                 }
                 _ => true,
@@ -1066,7 +1040,8 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a statx via io_uring.
+    /// Submit a statx via io_uring. With `nofollow`, a final symbolic link in
+    /// `pathname` is not followed.
     ///
     /// # Safety
     /// `pathname` must point to a valid null-terminated C string and `statxbuf`
@@ -1075,6 +1050,7 @@ impl Ring {
         &mut self,
         pathname: *const libc::c_char,
         statxbuf: *mut libc::statx,
+        nofollow: bool,
         ud: u64,
     ) -> io::Result<()> {
         // STATX_BASIC_STATS = 0x7ff
@@ -1082,6 +1058,7 @@ impl Ring {
             Op::Statx {
                 path: pathname,
                 buf: statxbuf,
+                nofollow,
             },
             ud,
         );

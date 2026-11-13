@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- On io_uring, when `RLIMIT_MEMLOCK`'s hard limit is too low for the
+  workers' rings and `cq_entries` was left at its default, launch fits the
+  rings to the limit instead of failing with `Error::ResourceLimit`. It halves
+  `cq_entries` until the rings fit, down to 1024, and lowers `sq_entries` and
+  `max_connections` left at their defaults in proportion (`cq / 16` and
+  `cq * 16000 / 65536`), and writes one line to stderr naming the sizes. At
+  the 8 MiB systemd sets by default, four workers run at 32768 CQ entries,
+  2048 SQ entries and 8000 connections each, where the defaults need about
+  10 MiB. Sizes set on the builder are kept: a `cq_entries` set there is
+  never lowered, and a `max_connections` or `sq_entries` the fitted CQ could
+  not hold ends the fit, which fails as before. `Runtime::max_connections`,
+  `Runtime::sq_entries` and `Runtime::cq_entries` report each worker's sizes.
+- io_uring: three `ringline/ring` counters for completion queue overflow
+  (#831): `cq_overflow`, reaps that found completions waiting in the kernel's
+  overflow list; `cqe_dropped`, completions the kernel dropped, from its own
+  count; and `cqe_dropped_reported`, enters that returned `EBADR`.
+- `fs::symlink_metadata`, which returns the metadata of a symbolic link
+  itself (`lstat`; on io_uring a statx with `AT_SYMLINK_NOFOLLOW`).
+  `fs::stat` follows the link, as before, so `Metadata::is_symlink` from it is
+  always false; `symlink_metadata` is the only way to get `true`. The fields
+  of `Metadata` are now documented (#863).
+- `ConfigBuilder::tls_handshake_timeout`, default 10 s, greater than zero and
+  at most 60 s. A TLS connection whose handshake has not completed within it
+  is closed: inbound, from its worker registering it; outbound, from the TCP
+  connect completing, and the `connect(..).tls(..)` resolves `TimedOut`.
+  Before, an inbound TLS connection whose peer sent nothing, or sent a
+  warning-level close_notify before TLS 1.3 was negotiated, held its slot
+  until the worker exited, because no task holds it before its handshake
+  completes. An outbound `connect(..).tls(..)` to such a peer did not
+  resolve. `metrics::conn::TLS_HANDSHAKE_TIMEOUT` (11,
+  `op=tls_handshake_timeout` on `ringline/connections`) counts the closes.
+  On io_uring the earliest handshake deadline bounds the worker's wait for
+  I/O, so it is checked on time whatever `tick_timeout_us` is (#838).
+  Send and recv paradigms audit L18
+  (`docs/journal/2026-11-send-recv-paradigms-audit.md`).
 - `ConfigBuilder::defer_recv_arm`, off by default. On io_uring, a plaintext
   connection's reader that parks has its receive armed after the worker's next
   wait, not in the same submission as the sends queued before it parked, so the
@@ -272,6 +307,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- io_uring: the default `tick_timeout_us` is 10,000 (10 ms) instead of
+  1,000. Timers and TLS handshake and close deadlines have their own
+  wake-ups since #838. The tick still sets how often an idle worker calls
+  `on_tick`, how often a worker publishes its connection count for merged
+  accept mode's placement and parking, and, on an idle worker, how long a
+  retry after a full submission queue or a full peer channel waits: one
+  tick for most, four for a Close or `shutdown`, and 64 for a park drain.
+  An idle worker used 3.5% of a core at 1 ms and 0.5% at 10 ms (one pinned
+  worker, Linux 6.12 VM, 5 runs). A handler that uses `on_tick` as a 1 ms
+  periodic callback on io_uring sets `tick_timeout_us(1000)`. The setting
+  has no effect on mio, whose wait is at most 10 ms.
+- io_uring: the connect timeout and the send backstop no longer use the ring
+  either (#838), so the worker submits no timeout of any kind. A connect
+  timeout is a deadline in a per-worker heap that bounds the wait for I/O,
+  as a timer's does; when it passes, the worker cancels the connect and it
+  resolves `TimedOut`, as before. A connect that completes before its
+  deadline pushes nothing, where it pushed an `ASYNC_CANCEL` of its Timeout
+  SQE. A connect with a timeout whose Connect is cancelled by something
+  other than the timeout now resolves `ECANCELED`; before, that completion
+  was ignored. The send backstop's next run, one second after a send starts
+  waiting for room and every second while one waits, is a deadline that
+  bounds the wait too. A connect cancel the submission queue has no room for
+  is retried on the next iteration.
+- io_uring: timers and the loop tick no longer use the ring (#838). A
+  `sleep`, `timeout` or related timer records its deadline in a per-worker
+  min-heap, the one the mio backend already used, and the worker passes the
+  earliest of the next tick, the earliest timer and the earliest TLS
+  handshake or close deadline to `io_uring_enter` as its wait timeout
+  (`IORING_ENTER_EXT_ARG`, Linux 5.11). A timer costs no SQE and no CQE, and a
+  `timeout` whose future wins pushes no `ASYNC_CANCEL`. That cancel was the
+  expensive part: the kernel finds a timeout to cancel by walking its list of
+  pending timeouts. With one pinned worker on a Linux 6.12 VM (5 runs a
+  side, interleaved with the build before this change, medians), a
+  `timeout(60 s, yield_now())` took 1.44 µs of CPU before and 306 ns after
+  with no other timer pending, 6.43 µs and 332 ns with 1,000, 105 µs and
+  355 ns with 16,000, and 386 µs and 361 ns with 60,000. 64 tasks looping
+  `sleep(100 µs)` take 627 ns of CPU per sleep instead of 980, and complete
+  467,000 sleeps a second instead of 429,000. An idle worker uses the same
+  CPU as before at a 1 ms, 10 ms and 100 ms tick. One task looping
+  `sleep(100 µs)` at the 1 ms tick completes 7,349 sleeps a second instead
+  of 7,795 (136 µs per sleep instead of 128), and uses 36.5 µs of CPU per
+  sleep instead of 27.6. The cause is not known. That difference depends on
+  the tick: with no tick, the two builds complete the same number of 100 µs
+  sleeps (7,287 and 7,278 a second, 5 interleaved runs a side) with the same
+  median overshoot of 34 µs; with a 100 ms tick the build before this change
+  was 3 µs per sleep faster at 100 µs; at 200 µs and 500 µs the run ranges
+  overlap. This build takes about the same time per sleep at every tick. A
+  timer fires at its own deadline whatever `tick_timeout_us` is, including
+  0, and the kernel applies no timer slack to the wait. A wait passed to the
+  kernel is at most an hour long: the kernel adds it to the current time
+  without saturating, so a wait longer than about 292 years would wrap;
+  capping at an hour keeps it in range. `on_tick` still runs on every loop
+  iteration, and an idle worker still wakes every `tick_timeout_us`. The
+  deadline heap drops the entries of released timers once it holds twice the
+  entries it kept at its last compaction, so a loop of `timeout`s whose
+  futures win no longer grows it on either backend. The worker's exit drain
+  waits with the same timed wait.
+
+- io_uring: the CQ is sized by the new `ConfigBuilder::cq_entries`, default
+  65536, the largest Linux allows, instead of 4 × `sq_entries`; and the
+  default `sq_entries` is 4096 instead of 256. A large CQ keeps completions
+  out of the kernel's overflow list, where an allocation failure drops them
+  (#831). The default rings take about 2.5 MiB per worker, against about
+  70 KiB before. From Linux 6.14 the kernel charges that to `RLIMIT_MEMLOCK`,
+  summed over every process of the user: four workers' defaults exceed an
+  8 MiB hard limit, such as systemd's default, and launch then fails with
+  `Error::ResourceLimit` naming the `ulimit` to run (it raises the soft
+  limit when the hard limit allows). Before Linux 6.10 the CQ and its header
+  are one physically contiguous 4 MiB block per worker, which can fail with
+  `ENOMEM` on fragmented memory; 32768 entries fit in 2 MiB. Lower
+  `cq_entries`, raise the limit, or run with `CAP_IPC_LOCK`. With the larger
+  SQ, the io-wq pool's bound, `min(sq_entries, 4 × online CPUs)`, is 4 × the
+  CPU count on hosts with more than 64 CPUs, where it was 256.
+- Thread names are short enough that Linux keeps them whole: `rl-work-N`
+  (worker), `rl-acpt-N` (acceptor, numbered by listener), `rl-rslv-N`
+  (resolver), `rl-spwn-N` (process spawner), `rl-blok-N` (blocking pool) and,
+  on mio, `rl-disk-W-T` (disk I/O thread T of worker W). Linux keeps 15 bytes
+  of a thread name, so `ps`, `top` and `/proc/*/task/*/comm` showed the old
+  names as `ringline-worker`, `ringline-accept`, `ringline-resolv`,
+  `ringline-spawne`, `ringline-blocki` and `ringline-disk-i`, with no index.
+  Tooling that matches on those prefixes needs the new ones.
+- mio: a burst of disk-I/O completions writes the worker's wake pipe once
+  instead of once per completion, and the event loop reuses one events
+  `Vec` instead of allocating one per iteration. A serial `fs::read_into`
+  makes one allocation per operation instead of two. Finding P1 of
+  `docs/journal/2026-11-file-io-audit.md` (#875).
+- On io_uring `fs::stat` no longer allocates a `libc::statx` per call: the
+  buffer lives in the command slab entry, which costs each worker 256 bytes
+  per `max_commands_in_flight` slot (64 KiB at the default of 256). On both
+  backends the executor keeps one map of disk-I/O operations, with a cheaper
+  hash for its 32-bit keys, in place of five. Finding P2 of
+  `docs/journal/2026-11-file-io-audit.md` (#876).
 - **Breaking:** a peer's FIN or close_notify finishes the read half and
   closes nothing. Before, every read EOF requested a close, deferred behind
   queued sends and one poll of the task, and the task was then dropped
@@ -294,9 +421,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   their pools reconnect a slot whose server closed, as before. On TLS, a
   send after the peer's close_notify is encrypted and sent, including one
   whose encrypt deframes the alert; the task's return then sends this side's
-  close_notify and the FIN. Connection-close audit L1, #809
-  (`docs/half-close-design.md`,
+  close_notify and the FIN. A FIN before the TLS handshake completes still
+  closes the connection, because no task holds it yet, and an outbound
+  `connect(..).tls(..)` then resolves `UnexpectedEof` (#849). Connection-close
+  audit L1, #809 (`docs/half-close-design.md`,
   `docs/journal/2026-11-connection-close-audit.md`).
+
+- A TLS connection closed before its handshake completes (by the peer's FIN,
+  a TLS error or `tls_handshake_timeout`) waits at most 5 s for its queued
+  sends, the rest of the handshake flight and any alert, and is then closed
+  without them. Before, the wait had no bound, so a peer that sent a
+  ClientHello and stopped reading held the slot, on both backends, whenever
+  the server's flight was larger than the peer's receive window and the
+  server's send buffer together; on loopback a 2 MB flight did, a 0.5 MB one
+  did not. A peer that reads the flight within the 5 s still receives it and
+  the alert. On io_uring the earliest close deadline bounds the worker's
+  wait for I/O, so it is checked on time even when nothing else wakes the
+  worker (#838). Send and recv paradigms audit PL10
+  (`docs/journal/2026-11-send-recv-paradigms-audit.md`).
 
 - `with_data_result` reports a TLS record the engine cannot process (a bad
   record, a failed decrypt) as `Err(InvalidData)`, with rustls' error as the
@@ -322,8 +464,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `UdpSocket` half, a `fs::File`. Code that relied on
   `H: AsyncEventHandler` implying `H: Send` must add the bound itself.
 - **Breaking:** `fs::File`, `direct_io::DirectIoFile` and `nvme::NvmeDevice`
-  are no longer `Send`, and neither are `DirectIoCompletion` and
-  `NvmeCompletion`, which hold them. Each handle is a slot in the table of the
+  are no longer `Send`. Each handle is a slot in the table of the
   worker that opened it. Used on another worker it named that worker's slot:
   a write through a `File` opened on worker 0 and used on worker 1 succeeded
   and landed in worker 1's file. Use a handle on the worker that opened it, or
@@ -822,6 +963,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- The `timer`, `tick_timeout`, `deadline`, `timeout` and `send_backstop`
+  values of the `op` label on `ringline/cqe_by_tag`: those completions no
+  longer exist (#838).
+
+- **Breaking:** `DirectIoCompletion`, `NvmeCompletion` and `DirectIoOp` are
+  no longer public. Nothing constructed the two completion types, and their
+  docs described a completion handler that never existed; the results they
+  were to carry reach callers through the futures of `direct_io_read`,
+  `direct_io_write`, `direct_io_fsync`, `nvme_read`, `nvme_write` and
+  `nvme_flush`, and a failed NVMe command's status word through `NvmeStatus`
+  (#871).
 - **Breaking:** `DriverCtx` is no longer public, and `on_tick` and `on_notify`
   take no argument. The free functions work inside them:
   `ringline::request_shutdown`, `open_direct_io_file`, `open_nvme_device` and
@@ -962,6 +1114,182 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Timers (#836, items 1 and 2):
+  - A sleep or deadline too far out for the clock is never reached instead
+    of failing. On io_uring, a `Duration` with more than `i64::MAX` seconds
+    made a negative `tv_sec`, which the kernel refused with `EINVAL`, and the
+    sleep stayed pending without an error. On mio, `sleep(Duration::MAX)`
+    panicked adding it to an `Instant`, and `Deadline::after(Duration::MAX)`
+    overflowed on both backends.
+  - io_uring: a timeout that completed with an error instead of expiring
+    (`-ETIME`) or being cancelled (`-ECANCELED`) was taken as a cancel and
+    the sleep waited forever; and a sleep dropped while its timeout was in
+    flight, whose cancel could not be pushed, freed its slot at once, so
+    once the slot's 16-bit generation had wrapped the old timeout could wake
+    the slot's new occupant early. Timers no longer use timeout SQEs (#838),
+    so neither can happen.
+- io_uring: dropping a `Child::wait` future before the child exits cancels
+  its pidfd poll. Before, the poll stayed armed until the child exited, so a
+  loop that raced `wait` against a timer added one armed poll per iteration,
+  each holding the pidfd's file. `Child::wait` also registers its waiter only
+  after the poll is pushed; a failed push left the entry behind (#833).
+- `ConfigBuilder::build` refuses queue sizes Linux refuses: `sq_entries`
+  above 32768, `cq_entries` above 65536, and `cq_entries` below
+  `sq_entries`. Before, the CQ was 4 × `sq_entries`, so `sq_entries(32768)`
+  passed validation and then failed every worker's `io_uring_setup` with
+  `EINVAL`, reported as a kernel too old for ringline's setup flags. The
+  check applies on the mio backend too, which does not use the queue sizes,
+  so a `force-mio` build that set larger values is now refused (#835, #831).
+- io_uring: an `io_uring_enter` that returns `EBADR` no longer ends the
+  worker and every connection on it. `EBADR` is the kernel's report that it
+  dropped completions it could not queue in its overflow list. The worker
+  carries on and counts it; the operations whose completions were dropped
+  never complete (#831).
+- io_uring: a full submission queue no longer makes a `sleep`, `sleep_until`,
+  `try_sleep` or `try_sleep_until` fail. Before, `sleep` and `sleep_until`
+  panicked with `timer SQE submission failed` when the timeout SQE could not
+  be pushed, and `try_sleep` and `try_sleep_until` freed the slot and left
+  the first poll to allocate and push again, which panicked on an exhausted
+  pool or a second failed push. The same held for `timeout`, `timeout_at`,
+  `try_timeout` and `try_timeout_at` (#832). Timers no longer push an SQE
+  (#838).
+- io_uring: a connection's `Close` SQE carries the connection's generation,
+  and `handle_close` acts on its CQE only when that matches the slot's, before
+  touching any of the slot's state. The check added in #892 compared the
+  generation with a payload of 0 and ran after the waiting send, TLS state and
+  counters were already released, so a connection on a slot that had been
+  used before was never torn down: its task was not dropped, the slot stayed
+  taken, and the timer slots and pidfds its futures held were not freed.
+- mio with the `tls-buffered` feature: one rustls `write_tls` call writes at
+  most 64 records, and the mio paths called it once where more could be
+  pending; the rest stayed in rustls until the next receive or send. A flush
+  of TLS output after a handshake flight of more records than that (about
+  1 MB) delivered only part of it to a reading peer, and not the alert a TLS
+  error queued behind it. A send with records small enough that one rustls
+  write made more than 64 (`max_fragment_size` below about 1 KiB) returned
+  part of its ciphertext, and the peer waited for the rest. Both now drain
+  rustls' output, as the io_uring paths do. Found by
+  `tls_close_before_handshake.rs` (#886).
+- Docs: the `max_commands_in_flight` docs of `FsConfig`, `DirectIoConfig`
+  and `NvmeConfig` say that on io_uring each command slot has 16,384
+  operation keys; that a future neither polled to completion nor dropped
+  keeps its key, as does one dropped on a thread other than the worker that
+  created it; and that in a serial workload 16,384 such futures make every
+  later operation fail while other slots are free. Finding P4 of
+  `docs/journal/2026-11-file-io-audit.md` (#878).
+- mio: `ConfigBuilder::build` refuses `disk_io_threads(0)` while `fs` (on
+  by default) or `direct_io` is set, naming `no_fs()` (fs) or `direct_io`
+  (direct I/O). Before, the config built and every file operation failed at
+  its first call with an `Other` error naming the pool, where the
+  `disk_io_threads` doc said `Unsupported`; `open_direct_io_file` succeeded
+  and its operations failed. On io_uring the value is accepted and unused,
+  as before. Finding F6 of `docs/journal/2026-11-file-io-audit.md` (#870).
+- io_uring NVMe: a command the device fails resolves to an `io::Error` of
+  kind `Other` whose inner error (`get_ref()`, `into_inner()`) is the new
+  `NvmeStatus`, the completion's status word (`word()`, `code_type()`,
+  `code()`). Before, every status word became `EIO`, so a media error and an
+  invalid field read the same. A transport failure still resolves to the
+  errno's `io::Error`. Finding F7 of `docs/journal/2026-11-file-io-audit.md`
+  (#871).
+- Docs: the file I/O docs state the current behaviour: the `# Safety` sections
+  of `fs::read`, `fs::write`, `direct_io_read`, `direct_io_write`, `nvme_read`
+  and `nvme_write` say the buffer must outlive the operation, which a dropped
+  future gives no way to observe (#825); the futures say what a drop off the
+  owning worker leaks; `DiskIoFuture` says what it resolves to per operation;
+  the fs module doc says operations on one file are independent and what
+  `fsync` covers; the direct I/O and NVMe docs cover the mio backend and the
+  opens that run on the worker thread; `ConfigBuilder::fs`, `direct_io` and
+  `nvme` say what each reserves per worker; and the `NvmeUringCmd` builders
+  document their panic. Findings F9 and F10 of
+  `docs/journal/2026-11-file-io-audit.md` (#873, #874), and the documentation
+  part of P3 (#877).
+- `fs::OpenFlags` documents each flag and that `READ | WRITE` is `WRITE`
+  (the access modes are the `open(2)` values, not bits), with a doctest;
+  the type is now `PartialEq` and `Eq`. `fs::open` documents its `mode`.
+  Finding F8 of `docs/journal/2026-11-file-io-audit.md` (#872).
+- `open_direct_io_file` and `open_direct_io_file_with` (both backends) and
+  `open_nvme_device` (io_uring) with a path containing a NUL byte return their
+  error without holding a slot of the file table. Before, each such call left
+  a slot allocated until the worker exited, so later opens failed with
+  `direct I/O file table full` or `NVMe device table full` (#861).
+- The slot generation of `fs::File`, `DirectIoFile` and `NvmeDevice` handles
+  is 32 bits, up from 16, and the handles grow from 4 to 8 bytes. A handle
+  kept after its close matched the slot's new file again after 65,536 releases
+  of the slot (a close, an open that failed, or an open whose future was
+  dropped; 32,768 on io_uring when each close waited for an operation in
+  flight), and an operation or close through it acted on that file. That now
+  takes 2^32 releases (2^31 when each close waited) (#862).
+- mio: `FsConfig::max_commands_in_flight` and
+  `DirectIoConfig::max_commands_in_flight` bound the operations a worker has
+  in its disk-I/O pool, as they bound the command slabs on io_uring. An
+  operation submitted at the bound fails with the io_uring backend's error,
+  `filesystem command slab exhausted` or `direct I/O command slab exhausted`,
+  until one completes. Before, mio queued every operation on an unbounded
+  channel. A path operation of `fs` (`stat`, `symlink_metadata`, `rename`,
+  `remove`, `mkdir`) on a runtime with fs off (`ConfigBuilder::no_fs`) now fails with
+  `filesystem I/O not configured`, as on io_uring; before, mio ran it when
+  direct I/O was on, and failed with `disk I/O pool not configured` when it
+  was off. The pool's threads are now named with their worker's index (see
+  the thread-name entry under Changed), and `ConfigBuilder::disk_io_threads`
+  says the count is per worker; each worker always had its own pool (#864).
+- io_uring: `fs::close` with a read, write or fsync on the file still in
+  flight leaves the file registered until the last of them completes. Before,
+  it unregistered the file at once, and an operation issued earlier in the
+  same task poll, not yet submitted to the kernel, failed with `EBADF`: a
+  write did not reach the file. The handle is refused as soon as `close`
+  returns, as before, but its file-table slot is free only once those
+  operations complete, so an `open` right after `close` on a full table
+  fails until then (#859).
+- mio: worker exit waits, within 10 s, for the raw-pointer reads and writes
+  (`fs::read`/`fs::write`, `direct_io_read`/`direct_io_write`) its disk-I/O
+  pool is running. Before, the worker dropped its tasks while a pool thread
+  could still read or write a task's buffer, and requests still queued for
+  the pool ran after the worker had gone. At worker exit, requests the pool
+  has not started are now answered `ECANCELED` without running. A worker
+  whose pool is still running such a read or write when the 10 s run out
+  leaks its event loop and tasks, as on io_uring, closes its sockets and
+  accept queue, and writes a line to stderr (#856).
+- io_uring: a guard part of a send on a Unix-domain connection is sent with
+  a plain `sendmsg`. Before, it went out as `SENDMSG_ZC`, which the kernel
+  refuses on a Unix socket with `EOPNOTSUPP`, and the send failed and closed
+  the connection. That covered a `send_parts` or `send_chain` part with a
+  guard, when the send totalled at least `send_zc_threshold` bytes or a
+  smaller one could not be gathered into a pool slot. The kernel copies the
+  guard's bytes into the socket, so the guard is released when the send
+  completes, with no notification to wait for (#829).
+- The acceptor thread no longer exits on an `accept` error that ends one
+  pending connection or clears when an fd or memory frees: `ENOBUFS`,
+  `ENOMEM`, the errors Linux's `accept4` passes through from the new socket
+  (`EPROTO`, `ENETDOWN`, `ENETUNREACH`, `EHOSTDOWN`, `EHOSTUNREACH`,
+  `ENONET`, `EOPNOTSUPP`, `ENOPROTOOPT`) and `ETIMEDOUT`.
+  Before, any of these ended the thread with nothing logged, and its listener
+  accepted nothing while the workers ran. It now stops only on `EBADF`,
+  `ENOTSOCK` or `EINVAL` outside shutdown, writing the error to stderr and
+  counting `acceptor_stopped`; `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` and
+  any errno it does not classify wait 10 ms, are counted as
+  `accept_error_backoff`, and accept again (#828).
+- io_uring: worker exit cancels file, direct I/O and NVMe operations in
+  flight and waits for them to end, within the same 10 s bound it gives
+  connections. Before, the drain ended once connections and sends were done,
+  and the worker then freed its tasks and driver while such an operation
+  could still be running: a read, a `statx` or an NVMe command could write
+  into memory the allocator had handed out again, and a write could send
+  freed memory to disk. An operation a cancel does not end, such as one
+  already running on io-wq, is waited for; a worker with one still running
+  when the bound runs out leaks its event loop and its tasks instead of
+  dropping them, and writes a line to stderr (#824). A worker that leaks its
+  event loop, here or after a panic in its exit drain, releases its
+  references to the blocking, resolver and spawner pools, so their threads
+  still exit.
+- On io_uring, `forward_recv_buf` (on `Connection` or `SendHalf`) could free
+  the bytes it was given while the calling `with_data`, `with_data_result` or
+  `try_with_data` closure still held the slice. It happened when the receive
+  buffer was a remainder left by an earlier `with_bytes` call, the slice was
+  the whole buffer, and the send copied it: a plaintext send below
+  `send_zc_threshold`, or any send on a TLS connection. A closure that read
+  the slice after the call read freed memory. The runtime now keeps the bytes
+  allocated until the closure returns. The zero-copy forward of the receive
+  buffer is in no release (#850).
 - io_uring: a worker that stops on an error or a panic, and whose exit drain
   then panics, closes the fds its multishot accept, or a park's install,
   delivered but it never handled. They are ordinary descriptors the kernel
@@ -1707,8 +2035,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - An `OpenFuture` dropped before it resolved, including one owned by a
   connection's task when the connection closed, left its file open and its
   slot in the file table taken, on both backends, until the worker exited;
-  enough of them filled the table. The file is now closed and the slot freed
-  (#551).
+  enough of them filled the table. The file is now closed and the slot freed,
+  unless the future is dropped on a thread other than the worker that
+  created it, which leaves both until that worker exits (#551).
 
 - On mio, files opened by `fs::open` and direct I/O files, and on io_uring,
   NVMe devices and direct I/O files before they enter the fixed-file table,

@@ -65,7 +65,7 @@ within 30 s of the call, so a stuck handler fails the test instead of hanging
 
 Ringline has two backends selected at **compile time** by the `has_io_uring` cfg, which `build.rs` emits only when: target is Linux AND the `force-mio` feature is off AND the host kernel is ≥ 6.1. There is no runtime backend selection (it would fight the `CURRENT_DRIVER` raw-pointer thread-local design).
 
-Within the io_uring backend, `has_io_uring` selects the driver and `uring_engine` (emitted alongside it) runs that driver on the kernel's io_uring through `UringEngine` (`ringline/src/backend/uring/engine/`). The driver builds an `Sqe` per operation and only the engine encodes it, so only `engine/uring.rs` (and tests) use the `io_uring` crate. `RINGLINE_STUB_ENGINE=1 cargo clippy -p ringline` builds the driver on `StubEngine` instead, which fails at setup; CI's `Clippy (stub engine)` job uses it to check that the driver does not use the crate.
+Within the io_uring backend, `has_io_uring` selects the driver and `uring_engine` (emitted alongside it) runs that driver on the kernel's io_uring through `UringEngine` (`ringline/src/backend/uring/engine/`). The driver builds an `Sqe` per operation and only the engine encodes it, so only `engine/uring.rs` (and tests) use the `io_uring` crate. `RINGLINE_STUB_ENGINE=1 cargo clippy -p ringline` builds the driver on `StubEngine` instead, which fails at setup; CI's `Clippy (stub engine)` job builds and lints the driver that way. The `io_uring` crate is still a dependency of that build, so no CI job checks that the driver does not use it; review does.
 
 The kernel check is a **build-host, compile-time** gate and is necessary but not sufficient. At **run time** the kernel must also permit io_uring: `kernel.io_uring_disabled` (6.6+) must be 0, or 1 with the process in `kernel.io_uring_group` (or holding `CAP_SYS_ADMIN`), and no seccomp profile may deny `io_uring_setup`. Otherwise every launch fails with `Error::RingSetup`, whose message names the cause. RHEL 10 / Rocky 10 ship `io_uring_disabled = 2` (refused for everyone, root included), so on that family only a `force-mio` build runs — verified on Rocky 10.2, kernel 6.12.0-211.el10 (#355).
 
@@ -126,6 +126,23 @@ Three things worth knowing wherever the uring tests run:
   their processes, still exceeds the limit after 5 s, `make_test_loop`
   aborts the binary with the setup message.
 
+  Since the default ring sizes rose to SQ 4096 and CQ 65536 (#901), each
+  worker's ring charges about 2.5 MiB (645 pages at 4 KiB; `ring_bytes` in
+  `memlock.rs`). CI lifts the limit before the io_uring suites (`ci.yml`).
+  At the 8 MiB that systemd sets by default (`DefaultLimitMEMLOCK`), 344
+  ringline io_uring tests failed with ENOMEM on a Linux 7.2 host, and about
+  250 still did with `-j 1`. A finished test's charge is released
+  asynchronously, and one test can hold several rings. Check `ulimit -l`
+  before a local io_uring run. To raise the limit for a running shell:
+  `sudo prlimit --pid <shell pid> --memlock=unlimited:unlimited`; processes
+  that shell starts afterwards inherit it. For later sessions, processes
+  the systemd user manager starts (tmux under systemd, graphical
+  terminals) take the limit from a `user@.service` drop-in with
+  `[Service]` and `LimitMEMLOCK=infinity`, applied after
+  `systemctl daemon-reload` and a restart of `user@<uid>.service`. Shells
+  started by sshd or `login` take it from pam_limits: add
+  `<user> - memlock unlimited` to a file in `/etc/security/limits.d/`.
+
 ## Workspace Structure
 
 This is a Cargo workspace. The core runtime is in `ringline/`; protocol client crates build on top of it:
@@ -155,22 +172,22 @@ Ringline is a thread-per-core async I/O runtime. No work-stealing, no cross-thre
 ### Startup Flow
 
 `RinglineBuilder::new(config).bind(addr).launch::<Handler>()` →
-1. Validates config, ensures RLIMIT_NOFILE is sufficient (and, on io_uring, that RLIMIT_MEMLOCK covers what each worker charges to it: its `registered_regions`, plus on Linux 6.14+ its ring and one provided buffer ring per UDP socket — see `ringline/src/memlock.rs`; a process with `CAP_IPC_LOCK` in the initial user namespace is not charged); soft limits are raised when the hard limit allows, otherwise `Error::ResourceLimit` names the `ulimit` to run
+1. Validates config. On io_uring, ensures RLIMIT_MEMLOCK covers what each worker charges to it: its `registered_regions`, plus on Linux 6.14+ its ring and one provided buffer ring per UDP socket (see `ringline/src/memlock.rs`; a process with `CAP_IPC_LOCK` in the initial user namespace is not charged). The soft limit is raised when the hard limit allows; when the hard limit is too low for the rings, the `cq_entries` left at its default is halved (down to 1024) with the default `sq_entries` and `max_connections` in proportion until they fit (`memlock::fit_ring_sizes`), and otherwise `Error::ResourceLimit` names the `ulimit` to run. Then ensures RLIMIT_NOFILE is sufficient for the (possibly fitted) `max_connections`, raising the soft limit or returning `Error::ResourceLimit` the same way
 2. Spawns an **acceptor thread** (if `.bind()` was called) that runs `accept4()` and round-robins fds to workers via crossbeam channels
 3. Spawns **N worker threads**, each pinned to a CPU core (SMT-aware: one worker per physical core), each owning its own `Driver` + `Executor` + ring/poll instance
 
-`Config` is **opaque** — all fields are `pub(crate)`; `ConfigBuilder` is the only construction path and validates on `build()`. Notable knobs: `workers`, `pin_to_core`/`core_offset`, accumulator sizing and `recv_direct_region`, `send_pool`/`send_zc_threshold` (default 4096)/`send_slab_slots`, timers, UDP (`udp_bind`, `udp_gro`, queue depths), subsystems (`nvme`, `direct_io`, `no_fs` — fs is on by default), `tls`/`tls_client`.
+`Config` is **opaque** — all fields are `pub(crate)`; `ConfigBuilder` is the only construction path and validates on `build()`. Notable knobs: `workers`, `pin_to_core`/`core_offset`, accumulator sizing and `recv_direct_region`, `send_pool`/`send_zc_threshold` (default 4096)/`send_slab_slots`, timers, UDP (`udp_bind`, `udp_gro`, queue depths), subsystems (`nvme`, `direct_io`, `no_fs` — fs is on by default), `tls`/`tls_client`, `tls_handshake_timeout` (default 10 s, at most 60 s).
 
 ### Event Loop (per worker)
 
 io_uring — `AsyncEventLoop::run()`:
-1. `submit_and_wait(1)` — block until a CQE arrives
-2. `drain_completions()` — decode CQEs via `OpTag` + `UserData`, dispatch (recv → accumulator append + wake task, send → dequeue next pending send, connect → store result + wake, timer → fire slot + wake)
+1. `submit_and_wait_timeout(1, bound)` — block until a CQE arrives or the bound passes. The bound is the earliest of the next tick (`tick_timeout_us`), the earliest timer in the executor's deadline heap, and the earliest TLS handshake or close deadline (`wait_bound`); with no tick and no deadline the loop calls `submit_and_wait(1)`, and with a bound of zero (a deadline has passed) the non-blocking `submit_and_get_events()`. The engine caps a timed wait at `MAX_WAIT` (1 h). The wait passes the bound to `io_uring_enter` through `IORING_ENTER_EXT_ARG`, so timers and the tick cost no SQE or CQE
+2. `drain_completions()` — decode CQEs via `OpTag` + `UserData`, dispatch (recv → accumulator append + wake task, send → dequeue next pending send, connect → store result + wake), then `fire_expired_timers()` wakes the tasks whose timers have passed
 3. `collect_wakeups()` — drain thread-local `READY_QUEUE` and the worker's cross-thread wake inbox into executor's ready list
 4. `poll_ready_tasks()` — poll all Ready futures (sets `CURRENT_DRIVER` thread-local before each poll)
 5. `on_tick()` — call handler's sync tick callback
 
-The mio loop is epoll-shaped (poll with timer-heap-derived timeout → readable/writable handlers → same `collect_wakeups()`/`poll_ready_tasks()` → fire expired timers → `on_tick()`) and uses dirty-lists + a timer min-heap rather than per-iteration scans. Steps 3–4 (the portable executor) are shared.
+The mio loop is epoll-shaped (poll with timer-heap-derived timeout → readable/writable handlers → same `collect_wakeups()`/`poll_ready_tasks()` → fire expired timers → `on_tick()`) and uses dirty-lists rather than per-iteration scans. Steps 3–4 (the portable executor) and the timer heap (`TimerSlotPool`) are shared.
 
 ### Key Abstractions
 
@@ -178,9 +195,9 @@ The mio loop is epoll-shaped (poll with timer-heap-derived timeout → readable/
 
 **`Connection`** — An owned connection, from `on_accept` or `connect`; `split()` gives a `SendHalf` and a `RecvHalf`, neither `Copy`. `with_data(|&[u8]| -> ParseResult)` / `with_bytes(|Bytes| -> ParseResult)` for recv (`with_data_result` is the `io::Result` form that separates a clean close from a transport error); `send()`/`send_nowait()`/`send_parts()` for send; `eof_truncated()` distinguishes a peer FIN mid-message from a clean close. Internally indexes into the driver's connection table via `(conn_index, generation)`, in the `pub(crate)` `ConnCtx`.
 
-**`Driver`** — Owns all I/O state: the ring (or mio poll), `ConnectionTable`, buffer pools (the UDP `ProvidedBufRing`, `SendCopyPool`, `InFlightSendSlab`), `AccumulatorTable`, `TimerSlotPool`.
+**`Driver`** — Owns all I/O state: the ring (or mio poll), `ConnectionTable`, buffer pools (the UDP `ProvidedBufRing`, `SendCopyPool`, `InFlightSendSlab`), `AccumulatorTable`.
 
-**`Executor`** — Owns task state: `TaskSlab` (per-connection futures), `StandaloneTaskSlab` (spawned tasks), per-connection waiters/results vectors, ready queue.
+**`Executor`** — Owns task state: `TaskSlab` (per-connection futures), `StandaloneTaskSlab` (spawned tasks), per-connection waiters/results vectors, ready queue, and the timer pool and deadline heap (`TimerSlotPool`, `executor.timer_pool`).
 
 ### Thread-Local State Pattern
 
@@ -188,9 +205,9 @@ Async futures access the driver via `CURRENT_DRIVER` thread-local (raw pointer, 
 
 ### Connection Lifecycle
 
-Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → arm the hangup poll (TLS: also the handshake's receive; `on_accept` is spawned when the handshake completes) → spawn `on_accept` task (plaintext). Outbound: `connect(addr)` → allocate slot → submit connect SQE (optionally IO_LINK'd with timeout) → `ConnectFuture` resolves to a new `Connection`. On io_uring every plaintext connection, accepted or outbound, arms no ring receive: it receives directly into its accumulator, with a one-shot `RECV` armed when a read parks, and one `POLL_ADD(POLLRDHUP)` armed when it opens so a peer close is seen while nothing reads (`docs/recv-direct-design.md`). A TLS connection receives the same way, into its TLS engine's ciphertext buffer (with `tls-buffered`, a pooled buffer that `read_tls` copies from): re-armed after each completion during the handshake, then armed when a read parks (or after each completion once the hangup poll has fired).
+Inbound: acceptor → round-robin to worker → allocate `ConnectionTable` slot → arm the hangup poll (TLS: also the handshake's receive; `on_accept` is spawned when the handshake completes) → spawn `on_accept` task (plaintext). Outbound: `connect(addr)` → allocate slot → submit connect SQE (a connect timeout is a deadline in `Driver::connect_deadlines` that bounds the worker's wait; when it passes, `check_connect_deadlines` pushes an `ASYNC_CANCEL` of the connect and resolves it `TimedOut`) → `ConnectFuture` resolves to a new `Connection`. On io_uring every plaintext connection, accepted or outbound, arms no ring receive: it receives directly into its accumulator, with a one-shot `RECV` armed when a read parks, and one `POLL_ADD(POLLRDHUP)` armed when it opens so a peer close is seen while nothing reads (`docs/recv-direct-design.md`). A TLS connection receives the same way, into its TLS engine's ciphertext buffer (with `tls-buffered`, a pooled buffer that `read_tls` copies from): re-armed after each completion during the handshake, then armed when a read parks (or after each completion once the hangup poll has fired).
 
-A peer's FIN or close_notify finishes the read half and closes nothing: the task keeps the connection, may keep sending, and `Connection::peer_closed` reports the end; readers resolve `0` (`docs/half-close-design.md`). A reset or a read error still closes. Dropping the last half of a connection closes it (`release_half`, queued through `defer_release` when the drop is outside a task poll). Close, on both backends: only `close_connection` (and the `DriverCtx` close) moves the connection to `Lifecycle::Closing`; it also sets `ConnSendState::close_pending`, and teardown finalizes once queued sends drain (io_uring: `try_finalize_close` submits the Close SQE behind the kernel-dependent lead Domain Invariant 8 describes; mio: `drain_pending_closes` defers `finish_close`). A backend site that marks the connection closing directly leaks the slot — that was #368.
+A peer's FIN or close_notify finishes the read half and closes nothing: the task keeps the connection, may keep sending, and `Connection::peer_closed` reports the end; readers resolve `0` (`docs/half-close-design.md`). A FIN on a TLS connection whose handshake has not completed closes it, and an outbound connect resolves `UnexpectedEof`; a handshake still incomplete after `tls_handshake_timeout` closes it too, and an outbound connect resolves `TimedOut`. A reset or a read error still closes. Dropping the last half of a connection closes it (`release_half`, queued through `defer_release` when the drop is outside a task poll). Close, on both backends: only `close_connection` (and the `DriverCtx` close) moves the connection to `Lifecycle::Closing`; it also sets `ConnSendState::close_pending`, and teardown finalizes once queued sends drain (io_uring: `try_finalize_close` submits the Close SQE behind the kernel-dependent lead Domain Invariant 8 describes; mio: `drain_pending_closes` defers `finish_close`); a connection whose handshake or connect has not completed waits at most `CLOSE_NOTIFY_TIMEOUT` (5 s), set in `close_connection`, and is then closed without its unsent sends. A backend site that marks the connection closing directly leaks the slot — that was #368.
 
 Connection state is three fields on `ConnectionState`: `read` (the TCP read half as we observed it: `Open`, `Eof { truncated }`, `Error`), `lifecycle` (`Inactive`/`Connecting`/`Open`/`Closing`), and `write` (the TCP write half as we drive it: `Open`, `ShutdownPending`, `Shutdown`). Readers ask `recv_finished()` ("resolve to EOF instead of parking?") or `close_requested()` ("is a close already pending?") rather than matching variants; a peer FIN sets `read` and requests no close, so `Eof` with `Lifecycle::Open` is a steady state. Design: `docs/connection-state-model-design.md`, `docs/half-close-design.md`.
 
@@ -212,9 +229,9 @@ A leaf future (recv, send, timer, disk, channel) registers its task's id and ret
 ### UserData Encoding (64-bit CQE identification)
 
 ```
-Bits 63..56: OpTag (8 bits) — operation type (RecvDirect, Send, Connect, Timer, coalesced sends, etc.)
+Bits 63..56: OpTag (8 bits) — operation type (RecvDirect, Send, Connect, Timeout, coalesced sends, etc.)
 Bits 55..32: ConnIndex (24 bits)
-Bits 31..0:  Payload (32 bits) — buffer id, slab slot, timer slot, etc.
+Bits 31..0:  Payload (32 bits) — buffer id, slab slot, etc.
 ```
 
 For pool-slot send ops (`Send`/`TlsSend`) the payload's high bits carry the
@@ -223,7 +240,7 @@ outlived its connection slot; slab-backed sends record the generation in the
 slab entry instead, and the payload of `SendPollOut` is the whole generation.
 See `UserData::send_payload`.
 
-`OpTag` has grown to ~30 variants — read `completion.rs` rather than assuming the set.
+`OpTag` has about 26 variants — read `completion.rs` rather than assuming the set.
 
 ## Domain Invariants (io_uring correctness rules)
 
@@ -233,11 +250,11 @@ These are the recurring failure modes in this codebase — the 2026-07 audit (~3
 2. **io_uring does not order independent SQEs.** Anything that must hit the wire in order (TLS records, partial-send resubmits) goes through the per-connection send queue, never as parallel SQEs. Concurrent TLS sends that bypass the queue interleave records and produce `bad_record_mac` at the peer.
 3. **Stale CQEs are normal.** Slots recycle; every completion must be validated before touching state: connection completions against the connection generation, disk-I/O completions against their key (io_uring: subsystem, sequence, slab index; mio: a sequence). A disk-I/O key is not reissued while a future holds it (or, on mio, while its pool operation runs), and a result is stored only for a held key.
 4. **CQE-skip (`IOSQE_CQE_SKIP_SUCCESS`) is unsound for pool-backed sends** — slot lifecycle needs the CQE, and short sends would be silent. See `docs/send-completion-design.md` before any send-path change.
-5. **Short sends happen.** Stream sends use `MSG_DONTWAIT` (`STREAM_SEND_FLAGS`), so a send takes what the socket has room for and returns, and any new send variant must handle partial completion explicitly. The sends of a `send_chain` use `MSG_WAITALL` (`CHAIN_SEND_FLAGS`) instead, because a short part would be followed by the next one across a gap (#734). Build a chain part with `Sqe::chain_send` or `Sqe::chain_send_msg_zc`; `Ring::push_sqe_chain` debug-asserts it, before a one-part chain takes the plain push.
+5. **Short sends happen.** Stream sends use `MSG_DONTWAIT` (`STREAM_SEND_FLAGS`), so a send takes what the socket has room for and returns, and any new send variant must handle partial completion explicitly. The sends of a `send_chain` use `MSG_WAITALL` (`CHAIN_SEND_FLAGS`) instead, because a short part would be followed by the next one across a gap (#734). Build a chain part with `Sqe::chain_send`, `Sqe::chain_send_msg` or `Sqe::chain_send_msg_zc`; `Ring::push_sqe_chain` debug-asserts it, before a one-part chain takes the plain push.
 6. **`ENOBUFS` on a buffer-select recv means the provided ring is empty** — re-arm on replenish, not in a loop. Only UDP receives through a provided ring, one per socket. Its handlers record the socket in `udp_awaiting_buffers`, and `return_udp_buffers` re-arms it once its ring has a free buffer. A re-arm on an empty ring returns `ENOBUFS` at once, so re-arming from the handler spins the worker at full CPU (#742).
 7. **Errors like `EINTR`/`EBUSY`/`EAGAIN` on submit are backpressure, not failures.** A queued send whose SQE cannot be pushed is parked at its queue head and retried next iteration (`drain_send_retries`), never dropped.
 8. **Closing a fixed file does not release its socket while requests that hold it are in flight.** Before Linux 6.13, those are every earlier request that uses a registered file or buffer, on any connection: a receive or hangup poll on another connection is enough to delay the FIN. From 6.13, they are the connection's own requests. Close a connection through `try_finalize_close`, which hard-links a lead ahead of the Close. Before 6.13 the lead is `shutdown(SHUT_RDWR)`, which runs on the bounded io-wq pool behind any blocking file I/O. From 6.13 it is an `ASYNC_CANCEL` of every request on the connection's fixed file, which runs inline (#581, #586). A socket parked onto another worker (`socket_handed_off`) is closed without a lead. At worker exit every connection is closed with the cancel lead, on every kernel, so a send waiting on a peer that does not read is cancelled rather than waited out; a zero-copy entry holds exit until its notification arrives, for 1 s, and the connection then closes with `SO_LINGER {on, 0}`, which discards the queued data so the notification lands. Below Linux 6.7 that option cannot be set through io_uring, and an entry whose connection closed before exit began has no socket to set it on: such an entry holds exit until the 10 s shutdown bound runs out, and its guards and the send pool's memory are then leaked, since the kernel can still read them (#607).
-9. **A send that cannot finish waits in ringline, not on an io-wq thread.** A short result or `-EAGAIN` stores the send's user_data in `ConnSendState::waiting_send` and arms `SendPollOut` (`AsyncEventLoop::wait_for_room`). io_uring reports `POLLRDHUP` on every poll, so after the peer half-closes a one-shot `PollAdd(POLLOUT)` completes at once without `POLLOUT`, and retrying a send behind it spins (#603). That case moves to a multishot poll, which is edge-triggered: it reports `POLLRDHUP` once and then `POLLOUT` when room appears. A send can have room while the socket does not poll writable: `send` needs `wmem_queued < sndbuf`, and `POLLOUT` needs free space of at least `wmem_queued / 2`. A waiting send has nothing in the kernel, so whatever ends the wait must fail or resubmit it; a 1 s timer (`handle_send_backstop`) resubmits every waiting send for the cases no poll reports. A multishot poll holds the socket open past its `Close`, so `try_finalize_close` cancels it by user_data first. A `send_chain` still holds an io-wq thread while a part waits on a half-closed peer (#605, `docs/half-closed-send-wait-design.md`).
+9. **A send that cannot finish waits in ringline, not on an io-wq thread.** A short result or `-EAGAIN` stores the send's user_data in `ConnSendState::waiting_send` and arms `SendPollOut` (`AsyncEventLoop::wait_for_room`). io_uring reports `POLLRDHUP` on every poll, so after the peer half-closes a one-shot `PollAdd(POLLOUT)` completes at once without `POLLOUT`, and retrying a send behind it spins (#603). That case moves to a multishot poll, which is edge-triggered: it reports `POLLRDHUP` once and then `POLLOUT` when room appears. A send can have room while the socket does not poll writable: `send` needs `wmem_queued < sndbuf`, and `POLLOUT` needs free space of at least `wmem_queued / 2`. A waiting send has nothing in the kernel, so whatever ends the wait must fail or resubmit it; the send backstop (`handle_send_backstop`) resubmits every waiting send once a second for the cases no poll reports, at a deadline (`Driver::send_backstop_at`) that bounds the worker's wait. A multishot poll holds the socket open past its `Close`, so `try_finalize_close` cancels it by user_data first. A `send_chain` still holds an io-wq thread while a part waits on a half-closed peer (#605, `docs/half-closed-send-wait-design.md`).
 
 ## Copy Semantics
 
@@ -267,8 +284,8 @@ The key difference: `with_data(|&[u8]|)` provides a borrowed slice — the parse
 |--------|-------------|--------|
 | `send()` / `send_nowait()` | User data → `SendCopyPool` slot | 1 |
 | `send_parts()` with `.copy()` only | All copy parts gathered into one `SendCopyPool` slot | 1 |
-| `send_parts()` with `.guard()` only | Guard memory used in-place via `SendMsgZc` iovec | 0 |
-| `send_parts()` mixed `.copy()` + `.guard()` | Copy parts → pool; guard parts zero-copy via iovec | 1 (copy parts only) |
+| `send_parts()` with `.guard()` only | Guard memory used in-place via `SendMsgZc` iovec. On a Unix-domain connection, which refuses `SENDMSG_ZC`, a plain `sendmsg` of the same iovecs: the kernel copies the guard's bytes into the socket, as it does for a copy send (#829) | 0 |
+| `send_parts()` mixed `.copy()` + `.guard()` | Copy parts → pool; guard parts zero-copy via iovec (on a Unix-domain connection, a plain `sendmsg`, as above) | 1 (copy parts only) |
 | Any send with TLS (buffered engine, `tls-buffered`) | rustls seals each record in a per-record `PrefixedPayload`; `write_tls` copies it into pool slots through `PoolWriter` (an `io::Write` adapter, no scratch `Vec`) on io_uring, or into the queued `Vec` on mio (`encrypt_for_send_mio_buffered`). `send_parts` and `send_chain` first gather their parts, guard parts included, into a `Vec` (`SendBuilder::submit_tls` for `send_parts` and `SendChainBuilder::copy` / `ChainPartsBuilder::add` for `send_chain` on io_uring; `AsyncSendBuilder` on mio), one more copy | 2; 3 through `send_parts`/`send_chain` |
 | Application-data send with TLS (unbuffered engine, default) | With ringline-tls and the ring provider, a TLS 1.3 record is copied once: `WriteTraffic::encrypt` → `write_fragments` → `MessageEncrypter::encrypt_into` copies the plaintext into the pool slot (io_uring) or the queued buffer (mio) and seals it there. With the aws-lc-rs provider on an AES-GCM suite, outside FIPS mode, `encrypt_into` seals from the caller's slice into the destination (`seal_out_of_place_scatter`) and copies none of the plaintext (AWS-LC still copies its 288-byte key context per record); aws-lc-rs ChaCha20-Poly1305, or aws-lc-rs in FIPS mode, copies once as ring does. ringline's builders use ring; aws-lc-rs needs a config passed to `TlsConfig::from_rustls`. A TLS 1.2 record, or one from another provider, is sealed in a per-record `PrefixedPayload` and then copied into the destination. `send_parts` and `send_chain` first gather their parts, guard parts included, into a `Vec` (`SendBuilder::submit_tls` for `send_parts` and `SendChainBuilder::copy` / `ChainPartsBuilder::add` for `send_chain` on io_uring; `AsyncSendBuilder` on mio), one more copy | 0 (TLS 1.3, aws-lc-rs AES-GCM outside FIPS mode), 1 (other TLS 1.3 with ring or aws-lc-rs), 2 otherwise; `send_parts`/`send_chain` +1 |
 
@@ -305,7 +322,7 @@ the prerequisite for kTLS. See
 
 On the mio backend all of these degrade to copy sends (guards are consumed by copying).
 
-**Zero-copy sends**: `SendGuard` keeps user memory alive until the kernel posts a ZC notification CQE confirming the DMA completed. Guards are stored in `InFlightSendSlab` entries and dropped only after all notifications arrive. ZC only pays off above a size threshold: the runtime's `send_zc_threshold` (default 4096, validated by sweep — crossover is 1–4 KiB) routes smaller "guarded" sends through the copy path.
+**Zero-copy sends**: `SendGuard` keeps user memory alive until the kernel posts a ZC notification CQE confirming the DMA completed. Guards are stored in `InFlightSendSlab` entries and dropped only after all notifications arrive. On a Unix-domain connection guard parts go out with a plain `sendmsg` instead, and the guard drops when the send completes (#829). ZC only pays off above a size threshold: the runtime's `send_zc_threshold` (default 4096, validated by sweep — crossover is 1–4 KiB) routes smaller "guarded" sends through the copy path.
 
 ### Per-Client Copy Analysis
 

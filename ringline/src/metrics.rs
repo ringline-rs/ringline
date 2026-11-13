@@ -12,13 +12,13 @@ use metriken::{Gauge, ShardedCounterGroup, metric};
     name = "ringline/connections",
     description = "Connection lifecycle counters"
 )]
-pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(9);
+pub static CONNECTIONS: ShardedCounterGroup = ShardedCounterGroup::new(12);
 
 #[metric(name = "ringline/bytes", description = "Byte transfer counters")]
 pub static BYTES: ShardedCounterGroup = ShardedCounterGroup::new(2);
 
 #[metric(name = "ringline/ring", description = "Ring utilization counters")]
-pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(6);
+pub static RING: ShardedCounterGroup = ShardedCounterGroup::new(ring::COUNT);
 
 #[metric(name = "ringline/pool", description = "Pool exhaustion counters")]
 pub static POOL: ShardedCounterGroup = ShardedCounterGroup::new(7);
@@ -132,6 +132,18 @@ pub mod conn {
     /// Nothing else changes: the write half stays `Shutdown`, and on
     /// io_uring the Close it held goes ahead.
     pub const SHUTDOWN_FAILED: usize = 8;
+    /// An `accept` on the acceptor thread failed with an error that does not
+    /// end the listener and is not retried at once (`EMFILE`, `ENFILE`,
+    /// `ENOBUFS`, `ENOMEM`, or an errno ringline does not classify). The
+    /// acceptor waits 10 ms and accepts again.
+    pub const ACCEPT_ERROR_BACKOFF: usize = 9;
+    /// An acceptor thread stopped because its listening socket can no longer
+    /// accept (`EBADF`, `ENOTSOCK`, `EINVAL` outside shutdown). Its listener
+    /// accepts nothing afterwards; the error is also written to stderr.
+    pub const ACCEPTOR_STOPPED: usize = 10;
+    /// TLS connections, inbound or outbound, closed because their handshake
+    /// had not completed within `ConfigBuilder::tls_handshake_timeout`.
+    pub const TLS_HANDSHAKE_TIMEOUT: usize = 11;
 }
 
 /// Completions processed, split by `OpTag`.
@@ -313,6 +325,17 @@ pub mod ring {
     /// until the `Shutdown` CQE lands, so this should stay at zero; a nonzero
     /// value means that gate leaked (#518).
     pub const SHUTDOWN_STALE: usize = 5;
+    /// io_uring: reaps that found completions waiting in the kernel's
+    /// overflow list because the CQ was full. They are delivered on the next
+    /// enter; the count says the CQ is too small for the load.
+    pub const CQ_OVERFLOW: usize = 6;
+    /// io_uring: completions the kernel dropped because it could not allocate
+    /// an overflow entry. Each is an operation that never completes.
+    pub const CQE_DROPPED: usize = 7;
+    /// io_uring: enters that returned `EBADR`, the kernel's report that
+    /// completions were dropped. The worker carries on.
+    pub const CQE_DROPPED_REPORTED: usize = 8;
+    pub const COUNT: usize = 9;
 }
 
 /// Slot indices for `RECV_RING`: copies in the receive path.
@@ -468,6 +491,21 @@ pub fn init_metadata() {
         "accept_queue_full".into(),
     );
     CONNECTIONS.insert_metadata(conn::SHUTDOWN_FAILED, "op".into(), "shutdown_failed".into());
+    CONNECTIONS.insert_metadata(
+        conn::ACCEPT_ERROR_BACKOFF,
+        "op".into(),
+        "accept_error_backoff".into(),
+    );
+    CONNECTIONS.insert_metadata(
+        conn::ACCEPTOR_STOPPED,
+        "op".into(),
+        "acceptor_stopped".into(),
+    );
+    CONNECTIONS.insert_metadata(
+        conn::TLS_HANDSHAKE_TIMEOUT,
+        "op".into(),
+        "tls_handshake_timeout".into(),
+    );
 
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_100, "op".into(), "lt_100us".into());
     PARK_DRAIN_US.insert_metadata(park_drain_us::LT_250, "op".into(), "lt_250us".into());
@@ -573,6 +611,13 @@ pub fn init_metadata() {
     }
     RING.insert_metadata(ring::CQE_UNKNOWN_TAG, "op".into(), "cqe_unknown_tag".into());
     RING.insert_metadata(ring::SHUTDOWN_STALE, "op".into(), "shutdown_stale".into());
+    RING.insert_metadata(ring::CQ_OVERFLOW, "op".into(), "cq_overflow".into());
+    RING.insert_metadata(ring::CQE_DROPPED, "op".into(), "cqe_dropped".into());
+    RING.insert_metadata(
+        ring::CQE_DROPPED_REPORTED,
+        "op".into(),
+        "cqe_dropped_reported".into(),
+    );
 
     POOL.insert_metadata(pool::SEND_EXHAUSTED, "op".into(), "send_exhausted".into());
     POOL.insert_metadata(pool::TIMER_EXHAUSTED, "op".into(), "timer_exhausted".into());
@@ -612,6 +657,33 @@ pub fn init_metadata() {
 mod tests {
     use super::*;
 
+    /// Each `conn` index names its own slot, and together they fill
+    /// `CONNECTIONS`, so two counters cannot share a slot.
+    #[test]
+    fn conn_indices_are_distinct_and_fill_the_group() {
+        let mut idx = [
+            conn::ACCEPTED,
+            conn::CLOSED,
+            conn::PARK_STARTED,
+            conn::PARK_COMPLETED,
+            conn::ADOPTED,
+            conn::ACCEPT_TABLE_FULL,
+            conn::ACCEPT_REGISTER_FAILED,
+            conn::ACCEPT_QUEUE_FULL,
+            conn::SHUTDOWN_FAILED,
+            conn::ACCEPT_ERROR_BACKOFF,
+            conn::ACCEPTOR_STOPPED,
+            conn::TLS_HANDSHAKE_TIMEOUT,
+        ];
+        idx.sort_unstable();
+        assert_eq!(idx.to_vec(), (0..idx.len()).collect::<Vec<_>>());
+        assert_eq!(
+            CONNECTIONS.entries(),
+            idx.len(),
+            "CONNECTIONS is not sized to its named slots"
+        );
+    }
+
     /// Every declared slot index must be in bounds for its group —
     /// `ShardedCounterGroup::increment` silently returns `false` on an
     /// out-of-range index, so an undersized group means a counter that
@@ -628,6 +700,9 @@ mod tests {
             conn::ACCEPT_REGISTER_FAILED,
             conn::ACCEPT_QUEUE_FULL,
             conn::SHUTDOWN_FAILED,
+            conn::ACCEPT_ERROR_BACKOFF,
+            conn::ACCEPTOR_STOPPED,
+            conn::TLS_HANDSHAKE_TIMEOUT,
         ] {
             assert!(
                 CONNECTIONS.increment(idx),
@@ -765,14 +840,14 @@ mod cqe_tag_tests {
             cqe_tag::COUNT
         );
         // Guard against the walk finding nothing and passing vacuously.
-        assert!(found >= 30, "expected the full tag set, found {found}");
+        assert!(found >= 26, "expected the full tag set, found {found}");
     }
 
     /// The array is indexed by discriminant, which leaves gaps. Assert exactly
     /// which gaps we expect, rather than letting an unnoticed new one look
     /// normal — an unregistered slot reads as a counter stuck at zero.
     ///
-    /// Slots 0, 1, 17, 20, 26 to 30 have no `OpTag` variant.
+    /// Slots 0, 1, 9, 11, 12, 17, 20, 25 to 30 have no `OpTag` variant.
     #[test]
     fn expected_slots_are_unused() {
         let unused: Vec<usize> = (0..cqe_tag::COUNT)
@@ -780,7 +855,7 @@ mod cqe_tag_tests {
             .collect();
         assert_eq!(
             unused,
-            vec![0, 1, 17, 20, 26, 27, 28, 29, 30],
+            vec![0, 1, 9, 11, 12, 17, 20, 25, 26, 27, 28, 29, 30],
             "unexpected unused CQE_BY_TAG slots"
         );
     }
