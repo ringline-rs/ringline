@@ -132,14 +132,20 @@ pub mod conn {
     /// Nothing else changes: the write half stays `Shutdown`, and on
     /// io_uring the Close it held goes ahead.
     pub const SHUTDOWN_FAILED: usize = 8;
-    /// An `accept` on the acceptor thread failed with an error that does not
-    /// end the listener and is not retried at once (`EMFILE`, `ENFILE`,
-    /// `ENOBUFS`, `ENOMEM`, or an errno ringline does not classify). The
-    /// acceptor waits 10 ms and accepts again.
+    /// An `accept` on the acceptor thread, or a worker's multishot accept in
+    /// merged accept mode, failed with an error that does not end the
+    /// listener and is not retried at once (`EMFILE`, `ENFILE`, `ENOBUFS`,
+    /// `ENOMEM`, or an errno ringline does not classify). The acceptor
+    /// waits 10 ms and accepts again; the worker re-arms the accept after
+    /// 10 ms.
     pub const ACCEPT_ERROR_BACKOFF: usize = 9;
     /// An acceptor thread stopped because its listening socket can no longer
     /// accept (`EBADF`, `ENOTSOCK`, `EINVAL` outside shutdown). Its listener
-    /// accepts nothing afterwards; the error is also written to stderr.
+    /// accepts nothing afterwards; the error is also written to stderr. In
+    /// merged accept mode, a worker's multishot accept on one listener
+    /// stopped outside shutdown for the same errors or `ECANCELED`; that
+    /// worker accepts nothing more on that listener, and nothing is written
+    /// to stderr.
     pub const ACCEPTOR_STOPPED: usize = 10;
     /// TLS connections, inbound or outbound, closed because their handshake
     /// had not completed within `ConfigBuilder::tls_handshake_timeout`.

@@ -222,7 +222,7 @@ pub fn run_acceptor(config: AcceptorConfig) {
 
 /// What the acceptor does after `accept` fails with an errno.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AcceptErrorAction {
+pub(crate) enum AcceptErrorAction {
     /// Call `accept` again at once.
     Retry,
     /// Wait [`ACCEPT_ERROR_BACKOFF`], then call `accept` again.
@@ -233,13 +233,13 @@ enum AcceptErrorAction {
 
 /// How long the acceptor waits after an error that a retry at once would
 /// likely meet again: a full fd table, or no memory for the new socket.
-const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+pub(crate) const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Classify an `accept` errno. Only an error that means the listening socket
 /// is unusable stops the acceptor, since a stopped acceptor leaves its
 /// listener accepting nothing while the workers run. An errno not listed here
 /// backs off and is counted, rather than stopping.
-fn classify_accept_error(errno: i32) -> AcceptErrorAction {
+pub(crate) fn classify_accept_error(errno: i32) -> AcceptErrorAction {
     match errno {
         // Not a socket, or not listening (also what `SHUT_RD` gives).
         libc::EBADF | libc::ENOTSOCK | libc::EINVAL => AcceptErrorAction::Stop,

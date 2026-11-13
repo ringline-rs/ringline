@@ -328,7 +328,11 @@ event loop owns, which the kernel can still be using.
 The acceptor stops only on `EBADF`, `ENOTSOCK` or `EINVAL` outside shutdown, writing the error to
 stderr and counting `acceptor_stopped`. Errors that end one pending connection retry at once.
 `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` and errors it does not classify wait 10 ms and count
-`accept_error_backoff`.
+`accept_error_backoff`. In merged accept mode (`unstable-accept`) a worker's multishot accept
+follows the same classification, with `ECANCELED` also terminal: an error that stops the
+acceptor, or `ECANCELED`, stops that listener's accept on that worker, counting `acceptor_stopped`
+outside shutdown but writing nothing to stderr, and an `EMFILE`-class error re-arms it after
+10 ms and counts `accept_error_backoff`.
 
 ## Architectural invariants
 
