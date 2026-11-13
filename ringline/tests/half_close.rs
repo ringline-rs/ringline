@@ -144,13 +144,17 @@ fn a_task_awaiting_a_timer_survives_the_peers_fin_and_replies() {
 /// The kind of the first send error, as `ErrorKind as i32 + 1`; 0 is none.
 static SEND_ERROR: AtomicU32 = AtomicU32::new(0);
 static SENDER_RETURNED: AtomicUsize = AtomicUsize::new(0);
+/// Sends that completed before the task returned or was dropped.
+static SENDS_COMPLETED: AtomicUsize = AtomicUsize::new(0);
 
-/// Reads one message, then sends until a send fails.
+/// Reads the request and then to the end of the stream, then sends until a
+/// send fails.
 struct SendsUntilError;
 
 impl AsyncEventHandler for SendsUntilError {
     fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
         async move {
+            let mut guard = DroppedBeforeReturn(false);
             let n = conn
                 .with_data(|d| {
                     if d.is_empty() {
@@ -161,8 +165,14 @@ impl AsyncEventHandler for SendsUntilError {
                 })
                 .await;
             if n == 0 {
+                guard.0 = true;
                 return;
             }
+            // Read to the end of the stream before the first send. Data that
+            // reaches the peer before its close makes that close a reset,
+            // which the read side reports and the runtime aborts on, dropping
+            // this task before any send fails (#819).
+            while conn.with_data(|d| ParseResult::Consumed(d.len())).await != 0 {}
             let chunk = [0x5au8; 4096];
             for _ in 0..500 {
                 let result = match conn.send(&chunk) {
@@ -173,8 +183,10 @@ impl AsyncEventHandler for SendsUntilError {
                     SEND_ERROR.store(e.kind() as u32 + 1, Ordering::SeqCst);
                     break;
                 }
+                SENDS_COMPLETED.fetch_add(1, Ordering::SeqCst);
                 ringline::sleep(Duration::from_millis(5)).await;
             }
+            guard.0 = true;
             SENDER_RETURNED.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -183,13 +195,16 @@ impl AsyncEventHandler for SendsUntilError {
     }
 }
 
-/// A task that only sends on a connection its peer closed fully gets the
-/// send error (the peer answers the data with a reset) and returns.
+/// A task that has read to the end of the stream and then only sends on a
+/// connection its peer closed fully gets the send error (the peer answers the
+/// data with a reset) and returns.
 #[test]
 fn a_send_to_a_peer_that_closed_fully_fails() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     SEND_ERROR.store(0, Ordering::SeqCst);
     SENDER_RETURNED.store(0, Ordering::SeqCst);
+    SENDS_COMPLETED.store(0, Ordering::SeqCst);
+    DROPPED_EARLY.store(0, Ordering::SeqCst);
     let (runtime, handles) = RinglineBuilder::new(config())
         .bind("127.0.0.1:0".parse().unwrap())
         .launch::<SendsUntilError>()
@@ -200,7 +215,12 @@ fn a_send_to_a_peer_that_closed_fully_fails() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while SENDER_RETURNED.load(Ordering::SeqCst) == 0 {
-        assert!(Instant::now() < deadline, "the sending task never returned");
+        assert!(
+            Instant::now() < deadline,
+            "the sending task never returned: dropped before return {}, sends completed {}",
+            DROPPED_EARLY.load(Ordering::SeqCst),
+            SENDS_COMPLETED.load(Ordering::SeqCst)
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     runtime.shutdown();
