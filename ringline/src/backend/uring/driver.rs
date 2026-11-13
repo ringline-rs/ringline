@@ -149,10 +149,14 @@ impl Driver {
     /// less wakes the task like any other, and its parser sees the bytes so
     /// far.
     ///
-    /// On a push failure, with the accumulator at `recv_accumulator_max`, or
-    /// with a TLS engine that has no room for ciphertext, the connection is
-    /// closed, as for an accumulator overflow, and this returns `true`: the
-    /// caller wakes the task so its read resolves.
+    /// With the accumulator at `recv_accumulator_max`, or with a TLS engine
+    /// that has no room for ciphertext, the connection is closed, as for an
+    /// accumulator overflow, and this returns `true`: the caller wakes the
+    /// task so its read resolves. A push the ring refuses is backpressure
+    /// (Domain Invariant 7): the buffer goes back where it came from, the
+    /// connection goes on `recv_arm_retries` with `need`, and this returns
+    /// `false`, so a parked reader stays parked until `retry_recv_arms`
+    /// arms the receive (#830).
     pub(crate) fn arm_direct_recv_or_close(
         &mut self,
         conn_index: u32,
@@ -248,11 +252,8 @@ impl Driver {
                 }
             }
             self.direct_recv_free.push(slot);
-            self.abort_recv(
-                conn_index,
-                io::Error::other("the receive could not be submitted to the ring"),
-            );
-            return true;
+            self.queue_recv_arm_retry(conn_index, generation, need);
+            return false;
         }
         self.direct_recvs[slot as usize] = Some(DirectRecv {
             conn_index,
@@ -340,6 +341,27 @@ impl Driver {
             cs.hangup_poll_armed = true;
             cs.hangup_poll_retry = false;
         }
+    }
+
+    /// Record that `conn_index`'s receive could not be pushed, for
+    /// `retry_recv_arms` to arm with `need`. A connection already owed a
+    /// retry keeps one entry, which takes the latest `need`.
+    fn queue_recv_arm_retry(&mut self, conn_index: u32, generation: u32, need: Option<usize>) {
+        let Some(cs) = self.connections.get_mut(conn_index) else {
+            return;
+        };
+        if cs.recv_arm_retry {
+            if let Some(entry) = self
+                .recv_arm_retries
+                .iter_mut()
+                .find(|e| e.0 == conn_index && e.1 == generation)
+            {
+                entry.2 = need;
+            }
+            return;
+        }
+        cs.recv_arm_retry = true;
+        self.recv_arm_retries.push((conn_index, generation, need));
     }
 
     /// Close `conn_index` because its receive cannot be armed, and record
@@ -698,6 +720,11 @@ pub(crate) struct Driver {
     pub(crate) recv_direct_region: usize,
     /// `Config::defer_recv_arm`.
     pub(crate) defer_recv_arm: bool,
+    /// Receives the ring refused to take, as `(conn_index, generation,
+    /// need)` (`ConnectionState::recv_arm_retry`). `retry_recv_arms` arms
+    /// them again after each wait, and the wait does not block while any
+    /// is owed (`may_block`).
+    pub(crate) recv_arm_retries: Vec<(u32, u32, Option<usize>)>,
     /// Receives `park_recv` deferred under `defer_recv_arm`, as
     /// `(conn_index, generation, need)`. `arm_deferred_recvs` arms them before
     /// a wait that would block, or after the next wait.
@@ -717,10 +744,12 @@ pub(crate) struct Driver {
     pub(crate) tick_count: u64,
     /// Whether the eventfd read SQE is currently armed.
     pub(crate) eventfd_armed: bool,
-    /// Pending ZC send retries: (conn_index, generation, slab_idx, retries). Drained each tick.
-    pub(crate) pending_zc_retries: Vec<(u32, u32, u16, u8)>,
-    /// Pending copy send retries: (conn_index, generation, pool_slot, retries). Drained each tick.
-    pub(crate) pending_copy_retries: Vec<(u32, u32, u16, u8, OpTag)>,
+    /// Pending ZC send retries: (conn_index, generation, slab_idx). Drained
+    /// each iteration until the push goes through.
+    pub(crate) pending_zc_retries: Vec<(u32, u32, u16)>,
+    /// Pending copy send retries: (conn_index, generation, pool_slot, op).
+    /// Drained each iteration until the push goes through.
+    pub(crate) pending_copy_retries: Vec<(u32, u32, u16, OpTag)>,
     /// `SendPollOut`s the SQ had no room for: (conn_index, generation, multi).
     /// Drained each tick.
     pub(crate) pending_send_pollout_retries: Vec<(u32, u32, bool)>,
@@ -736,10 +765,10 @@ pub(crate) struct Driver {
     pub(crate) send_backstop_at: Option<std::time::Instant>,
     /// TLS handshakes in progress and their deadlines.
     pub(crate) handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines,
-    /// Pending coalesced-send retries: (conn_index, generation, slab_idx, retries).
-    /// Drained each tick — used when resubmitting a coalesced `sendmsg` found
-    /// the SQ full.
-    pub(crate) pending_coalesced_retries: Vec<(u32, u32, u16, u8)>,
+    /// Pending coalesced-send retries: (conn_index, generation, slab_idx).
+    /// Drained each iteration until the push goes through — used when
+    /// resubmitting a coalesced `sendmsg` found the SQ full.
+    pub(crate) pending_coalesced_retries: Vec<(u32, u32, u16)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
     /// `Shutdown` SQEs the ring refused: (conn_index, generation). The write
@@ -750,12 +779,11 @@ pub(crate) struct Driver {
     /// slot, and `reset_send_state` clears it at reactivation.
     pub(crate) pending_shutdown_retries: Vec<(u32, u32)>,
     /// Connections whose queued head send could not be pushed (SQ still
-    /// full after submit): (conn_index, generation, attempts). Drained each
-    /// tick by `drain_send_retries`; the entry stays at the queue head with
-    /// `in_flight = true` meanwhile, so stream order and the close deferral
-    /// are preserved. Two failed attempts fail the queued sends and close the
-    /// connection, mirroring `pending_copy_retries`.
-    pub(crate) pending_send_retries: Vec<(u32, u32, u8)>,
+    /// full after submit): (conn_index, generation). Drained each iteration
+    /// by `drain_send_retries` until the push goes through; the entry stays
+    /// at the queue head with `in_flight = true` meanwhile, so stream order
+    /// and the close deferral are preserved.
+    pub(crate) pending_send_retries: Vec<(u32, u32)>,
     /// Awaited sends that no CQE will ever settle, in settle order and keyed
     /// by the id the submitting future holds. Drained by the event loop into
     /// `Executor::complete_send`; the driver never touches the `Executor`
@@ -782,7 +810,7 @@ pub(crate) struct Driver {
     pub(crate) settled_sends: VecDeque<(SendId, io::Result<u32>)>,
     /// Connections `arm_direct_recv_or_close` closed because it could not arm
     /// their receive — no room under `recv_accumulator_max` or in the TLS
-    /// engine's buffer, or the SQE could not be pushed — with the error the
+    /// engine's buffer — with the error the
     /// reader is owed, keyed by `(conn_index, generation)`. Drained by the
     /// caller into `Executor::fail_recv` before the woken reader is polled;
     /// the driver never touches the `Executor` itself.
@@ -813,10 +841,10 @@ pub(crate) struct Driver {
     /// queue at drain time so the per-tick drain reuses a single allocation
     /// across ticks (the primary queue is left empty for in-iteration
     /// re-enqueues; `drain(..)` on the scratch keeps its capacity).
-    pub(crate) zc_retry_scratch: Vec<(u32, u32, u16, u8)>,
-    pub(crate) copy_retry_scratch: Vec<(u32, u32, u16, u8, OpTag)>,
-    pub(crate) coalesced_retry_scratch: Vec<(u32, u32, u16, u8)>,
-    pub(crate) send_retry_scratch: Vec<(u32, u32, u8)>,
+    pub(crate) zc_retry_scratch: Vec<(u32, u32, u16)>,
+    pub(crate) copy_retry_scratch: Vec<(u32, u32, u16, OpTag)>,
+    pub(crate) coalesced_retry_scratch: Vec<(u32, u32, u16)>,
+    pub(crate) send_retry_scratch: Vec<(u32, u32)>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
     /// NVMe device tracking table. `None` when NVMe is not configured.
@@ -1198,6 +1226,7 @@ impl Driver {
             recv_direct_region: config.recv_direct_region,
             defer_recv_arm: config.defer_recv_arm,
             deferred_recv_arms: Vec::new(),
+            recv_arm_retries: Vec::new(),
             udp_batch_recv_at: std::time::Instant::now(),
             tick_interval: (config.tick_timeout_us > 0)
                 .then(|| std::time::Duration::from_micros(config.tick_timeout_us)),
@@ -1552,7 +1581,7 @@ impl Driver {
             // A `false` here means the head was parked (SQ still full):
             // it stays queued with `in_flight = true`, `drain_send_retries`
             // re-pushes it, and `close_pending` keeps the Close deferred
-            // behind it until it drains or the retry cap fails the send.
+            // behind it until it drains.
             self.submit_next_queued(conn_index);
         } else {
             // Nothing queued: do NOT finalize here. Committing the Close SQE
@@ -1952,23 +1981,20 @@ impl Driver {
     /// pushed (SQ still full after submit): the entry is *parked* — it stays
     /// at the queue head, `in_flight` stays `true`, and the connection is on
     /// `pending_send_retries` for `drain_send_retries` to re-push next
-    /// iteration. Nothing is dropped or released on that path (Domain
-    /// Invariant 7); persistent starvation past the retry cap fails the
-    /// queued sends and closes the connection there.
+    /// iteration, and each iteration after until the ring takes it. Nothing
+    /// is dropped or released on that path (Domain Invariant 7).
     pub(crate) fn submit_next_queued(&mut self, conn_index: u32) -> bool {
         // Clear the finished send's wait state.
         let state = &mut self.send_queues[conn_index as usize];
         state.pollout_seen = false;
         state.resubmitted_on_pollout = false;
-        self.submit_next_queued_inner(conn_index, 0)
+        self.submit_next_queued_inner(conn_index)
     }
 
-    /// [`submit_next_queued`](Self::submit_next_queued) with the attempt
-    /// count to record if the push fails again. `drain_send_retries` passes
-    /// `attempts + 1` so a re-park carries the incremented count instead of
-    /// restarting at zero; every other caller goes through the public
-    /// wrapper with `0`.
-    pub(crate) fn submit_next_queued_inner(&mut self, conn_index: u32, attempts: u8) -> bool {
+    /// [`submit_next_queued`](Self::submit_next_queued) without clearing the
+    /// finished send's wait state, for `drain_send_retries`, which re-pushes
+    /// a parked head and has no finished send.
+    pub(crate) fn submit_next_queued_inner(&mut self, conn_index: u32) -> bool {
         let ci = conn_index as usize;
 
         let generation = self.connections.generation(conn_index);
@@ -1982,7 +2008,6 @@ impl Driver {
             },
             conn_index,
             generation,
-            attempts,
         ) {
             return pushed;
         }
@@ -2004,11 +2029,10 @@ impl Driver {
                 Err(_) => {
                     // SQ still full after submit: park at the head. Nothing
                     // is released and `in_flight` stays true; see
-                    // `drain_send_retries` for the retry and the cap.
+                    // `drain_send_retries` for the retry.
                     state.parked = true;
                     let generation = self.connections.generation(conn_index);
-                    self.pending_send_retries
-                        .push((conn_index, generation, attempts));
+                    self.pending_send_retries.push((conn_index, generation));
                     false
                 }
             };
@@ -2079,7 +2103,7 @@ impl Driver {
                 state.in_flight = true;
                 state.parked = true;
                 let generation = self.connections.generation(conn_index);
-                self.pending_send_retries.push((conn_index, generation, 0));
+                self.pending_send_retries.push((conn_index, generation));
             }
         }
     }
@@ -2715,8 +2739,9 @@ impl Driver {
             self.ring
                 .submit_recvmsg_multishot(fd_index, msghdr_ptr, bgid, ud)
         };
+        // A refused push is counted in `ring::SQE_SUBMIT_FAILURES` by the
+        // engine.
         if result.is_err() {
-            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
             self.udp_awaiting_buffers.push(udp_index);
         }
     }
@@ -2999,10 +3024,10 @@ impl Driver {
         //    SQ full, so no operation is in flight and no CQE will release
         //    them. A zero-copy entry still waits for any notification its
         //    earlier operations owe.
-        for (_, _, slab_idx, _) in std::mem::take(&mut self.pending_coalesced_retries) {
+        for (_, _, slab_idx) in std::mem::take(&mut self.pending_coalesced_retries) {
             self.release_coalesced_at_shutdown(slab_idx);
         }
-        for (_, _, slab_idx, _) in std::mem::take(&mut self.pending_zc_retries) {
+        for (_, _, slab_idx) in std::mem::take(&mut self.pending_zc_retries) {
             self.release_zc_at_shutdown(slab_idx);
         }
         // A parked `Shutdown` has nothing in the kernel either, and the
@@ -3200,7 +3225,7 @@ pub(crate) struct RunParts<'a> {
     pub(crate) send_slab: &'a mut crate::buffer::send_slab::InFlightSendSlab,
     pub(crate) send_copy_pool: &'a mut crate::buffer::send_copy::SendCopyPool,
     pub(crate) send_queues: &'a mut [crate::handler::ConnSendState],
-    pub(crate) pending_send_retries: &'a mut Vec<(u32, u32, u8)>,
+    pub(crate) pending_send_retries: &'a mut Vec<(u32, u32)>,
 }
 
 /// Submit the run of consecutive copy sends at the head of `conn_index`'s
@@ -3208,13 +3233,11 @@ pub(crate) struct RunParts<'a> {
 /// of at least two or the send slab is full, with nothing changed, and the
 /// caller submits the head alone. Returns `Some(true)` when the run was
 /// pushed and popped off the queue, and `Some(false)` when the SQ was full:
-/// the run stays queued, parked, and on `pending_send_retries` with
-/// `attempts`.
+/// the run stays queued, parked, and on `pending_send_retries`.
 pub(crate) fn submit_coalesced_run(
     p: RunParts<'_>,
     conn_index: u32,
     generation: u32,
-    attempts: u8,
 ) -> Option<bool> {
     use crate::buffer::send_slab::MAX_IOVECS;
 
@@ -3322,8 +3345,7 @@ pub(crate) fn submit_coalesced_run(
                     p.send_slab.release(slab_idx);
                     restore(p.send_copy_pool);
                     p.send_queues[ci].parked = true;
-                    p.pending_send_retries
-                        .push((conn_index, generation, attempts));
+                    p.pending_send_retries.push((conn_index, generation));
                     return Some(false);
                 }
             }

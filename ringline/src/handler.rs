@@ -362,7 +362,7 @@ pub(crate) struct DriverCtx<'a> {
     /// full after submit); `submit_or_queue` parks the entry here instead of
     /// failing. Same list as `backend::uring::driver::Driver::pending_send_retries`,
     /// drained by the event loop's `drain_send_retries`.
-    pub(crate) pending_send_retries: &'a mut Vec<(u32, u32, u8)>,
+    pub(crate) pending_send_retries: &'a mut Vec<(u32, u32)>,
     /// Worker-wide bounded-send results that no CQE will carry, keyed by
     /// the id the submitting future holds. Same queue as
     /// `backend::uring::driver::Driver::settled_sends`, drained by
@@ -984,9 +984,8 @@ impl<'a> DriverCtx<'a> {
     /// return. If the push fails (SQ still full after submit) the entry is
     /// parked at the head of the (empty) queue with `in_flight = true` and
     /// the connection is registered on `pending_send_retries`; the event
-    /// loop's `drain_send_retries` re-pushes it next iteration and, after
-    /// two failed attempts, fails the queued sends and closes the connection.
-    /// Nothing is dropped or released here (Domain Invariant 7).
+    /// loop's `drain_send_retries` re-pushes it each iteration until the ring
+    /// takes it. Nothing is dropped or released here (Domain Invariant 7).
     pub(crate) fn submit_or_queue(&mut self, conn_index: u32, built: BuiltSend) {
         // An active IO_LINK chain counts as in flight: io_uring does not order
         // independent SQEs, so pushing this send now could interleave its bytes
@@ -1011,7 +1010,7 @@ impl<'a> DriverCtx<'a> {
                 state.in_flight = true;
                 state.parked = true;
                 let generation = self.connections.generation(conn_index);
-                self.pending_send_retries.push((conn_index, generation, 0));
+                self.pending_send_retries.push((conn_index, generation));
             }
         }
     }
@@ -1042,7 +1041,6 @@ impl<'a> DriverCtx<'a> {
             },
             conn_index,
             generation,
-            0,
         );
         if pushed.is_some() {
             return;
@@ -1054,7 +1052,7 @@ impl<'a> DriverCtx<'a> {
             }
             Err(_) => {
                 state.parked = true;
-                self.pending_send_retries.push((conn_index, generation, 0));
+                self.pending_send_retries.push((conn_index, generation));
             }
         }
     }
