@@ -11,7 +11,9 @@
 // connections are opened first, so their polls are earlier requests than
 // anything on the target. Then the target: its client sets a 4 KiB receive
 // buffer and never reads, its hangup poll is armed, and a 512 KiB SEND_ZC is
-// submitted, so most of it stays queued and its notification (CQE_F_NOTIF)
+// submitted with MSG_DONTWAIT. The kernel accepts what fits in the socket
+// buffer (176,128 bytes on 6.8 and 6.12, all of it on 7.2), and since the peer
+// does not read, that data stays queued and the notification (CQE_F_NOTIF)
 // does not land. After 300 ms the round checks the notification is still out
 // and applies the arm:
 //

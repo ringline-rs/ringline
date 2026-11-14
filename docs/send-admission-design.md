@@ -44,9 +44,9 @@ problems 2 and 3.
 
 ## What exists
 
-Read at 07dd0f56; line numbers in every section are at that commit. `io.rs`
-is `ringline/src/runtime/io.rs`, `sc.rs` is
-`ringline/src/runtime/send_completion.rs`, `waker.rs` is
+Read at 07dd0f56; line numbers are at that commit, except in section 3's
+specification, which cites 03628fee. `io.rs` is `ringline/src/runtime/io.rs`,
+`sc.rs` is `ringline/src/runtime/send_completion.rs`, `waker.rs` is
 `ringline/src/runtime/waker.rs`, `handler.rs` is `ringline/src/handler.rs`,
 and `completion.rs` is `ringline/src/completion.rs`. `udriver.rs`, `uloop.rs`
 and `ring.rs` are `ringline/src/backend/uring/driver.rs`, `event_loop.rs` and
@@ -262,7 +262,7 @@ releasing their pool slots and slab entries. The contract the caller needs:
   `ConnectionAborted` too;
 - a parked reader gets `ConnectionAborted`;
 - no close_notify is sent, and on mio the queue is not flushed first
-  (`finish_close` flushes and writes the alert, mdriver.rs:736-776);
+  (`finish_close` flushes and writes the alert, mio driver.rs:738-785);
 - it applies to a connection that is already closing, which is problem 4's
   case, and does nothing once the connection's `Close` has been committed;
 - callers use it in place of `close()` for a peer that has stopped reading.
@@ -287,8 +287,10 @@ results are in `docs/journal/2026-11-abort-close.md`, with the probe in
   kernels, with 0, 1 and 256 other connections whose hangup polls were
   pending. The disconnect does not wait for the fixed file's release.
 - Cancelling the connection's requests, setting `SO_LINGER {1, 0}` and closing
-  released it at once on 7.2. On 6.8 and 6.12 it was released only once every
-  request that other connections had pending before it had ended: not within
+  released it at once with no other connections, and, with other
+  connections' requests pending, at once only on 7.2. On 6.8 and 6.12 it was
+  then released only once every request that other connections had pending
+  before it had ended: not within
   5 s while they stayed pending, and as soon as the probe ended them by closing
   the idle peers (0.08 to 0.17 ms after closing one, 2.3 to 4.3 ms after
   starting to close 256).
@@ -298,64 +300,91 @@ results are in `docs/journal/2026-11-abort-close.md`, with the probe in
 So `abort` uses the disconnect on every kernel. On io_uring, for a TCP
 connection, plain or TLS:
 
-1. The connection is marked closing, and a parked reader is failed with
-   `ConnectionAborted`, as `abort_connection` does (event_loop.rs:3341), and
-   also when a close is already requested, where `abort_connection` returns
-   early today.
+1. The connection is marked closing (`Lifecycle::Closing`) before anything
+   is pushed, and a parked reader is failed with `ConnectionAborted`, as
+   `abort_connection` does (uloop.rs:3341). `abort` does this also when
+   a close is already requested, where `abort_connection` returns early. The
+   disconnect completes the connection's hangup poll and any armed receive,
+   and their handlers drop completions for a connection that is not open
+   (`handle_hangup_poll`, uloop.rs:1559; `handle_recv_direct`,
+   uloop.rs:1236).
 2. Its queued sends and its waiting bounded sends fail with
-   `ConnectionAborted` and release their pool slots.
-3. An `IORING_OP_CONNECT` with an `AF_UNSPEC` address is submitted on the
-   connection's fixed file, under a completion tag of its own so that its
-   completion does not reach `handle_connect` (`submit_connect`, ring.rs:617).
-   It is hard-linked to the connection's normal close lead and `Close`
-   (`submit_close`, ring.rs:549; `close_lead_for`, ring.rs:83), so the `Close`
-   runs whether or not the disconnect succeeds.
-4. The disconnect sends an RST and purges the socket's write queue, so the
-   zero-copy notifications land and the slab entries and their paired pool
-   slots are released. A send still in the kernel is expected to complete
-   with an error, which `abort` reports as `ConnectionAborted`. Experiment A
-   had none in flight at the disconnect, so this is not verified, and the
-   tests below check it.
-5. The `Close` frees the slot when the kernel releases the file. Before 6.13
-   that waits for older requests on other connections, as before, but nothing
-   the connection's sends hold waits with it.
+   `ConnectionAborted` and release their pool slots, and a close_notify the
+   pool retained is dropped, as `force_finalize_close` drops them
+   (udriver.rs:2070-2110). `close_submitted` is set and `close_pending`
+   cleared, as `try_finalize_close` does (udriver.rs:2003-2009), so the end of
+   the iteration does not submit a second `Close`. A `SendPollOut` is
+   cancelled first, as `submit_committed_close` does (udriver.rs:2024-2033).
+3. An `IORING_OP_CONNECT` with an `AF_UNSPEC` address, the connection's
+   normal close lead (`close_lead_for`, ring.rs:83) and the `Close` are pushed
+   as one hard-linked chain of three through `Engine::push_chain`
+   (engine/mod.rs:58), so the `Close` runs whether or not the disconnect
+   succeeds. The connect has a completion tag of its own, whose handler
+   ignores the result as the close leads' handlers do, so that it does not
+   reach `handle_connect` (`submit_connect`, ring.rs:617). `push_chain`
+   refuses a chain longer than the SQ, so config validation raises the SQ
+   minimum to 4. If a `Shutdown` lead of an earlier close is still in the
+   kernel, the `Close` must wait for it, because the `Close` frees the slot
+   the `Shutdown` names (udriver.rs:1987-1993, #518). In that case only the
+   connect is pushed at once, since it frees nothing, and the `Shutdown`'s
+   completion commits the lead and `Close` as it does today.
+4. On TCP the disconnect returns 0 for an established, closing or
+   peer-reset socket. It sends an RST and purges the socket's write queue,
+   so the zero-copy notifications land and the slab entries and their paired
+   pool slots are released. Only errors before the protocol is reached, such
+   as `EBADF`, fail it. This is from the Linux 6.8 source (`tcp_disconnect`
+   always returns 0), not a run. A send still in the kernel is expected to
+   complete with an error, which `abort` reports as `ConnectionAborted`.
+   Experiment A had none in flight at the disconnect, so this is not
+   verified, and the tests below check it.
+5. The `Close`'s completion releases the slot at once (`handle_close`,
+   uloop.rs:4026). The kernel releases the socket later (before 6.13,
+   after older requests on other connections end), but nothing the
+   connection's sends hold waits for it.
 
 On a Unix-domain connection, `abort` drops the queue and closes with the
 normal lead, without a disconnect. Guarded sends there release at completion
-(CLAUDE.md, the copies table), so nothing outlives the `Close`, and the peer
-sees end of file rather than a reset. Experiment A did not test a disconnect on
-a Unix-domain socket.
+(CLAUDE.md, the copies table), so nothing outlives the `Close`. The peer sees
+end of file, or `ECONNRESET` if this end had received data it did not read.
+Experiment A did not test a disconnect on a Unix-domain socket.
 
 On mio, `abort` drops the queue on the open connection, as
 `fail_connection_on_send_error` does (mio event_loop.rs:1341), returns the
 queued sends' permits, sets `SO_LINGER {1, 0}` on the socket and closes it,
-skipping `finish_close`'s flush and close_notify (mio driver.rs:738). The
+skipping `finish_close`'s flush and close_notify (mio driver.rs:738-785). The
 socket is a normal descriptor there, so the setsockopt and close reset it on
 every kernel; Experiment A did not cover mio.
 
-Worker exit is unchanged. It cancels every request and then closes with the
-`Abort` lead, and Experiment A's batch arm, which cancels, sets `SO_LINGER` and
-closes every connection at once, released all 257 connections in 7.2 to 8.1 ms
-on 6.8 and 6.12 and 3.2 to 3.7 ms on 7.2.
+Worker exit is unchanged. It cancels every connection's requests. A connection
+holding no slab entry is closed at once with the `CancelAll` lead, and one
+still holding entries after `ABORT_AFTER` (1 s) is closed with the `Abort`
+lead (udriver.rs:117, 3221-3237, 3311-3326). Experiment A's batch arm is that
+last step without the wait: the cancel, `SO_LINGER` and `Close` of all 257
+connections submitted together, after which the target was released by the
+first reap, 7.1 to 8.2 ms after the batch began on 6.8 and 6.12 and 3.2 to
+3.7 ms on 7.2, and every idle client read `ECONNRESET` when checked just
+after.
 
 ### Tests
 
-- On a connection whose peer has stopped reading, with a zero-copy send held
-  and another, idle connection with its hangup poll pending, `abort` returns
-  the slab entry, its paired pool slot and the queued sends' slots within
-  100 ms, and the peer reads `ECONNRESET`. This has to run on a kernel before
-  6.13, the rack's 6.8 and 6.12 images: on CI's 6.17 the cancel-and-linger
-  close also passes it.
+- On one worker (`workers(1)`), so that both connections share a ring: a
+  connection whose peer has stopped reading holds a zero-copy send, and
+  another, idle connection has its hangup poll pending. `abort` returns the
+  slab entry, its paired pool slot and the queued sends' slots within 100 ms,
+  and the peer reads `ECONNRESET`. CI's 6.17 cannot tell the disconnect from
+  the cancel-and-linger close here, so the test also runs on the rack's 6.8
+  and 6.12 images through an `experiments/*-verify.toml` spec, red with the
+  disconnect replaced by the cancel-and-linger close and green without.
 - Queued, waiting and in-flight sends fail with `ConnectionAborted`, and a
   parked reader gets `ConnectionAborted`.
 - `abort` after `close()` on a connection whose peer has stopped reading
   releases the same resources; `abort` after the `Close` is committed does
   nothing.
-- A TLS connection sends no close_notify, and a Unix-domain connection closes.
+- A TLS connection sends no close_notify. A Unix-domain connection closes and
+  its queued sends' pool slots are released.
 - On mio, the peer reads `ECONNRESET`, no close_notify is written, and the
   permits return to the pool.
-- Each test fails with its mechanism removed: with the disconnect replaced by
-  the cancel-and-linger close, the first test fails on 6.8 and 6.12.
+- Each test fails with its mechanism removed.
 
 ## 4. The fast path
 

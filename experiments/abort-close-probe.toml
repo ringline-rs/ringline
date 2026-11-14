@@ -29,16 +29,17 @@ artifacts = ["/tmp/job/run.log", "/tmp/job/results.txt"]
 payload = '''
 set -o pipefail
 mkdir -p /tmp/job
+echo 0 > /tmp/job/status
 {
   echo "== guest =="; uname -r; nproc; grep PRETTY /etc/os-release
   if ! command -v cc >/dev/null || ! command -v git >/dev/null; then
     sudo apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential git >/dev/null
   fi
-  git clone -q {repo} /tmp/job/src
-  git -C /tmp/job/src checkout -q {ref}
+  git clone -q {repo} /tmp/job/src || { echo "clone failed"; echo 1 > /tmp/job/status; exit 1; }
+  git -C /tmp/job/src checkout -q {ref} || { echo "checkout of {ref} failed"; echo 1 > /tmp/job/status; exit 1; }
   echo "== probe at $(git -C /tmp/job/src log --oneline -1)"
-  cc -O2 -Wall -o /tmp/job/probe /tmp/job/src/experiments/abort-close-probe.c
+  cc -O2 -Wall -o /tmp/job/probe /tmp/job/src/experiments/abort-close-probe.c || { echo "build failed"; echo 1 > /tmp/job/status; exit 1; }
   set +e
   for idle in 0 1 256; do
     for arm in plain linger cancel_linger unspec cancel_unspec batch; do
@@ -50,5 +51,6 @@ mkdir -p /tmp/job
   done
   echo done
 } 2>&1 | tee /tmp/job/run.log
-exit 0
+# The group above runs in a subshell, so its failures are reported here.
+exit "$(cat /tmp/job/status)"
 '''
