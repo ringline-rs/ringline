@@ -805,9 +805,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let (fwd, rest) = data.split_at(take);
 
         if !fwd.is_empty() && !self.driver.forward_push(conn_index, fwd) {
-            // Sink gone or its slot recycled. The source itself is still
-            // healthy, so the remaining bytes go to the accumulator and the
-            // handler decides what to do with the EPIPE.
+            // Sink gone, its slot recycled, or aborted. The source itself is
+            // still healthy, so the remaining bytes go to the accumulator and
+            // the handler decides what to do with the EPIPE.
             self.driver.finish_forward(conn_index, Err(libc::EPIPE));
             self.executor.wake_recv(conn_index);
             return self.append_or_close(conn_index, data);
@@ -3068,7 +3068,8 @@ mod tests {
             !el.driver.forward_push(source, &chunk),
             "a forward into an aborted sink is refused"
         );
-        // A send queued on the sink without its refusal.
+        // Queued directly, past the `closing_refusal` an aborted connection's
+        // sends get, to stand for anything left on the queue at the drain.
         el.driver.pending_sends[sink as usize].push_back(
             crate::backend::mio::driver::PendingSend::plain(chunk.clone()),
         );
@@ -3076,6 +3077,10 @@ mod tests {
         assert!(
             !el.driver.pending_closes.contains(&sink),
             "the aborted sink's close did not finish"
+        );
+        assert_eq!(
+            el.driver.forward_done[source as usize],
+            Some(Err(libc::EPIPE))
         );
     }
 

@@ -163,10 +163,12 @@ fn fill(conn: &mut Connection) {
         .expect("guard send accepted");
 }
 
-/// On mio: plain sends, which take no send-pool slot.
+/// On mio: 16 MiB of plain sends, which take no send-pool slot. macOS grows
+/// loopback socket buffers to 4 MiB a side, and a smaller fill let the bounded
+/// sends behind it complete before the abort.
 #[cfg(not(has_io_uring))]
 fn fill(conn: &mut Connection) {
-    for _ in 0..64 {
+    for _ in 0..256 {
         conn.send_nowait(&[1; 1 << 16]).expect("queued");
     }
 }
@@ -270,8 +272,8 @@ fn abort_releases_a_stalled_connection_at_once() {
     let mut body = Vec::new();
     let read = peer.read_to_end(&mut body);
     // On macOS a peer that only read sometimes saw no reset within the 5 s
-    // timeout (13 of 210 runs, and the same with a plain socket pair and no
-    // ringline). A write draws a reset from any closed socket, so it is made
+    // timeout (13 of 210 runs, and the same with two plain TCP sockets on
+    // loopback and no ringline). A write draws a reset from any closed socket, so it is made
     // only after the read timed out: an end of stream still fails the test.
     #[cfg(target_os = "macos")]
     let read = if matches!(&read, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {

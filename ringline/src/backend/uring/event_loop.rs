@@ -2815,11 +2815,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.defer_finalize_close(conn_index);
     }
 
-    /// `abort`'s disconnect has completed. Its result is ignored, as the
-    /// close leads' are: the `Close` runs whatever the disconnect returned.
-    /// A lone one (`Disconnect::Alone`) held the `Close`, which frees the slot
-    /// it names,
-    /// so this releases the hold and registers the connection for the
+    /// `abort`'s disconnect has completed. Its result is ignored, as a close
+    /// lead's is: the `Close` runs whatever the disconnect returned. A lone
+    /// one (`Disconnect::Alone`) held the `Close`, which frees the slot it
+    /// names, so this releases the hold and registers the connection for the
     /// end-of-iteration drain, as `handle_shutdown` does. One chained ahead
     /// of a `Close` changes nothing here, and neither does one whose slot has
     /// been released (its generation changed).

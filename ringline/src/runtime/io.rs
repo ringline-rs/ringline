@@ -4086,8 +4086,8 @@ enum AdmissionState {
 /// for a write half that is shut down, `ConnectionAborted` for a connection
 /// that was aborted ([`SendHalf::abort`]) or closed while waiting,
 /// `NotConnected`, on io_uring, for a TLS connection whose close_notify is
-/// queued or whose close was committed before or while it waited, and
-/// anything the submission itself reports. Errors after submission come from
+/// queued and for any connection whose close was committed before or while it
+/// waited, and anything the submission itself reports. Errors after submission come from
 /// the [`SendCompletion`].
 ///
 /// `!Send`: its connection index and its place in the admission FIFO belong
@@ -4361,14 +4361,14 @@ enum BackpressuredState<'a> {
 /// - [`NotConnected`](io::ErrorKind::NotConnected) — on io_uring, the
 ///   connection is TLS and its close_notify is already queued (`close()`, a
 ///   handler return or a fatal encrypt error); or the connection's close was
-///   *committed* before or while this send waited for capacity. A waiter in
-///   the admission FIFO is neither in flight nor in the per-connection send
-///   queue, so it does
-///   not hold off `try_finalize_close`; if the close is finalized while it
-///   waits, winning capacity finds the Close already submitted and the send is
-///   refused rather than written. Which of this and `ConnectionAborted` you see
-///   is a race between the capacity wake and teardown — treat both as "the
-///   connection went away", and expect either on a peer that closed.
+///   committed before or while this send waited for capacity. A waiter in the
+///   admission FIFO is neither in flight nor in the per-connection send queue,
+///   so it does not hold off `try_finalize_close`; if the close is finalized
+///   while it waits, winning capacity finds the Close already submitted and
+///   the send is refused rather than written. Which of this and
+///   `ConnectionAborted` you see is a race between the capacity wake and
+///   teardown — treat both as "the connection went away", and expect either
+///   on a peer that closed.
 /// - Anything the underlying send reports, including `BrokenPipe` (`EPIPE`) from
 ///   the socket itself when the peer has reset.
 ///

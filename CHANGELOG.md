@@ -31,18 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `SendCompletion`, with no change in behaviour. Removing a waiter from the
   FIFO, on a timeout, a cancel or a connection's release, no longer searches
   it (`docs/send-admission-design.md`, section 2).
-- `SendHalf::abort` and `Connection::abort` close a connection without
-  draining its sends, for a peer that has stopped reading, where `close()`
-  waits for it. Every send on the connection that has not resolved fails with
+- `SendHalf::abort` and `Connection::abort` close a connection without draining
+  its sends, for a peer that has stopped reading, where `close()` waits for it.
+  Every send on the connection that has not resolved fails with
   `ConnectionAborted`: queued sends, sends waiting for send-pool capacity, and
-  sends in flight. A later send fails the same way, a parked `with_data`
-  resolves to 0, and `with_data_result` returns `ConnectionAborted`. The sends'
-  send-pool slots and zero-copy buffers are released without waiting for the
-  peer. No close_notify is sent, and a TCP peer on Linux reads `ECONNRESET`. On
-  io_uring the socket is disconnected (`IORING_OP_CONNECT` to `AF_UNSPEC`)
-  ahead of its `Close`, so before Linux 6.13 the zero-copy buffers come back
-  even while other connections' requests hold the fixed file. On mio the
-  socket is closed with `SO_LINGER {1, 0}`.
+  sends in flight. A send made after the abort fails the same way until the
+  connection is released, a parked `with_data` resolves to 0, and
+  `with_data_result` returns `ConnectionAborted`. The sends' send-pool slots and
+  zero-copy buffers are released without waiting for the peer. No close_notify
+  is sent, and a TCP peer on Linux reads `ECONNRESET`. On io_uring the socket is
+  disconnected (`IORING_OP_CONNECT` to `AF_UNSPEC`) ahead of its `Close`, so
+  before Linux 6.13 the zero-copy buffers come back even while other
+  connections' requests hold the fixed file. On mio the socket is closed with
+  `SO_LINGER {1, 0}`.
 - io_uring: `ConfigBuilder::sqpoll_cpus(&[u32])` pins worker `i`'s SQPOLL
   thread to logical CPU `cpus[i]` (#834). Entries may repeat, so several SQ
   threads can share one CPU. With `sqpoll(true)`, `launch` fails with
