@@ -352,7 +352,7 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
         &mio_loop,
         "if let Some(ref rx) = self.driver.disk_io_rx",
         "rx.try_recv()",
-        "response.seq",
+        "response.key",
         "Mio drains disk I/O responses in the worker loop",
     )?;
     // Both ring-entry branches must precede the drain, and both must carry

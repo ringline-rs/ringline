@@ -4486,9 +4486,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             None => return,
         };
 
-        if !nvme_cmd_slab.in_use(slab_idx) {
+        let Some(key) = nvme_cmd_slab.key_for(slab_idx, ud.raw()) else {
             return;
-        }
+        };
 
         let device_index = nvme_cmd_slab.release(slab_idx);
 
@@ -4517,13 +4517,13 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let result = crate::nvme::status_result(result);
 
         // Wake the async task waiting for this NVMe completion.
-        self.executor.wake_disk_io(ud.payload(), result);
+        self.executor.wake_disk_io(key, result);
     }
 
     /// Push the fsyncs held until the write under disk-I/O key `key` and the
     /// writes before it completed (#905). A push the ring refuses is queued
     /// (`Ring::push_disk_sqe`), so none is lost.
-    fn submit_released_fsyncs(&mut self, key: u32) {
+    fn submit_released_fsyncs(&mut self, key: crate::runtime::DiskIoKey) {
         for (fd_index, ud) in self.driver.write_orders.end_write(key) {
             let _ = self.driver.ring.submit_direct_fsync(fd_index, UserData(ud));
         }
@@ -4558,9 +4558,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             None => return,
         };
 
-        if !cmd_slab.in_use(slab_idx) {
+        let Some(key) = cmd_slab.key_for(slab_idx, ud.raw()) else {
             return;
-        }
+        };
 
         let op = cmd_slab.get(slab_idx).map(|e| e.op);
 
@@ -4575,7 +4575,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // An open whose `OpenFuture` was dropped: nothing holds a handle to
         // the file, so close it, free the slot and deliver nothing.
-        if op == Some(crate::fs::FsOp::Open) && self.executor.take_abandoned_open(ud.payload()) {
+        if op == Some(crate::fs::FsOp::Open) && self.executor.take_abandoned_open(key) {
             cmd_slab.release(slab_idx);
             if result >= 0 {
                 // The slot is free once the close completes.
@@ -4603,7 +4603,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         let (released_file_index, released_op) = cmd_slab.release(slab_idx);
-        self.submit_released_fsyncs(ud.payload());
+        self.submit_released_fsyncs(key);
 
         // Decrement in-flight count for file-bound ops.
         match released_op {
@@ -4630,8 +4630,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Wake the async task waiting for this completion.
-        self.executor
-            .wake_disk_io_with(ud.payload(), result, metadata);
+        self.executor.wake_disk_io_with(key, result, metadata);
     }
 
     fn handle_pidfd_poll(&mut self, ud: UserData, result: i32) {
@@ -6503,12 +6502,11 @@ mod tests {
         let mut el = make_test_loop();
         el.driver.ring.flush().unwrap();
         el.driver.ring.force_push_failures(1);
-        let key = el
-            .driver
+        let key = el.executor.begin_disk_io(0);
+        el.driver
             .make_ctx()
-            .fs_stat(std::path::Path::new("/"), false)
+            .fs_stat(std::path::Path::new("/"), false, key)
             .expect("a refused push queues the command");
-        el.executor.wait_disk_io(key, 0);
         assert_eq!(el.driver.ring.disk_retries_pending(), 1);
         assert_eq!(el.driver.push_retries_pending(), 1);
         assert_eq!(
@@ -6522,6 +6520,39 @@ mod tests {
         assert_eq!(el.executor.take_disk_io_result(key), Some(0), "statx of /");
     }
 
+    /// A CQE whose user_data is that of an earlier operation in the same
+    /// command-slab slot is ignored: it neither completes the slot's current
+    /// operation nor releases the slot (#906). The current operation is held
+    /// in the push queue, so the kernel cannot complete it first.
+    #[test]
+    fn a_cqe_for_an_earlier_operation_in_the_slab_slot_is_ignored() {
+        let mut el = make_test_loop();
+        el.driver.ring.flush().unwrap();
+        el.driver.ring.force_push_failures(1);
+        let key = el.executor.begin_disk_io(0);
+        el.driver
+            .make_ctx()
+            .fs_stat(std::path::Path::new("/"), false, key)
+            .expect("a refused push queues the command");
+        let [current] = fs_commands(&el)[..] else {
+            panic!("one command in flight")
+        };
+        let current = UserData(current);
+        // The same slab index under another sequence.
+        let earlier = UserData::encode(
+            OpTag::Fs,
+            current.conn_index(),
+            current.payload() ^ (1 << 16),
+        );
+        el.dispatch_cqe(earlier.raw(), 0, 0);
+        assert_eq!(fs_commands(&el), [current.raw()], "the slot was released");
+        assert_eq!(el.executor.take_disk_io_result(key), None);
+
+        el.driver.ring.retry_disk_pushes();
+        drain_fs_commands(&mut el);
+        assert_eq!(el.executor.take_disk_io_result(key), Some(0), "statx of /");
+    }
+
     /// A command submitted while others are queued queues behind them, so
     /// queued commands are pushed in the order they were called.
     #[test]
@@ -6529,9 +6560,10 @@ mod tests {
         let mut el = make_test_loop();
         el.driver.ring.flush().unwrap();
         el.driver.ring.force_push_failures(1);
+        let [k1, k2] = [(); 2].map(|()| el.executor.begin_disk_io(0));
         let mut ctx = el.driver.make_ctx();
-        ctx.fs_stat(std::path::Path::new("/"), false).unwrap();
-        ctx.fs_stat(std::path::Path::new("/"), false).unwrap();
+        ctx.fs_stat(std::path::Path::new("/"), false, k1).unwrap();
+        ctx.fs_stat(std::path::Path::new("/"), false, k2).unwrap();
         assert_eq!(
             el.driver.ring.disk_retries_pending(),
             2,
@@ -6549,12 +6581,11 @@ mod tests {
         let mut el = make_test_loop();
         el.driver.ring.flush().unwrap();
         el.driver.ring.force_push_failures(1);
-        let key = el
-            .driver
+        let key = el.executor.begin_disk_io(0);
+        el.driver
             .make_ctx()
-            .fs_stat(std::path::Path::new("/"), false)
+            .fs_stat(std::path::Path::new("/"), false, key)
             .unwrap();
-        el.executor.wait_disk_io(key, 0);
         let [ud] = fs_commands(&el)[..] else {
             panic!("one command in flight")
         };
@@ -6572,9 +6603,10 @@ mod tests {
         let mut el = make_test_loop();
         el.driver.ring.flush().unwrap();
         el.driver.ring.force_push_failures(1);
+        let key = el.executor.begin_disk_io(0);
         el.driver
             .make_ctx()
-            .fs_stat(std::path::Path::new("/"), false)
+            .fs_stat(std::path::Path::new("/"), false, key)
             .unwrap();
         assert_eq!(el.driver.ring.disk_retries_pending(), 1);
         let started = std::time::Instant::now();
@@ -6683,7 +6715,10 @@ mod tests {
     /// Wait for and dispatch completions until `key`'s result arrives, for
     /// at most 30 s: an `O_DIRECT` write and fsync on a busy VM disk took
     /// about 5 s alongside the integration tests.
-    fn wait_for_result(el: &mut AsyncEventLoop<NoopHandler>, key: u32) -> i32 {
+    fn wait_for_result(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        key: crate::runtime::DiskIoKey,
+    ) -> i32 {
         let started = std::time::Instant::now();
         loop {
             if let Some(result) = el.executor.take_disk_io_result(key) {
@@ -6711,25 +6746,23 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("ringline-fsync-earlier-{}", std::process::id()));
         std::fs::write(&path, b"").unwrap();
-        let (index, generation, open_key) = el
+        let open_key = el.executor.begin_disk_io(0);
+        let (index, generation) = el
             .driver
             .make_ctx()
-            .fs_open(&path, crate::fs::OpenFlags::WRITE, 0)
+            .fs_open(&path, crate::fs::OpenFlags::WRITE, 0, open_key)
             .expect("submit open");
-        el.executor.wait_disk_io(open_key, 0);
         assert!(wait_for_result(&mut el, open_key) >= 0, "open");
         let file = crate::fs::File::new(index, generation);
 
         static DATA: &[u8] = b"durable";
-        let (write_key, sync_key) = {
+        let [write_key, sync_key] = [(); 2].map(|()| el.executor.begin_disk_io(0));
+        {
             let mut ctx = el.driver.make_ctx();
-            let write_key = unsafe { ctx.fs_write(file, 0, DATA.as_ptr(), DATA.len() as u32) }
+            unsafe { ctx.fs_write(file, 0, DATA.as_ptr(), DATA.len() as u32, write_key) }
                 .expect("submit write");
-            let sync_key = ctx.fs_fsync(file).expect("submit fsync");
-            (write_key, sync_key)
-        };
-        el.executor.wait_disk_io(write_key, 0);
-        el.executor.wait_disk_io(sync_key, 0);
+            ctx.fs_fsync(file, sync_key).expect("submit fsync");
+        }
         assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
         assert_eq!(wait_for_result(&mut el, write_key), DATA.len() as i32);
         assert_eq!(el.driver.write_orders.held(), 0, "the write released it");
@@ -6749,12 +6782,12 @@ mod tests {
             std::env::temp_dir().join(format!("ringline-fixed-close-{}", std::process::id()));
         std::fs::write(&path, b"data").unwrap();
         let open = |el: &mut AsyncEventLoop<NoopHandler>| {
-            let (index, generation, key) = el
+            let key = el.executor.begin_disk_io(0);
+            let (index, generation) = el
                 .driver
                 .make_ctx()
-                .fs_open(&path, crate::fs::OpenFlags::READ, 0)
+                .fs_open(&path, crate::fs::OpenFlags::READ, 0, key)
                 .expect("submit open");
-            el.executor.wait_disk_io(key, 0);
             assert!(wait_for_result(el, key) >= 0, "open");
             crate::fs::File::new(index, generation)
         };
@@ -6832,11 +6865,15 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("ringline-abandoned-open-{}", std::process::id()));
         std::fs::write(&path, b"data").unwrap();
-        let (index, _generation, key) = el
+        let key = el.executor.begin_disk_io(0);
+        let (index, _generation) = el
             .driver
             .make_ctx()
-            .fs_open(&path, crate::fs::OpenFlags::READ, 0)
+            .fs_open(&path, crate::fs::OpenFlags::READ, 0, key)
             .expect("submit open");
+        let [open_ud] = fs_commands(&el)[..] else {
+            panic!("one command in flight")
+        };
         el.executor.abandon_disk_io_open(key);
         let active = |el: &AsyncEventLoop<NoopHandler>| {
             el.driver
@@ -6866,10 +6903,7 @@ mod tests {
         loop {
             assert!(started.elapsed() < std::time::Duration::from_secs(30));
             let batch = reap(&mut el);
-            let open_done = batch.iter().any(|&(ud, _, _)| {
-                let ud = UserData(ud);
-                ud.tag() == Some(OpTag::Fs) && ud.payload() == key
-            });
+            let open_done = batch.iter().any(|&(ud, _, _)| ud == open_ud);
             if open_done {
                 assert!(active(&el), "the slot was freed before its close ran");
                 break;
@@ -6898,22 +6932,27 @@ mod tests {
             .unwrap()
             .join(format!(".ringline-o-direct-openat-{}", std::process::id()));
         std::fs::write(&path, [0u8; 4096]).unwrap();
-        let (index, generation, open_key) = el
+        let open_key = el.executor.begin_disk_io(0);
+        let (index, generation) = el
             .driver
             .make_ctx()
             .fs_open(
                 &path,
                 crate::fs::OpenFlags::READ_WRITE | crate::fs::OpenFlags::DIRECT,
                 0,
+                open_key,
             )
             .expect("submit open");
-        el.executor.wait_disk_io(open_key, 0);
         assert!(wait_for_result(&mut el, open_key) >= 0, "O_DIRECT open");
         let file = crate::fs::File::new(index, generation);
         static SHORT: [u8; 100] = [7; 100];
-        let write_key = unsafe { el.driver.make_ctx().fs_write(file, 0, SHORT.as_ptr(), 100) }
-            .expect("submit write");
-        el.executor.wait_disk_io(write_key, 0);
+        let write_key = el.executor.begin_disk_io(0);
+        unsafe {
+            el.driver
+                .make_ctx()
+                .fs_write(file, 0, SHORT.as_ptr(), 100, write_key)
+        }
+        .expect("submit write");
         let result = wait_for_result(&mut el, write_key);
         let _ = el.driver.make_ctx().fs_close(file);
         let _ = std::fs::remove_file(&path);
@@ -6930,28 +6969,27 @@ mod tests {
             .unwrap()
             .join(format!(".ringline-direct-fsync-{}", std::process::id()));
         std::fs::write(&path, [0u8; 4096]).unwrap();
-        let (index, generation, open_key) = el
+        let open_key = el.executor.begin_disk_io(0);
+        let (index, generation) = el
             .driver
             .make_ctx()
             .fs_open(
                 &path,
                 crate::fs::OpenFlags::READ_WRITE | crate::fs::OpenFlags::DIRECT,
                 0,
+                open_key,
             )
             .expect("submit open");
-        el.executor.wait_disk_io(open_key, 0);
         assert!(wait_for_result(&mut el, open_key) >= 0, "O_DIRECT open");
         let file = crate::fs::File::new(index, generation);
         let block = crate::buf::AlignedBuf::zeroed(4096, 4096);
-        let (write_key, sync_key) = {
+        let [write_key, sync_key] = [(); 2].map(|()| el.executor.begin_disk_io(0));
+        {
             let mut ctx = el.driver.make_ctx();
-            let write_key =
-                unsafe { ctx.fs_write(file, 0, block.as_ptr(), 4096) }.expect("submit write");
-            let sync_key = ctx.fs_fsync(file).expect("submit fsync");
-            (write_key, sync_key)
-        };
-        el.executor.wait_disk_io(write_key, 0);
-        el.executor.wait_disk_io(sync_key, 0);
+            unsafe { ctx.fs_write(file, 0, block.as_ptr(), 4096, write_key) }
+                .expect("submit write");
+            ctx.fs_fsync(file, sync_key).expect("submit fsync");
+        }
         assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
         assert_eq!(wait_for_result(&mut el, write_key), 4096);
         assert_eq!(el.driver.write_orders.held(), 0, "the write released it");
@@ -6971,32 +7009,28 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("ringline-fsync-later-{}", std::process::id()));
         std::fs::write(&path, b"0123").unwrap();
-        let (index, generation, open_key) = el
+        let open_key = el.executor.begin_disk_io(0);
+        let (index, generation) = el
             .driver
             .make_ctx()
-            .fs_open(&path, crate::fs::OpenFlags::READ_WRITE, 0)
+            .fs_open(&path, crate::fs::OpenFlags::READ_WRITE, 0, open_key)
             .expect("submit open");
-        el.executor.wait_disk_io(open_key, 0);
         assert!(wait_for_result(&mut el, open_key) >= 0, "open");
         let file = crate::fs::File::new(index, generation);
-        const EARLIER: u32 = u32::MAX;
+        const EARLIER: crate::runtime::DiskIoKey = u64::MAX;
         el.driver
             .write_orders
             .begin_write(crate::disk_order::OrderKey { index, generation }, EARLIER);
 
         static DATA: &[u8] = b"later";
         let mut buf = [0u8; 4];
-        let (sync_key, write_key, read_key) = {
+        let [sync_key, write_key, read_key] = [(); 3].map(|()| el.executor.begin_disk_io(0));
+        {
             let mut ctx = el.driver.make_ctx();
-            let sync_key = ctx.fs_fsync(file).expect("submit fsync");
-            let write_key = unsafe { ctx.fs_write(file, 8, DATA.as_ptr(), DATA.len() as u32) }
+            ctx.fs_fsync(file, sync_key).expect("submit fsync");
+            unsafe { ctx.fs_write(file, 8, DATA.as_ptr(), DATA.len() as u32, write_key) }
                 .expect("submit write");
-            let read_key =
-                unsafe { ctx.fs_read(file, 0, buf.as_mut_ptr(), 4) }.expect("submit read");
-            (sync_key, write_key, read_key)
-        };
-        for key in [sync_key, write_key, read_key] {
-            el.executor.wait_disk_io(key, 0);
+            unsafe { ctx.fs_read(file, 0, buf.as_mut_ptr(), 4, read_key) }.expect("submit read");
         }
         assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
         assert_eq!(wait_for_result(&mut el, write_key), DATA.len() as i32);
@@ -7019,12 +7053,12 @@ mod tests {
         let mut el = make_test_loop();
         let path = std::env::temp_dir().join(format!("ringline-held-fsync-{}", std::process::id()));
         std::fs::write(&path, b"x").unwrap();
-        let (index, generation, open_key) = el
+        let open_key = el.executor.begin_disk_io(0);
+        let (index, generation) = el
             .driver
             .make_ctx()
-            .fs_open(&path, crate::fs::OpenFlags::WRITE, 0)
+            .fs_open(&path, crate::fs::OpenFlags::WRITE, 0, open_key)
             .expect("submit open");
-        el.executor.wait_disk_io(open_key, 0);
         drain_fs_commands(&mut el);
         assert!(
             el.executor.take_disk_io_result(open_key).unwrap() >= 0,
@@ -7034,8 +7068,12 @@ mod tests {
         // Stand in for a write still in flight on the file.
         el.driver
             .write_orders
-            .begin_write(crate::disk_order::OrderKey { index, generation }, u32::MAX);
-        el.driver.make_ctx().fs_fsync(file).expect("submit fsync");
+            .begin_write(crate::disk_order::OrderKey { index, generation }, u64::MAX);
+        let sync_key = el.executor.begin_disk_io(0);
+        el.driver
+            .make_ctx()
+            .fs_fsync(file, sync_key)
+            .expect("submit fsync");
         assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
         let started = std::time::Instant::now();
         el.driver.run_shutdown();
@@ -13899,10 +13937,8 @@ mod tests {
         let mut el = make_test_loop();
 
         // Hold the key as a future's creation does.
-        let seq = 42u32;
-        let task_id = 0u32;
-        el.executor.wait_disk_io(seq, task_id);
-        assert!(el.executor.disk_io.contains_key(&seq));
+        let seq = el.executor.begin_disk_io(0);
+        assert!(el.executor.disk_io.contains(seq));
 
         // Set up thread-local so DiskIoFuture::drop can access executor.
         let driver_ptr = &mut el.driver as *mut Driver;
@@ -13918,14 +13954,14 @@ mod tests {
 
         // Create and immediately drop a DiskIoFuture.
         {
-            let _fut = crate::runtime::io::DiskIoFuture::new(seq);
+            let _fut = crate::runtime::io::DiskIoFuture::new(seq, false);
         }
 
         drop(guard);
 
         // The entry should be gone.
         assert!(
-            !el.executor.disk_io.contains_key(&seq),
+            !el.executor.disk_io.contains(seq),
             "the key's entry was not released on DiskIoFuture drop"
         );
     }
@@ -14464,57 +14500,40 @@ mod tests {
     }
 
     /// A key abandoned outside the executor (a future dropped with its
-    /// connection's task) is queued, and `release_orphans` stops holding it
-    /// and drops its result. Without the release the key and its result stay
-    /// held for the life of the worker.
+    /// connection's task) is queued, and `release_orphans` frees it and drops
+    /// its result. Without the release the key and its result stay in the
+    /// table for the life of the worker.
     #[test]
     fn a_key_abandoned_outside_the_executor_is_released() {
         let mut el = make_test_loop();
-        let key = 0x0123_0005;
-        el.executor.wait_disk_io(key, 0);
+        let key = el.executor.begin_disk_io(0);
         // Its result has arrived and nothing will take it.
         el.executor.wake_disk_io(key, 0);
 
         // CURRENT_DRIVER is unset here, as during connection teardown.
         crate::fs::abandon_disk_io_key(key);
         assert!(
-            crate::runtime::disk_io_key_held(key),
+            el.executor.disk_io.contains(key),
             "the key is queued, not yet released"
         );
 
         crate::fs::release_orphans(&mut el.driver, &mut el.executor);
-        assert!(!crate::runtime::disk_io_key_held(key));
-        assert!(!el.executor.disk_io.contains_key(&key));
+        assert!(!el.executor.disk_io.contains(key));
     }
 
     #[test]
-    fn disk_io_keys_are_unique_per_op() {
-        // fs and NVMe share the executor's completion maps; the key must
-        // differ across ops even for the same slab index (both slabs start
-        // their free lists at 0).
+    fn disk_op_ids_are_unique_per_op() {
+        // An operation's user_data differs from that of the earlier
+        // operation in the same slab slot, which a late cancel targets, and
+        // the low 16 bits carry the slab index the CQE handler reads.
         use crate::handler::DiskIoKind;
         let mut el = make_test_loop();
         let mut ctx = el.driver.make_ctx();
-        let k1 = ctx.disk_io_key(DiskIoKind::Fs, 3).unwrap();
-        let k2 = ctx.disk_io_key(DiskIoKind::Fs, 3).unwrap();
-        assert_ne!(k1, k2, "same slab index must map to distinct keys");
+        let k1 = ctx.disk_op_id(DiskIoKind::Fs, 3);
+        let k2 = ctx.disk_op_id(DiskIoKind::Fs, 3);
+        assert_ne!(k1, k2, "same slab index must map to distinct ids");
         assert_eq!(k1 & 0xFFFF, 3, "low 16 bits must carry the slab index");
         assert_eq!(k2 & 0xFFFF, 3);
-
-        // Slot 3 of each subsystem's slab, whatever the sequence: an fs
-        // operation in flight never shares a key with an NVMe one, even when
-        // the sequence has come round to the same value.
-        let fs = ctx.disk_io_key(DiskIoKind::Fs, 3).unwrap();
-        for _ in 0..0x3FFF {
-            ctx.disk_io_key(DiskIoKind::Fs, 0).unwrap();
-        }
-        let nvme = ctx.disk_io_key(DiskIoKind::Nvme, 3).unwrap();
-        assert_eq!(
-            fs & 0x3FFF_FFFF,
-            nvme & 0x3FFF_FFFF,
-            "the sequence came round"
-        );
-        assert_ne!(fs, nvme, "fs and NVMe keys must differ");
     }
 
     /// An outbound slot whose Connect is in the kernel and a task waiting on

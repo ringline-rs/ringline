@@ -282,14 +282,10 @@ pub(crate) struct Driver {
     pub(crate) disk_io_tx: Option<crossbeam_channel::Sender<crate::disk_io_pool::DiskIoResponse>>,
     /// Shared disk I/O pool.
     pub(crate) disk_io_pool: Option<Arc<DiskIoPool>>,
-    /// Monotonic sequence counter for disk I/O requests.
-    pub(crate) next_disk_io_seq: u32,
     /// Keys of operations submitted to the disk-I/O pool whose response has
-    /// not been drained yet. Not reissued: with no slab slot to keep a key
-    /// busy, a dropped future's key would otherwise be handed out while its
-    /// operation still runs (#574).
+    /// not been drained yet.
     pub(crate) disk_io_in_flight:
-        std::collections::HashMap<u32, crate::disk_io_pool::PoolSubsystem>,
+        std::collections::HashMap<crate::runtime::DiskIoKey, crate::disk_io_pool::PoolSubsystem>,
     /// Entries of `disk_io_in_flight` per subsystem, indexed by
     /// `PoolSubsystem`.
     pub(crate) disk_io_counts: [u16; 1],
@@ -299,7 +295,7 @@ pub(crate) struct Driver {
     /// The keys in `disk_io_in_flight` whose request reads or writes through
     /// a buffer address: `fs::read_into` and `fs::write_from`. Worker exit
     /// waits for these.
-    pub(crate) disk_io_borrowing: std::collections::HashSet<u32>,
+    pub(crate) disk_io_borrowing: std::collections::HashSet<crate::runtime::DiskIoKey>,
     /// The fs writes in the pool per file, and the fsyncs
     /// held, with their keys and work, until the writes submitted before
     /// them complete (#905). A held fsync is in `disk_io_in_flight`; at
@@ -317,12 +313,12 @@ pub(crate) struct Driver {
     /// disk-I/O pool holds a clone, so closing a file leaves its fd open until
     /// those operations finish.
     pub(crate) fs_fds: Vec<Option<Arc<OwnedFd>>>,
-    /// Pending fs_open requests: maps seq → file_index. On completion, the
+    /// Pending fs_open requests: maps disk-I/O key → file_index. On completion, the
     /// opened fd (`DiskIoResponse::opened`) is stored in `fs_fds[file_index]`.
     /// On failure, the file slot is released. If the open was abandoned
     /// (`Executor::take_abandoned_open` returns true), the fd is dropped and
     /// the slot released instead.
-    pub(crate) pending_fs_opens: std::collections::HashMap<u32, u16>,
+    pub(crate) pending_fs_opens: std::collections::HashMap<crate::runtime::DiskIoKey, u16>,
 }
 
 impl Driver {
@@ -336,13 +332,13 @@ impl Driver {
         let Some(pool) = self.disk_io_pool.as_ref() else {
             return;
         };
-        let mut wait: std::collections::HashSet<u32> = {
+        let mut wait: std::collections::HashSet<crate::runtime::DiskIoKey> = {
             let mut state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
             state.abandon = true;
             state
                 .running
                 .iter()
-                .filter(|seq| self.disk_io_borrowing.contains(seq))
+                .filter(|key| self.disk_io_borrowing.contains(key))
                 .copied()
                 .collect()
         };
@@ -355,7 +351,7 @@ impl Driver {
                 }
                 match rx.recv_timeout(left) {
                     Ok(response) => {
-                        wait.remove(&response.seq);
+                        wait.remove(&response.key);
                     }
                     Err(_) => break,
                 }
@@ -584,7 +580,6 @@ impl Driver {
             disk_io_rx,
             disk_io_tx,
             disk_io_pool,
-            next_disk_io_seq: 0,
             disk_io_in_flight: std::collections::HashMap::new(),
             disk_io_counts: [0; 1],
             disk_io_limits: [config.fs.as_ref().map(|f| f.max_commands_in_flight)],
@@ -635,7 +630,6 @@ impl Driver {
             disk_io_tx: &self.disk_io_tx,
             wake_handle: self.wake_handle,
             disk_io_wake_pending: &self.disk_io_wake_pending,
-            next_disk_io_seq: &mut self.next_disk_io_seq,
             disk_io_in_flight: &mut self.disk_io_in_flight,
             disk_io_counts: &mut self.disk_io_counts,
             disk_io_limits: self.disk_io_limits,

@@ -1,14 +1,19 @@
 //! A disk-I/O future dropped before it resolves must not leave a result that
-//! a later operation with the same key takes as its own completion (#574).
+//! a later operation in the same slab slot takes as its own completion
+//! (#574).
 //!
-//! On io_uring the key is a subsystem tag, a 14-bit sequence and the slab
-//! index. The sequence repeats every 16,384 operations; with one operation
-//! in flight each reuses the same slab slot, so the key repeats exactly. A
-//! stale result under a read's key made the read's dropped future free its
-//! buffer at once, while the kernel could still write into it.
+//! On io_uring an operation's user_data payload is a subsystem tag, a 14-bit
+//! sequence and the command-slab index. The sequence repeats every 16,384
+//! operations; with one operation in flight each reuses the same slab slot,
+//! so the user_data repeats exactly. When the key was that payload, a stale
+//! result under a read's key made the read's dropped future free its buffer
+//! at once, while the kernel could still write into it. These tests bring
+//! the user_data round and check that nothing an earlier operation left
+//! reaches the later one.
 //!
 //! Its own test binary: it installs a global allocator that counts frees of
-//! one distinctive allocation size. io_uring only: mio's sequence is 32-bit.
+//! one distinctive allocation size. io_uring only: the mio pool's requests
+//! have no slab slot or user_data.
 
 #![cfg(all(target_os = "linux", has_io_uring))]
 #![allow(clippy::manual_async_fn)]
@@ -31,7 +36,8 @@ use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 /// allocates exactly this many bytes.
 const BUF_SIZE: usize = 777_787;
 
-/// How often the io_uring disk-I/O key's sequence repeats.
+/// How often an io_uring disk operation's user_data repeats when one
+/// operation is in flight at a time.
 const KEY_PERIOD: usize = 1 << 14;
 
 static BUF_FREES: AtomicUsize = AtomicUsize::new(0);
@@ -82,7 +88,7 @@ async fn drop_a_read_on_a_reused_key() -> Result<usize, String> {
     let dir = DIR.lock().unwrap().clone().unwrap();
     let path = dir.join("file");
     // Read-write, so the open does not wait for a writer and a read waits
-    // for data that never comes. Opened before the key cycle starts.
+    // for data that never comes. Opened before the cycle starts.
     let fifo = ringline::fs::open(dir.join("fifo"), OpenFlags::READ_WRITE, 0)
         .map_err(|e| e.to_string())?
         .await
@@ -95,7 +101,7 @@ async fn drop_a_read_on_a_reused_key() -> Result<usize, String> {
     drop(ringline::fs::stat(&path).map_err(|e| e.to_string())?);
     ringline::sleep(Duration::from_millis(10)).await;
 
-    // Bring the key round to the dropped stat's.
+    // Bring the user_data round to the dropped stat's.
     for _ in 1..KEY_PERIOD {
         ringline::fs::stat(&path)
             .map_err(|e| e.to_string())?
@@ -103,7 +109,7 @@ async fn drop_a_read_on_a_reused_key() -> Result<usize, String> {
             .map_err(|e| e.to_string())?;
     }
 
-    // This read takes the dropped stat's key. It waits on the FIFO, so
+    // This read takes the dropped stat's user_data. It waits on the FIFO, so
     // dropping it must park the buffer, not free it.
     let before = BUF_FREES.load(Ordering::SeqCst);
     drop(ringline::fs::read_into(
@@ -175,9 +181,9 @@ impl AsyncEventHandler for ResolvedKeyReused {
     }
 }
 
-/// A stat that resolved is kept alive while the key comes round, and dropped
-/// only after a new stat has taken its key and is waiting on it. The new stat
-/// must still resolve.
+/// A stat that resolved is kept alive while the user_data comes round, and
+/// dropped only after a new stat has taken its user_data and is waiting on
+/// it. The new stat must still resolve.
 async fn reuse_a_resolved_key() -> Result<(), String> {
     let path = DIR.lock().unwrap().clone().unwrap().join("file");
     let mut first = ringline::fs::stat(&path).map_err(|e| e.to_string())?;
@@ -188,7 +194,7 @@ async fn reuse_a_resolved_key() -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
     }
-    // Takes `first`'s key, and is waiting on it.
+    // Takes `first`'s user_data, and is waiting on it.
     let mut reuser = ringline::fs::stat(&path).map_err(|e| e.to_string())?;
     std::future::poll_fn(|cx| {
         assert!(Pin::new(&mut reuser).poll(cx).is_pending());

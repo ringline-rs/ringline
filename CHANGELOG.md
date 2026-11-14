@@ -498,9 +498,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - On io_uring `fs::stat` no longer allocates a `libc::statx` per call: the
   buffer lives in the command slab entry, which costs each worker 256 bytes
   per `max_commands_in_flight` slot (64 KiB at the default of 256). On both
-  backends the executor keeps one map of disk-I/O operations, with a cheaper
-  hash for its 32-bit keys, in place of five. Finding P2 of
-  `docs/journal/2026-11-file-io-audit.md` (#876).
+  backends the executor keeps one table of disk-I/O operations, indexed by
+  key, in place of five hash maps. Finding P2 of
+  `docs/journal/2026-11-file-io-audit.md` (#876, #906).
 - **Breaking:** a peer's FIN or close_notify finishes the read half and
   closes nothing. Before, every read EOF requested a close, deferred behind
   queued sends and one poll of the task, and the task was then dropped
@@ -1342,13 +1342,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   part of its ciphertext, and the peer waited for the rest. Both now drain
   rustls' output, as the io_uring paths do. Found by
   `tls_close_before_handshake.rs` (#886).
-- Docs: the `max_commands_in_flight` docs of `FsConfig` and `NvmeConfig`
-  say that on io_uring each command slot has 16,384
-  operation keys; that a future neither polled to completion nor dropped
-  keeps its key, as does one dropped on a thread other than the worker that
-  created it; and that in a serial workload 16,384 such futures make every
-  later operation fail while other slots are free. Finding P4 of
-  `docs/journal/2026-11-file-io-audit.md` (#878).
 - mio: `ConfigBuilder::build` refuses `disk_io_threads(0)` while `fs` (on by
   default) is set, naming `no_fs()`. Before, the config built and every file
   operation failed at its first call with an `Other` error naming the pool,
@@ -2125,12 +2118,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is matched to its operation by a key that repeats, and a result nothing had
   taken was taken by a later operation with the same key: one left by a
   dropped future, by an NVMe or direct-I/O operation submitted through
-  `DriverCtx`, or by a future not yet polled. A key is now not reused while a
-  future holds it or, on mio, while its operation is still in the disk-I/O
-  pool, and a result is kept only while a future holds its key. A key
-  allocation that finds every key of its slab slot held fails with an error.
-  `DiskIoFuture`, `StatFuture`, `OpenFuture`, `ReadFuture` and `WriteFuture`
-  now panic if polled after returning `Ready` (#574).
+  `DriverCtx`, or by a future not yet polled. Each operation now has its own
+  key, a slot and generation in a per-worker table, and a result is kept only
+  while a future holds its key (#906). `DiskIoFuture`, `StatFuture`,
+  `OpenFuture`, `ReadFuture` and `WriteFuture` now panic if polled after
+  returning `Ready` (#574).
 
 - A connection closed while its task awaited `fs::read_into` or
   `fs::write_from` leaked the operation's buffer for the life of the
