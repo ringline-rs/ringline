@@ -468,6 +468,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // poll pass queued, so an idle worker does not hold it until its
             // next completion, and a released timer no longer bounds the wait.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
+            self.complete_cancelled_disk();
             self.executor.collect_wakeups();
             // Tasks have read what they will read in this pass. The wait below
             // submits any re-arm, so a socket that ran out of buffers receives
@@ -591,6 +592,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_shutdown_retries();
             self.drain_send_pollout_retries();
             self.retry_recv_arms();
+            self.driver.ring.retry_disk_pushes();
             // Set the wait before the next retry of what the ring refused
             // again, or reset it once nothing is owed.
             self.driver.after_push_retries(std::time::Instant::now());
@@ -624,6 +626,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // submits this pass's SQEs, so an open whose future was dropped
             // during the pass is marked abandoned before it can complete.
             crate::fs::release_orphans(&mut self.driver, &mut self.executor);
+            self.complete_cancelled_disk();
             self.recheck_hangups();
             diag_tasks_1st += tasks_before as u64;
             if tasks_before == 0 {
@@ -1166,8 +1169,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// until an unrelated completion arrives.
     ///
     /// What the ring refused does not keep the worker from blocking: a
-    /// receive arm, send, UDP re-arm or merged accept arm the ring could not
-    /// take, or a submit the kernel refused with SQEs left queued, is
+    /// receive arm, send, UDP re-arm, merged accept arm or disk-I/O command
+    /// the ring could not take, or a submit the kernel refused with SQEs left queued, is
     /// retried after every wait, and the wait is bounded by its next retry
     /// (`Driver::push_retries_pending`, `Driver::push_retry`, part of
     /// `Driver::next_deadline`).
@@ -1792,6 +1795,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // Entries added while this ran went onto the list swapped in.
         list.append(&mut self.driver.hangup_rechecks);
         self.driver.hangup_rechecks = list;
+    }
+
+    /// Complete with `-ECANCELED` the disk-I/O operations whose cancel
+    /// found them still queued for a push (`Ring::submit_async_cancel`), as
+    /// the kernel would have completed them. These go through `dispatch_cqe`,
+    /// so `ring/cqe_processed` and `CQE_BY_TAG` count them although the
+    /// kernel posted no CQE.
+    fn complete_cancelled_disk(&mut self) {
+        for ud in self.driver.ring.take_cancelled_disk() {
+            self.dispatch_cqe(ud, -libc::ECANCELED, 0);
+        }
     }
 
     fn dispatch_cqe(&mut self, user_data_raw: u64, result: i32, flags: u32) {
@@ -6436,6 +6450,211 @@ mod tests {
             el.driver.pending_zc_retries.clear();
             assert_eq!(el.wait_bound(), None, "list {list} cleared");
         }
+    }
+
+    /// The user_data of every fs command in flight.
+    fn fs_commands(el: &AsyncEventLoop<NoopHandler>) -> Vec<u64> {
+        el.driver
+            .fs_cmd_slab
+            .as_ref()
+            .expect("fs enabled")
+            .in_flight_user_data()
+            .collect()
+    }
+
+    /// Wait for and dispatch completions until no fs command is in flight.
+    fn drain_fs_commands(el: &mut AsyncEventLoop<NoopHandler>) {
+        let started = std::time::Instant::now();
+        while !fs_commands(el).is_empty() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "fs commands still in flight"
+            );
+            el.driver
+                .ring
+                .submit_and_wait_timeout(1, std::time::Duration::from_millis(100))
+                .expect("wait");
+            el.drain_completions();
+        }
+    }
+
+    /// An fs command whose push the ring refuses is queued instead of
+    /// failing its call, counts as owed, and completes once the retry after
+    /// the next wait pushes it (#877).
+    #[test]
+    fn a_refused_disk_command_is_queued_until_the_ring_takes_it() {
+        let mut el = make_test_loop();
+        el.driver.ring.flush().unwrap();
+        el.driver.ring.force_push_failures(1);
+        let key = el
+            .driver
+            .make_ctx()
+            .fs_stat(std::path::Path::new("/"), false)
+            .expect("a refused push queues the command");
+        el.executor.wait_disk_io(key, 0);
+        assert_eq!(el.driver.ring.disk_retries_pending(), 1);
+        assert_eq!(el.driver.push_retries_pending(), 1);
+        assert_eq!(
+            el.wait_bound(),
+            Some(std::time::Duration::ZERO),
+            "the first retry is due now"
+        );
+        el.driver.ring.retry_disk_pushes();
+        assert_eq!(el.driver.ring.disk_retries_pending(), 0);
+        drain_fs_commands(&mut el);
+        assert_eq!(el.executor.take_disk_io_result(key), Some(0), "statx of /");
+    }
+
+    /// A command submitted while others are queued queues behind them, so
+    /// queued commands are pushed in the order they were called.
+    #[test]
+    fn a_disk_command_queues_behind_one_already_queued() {
+        let mut el = make_test_loop();
+        el.driver.ring.flush().unwrap();
+        el.driver.ring.force_push_failures(1);
+        let mut ctx = el.driver.make_ctx();
+        ctx.fs_stat(std::path::Path::new("/"), false).unwrap();
+        ctx.fs_stat(std::path::Path::new("/"), false).unwrap();
+        assert_eq!(
+            el.driver.ring.disk_retries_pending(),
+            2,
+            "the second command went behind the first though the ring had room"
+        );
+        el.driver.ring.retry_disk_pushes();
+        assert_eq!(el.driver.ring.disk_retries_pending(), 0);
+        drain_fs_commands(&mut el);
+    }
+
+    /// A cancel of a queued command removes it from the queue, and the
+    /// event loop completes it with `-ECANCELED` as the kernel would.
+    #[test]
+    fn a_cancelled_queued_disk_command_completes_cancelled() {
+        let mut el = make_test_loop();
+        el.driver.ring.flush().unwrap();
+        el.driver.ring.force_push_failures(1);
+        let key = el
+            .driver
+            .make_ctx()
+            .fs_stat(std::path::Path::new("/"), false)
+            .unwrap();
+        el.executor.wait_disk_io(key, 0);
+        let [ud] = fs_commands(&el)[..] else {
+            panic!("one command in flight")
+        };
+        el.driver.ring.submit_async_cancel(ud, 0).unwrap();
+        assert_eq!(el.driver.ring.disk_retries_pending(), 0, "removed");
+        el.complete_cancelled_disk();
+        assert!(fs_commands(&el).is_empty(), "its slab entry is released");
+        assert_eq!(el.executor.take_disk_io_result(key), Some(-libc::ECANCELED));
+    }
+
+    /// A command still queued at worker exit is cancelled and completed by
+    /// the exit loop instead of holding it for its whole bound.
+    #[test]
+    fn worker_exit_completes_a_queued_disk_command() {
+        let mut el = make_test_loop();
+        el.driver.ring.flush().unwrap();
+        el.driver.ring.force_push_failures(1);
+        el.driver
+            .make_ctx()
+            .fs_stat(std::path::Path::new("/"), false)
+            .unwrap();
+        assert_eq!(el.driver.ring.disk_retries_pending(), 1);
+        let started = std::time::Instant::now();
+        el.driver.run_shutdown();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "exit waited {:?}",
+            started.elapsed()
+        );
+        assert!(!el.driver.disk_io_outstanding, "nothing left in flight");
+    }
+
+    /// Run `task` on `el`'s loop until it finishes or 2 s pass, and return
+    /// whether it finished.
+    fn run_disk_task(
+        el: &mut AsyncEventLoop<NoopHandler>,
+        task: impl std::future::Future<Output = ()> + 'static,
+    ) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fault = std::sync::Arc::new(crate::config::TestFault::default());
+        el.driver.test_fault = Some(fault.clone());
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let (stop, done) = (fault.clone(), finished.clone());
+        let main = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                task.await;
+                done.store(true, Ordering::Release);
+                stop.error.store(true, Ordering::Release);
+            }))
+            .expect("free standalone slot");
+        let backstop = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                crate::sleep(std::time::Duration::from_secs(2)).await;
+                fault.error.store(true, Ordering::Release);
+            }))
+            .expect("free standalone slot");
+        el.executor.ready_queue.push_back(main | STANDALONE_BIT);
+        el.executor.ready_queue.push_back(backstop | STANDALONE_BIT);
+        assert!(el.run().is_err(), "the fault ends the loop");
+        el.driver.ring.force_push_failures(0);
+        el.driver.unpublish_push_retries();
+        finished.load(Ordering::Acquire)
+    }
+
+    /// Through the run loop: an `fs::stat` whose push the ring refuses
+    /// resolves once the loop's retry pushes it.
+    #[test]
+    fn the_run_loop_pushes_a_refused_disk_command() {
+        let mut el = make_test_loop();
+        let finished = run_disk_task(&mut el, async {
+            crate::runtime::io::with_state(|d, _| d.ring.force_push_failures(1));
+            let meta = crate::fs::stat("/")
+                .expect("a refused push queues the command")
+                .await
+                .expect("statx of /");
+            assert!(meta.is_dir);
+        });
+        assert!(finished, "the stat never resolved");
+    }
+
+    /// Through the run loop: a `read_into` dropped while its push is still
+    /// queued is completed cancelled, which releases its slab entry and its
+    /// parked buffer.
+    #[test]
+    fn the_run_loop_completes_a_dropped_queued_read() {
+        let mut el = make_test_loop();
+        let path = std::env::temp_dir().join(format!("ringline-877-{}", std::process::id()));
+        std::fs::write(&path, b"0123456789abcdef").expect("write the file");
+        let file_path = path.clone();
+        let finished = run_disk_task(&mut el, async move {
+            let file = crate::fs::open(&file_path, crate::fs::OpenFlags::READ, 0)
+                .expect("open")
+                .await
+                .expect("opened");
+            crate::runtime::io::with_state(|d, _| d.ring.force_push_failures(1));
+            let read = crate::fs::read_into(file, 0, bytes::BytesMut::with_capacity(16))
+                .expect("a refused push queues the read");
+            drop(read);
+            crate::runtime::io::with_state(|d, _| {
+                assert_eq!(d.ring.disk_retries_pending(), 0, "the cancel removed it")
+            });
+            crate::sleep(std::time::Duration::from_millis(20)).await;
+            crate::runtime::io::with_state(|d, e| {
+                assert!(
+                    !d.fs_cmd_slab.as_ref().unwrap().has_in_flight(),
+                    "its slab entry is released"
+                );
+                assert!(e.disk_io.is_empty(), "nothing is parked");
+            });
+            crate::fs::close(file).expect("close");
+        });
+        let _ = std::fs::remove_file(&path);
+        assert!(finished, "the task did not finish");
     }
 
     /// A retry the ring refuses again sets the next one `delay` away,

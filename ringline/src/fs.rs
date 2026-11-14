@@ -15,11 +15,15 @@
 //!
 //! On io_uring a call that finds the ring's submission queue full submits the
 //! queue inline before pushing (under [`sqpoll`](crate::ConfigBuilder::sqpoll)
-//! it waits for the SQ thread to free an entry); if that submit
+//! it waits for the SQ thread to free an entry). If that submit
 //! (`io_uring_enter(2)`) fails, for example with `Interrupted`, `EBUSY` or
-//! `EAGAIN`, the call returns the error and leaves nothing in flight. The
-//! submission queue holds `sq_entries` entries per worker, shared by every
-//! operation on it.
+//! `EAGAIN`, the worker queues the operation and pushes it again after its
+//! next wait, with waits of up to 10 ms between attempts while the kernel
+//! keeps refusing, and the call returns its future as usual. While any
+//! operation is queued, later calls queue behind it, and the queue is pushed
+//! in the order the calls were made. The submission
+//! queue holds `sq_entries` entries per worker, shared by every operation on
+//! it.
 //!
 //! ## Blocking file I/O and connection closes (io_uring)
 //!

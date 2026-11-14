@@ -5,8 +5,8 @@
 //! `IORING_OP_FSYNC` on a fixed file. On mio they are `pread`, `pwrite` and
 //! `fsync` on the disk-I/O pool, with `F_NOCACHE` in place of `O_DIRECT` on
 //! macOS. On io_uring a call that finds the ring's submission queue full
-//! submits the queue inline before pushing, and returns the error if that
-//! submit fails, leaving nothing in flight (see the `fs` module docs).
+//! submits the queue inline before pushing, and if that submit fails, queues
+//! the operation and pushes it again later (see the `fs` module docs).
 //!
 //! # Alignment requirements
 //!

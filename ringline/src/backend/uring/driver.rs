@@ -422,8 +422,8 @@ impl Driver {
 /// (`AsyncEventLoop::handle_send_backstop`).
 pub(crate) const SEND_BACKSTOP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The first wait after a pushed retry the ring refused again: a stream send
-/// or receive arm on a retry list (`Driver::push_retries_pending`).
+/// The first wait after a pushed retry the ring refused again: anything
+/// `Driver::push_retries_pending` counts.
 pub(crate) const PUSH_RETRY_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_micros(50);
 
 /// The longest wait between retries of a refused push. Each refused retry
@@ -1559,8 +1559,9 @@ impl Driver {
     /// backoff: the entries on `recv_arm_retries` and the four send retry
     /// lists, a submit the kernel refused with SQEs left queued
     /// (`Ring::submit_refused`), an unarmed merged accept whose arm is due
-    /// (`merged_accept_due`), and the UDP sockets whose re-arm is due
-    /// (`udp_rearms_due`).
+    /// (`merged_accept_due`), the UDP sockets whose re-arm is due
+    /// (`udp_rearms_due`), and the disk-I/O commands queued on the ring
+    /// (`Ring::disk_retries_pending`).
     pub(crate) fn push_retries_pending(&self) -> usize {
         self.recv_arm_retries.len()
             + self.pending_send_retries.len()
@@ -1570,6 +1571,7 @@ impl Driver {
             + usize::from(self.ring.submit_refused())
             + usize::from(self.merged_accept_due())
             + self.udp_rearms_due()
+            + self.ring.disk_retries_pending()
     }
 
     /// After the retry drains have run: with nothing left on the retry
@@ -3279,6 +3281,12 @@ impl Driver {
             self.handle_shutdown_cqe(user_data_raw, result, flags);
         }
         while started.elapsed() < SHUTDOWN_BOUND {
+            // A disk command the ring refused before exit is pushed now, and
+            // one the cancels above removed from the queue completes here.
+            self.ring.retry_disk_pushes();
+            for ud in self.ring.take_cancelled_disk() {
+                self.handle_shutdown_cqe(ud, -libc::ECANCELED, 0);
+            }
             for i in std::mem::take(&mut cancels_to_retry) {
                 if self.ring.submit_cancel_all(i).is_err() {
                     cancels_to_retry.push(i);

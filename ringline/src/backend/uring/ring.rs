@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
 
@@ -91,6 +92,17 @@ pub(crate) fn close_lead_for(kernel: Option<KernelVersion>) -> CloseLead {
 /// and pushes it to the engine.
 pub struct Ring {
     pub(crate) engine: ActiveEngine,
+    /// Disk-I/O operations (fs, direct I/O, NVMe) the ring refused, and
+    /// those submitted while earlier ones were queued, in submission order.
+    /// [`push_disk_sqe`](Self::push_disk_sqe) queues them and
+    /// [`retry_disk_pushes`](Self::retry_disk_pushes) pushes them again after
+    /// each wait. Each one's memory is held by its command
+    /// slab entry or its caller's buffer contract, as for a pushed one.
+    disk_retries: VecDeque<Sqe>,
+    /// The user_data of queued disk-I/O operations that a cancel removed
+    /// before they were pushed. The event loop completes each with
+    /// `-ECANCELED` ([`take_cancelled_disk`](Self::take_cancelled_disk)).
+    disk_cancelled: Vec<u64>,
     /// Test-only: the last operation pushed through `push_sqe`, so a test
     /// can check which operation a handler submitted.
     #[cfg(test)]
@@ -110,6 +122,8 @@ impl Ring {
     pub fn setup(config: &Config) -> Result<Self, Error> {
         Ok(Ring {
             engine: ActiveEngine::setup(config)?,
+            disk_retries: VecDeque::new(),
+            disk_cancelled: Vec::new(),
             #[cfg(test)]
             last_pushed: None,
             #[cfg(test)]
@@ -662,6 +676,18 @@ impl Ring {
         target_user_data: u64,
         conn_index: u32,
     ) -> io::Result<()> {
+        // A disk-I/O operation still queued has nothing in the kernel to
+        // cancel: drop it from the queue and record it in `disk_cancelled`,
+        // which the event loop completes with `-ECANCELED`.
+        if let Some(pos) = self
+            .disk_retries
+            .iter()
+            .position(|sqe| sqe.user_data == target_user_data)
+        {
+            self.disk_retries.remove(pos);
+            self.disk_cancelled.push(target_user_data);
+            return Ok(());
+        }
         let ud = UserData::encode(OpTag::Cancel, conn_index, 0);
         let entry = Sqe::new(
             Op::Cancel {
@@ -906,6 +932,47 @@ impl Ring {
         unsafe { self.engine.push_chain(entries) }
     }
 
+    /// Push a disk-I/O operation, or queue it if the ring refuses it: a full
+    /// SQ whose inline submit fails, with any errno (for example `EINTR`,
+    /// `EBUSY` or `EAGAIN`), delays the operation instead of failing it, with
+    /// no cap on the attempts. While earlier operations are queued
+    /// this one queues behind them. The event loop pushes the queue again
+    /// after each wait (`retry_disk_pushes`), under the push-retry backoff
+    /// (`Driver::push_retries_pending`).
+    ///
+    /// # Safety
+    /// As [`push_sqe`](Self::push_sqe): the operation's memory must stay
+    /// valid until its completion, which for a queued operation is later.
+    unsafe fn push_disk_sqe(&mut self, sqe: &Sqe) {
+        if !self.disk_retries.is_empty() || unsafe { self.push_sqe(sqe) }.is_err() {
+            self.disk_retries.push_back(*sqe);
+        }
+    }
+
+    /// Push the queued disk-I/O operations in order, stopping at the first
+    /// the ring refuses again.
+    pub(crate) fn retry_disk_pushes(&mut self) {
+        while let Some(&sqe) = self.disk_retries.front() {
+            // Safety: `push_disk_sqe`'s caller keeps the memory valid until
+            // the completion.
+            if unsafe { self.push_sqe(&sqe) }.is_err() {
+                return;
+            }
+            self.disk_retries.pop_front();
+        }
+    }
+
+    /// The number of disk-I/O operations queued for a retry.
+    pub(crate) fn disk_retries_pending(&self) -> usize {
+        self.disk_retries.len()
+    }
+
+    /// Take the user_data of the queued disk-I/O operations cancelled before
+    /// their push, for the event loop to complete with `-ECANCELED`.
+    pub(crate) fn take_cancelled_disk(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.disk_cancelled)
+    }
+
     /// Submit an NVMe passthrough command via `IORING_OP_URING_CMD`.
     ///
     /// The `fd_index` must be a fixed file table index pointing to an opened
@@ -929,9 +996,7 @@ impl Ring {
             },
             user_data.raw(),
         );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
+        unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 
@@ -961,9 +1026,7 @@ impl Ring {
             },
             user_data.raw(),
         );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
+        unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 
@@ -993,9 +1056,7 @@ impl Ring {
             },
             user_data.raw(),
         );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
+        unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 
@@ -1009,9 +1070,7 @@ impl Ring {
             },
             user_data.raw(),
         );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
+        unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 
@@ -1045,9 +1104,7 @@ impl Ring {
             },
             ud,
         );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
+        unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 
@@ -1073,9 +1130,7 @@ impl Ring {
             },
             ud,
         );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
+        unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 
@@ -1097,9 +1152,7 @@ impl Ring {
             },
             ud,
         );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
+        unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 
@@ -1121,9 +1174,7 @@ impl Ring {
             },
             ud,
         );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
+        unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 
@@ -1145,9 +1196,7 @@ impl Ring {
             },
             ud,
         );
-        unsafe {
-            self.push_sqe(&entry)?;
-        }
+        unsafe { self.push_disk_sqe(&entry) };
         Ok(())
     }
 }
