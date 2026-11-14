@@ -154,8 +154,13 @@ ring takes it. A partial-write resubmit the ring refuses goes on
 `pending_copy_retries` (or the coalesced or zero-copy list) the same way.
 Neither has a cap: a full SQ is backpressure, not a connection error (Domain
 Invariant 7). Until #830, two failed attempts failed the send and closed the
-connection. The worker does not block while a retry is owed (`may_block`),
-since nothing in the kernel would complete to trigger it.
+connection. While a retry is owed the worker's wait is bounded by the next
+retry (`Driver::push_retry`): zero for the first refusal of a run if it
+was made while tasks ran, otherwise 50 µs, doubling on each refused retry up to 10 ms. The retries
+also run after every wait a completion ends. A submit the kernel refuses
+with `EAGAIN` returns before its wait with the SQEs still queued; the
+engine records it (`Ring::submit_refused`), and a timed wait then waits
+again without submitting for the same bound.
 
 Consequence: on io_uring `DriverCtx::send` fails only before it has committed
 anything (stale token, or pool admission). TLS pool exhaustion during

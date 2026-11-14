@@ -59,6 +59,10 @@ impl Engine for StubEngine {
         unreachable!("the stub engine fails at setup")
     }
 
+    fn submit_refused(&self) -> bool {
+        unreachable!("the stub engine fails at setup")
+    }
+
     fn reap(&mut self, _out: &mut Vec<(u64, i32, u32)>) {
         unreachable!("the stub engine fails at setup")
     }
@@ -102,6 +106,11 @@ impl Engine for StubEngine {
 
     #[cfg(test)]
     fn force_push_failures(&mut self, _count: usize) {
+        unreachable!("the stub engine fails at setup")
+    }
+
+    #[cfg(test)]
+    fn force_enter_eagain(&mut self, _count: usize) {
         unreachable!("the stub engine fails at setup")
     }
 }

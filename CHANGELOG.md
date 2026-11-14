@@ -1143,10 +1143,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   coalesced send resubmit`, `... zc send resubmit`) in every 0.6 release,
   and from 0.6.6 a queued send was failed the same way with `max retries
   during send submit`; its connection was closed. The send now stays
-  queued, in order, and is pushed again every iteration until the ring
-  takes it. A receive the ring refused closed the connection; the receive
-  is now armed again after the next wait, and the read stays pending. The
-  worker does not block in its wait while either is owed.
+  queued, in order, and is pushed again until the ring takes it. A
+  receive the ring refused closed the connection; the receive is now armed
+  again after the next wait, and the read stays pending. While either is
+  owed the worker retries after every wait and bounds the wait by the next
+  retry: zero for the first refusal of a run if it was made while tasks
+  ran, otherwise 50 µs, doubling on each refused retry up to 10 ms. The
+  same backoff covers a submit the kernel refuses with `EAGAIN`, after
+  which the worker now waits instead of returning at once, and a refused
+  UDP re-arm or merged accept arm, which kept the worker from blocking at
+  all. The gauge `ringline/ring/push_retries_pending` shows how many are
+  owed, `ringline/ring` `op=push_retry_waits` counts the
+  waits, and after 1 s of refusals the worker writes one line to stderr.
 - Timers (#836, items 1 and 2):
   - A sleep or deadline too far out for the clock is never reached instead
     of failing. On io_uring, a `Duration` with more than `i64::MAX` seconds

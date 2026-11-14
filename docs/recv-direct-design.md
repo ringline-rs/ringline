@@ -379,7 +379,7 @@ nothing is buffered, armed or parking. A receive that cannot be pushed is
 counted the same way and closes nothing (#830): its buffer goes back to the
 accumulator or the TLS engine, the reader stays parked, and the connection
 goes on `Driver::recv_arm_retries`, which `retry_recv_arms` arms after each
-wait. The worker does not block while an entry is owed. Until the poll is armed, a FIN or
+wait; the wait is bounded by the next retry (`Driver::push_retry`). Until the poll is armed, a FIN or
 reset is seen by the next receive to complete, which a read arms when it
 parks. A FIN closes nothing: a connection whose task only sends stays open
 until the task ends, and a peer that closed fully answers the next send with
