@@ -5225,8 +5225,10 @@ impl Drop for DiskIoFuture {
 /// Close an NVMe device. Returns `Unsupported` on mio.
 ///
 /// The handle is invalid at once, and a command already submitted finishes on
-/// this device. The slot is free once the last of them completes, so until then
-/// an open can fail because the device table is full.
+/// this device. The device's fixed-file slot is closed with `IORING_OP_CLOSE`
+/// once no command on it is in flight, and its slot in the device table is
+/// free when that close completes, so until then an open can fail because the
+/// device table is full.
 ///
 /// # Panics
 ///

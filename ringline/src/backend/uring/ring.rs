@@ -932,6 +932,22 @@ impl Ring {
         unsafe { self.engine.push_chain(entries) }
     }
 
+    /// Close fixed-file slot `fd_index` with `IORING_OP_CLOSE`: an fs file's
+    /// or NVMe device's, which the caller keeps allocated in its table until
+    /// the completion (tag `FileClose`), so no open installs into the slot
+    /// before the close has run. Queued like a disk-I/O operation when the
+    /// ring refuses it (`push_disk_sqe`).
+    pub(crate) fn submit_fixed_close(&mut self, fd_index: u32, user_data: UserData) {
+        let entry = Sqe::new(
+            Op::Close {
+                fd: sqe::Fd::Fixed(fd_index),
+            },
+            user_data.raw(),
+        );
+        // Safety: a close references no memory.
+        unsafe { self.push_disk_sqe(&entry) };
+    }
+
     /// Push a disk-I/O operation, or queue it if the ring refuses it: a full
     /// SQ whose inline submit fails, with any errno (for example `EINTR`,
     /// `EBUSY` or `EAGAIN`), delays the operation instead of failing it, with

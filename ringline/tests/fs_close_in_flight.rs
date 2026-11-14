@@ -73,13 +73,25 @@ impl AsyncEventHandler for WriteThenClose {
             let reuse = ringline::fs::fsync(file).map(|_| ());
             let (written, _buf) = write.await;
             let on_disk = std::fs::read(&path).unwrap_or_default();
-            // The one slot is free again once the write has completed.
-            let reopened = match ringline::fs::create(&other) {
-                Ok(open) => open.await.map(|f| {
-                    let _ = ringline::fs::close(f);
-                }),
-                Err(e) => Err(e),
-            };
+            // The one slot is free again once the deferred close has
+            // completed: on io_uring the close is an `IORING_OP_CLOSE`
+            // submitted after the write, so an open may find the table full
+            // until then.
+            let mut reopened = Err(std::io::Error::other("not tried"));
+            for _ in 0..1000 {
+                reopened = match ringline::fs::create(&other) {
+                    Ok(open) => open.await.map(|f| {
+                        let _ = ringline::fs::close(f);
+                    }),
+                    Err(e) => Err(e),
+                };
+                match &reopened {
+                    Err(e) if e.to_string() == "filesystem file table full" => {
+                        ringline::yield_now().await;
+                    }
+                    _ => break,
+                }
+            }
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(&other);
             finish(format!(

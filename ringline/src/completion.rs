@@ -37,6 +37,10 @@ pub enum OpTag {
     SendMsgUdp = 14,
     /// NVMe passthrough command (read, write, flush via IORING_OP_URING_CMD).
     NvmeCmd = 15,
+    /// `IORING_OP_CLOSE` of an fs file's or NVMe device's fixed-file slot. The
+    /// conn_index field is the table slot, the payload its subsystem
+    /// (`FILE_CLOSE_FS`, `FILE_CLOSE_NVME`).
+    FileClose = 16,
     /// Filesystem I/O command (open, read, write, fsync, stat, rename, unlink, mkdir).
     Fs = 18,
     /// PollAdd on a pidfd for async child process exit notification.
@@ -113,6 +117,7 @@ impl OpTag {
             13 => Some(OpTag::RecvMsgUdp),
             14 => Some(OpTag::SendMsgUdp),
             15 => Some(OpTag::NvmeCmd),
+            16 => Some(OpTag::FileClose),
             18 => Some(OpTag::Fs),
             19 => Some(OpTag::PidfdPoll),
             21 => Some(OpTag::SendPollOut),
@@ -151,6 +156,7 @@ impl OpTag {
             OpTag::RecvMsgUdp => "recv_msg_udp",
             OpTag::SendMsgUdp => "send_msg_udp",
             OpTag::NvmeCmd => "nvme_cmd",
+            OpTag::FileClose => "file_close",
             OpTag::Fs => "fs",
             OpTag::PidfdPoll => "pidfd_poll",
             OpTag::SendPollOut => "send_poll_out",
@@ -168,6 +174,11 @@ impl OpTag {
         }
     }
 }
+
+/// The `FileClose` payload of an fs file's slot.
+pub(crate) const FILE_CLOSE_FS: u32 = 0;
+/// The `FileClose` payload of an NVMe device's slot.
+pub(crate) const FILE_CLOSE_NVME: u32 = 1;
 
 #[cfg(test)]
 mod optag_label_tests {
@@ -191,7 +202,7 @@ mod optag_label_tests {
         }
         // Sanity: the walk found the tags, rather than silently finding none.
         assert!(
-            seen.len() >= 25,
+            seen.len() >= 26,
             "expected the full tag set, found {}",
             seen.len()
         );

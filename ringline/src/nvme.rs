@@ -361,8 +361,10 @@ pub(crate) struct NvmeDeviceState {
     pub generation: u32,
     /// Number of commands currently in flight.
     pub in_flight: u32,
-    /// Closed with commands in flight: the last completion unregisters the
-    /// device, because a queued SQE resolves its fixed-file index at submission.
+    /// `close_nvme_device` was called: the handle is refused. The slot is
+    /// closed with `IORING_OP_CLOSE` once no command is in flight, because a
+    /// queued SQE resolves its fixed-file index at submission, and the table
+    /// slot is released when that close completes.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub closing: bool,
     /// The namespace's logical block size in bytes, from Identify Namespace

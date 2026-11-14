@@ -2,10 +2,11 @@
 //!
 //! Provides file read/write, buffered or bypassing the page cache with
 //! [`OpenFlags::DIRECT`], and metadata operations (stat, symlink_metadata,
-//! rename, remove, mkdir). Apart from [`close`], which is
-//! synchronous, file operations do not block the worker thread: on io_uring
-//! the kernel completes them inline or on its own threads (see below); on mio
-//! they run on a thread pool.
+//! rename, remove, mkdir). File operations do not block the worker thread:
+//! on io_uring the kernel completes them inline or on its own threads (see
+//! below); on mio they run on a thread pool. On io_uring [`close`] does not
+//! wait for the file to close; on mio it closes the fd on the worker unless
+//! an operation queued on it still holds it.
 //!
 //! Reads and writes are independent of each other on both backends, including
 //! those on one file: io_uring does not order independent submissions, and
@@ -408,9 +409,9 @@ pub(crate) struct FsFileState {
     /// Number of read, write and fsync commands pushed to the SQ and not
     /// completed (io_uring).
     pub in_flight: u32,
-    /// `close` was called while commands were in flight (io_uring): the
-    /// handle is refused, and the last completion unregisters the file and
-    /// releases the slot (#859).
+    /// `close` was called (io_uring): the handle is refused. The fixed slot
+    /// is closed with `IORING_OP_CLOSE` once `in_flight` is 0, and the table
+    /// slot is released when that close completes (#859, #845).
     pub closing: bool,
 }
 
@@ -1255,12 +1256,14 @@ pub fn fsync(file: File) -> io::Result<DiskIoFuture> {
 
 /// Close a file handle.
 ///
-/// Synchronous: on success the handle is invalid when this returns. A read,
-/// write or fsync already issued on it completes against the file. On
-/// io_uring the file leaves the ring's fixed-file table and its slot is freed
-/// when this returns or, if such operations are in flight, when the last of
-/// them completes. On mio the slot is free when this returns, and the fd
-/// closes once the operations already queued on it have finished.
+/// On success the handle is invalid when this returns, and a read, write or
+/// fsync already issued on it completes against the file. On io_uring
+/// nothing blocks the worker: the file's fixed-file slot is closed with
+/// `IORING_OP_CLOSE` once no such operation is in flight (at once, or after
+/// the last of them completes), and its slot in the file table is free when
+/// that close completes, so until then an open can fail because the table is
+/// full. On mio the slot is free when this returns, and the fd closes once
+/// the operations already queued on it have finished.
 ///
 /// # Panics
 ///
