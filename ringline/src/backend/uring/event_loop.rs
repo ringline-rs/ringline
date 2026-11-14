@@ -6637,8 +6637,14 @@ mod tests {
                 .await
                 .expect("opened");
             crate::runtime::io::with_state(|d, _| d.ring.force_push_failures(1));
-            let read = crate::fs::read_into(file, 0, bytes::BytesMut::with_capacity(16))
-                .expect("a refused push queues the read");
+            let read = crate::fs::read_into(file, 0, bytes::BytesMut::with_capacity(16));
+            crate::runtime::io::with_state(|d, _| {
+                assert_eq!(
+                    d.ring.disk_retries_pending(),
+                    1,
+                    "the refused push queued the read"
+                )
+            });
             drop(read);
             crate::runtime::io::with_state(|d, _| {
                 assert_eq!(d.ring.disk_retries_pending(), 0, "the cancel removed it")

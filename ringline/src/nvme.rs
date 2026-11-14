@@ -11,7 +11,8 @@
 //! - Linux 6.1+ already required by ringline for `SendMsgZc`
 //! - NVMe device accessible via `/dev/ng*` (requires `CAP_SYS_ADMIN` or udev rules)
 //!
-//! io_uring only: on the mio backend every NVMe call returns `Unsupported`.
+//! io_uring only: on the mio backend every NVMe call fails with `Unsupported`
+//! (`nvme_read` and `nvme_write` resolve to it).
 //! On io_uring a call that finds the ring's submission queue full submits the
 //! queue inline before pushing, and if that submit fails, queues the command
 //! and pushes it again later (see the `fs` module docs).
@@ -248,6 +249,106 @@ impl NvmeDevice {
     }
 }
 
+/// `NVME_IOCTL_ADMIN_CMD`: `_IOWR('N', 0x41, struct nvme_passthru_cmd)`.
+const NVME_IOCTL_ADMIN_CMD: libc::c_ulong = 0xC048_4E41;
+
+/// Admin opcode: Identify.
+const NVME_ADMIN_IDENTIFY: u8 = 0x06;
+
+/// `struct nvme_passthru_cmd` (`include/uapi/linux/nvme_ioctl.h`), 72 bytes.
+#[repr(C)]
+#[derive(Default)]
+struct NvmePassthruCmd {
+    opcode: u8,
+    flags: u8,
+    rsvd1: u16,
+    nsid: u32,
+    cdw2: u32,
+    cdw3: u32,
+    metadata: u64,
+    addr: u64,
+    metadata_len: u32,
+    data_len: u32,
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+    cdw13: u32,
+    cdw14: u32,
+    cdw15: u32,
+    timeout_ms: u32,
+    result: u32,
+}
+
+/// The logical block size of namespace `nsid` on the NVMe-generic character
+/// device `fd`, from Identify Namespace (CNS 0) through
+/// `NVME_IOCTL_ADMIN_CMD`. Below Linux 6.2 it needs `CAP_SYS_ADMIN`, as
+/// every NVMe passthrough command does there; from 6.2 the kernel allows it
+/// without (`nvme_cmd_allowed`).
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+pub(crate) fn identify_lba_size(fd: libc::c_int, nsid: u32) -> std::io::Result<u32> {
+    let mut data = vec![0u8; 4096];
+    let mut cmd = NvmePassthruCmd {
+        opcode: NVME_ADMIN_IDENTIFY,
+        nsid,
+        addr: data.as_mut_ptr() as u64,
+        data_len: data.len() as u32,
+        // CNS 0: Identify Namespace.
+        cdw10: 0,
+        ..Default::default()
+    };
+    // Safety: `cmd` is a valid `nvme_passthru_cmd` whose `addr` points to
+    // `data_len` writable bytes that outlive the synchronous ioctl.
+    let ret = unsafe { libc::ioctl(fd, NVME_IOCTL_ADMIN_CMD as _, &mut cmd) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if ret > 0 {
+        // The device failed the command: the ioctl returns its status field.
+        return Err(std::io::Error::other(NvmeStatus((ret & 0x7FFF) as u16)));
+    }
+    lba_size_from_identify(&data)
+}
+
+/// The logical block size an Identify Namespace data structure gives for its
+/// formatted LBA format: FLBAS (byte 26) selects an entry of the LBA format
+/// list at byte 128 (4 bytes each), whose LBADS (byte 2 of the entry) is
+/// log2 of the size. A format with metadata (MS, bytes 0 and 1 of the entry,
+/// nonzero) is refused.
+pub(crate) fn lba_size_from_identify(data: &[u8]) -> std::io::Result<u32> {
+    let invalid = |what: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("NVMe Identify Namespace: {what}"),
+        )
+    };
+    if data.len() < 4096 {
+        return Err(invalid("data shorter than 4096 bytes"));
+    }
+    let nlbaf = data[25] as usize;
+    let flbas = data[26];
+    // Bits 3:0 are the low bits of the format index; bits 6:5 the high bits
+    // when there are more than 16 formats.
+    let index = (flbas & 0x0f) as usize | ((((flbas >> 5) & 0x03) as usize) << 4);
+    if index > nlbaf {
+        return Err(invalid("formatted LBA index beyond the format list"));
+    }
+    let format = &data[128 + 4 * index..][..4];
+    // MS: metadata bytes per block. Passthrough reads and writes here carry
+    // no metadata pointer, and with extended LBAs the device would move more
+    // than `num_blocks * LBA size` bytes.
+    if u16::from_le_bytes([format[0], format[1]]) != 0 {
+        return Err(invalid(
+            "the formatted LBA format has metadata, which passthrough reads and writes do not carry",
+        ));
+    }
+    let lbads = format[2];
+    // LBADS below 9 (512 bytes) is not a supported format.
+    if !(9..=31).contains(&lbads) {
+        return Err(invalid("LBA data size out of range"));
+    }
+    Ok(1u32 << lbads)
+}
+
 /// Per-device state tracked by the driver.
 pub(crate) struct NvmeDeviceState {
     /// Index in the io_uring fixed file table.
@@ -264,6 +365,10 @@ pub(crate) struct NvmeDeviceState {
     /// device, because a queued SQE resolves its fixed-file index at submission.
     #[cfg_attr(not(has_io_uring), allow(dead_code))]
     pub closing: bool,
+    /// The namespace's logical block size in bytes, from Identify Namespace
+    /// at open (`identify_lba_size`), or the error that command returned.
+    #[cfg_attr(not(has_io_uring), allow(dead_code))]
+    pub lba_size: Result<u32, (std::io::ErrorKind, String)>,
 }
 
 impl NvmeDeviceState {
@@ -275,6 +380,7 @@ impl NvmeDeviceState {
             generation: 0,
             in_flight: 0,
             closing: false,
+            lba_size: Err((std::io::ErrorKind::Other, "not open".into())),
         }
     }
 }
@@ -494,6 +600,9 @@ impl NvmeConfig {
 
     /// Set the most NVMe commands in flight across all devices, per worker. Defaults to 256.
     ///
+    /// One submitted at the limit fails with an error of kind `WouldBlock`,
+    /// `NVMe command slab exhausted`.
+    ///
     /// Each command slot has 16,384 operation keys. A future holds one from
     /// submission until it takes its result or is dropped on the worker that
     /// created it. A future that is neither polled to completion nor dropped
@@ -546,6 +655,60 @@ mod tests {
             .max_devices(2)
             .max_commands_in_flight(32);
         assert_eq!((c.max_devices, c.max_commands_in_flight), (2, 32));
+    }
+
+    fn identify_with(nlbaf: u8, flbas: u8, formats: &[(usize, u8)]) -> Vec<u8> {
+        let mut data = vec![0u8; 4096];
+        data[25] = nlbaf;
+        data[26] = flbas;
+        for &(index, lbads) in formats {
+            data[128 + 4 * index + 2] = lbads;
+        }
+        data
+    }
+
+    #[test]
+    fn lba_size_comes_from_the_formatted_lba_format() {
+        // Format 0 is 512 bytes, format 1 (formatted) is 4096.
+        let data = identify_with(1, 1, &[(0, 9), (1, 12)]);
+        assert_eq!(lba_size_from_identify(&data).unwrap(), 4096);
+        let data = identify_with(1, 0, &[(0, 9), (1, 12)]);
+        assert_eq!(lba_size_from_identify(&data).unwrap(), 512);
+    }
+
+    #[test]
+    fn lba_size_reads_the_high_bits_of_the_format_index() {
+        // FLBAS bits 6:5 = 1, bits 3:0 = 2: format 18.
+        let data = identify_with(20, (1 << 5) | 2, &[(2, 9), (18, 12)]);
+        assert_eq!(lba_size_from_identify(&data).unwrap(), 4096);
+    }
+
+    #[test]
+    fn lba_size_refuses_a_format_with_metadata() {
+        let mut data = identify_with(1, 1, &[(0, 9), (1, 9)]);
+        // Format 1: 512 bytes plus 8 bytes of metadata.
+        data[128 + 4] = 8;
+        let err = lba_size_from_identify(&data).unwrap_err();
+        assert!(err.to_string().contains("metadata"), "{err}");
+        // Format 0, without metadata, is accepted.
+        data[26] = 0;
+        assert_eq!(lba_size_from_identify(&data).unwrap(), 512);
+    }
+
+    #[test]
+    fn lba_size_rejects_malformed_identify_data() {
+        assert!(lba_size_from_identify(&[0u8; 512]).is_err(), "short");
+        let data = identify_with(0, 1, &[(1, 12)]);
+        assert!(lba_size_from_identify(&data).is_err(), "index beyond NLBAF");
+        let data = identify_with(0, 0, &[(0, 0)]);
+        assert!(lba_size_from_identify(&data).is_err(), "LBADS 0");
+    }
+
+    #[test]
+    fn nvme_ioctl_admin_cmd_encodes_its_struct_size() {
+        assert_eq!(std::mem::size_of::<NvmePassthruCmd>(), 72);
+        let ioc: libc::c_ulong = (3 << 30) | (72 << 16) | ((b'N' as libc::c_ulong) << 8) | 0x41;
+        assert_eq!(NVME_IOCTL_ADMIN_CMD, ioc);
     }
 
     #[test]

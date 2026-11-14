@@ -425,7 +425,7 @@ Two `ClientBuilder` knobs control batching of fired requests:
 - Futures use `pin-project-lite` for pin projection.
 - `ParseResult::Consumed(0)` on non-empty data is treated as "need more" (same as `NeedMore`).
 - The `manual_async_fn` clippy lint is suppressed in tests/examples — `async fn on_accept` doesn't work because it borrows `&self` (not `'static`).
-- `unsafe fn` is used where the caller carries a real obligation (e.g. `nvme_read`/`nvme_write` require the buffer to be valid, aligned, and to outlive the future) — don't wrap such contracts in "safe" signatures that can't uphold them.
+- `unsafe` marks an obligation the caller or implementer carries (e.g. implementing `buf::IoBuf`/`IoBufMut` promises the buffer's memory stays valid while ringline holds the value, which the disk reads and writes rely on) — don't wrap such contracts in "safe" signatures that can't uphold them.
 
 ## API Design Principles
 

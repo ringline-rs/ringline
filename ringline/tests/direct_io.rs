@@ -282,46 +282,22 @@ fn direct_io_multiple_files() {
 
 static DSYNC_OUTCOME: std::sync::Mutex<Option<Result<(), String>>> = std::sync::Mutex::new(None);
 
-/// One block, aligned for `O_DIRECT`, freed on drop.
-struct Block(*mut u8);
+/// The length of one `O_DIRECT` block in these tests.
+const BLOCK: usize = 4096;
 
-impl Block {
-    const LEN: usize = 4096;
-
-    fn filled(byte: u8) -> Self {
-        let layout = std::alloc::Layout::from_size_align(Self::LEN, Self::LEN).unwrap();
-        // SAFETY: the layout has a non-zero size.
-        let ptr = unsafe { std::alloc::alloc(layout) };
-        assert!(!ptr.is_null());
-        // SAFETY: `ptr` is valid for `LEN` bytes.
-        unsafe { std::ptr::write_bytes(ptr, byte, Self::LEN) };
-        Block(ptr)
-    }
-
-    fn bytes(&self) -> &[u8] {
-        // SAFETY: `self.0` is valid for `LEN` bytes for the life of `self`.
-        unsafe { std::slice::from_raw_parts(self.0, Self::LEN) }
-    }
-}
-
-impl Drop for Block {
-    fn drop(&mut self) {
-        let layout = std::alloc::Layout::from_size_align(Self::LEN, Self::LEN).unwrap();
-        // SAFETY: allocated in `filled` with this layout.
-        unsafe { std::alloc::dealloc(self.0, layout) };
-    }
+/// One block of `byte`, aligned for `O_DIRECT`.
+fn filled_block(byte: u8) -> ringline::buf::AlignedBuf {
+    let mut buf = ringline::buf::AlignedBuf::zeroed(BLOCK, BLOCK);
+    buf.fill(byte);
+    buf
 }
 
 async fn dsync_write_fsync_read(path: &str) -> Result<(), String> {
     let options = ringline::DirectIoOpenOptions::new().dsync(true);
     let file = ringline::open_direct_io_file_with(path, options).map_err(|e| e.to_string())?;
-    let out = Block::filled(0xa5);
-    // SAFETY: `out` is aligned, `LEN` bytes, and outlives the await.
-    let n = unsafe { ringline::direct_io_write(file, 0, out.0, Block::LEN as u32) }
-        .map_err(|e| e.to_string())?
-        .await
-        .map_err(|e| format!("write: {e}"))?;
-    if n as usize != Block::LEN {
+    let (n, out) = ringline::direct_io_write(file, 0, filled_block(0xa5)).await;
+    let n = n.map_err(|e| format!("write: {e}"))?;
+    if n != BLOCK {
         return Err(format!("wrote {n} bytes"));
     }
     let synced = ringline::direct_io_fsync(file)
@@ -331,13 +307,10 @@ async fn dsync_write_fsync_read(path: &str) -> Result<(), String> {
     if synced != 0 {
         return Err(format!("fsync resolved to {synced}"));
     }
-    let back = Block::filled(0);
-    // SAFETY: as for the write.
-    let n = unsafe { ringline::direct_io_read(file, 0, back.0, Block::LEN as u32) }
-        .map_err(|e| e.to_string())?
-        .await
-        .map_err(|e| format!("read: {e}"))?;
-    if n as usize != Block::LEN || back.bytes() != out.bytes() {
+    let back = ringline::buf::AlignedBuf::with_capacity(BLOCK, BLOCK);
+    let (n, back) = ringline::direct_io_read(file, 0, back).await;
+    let n = n.map_err(|e| format!("read: {e}"))?;
+    if n != BLOCK || back[..] != out[..] {
         return Err(format!("read {n} bytes that differ from the write"));
     }
     Ok(())
@@ -377,7 +350,7 @@ fn a_dsync_file_round_trips_and_its_fsync_future_resolves() {
         return;
     }
     let path = temp_file_path(".krio_direct_io_dsync");
-    std::fs::write(&path, [0u8; Block::LEN]).unwrap();
+    std::fs::write(&path, [0u8; BLOCK]).unwrap();
 
     let (shutdown, handles) = RinglineBuilder::new(direct_io_test_config())
         .launch::<DsyncHandler>()
@@ -406,27 +379,15 @@ fn queued_paths() -> (PathBuf, PathBuf) {
     )
 }
 
-/// A 4 KiB-aligned 4 KiB slice of `buf`, which holds 8 KiB.
-fn aligned_block(buf: &mut [u8]) -> &mut [u8] {
-    let offset = buf.as_ptr().align_offset(4096);
-    &mut buf[offset..offset + 4096]
-}
-
 /// A write queued before a close lands in the closed file, the handle goes
 /// stale at once, and the next file opened gets none of it.
 async fn write_close_open(first: &str, second: &str) -> Result<(), String> {
-    let mut buf = vec![0u8; 8192];
-    let block = aligned_block(&mut buf);
-    block.fill(0xab);
-
     let a = ringline::open_direct_io_file(first).map_err(|e| e.to_string())?;
-    let write = unsafe { ringline::direct_io_write(a, 0, block.as_ptr(), 4096) }
-        .map_err(|e| e.to_string())?;
+    let write = ringline::direct_io_write(a, 0, filled_block(0xab));
     let closed = ringline::close_direct_io_file(a).map_err(|e| e.to_string());
     let stale = ringline::close_direct_io_file(a).is_err();
     let b = ringline::open_direct_io_file(second).map_err(|e| e.to_string());
-    // Awaited before any return, so `buf` outlives the write.
-    let written = write.await.map_err(|e| e.to_string())?;
+    let written = write.await.0.map_err(|e| e.to_string())?;
     closed?;
     ringline::close_direct_io_file(b?).map_err(|e| e.to_string())?;
     if !stale {
@@ -441,20 +402,26 @@ async fn write_close_open(first: &str, second: &str) -> Result<(), String> {
 /// Every deferred close releases its slot: with more rounds than slots, an open
 /// fails once a slot leaks.
 async fn deferred_closes_release_their_slots(path: &str) -> Result<(), String> {
-    let mut buf = vec![0u8; 8192];
-    let block = aligned_block(&mut buf);
     for round in 0..16 {
         let file =
             ringline::open_direct_io_file(path).map_err(|e| format!("round {round}: open: {e}"))?;
-        let ptr = block.as_mut_ptr();
-        let op = match round % 3 {
-            0 => unsafe { ringline::direct_io_write(file, 0, ptr, 4096) },
-            1 => unsafe { ringline::direct_io_read(file, 0, ptr, 4096) },
-            _ => ringline::direct_io_fsync(file),
-        }
-        .map_err(|e| format!("round {round}: submit: {e}"))?;
+        let submit = |e: std::io::Error| format!("round {round}: submit: {e}");
+        let op: std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>>>> = match round % 3 {
+            0 => {
+                let write = ringline::direct_io_write(file, 0, filled_block(0));
+                Box::pin(async move { write.await.0 })
+            }
+            1 => {
+                let buf = ringline::buf::AlignedBuf::with_capacity(BLOCK, BLOCK);
+                let read = ringline::direct_io_read(file, 0, buf);
+                Box::pin(async move { read.await.0 })
+            }
+            _ => {
+                let fsync = ringline::direct_io_fsync(file).map_err(submit)?;
+                Box::pin(async move { fsync.await.map(|n| n as usize) })
+            }
+        };
         let closed = ringline::close_direct_io_file(file);
-        // Awaited before any return, so `buf` outlives the operation.
         op.await.map_err(|e| format!("round {round}: op: {e}"))?;
         closed.map_err(|e| format!("round {round}: close: {e}"))?;
     }

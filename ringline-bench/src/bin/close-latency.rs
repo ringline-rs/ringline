@@ -85,10 +85,7 @@ async fn fsync_loop(path: std::path::PathBuf) {
     };
     let mut buf = bytes::BytesMut::zeroed(4096);
     loop {
-        let (written, back) = match ringline::fs::write_from(file, 0, buf) {
-            Ok(write) => write.await,
-            Err(e) => return eprintln!("close-latency: write: {e}"),
-        };
+        let (written, back) = ringline::fs::write_from(file, 0, buf).await;
         buf = back;
         if let Err(e) = written {
             return eprintln!("close-latency: write: {e}");

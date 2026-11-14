@@ -160,6 +160,7 @@ pub mod bench_internal {
 
 pub(crate) mod backend;
 pub(crate) mod blocking;
+pub mod buf;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod buffer;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
@@ -287,8 +288,9 @@ pub use runtime::io::ConnectFuture;
 pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;
-/// Future that awaits a disk-I/O completion (`fs::read`, `fs::write`,
-/// `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, NVMe, direct I/O).
+/// Future that awaits a disk-I/O completion that carries no buffer
+/// (`fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, `direct_io_fsync`,
+/// `nvme_flush`).
 pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
@@ -350,15 +352,17 @@ pub use runtime::io::connect;
 pub use runtime::io::connect_unix;
 /// Submit an fsync of a Direct I/O file and return a future for the result.
 pub use runtime::io::direct_io_fsync;
-/// Submit a Direct I/O read and return a future for the result.
+/// Read from a Direct I/O file into an owned buffer.
 pub use runtime::io::direct_io_read;
-/// Submit a Direct I/O write and return a future for the result.
+/// Write an owned buffer to a Direct I/O file.
 pub use runtime::io::direct_io_write;
 /// Submit an NVMe flush and return a future for the result.
 pub use runtime::io::nvme_flush;
-/// Submit an NVMe read and return a future for the result.
+/// The logical block size of an NVMe device's namespace.
+pub use runtime::io::nvme_lba_size;
+/// Read NVMe logical blocks into an owned buffer.
 pub use runtime::io::nvme_read;
-/// Submit an NVMe write and return a future for the result.
+/// Write NVMe logical blocks from an owned buffer.
 pub use runtime::io::nvme_write;
 /// Open a Direct I/O file from any async task.
 pub use runtime::io::open_direct_io_file;

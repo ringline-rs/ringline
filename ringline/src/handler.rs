@@ -1522,6 +1522,12 @@ impl<'a> DriverCtx<'a> {
             return Err(io::Error::last_os_error());
         }
 
+        // The logical block size, so a read knows how many bytes a command
+        // transfers. A failure is kept for the reads and writes to return;
+        // the device still opens, for flushes.
+        let lba_size =
+            crate::nvme::identify_lba_size(fd, nsid).map_err(|e| (e.kind(), e.to_string()));
+
         // Register in the fixed file table.
         let fd_index = self.nvme_fd_base + index as u32;
         if self.ring.register_files_update(fd_index, &[fd]).is_err() {
@@ -1539,6 +1545,7 @@ impl<'a> DriverCtx<'a> {
         if let Some(dev) = devices.get_mut(index) {
             dev.fd_index = fd_index;
             dev.nsid = nsid;
+            dev.lba_size = lba_size;
         }
 
         let generation = devices.get(index).map(|d| d.generation).unwrap_or(0);
@@ -1575,9 +1582,9 @@ impl<'a> DriverCtx<'a> {
             .nvme_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("NVMe not configured"))?;
-        let slab_idx = slab
-            .allocate(device.index)
-            .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
+        let slab_idx = slab.allocate(device.index).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "NVMe command slab exhausted")
+        })?;
 
         let cmd = crate::nvme::NvmeUringCmd::read(nsid, lba, num_blocks, buf_addr, buf_len);
         let key = match self.disk_io_key(DiskIoKind::Nvme, slab_idx) {
@@ -1646,9 +1653,9 @@ impl<'a> DriverCtx<'a> {
             .nvme_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("NVMe not configured"))?;
-        let slab_idx = slab
-            .allocate(device.index)
-            .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
+        let slab_idx = slab.allocate(device.index).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "NVMe command slab exhausted")
+        })?;
 
         let cmd = crate::nvme::NvmeUringCmd::write(nsid, lba, num_blocks, buf_addr, buf_len);
         let key = match self.disk_io_key(DiskIoKind::Nvme, slab_idx) {
@@ -1698,9 +1705,9 @@ impl<'a> DriverCtx<'a> {
             .nvme_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("NVMe not configured"))?;
-        let slab_idx = slab
-            .allocate(device.index)
-            .ok_or_else(|| io::Error::other("NVMe command slab exhausted"))?;
+        let slab_idx = slab.allocate(device.index).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "NVMe command slab exhausted")
+        })?;
 
         let cmd = crate::nvme::NvmeUringCmd::flush(nsid);
         let key = match self.disk_io_key(DiskIoKind::Nvme, slab_idx) {
@@ -1761,6 +1768,22 @@ impl<'a> DriverCtx<'a> {
         }
 
         Ok(())
+    }
+
+    /// The logical block size of `device`'s namespace, in bytes.
+    pub(crate) fn nvme_lba_size(&self, device: crate::nvme::NvmeDevice) -> io::Result<u32> {
+        self.validate_nvme_device(device)?;
+        let dev = self
+            .nvme_devices
+            .as_ref()
+            .and_then(|devices| devices.get(device.index))
+            .ok_or_else(|| io::Error::other("invalid NVMe device handle"))?;
+        dev.lba_size.clone().map_err(|(kind, message)| {
+            io::Error::new(
+                kind,
+                format!("NVMe Identify Namespace failed at open: {message}"),
+            )
+        })
     }
 
     /// Validate an NVMe device handle and return (fd_index, nsid).
@@ -1874,7 +1897,12 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
         let slab_idx = slab
             .allocate(file.index, crate::direct_io::DirectIoOp::Read)
-            .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "direct I/O command slab exhausted",
+                )
+            })?;
 
         let key = match self.disk_io_key(DiskIoKind::DirectIo, slab_idx) {
             Ok(key) => key,
@@ -1939,7 +1967,12 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
         let slab_idx = slab
             .allocate(file.index, crate::direct_io::DirectIoOp::Write)
-            .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "direct I/O command slab exhausted",
+                )
+            })?;
 
         let key = match self.disk_io_key(DiskIoKind::DirectIo, slab_idx) {
             Ok(key) => key,
@@ -1993,7 +2026,12 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
         let slab_idx = slab
             .allocate(file.index, crate::direct_io::DirectIoOp::Fsync)
-            .ok_or_else(|| io::Error::other("direct I/O command slab exhausted"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "direct I/O command slab exhausted",
+                )
+            })?;
 
         let key = match self.disk_io_key(DiskIoKind::DirectIo, slab_idx) {
             Ok(key) => key,
@@ -2114,7 +2152,10 @@ impl<'a> DriverCtx<'a> {
             .allocate(file_index, crate::fs::FsOp::Open)
             .ok_or_else(|| {
                 self.fs_files.as_mut().unwrap().release(file_index);
-                io::Error::other("filesystem command slab exhausted")
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem command slab exhausted",
+                )
             })?;
 
         // Store the CString in the slab entry so it lives until CQE.
@@ -2191,7 +2232,12 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
         let slab_idx = slab
             .allocate(file.index, crate::fs::FsOp::Read)
-            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem command slab exhausted",
+                )
+            })?;
 
         let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
             Ok(key) => key,
@@ -2249,7 +2295,12 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
         let slab_idx = slab
             .allocate(file.index, crate::fs::FsOp::Write)
-            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem command slab exhausted",
+                )
+            })?;
 
         let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
             Ok(key) => key,
@@ -2300,7 +2351,12 @@ impl<'a> DriverCtx<'a> {
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
         let slab_idx = slab
             .allocate(file.index, crate::fs::FsOp::Fsync)
-            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem command slab exhausted",
+                )
+            })?;
 
         let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
             Ok(key) => key,
@@ -2378,9 +2434,12 @@ impl<'a> DriverCtx<'a> {
             .fs_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab
-            .allocate(0, crate::fs::FsOp::Statx)
-            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+        let slab_idx = slab.allocate(0, crate::fs::FsOp::Statx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem command slab exhausted",
+            )
+        })?;
 
         // The kernel writes into the slab entry's statx buffer; the slab
         // never moves an entry, so the pointer stays valid until the CQE.
@@ -2444,9 +2503,12 @@ impl<'a> DriverCtx<'a> {
             .fs_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab
-            .allocate(0, crate::fs::FsOp::Rename)
-            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+        let slab_idx = slab.allocate(0, crate::fs::FsOp::Rename).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem command slab exhausted",
+            )
+        })?;
 
         if let Some(entry) = slab.get_mut(slab_idx) {
             entry.path = Some(c_from);
@@ -2494,9 +2556,12 @@ impl<'a> DriverCtx<'a> {
             .fs_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab
-            .allocate(0, crate::fs::FsOp::Unlink)
-            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+        let slab_idx = slab.allocate(0, crate::fs::FsOp::Unlink).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem command slab exhausted",
+            )
+        })?;
 
         if let Some(entry) = slab.get_mut(slab_idx) {
             entry.path = Some(c_path);
@@ -2546,9 +2611,12 @@ impl<'a> DriverCtx<'a> {
             .fs_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab
-            .allocate(0, crate::fs::FsOp::Mkdir)
-            .ok_or_else(|| io::Error::other("filesystem command slab exhausted"))?;
+        let slab_idx = slab.allocate(0, crate::fs::FsOp::Mkdir).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem command slab exhausted",
+            )
+        })?;
 
         if let Some(entry) = slab.get_mut(slab_idx) {
             entry.path = Some(c_path);
@@ -3214,6 +3282,14 @@ impl<'a> DriverCtx<'a> {
         _buf_addr: u64,
         _buf_len: u32,
     ) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "NVMe passthrough requires the io_uring backend",
+        ))
+    }
+
+    /// NVMe logical block size (not supported on mio backend).
+    pub(crate) fn nvme_lba_size(&self, _device: crate::nvme::NvmeDevice) -> io::Result<u32> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "NVMe passthrough requires the io_uring backend",

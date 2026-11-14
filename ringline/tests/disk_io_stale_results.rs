@@ -106,10 +106,11 @@ async fn drop_a_read_on_a_reused_key() -> Result<usize, String> {
     // This read takes the dropped stat's key. It waits on the FIFO, so
     // dropping it must park the buffer, not free it.
     let before = BUF_FREES.load(Ordering::SeqCst);
-    drop(
-        ringline::fs::read_into(fifo, 0, BytesMut::with_capacity(BUF_SIZE))
-            .map_err(|e| e.to_string())?,
-    );
+    drop(ringline::fs::read_into(
+        fifo,
+        0,
+        BytesMut::with_capacity(BUF_SIZE),
+    ));
     Ok(BUF_FREES.load(Ordering::SeqCst) - before)
 }
 
@@ -312,10 +313,11 @@ async fn cycle_then_drop_a_read() -> Result<usize, String> {
     }
     let fifo = TD_FIFO_FILE.take().expect("fifo opened");
     let before = BUF_FREES.load(Ordering::SeqCst);
-    drop(
-        ringline::fs::read_into(fifo, 0, BytesMut::with_capacity(BUF_SIZE))
-            .map_err(|e| e.to_string())?,
-    );
+    drop(ringline::fs::read_into(
+        fifo,
+        0,
+        BytesMut::with_capacity(BUF_SIZE),
+    ));
     Ok(BUF_FREES.load(Ordering::SeqCst) - before)
 }
 
@@ -416,7 +418,7 @@ async fn hold_a_result_while_the_key_comes_round() -> String {
     for _ in 1..KEY_PERIOD {
         ringline::fs::stat(&path).unwrap().await.unwrap();
     }
-    let read = ringline::fs::read_into(fifo, 0, BytesMut::with_capacity(4096)).unwrap();
+    let read = ringline::fs::read_into(fifo, 0, BytesMut::with_capacity(4096));
     let read = match ringline::timeout(Duration::from_millis(200), read).await {
         Ok((result, _buf)) => {
             format!("the read resolved with {result:?} while the kernel read was pending")
