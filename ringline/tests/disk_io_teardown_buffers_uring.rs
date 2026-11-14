@@ -71,7 +71,7 @@ impl AsyncEventHandler for ReadsInConnection {
                 .unwrap()
                 .await
                 .unwrap();
-            let read = ringline::fs::read_into(file, 0, BytesMut::with_capacity(BUF_SIZE)).unwrap();
+            let read = ringline::fs::read_into(file, 0, BytesMut::with_capacity(BUF_SIZE));
             // Close this connection while the read waits: the task, and the
             // read's future with it, is dropped outside any task poll.
             ringline::spawn(async move {

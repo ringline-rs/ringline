@@ -1442,7 +1442,7 @@ impl ConfigBuilder {
     /// Enable NVMe passthrough (io_uring only). On io_uring each worker
     /// reserves `max_devices` fixed-file slots and allocates its device table
     /// and command slab; on mio the config is accepted and every NVMe call
-    /// returns `Unsupported`.
+    /// fails with `Unsupported` (`nvme_read` and `nvme_write` resolve to it).
     pub fn nvme(mut self, config: crate::nvme::NvmeConfig) -> Self {
         self.config.nvme = Some(config);
         self

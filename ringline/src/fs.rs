@@ -9,7 +9,7 @@
 //! Operations are independent of each other on both backends, including
 //! operations on one file: io_uring does not order independent submissions,
 //! and the mio pool's threads take requests from one queue. A write is in the
-//! file when its future resolves, not when `write` returns, and [`fsync`]
+//! file when its future resolves, not when `write_from` returns, and [`fsync`]
 //! covers the writes whose futures have resolved when it is called. To order
 //! two operations, await the first before submitting the second.
 //!
@@ -109,6 +109,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 
+use crate::buf::{IoBuf, IoBufMut};
 use crate::runtime::CURRENT_TASK_ID;
 use crate::runtime::io::{CURRENT_DRIVER, DiskIoFuture, with_state};
 use crate::runtime::waker::pending;
@@ -190,7 +191,7 @@ impl OpenFlags {
     /// Truncate an existing regular file to zero length (`O_TRUNC`).
     pub const TRUNCATE: Self = Self(libc::O_TRUNC);
     /// Append every write to the end of the file (`O_APPEND`). On Linux the
-    /// `offset` argument of [`write()`] and [`write_from()`] is then ignored, on
+    /// `offset` argument of [`write_from()`] is then ignored, on
     /// both backends; on macOS `pwrite` writes at `offset` regardless.
     pub const APPEND: Self = Self(libc::O_APPEND);
 }
@@ -313,7 +314,8 @@ impl FsConfig {
     ///
     /// Every operation of this module except `close` counts from submission
     /// until its completion is processed. One submitted at the limit fails
-    /// with `filesystem command slab exhausted`, on both backends.
+    /// with an error of kind `WouldBlock`, `filesystem command slab
+    /// exhausted`, on both backends.
     ///
     /// On io_uring each command slot has 16,384 operation keys. A future holds
     /// one from submission until it takes its result or is dropped on the
@@ -662,9 +664,9 @@ thread_local! {
         const { std::cell::RefCell::new(OrphanedBuffers(Vec::new())) };
 }
 
-/// Buffers of abandoned reads and writes, as `(disk I/O key, file slot,
-/// buffer)`, waiting for the event loop to park or drop them.
-struct OrphanedBuffers(Vec<(u32, u16, BytesMut)>);
+/// Buffers of abandoned reads and writes, as `(disk I/O key, user_data to
+/// cancel, buffer)`, waiting for the event loop to park or drop them.
+struct OrphanedBuffers(Vec<(u32, u64, Box<dyn std::any::Any>)>);
 
 impl Drop for OrphanedBuffers {
     fn drop(&mut self) {
@@ -712,8 +714,8 @@ pub(crate) fn release_orphans(
             std::mem::take(&mut orphans.0)
         }
     });
-    for (seq, file_index, buf) in buffers {
-        park_buffer(driver, executor, seq, file_index, buf);
+    for (seq, target, buf) in buffers {
+        drop(park_buffer(driver, executor, seq, target, buf));
     }
 
     let orphans = ORPHANED_OPENS.with(|orphans| {
@@ -736,108 +738,118 @@ pub(crate) fn release_orphans(
     }
 }
 
-/// Read from a file at the given offset.
+// ── Owned-buffer API ──────────────────────────────────────────────────
+
+/// Read from a file at the given offset into `buf`'s spare capacity.
 ///
 /// On io_uring this can run on the worker's io-wq pool; before Linux 6.13
 /// that can delay the worker's connection closes. See
 /// [the module docs](self#blocking-file-io-and-connection-closes-io_uring)
 /// for when.
 ///
-/// Returns a [`DiskIoFuture`] whose output is the number of bytes read.
-///
-/// # Safety
-///
-/// `buf` must point to writable memory of at least `len` bytes that remains
-/// valid until the operation completes. The operation keeps using the memory
-/// after the future is dropped, and a dropped future gives no way to learn
-/// when the operation completes, so after a drop the memory must not be freed
-/// or reused: leak it, or use an owned-buffer variant where one exists (#825).
-/// Here that is [`read_into`].
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor.
-pub unsafe fn read(file: File, offset: u64, buf: *mut u8, len: u32) -> io::Result<DiskIoFuture> {
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        // Safety: the outer `read()` is already unsafe, and the caller
-        // guarantees the buffer invariants.
-        #[allow(unused_unsafe)]
-        let seq = unsafe { ctx.fs_read(file, offset, buf, len)? };
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.wait_disk_io(seq, task_id);
-        Ok(DiskIoFuture::new(seq))
-    })
-}
-
-/// Write to a file at the given offset.
-///
-/// On io_uring this can run on the worker's io-wq pool; before Linux 6.13
-/// that can delay the worker's connection closes. See
-/// [the module docs](self#blocking-file-io-and-connection-closes-io_uring)
-/// for when.
-///
-/// Returns a [`DiskIoFuture`] whose output is the number of bytes written.
-///
-/// # Safety
-///
-/// `buf` must point to readable memory of at least `len` bytes that remains
-/// valid until the operation completes. The operation keeps using the memory
-/// after the future is dropped, and a dropped future gives no way to learn
-/// when the operation completes, so after a drop the memory must not be freed
-/// or reused: leak it, or use an owned-buffer variant where one exists (#825).
-/// Here that is [`write_from`].
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor.
-pub unsafe fn write(file: File, offset: u64, buf: *const u8, len: u32) -> io::Result<DiskIoFuture> {
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        // Safety: the outer `write()` is already unsafe, and the caller
-        // guarantees the buffer invariants.
-        #[allow(unused_unsafe)]
-        let seq = unsafe { ctx.fs_write(file, offset, buf, len)? };
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.wait_disk_io(seq, task_id);
-        Ok(DiskIoFuture::new(seq))
-    })
-}
-
-// ── Safe owned-buffer API ─────────────────────────────────────────────
-
-/// Read from a file at the given offset into a [`BytesMut`].
-///
-/// On io_uring this can run on the worker's io-wq pool; before Linux 6.13
-/// that can delay the worker's connection closes. See
-/// [the module docs](self#blocking-file-io-and-connection-closes-io_uring)
-/// for when.
-///
-/// The kernel writes into `buf`'s spare capacity (`buf.capacity() - buf.len()`).
-/// On success, the returned future yields `(Ok(n), buf)` with `buf.len()` extended
-/// by `n` bytes. On failure, the buffer is returned unchanged alongside the error.
+/// `buf` is any [`IoBufMut`], such as a [`BytesMut`], a `Vec<u8>` or an
+/// [`AlignedBuf`](crate::buf::AlignedBuf). The kernel writes into its spare
+/// capacity (`bytes_total() - bytes_init()`). On success, the returned future
+/// yields `(Ok(n), buf)` with the initialized length extended by `n` bytes. On
+/// failure, the buffer is returned unchanged alongside the error.
 ///
 /// If the future is dropped before the I/O completes, the buffer is kept
-/// until the operation completes and then freed. On io_uring a best-effort
+/// until the operation completes and then dropped. On io_uring a best-effort
 /// `ASYNC_CANCEL` is also submitted. If the worker exits first, or the future
 /// is dropped on a thread other than the worker that created it, the buffer
 /// is leaked.
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] if `buf` has no spare capacity
-/// or if spare capacity exceeds `u32::MAX`. A spare capacity above
-/// `i32::MAX` is refused by macOS with `EINVAL` and read short by Linux,
-/// which reads at most `0x7ffff000` bytes per call.
+/// An operation that cannot be submitted resolves at once to `(Err(e), buf)`,
+/// with `buf` unchanged: [`io::ErrorKind::WouldBlock`] when the command slab
+/// or the in-flight bound is full, which a later retry with the same buffer
+/// can pass; [`io::ErrorKind::InvalidInput`] for a `buf` with no spare
+/// capacity or more than `u32::MAX` bytes of it; and an error of kind `Other`
+/// otherwise, for example for a stale handle, or when every key of the slab
+/// slot is held by a future (see [`FsConfig::max_commands_in_flight`]). The
+/// read's length is the whole spare capacity; to read fewer bytes, pass a
+/// buffer with that much spare capacity (an `AlignedBuf`'s capacity is
+/// exact). A spare capacity above `i32::MAX` is refused by macOS with
+/// `EINVAL` and read short by Linux, which reads at most `0x7ffff000` bytes
+/// per call.
 ///
 /// # Panics
 ///
-/// Panics if called outside the ringline async executor.
-pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadFuture> {
-    let initial_len = buf.len();
-    let cap = buf.capacity();
+/// Panics if called outside the ringline async executor, unless `buf` is
+/// refused before submission (the `InvalidInput` cases above).
+pub fn read_into<B: IoBufMut>(file: File, offset: u64, mut buf: B) -> ReadFuture<B> {
+    let (ptr, len, initial_len) = match spare_region(&mut buf) {
+        Ok(region) => region,
+        Err(e) => return ReadFuture::failed(e, buf),
+    };
+    with_state(|driver, executor| {
+        // Safety: the future owns `buf`, or parks it on drop until the
+        // operation completes (`ReadFuture::drop`), so the memory outlives
+        // the kernel's use of it.
+        match unsafe { driver.make_ctx().fs_read(file, offset, ptr, len) } {
+            Ok(seq) => {
+                let target = cancel_target(crate::completion::OpTag::Fs, file.index as u32, seq);
+                ReadFuture::new(executor, seq, target, initial_len, None, buf)
+            }
+            Err(e) => ReadFuture::failed(e, buf),
+        }
+    })
+}
+
+/// Write to a file at the given offset from `buf`'s initialized bytes.
+///
+/// On io_uring this can run on the worker's io-wq pool; before Linux 6.13
+/// that can delay the worker's connection closes. See
+/// [the module docs](self#blocking-file-io-and-connection-closes-io_uring)
+/// for when.
+///
+/// `buf` is any [`IoBuf`], such as a [`BytesMut`], a [`Bytes`](bytes::Bytes),
+/// a `Vec<u8>` or an [`AlignedBuf`](crate::buf::AlignedBuf). The kernel reads
+/// its `bytes_init()` bytes. The future yields `(io::Result<usize>, buf)`;
+/// the buffer is returned unchanged.
+///
+/// If the future is dropped before the I/O completes, the buffer is kept
+/// until the operation completes and then dropped. On io_uring a best-effort
+/// `ASYNC_CANCEL` is also submitted. If the worker exits first, or the future
+/// is dropped on a thread other than the worker that created it, the buffer
+/// is leaked.
+///
+/// An operation that cannot be submitted resolves at once to
+/// `(Err(e), buf)`, as for [`read_into`]; so does an initialized length above
+/// `u32::MAX`, with [`io::ErrorKind::InvalidInput`]. A length above
+/// `i32::MAX` is refused by macOS with `EINVAL` and written short by Linux,
+/// which writes at most `0x7ffff000` bytes per call.
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor, unless `buf` is
+/// refused before submission (the `InvalidInput` cases above).
+pub fn write_from<B: IoBuf>(file: File, offset: u64, buf: B) -> WriteFuture<B> {
+    let (ptr, len) = match init_region(&buf) {
+        Ok(region) => region,
+        Err(e) => return WriteFuture::failed(e, buf),
+    };
+    with_state(|driver, executor| {
+        // Safety: the future owns `buf`, or parks it on drop until the
+        // operation completes (`WriteFuture::drop`).
+        match unsafe { driver.make_ctx().fs_write(file, offset, ptr, len) } {
+            Ok(seq) => {
+                let target = cancel_target(crate::completion::OpTag::Fs, file.index as u32, seq);
+                WriteFuture::new(executor, seq, target, None, buf)
+            }
+            Err(e) => WriteFuture::failed(e, buf),
+        }
+    })
+}
+
+/// The spare capacity of `buf` a read writes into: its start, its length and
+/// the initialized length before it.
+pub(crate) fn spare_region<B: IoBufMut>(buf: &mut B) -> io::Result<(*mut u8, u32, usize)> {
+    let initial_len = buf.bytes_init();
+    let cap = buf.bytes_total();
     if initial_len >= cap {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "BytesMut has no spare capacity",
+            "buffer has no spare capacity",
         ));
     }
     let spare = cap - initial_len;
@@ -847,103 +859,107 @@ pub fn read_into(file: File, offset: u64, mut buf: BytesMut) -> io::Result<ReadF
             "spare capacity exceeds u32::MAX",
         ));
     }
-    // Safety: `as_mut_ptr().add(initial_len)` points into the spare region of
-    // the BytesMut's backing allocation. The future owns `buf` (or parks it on
-    // drop), so the allocation outlives the kernel's use of the pointer.
-    let ptr = unsafe { buf.as_mut_ptr().add(initial_len) };
-    let len = spare as u32;
-    let file_index = file.index;
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        // Safety: caller-side invariant is upheld by ReadFuture's ownership +
-        // parking on drop (see ReadFuture::Drop).
-        let seq = unsafe { ctx.fs_read(file, offset, ptr, len)? };
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.wait_disk_io(seq, task_id);
-        Ok(ReadFuture {
-            seq,
-            file_index,
-            initial_len,
-            buf: Some(buf),
-            owner: crate::runtime::waker::current_worker(),
-        })
-    })
+    // Safety: `initial_len < bytes_total()`, so the offset is inside the
+    // buffer's memory (`IoBufMut`'s contract).
+    let ptr = unsafe { buf.stable_mut_ptr().add(initial_len) };
+    Ok((ptr, spare as u32, initial_len))
 }
 
-/// Write to a file at the given offset from a [`BytesMut`].
-///
-/// On io_uring this can run on the worker's io-wq pool; before Linux 6.13
-/// that can delay the worker's connection closes. See
-/// [the module docs](self#blocking-file-io-and-connection-closes-io_uring)
-/// for when.
-///
-/// The kernel reads `buf.len()` bytes starting at `buf.as_ptr()`. The future
-/// yields `(io::Result<usize>, buf)` — the buffer is returned unchanged.
-///
-/// If the future is dropped before the I/O completes, the buffer is kept
-/// until the operation completes and then freed. On io_uring a best-effort
-/// `ASYNC_CANCEL` is also submitted. If the worker exits first, or the future
-/// is dropped on a thread other than the worker that created it, the buffer
-/// is leaked.
-///
-/// Returns [`io::ErrorKind::InvalidInput`] if `buf.len() > u32::MAX`. A
-/// length above `i32::MAX` is refused by macOS with `EINVAL` and written
-/// short by Linux, which writes at most `0x7ffff000` bytes per call.
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor.
-pub fn write_from(file: File, offset: u64, buf: BytesMut) -> io::Result<WriteFuture> {
-    let len = buf.len();
+/// The initialized bytes of `buf` a write sends: their start and length.
+pub(crate) fn init_region<B: IoBuf>(buf: &B) -> io::Result<(*const u8, u32)> {
+    let len = buf.bytes_init();
     if len > u32::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "buffer len exceeds u32::MAX",
         ));
     }
-    let ptr = buf.as_ptr();
-    let len_u32 = len as u32;
-    let file_index = file.index;
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        // Safety: caller-side invariant is upheld by WriteFuture's ownership +
-        // parking on drop (see WriteFuture::Drop).
-        let seq = unsafe { ctx.fs_write(file, offset, ptr, len_u32)? };
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.wait_disk_io(seq, task_id);
-        Ok(WriteFuture {
-            seq,
-            file_index,
-            buf: Some(buf),
-            owner: crate::runtime::waker::current_worker(),
-        })
-    })
+    Ok((buf.stable_ptr(), len as u32))
 }
 
-/// Future returned by [`read_into()`].
+/// The user_data of operation `seq` on `index`, which a dropped read or
+/// write cancels on io_uring.
+pub(crate) fn cancel_target(tag: crate::completion::OpTag, index: u32, seq: u32) -> u64 {
+    crate::completion::UserData::encode(tag, index, seq).raw()
+}
+
+/// Future returned by [`read_into()`], [`direct_io_read()`](crate::direct_io_read)
+/// and [`nvme_read()`](crate::nvme_read).
 ///
-/// Resolves to `(io::Result<usize>, BytesMut)`. On success `buf.len()` is
-/// extended by the number of bytes read.
+/// Resolves to `(io::Result<usize>, B)`. On success the buffer's initialized
+/// length is extended by the number of bytes read.
 ///
 /// Polled from a task on another worker it stays pending until a task on the
-/// owning worker drives it; polled outside the ringline executor it panics.
-/// Dropped on a thread other than the owning worker, it leaks the buffer and
-/// leaves its result slot on the owning worker taken until that worker exits.
-pub struct ReadFuture {
+/// owning worker drives it; polled outside the ringline executor it panics,
+/// except that a future whose submission failed resolves on its first poll
+/// wherever it is polled. Dropped on a thread other than the owning worker,
+/// it leaks the buffer and leaves its result slot on the owning worker taken
+/// until that worker exits.
+#[must_use = "dropping a read's future discards its result, and on io_uring cancels the read"]
+pub struct ReadFuture<B: IoBufMut = BytesMut> {
     seq: u32,
-    file_index: u16,
+    /// The user_data a drop cancels (io_uring).
+    target: u64,
     initial_len: usize,
-    buf: Option<BytesMut>,
+    /// For an NVMe read, the bytes a successful command transfers; its
+    /// completion carries a status, not a count.
+    fill: Option<u32>,
+    buf: Option<B>,
     /// The worker whose executor holds `seq`.
     owner: u32,
+    /// The submission failed with this error: nothing is in flight, and the
+    /// first poll returns it with the buffer.
+    failed: Option<io::Error>,
 }
 
-impl Future for ReadFuture {
-    type Output = (io::Result<usize>, BytesMut);
+impl<B: IoBufMut> ReadFuture<B> {
+    /// A future that resolves at once to `(Err(error), buf)`.
+    pub(crate) fn failed(error: io::Error, buf: B) -> Self {
+        ReadFuture {
+            seq: 0,
+            target: 0,
+            initial_len: 0,
+            fill: None,
+            buf: Some(buf),
+            owner: crate::runtime::waker::current_worker(),
+            failed: Some(error),
+        }
+    }
+
+    pub(crate) fn new(
+        executor: &mut crate::runtime::Executor,
+        seq: u32,
+        target: u64,
+        initial_len: usize,
+        fill: Option<u32>,
+        buf: B,
+    ) -> Self {
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor.wait_disk_io(seq, task_id);
+        ReadFuture {
+            seq,
+            target,
+            initial_len,
+            fill,
+            buf: Some(buf),
+            owner: crate::runtime::waker::current_worker(),
+            failed: None,
+        }
+    }
+}
+
+// The future holds no self-references; `buf` is moved, never pinned.
+impl<B: IoBufMut> Unpin for ReadFuture<B> {}
+
+impl<B: IoBufMut> Future for ReadFuture<B> {
+    type Output = (io::Result<usize>, B);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         assert!(me.buf.is_some(), "ReadFuture polled after completion");
+        if let Some(error) = me.failed.take() {
+            return Poll::Ready((Err(error), me.buf.take().expect("checked above")));
+        }
         with_state(|_driver, executor| {
             // On another worker `seq` names that worker's entry, and the
             // result is not there.
@@ -954,16 +970,16 @@ impl Future for ReadFuture {
             match executor.poll_disk_io(me.seq, task_id) {
                 Some((result, _)) if result < 0 => {
                     let buf = me.buf.take().expect("ReadFuture polled after completion");
-                    Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
+                    Poll::Ready((Err(crate::runtime::io::disk_io_error(me.seq, result)), buf))
                 }
                 Some((result, _)) => {
                     let mut buf = me.buf.take().expect("ReadFuture polled after completion");
-                    let n = result as usize;
-                    let max_n = buf.capacity() - me.initial_len;
-                    let n = n.min(max_n);
-                    // Safety: kernel wrote `n` bytes into the spare region
-                    // [initial_len, initial_len + n), initializing them.
-                    unsafe { buf.set_len(me.initial_len + n) };
+                    let n = me.fill.map_or(result as usize, |fill| fill as usize);
+                    let n = n.min(buf.bytes_total().saturating_sub(me.initial_len));
+                    // Safety: the operation wrote `n` bytes into the spare
+                    // region [initial_len, initial_len + n), initializing
+                    // them.
+                    unsafe { buf.set_init(me.initial_len + n) };
                     Poll::Ready((Ok(n), buf))
                 }
                 None => pending(cx),
@@ -972,36 +988,90 @@ impl Future for ReadFuture {
     }
 }
 
-impl Drop for ReadFuture {
+impl<B: IoBufMut> Drop for ReadFuture<B> {
     fn drop(&mut self) {
         let Some(buf) = self.buf.take() else { return };
-        drop_buffer(self.owner, self.seq, self.file_index, buf);
+        if self.failed.is_some() {
+            // Nothing was submitted.
+            return;
+        }
+        drop_buffer(self.owner, self.seq, self.target, buf);
     }
 }
 
-/// Future returned by [`write_from()`].
+/// Future returned by [`write_from()`], [`direct_io_write()`](crate::direct_io_write)
+/// and [`nvme_write()`](crate::nvme_write).
 ///
-/// Resolves to `(io::Result<usize>, BytesMut)`. The buffer is returned
-/// unchanged regardless of success or failure.
+/// Resolves to `(io::Result<usize>, B)`. The buffer is returned unchanged
+/// regardless of success or failure.
 ///
 /// Polled from a task on another worker it stays pending until a task on the
-/// owning worker drives it; polled outside the ringline executor it panics.
-/// Dropped on a thread other than the owning worker, it leaks the buffer and
-/// leaves its result slot on the owning worker taken until that worker exits.
-pub struct WriteFuture {
+/// owning worker drives it; polled outside the ringline executor it panics,
+/// except that a future whose submission failed resolves on its first poll
+/// wherever it is polled. Dropped on a thread other than the owning worker,
+/// it leaks the buffer and leaves its result slot on the owning worker taken
+/// until that worker exits.
+#[must_use = "dropping a write's future discards its result, and on io_uring cancels the write"]
+pub struct WriteFuture<B: IoBuf = BytesMut> {
     seq: u32,
-    file_index: u16,
-    buf: Option<BytesMut>,
+    /// The user_data a drop cancels (io_uring).
+    target: u64,
+    /// For an NVMe write, the bytes a successful command transfers; its
+    /// completion carries a status, not a count.
+    fill: Option<u32>,
+    buf: Option<B>,
     /// The worker whose executor holds `seq`.
     owner: u32,
+    /// The submission failed with this error: nothing is in flight, and the
+    /// first poll returns it with the buffer.
+    failed: Option<io::Error>,
 }
 
-impl Future for WriteFuture {
-    type Output = (io::Result<usize>, BytesMut);
+impl<B: IoBuf> WriteFuture<B> {
+    /// A future that resolves at once to `(Err(error), buf)`.
+    pub(crate) fn failed(error: io::Error, buf: B) -> Self {
+        WriteFuture {
+            seq: 0,
+            target: 0,
+            fill: None,
+            buf: Some(buf),
+            owner: crate::runtime::waker::current_worker(),
+            failed: Some(error),
+        }
+    }
+
+    pub(crate) fn new(
+        executor: &mut crate::runtime::Executor,
+        seq: u32,
+        target: u64,
+        fill: Option<u32>,
+        buf: B,
+    ) -> Self {
+        let task_id = CURRENT_TASK_ID.with(|c| c.get());
+        executor.wait_disk_io(seq, task_id);
+        WriteFuture {
+            seq,
+            target,
+            fill,
+            buf: Some(buf),
+            owner: crate::runtime::waker::current_worker(),
+            failed: None,
+        }
+    }
+}
+
+// The future holds no self-references; `buf` is moved, never pinned.
+impl<B: IoBuf> Unpin for WriteFuture<B> {}
+
+impl<B: IoBuf> Future for WriteFuture<B> {
+    type Output = (io::Result<usize>, B);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
         assert!(me.buf.is_some(), "WriteFuture polled after completion");
+        if let Some(error) = me.failed.take() {
+            return Poll::Ready((Err(error), me.buf.take().expect("checked above")));
+        }
         with_state(|_driver, executor| {
             // On another worker `seq` names that worker's entry, and the
             // result is not there.
@@ -1012,11 +1082,12 @@ impl Future for WriteFuture {
             match executor.poll_disk_io(me.seq, task_id) {
                 Some((result, _)) if result < 0 => {
                     let buf = me.buf.take().expect("WriteFuture polled after completion");
-                    Poll::Ready((Err(io::Error::from_raw_os_error(-result)), buf))
+                    Poll::Ready((Err(crate::runtime::io::disk_io_error(me.seq, result)), buf))
                 }
                 Some((result, _)) => {
                     let buf = me.buf.take().expect("WriteFuture polled after completion");
-                    Poll::Ready((Ok(result as usize), buf))
+                    let n = me.fill.map_or(result as usize, |fill| fill as usize);
+                    Poll::Ready((Ok(n), buf))
                 }
                 None => pending(cx),
             }
@@ -1024,20 +1095,24 @@ impl Future for WriteFuture {
     }
 }
 
-impl Drop for WriteFuture {
+impl<B: IoBuf> Drop for WriteFuture<B> {
     fn drop(&mut self) {
         let Some(buf) = self.buf.take() else { return };
-        drop_buffer(self.owner, self.seq, self.file_index, buf);
+        if self.failed.is_some() {
+            // Nothing was submitted.
+            return;
+        }
+        drop_buffer(self.owner, self.seq, self.target, buf);
     }
 }
 
 /// Drop-side handler shared by [`ReadFuture`] and [`WriteFuture`]. Only the
 /// owning worker's executor tracks `seq`; dropped on another thread (the
-/// futures are `Send`), the operation may still be using `buf` and no
-/// executor here can park it, so it is leaked (#575).
-fn drop_buffer(owner: u32, seq: u32, file_index: u16, buf: BytesMut) {
+/// futures are `Send` when `B` is), the operation may still be using `buf`
+/// and no executor here can park it, so it is leaked (#575).
+fn drop_buffer<B: 'static>(owner: u32, seq: u32, target: u64, buf: B) {
     if crate::runtime::waker::current_worker() == owner {
-        park_or_drop(seq, file_index, buf);
+        park_or_drop(seq, target, Box::new(buf));
     } else {
         std::mem::forget(buf);
     }
@@ -1047,7 +1122,7 @@ fn drop_buffer(owner: u32, seq: u32, file_index: u16, buf: BytesMut) {
 /// it calls [`park_buffer`]. Outside one (a connection's task dropped at
 /// teardown) it queues the buffer on `ORPHANED_BUFFERS`, which
 /// [`release_orphans`] passes to `park_buffer`.
-fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
+fn park_or_drop(seq: u32, target: u64, buf: Box<dyn std::any::Any>) {
     let Some(mut non_null) = CURRENT_DRIVER.with(|c| c.get()) else {
         // Outside the executor: a connection's task is dropped outside any
         // task poll. Queue the buffer; the event loop releases it after its
@@ -1057,7 +1132,7 @@ fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
         let mut pending = Some(buf);
         let _ = ORPHANED_BUFFERS.try_with(|orphans| {
             if let Some(buf) = pending.take() {
-                orphans.borrow_mut().0.push((seq, file_index, buf));
+                orphans.borrow_mut().0.push((seq, target, buf));
             }
         });
         if let Some(buf) = pending {
@@ -1065,46 +1140,43 @@ fn park_or_drop(seq: u32, file_index: u16, buf: BytesMut) {
         }
         return;
     };
-    let state = unsafe { non_null.as_mut() };
-    let driver = unsafe { &mut *state.driver.as_mut() };
-    let executor = unsafe { &mut *state.executor.as_mut() };
-    park_buffer(driver, executor, seq, file_index, buf);
+    let completed = {
+        let state = unsafe { non_null.as_mut() };
+        let driver = unsafe { &mut *state.driver.as_mut() };
+        let executor = unsafe { &mut *state.executor.as_mut() };
+        park_buffer(driver, executor, seq, target, buf)
+    };
+    // Dropped after the borrows of the driver and executor end.
+    drop(completed);
 }
 
-/// Drop `buf` if its operation has completed (its result has arrived),
-/// otherwise park it under `seq`; `wake_disk_io` frees it when the
-/// operation completes.
+/// Return `buf` for the caller to drop if its operation has completed (its
+/// result has arrived), otherwise park it under `seq`; `wake_disk_io` frees
+/// it when the operation completes.
 ///
-/// On io_uring, also submit a best-effort `ASYNC_CANCEL` to speed up the
-/// completion, which then arrives with `-ECANCELED` or the natural result.
-/// On mio the disk-I/O pool thread runs the operation, which may not have
-/// started yet, and there is nothing to cancel.
+/// On io_uring, also submit a best-effort `ASYNC_CANCEL` of `target` to speed
+/// up the completion, which then arrives with `-ECANCELED` or the natural
+/// result. On mio the disk-I/O pool thread runs the operation, which may not
+/// have started yet, and there is nothing to cancel.
 #[cfg_attr(not(has_io_uring), allow(unused_variables))]
 fn park_buffer(
     driver: &mut crate::backend::Driver,
     executor: &mut crate::runtime::Executor,
     seq: u32,
-    file_index: u16,
-    buf: BytesMut,
-) {
+    target: u64,
+    buf: Box<dyn std::any::Any>,
+) -> Option<Box<dyn std::any::Any>> {
     if executor.take_disk_io_result(seq).is_some() {
         // The operation has completed and released the buffer.
-        drop(buf);
-        return;
+        return Some(buf);
     }
     executor.park_disk_io(seq, buf);
+    // The cancel CQE handler is a no-op (event_loop.rs), so the conn_index
+    // encoded into the cancel SQE's own user_data is unused: pass 0 to
+    // satisfy `UserData::encode`'s 24-bit guard.
     #[cfg(has_io_uring)]
-    {
-        let target = crate::completion::UserData::encode(
-            crate::completion::OpTag::Fs,
-            file_index as u32,
-            seq,
-        );
-        // The cancel CQE handler is a no-op (event_loop.rs), so the
-        // conn_index encoded into the cancel SQE's own user_data is
-        // unused — pass 0 to satisfy `UserData::encode`'s 24-bit guard.
-        let _ = driver.ring.submit_async_cancel(target.raw(), 0);
-    }
+    let _ = driver.ring.submit_async_cancel(target, 0);
+    None
 }
 
 /// Fsync a file: `fsync(2)`, which persists the writes to it whose futures

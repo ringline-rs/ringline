@@ -72,7 +72,7 @@ impl AsyncEventHandler for ReadsInConnection {
             // Park the pool's only thread in an open that waits for a writer.
             drop(ringline::fs::open(dir.join("fifo"), OpenFlags::READ, 0).unwrap());
             // Queued behind it, then abandoned when this task is dropped.
-            let read = ringline::fs::read_into(file, 0, BytesMut::with_capacity(BUF_SIZE)).unwrap();
+            let read = ringline::fs::read_into(file, 0, BytesMut::with_capacity(BUF_SIZE));
             // Close this connection while the read waits: the task, and the
             // read's future with it, is dropped outside any task poll.
             ringline::spawn(async move {

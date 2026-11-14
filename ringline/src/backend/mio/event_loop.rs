@@ -70,7 +70,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.count_out_open_connections();
     }
 
-    /// Whether exit left a raw-pointer read or write (`disk_io_borrowing`)
+    /// Whether exit left a read or write (`disk_io_borrowing`)
     /// running on a pool thread, which can still use memory the event loop and
     /// its tasks own; the caller must then leak the event loop (#856).
     pub(crate) fn memory_in_use_at_exit(&self) -> bool {

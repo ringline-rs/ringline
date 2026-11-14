@@ -41,11 +41,7 @@ impl AsyncEventHandler for FsReadWriteHandler {
             // Create and write.
             let file = ringline::fs::create(&path).unwrap().await.unwrap();
             let data = b"hello ringline fs";
-            let n = unsafe {
-                ringline::fs::write(file, 0, data.as_ptr(), data.len() as u32)
-                    .unwrap()
-                    .await
-            };
+            let (n, _) = ringline::fs::write_from(file, 0, bytes::Bytes::from_static(data)).await;
             assert!(n.is_ok());
 
             // Fsync.
@@ -58,14 +54,9 @@ impl AsyncEventHandler for FsReadWriteHandler {
                 .unwrap()
                 .await
                 .unwrap();
-            let mut buf = [0u8; 64];
-            let result = unsafe {
-                ringline::fs::read(file, 0, buf.as_mut_ptr(), buf.len() as u32)
-                    .unwrap()
-                    .await
-            };
+            let (result, buf) = ringline::fs::read_into(file, 0, Vec::with_capacity(64)).await;
             match result {
-                Ok(n) if n > 0 && &buf[..n as usize] == b"hello ringline fs" => {
+                Ok(n) if n > 0 && &buf[..n] == b"hello ringline fs" => {
                     FS_READ_RESULT.store(1, Ordering::SeqCst);
                 }
                 _ => {}
@@ -291,7 +282,7 @@ impl AsyncEventHandler for FsSafeRoundtripHandler {
             let file = ringline::fs::create(&path).unwrap().await.unwrap();
             let mut wbuf = bytes::BytesMut::with_capacity(payload.len());
             wbuf.extend_from_slice(payload);
-            let (wres, wbuf) = ringline::fs::write_from(file, 0, wbuf).unwrap().await;
+            let (wres, wbuf) = ringline::fs::write_from(file, 0, wbuf).await;
             assert_eq!(wres.unwrap(), payload.len());
             // Buffer is returned with len unchanged.
             assert_eq!(&wbuf[..], payload);
@@ -303,7 +294,7 @@ impl AsyncEventHandler for FsSafeRoundtripHandler {
                 .await
                 .unwrap();
             let rbuf = bytes::BytesMut::with_capacity(64);
-            let (rres, rbuf) = ringline::fs::read_into(file, 0, rbuf).unwrap().await;
+            let (rres, rbuf) = ringline::fs::read_into(file, 0, rbuf).await;
             let n = rres.unwrap();
             if n == payload.len() && &rbuf[..n] == payload {
                 FS_SAFE_RESULT.store(1, Ordering::SeqCst);
@@ -358,15 +349,14 @@ impl AsyncEventHandler for FsDropInFlightHandler {
             // arrives; if it isn't, the kernel may scribble into freed memory.
             {
                 let _fut =
-                    ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(payload.len()))
-                        .unwrap();
+                    ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(payload.len()));
                 // _fut dropped here without poll.
             }
 
             // Issue a second read on the same file. If the graveyard logic
             // is broken, this is where memory corruption would surface.
             let rbuf = bytes::BytesMut::with_capacity(payload.len());
-            let (rres, rbuf) = ringline::fs::read_into(file, 0, rbuf).unwrap().await;
+            let (rres, rbuf) = ringline::fs::read_into(file, 0, rbuf).await;
             let n = rres.unwrap();
             if n == payload.len() && &rbuf[..n] == payload {
                 FS_DROP_RESULT.store(1, Ordering::SeqCst);
