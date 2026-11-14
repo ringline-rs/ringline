@@ -5521,12 +5521,16 @@ pub fn direct_io_write<B: crate::buf::IoBuf>(
 
 /// Submit an fsync of a Direct I/O file and return a future for the result.
 ///
-/// The future resolves to `Ok(0)` once every write to `file` that completed
-/// before the call is on stable storage. On a Linux block device this sends
-/// the device a cache flush, which persists everything in its volatile write
-/// cache and not only this file's writes; the kernel skips the flush when the
-/// device reports a write-through cache. To make individual writes durable
-/// without flushing the whole cache, open the file with
+/// The fsync waits in ringline, not submitted, until every write submitted
+/// before it through `file` has completed, as [`fs::fsync`](crate::fs::fsync)
+/// does; writes through another handle opened on the same path are not
+/// waited for. Once it runs, the future resolves to `Ok(0)` when every write
+/// to the file that completed before then is on stable storage. On a Linux
+/// block device this sends the device a cache flush, which persists
+/// everything in its volatile write cache and not only this file's writes;
+/// the kernel skips the flush when the device reports a write-through cache.
+/// To make individual writes durable without flushing the whole cache, open
+/// the file with
 /// [`DirectIoOpenOptions::dsync`](crate::direct_io::DirectIoOpenOptions::dsync).
 ///
 /// On io_uring the kernel runs an fsync on an io-wq worker thread.

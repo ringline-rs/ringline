@@ -173,6 +173,7 @@ pub(crate) mod connection;
 pub mod direct_io;
 #[cfg(not(has_io_uring))]
 pub(crate) mod disk_io_pool;
+pub(crate) mod disk_order;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub mod fs;
 pub(crate) mod handoff;
