@@ -108,8 +108,8 @@ pub(crate) struct ConnSendState {
     /// skips the flush and the close_notify. Cleared by `reset_send_state`
     /// at slot reactivation (io_uring) and by `finish_close` (mio).
     pub aborted: bool,
-    /// Where the disconnect `abort` puts ahead of the `Close` of a TCP
-    /// connection stands. io_uring only.
+    /// The state of the disconnect `abort` submits on a TCP connection.
+    /// io_uring only.
     #[cfg(has_io_uring)]
     pub disconnect: Disconnect,
 }
@@ -121,8 +121,8 @@ pub(crate) struct ConnSendState {
 #[cfg(has_io_uring)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Disconnect {
-    /// No disconnect is pending: no abort, a Unix-domain connection, or the
-    /// disconnect was pushed or has completed.
+    /// No disconnect is pending: no abort, a Unix-domain connection, the
+    /// chain carrying it was pushed, or a lone one has completed.
     None,
     /// The disconnect goes first in the `Close`'s chain:
     /// `submit_committed_close` pushes the disconnect, the close lead and the
@@ -722,7 +722,7 @@ impl<'a> DriverCtx<'a> {
     /// operation's identity onto the slot whose completion settles it.
     ///
     /// Byte-for-byte `send` — the same generation check, the
-    /// same `close_submitted` refusal, the same two `reserve_slots` error
+    /// same `closing_refusal`, the same two `reserve_slots` error
     /// mappings, the same TLS branch, the same chunk loop — plus one thing:
     /// `id` and the **logical (plaintext) length** are attached to the
     /// final slot, so the completion handler can resolve exactly this
@@ -2573,7 +2573,8 @@ impl<'a> DriverCtx<'a> {
                 "stale connection",
             ));
         }
-        // After `abort` (the only flag mio sets), as the io_uring `send`.
+        // As the io_uring `send`. Of the two flags `closing_refusal` reads,
+        // mio sets only `aborted`.
         if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
             return Err(e);
         }
@@ -3604,7 +3605,8 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     ///
     /// A batch with no parts, or whose parts carry no bytes, queues nothing
     /// and returns `Ok(())` on a live connection; a stale or closing
-    /// connection is reported as `NotConnected`, as for any batch.
+    /// connection is reported as `NotConnected`, or `ConnectionAborted` after
+    /// `abort`, as for any batch.
     pub fn submit(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             return Err(e);

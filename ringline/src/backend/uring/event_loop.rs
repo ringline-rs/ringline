@@ -2816,7 +2816,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// `abort`'s disconnect has completed. Its result is ignored, as the
-    /// close leads' are: the `Close` runs whatever it returned. A lone one
+    /// close leads' are: the `Close` runs whatever the disconnect returned. A
+    /// lone one
     /// (`Disconnect::Alone`) held the `Close`, which frees the slot it names,
     /// so this releases the hold and registers the connection for the
     /// end-of-iteration drain, as `handle_shutdown` does. One chained ahead
@@ -17464,6 +17465,27 @@ mod tests {
         el.drain_settled_sends();
         assert_aborted(el.executor.take_send_result(id));
         assert_eq!(el.driver.send_copy_pool.free_count(), 8);
+    }
+
+    /// The slot's next occupant does not inherit the abort: its sends are
+    /// accepted and its close takes no disconnect.
+    #[test]
+    fn a_reused_slot_does_not_inherit_the_abort() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.send_queues[conn_index as usize].shutdown_inflight = true;
+        abort(&mut el, conn_index);
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].disconnect,
+            Disconnect::Alone
+        );
+
+        el.driver.reset_send_state(conn_index);
+
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(!state.aborted);
+        assert_eq!(state.disconnect, Disconnect::None);
+        assert!(state.closing_refusal().is_none());
     }
 
     /// A Unix-domain connection is closed with its normal lead and no

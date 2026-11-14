@@ -584,7 +584,7 @@ impl Ring {
         // requests. See `CloseLead`. The lead is hard-linked, so the Close
         // runs after it even when it fails. `Engine::push_pair` pushes both
         // together, so a submit cannot separate them. Config validation
-        // guarantees an SQ of at least two entries.
+        // guarantees an SQ of at least four entries.
         match self.close_lead_sqe(conn_index, lead) {
             None => unsafe { self.push_sqe(&close) }?,
             Some(first) => unsafe { self.engine.push_pair(&first, &close) }?,

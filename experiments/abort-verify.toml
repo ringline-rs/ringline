@@ -7,9 +7,10 @@ name = "abort verify on {image} ({ref})"
 #   systemslab submit experiments/abort-verify.toml -p image=debian-13-6.12 -p linger_expect=fail
 #   systemslab submit experiments/abort-verify.toml -p image=debian-14-7.2 -p linger_expect=pass
 #
-# tests/abort.rs's first test aborts a connection holding a zero-copy send to
-# a peer that does not read, while an older idle connection's hangup poll is
-# pending, and requires the send's buffer back within 100 ms.
+# `abort_releases_a_stalled_connection_at_once` in tests/abort.rs aborts a
+# connection holding a zero-copy send to a peer that does not read, while an
+# older idle connection's hangup poll is pending, and requires the send's
+# buffer back within 100 ms.
 # - green: the test passes.
 # - abort-verify-no-disconnect.patch closes with the normal lead and no
 #   disconnect. The buffer is held on every kernel, so the test fails.

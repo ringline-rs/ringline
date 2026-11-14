@@ -683,8 +683,8 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// last half or calls `close`, or on an error (`docs/half-close-design.md`).
 /// After the FIN the runtime arms no receive for the socket, so a reset that
 /// arrives then is reported by the next send. Sends made once the Close is
-/// submitted
-/// (after queued sends drain) fail with `NotConnected`.
+/// submitted (after queued sends drain) fail with `NotConnected`, and sends
+/// made after [`SendHalf::abort`] with `ConnectionAborted`.
 ///
 /// A TLS connection receives ciphertext directly too, up to
 /// `recv_direct_region` bytes per receive. With the default engine the
@@ -1613,7 +1613,7 @@ impl ConnCtx {
                 crate::handler::aborted_error(),
             );
             executor.abort_sends(self.conn_index, self.generation);
-            driver.abort_connection(self.conn_index);
+            driver.abort(self.conn_index);
         });
     }
 
@@ -3249,7 +3249,8 @@ impl SendHalf {
     /// # Errors
     ///
     /// `NotConnected` if this handle is stale (its connection closed and
-    /// the slot may hold another). On io_uring also `NotConnected` once the
+    /// the slot may hold another). `ConnectionAborted` after
+    /// [`abort`](Self::abort). On io_uring also `NotConnected` once the
     /// connection's Close has been submitted and, on a TLS connection, once
     /// its close_notify has been queued; on mio a send made after `close` is
     /// queued and flushed or discarded with the connection. On io_uring,
@@ -3387,27 +3388,36 @@ impl SendHalf {
     /// Every send on the connection that has not resolved fails with
     /// [`ConnectionAborted`](io::ErrorKind::ConnectionAborted), whatever the
     /// kernel reports for it: queued sends, sends waiting for send-pool
-    /// capacity, and sends in flight. A send started afterwards fails the
-    /// same way, and so does a read parked on the connection. Their send-pool
-    /// slots and zero-copy buffers are released without waiting for the peer.
-    /// No close_notify is sent.
+    /// capacity, and sends in flight. A send started afterwards fails the same
+    /// way until the connection is released, and then with `NotConnected`, as
+    /// on any released connection. A read parked on the connection ends:
+    /// [`with_data`](Connection::with_data) resolves to 0, and
+    /// [`with_data_result`](Connection::with_data_result) to
+    /// `ConnectionAborted`, which replaces a receive error not yet taken. The
+    /// sends' send-pool slots and zero-copy buffers are released without
+    /// waiting for the peer: queued sends' at once, and a send in the kernel's
+    /// when its completion or notification lands after the reset. No
+    /// close_notify is sent.
     ///
-    /// On a TCP connection the peer reads `ECONNRESET`. On io_uring the
-    /// socket is disconnected (an `IORING_OP_CONNECT` to `AF_UNSPEC`, which
-    /// resets it and discards its queued data) ahead of the `Close`, so the
-    /// kernel returns the zero-copy buffers of its sends at once even while
-    /// other connections' requests keep the socket from being released. On
-    /// mio the socket is closed with `SO_LINGER {1, 0}`. On io_uring a
-    /// Unix-domain connection is closed with its queued sends dropped; the
-    /// peer reads end of file, or `ECONNRESET` if this end had unread data.
+    /// On a TCP connection the peer reads `ECONNRESET` on Linux. On macOS a
+    /// peer that only reads may not see the reset until it sends. On io_uring
+    /// the socket is disconnected (an `IORING_OP_CONNECT` to `AF_UNSPEC`,
+    /// which resets it and discards its queued data) ahead of the `Close`, so
+    /// the kernel returns the zero-copy buffers of its sends even while other
+    /// connections' requests keep the socket from being released. On mio the
+    /// socket is closed with `SO_LINGER {1, 0}`. On io_uring a Unix-domain
+    /// connection is closed with its queued sends dropped; the peer reads end
+    /// of file, or `ECONNRESET` if this end had unread data.
     ///
     /// It also applies to a connection that is already closing, for example
     /// one whose [`close`](Self::close) waits for a peer that stopped
-    /// reading. It does nothing once the connection's close is committed,
-    /// on io_uring when its `Close` has been submitted; nothing then waits on
-    /// the peer. As for `close`, it does nothing if the connection has been
-    /// released, or when called outside the worker's executor, and the
-    /// connection's task is dropped when the close completes.
+    /// reading. It does nothing once the connection's close is committed (on
+    /// io_uring, once its `Close` has been submitted). A zero-copy send whose
+    /// data the kernel had already taken then keeps its buffer until the peer
+    /// acknowledges the data or the kernel gives up on the socket. As for
+    /// `close`, it does nothing if the connection has been released, or when
+    /// called outside the worker's executor, and the connection's task is
+    /// dropped when the close completes.
     pub fn abort(&mut self) {
         self.conn.abort();
     }
@@ -4144,6 +4154,13 @@ impl Future for Admission<'_> {
                             io::ErrorKind::ConnectionAborted,
                             "connection closed",
                         )));
+                    }
+                    // After `abort`, or once the Close is committed, the
+                    // refusal every send gets; ahead of the write-half and
+                    // close_notify checks, which an abort can leave set.
+                    if let Some(e) = driver.send_queues[this.conn_index as usize].closing_refusal()
+                    {
+                        return this.finish(Err(e));
                     }
                     // Waiting for capacity in order to write to a half-closed
                     // socket is never useful, and a doomed entry at the head

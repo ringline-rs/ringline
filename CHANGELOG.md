@@ -33,14 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it (`docs/send-admission-design.md`, section 2).
 - `SendHalf::abort` and `Connection::abort` close a connection without
   draining its sends, for a peer that has stopped reading, where `close()`
-  waits for it. Every send on the connection that has not resolved, queued,
-  waiting for send-pool capacity or in flight, fails with `ConnectionAborted`,
-  as do a later send and a parked read, and their send-pool slots and
-  zero-copy buffers are released at once. No close_notify is sent, and a TCP
-  peer reads `ECONNRESET`. On io_uring the socket is disconnected
-  (`IORING_OP_CONNECT` to `AF_UNSPEC`) ahead of its `Close`, so before Linux
-  6.13 the zero-copy buffers come back even while other connections' requests
-  hold the fixed file; on mio the socket is closed with `SO_LINGER {1, 0}`.
+  waits for it. Every send on the connection that has not resolved fails with
+  `ConnectionAborted`: queued sends, sends waiting for send-pool capacity, and
+  sends in flight. A later send fails the same way, a parked `with_data`
+  resolves to 0, and `with_data_result` returns `ConnectionAborted`. The sends'
+  send-pool slots and zero-copy buffers are released without waiting for the
+  peer. No close_notify is sent, and a TCP peer on Linux reads `ECONNRESET`. On
+  io_uring the socket is disconnected (`IORING_OP_CONNECT` to `AF_UNSPEC`)
+  ahead of its `Close`, so before Linux 6.13 the zero-copy buffers come back
+  even while other connections' requests hold the fixed file. On mio the
+  socket is closed with `SO_LINGER {1, 0}`.
 - io_uring: `ConfigBuilder::sqpoll_cpus(&[u32])` pins worker `i`'s SQPOLL
   thread to logical CPU `cpus[i]` (#834). Entries may repeat, so several SQ
   threads can share one CPU. With `sqpoll(true)`, `launch` fails with
@@ -367,7 +369,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking:** `ConfigBuilder::sq_entries` must be at least 4, up from 2:
   `abort` pushes a chain of three linked operations, which a smaller
   submission queue cannot take. A config with 2 fails validation with
-  `Error::RingSetup`. The default, 4096, and the sizes launch fits to
+  `Error::RingSetup` on both backends, since validation is shared. The default, 4096, and the sizes launch fits to
   `RLIMIT_MEMLOCK` (at least 64) are unchanged.
 - `fs::fsync` waits for every write submitted before it through the same
   handle (#905). Before, an fsync submitted while a

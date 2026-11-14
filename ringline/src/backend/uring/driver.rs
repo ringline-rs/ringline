@@ -2048,7 +2048,8 @@ impl Driver {
     /// of the sends the kernel holds land and release their slab entries
     /// without waiting for the fixed file's release (before Linux 6.13, the
     /// end of older requests on any connection). A send still in the kernel
-    /// completes with an error and releases its own slot or slab entry.
+    /// completes (with an error or a short count) and releases its own slot or
+    /// slab entry.
     ///
     /// The `Close` is committed here, pushed or queued for retry as the whole
     /// chain, except while a `Shutdown` from `shutdown_write` is in flight:
@@ -2057,7 +2058,7 @@ impl Driver {
     /// the disconnect's completions let `try_finalize_close` commit the lead
     /// and the `Close`. Nothing is queued ahead of either, so the drain
     /// sends nothing.
-    pub(crate) fn abort_connection(&mut self, conn_index: u32) -> bool {
+    pub(crate) fn abort(&mut self, conn_index: u32) -> bool {
         let ci = conn_index as usize;
         let Some(conn) = self.connections.get_mut(conn_index) else {
             return false;

@@ -34,14 +34,14 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 struct Seen {
     /// When `abort` returned.
     aborted_at: Option<Instant>,
-    /// The result of the send queued behind the zero-copy send (io_uring).
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
-    queued: Option<io::ErrorKind>,
-    /// The result of the send waiting for send-pool capacity (io_uring).
-    #[cfg_attr(not(has_io_uring), allow(dead_code))]
-    waiting: Option<io::ErrorKind>,
+    /// The result of the sends queued behind the first one.
+    queued: Option<String>,
+    /// The result of the send waiting for send-pool capacity.
+    waiting: Option<String>,
     /// The result of a send made after `abort`.
-    late: Option<io::ErrorKind>,
+    late: Option<String>,
+    /// The result of a bounded send made after `abort`.
+    late_admitted: Option<String>,
 }
 
 static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
@@ -78,10 +78,15 @@ impl Drop for VecGuard {
     }
 }
 
-fn kind(result: io::Result<impl Sized>) -> io::ErrorKind {
+/// What `abort`'s sends fail with.
+const ABORTED: &str = "ConnectionAborted: connection aborted";
+
+/// A failed send's kind and message, which tells `abort`'s refusal
+/// ("connection aborted") from a released connection's ("connection closed").
+fn kind(result: io::Result<impl Sized>) -> String {
     match result {
         Ok(_) => panic!("the send succeeded"),
-        Err(e) => e.kind(),
+        Err(e) => format!("{:?}: {e}", e.kind()),
     }
 }
 
@@ -118,19 +123,18 @@ impl AsyncEventHandler for Aborter {
     }
 }
 
-/// On io_uring: a zero-copy send the peer will not take in full, a send
-/// queued behind it, and a send waiting for more send-pool slots than are
-/// free; then `abort`, and the two sends' results.
-#[cfg(has_io_uring)]
+/// More than the socket buffers take, four bounded sends queued behind it
+/// holding send-pool slots, and a bounded send waiting for more slots than are
+/// free; then `abort`, the sends' results, and the result of a bounded send
+/// made after it.
 async fn fill_and_abort(conn: &mut Connection, seen: &mut Seen) {
+    static QUEUED: [u8; SLOT] = [1; SLOT];
     static WAITING: [u8; 6 * SLOT] = [2; 6 * SLOT];
-    let guard = ringline::GuardBox::new(VecGuard(vec![7; GUARD_LEN]));
-    conn.send_parts()
-        .build(|b| b.guard(guard).submit())
-        .expect("guard send accepted");
-    let queued: Vec<_> = (0..4)
-        .map(|_| conn.send(&[1; SLOT]).expect("queued"))
-        .collect();
+    fill(conn);
+    let mut queued = Vec::new();
+    for _ in 0..4 {
+        queued.push(conn.send_admitted(&QUEUED).await.expect("admitted"));
+    }
     let mut waiting = std::pin::pin!(conn.send_admitted(&WAITING));
     let first = std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx))).await;
     assert!(first.is_pending(), "the send waits for capacity");
@@ -145,18 +149,25 @@ async fn fill_and_abort(conn: &mut Connection, seen: &mut Seen) {
         kinds.push(kind(send.await));
     }
     assert!(kinds.iter().all(|k| *k == kinds[0]), "{kinds:?}");
-    seen.queued = Some(kinds[0]);
+    seen.queued = Some(kinds[0].clone());
+    seen.late_admitted = Some(kind(conn.send_admitted(b"late").await));
 }
 
-/// On mio: more than the socket buffers take, then `abort`.
+/// On io_uring: a zero-copy send the peer will not take in full.
+#[cfg(has_io_uring)]
+fn fill(conn: &mut Connection) {
+    let guard = ringline::GuardBox::new(VecGuard(vec![7; GUARD_LEN]));
+    conn.send_parts()
+        .build(|b| b.guard(guard).submit())
+        .expect("guard send accepted");
+}
+
+/// On mio: plain sends, which take no send-pool slot.
 #[cfg(not(has_io_uring))]
-async fn fill_and_abort(conn: &mut Connection, seen: &mut Seen) {
+fn fill(conn: &mut Connection) {
     for _ in 0..64 {
         conn.send_nowait(&[1; 1 << 16]).expect("queued");
     }
-    ringline::sleep(Duration::from_millis(100)).await;
-    conn.abort();
-    seen.aborted_at = Some(Instant::now());
 }
 
 fn launch<H: AsyncEventHandler>(
@@ -219,12 +230,14 @@ fn abort_releases_a_stalled_connection_at_once() {
 
     let seen = wait_for_seen();
     assert!(seen.aborted_at.is_some());
-    assert_eq!(seen.late, Some(io::ErrorKind::ConnectionAborted));
+    let aborted = Some(ABORTED.to_string());
+    assert_eq!(seen.queued, aborted);
+    assert_eq!(seen.waiting, aborted);
+    assert_eq!(seen.late, aborted);
+    assert_eq!(seen.late_admitted, aborted);
     #[cfg(has_io_uring)]
     {
         let aborted_at = seen.aborted_at.unwrap();
-        assert_eq!(seen.queued, Some(io::ErrorKind::ConnectionAborted));
-        assert_eq!(seen.waiting, Some(io::ErrorKind::ConnectionAborted));
         // Over `RLIMIT_MEMLOCK` the guard send falls back to a plain send,
         // and no zero-copy notification is held.
         let enomem = ringline::metrics::POOL
@@ -243,7 +256,8 @@ fn abort_releases_a_stalled_connection_at_once() {
                 std::thread::sleep(Duration::from_millis(1));
             };
             let dropped = dropped.expect("the zero-copy buffer was not released within 2 s");
-            let took = dropped.saturating_duration_since(aborted_at);
+            assert!(dropped >= aborted_at, "released before the abort");
+            let took = dropped - aborted_at;
             eprintln!("abort: released {took:?} after the abort");
             assert!(
                 took < Duration::from_millis(100),
@@ -252,6 +266,12 @@ fn abort_releases_a_stalled_connection_at_once() {
         }
     }
 
+    // On macOS a peer that only read sometimes saw no reset within the 5 s
+    // timeout (13 of 210 runs, and the same with a plain socket pair and no
+    // ringline); a write first made it see one in every run tried. On Linux
+    // the write would take the error, and the read would then return 0.
+    #[cfg(target_os = "macos")]
+    let _ = peer.write(b"x");
     let mut body = Vec::new();
     let read = peer.read_to_end(&mut body);
     assert!(
@@ -275,6 +295,7 @@ impl AsyncEventHandler for TlsAborter {
             let seen = Seen {
                 aborted_at: Some(Instant::now()),
                 late: Some(kind(conn.send(b"late"))),
+                late_admitted: Some(kind(conn.send_admitted(b"late").await)),
                 ..Seen::default()
             };
             *SEEN.lock().unwrap() = Some(seen);
@@ -316,13 +337,59 @@ fn abort_sends_no_close_notify() {
     stream.write_all(b"request").expect("handshake and write");
 
     let seen = wait_for_seen();
-    assert_eq!(seen.late, Some(io::ErrorKind::ConnectionAborted));
+    assert_eq!(seen.late, Some(ABORTED.to_string()));
+    assert_eq!(seen.late_admitted, Some(ABORTED.to_string()));
     let mut buf = [0u8; 64];
     let read = stream.read(&mut buf);
     assert!(
         matches!(&read, Err(e) if e.kind() == io::ErrorKind::ConnectionReset),
         "expected a reset, not a close_notify: {read:?}"
     );
+    runtime.shutdown();
+    common::join_workers(&runtime, handles);
+}
+
+/// Shuts the write half down, aborts, and sends.
+struct ShutdownAborter;
+
+impl AsyncEventHandler for ShutdownAborter {
+    fn on_accept(&self, mut conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            conn.with_data(|data| ParseResult::Consumed(data.len()))
+                .await;
+            conn.shutdown_write();
+            conn.abort();
+            let seen = Seen {
+                aborted_at: Some(Instant::now()),
+                late: Some(kind(conn.send(b"late"))),
+                late_admitted: Some(kind(conn.send_admitted(b"late").await)),
+                ..Seen::default()
+            };
+            *SEEN.lock().unwrap() = Some(seen);
+        }
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        ShutdownAborter
+    }
+}
+
+/// After `shutdown_write`, a send made after `abort` still fails with
+/// `ConnectionAborted`, a bounded one included, rather than with the
+/// `BrokenPipe` of a shut-down write half.
+#[test]
+fn abort_after_shutdown_write_refuses_sends_as_aborted() {
+    let _serial = serial();
+    *SEEN.lock().unwrap() = None;
+    let (runtime, handles) = launch::<ShutdownAborter>(None);
+    let mut peer = TcpStream::connect(runtime.bound_addr().expect("bound")).expect("connect");
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    peer.write_all(b"x").unwrap();
+
+    let seen = wait_for_seen();
+    assert_eq!(seen.late, Some(ABORTED.to_string()));
+    assert_eq!(seen.late_admitted, Some(ABORTED.to_string()));
+    drop(peer);
     runtime.shutdown();
     common::join_workers(&runtime, handles);
 }
@@ -388,8 +455,8 @@ fn abort_closes_a_unix_connection() {
     peer.write_all(b"a").unwrap();
 
     let seen = wait_for_seen();
-    assert_eq!(seen.queued, Some(io::ErrorKind::ConnectionAborted));
-    assert_eq!(seen.late, Some(io::ErrorKind::ConnectionAborted));
+    assert_eq!(seen.queued, Some(ABORTED.to_string()));
+    assert_eq!(seen.late, Some(ABORTED.to_string()));
     // The peer reads what reached its buffer, then the end of the stream or
     // a reset; either ends the read.
     let mut body = Vec::new();

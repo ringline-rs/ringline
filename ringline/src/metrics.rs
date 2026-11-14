@@ -459,7 +459,8 @@ pub mod pool {
     /// send pool had no slot for the alert when the close was requested and
     /// still had none once the connection's own sends had drained, or the
     /// close_notify deadline forced the close first. The peer reads the
-    /// stream as truncated (`eof_truncated`). The alert needs one slot. A
+    /// stream as truncated (`eof_truncated`). `abort` also counts a retained
+    /// alert it drops; that peer reads a reset. The alert needs one slot. A
     /// sustained count means the pool was full at the close drain;
     /// `ConfigBuilder::send_pool` sets its size.
     pub const CLOSE_NOTIFY_DROPPED: usize = 6;

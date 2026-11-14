@@ -701,7 +701,7 @@ impl Driver {
     /// connection is gone or was aborted already. The caller
     /// (`ConnCtx::abort`) has failed the reader and the sends waiting for
     /// capacity.
-    pub(crate) fn abort_connection(&mut self, conn_index: u32) -> bool {
+    pub(crate) fn abort(&mut self, conn_index: u32) -> bool {
         let idx = conn_index as usize;
         if self.connections.get(conn_index).is_none() || self.send_queues[idx].aborted {
             return false;
@@ -2158,8 +2158,8 @@ pub(crate) mod tests {
             .expect("admitted");
         assert_eq!(driver.send_copy_pool.free_count(), 3);
 
-        assert!(driver.abort_connection(conn_index));
-        assert!(!driver.abort_connection(conn_index), "a second abort");
+        assert!(driver.abort(conn_index));
+        assert!(!driver.abort(conn_index), "a second abort");
 
         assert!(driver.pending_sends[idx].is_empty());
         assert_eq!(driver.send_copy_pool.free_count(), 4, "the permit is back");
@@ -2176,6 +2176,9 @@ pub(crate) mod tests {
             .expect_err("a send after the abort");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
 
+        // A send queued after the abort without its refusal, as a forward
+        // into this sink could be: the close must not write it.
+        driver.pending_sends[idx].push_back(PendingSend::plain(b"forwarded".to_vec()));
         driver.finish_close(conn_index);
         assert!(
             !driver.send_queues[idx].aborted,
