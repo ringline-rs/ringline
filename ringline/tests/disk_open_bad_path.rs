@@ -8,9 +8,10 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, Connection, DirectIoConfig, RinglineBuilder};
+use ringline::fs::{FsConfig, OpenFlags};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
-static DIRECT_IO_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+static DIRECT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// A file in the working directory, so that it is not under the temp dir.
 fn file_path(name: &str) -> PathBuf {
@@ -28,24 +29,31 @@ fn config_builder() -> ConfigBuilder {
         .send_pool(8, 16384)
 }
 
-async fn direct_io_bad_paths(path: &str) -> Result<(), String> {
+async fn direct_bad_paths(path: &str) -> Result<(), String> {
+    let flags = OpenFlags::READ_WRITE | OpenFlags::DIRECT;
     for round in 0..3 {
-        match ringline::open_direct_io_file("a\0b") {
+        match ringline::fs::open("a\0b", flags, 0) {
             Ok(_) => return Err(format!("round {round}: a NUL path opened")),
-            Err(e) if e.to_string() == "invalid file path" => {}
+            Err(e) if e.to_string() == "path contains null byte" => {}
             Err(e) => return Err(format!("round {round}: unexpected error: {e}")),
         }
     }
-    let a = ringline::open_direct_io_file(path).map_err(|e| format!("first open: {e}"))?;
-    let b = ringline::open_direct_io_file(path).map_err(|e| format!("second open: {e}"))?;
-    ringline::close_direct_io_file(a).map_err(|e| format!("close a: {e}"))?;
-    ringline::close_direct_io_file(b).map_err(|e| format!("close b: {e}"))?;
+    let open = |which: &'static str| async move {
+        ringline::fs::open(path, flags, 0)
+            .map_err(|e| format!("{which} open: {e}"))?
+            .await
+            .map_err(|e| format!("{which} open: {e}"))
+    };
+    let a = open("first").await?;
+    let b = open("second").await?;
+    ringline::fs::close(a).map_err(|e| format!("close a: {e}"))?;
+    ringline::fs::close(b).map_err(|e| format!("close b: {e}"))?;
     Ok(())
 }
 
-struct DirectIoHandler;
+struct DirectHandler;
 
-impl AsyncEventHandler for DirectIoHandler {
+impl AsyncEventHandler for DirectHandler {
     fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
         async {}
     }
@@ -53,35 +61,33 @@ impl AsyncEventHandler for DirectIoHandler {
     fn on_start(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
             let path = file_path("bad_path_direct_io");
-            let result = direct_io_bad_paths(path.to_str().unwrap()).await;
-            let _ = DIRECT_IO_RESULT.set(result);
+            let result = direct_bad_paths(path.to_str().unwrap()).await;
+            let _ = DIRECT_RESULT.set(result);
             ringline::request_shutdown().ok();
         }))
     }
 
     fn create_for_worker(_id: usize) -> Self {
-        DirectIoHandler
+        DirectHandler
     }
 }
 
+/// With two fs slots, three opens refused for a NUL path are followed by two
+/// `O_DIRECT` opens that succeed.
 #[test]
-fn a_nul_path_does_not_leak_a_direct_io_slot() {
+fn a_nul_path_does_not_leak_an_fs_slot() {
     let path = file_path("bad_path_direct_io");
     std::fs::write(&path, [0u8; 4096]).unwrap();
     let config = config_builder()
-        .direct_io(
-            DirectIoConfig::default()
-                .max_files(2)
-                .max_commands_in_flight(8),
-        )
+        .fs(FsConfig::default().max_files(2).max_commands_in_flight(8))
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)
-        .launch::<DirectIoHandler>()
+        .launch::<DirectHandler>()
         .expect("launch failed");
     common::join_workers(&runtime, handles);
     let _ = std::fs::remove_file(&path);
-    let result = DIRECT_IO_RESULT.get().expect("the task finished").clone();
+    let result = DIRECT_RESULT.get().expect("the task finished").clone();
     if let Err(e) = &result
         && e.contains("Invalid argument")
     {

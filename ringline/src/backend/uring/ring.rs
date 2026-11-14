@@ -92,7 +92,7 @@ pub(crate) fn close_lead_for(kernel: Option<KernelVersion>) -> CloseLead {
 /// and pushes it to the engine.
 pub struct Ring {
     pub(crate) engine: ActiveEngine,
-    /// Disk-I/O operations (fs, direct I/O, NVMe) the ring refused, and
+    /// Disk-I/O operations (fs, NVMe) the ring refused, and
     /// those submitted while earlier ones were queued, in submission order.
     /// [`push_disk_sqe`](Self::push_disk_sqe) queues them and
     /// [`retry_disk_pushes`](Self::retry_disk_pushes) pushes them again after
@@ -1000,10 +1000,10 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a direct I/O read via `IORING_OP_READ`.
+    /// Submit a file read via `IORING_OP_READ`.
     ///
-    /// The `fd_index` must be a fixed file table index pointing to a file
-    /// opened with `O_DIRECT`.
+    /// The `fd_index` must be a fixed file table index pointing to an opened
+    /// file.
     ///
     /// # Safety
     /// The buffer at `buf` with length `len` must remain valid and properly
@@ -1030,10 +1030,10 @@ impl Ring {
         Ok(())
     }
 
-    /// Submit a direct I/O write via `IORING_OP_WRITE`.
+    /// Submit a file write via `IORING_OP_WRITE`.
     ///
-    /// The `fd_index` must be a fixed file table index pointing to a file
-    /// opened with `O_DIRECT`.
+    /// The `fd_index` must be a fixed file table index pointing to an opened
+    /// file.
     ///
     /// # Safety
     /// The buffer at `buf` with length `len` must remain valid and properly

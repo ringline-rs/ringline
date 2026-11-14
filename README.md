@@ -127,7 +127,7 @@ handler instance. On the io_uring backend, each worker also owns:
 - **Timers** — `sleep()`, `timeout()`, `sleep_until()`, `timeout_at()` with fallible variants
 - **Standalone tasks** — `spawn()` for tasks not tied to a connection
 - **NVMe passthrough** — direct NVMe command submission via io_uring
-- **Direct I/O** — O_DIRECT file reads, writes and fsync via io_uring, or the disk-I/O pool on mio
+- **Direct I/O** — `fs::OpenFlags::DIRECT` (`O_DIRECT`) file reads, writes and fsync via io_uring, or the disk-I/O pool on mio
 - **Zero-copy sends** — `SendGuard` trait with `GuardBox` inline storage
 - **Scatter-gather** — `send_parts()` builder for mixed copy + zero-copy sends
 

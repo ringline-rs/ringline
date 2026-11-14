@@ -69,12 +69,12 @@ pub(crate) struct DiskIoResponse {
     pub(crate) opened: Option<std::os::fd::OwnedFd>,
 }
 
-/// The subsystem a pool request counts against. Each has its own
-/// `max_commands_in_flight` (`FsConfig`, `DirectIoConfig`).
+/// The subsystem a pool request counts against, with its own
+/// `max_commands_in_flight` (`FsConfig`). fs is the only one: NVMe does not
+/// run on mio.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PoolSubsystem {
     Fs = 0,
-    DirectIo = 1,
 }
 
 /// A pool request held in the worker, not yet sent: its key and its work.
@@ -110,7 +110,6 @@ impl PoolSubsystem {
             std::io::ErrorKind::WouldBlock,
             match self {
                 PoolSubsystem::Fs => "filesystem command slab exhausted",
-                PoolSubsystem::DirectIo => "direct I/O command slab exhausted",
             },
         )
     }
@@ -120,7 +119,6 @@ impl PoolSubsystem {
     pub(crate) fn not_configured(self) -> std::io::Error {
         std::io::Error::other(match self {
             PoolSubsystem::Fs => "filesystem I/O not configured",
-            PoolSubsystem::DirectIo => "direct I/O not configured",
         })
     }
 }

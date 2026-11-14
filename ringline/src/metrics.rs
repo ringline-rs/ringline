@@ -82,7 +82,7 @@ pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 
 /// io_uring: what the ring refused and a worker is waiting to retry, summed
 /// over workers: stream sends and receive arms on retry lists, UDP re-arms,
-/// merged accept arms, fs, direct I/O and NVMe commands queued for a push,
+/// merged accept arms, fs and NVMe commands queued for a push,
 /// and one per worker whose last submit left SQEs queued (refused, or only
 /// some submitted). Nonzero while the kernel refuses submissions; each worker withdraws its share when it exits.
 #[metric(
@@ -876,14 +876,14 @@ mod cqe_tag_tests {
             cqe_tag::COUNT
         );
         // Guard against the walk finding nothing and passing vacuously.
-        assert!(found >= 26, "expected the full tag set, found {found}");
+        assert!(found >= 25, "expected the full tag set, found {found}");
     }
 
     /// The array is indexed by discriminant, which leaves gaps. Assert exactly
     /// which gaps we expect, rather than letting an unnoticed new one look
     /// normal — an unregistered slot reads as a counter stuck at zero.
     ///
-    /// Slots 0, 1, 9, 11, 12, 17, 20, 25 to 30 have no `OpTag` variant.
+    /// Slots 0, 1, 9, 11, 12, 16, 17, 20, 25 to 30 have no `OpTag` variant.
     #[test]
     fn expected_slots_are_unused() {
         let unused: Vec<usize> = (0..cqe_tag::COUNT)
@@ -891,7 +891,7 @@ mod cqe_tag_tests {
             .collect();
         assert_eq!(
             unused,
-            vec![0, 1, 9, 11, 12, 17, 20, 25, 26, 27, 28, 29, 30],
+            vec![0, 1, 9, 11, 12, 16, 17, 20, 25, 26, 27, 28, 29, 30],
             "unexpected unused CQE_BY_TAG slots"
         );
     }

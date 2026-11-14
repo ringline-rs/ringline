@@ -84,7 +84,7 @@ Every operation already reads from or writes into memory ringline owns:
 | Slab entries (iovecs, guards) | `InFlightSendSlab` | coalesced and zero-copy sends |
 | Provided recv buffers | `ProvidedBufRing` | multishot recv, UDP recv, `forward_to` |
 | Fallback recv slots | `fallback_recv_pool` (a `SendCopyPool`) | one-shot recv |
-| Disk buffers | caller, held by the disk-I/O future | fs, direct I/O |
+| Disk buffers | caller, held by the disk-I/O future | fs (including `O_DIRECT`) |
 
 The engines share these pools, and each buffer's lifetime is the same on
 both engines:
@@ -320,7 +320,7 @@ conformance tests confirm against the real ring first.
 | ParkInstall | FIXED_FD_INSTALL | `fcntl(F_DUPFD_CLOEXEC)` on the slot's fd; post the new fd. The kernel installs it close-on-exec, which #460 relies on. | A |
 | PidfdPoll | POLL_ADD on a pidfd | On Linux, poll the pidfd for readable. Off Linux there are no pidfds: the engine registers `EVFILT_PROC` / `NOTE_EXIT` for the pid on its kqueue and posts the completion when the child exits. `ChildProcess::wait` then works as on Linux. | A, P |
 | SendMsgUdp, SendUdp | SENDMSG (with `UDP_SEGMENT`), SEND | `sendmsg`, with `UDP_SEGMENT` on Linux. Off Linux there is no GSO: the engine sends one datagram per segment and posts one completion with the total. | B, P |
-| Fs, DirectIo | OPENAT (direct install), READ, WRITE, FSYNC, STATX, RENAMEAT, UNLINKAT, MKDIRAT | The disk-I/O thread pool (`disk_io_pool.rs`) runs the call. OPENAT installs into the emulated fixed-file table when reaped. Off Linux: STATX is filled from `fstatat` (fields `stat` lacks are left zero and unmarked in the mask), and direct I/O uses `F_NOCACHE` where Linux uses `O_DIRECT`. | B, P |
+| Fs | OPENAT (direct install), READ, WRITE, FSYNC, STATX, RENAMEAT, UNLINKAT, MKDIRAT | The disk-I/O thread pool (`disk_io_pool.rs`) runs the call. OPENAT installs into the emulated fixed-file table when reaped. Off Linux: STATX is filled from `fstatat` (fields `stat` lacks are left zero and unmarked in the mask), and direct I/O uses `F_NOCACHE` where Linux uses `O_DIRECT`. | B, P |
 | NvmeCmd | URING_CMD (SQE128) | The API is `open_nvme_device` plus three commands: read, write, flush. On Linux the disk-I/O pool runs the same command with the synchronous `NVME_IOCTL_IO64_CMD` ioctl on the same `/dev/ngXnY` device and posts its NVMe status word as the result, so `handle_nvme_cmd` is unchanged. Off Linux there is no NVMe passthrough for user processes: the "device" is a raw disk (`/dev/rdiskN`, root only) or a file, read becomes `pread` and write `pwrite` at LBA × block size, and flush becomes `fcntl(F_FULLFSYNC)`. Errors there are errno, not NVMe status codes, and `nsid` is ignored. | B, P |
 
 The ring setup flags have no counterpart in the emulator: `COOP_TASKRUN`,
@@ -467,7 +467,7 @@ Each step is a separate PR. Steps 1–6 keep both backends working.
    both engines, and the `tests/echo.rs` tests that use only those ops
    pass on the emulator (the PR names the filter).
 4. **The rest of the table**, op group by op group: accept; coalesced,
-   zero-copy and forward sends; chains; UDP; fs and direct I/O; park;
+   zero-copy and forward sends; chains; UDP; fs (including `O_DIRECT`); park;
    process; NVMe on Linux.
 5. **macOS.** Build the io_uring driver on the emulator on macOS and run
    the full suite in CI.
