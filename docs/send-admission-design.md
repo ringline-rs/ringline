@@ -1,8 +1,8 @@
 # Send admission a server can bound
 
-Status: sections 1 and 2 are built. Section 3 is specified for building, from
-Experiment A's results (`docs/journal/2026-11-abort-close.md`). Section 4
-names the experiment that decides it and the constraints already found.
+Status: sections 1 to 3 are built; section 3 was specified from Experiment
+A's results (`docs/journal/2026-11-abort-close.md`). Section 4 names the
+experiment that decides it and the constraints already found.
 "What exists" describes the code before section 1, at 07dd0f56; section 3's
 specification cites the code at 03628fee.
 
@@ -335,9 +335,12 @@ connection, plain or TLS:
    commits the lead and `Close` through `submit_committed_close`. The queue and
    any retained close_notify are already gone, so nothing is sent ahead of
    them. A refused chain, or a refused lone connect, is retried as itself: the
-   retry entry records that the close is an abort, so `drain_close_retries`
-   (uloop.rs:4935-4941) does not fall back to the lead-and-`Close` pair, which
-   would leave the zero-copy entries held. In the `Shutdown` case the lone
+   connection's send state records that the close is an abort
+   (`ConnSendState::disconnect`), so `submit_committed_close`, which
+   `drain_close_retries` (uloop.rs:4935-4941) calls, pushes the chain again
+   rather than the lead-and-`Close` pair, which would leave the zero-copy
+   entries held. A refused lone connect has its own retry list
+   (`pending_disconnect_retries`). In the `Shutdown` case the lone
    connect holds `try_finalize_close` until its completion lands, pushed at
    once or after a retry, as `shutdown_inflight` does. Its handler ignores
    the result, clears the hold and calls `defer_finalize_close`, as
@@ -540,7 +543,8 @@ Constraints already found for each outcome:
 2. Section 2, `send_admitted`, with `send_backpressured` rewritten on it and
    removal from the FIFO without a scan. This ends the false closes of
    problem 1.
-3. Section 3, `abort`, as specified from Experiment A.
+3. Section 3, `abort`, as specified from Experiment A. Its tests run on the
+   rack's 6.8, 6.12 and 7.2 images through `experiments/abort-verify.toml`.
 4. Experiment B, then the fast-path specification and its PR.
 
 ## What a caller can no longer do
@@ -558,3 +562,6 @@ Section 1 removes three things, each a compile error:
   A task that also holds a `SendHalf` was `!Send` already.
 
 Section 2 adds API and changes no existing behaviour.
+
+Section 3 raises the smallest `sq_entries` from 2 to 4, the smallest power of
+two that holds `abort`'s chain of three: a config with 2 now fails validation.
