@@ -117,7 +117,7 @@ pub(crate) enum DirectRecvBuf {
 const ABORT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The longest worker exit waits for connections to close, send slab entries
-/// to be released and fs, direct I/O and NVMe commands to complete.
+/// to be released and fs and NVMe commands to complete.
 const SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Driver {
@@ -728,7 +728,7 @@ pub(crate) struct Driver {
     pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
     /// Monotonic disk-I/O sequence (see DriverCtx::disk_io_key).
     pub(crate) next_disk_io_seq: u16,
-    /// The fs and direct I/O writes in flight per file, and the fsyncs held
+    /// The fs writes in flight per file, and the fsyncs held
     /// until the writes submitted before them complete (#905): each held
     /// fsync's fixed file index and user_data.
     pub(crate) write_orders: crate::disk_order::WriteOrders<(u32, u64)>,
@@ -904,12 +904,6 @@ pub(crate) struct Driver {
     /// Base offset in the fixed file table for NVMe device fds.
     /// NVMe devices are registered at `nvme_fd_base + device_index`.
     pub(crate) nvme_fd_base: u32,
-    /// Direct I/O file tracking table. `None` when direct I/O is not configured.
-    pub(crate) direct_io_files: Option<crate::direct_io::DirectIoFileTable>,
-    /// Direct I/O command slab for tracking in-flight commands. `None` when not configured.
-    pub(crate) direct_io_cmd_slab: Option<crate::direct_io::DirectIoCmdSlab>,
-    /// Base offset in the fixed file table for direct I/O file fds.
-    pub(crate) direct_io_fd_base: u32,
     /// Filesystem file tracking table. `None` when fs is not configured.
     pub(crate) fs_files: Option<crate::fs::FsFileTable>,
     /// Filesystem command slab for tracking in-flight commands. `None` when not configured.
@@ -917,7 +911,7 @@ pub(crate) struct Driver {
     /// Base offset in the fixed file table for filesystem file fds.
     pub(crate) fs_fd_base: u32,
     /// Set by [`run_shutdown`](Self::run_shutdown) when its drain ended, at
-    /// the bound or on a ring error, with an fs, direct I/O or NVMe command
+    /// the bound or on a ring error, with an fs or NVMe command
     /// still in flight. The kernel can still use the command's buffer or statx
     /// box, so the worker leaks its event loop instead of dropping it (#824).
     pub(crate) disk_io_outstanding: bool,
@@ -1108,18 +1102,11 @@ impl Driver {
             .as_ref()
             .map(|n| n.max_devices as u32)
             .unwrap_or(0);
-        let direct_io_max = config
-            .direct_io
-            .as_ref()
-            .map(|d| d.max_files as u32)
-            .unwrap_or(0);
         let fs_max = config.fs.as_ref().map(|f| f.max_files as u32).unwrap_or(0);
 
         // Register resources with the kernel
         ring.register_buffers(&fixed_buffers)?;
-        ring.register_files_sparse(
-            config.max_connections + udp_count + nvme_max + direct_io_max + fs_max,
-        )?;
+        ring.register_files_sparse(config.max_connections + udp_count + nvme_max + fs_max)?;
         for udp_bufs in &udp_provided_bufs {
             ring.register_buf_ring(udp_bufs)?;
         }
@@ -1319,15 +1306,6 @@ impl Driver {
                 .as_ref()
                 .map(|n| crate::nvme::NvmeCmdSlab::new(n.max_commands_in_flight)),
             nvme_fd_base: config.max_connections + udp_count,
-            direct_io_files: config
-                .direct_io
-                .as_ref()
-                .map(|d| crate::direct_io::DirectIoFileTable::new(d.max_files)),
-            direct_io_cmd_slab: config
-                .direct_io
-                .as_ref()
-                .map(|d| crate::direct_io::DirectIoCmdSlab::new(d.max_commands_in_flight)),
-            direct_io_fd_base: config.max_connections + udp_count + nvme_max,
             fs_files: config
                 .fs
                 .as_ref()
@@ -1336,7 +1314,7 @@ impl Driver {
                 .fs
                 .as_ref()
                 .map(|f| crate::fs::FsCmdSlab::new(f.max_commands_in_flight)),
-            fs_fd_base: config.max_connections + udp_count + nvme_max + direct_io_max,
+            fs_fd_base: config.max_connections + udp_count + nvme_max,
             disk_io_outstanding: false,
             resolve_rx,
             resolve_tx,
@@ -1410,9 +1388,6 @@ impl Driver {
             nvme_devices: &mut self.nvme_devices,
             nvme_cmd_slab: &mut self.nvme_cmd_slab,
             nvme_fd_base: self.nvme_fd_base,
-            direct_io_files: &mut self.direct_io_files,
-            direct_io_cmd_slab: &mut self.direct_io_cmd_slab,
-            direct_io_fd_base: self.direct_io_fd_base,
             fs_files: &mut self.fs_files,
             fs_cmd_slab: &mut self.fs_cmd_slab,
             fs_fd_base: self.fs_fd_base,
@@ -3052,14 +3027,6 @@ impl Driver {
                     slab.release(slab_idx);
                 }
             }
-            OpTag::DirectIo => {
-                let slab_idx = ud.payload() as u16;
-                if let Some(slab) = self.direct_io_cmd_slab.as_mut()
-                    && slab.in_use(slab_idx)
-                {
-                    slab.release(slab_idx);
-                }
-            }
             OpTag::NvmeCmd => {
                 let slab_idx = ud.payload() as u16;
                 if let Some(slab) = self.nvme_cmd_slab.as_mut()
@@ -3131,13 +3098,10 @@ impl Driver {
         self.merged_accept_arms.clear();
     }
 
-    /// The user_data of every fs, direct I/O and NVMe command in flight.
+    /// The user_data of every fs and NVMe command in flight.
     fn disk_command_user_data(&self) -> Vec<u64> {
         let mut uds = Vec::new();
         if let Some(s) = self.fs_cmd_slab.as_ref() {
-            uds.extend(s.in_flight_user_data());
-        }
-        if let Some(s) = self.direct_io_cmd_slab.as_ref() {
             uds.extend(s.in_flight_user_data());
         }
         if let Some(s) = self.nvme_cmd_slab.as_ref() {
@@ -3146,14 +3110,10 @@ impl Driver {
         uds
     }
 
-    /// Whether an fs, direct I/O or NVMe command has not completed. Its
+    /// Whether an fs or NVMe command has not completed. Its
     /// operation can still read or write memory this worker owns.
     fn disk_commands_in_flight(&self) -> bool {
         self.fs_cmd_slab.as_ref().is_some_and(|s| s.has_in_flight())
-            || self
-                .direct_io_cmd_slab
-                .as_ref()
-                .is_some_and(|s| s.has_in_flight())
             || self
                 .nvme_cmd_slab
                 .as_ref()
@@ -3238,10 +3198,10 @@ impl Driver {
             }
         }
 
-        // Cancel every fs, direct I/O and NVMe command. A read or write
+        // Cancel every fs and NVMe command. A read or write
         // waiting for a pipe or FIFO to become ready ends at once and
         // transfers nothing. An operation already in progress, on io-wq or in
-        // the device (direct I/O, NVMe), completes in its own time and the
+        // the device (`O_DIRECT`, NVMe), completes in its own time and the
         // loop below waits for it.
         let mut disk_cancels_to_retry: Vec<u64> = Vec::new();
         // An fsync held behind earlier writes (#905) is in nothing a cancel
@@ -3265,8 +3225,8 @@ impl Driver {
         }
 
         // 3. Submit + drain loop until every connection's Close has
-        //    completed, every slab entry is released and every fs, direct I/O
-        //    and NVMe command has completed, for at most `SHUTDOWN_BOUND`.
+        //    completed, every slab entry is released and every fs and NVMe
+        //    command has completed, for at most `SHUTDOWN_BOUND`.
         //    Each wait ends after at most 100 ms, so a pass never blocks
         //    indefinitely. A pass ends at any CQE, so neither the pass count
         //    nor one timeout per pass measures time.

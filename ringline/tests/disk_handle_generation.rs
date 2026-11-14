@@ -1,6 +1,6 @@
 #![allow(clippy::manual_async_fn)]
-//! A direct I/O handle kept across 65,536 opens and closes of its slot stays
-//! stale: closing it fails and leaves the slot's new file open (#862).
+//! An fs handle kept across 65,536 opens and closes of its slot stays stale:
+//! closing it fails and leaves the slot's new file open (#862).
 
 mod common;
 
@@ -8,7 +8,8 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use ringline::{AsyncEventHandler, ConfigBuilder, Connection, DirectIoConfig, RinglineBuilder};
+use ringline::fs::{File, FsConfig, OpenFlags};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
 static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -19,22 +20,30 @@ fn file_path() -> PathBuf {
         .join(format!(".krio_handle_generation_{}", std::process::id()))
 }
 
+async fn open(path: &str, what: &str) -> Result<File, String> {
+    ringline::fs::open(path, OpenFlags::READ, 0)
+        .map_err(|e| format!("{what}: {e}"))?
+        .await
+        .map_err(|e| format!("{what}: {e}"))
+}
+
 async fn stale_after_wrap(path: &str) -> Result<(), String> {
-    let first = ringline::open_direct_io_file(path).map_err(|e| format!("first open: {e}"))?;
-    ringline::close_direct_io_file(first).map_err(|e| format!("first close: {e}"))?;
+    let first = open(path, "first open").await?;
+    ringline::fs::close(first).map_err(|e| format!("first close: {e}"))?;
     for cycle in 1..65_536 {
-        let file =
-            ringline::open_direct_io_file(path).map_err(|e| format!("cycle {cycle}: open: {e}"))?;
-        ringline::close_direct_io_file(file).map_err(|e| format!("cycle {cycle}: close: {e}"))?;
+        let file = open(path, "open")
+            .await
+            .map_err(|e| format!("cycle {cycle}: {e}"))?;
+        ringline::fs::close(file).map_err(|e| format!("cycle {cycle}: close: {e}"))?;
     }
-    let current = ringline::open_direct_io_file(path).map_err(|e| format!("last open: {e}"))?;
+    let current = open(path, "last open").await?;
     if current.index() != first.index() {
         return Err("the last open did not reuse the first slot".to_string());
     }
-    if ringline::close_direct_io_file(first).is_ok() {
+    if ringline::fs::close(first).is_ok() {
         return Err("the stale handle closed the slot's new file".to_string());
     }
-    ringline::close_direct_io_file(current).map_err(|e| format!("last close: {e}"))
+    ringline::fs::close(current).map_err(|e| format!("last close: {e}"))
 }
 
 struct Handler;
@@ -59,7 +68,7 @@ impl AsyncEventHandler for Handler {
 }
 
 #[test]
-fn a_stale_direct_io_handle_stays_stale_after_65536_reuses() {
+fn a_stale_fs_handle_stays_stale_after_65536_reuses() {
     let path = file_path();
     std::fs::write(&path, [0u8; 4096]).unwrap();
     let config = ConfigBuilder::new()
@@ -68,11 +77,7 @@ fn a_stale_direct_io_handle_stays_stale_after_65536_reuses() {
         .sq_entries(64)
         .max_connections(8)
         .send_pool(8, 16384)
-        .direct_io(
-            DirectIoConfig::default()
-                .max_files(1)
-                .max_commands_in_flight(8),
-        )
+        .fs(FsConfig::default().max_files(1).max_commands_in_flight(8))
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)
@@ -80,13 +85,5 @@ fn a_stale_direct_io_handle_stays_stale_after_65536_reuses() {
         .expect("launch failed");
     common::join_workers(&runtime, handles);
     let _ = std::fs::remove_file(&path);
-    let result = RESULT.get().expect("the task finished").clone();
-    if let Err(e) = &result
-        && e.starts_with("first open")
-        && e.contains("Invalid argument")
-    {
-        eprintln!("skipping: O_DIRECT is not supported here ({e})");
-        return;
-    }
-    result.unwrap();
+    RESULT.get().expect("the task finished").clone().unwrap();
 }

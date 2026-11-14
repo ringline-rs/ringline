@@ -1,13 +1,12 @@
 #![allow(clippy::manual_async_fn)]
-//! Integration tests: direct I/O via ringline's direct I/O support.
+//! Integration tests: files opened with `OpenFlags::DIRECT`.
 //!
-//! On Linux, this exercises io_uring `IORING_OP_READ` / `IORING_OP_WRITE`
-//! with `O_DIRECT`. On macOS (mio backend), it uses the disk I/O thread pool
-//! with `fcntl(F_NOCACHE)` as an approximation.
+//! On Linux this is `O_DIRECT`: io_uring `IORING_OP_OPENAT`, `READ` and
+//! `WRITE` on a fixed file, or `open`, `pread` and `pwrite` on the mio
+//! backend's pool. On macOS (mio) `DIRECT` is `F_NOCACHE`.
 //!
-//! Requirements:
-//! - Linux: kernel 5.6+, a real filesystem (not tmpfs)
-//! - macOS: any filesystem (F_NOCACHE works everywhere)
+//! Linux needs a filesystem that accepts `O_DIRECT`; the files are in the
+//! working directory rather than the temp dir, which may be tmpfs.
 
 mod common;
 
@@ -16,54 +15,27 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ringline::{
-    AsyncEventHandler, Config, ConfigBuilder, Connection, DirectIoConfig, RinglineBuilder,
-};
+use ringline::fs::{File, FsConfig, OpenFlags};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn direct_io_test_config_builder() -> ConfigBuilder {
+fn direct_test_config_builder() -> ConfigBuilder {
     ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
         .sq_entries(64)
         .max_connections(8)
         .send_pool(8, 16384)
-        .tick_timeout_us(1000)
-        .direct_io(
-            DirectIoConfig::default()
-                .max_files(4)
-                .max_commands_in_flight(32),
-        )
+        .fs(FsConfig::default().max_files(4).max_commands_in_flight(32))
 }
 
-fn direct_io_test_config() -> Config {
-    direct_io_test_config_builder()
-        .build()
-        .expect("valid config")
-}
-
-/// Generate a temp file path in the current working directory.
-/// Using cwd (the repo root) ensures we're on a real filesystem, not tmpfs.
+/// A path in the working directory, which is not tmpfs.
 fn temp_file_path(name: &str) -> PathBuf {
     std::env::current_dir().unwrap().join(name)
 }
 
-/// Check if io_uring is supported on this kernel.
-#[cfg(target_os = "linux")]
-fn io_uring_supported() -> bool {
-    // Try to create a minimal io_uring. ENOSYS means the syscall doesn't exist.
-    let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, std::ptr::null_mut::<u8>()) };
-    // EFAULT (bad params pointer) means the syscall exists; ENOSYS means it doesn't.
-    ret != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn io_uring_supported() -> bool {
-    false
-}
-
-/// Check if O_DIRECT is supported by trying to open a file.
+/// Whether this filesystem accepts `O_DIRECT`.
 #[cfg(target_os = "linux")]
 fn o_direct_supported() -> bool {
     let path = temp_file_path(".krio_direct_io_probe");
@@ -87,200 +59,23 @@ fn o_direct_supported() -> bool {
     }
 }
 
-/// On macOS, "direct I/O" uses F_NOCACHE (set by open_direct_io_file).
-/// No special filesystem support needed.
+/// On macOS `DIRECT` is `F_NOCACHE`, which every filesystem accepts.
 #[cfg(not(target_os = "linux"))]
 fn o_direct_supported() -> bool {
     true
 }
 
-// ── Write then Read roundtrip test ──────────────────────────────────
-
-static ROUNDTRIP_DONE: AtomicBool = AtomicBool::new(false);
-static ROUNDTRIP_OK: AtomicBool = AtomicBool::new(false);
-static ROUNDTRIP_ERR: OnceLock<String> = OnceLock::new();
-
-struct RoundtripTickHandler;
-
-impl AsyncEventHandler for RoundtripTickHandler {
-    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
-        async {}
+/// Open `path` read-write with `DIRECT` and `extra`.
+async fn open_direct(path: &str, extra: Option<OpenFlags>) -> Result<File, String> {
+    let mut flags = OpenFlags::READ_WRITE | OpenFlags::DIRECT;
+    if let Some(extra) = extra {
+        flags = flags | extra;
     }
-
-    fn on_tick(&mut self) {
-        static STARTED: AtomicBool = AtomicBool::new(false);
-        if STARTED.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        let path = temp_file_path(".krio_direct_io_roundtrip_test");
-
-        // Create the file with 4096 bytes so read doesn't hit EOF.
-        if let Err(e) = std::fs::write(&path, [0u8; 4096]) {
-            let _ = ROUNDTRIP_ERR.set(format!("file create failed: {e}"));
-            ROUNDTRIP_DONE.store(true, Ordering::Release);
-            ringline::request_shutdown().unwrap();
-            return;
-        }
-
-        let path_str = path.to_str().unwrap();
-        match ringline::open_direct_io_file(path_str) {
-            Ok(_file) => {
-                // File opened successfully - the full roundtrip test
-                // would need completion callbacks which aren't available
-                // in the async on_tick. Mark as done.
-                ROUNDTRIP_OK.store(true, Ordering::Release);
-                ROUNDTRIP_DONE.store(true, Ordering::Release);
-                ringline::request_shutdown().unwrap();
-            }
-            Err(e) => {
-                let _ = ROUNDTRIP_ERR.set(format!("open failed: {e}"));
-                ROUNDTRIP_DONE.store(true, Ordering::Release);
-                ringline::request_shutdown().unwrap();
-            }
-        }
-    }
-
-    fn create_for_worker(_id: usize) -> Self {
-        RoundtripTickHandler
-    }
+    ringline::fs::open(path, flags, 0)
+        .map_err(|e| format!("open: {e}"))?
+        .await
+        .map_err(|e| format!("open: {e}"))
 }
-
-#[test]
-fn direct_io_write_fsync_read_roundtrip() {
-    if ringline::backend() == ringline::Backend::IoUring && !io_uring_supported() {
-        eprintln!("SKIP: io_uring not supported on this kernel");
-        return;
-    }
-    if !o_direct_supported() {
-        eprintln!("SKIP: O_DIRECT not supported on this filesystem");
-        return;
-    }
-
-    // Reset statics (in case test runner reuses the process).
-    ROUNDTRIP_DONE.store(false, Ordering::Release);
-    ROUNDTRIP_OK.store(false, Ordering::Release);
-
-    let (shutdown, handles) = RinglineBuilder::new(direct_io_test_config())
-        .launch::<RoundtripTickHandler>()
-        .expect("launch failed");
-
-    common::join_workers(&shutdown, handles);
-
-    // Clean up temp file.
-    let path = temp_file_path(".krio_direct_io_roundtrip_test");
-    let _ = std::fs::remove_file(&path);
-
-    if let Some(err) = ROUNDTRIP_ERR.get() {
-        panic!("direct I/O roundtrip failed: {err}");
-    }
-    assert!(
-        ROUNDTRIP_DONE.load(Ordering::Acquire),
-        "test did not complete"
-    );
-    assert!(
-        ROUNDTRIP_OK.load(Ordering::Acquire),
-        "data verification failed"
-    );
-}
-
-// ── Multiple files test ─────────────────────────────────────────────
-
-static MULTI_FILE_DONE: AtomicBool = AtomicBool::new(false);
-static MULTI_FILE_OK: AtomicBool = AtomicBool::new(false);
-static MULTI_FILE_ERR: OnceLock<String> = OnceLock::new();
-
-struct MultiFileTickHandler;
-
-impl AsyncEventHandler for MultiFileTickHandler {
-    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
-        async {}
-    }
-
-    fn on_tick(&mut self) {
-        static STARTED: AtomicBool = AtomicBool::new(false);
-        if STARTED.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        let mut paths = Vec::new();
-        for i in 0..3 {
-            let path = temp_file_path(&format!(".krio_direct_io_multi_{i}"));
-            if let Err(e) = std::fs::write(&path, [0u8; 4096]) {
-                let _ = MULTI_FILE_ERR.set(format!("file create failed: {e}"));
-                MULTI_FILE_DONE.store(true, Ordering::Release);
-                ringline::request_shutdown().unwrap();
-                return;
-            }
-            paths.push(path);
-        }
-
-        // Open all files.
-        let mut files = Vec::new();
-        for path in &paths {
-            let path_str = path.to_str().unwrap();
-            match ringline::open_direct_io_file(path_str) {
-                Ok(file) => files.push(file),
-                Err(e) => {
-                    let _ = MULTI_FILE_ERR.set(format!("open failed: {e}"));
-                    MULTI_FILE_DONE.store(true, Ordering::Release);
-                    ringline::request_shutdown().unwrap();
-                    return;
-                }
-            }
-        }
-
-        // Close all files.
-        for file in &files {
-            let _ = ringline::close_direct_io_file(*file);
-        }
-
-        MULTI_FILE_OK.store(true, Ordering::Release);
-        MULTI_FILE_DONE.store(true, Ordering::Release);
-        ringline::request_shutdown().unwrap();
-    }
-
-    fn create_for_worker(_id: usize) -> Self {
-        MultiFileTickHandler
-    }
-}
-
-#[test]
-fn direct_io_multiple_files() {
-    if ringline::backend() == ringline::Backend::IoUring && !io_uring_supported() {
-        eprintln!("SKIP: io_uring not supported on this kernel");
-        return;
-    }
-    if !o_direct_supported() {
-        eprintln!("SKIP: O_DIRECT not supported on this filesystem");
-        return;
-    }
-
-    MULTI_FILE_DONE.store(false, Ordering::Release);
-    MULTI_FILE_OK.store(false, Ordering::Release);
-
-    let (shutdown, handles) = RinglineBuilder::new(direct_io_test_config())
-        .launch::<MultiFileTickHandler>()
-        .expect("launch failed");
-
-    common::join_workers(&shutdown, handles);
-
-    // Clean up.
-    for i in 0..3 {
-        let path = temp_file_path(&format!(".krio_direct_io_multi_{i}"));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    if let Some(err) = MULTI_FILE_ERR.get() {
-        panic!("multi-file test failed: {err}");
-    }
-    assert!(MULTI_FILE_DONE.load(Ordering::Acquire));
-    assert!(MULTI_FILE_OK.load(Ordering::Acquire));
-}
-
-// ── O_DSYNC open, write, fsync future, read back ────────────────────
-
-static DSYNC_OUTCOME: std::sync::Mutex<Option<Result<(), String>>> = std::sync::Mutex::new(None);
 
 /// The length of one `O_DIRECT` block in these tests.
 const BLOCK: usize = 4096;
@@ -292,15 +87,18 @@ fn filled_block(byte: u8) -> ringline::buf::AlignedBuf {
     buf
 }
 
+// ── O_DSYNC open, write, fsync, read back ───────────────────────────
+
+static DSYNC_OUTCOME: std::sync::Mutex<Option<Result<(), String>>> = std::sync::Mutex::new(None);
+
 async fn dsync_write_fsync_read(path: &str) -> Result<(), String> {
-    let options = ringline::DirectIoOpenOptions::new().dsync(true);
-    let file = ringline::open_direct_io_file_with(path, options).map_err(|e| e.to_string())?;
-    let (n, out) = ringline::direct_io_write(file, 0, filled_block(0xa5)).await;
+    let file = open_direct(path, Some(OpenFlags::DSYNC)).await?;
+    let (n, out) = ringline::fs::write_from(file, 0, filled_block(0xa5)).await;
     let n = n.map_err(|e| format!("write: {e}"))?;
     if n != BLOCK {
         return Err(format!("wrote {n} bytes"));
     }
-    let synced = ringline::direct_io_fsync(file)
+    let synced = ringline::fs::fsync(file)
         .map_err(|e| e.to_string())?
         .await
         .map_err(|e| format!("fsync: {e}"))?;
@@ -308,12 +106,12 @@ async fn dsync_write_fsync_read(path: &str) -> Result<(), String> {
         return Err(format!("fsync resolved to {synced}"));
     }
     let back = ringline::buf::AlignedBuf::with_capacity(BLOCK, BLOCK);
-    let (n, back) = ringline::direct_io_read(file, 0, back).await;
+    let (n, back) = ringline::fs::read_into(file, 0, back).await;
     let n = n.map_err(|e| format!("read: {e}"))?;
     if n != BLOCK || back[..] != out[..] {
         return Err(format!("read {n} bytes that differ from the write"));
     }
-    Ok(())
+    ringline::fs::close(file).map_err(|e| format!("close: {e}"))
 }
 
 struct DsyncHandler;
@@ -337,14 +135,10 @@ impl AsyncEventHandler for DsyncHandler {
     }
 }
 
-/// A file opened with `dsync` takes writes and reads like any other, and the
-/// fsync future resolves to `Ok(0)`.
+/// A file opened with `DIRECT | DSYNC` takes aligned writes and reads, and
+/// its fsync future resolves to `Ok(0)`.
 #[test]
-fn a_dsync_file_round_trips_and_its_fsync_future_resolves() {
-    if ringline::backend() == ringline::Backend::IoUring && !io_uring_supported() {
-        eprintln!("SKIP: io_uring not supported on this kernel");
-        return;
-    }
+fn a_direct_dsync_file_round_trips_and_its_fsync_future_resolves() {
     if !o_direct_supported() {
         eprintln!("SKIP: O_DIRECT not supported on this filesystem");
         return;
@@ -352,7 +146,8 @@ fn a_dsync_file_round_trips_and_its_fsync_future_resolves() {
     let path = temp_file_path(".krio_direct_io_dsync");
     std::fs::write(&path, [0u8; BLOCK]).unwrap();
 
-    let (shutdown, handles) = RinglineBuilder::new(direct_io_test_config())
+    let config = direct_test_config_builder().build().expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
         .launch::<DsyncHandler>()
         .expect("launch failed");
     common::join_workers(&shutdown, handles);
@@ -382,18 +177,18 @@ fn queued_paths() -> (PathBuf, PathBuf) {
 /// A write queued before a close lands in the closed file, the handle goes
 /// stale at once, and the next file opened gets none of it.
 async fn write_close_open(first: &str, second: &str) -> Result<(), String> {
-    let a = ringline::open_direct_io_file(first).map_err(|e| e.to_string())?;
-    let write = ringline::direct_io_write(a, 0, filled_block(0xab));
-    let closed = ringline::close_direct_io_file(a).map_err(|e| e.to_string());
-    let stale = ringline::close_direct_io_file(a).is_err();
-    let b = ringline::open_direct_io_file(second).map_err(|e| e.to_string());
+    let a = open_direct(first, None).await?;
+    let write = ringline::fs::write_from(a, 0, filled_block(0xab));
+    let closed = ringline::fs::close(a).map_err(|e| e.to_string());
+    let stale = ringline::fs::close(a).is_err();
+    let b = open_direct(second, None).await;
     let written = write.await.0.map_err(|e| e.to_string())?;
     closed?;
-    ringline::close_direct_io_file(b?).map_err(|e| e.to_string())?;
+    ringline::fs::close(b?).map_err(|e| e.to_string())?;
     if !stale {
         return Err("a second close of the handle succeeded".to_string());
     }
-    if written != 4096 {
+    if written != BLOCK {
         return Err(format!("write returned {written}"));
     }
     Ok(())
@@ -403,25 +198,26 @@ async fn write_close_open(first: &str, second: &str) -> Result<(), String> {
 /// fails once a slot leaks.
 async fn deferred_closes_release_their_slots(path: &str) -> Result<(), String> {
     for round in 0..16 {
-        let file =
-            ringline::open_direct_io_file(path).map_err(|e| format!("round {round}: open: {e}"))?;
+        let file = open_direct(path, None)
+            .await
+            .map_err(|e| format!("round {round}: {e}"))?;
         let submit = |e: std::io::Error| format!("round {round}: submit: {e}");
         let op: std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>>>> = match round % 3 {
             0 => {
-                let write = ringline::direct_io_write(file, 0, filled_block(0));
+                let write = ringline::fs::write_from(file, 0, filled_block(0));
                 Box::pin(async move { write.await.0 })
             }
             1 => {
                 let buf = ringline::buf::AlignedBuf::with_capacity(BLOCK, BLOCK);
-                let read = ringline::direct_io_read(file, 0, buf);
+                let read = ringline::fs::read_into(file, 0, buf);
                 Box::pin(async move { read.await.0 })
             }
             _ => {
-                let fsync = ringline::direct_io_fsync(file).map_err(submit)?;
+                let fsync = ringline::fs::fsync(file).map_err(submit)?;
                 Box::pin(async move { fsync.await.map(|n| n as usize) })
             }
         };
-        let closed = ringline::close_direct_io_file(file);
+        let closed = ringline::fs::close(file);
         op.await.map_err(|e| format!("round {round}: op: {e}"))?;
         closed.map_err(|e| format!("round {round}: close: {e}"))?;
     }
@@ -461,15 +257,11 @@ fn a_close_with_an_operation_queued_finishes_it_on_the_closed_file() {
         return;
     }
     let (first, second) = queued_paths();
-    std::fs::write(&first, [0u8; 4096]).unwrap();
-    std::fs::write(&second, [0u8; 4096]).unwrap();
+    std::fs::write(&first, [0u8; BLOCK]).unwrap();
+    std::fs::write(&second, [0u8; BLOCK]).unwrap();
 
-    let config = direct_io_test_config_builder()
-        .direct_io(
-            DirectIoConfig::default()
-                .max_files(2)
-                .max_commands_in_flight(32),
-        )
+    let config = direct_test_config_builder()
+        .fs(FsConfig::default().max_files(2).max_commands_in_flight(32))
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)

@@ -139,7 +139,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // handles) and its own channel pair. This avoids changing the
         // launch_inner / worker_fn signature.
         let (disk_io_rx, disk_io_tx, disk_io_pool) = if config.disk_io_threads > 0
-            && (config.direct_io.is_some() || config.fs.is_some())
+            && config.fs.is_some()
         {
             let pool = Arc::new(crate::disk_io_pool::DiskIoPool::start(
                 config.worker_index,
@@ -2304,60 +2304,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// As `an_fsync_waits_in_the_worker_for_an_earlier_write`, for a direct
-    /// I/O write and `direct_io_fsync`.
+    /// `OpenFlags::DIRECT` and `OpenFlags::DSYNC` reach the `open(2)` the
+    /// pool makes: `O_DSYNC` on both platforms and `O_DIRECT` on Linux (on
+    /// macOS `DIRECT` is applied as `F_NOCACHE`, which `F_GETFL` does not
+    /// show), and a plain open adds neither.
     #[test]
-    fn a_direct_io_fsync_waits_in_the_worker_for_an_earlier_write() {
+    fn fs_open_passes_direct_and_dsync_to_open() {
         let config = ConfigBuilder::new()
             .workers(1)
             .pin_to_core(false)
             .max_connections(16)
             .send_pool(4, 64)
             .disk_io_threads(1)
-            .direct_io(crate::direct_io::DirectIoConfig::default())
             .build()
             .expect("valid test config");
         let (mut el, _wake) = test_loop(&config);
-        let dir = std::env::current_dir()
+        // In the working directory: tmpfs may refuse O_DIRECT.
+        let path = std::env::current_dir()
             .unwrap()
-            .join(format!(".ringline-mio-direct-fsync-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let fifo = dir.join("fifo");
-        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let path = dir.join("file");
+            .join(format!(".ringline-mio-open-flags-{}", std::process::id()));
         std::fs::write(&path, [0u8; 4096]).unwrap();
-        let file = el
-            .driver
-            .make_ctx()
-            .open_direct_io_file(path.to_str().unwrap())
-            .expect("open for direct I/O");
-
-        let block = crate::buf::AlignedBuf::zeroed(4096, 4096);
-        let (write_seq, sync_seq) = {
-            let mut ctx = el.driver.make_ctx();
-            // Holds the pool's only thread until a writer opens the FIFO.
-            ctx.fs_open(&fifo, crate::fs::OpenFlags::READ, 0)
-                .expect("submit blocker");
-            let write_seq = ctx
-                .direct_io_write(file, 0, block.as_ptr(), 4096)
-                .expect("submit write");
-            let sync_seq = ctx.direct_io_fsync(file).expect("submit fsync");
-            (write_seq, sync_seq)
+        let open = |el: &mut AsyncEventLoop<NoopHandler>, flags| {
+            let (index, _, seq) = el
+                .driver
+                .make_ctx()
+                .fs_open(&path, flags, 0)
+                .expect("submit open");
+            el.executor.wait_disk_io(seq, 0);
+            assert!(drain_until_result(el, seq) >= 0, "open with {flags:?}");
+            let fd = el.driver.fs_fds[index as usize]
+                .as_ref()
+                .expect("installed");
+            unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&**fd), libc::F_GETFL) }
         };
-        el.executor.wait_disk_io(write_seq, 0);
-        el.executor.wait_disk_io(sync_seq, 0);
-        assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
-
-        let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-        assert_eq!(drain_until_result(&mut el, write_seq), 4096);
-        assert_eq!(el.driver.write_orders.held(), 0, "the write released it");
-        assert_eq!(drain_until_result(&mut el, sync_seq), 0, "fsync");
-        drop(writer);
-        drop(block);
-        drop(el);
-        let _ = std::fs::remove_dir_all(&dir);
+        use crate::fs::OpenFlags;
+        let plain = open(&mut el, OpenFlags::READ_WRITE);
+        let flagged = open(
+            &mut el,
+            OpenFlags::READ_WRITE | OpenFlags::DIRECT | OpenFlags::DSYNC,
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(plain & libc::O_DSYNC, 0);
+        assert_eq!(flagged & libc::O_DSYNC, libc::O_DSYNC);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(plain & libc::O_DIRECT, 0);
+            assert_eq!(flagged & libc::O_DIRECT, libc::O_DIRECT);
+        }
     }
 
     /// A write and a read submitted after a held fsync on the same file run
@@ -2387,14 +2380,9 @@ mod tests {
         assert!(drain_until_result(&mut el, open_seq) >= 0, "open");
         let file = crate::fs::File::new(index, generation);
         const EARLIER: u32 = u32::MAX;
-        el.driver.write_orders.begin_write(
-            crate::disk_order::OrderKey {
-                subsystem: crate::disk_order::Subsystem::Fs,
-                index,
-                generation,
-            },
-            EARLIER,
-        );
+        el.driver
+            .write_orders
+            .begin_write(crate::disk_order::OrderKey { index, generation }, EARLIER);
 
         static DATA: &[u8] = b"later";
         let mut buf = [0u8; 4];

@@ -1,9 +1,8 @@
 //! Buffers that disk operations take by value.
 //!
-//! [`fs::read_into`](crate::fs::read_into), [`direct_io_read`](crate::direct_io_read)
-//! and [`nvme_read`](crate::nvme_read) take an [`IoBufMut`] and write into its
-//! spare capacity; [`fs::write_from`](crate::fs::write_from),
-//! [`direct_io_write`](crate::direct_io_write) and
+//! [`fs::read_into`](crate::fs::read_into) and [`nvme_read`](crate::nvme_read)
+//! take an [`IoBufMut`] and write into its spare capacity;
+//! [`fs::write_from`](crate::fs::write_from) and
 //! [`nvme_write`](crate::nvme_write) take an [`IoBuf`] and send its initialized
 //! bytes. The future returns the buffer with the result. If the future is
 //! dropped before the operation completes, ringline keeps the buffer until the
@@ -11,8 +10,9 @@
 //! kernel uses stays valid either way.
 //!
 //! ringline implements the traits for `Vec<u8>`, [`BytesMut`], [`Bytes`]
-//! ([`IoBuf`] only) and [`AlignedBuf`]. Direct I/O needs memory aligned to the
-//! device's logical block size, which `Vec<u8>` and `BytesMut` do not
+//! ([`IoBuf`] only) and [`AlignedBuf`]. A file opened with
+//! [`OpenFlags::DIRECT`](crate::fs::OpenFlags::DIRECT) needs memory aligned to
+//! the device's logical block size, which `Vec<u8>` and `BytesMut` do not
 //! guarantee; NVMe passthrough copies a buffer whose address is not 4-byte
 //! aligned through a bounce buffer. [`AlignedBuf`] allocates at
 //! a chosen alignment, and [`AlignedBuf::freeze`] turns one into an aligned

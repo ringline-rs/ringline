@@ -138,7 +138,7 @@
 //! mio backend: works on Linux and macOS; forced on Linux with the
 //! `force-mio` cargo feature (`--features ringline/force-mio` from a
 //! dependent crate). NVMe passthrough and zero-copy sends are not
-//! available. Direct I/O and filesystem operations are supported via a
+//! available. Filesystem operations, `O_DIRECT` ones included, run on a
 //! dedicated thread pool.
 
 // A stub-engine build (`RINGLINE_STUB_ENGINE=1`) only checks that the
@@ -169,8 +169,6 @@ pub(crate) mod chain;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod completion;
 pub(crate) mod connection;
-#[cfg_attr(not(has_io_uring), allow(dead_code))]
-pub mod direct_io;
 #[cfg(not(has_io_uring))]
 pub(crate) mod disk_io_pool;
 pub(crate) mod disk_order;
@@ -294,8 +292,7 @@ pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;
 /// Future that awaits a disk-I/O completion that carries no buffer
-/// (`fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, `direct_io_fsync`,
-/// `nvme_flush`).
+/// (`fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, `nvme_flush`).
 pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
@@ -347,20 +344,12 @@ pub use runtime::io::WithDataFuture;
 pub use runtime::io::WithDataResultFuture;
 /// Future returned by [`yield_now()`].
 pub use runtime::io::YieldNow;
-/// Close a Direct I/O file.
-pub use runtime::io::close_direct_io_file;
 /// Close an NVMe device.
 pub use runtime::io::close_nvme_device;
 /// Begin an outbound TCP connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect;
 /// Begin an outbound Unix-domain connection; awaiting resolves to a `Connection`.
 pub use runtime::io::connect_unix;
-/// Submit an fsync of a Direct I/O file and return a future for the result.
-pub use runtime::io::direct_io_fsync;
-/// Read from a Direct I/O file into an owned buffer.
-pub use runtime::io::direct_io_read;
-/// Write an owned buffer to a Direct I/O file.
-pub use runtime::io::direct_io_write;
 /// Submit an NVMe flush and return a future for the result.
 pub use runtime::io::nvme_flush;
 /// The logical block size of an NVMe device's namespace.
@@ -369,10 +358,6 @@ pub use runtime::io::nvme_lba_size;
 pub use runtime::io::nvme_read;
 /// Write NVMe logical blocks from an owned buffer.
 pub use runtime::io::nvme_write;
-/// Open a Direct I/O file from any async task.
-pub use runtime::io::open_direct_io_file;
-/// Open a Direct I/O file from any async task, with open options.
-pub use runtime::io::open_direct_io_file_with;
 /// Open an NVMe device from any async task.
 pub use runtime::io::open_nvme_device;
 /// Request graceful shutdown from any async task.
@@ -478,12 +463,6 @@ pub use buffer::fixed::RegionId;
 pub use config::Config;
 /// Builder for [`Config`] with discoverable methods and `build()` validation.
 pub use config::ConfigBuilder;
-/// Direct I/O configuration.
-pub use direct_io::DirectIoConfig;
-/// Direct I/O file handle.
-pub use direct_io::DirectIoFile;
-/// Options for opening a direct I/O file.
-pub use direct_io::DirectIoOpenOptions;
 /// Runtime errors.
 pub use error::Error;
 /// Zero-copy send guard trait.

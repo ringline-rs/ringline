@@ -292,15 +292,15 @@ pub(crate) struct Driver {
         std::collections::HashMap<u32, crate::disk_io_pool::PoolSubsystem>,
     /// Entries of `disk_io_in_flight` per subsystem, indexed by
     /// `PoolSubsystem`.
-    pub(crate) disk_io_counts: [u16; 2],
+    pub(crate) disk_io_counts: [u16; 1],
     /// Each subsystem's `max_commands_in_flight`, indexed by `PoolSubsystem`;
     /// `None` when it is not configured. A submit at the bound fails.
-    pub(crate) disk_io_limits: [Option<u16>; 2],
+    pub(crate) disk_io_limits: [Option<u16>; 1],
     /// The keys in `disk_io_in_flight` whose request reads or writes through
-    /// a buffer address: `fs::read_into`/`fs::write_from` and
-    /// `direct_io_read`/`direct_io_write`. Worker exit waits for these.
+    /// a buffer address: `fs::read_into` and `fs::write_from`. Worker exit
+    /// waits for these.
     pub(crate) disk_io_borrowing: std::collections::HashSet<u32>,
-    /// The fs and direct I/O writes in the pool per file, and the fsyncs
+    /// The fs writes in the pool per file, and the fsyncs
     /// held, with their keys and work, until the writes submitted before
     /// them complete (#905). A held fsync is in `disk_io_in_flight`; at
     /// worker exit it is dropped with the driver, unsent.
@@ -310,19 +310,12 @@ pub(crate) struct Driver {
     /// the operation's buffer, so the worker leaks its event loop (#856).
     pub(crate) disk_io_outstanding: bool,
 
-    // ── Direct I/O file management ──────────��───────────────────────
-    /// Direct I/O file table (allocates file slots and generations).
-    pub(crate) direct_io_files: Option<crate::direct_io::DirectIoFileTable>,
-    /// Direct I/O fds, indexed by file slot. Each operation queued on the
-    /// disk-I/O pool holds a clone, so closing a file leaves its fd open until
-    /// those operations finish.
-    pub(crate) direct_io_fds: Vec<Option<Arc<OwnedFd>>>,
-
     // ── Filesystem file management ──────────────────────────────────
     /// Filesystem file table (allocates file slots and generations).
     pub(crate) fs_files: Option<crate::fs::FsFileTable>,
-    /// Filesystem fds, indexed by file slot, shared with queued pool
-    /// operations as `direct_io_fds` is.
+    /// Filesystem fds, indexed by file slot. Each operation queued on the
+    /// disk-I/O pool holds a clone, so closing a file leaves its fd open until
+    /// those operations finish.
     pub(crate) fs_fds: Vec<Option<Arc<OwnedFd>>>,
     /// Pending fs_open requests: maps seq → file_index. On completion, the
     /// opened fd (`DiskIoResponse::opened`) is stored in `fs_fds[file_index]`.
@@ -593,23 +586,11 @@ impl Driver {
             disk_io_pool,
             next_disk_io_seq: 0,
             disk_io_in_flight: std::collections::HashMap::new(),
-            disk_io_counts: [0; 2],
-            disk_io_limits: [
-                config.fs.as_ref().map(|f| f.max_commands_in_flight),
-                config.direct_io.as_ref().map(|d| d.max_commands_in_flight),
-            ],
+            disk_io_counts: [0; 1],
+            disk_io_limits: [config.fs.as_ref().map(|f| f.max_commands_in_flight)],
             disk_io_borrowing: std::collections::HashSet::new(),
             write_orders: crate::disk_order::WriteOrders::default(),
             disk_io_outstanding: false,
-            direct_io_files: config
-                .direct_io
-                .as_ref()
-                .map(|dio| crate::direct_io::DirectIoFileTable::new(dio.max_files)),
-            direct_io_fds: config
-                .direct_io
-                .as_ref()
-                .map(|dio| vec![None; dio.max_files as usize])
-                .unwrap_or_default(),
             fs_files: config
                 .fs
                 .as_ref()
@@ -660,8 +641,6 @@ impl Driver {
             disk_io_limits: self.disk_io_limits,
             disk_io_borrowing: &mut self.disk_io_borrowing,
             write_orders: &mut self.write_orders,
-            direct_io_files: &mut self.direct_io_files,
-            direct_io_fds: &mut self.direct_io_fds,
             fs_files: &mut self.fs_files,
             fs_fds: &mut self.fs_fds,
             pending_fs_opens: &mut self.pending_fs_opens,
@@ -2331,48 +2310,6 @@ pub(crate) mod tests {
             err.to_string().contains("no bytes left to write"),
             "unexpected message: {err}"
         );
-    }
-
-    /// `dsync(true)` reaches the `open(2)` the mio backend makes, and the
-    /// default does not add `O_DSYNC`.
-    #[test]
-    fn open_direct_io_file_with_dsync_sets_o_dsync_on_the_fd() {
-        let config = ConfigBuilder::new()
-            .workers(1)
-            .pin_to_core(false)
-            .max_connections(16)
-            .send_pool(4, 64)
-            .direct_io(crate::direct_io::DirectIoConfig {
-                max_files: 2,
-                max_commands_in_flight: 4,
-            })
-            .build()
-            .expect("valid test config");
-        let (mut driver, _wake) = test_driver(&config);
-        let path = std::env::current_dir()
-            .unwrap()
-            .join(".ringline_mio_dsync_flag");
-        std::fs::write(&path, [0u8; 4096]).unwrap();
-        let p = path.to_str().unwrap();
-        let (plain, synced) = {
-            let mut ctx = driver.make_ctx();
-            let plain = ctx.open_direct_io_file(p).expect("open plain");
-            let synced = ctx
-                .open_direct_io_file_with(
-                    p,
-                    crate::direct_io::DirectIoOpenOptions::new().dsync(true),
-                )
-                .expect("open dsync");
-            (plain, synced)
-        };
-        let fl = |index: u16| {
-            let fd = driver.direct_io_fds[index as usize].as_ref().unwrap();
-            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }
-        };
-        let (plain_fl, synced_fl) = (fl(plain.index), fl(synced.index));
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(plain_fl & libc::O_DSYNC, 0);
-        assert_eq!(synced_fl & libc::O_DSYNC, libc::O_DSYNC);
     }
 
     /// A TLS encrypt failure closes the connection, as on io_uring: the
