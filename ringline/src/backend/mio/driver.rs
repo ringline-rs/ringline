@@ -2177,7 +2177,10 @@ pub(crate) mod tests {
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
 
         driver.finish_close(conn_index);
-        assert!(!driver.send_queues[idx].aborted, "cleared for the next occupant");
+        assert!(
+            !driver.send_queues[idx].aborted,
+            "cleared for the next occupant"
+        );
         let mut buf = [0u8; 64];
         let read = client.read(&mut buf);
         assert!(
