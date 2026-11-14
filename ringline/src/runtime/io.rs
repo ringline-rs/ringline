@@ -5242,17 +5242,21 @@ impl<F: Future> Future for TimeoutFuture<F> {
 /// Dropped on a thread other than the owning worker, it leaves its result slot
 /// on the owning worker taken until that worker exits.
 pub struct DiskIoFuture {
-    pub(crate) seq: u32,
+    pub(crate) key: crate::runtime::DiskIoKey,
+    /// Whether the operation is an NVMe command, whose failure can carry a
+    /// device status word.
+    nvme: bool,
     /// Set once `poll` has returned `Ready`: the result has been taken.
     done: bool,
-    /// The worker whose executor holds `seq`.
+    /// The worker whose executor holds `key`.
     owner: u32,
 }
 
 impl DiskIoFuture {
-    pub(crate) fn new(seq: u32) -> Self {
+    pub(crate) fn new(key: crate::runtime::DiskIoKey, nvme: bool) -> Self {
         DiskIoFuture {
-            seq,
+            key,
+            nvme,
             done: false,
             owner: crate::runtime::waker::current_worker(),
         }
@@ -5265,15 +5269,15 @@ impl Future for DiskIoFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<i32>> {
         assert!(!self.done, "DiskIoFuture polled after completion");
         let poll = with_state(|_driver, executor| {
-            // On another worker `seq` names that worker's entry, and the
+            // On another worker `key` names that worker's entry, and the
             // result is not there.
             if self.owner != crate::runtime::waker::current_worker() {
                 return pending(cx);
             }
             let task_id = CURRENT_TASK_ID.with(|c| c.get());
-            match executor.poll_disk_io(self.seq, task_id) {
+            match executor.poll_disk_io(self.key, task_id) {
                 Some((result, _)) if result < 0 => {
-                    Poll::Ready(Err(disk_io_error(self.seq, result)))
+                    Poll::Ready(Err(disk_io_error(self.nvme, result)))
                 }
                 Some((result, _)) => Poll::Ready(Ok(result)),
                 None => pending(cx),
@@ -5288,12 +5292,12 @@ impl Future for DiskIoFuture {
 
 /// The error a negative disk-I/O result resolves to: for an NVMe command, a
 /// status word the device returned or an errno; otherwise an errno.
-pub(crate) fn disk_io_error(key: u32, result: i32) -> io::Error {
+pub(crate) fn disk_io_error(nvme: bool, result: i32) -> io::Error {
     #[cfg(has_io_uring)]
-    if key >> 30 == crate::handler::DiskIoKind::Nvme as u32 {
+    if nvme {
         return crate::nvme::error_from_result(result);
     }
-    let _ = key;
+    let _ = nvme;
     io::Error::from_raw_os_error(-result)
 }
 
@@ -5302,7 +5306,7 @@ impl Drop for DiskIoFuture {
         // Only the owning worker's executor holds the key. Dropped elsewhere
         // (the future is `Send`), the key stays held there (#575).
         if !self.done && crate::runtime::waker::current_worker() == self.owner {
-            crate::fs::abandon_disk_io_key(self.seq);
+            crate::fs::abandon_disk_io_key(self.key);
         }
     }
 }
@@ -5434,15 +5438,10 @@ pub fn nvme_read<B: crate::buf::IoBufMut>(
         }
         // Safety: the future owns `buf`, or parks it on drop until the
         // command completes.
-        match unsafe { ctx.nvme_read(device, lba, num_blocks, ptr as u64, data_len) } {
-            Ok(seq) => {
-                let target = crate::fs::cancel_target(
-                    crate::completion::OpTag::NvmeCmd,
-                    device.index as u32,
-                    seq,
-                );
-                ReadFuture::new(executor, seq, target, initial_len, Some(data_len), buf)
-            }
+        match crate::fs::submit_with_key(executor, |key| unsafe {
+            ctx.nvme_read(device, lba, num_blocks, ptr as u64, data_len, key)
+        }) {
+            Ok((key, target)) => ReadFuture::new(key, target, initial_len, Some(data_len), buf),
             Err(e) => ReadFuture::failed(e, buf),
         }
     })
@@ -5461,10 +5460,8 @@ pub fn nvme_read<B: crate::buf::IoBufMut>(
 pub fn nvme_flush(device: crate::nvme::NvmeDevice) -> io::Result<DiskIoFuture> {
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        let seq = ctx.nvme_flush(device)?;
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.wait_disk_io(seq, task_id);
-        Ok(DiskIoFuture::new(seq))
+        let (key, ()) = crate::fs::submit_with_key(executor, |key| ctx.nvme_flush(device, key))?;
+        Ok(DiskIoFuture::new(key, true))
     })
 }
 
@@ -5512,15 +5509,10 @@ pub fn nvme_write<B: crate::buf::IoBuf>(
         }
         // Safety: the future owns `buf`, or parks it on drop until the
         // command completes.
-        match unsafe { ctx.nvme_write(device, lba, num_blocks, ptr as u64, data_len) } {
-            Ok(seq) => {
-                let target = crate::fs::cancel_target(
-                    crate::completion::OpTag::NvmeCmd,
-                    device.index as u32,
-                    seq,
-                );
-                WriteFuture::new(executor, seq, target, Some(data_len), buf)
-            }
+        match crate::fs::submit_with_key(executor, |key| unsafe {
+            ctx.nvme_write(device, lba, num_blocks, ptr as u64, data_len, key)
+        }) {
+            Ok((key, target)) => WriteFuture::new(key, target, Some(data_len), buf),
             Err(e) => WriteFuture::failed(e, buf),
         }
     })

@@ -965,28 +965,17 @@ impl<'a> DriverCtx<'a> {
         *self.capacity_released = true;
     }
 
-    /// Allocate a 32-bit disk-I/O completion key: the subsystem in the top 2
-    /// bits, a 14-bit sequence below it, and the slab index in the low 16.
-    /// fs and NVMe share the executor's disk-I/O entry map but
-    /// have independent slabs, each numbering its slots from 0. CQE handlers
-    /// extract the slab index from the low 16 bits and wake with the full key.
-    ///
-    /// A key is held from submission until its future takes the result or is
-    /// dropped, which can be long after the slab slot is freed. A key a
-    /// future still holds is skipped, so no two held keys are equal. Fails
-    /// when futures hold every key of this slot (16,384 of them).
-    pub(crate) fn disk_io_key(&mut self, kind: DiskIoKind, slab_idx: u16) -> io::Result<u32> {
-        for _ in 0..=0x3FFF {
-            let seq = *self.next_disk_io_seq;
-            *self.next_disk_io_seq = seq.wrapping_add(1);
-            let key = ((kind as u32) << 30) | (((seq as u32) & 0x3FFF) << 16) | slab_idx as u32;
-            if !crate::runtime::disk_io_key_held(key) {
-                return Ok(key);
-            }
-        }
-        Err(io::Error::other(
-            "every disk-I/O key for this slab slot is held by a future",
-        ))
+    /// The user_data payload of a disk-I/O operation in command-slab slot
+    /// `slab_idx`: the subsystem in the top 2 bits, a 14-bit sequence below
+    /// it, and the slab index in the low 16. CQE handlers take the slab
+    /// index from the low 16 bits, and the slab entry holds the operation's
+    /// disk-I/O key. The sequence makes the user_data of an operation differ
+    /// from that of an earlier one in the same slot, which a cancel of the
+    /// earlier one could otherwise reach.
+    pub(crate) fn disk_op_id(&mut self, kind: DiskIoKind, slab_idx: u16) -> u32 {
+        let seq = *self.next_disk_io_seq;
+        *self.next_disk_io_seq = seq.wrapping_add(1);
+        ((kind as u32) << 30) | (((seq as u32) & 0x3FFF) << 16) | slab_idx as u32
     }
 
     /// Attach `id` to the resource whose completion ends `built`: its slab
@@ -1603,8 +1592,8 @@ impl<'a> DriverCtx<'a> {
     /// Reads `num_blocks` logical blocks starting at `lba` into the buffer
     /// at `buf_addr` with length `buf_len`.
     ///
-    /// Returns the operation's disk-I/O key. [`nvme_read`](crate::nvme_read) holds it
-    /// in a future that resolves to the result.
+    /// The command completes to `key`. Returns its user_data, which
+    /// [`nvme_read`](crate::nvme_read)'s future cancels if it is dropped first.
     ///
     /// # Safety
     ///
@@ -1618,7 +1607,8 @@ impl<'a> DriverCtx<'a> {
         num_blocks: u16,
         buf_addr: u64,
         buf_len: u32,
-    ) -> io::Result<u32> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
         if num_blocks == 0 {
             return Err(io::Error::other("num_blocks must be >= 1"));
         }
@@ -1628,24 +1618,16 @@ impl<'a> DriverCtx<'a> {
             .nvme_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("NVMe not configured"))?;
-        let slab_idx = slab.allocate(device.index).ok_or_else(|| {
+        let slab_idx = slab.allocate(device.index, key).ok_or_else(|| {
             io::Error::new(io::ErrorKind::WouldBlock, "NVMe command slab exhausted")
         })?;
 
         let cmd = crate::nvme::NvmeUringCmd::read(nsid, lba, num_blocks, buf_addr, buf_len);
-        let key = match self.disk_io_key(DiskIoKind::Nvme, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
+        let op_id = self.disk_op_id(DiskIoKind::Nvme, slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::NvmeCmd,
             device.index as u32,
-            key,
+            op_id,
         );
         if let Some(slab) = self.nvme_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
@@ -1658,7 +1640,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     dev.in_flight += 1;
                 }
-                Ok(key)
+                Ok(ud.raw())
             }
             Err(e) => {
                 if let Some(slab) = self.nvme_cmd_slab.as_mut() {
@@ -1674,8 +1656,8 @@ impl<'a> DriverCtx<'a> {
     /// Writes `num_blocks` logical blocks starting at `lba` from the buffer
     /// at `buf_addr` with length `buf_len`.
     ///
-    /// Returns the operation's disk-I/O key. [`nvme_write`](crate::nvme_write) holds it
-    /// in a future that resolves to the result.
+    /// The command completes to `key`. Returns its user_data, which
+    /// [`nvme_write`](crate::nvme_write)'s future cancels if it is dropped first.
     ///
     /// # Safety
     ///
@@ -1689,7 +1671,8 @@ impl<'a> DriverCtx<'a> {
         num_blocks: u16,
         buf_addr: u64,
         buf_len: u32,
-    ) -> io::Result<u32> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
         if num_blocks == 0 {
             return Err(io::Error::other("num_blocks must be >= 1"));
         }
@@ -1699,24 +1682,16 @@ impl<'a> DriverCtx<'a> {
             .nvme_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("NVMe not configured"))?;
-        let slab_idx = slab.allocate(device.index).ok_or_else(|| {
+        let slab_idx = slab.allocate(device.index, key).ok_or_else(|| {
             io::Error::new(io::ErrorKind::WouldBlock, "NVMe command slab exhausted")
         })?;
 
         let cmd = crate::nvme::NvmeUringCmd::write(nsid, lba, num_blocks, buf_addr, buf_len);
-        let key = match self.disk_io_key(DiskIoKind::Nvme, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
+        let op_id = self.disk_op_id(DiskIoKind::Nvme, slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::NvmeCmd,
             device.index as u32,
-            key,
+            op_id,
         );
         if let Some(slab) = self.nvme_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
@@ -1729,7 +1704,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     dev.in_flight += 1;
                 }
-                Ok(key)
+                Ok(ud.raw())
             }
             Err(e) => {
                 if let Some(slab) = self.nvme_cmd_slab.as_mut() {
@@ -1742,33 +1717,29 @@ impl<'a> DriverCtx<'a> {
 
     /// Submit an NVMe flush command.
     ///
-    /// Returns the operation's disk-I/O key. [`nvme_flush`](crate::nvme_flush) holds it
-    /// in a future that resolves to the result.
-    pub fn nvme_flush(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<u32> {
+    /// The command completes to `key`, which
+    /// [`nvme_flush`](crate::nvme_flush)'s future holds.
+    pub fn nvme_flush(
+        &mut self,
+        device: crate::nvme::NvmeDevice,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let (fd_index, nsid) = self.validate_nvme_device(device)?;
 
         let slab = self
             .nvme_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("NVMe not configured"))?;
-        let slab_idx = slab.allocate(device.index).ok_or_else(|| {
+        let slab_idx = slab.allocate(device.index, key).ok_or_else(|| {
             io::Error::new(io::ErrorKind::WouldBlock, "NVMe command slab exhausted")
         })?;
 
         let cmd = crate::nvme::NvmeUringCmd::flush(nsid);
-        let key = match self.disk_io_key(DiskIoKind::Nvme, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.nvme_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
+        let op_id = self.disk_op_id(DiskIoKind::Nvme, slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::NvmeCmd,
             device.index as u32,
-            key,
+            op_id,
         );
         if let Some(slab) = self.nvme_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
@@ -1781,7 +1752,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     dev.in_flight += 1;
                 }
-                Ok(key)
+                Ok(())
             }
             Err(e) => {
                 if let Some(slab) = self.nvme_cmd_slab.as_mut() {
@@ -1858,13 +1829,14 @@ impl<'a> DriverCtx<'a> {
     /// Allocates a file table slot and command slab entry, submits an openat
     /// SQE that installs the fd directly into the fixed file table.
     ///
-    /// Returns `(file_index, generation, slab_idx)`.
+    /// Returns `(file_index, generation)`; the open completes to `key`.
     pub(crate) fn fs_open(
         &mut self,
         path: &std::path::Path,
         flags: crate::fs::OpenFlags,
         mode: u32,
-    ) -> io::Result<(u16, u32, u32)> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<(u16, u32)> {
         let files = self
             .fs_files
             .as_mut()
@@ -1892,7 +1864,7 @@ impl<'a> DriverCtx<'a> {
         })?;
 
         let slab_idx = slab
-            .allocate(file_index, crate::fs::FsOp::Open)
+            .allocate(file_index, crate::fs::FsOp::Open, key)
             .ok_or_else(|| {
                 self.fs_files.as_mut().unwrap().release(file_index);
                 io::Error::new(
@@ -1917,22 +1889,11 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                if let Some(files) = self.fs_files.as_mut() {
-                    files.release(file_index);
-                }
-                return Err(e);
-            }
-        };
+        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file_index as u32,
-            key,
+            op_id,
         );
         if let Some(slab) = self.fs_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
@@ -1942,7 +1903,7 @@ impl<'a> DriverCtx<'a> {
             self.ring
                 .submit_openat(fd_index, path_ptr, flags.0, mode, ud.raw())
         } {
-            Ok(()) => Ok((file_index, generation, key)),
+            Ok(()) => Ok((file_index, generation)),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
                     slab.release(slab_idx);
@@ -1955,7 +1916,8 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Submit a filesystem read.
+    /// Submit a filesystem read that completes to `key`. Returns its user_data,
+    /// which a dropped future cancels.
     ///
     /// # Safety
     /// `buf` must point to valid, writable memory of at least `len` bytes
@@ -1966,7 +1928,8 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *mut u8,
         len: u32,
-    ) -> io::Result<u32> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
         let fd_index = self.validate_fs_file(file)?;
 
         let slab = self
@@ -1974,7 +1937,7 @@ impl<'a> DriverCtx<'a> {
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
         let slab_idx = slab
-            .allocate(file.index, crate::fs::FsOp::Read)
+            .allocate(file.index, crate::fs::FsOp::Read, key)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -1982,19 +1945,11 @@ impl<'a> DriverCtx<'a> {
                 )
             })?;
 
-        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
+        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file.index as u32,
-            key,
+            op_id,
         );
         if let Some(slab) = self.fs_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
@@ -2007,7 +1962,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     f.in_flight += 1;
                 }
-                Ok(key)
+                Ok(ud.raw())
             }
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
@@ -2018,7 +1973,8 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Submit a filesystem write.
+    /// Submit a filesystem write that completes to `key`. Returns its user_data,
+    /// which a dropped future cancels.
     ///
     /// # Safety
     /// `buf` must point to valid, readable memory of at least `len` bytes
@@ -2029,7 +1985,8 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *const u8,
         len: u32,
-    ) -> io::Result<u32> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
         let fd_index = self.validate_fs_file(file)?;
 
         let slab = self
@@ -2037,7 +1994,7 @@ impl<'a> DriverCtx<'a> {
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
         let slab_idx = slab
-            .allocate(file.index, crate::fs::FsOp::Write)
+            .allocate(file.index, crate::fs::FsOp::Write, key)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -2045,19 +2002,11 @@ impl<'a> DriverCtx<'a> {
                 )
             })?;
 
-        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
+        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file.index as u32,
-            key,
+            op_id,
         );
         if let Some(slab) = self.fs_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
@@ -2080,7 +2029,7 @@ impl<'a> DriverCtx<'a> {
                     },
                     key,
                 );
-                Ok(key)
+                Ok(ud.raw())
             }
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
@@ -2092,7 +2041,11 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Submit an fsync for a filesystem file.
-    pub(crate) fn fs_fsync(&mut self, file: crate::fs::File) -> io::Result<u32> {
+    pub(crate) fn fs_fsync(
+        &mut self,
+        file: crate::fs::File,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let fd_index = self.validate_fs_file(file)?;
 
         let slab = self
@@ -2100,7 +2053,7 @@ impl<'a> DriverCtx<'a> {
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
         let slab_idx = slab
-            .allocate(file.index, crate::fs::FsOp::Fsync)
+            .allocate(file.index, crate::fs::FsOp::Fsync, key)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -2108,19 +2061,11 @@ impl<'a> DriverCtx<'a> {
                 )
             })?;
 
-        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
+        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
         let ud = crate::completion::UserData::encode(
             crate::completion::OpTag::Fs,
             file.index as u32,
-            key,
+            op_id,
         );
         if let Some(slab) = self.fs_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
@@ -2143,7 +2088,7 @@ impl<'a> DriverCtx<'a> {
                 {
                     f.in_flight += 1;
                 }
-                Ok(key)
+                Ok(())
             }
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
@@ -2190,20 +2135,27 @@ impl<'a> DriverCtx<'a> {
     /// Submit a statx via io_uring. With `nofollow`, a final symbolic link in
     /// `path` is not followed.
     ///
-    /// Returns the slab_idx (seq number for DiskIoFuture).
-    pub(crate) fn fs_stat(&mut self, path: &std::path::Path, nofollow: bool) -> io::Result<u32> {
+    /// The stat completes to `key`.
+    pub(crate) fn fs_stat(
+        &mut self,
+        path: &std::path::Path,
+        nofollow: bool,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let c_path = crate::fs::path_to_cstring(path)?;
 
         let slab = self
             .fs_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab.allocate(0, crate::fs::FsOp::Statx).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "filesystem command slab exhausted",
-            )
-        })?;
+        let slab_idx = slab
+            .allocate(0, crate::fs::FsOp::Statx, key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem command slab exhausted",
+                )
+            })?;
 
         // The kernel writes into the slab entry's statx buffer; the slab
         // never moves an entry, so the pointer stays valid until the CQE.
@@ -2226,16 +2178,8 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
-        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
+        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, op_id);
         if let Some(slab) = self.fs_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
         }
@@ -2244,7 +2188,7 @@ impl<'a> DriverCtx<'a> {
             self.ring
                 .submit_statx(path_ptr, statx_ptr, nofollow, ud.raw())
         } {
-            Ok(()) => Ok(key),
+            Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
                     slab.release(slab_idx);
@@ -2259,7 +2203,8 @@ impl<'a> DriverCtx<'a> {
         &mut self,
         from: &std::path::Path,
         to: &std::path::Path,
-    ) -> io::Result<u32> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let c_from = crate::fs::path_to_cstring(from)?;
         let c_to = crate::fs::path_to_cstring(to)?;
 
@@ -2267,12 +2212,14 @@ impl<'a> DriverCtx<'a> {
             .fs_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab.allocate(0, crate::fs::FsOp::Rename).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "filesystem command slab exhausted",
-            )
-        })?;
+        let slab_idx = slab
+            .allocate(0, crate::fs::FsOp::Rename, key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem command slab exhausted",
+                )
+            })?;
 
         if let Some(entry) = slab.get_mut(slab_idx) {
             entry.path = Some(c_from);
@@ -2287,22 +2234,14 @@ impl<'a> DriverCtx<'a> {
             )
         };
 
-        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
-        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
+        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, op_id);
         if let Some(slab) = self.fs_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
         match unsafe { self.ring.submit_renameat(old_ptr, new_ptr, ud.raw()) } {
-            Ok(()) => Ok(key),
+            Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
                     slab.release(slab_idx);
@@ -2313,19 +2252,25 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Submit an unlinkat via io_uring.
-    pub(crate) fn fs_unlink(&mut self, path: &std::path::Path) -> io::Result<u32> {
+    pub(crate) fn fs_unlink(
+        &mut self,
+        path: &std::path::Path,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let c_path = crate::fs::path_to_cstring(path)?;
 
         let slab = self
             .fs_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab.allocate(0, crate::fs::FsOp::Unlink).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "filesystem command slab exhausted",
-            )
-        })?;
+        let slab_idx = slab
+            .allocate(0, crate::fs::FsOp::Unlink, key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem command slab exhausted",
+                )
+            })?;
 
         if let Some(entry) = slab.get_mut(slab_idx) {
             entry.path = Some(c_path);
@@ -2342,22 +2287,14 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
-        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
+        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, op_id);
         if let Some(slab) = self.fs_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
         match unsafe { self.ring.submit_unlinkat(path_ptr, 0, ud.raw()) } {
-            Ok(()) => Ok(key),
+            Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
                     slab.release(slab_idx);
@@ -2368,19 +2305,26 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// Submit a mkdirat via io_uring.
-    pub(crate) fn fs_mkdir(&mut self, path: &std::path::Path, mode: u32) -> io::Result<u32> {
+    pub(crate) fn fs_mkdir(
+        &mut self,
+        path: &std::path::Path,
+        mode: u32,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let c_path = crate::fs::path_to_cstring(path)?;
 
         let slab = self
             .fs_cmd_slab
             .as_mut()
             .ok_or_else(|| io::Error::other("filesystem I/O not configured"))?;
-        let slab_idx = slab.allocate(0, crate::fs::FsOp::Mkdir).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "filesystem command slab exhausted",
-            )
-        })?;
+        let slab_idx = slab
+            .allocate(0, crate::fs::FsOp::Mkdir, key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "filesystem command slab exhausted",
+                )
+            })?;
 
         if let Some(entry) = slab.get_mut(slab_idx) {
             entry.path = Some(c_path);
@@ -2397,22 +2341,14 @@ impl<'a> DriverCtx<'a> {
             .unwrap()
             .as_ptr();
 
-        let key = match self.disk_io_key(DiskIoKind::Fs, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.fs_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
-        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, key);
+        let op_id = self.disk_op_id(DiskIoKind::Fs, slab_idx);
+        let ud = crate::completion::UserData::encode(crate::completion::OpTag::Fs, 0, op_id);
         if let Some(slab) = self.fs_cmd_slab.as_mut() {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
         match unsafe { self.ring.submit_mkdirat(path_ptr, mode, ud.raw()) } {
-            Ok(()) => Ok(key),
+            Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(slab) = self.fs_cmd_slab.as_mut() {
                     slab.release(slab_idx);
@@ -2512,17 +2448,17 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) wake_handle: crate::wakeup::WakeFd,
     /// See `Driver::disk_io_wake_pending`.
     pub(crate) disk_io_wake_pending: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Monotonic sequence counter for disk I/O requests.
-    pub(crate) next_disk_io_seq: &'a mut u32,
     /// Keys of pool operations not yet drained; see `Driver::disk_io_in_flight`.
-    pub(crate) disk_io_in_flight:
-        &'a mut std::collections::HashMap<u32, crate::disk_io_pool::PoolSubsystem>,
+    pub(crate) disk_io_in_flight: &'a mut std::collections::HashMap<
+        crate::runtime::DiskIoKey,
+        crate::disk_io_pool::PoolSubsystem,
+    >,
     /// See `Driver::disk_io_counts`.
     pub(crate) disk_io_counts: &'a mut [u16; 1],
     /// See `Driver::disk_io_limits`.
     pub(crate) disk_io_limits: [Option<u16>; 1],
     /// See `Driver::disk_io_borrowing`.
-    pub(crate) disk_io_borrowing: &'a mut std::collections::HashSet<u32>,
+    pub(crate) disk_io_borrowing: &'a mut std::collections::HashSet<crate::runtime::DiskIoKey>,
     /// See `Driver::write_orders`.
     pub(crate) write_orders:
         &'a mut crate::disk_order::WriteOrders<crate::disk_io_pool::HeldRequest>,
@@ -2530,8 +2466,8 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) fs_files: &'a mut Option<crate::fs::FsFileTable>,
     /// Filesystem fds, indexed by file slot.
     pub(crate) fs_fds: &'a mut Vec<Option<std::sync::Arc<std::os::fd::OwnedFd>>>,
-    /// Pending fs_open requests: maps seq → file_index.
-    pub(crate) pending_fs_opens: &'a mut std::collections::HashMap<u32, u16>,
+    /// Pending fs_open requests: maps disk-I/O key → file_index.
+    pub(crate) pending_fs_opens: &'a mut std::collections::HashMap<crate::runtime::DiskIoKey, u16>,
 }
 
 #[cfg(not(has_io_uring))]
@@ -3027,7 +2963,8 @@ impl<'a> DriverCtx<'a> {
         _num_blocks: u16,
         _buf_addr: u64,
         _buf_len: u32,
-    ) -> io::Result<u32> {
+        _key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "NVMe passthrough requires the io_uring backend",
@@ -3046,7 +2983,8 @@ impl<'a> DriverCtx<'a> {
         _num_blocks: u16,
         _buf_addr: u64,
         _buf_len: u32,
-    ) -> io::Result<u32> {
+        _key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "NVMe passthrough requires the io_uring backend",
@@ -3062,7 +3000,11 @@ impl<'a> DriverCtx<'a> {
     }
 
     /// NVMe flush (not supported on mio backend).
-    pub fn nvme_flush(&mut self, _device: crate::nvme::NvmeDevice) -> io::Result<u32> {
+    pub fn nvme_flush(
+        &mut self,
+        _device: crate::nvme::NvmeDevice,
+        _key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "NVMe passthrough requires the io_uring backend",
@@ -3071,7 +3013,7 @@ impl<'a> DriverCtx<'a> {
 
     // ── Disk-I/O pool ─────────────────────────────────────────────────
 
-    /// Allocate a sequence number and submit work to the disk I/O pool.
+    /// Submit work to the disk I/O pool as the operation `key`.
     /// `borrows` is true when `work` reads or writes through a caller's
     /// buffer address, which worker exit must then wait for. Fails when
     /// `subsystem` is not configured, or already has its
@@ -3081,21 +3023,23 @@ impl<'a> DriverCtx<'a> {
         subsystem: crate::disk_io_pool::PoolSubsystem,
         work: Box<dyn FnOnce() -> crate::disk_io_pool::DiskIoResult + Send>,
         borrows: bool,
-    ) -> io::Result<u32> {
-        self.submit_disk_io_ordered(subsystem, work, borrows, None)
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
+        self.submit_disk_io_ordered(subsystem, work, borrows, None, key)
     }
 
     /// [`submit_disk_io`](Self::submit_disk_io) for a write or an fsync on
     /// a file. A write is recorded in `write_orders`; an fsync is held there,
     /// not sent, until the writes submitted before it on the file complete
-    /// (#905). A held fsync has its key and counts against the bound.
+    /// (#905). A held fsync counts against the bound.
     fn submit_disk_io_ordered(
         &mut self,
         subsystem: crate::disk_io_pool::PoolSubsystem,
         work: Box<dyn FnOnce() -> crate::disk_io_pool::DiskIoResult + Send>,
         borrows: bool,
         order: Option<DiskOrder>,
-    ) -> io::Result<u32> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         // An unconfigured subsystem fails first, with io_uring's error, even
         // when this worker has no pool. A missing pool with the subsystem
         // configured is unreachable through `ConfigBuilder`, which refuses it
@@ -3112,41 +3056,30 @@ impl<'a> DriverCtx<'a> {
             return Err(subsystem.exhausted());
         }
 
-        // Skip a key a future still holds, or whose operation is still in the
-        // pool; the u32 sequence can wrap on a long-running worker.
-        let seq = loop {
-            let seq = *self.next_disk_io_seq;
-            *self.next_disk_io_seq = seq.wrapping_add(1);
-            if !crate::runtime::disk_io_key_held(seq) && !self.disk_io_in_flight.contains_key(&seq)
-            {
-                break seq;
-            }
-        };
-
         let to_send = match order {
-            Some(DiskOrder::Sync(file)) => self.write_orders.sync(file, (seq, work)),
-            _ => Some((seq, work)),
+            Some(DiskOrder::Sync(file)) => self.write_orders.sync(file, (key, work)),
+            _ => Some((key, work)),
         };
-        if let Some((seq, work)) = to_send {
+        if let Some((key, work)) = to_send {
             crate::disk_io_pool::send_request(
                 pool,
                 tx,
                 self.wake_handle,
                 self.disk_io_wake_pending,
-                seq,
+                key,
                 work,
             )?;
         }
-        self.disk_io_in_flight.insert(seq, subsystem);
+        self.disk_io_in_flight.insert(key, subsystem);
         self.disk_io_counts[subsystem as usize] += 1;
         if borrows {
-            self.disk_io_borrowing.insert(seq);
+            self.disk_io_borrowing.insert(key);
         }
         if let Some(DiskOrder::Write(file)) = order {
-            self.write_orders.begin_write(file, seq);
+            self.write_orders.begin_write(file, key);
         }
 
-        Ok(seq)
+        Ok(())
     }
 
     // ── Filesystem I/O methods ────────────────────────────────────────
@@ -3157,13 +3090,14 @@ impl<'a> DriverCtx<'a> {
     /// the opened fd in `DiskIoResult::opened`; the event loop moves it into
     /// `fs_fds` when it drains the response.
     ///
-    /// Returns `(file_index, generation, seq)`.
+    /// Returns `(file_index, generation)`.
     pub(crate) fn fs_open(
         &mut self,
         path: &std::path::Path,
         flags: crate::fs::OpenFlags,
         mode: u32,
-    ) -> io::Result<(u16, u32, u32)> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<(u16, u32)> {
         let files = self
             .fs_files
             .as_mut()
@@ -3225,10 +3159,10 @@ impl<'a> DriverCtx<'a> {
             }
         });
 
-        match self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false) {
-            Ok(seq) => {
-                self.pending_fs_opens.insert(seq, file_index);
-                Ok((file_index, generation, seq))
+        match self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false, key) {
+            Ok(()) => {
+                self.pending_fs_opens.insert(key, file_index);
+                Ok((file_index, generation))
             }
             Err(e) => {
                 self.fs_files.as_mut().unwrap().release(file_index);
@@ -3244,7 +3178,8 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *mut u8,
         len: u32,
-    ) -> io::Result<u32> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
         let fd = self.validate_fs_file(file)?;
         let buf_addr = buf as usize;
         let work = Box::new(move || {
@@ -3269,7 +3204,9 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, true)
+        // Nothing is cancelled on mio, so the cancel target is unused.
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, true, key)?;
+        Ok(0)
     }
 
     /// Submit a filesystem write via the disk I/O pool.
@@ -3279,7 +3216,8 @@ impl<'a> DriverCtx<'a> {
         offset: u64,
         buf: *const u8,
         len: u32,
-    ) -> io::Result<u32> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<u64> {
         let fd = self.validate_fs_file(file)?;
         let buf_addr = buf as usize;
         let work = Box::new(move || {
@@ -3308,16 +3246,23 @@ impl<'a> DriverCtx<'a> {
             index: file.index,
             generation: file.generation,
         });
+        // Nothing is cancelled on mio, so the cancel target is unused.
         self.submit_disk_io_ordered(
             crate::disk_io_pool::PoolSubsystem::Fs,
             work,
             true,
             Some(order),
-        )
+            key,
+        )?;
+        Ok(0)
     }
 
     /// Submit an fsync for a filesystem file via the disk I/O pool.
-    pub(crate) fn fs_fsync(&mut self, file: crate::fs::File) -> io::Result<u32> {
+    pub(crate) fn fs_fsync(
+        &mut self,
+        file: crate::fs::File,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let fd = self.validate_fs_file(file)?;
         let work = Box::new(move || {
             let result = unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&*fd)) };
@@ -3343,6 +3288,7 @@ impl<'a> DriverCtx<'a> {
             work,
             false,
             Some(order),
+            key,
         )
     }
 
@@ -3364,7 +3310,12 @@ impl<'a> DriverCtx<'a> {
     /// Uses `libc::stat` (portable) instead of `statx` (Linux-only). The
     /// result is converted to `crate::fs::Metadata` inside the pool closure
     /// and delivered via `DiskIoResponse::metadata`.
-    pub(crate) fn fs_stat(&mut self, path: &std::path::Path, nofollow: bool) -> io::Result<u32> {
+    pub(crate) fn fs_stat(
+        &mut self,
+        path: &std::path::Path,
+        nofollow: bool,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let c_path = crate::fs::path_to_cstring(path)?;
         let work = Box::new(move || {
             let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
@@ -3391,7 +3342,7 @@ impl<'a> DriverCtx<'a> {
                 }
             }
         });
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false, key)
     }
 
     /// Submit a rename via the disk I/O pool.
@@ -3399,7 +3350,8 @@ impl<'a> DriverCtx<'a> {
         &mut self,
         from: &std::path::Path,
         to: &std::path::Path,
-    ) -> io::Result<u32> {
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let c_from = crate::fs::path_to_cstring(from)?;
         let c_to = crate::fs::path_to_cstring(to)?;
         let work = Box::new(move || {
@@ -3417,11 +3369,15 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false, key)
     }
 
     /// Submit an unlink via the disk I/O pool.
-    pub(crate) fn fs_unlink(&mut self, path: &std::path::Path) -> io::Result<u32> {
+    pub(crate) fn fs_unlink(
+        &mut self,
+        path: &std::path::Path,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let c_path = crate::fs::path_to_cstring(path)?;
         let work = Box::new(move || {
             let result = unsafe { libc::unlink(c_path.as_ptr()) };
@@ -3438,11 +3394,16 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false, key)
     }
 
     /// Submit a mkdir via the disk I/O pool.
-    pub(crate) fn fs_mkdir(&mut self, path: &std::path::Path, mode: u32) -> io::Result<u32> {
+    pub(crate) fn fs_mkdir(
+        &mut self,
+        path: &std::path::Path,
+        mode: u32,
+        key: crate::runtime::DiskIoKey,
+    ) -> io::Result<()> {
         let c_path = crate::fs::path_to_cstring(path)?;
         let work = Box::new(move || {
             let result = unsafe { libc::mkdir(c_path.as_ptr(), mode as libc::mode_t) };
@@ -3459,7 +3420,7 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
+        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false, key)
     }
 
     /// Validate a filesystem file handle and return a hold on its fd.
@@ -4682,7 +4643,8 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
     }
 }
 
-/// The subsystem a disk-I/O key belongs to: its top two bits.
+/// The subsystem a disk operation's user_data payload names: its top two
+/// bits (`DriverCtx::disk_op_id`).
 #[cfg(has_io_uring)]
 #[derive(Clone, Copy)]
 pub(crate) enum DiskIoKind {

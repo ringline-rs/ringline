@@ -19,8 +19,8 @@ pub(crate) struct DiskIoRequest {
     /// The i32 follows io_uring CQE convention: >= 0 for success/bytes,
     /// < 0 for -errno.
     pub(crate) work: Box<dyn FnOnce() -> DiskIoResult + Send>,
-    /// Sequence number for correlating request → response.
-    pub(crate) seq: u32,
+    /// The operation's disk-I/O key, which its response carries back.
+    pub(crate) key: crate::runtime::DiskIoKey,
     /// Per-worker response channel.
     pub(crate) response_tx: Sender<DiskIoResponse>,
     /// The worker's wake handle, written after a response when `wake_pending`
@@ -59,8 +59,8 @@ pub(crate) struct DiskIoResult {
 
 /// A response from the disk I/O pool to a worker.
 pub(crate) struct DiskIoResponse {
-    /// Sequence number matching the original request.
-    pub(crate) seq: u32,
+    /// The disk-I/O key of the request answered.
+    pub(crate) key: crate::runtime::DiskIoKey,
     /// io_uring-compatible result.
     pub(crate) result: i32,
     /// Optional metadata (populated only for stat operations).
@@ -79,22 +79,25 @@ pub(crate) enum PoolSubsystem {
 
 /// A pool request held in the worker, not yet sent: its key and its work.
 /// An fsync waits like this for the writes submitted before it (#905).
-pub(crate) type HeldRequest = (u32, Box<dyn FnOnce() -> DiskIoResult + Send>);
+pub(crate) type HeldRequest = (
+    crate::runtime::DiskIoKey,
+    Box<dyn FnOnce() -> DiskIoResult + Send>,
+);
 
-/// Send `work` under key `seq` to `pool`, with the worker's response channel
+/// Send `work` under key `key` to `pool`, with the worker's response channel
 /// and wake handle.
 pub(crate) fn send_request(
     pool: &DiskIoPool,
     response_tx: &Sender<DiskIoResponse>,
     wake_handle: crate::wakeup::WakeFd,
     wake_pending: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    seq: u32,
+    key: crate::runtime::DiskIoKey,
     work: Box<dyn FnOnce() -> DiskIoResult + Send>,
 ) -> std::io::Result<()> {
     pool.request_tx
         .send(DiskIoRequest {
             work,
-            seq,
+            key,
             response_tx: response_tx.clone(),
             wake_handle,
             wake_pending: std::sync::Arc::clone(wake_pending),
@@ -130,11 +133,11 @@ pub(crate) struct PoolState {
     /// Set when the worker exits: a request not yet started is answered
     /// `-ECANCELED` without running, so it uses no memory after exit (#856).
     pub(crate) abandon: bool,
-    /// The sequence numbers of the requests a thread has started and not
+    /// The disk-I/O keys of the requests a thread has started and not
     /// finished. A thread adds one only while `abandon` is false, under the
     /// same lock, so the set the exit drain reads after setting `abandon` is
     /// every request that can still run.
-    pub(crate) running: std::collections::HashSet<u32>,
+    pub(crate) running: std::collections::HashSet<crate::runtime::DiskIoKey>,
 }
 
 /// A pool of threads that perform blocking disk I/O.
@@ -202,7 +205,7 @@ fn disk_io_thread(
         let start = {
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
             if !state.abandon {
-                state.running.insert(req.seq);
+                state.running.insert(req.key);
             }
             !state.abandon
         };
@@ -224,7 +227,7 @@ fn disk_io_thread(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .running
-                .remove(&req.seq);
+                .remove(&req.key);
             result
         } else {
             #[cfg(test)]
@@ -240,7 +243,7 @@ fn disk_io_thread(
             }
         };
         let _ = req.response_tx.send(DiskIoResponse {
-            seq: req.seq,
+            key: req.key,
             result: result.result,
             metadata: result.metadata,
             opened: result.opened,

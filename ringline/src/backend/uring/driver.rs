@@ -726,7 +726,7 @@ pub(crate) struct Driver {
     pub(crate) close_notify_armed: Vec<u32>,
     /// Scratch for TLS output sends collected during CQE handling.
     pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
-    /// Monotonic disk-I/O sequence (see DriverCtx::disk_io_key).
+    /// Monotonic disk-I/O sequence (see DriverCtx::disk_op_id).
     pub(crate) next_disk_io_seq: u16,
     /// The fs writes in flight per file, and the fsyncs held
     /// until the writes submitted before them complete (#905): each held

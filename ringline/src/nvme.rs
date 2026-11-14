@@ -444,6 +444,8 @@ struct NvmeCmdEntry {
     in_use: bool,
     /// The SQE's user_data, recorded before the SQE is pushed.
     user_data: u64,
+    /// The command's disk-I/O key, which its completion is delivered to.
+    key: crate::runtime::DiskIoKey,
 }
 
 impl NvmeCmdSlab {
@@ -455,17 +457,20 @@ impl NvmeCmdSlab {
                 device_index: 0,
                 in_use: false,
                 user_data: 0,
+                key: 0,
             });
             free_list.push(i);
         }
         NvmeCmdSlab { entries, free_list }
     }
 
-    /// Allocate a command slot. Returns the slab index.
-    pub fn allocate(&mut self, device_index: u16) -> Option<u16> {
+    /// Allocate a command slot for the command `key`. Returns the slab
+    /// index.
+    pub fn allocate(&mut self, device_index: u16, key: crate::runtime::DiskIoKey) -> Option<u16> {
         let idx = self.free_list.pop()?;
         let entry = &mut self.entries[idx as usize];
         entry.device_index = device_index;
+        entry.key = key;
         entry.in_use = true;
         Some(idx)
     }
@@ -504,6 +509,15 @@ impl NvmeCmdSlab {
             .iter()
             .filter(|e| e.in_use)
             .map(|e| e.user_data)
+    }
+
+    /// The disk-I/O key of the command in slot `idx`, if the slot holds the
+    /// command whose SQE carried `user_data`.
+    pub fn key_for(&self, idx: u16, user_data: u64) -> Option<crate::runtime::DiskIoKey> {
+        self.entries
+            .get(idx as usize)
+            .filter(|e| e.in_use && e.user_data == user_data)
+            .map(|e| e.key)
     }
 }
 
@@ -604,16 +618,6 @@ impl NvmeConfig {
     ///
     /// One submitted at the limit fails with an error of kind `WouldBlock`,
     /// `NVMe command slab exhausted`.
-    ///
-    /// Each command slot has 16,384 operation keys. A future holds one from
-    /// submission until it takes its result or is dropped on the worker that
-    /// created it. A future that is neither polled to completion nor dropped
-    /// keeps its key after its command completes, and one dropped on another
-    /// thread keeps it for the life of that worker. The slot freed last is
-    /// reused first, so in a serial workload 16,384 such futures make every
-    /// later operation fail with `every disk-I/O key for this slab slot is held
-    /// by a future`, until one of them takes its result or is dropped on that
-    /// worker, while other slots are free.
     pub fn max_commands_in_flight(mut self, max_commands_in_flight: u16) -> Self {
         self.max_commands_in_flight = max_commands_in_flight;
         self
@@ -800,8 +804,8 @@ mod tests {
     #[test]
     fn cmd_slab_alloc_release() {
         let mut slab = NvmeCmdSlab::new(8);
-        let a = slab.allocate(0).unwrap();
-        let b = slab.allocate(1).unwrap();
+        let a = slab.allocate(0, 0).unwrap();
+        let b = slab.allocate(1, 0).unwrap();
         assert!(slab.in_use(a));
         assert!(slab.in_use(b));
         assert_eq!(slab.device_index(a), 0);

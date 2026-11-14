@@ -10,8 +10,6 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
-use crate::runtime::KeyMap;
-
 /// The file an operation is on: its fs table slot and generation. The
 /// generation keeps a slot reused after a close apart from the file that
 /// held it before.
@@ -39,21 +37,21 @@ struct FileOrder<S> {
 pub(crate) struct WriteOrders<S> {
     files: HashMap<OrderKey, FileOrder<S>>,
     /// The file and ticket of each write in flight, by disk-I/O key.
-    writes: KeyMap<(OrderKey, u64)>,
+    writes: HashMap<crate::runtime::DiskIoKey, (OrderKey, u64)>,
 }
 
 impl<S> Default for WriteOrders<S> {
     fn default() -> Self {
         WriteOrders {
             files: HashMap::new(),
-            writes: KeyMap::default(),
+            writes: HashMap::new(),
         }
     }
 }
 
 impl<S> WriteOrders<S> {
     /// Record a write submitted on `file` under disk-I/O key `op`.
-    pub(crate) fn begin_write(&mut self, file: OrderKey, op: u32) {
+    pub(crate) fn begin_write(&mut self, file: OrderKey, op: crate::runtime::DiskIoKey) {
         let order = self.files.entry(file).or_insert_with(|| FileOrder {
             next: 0,
             writes: BTreeSet::new(),
@@ -80,7 +78,12 @@ impl<S> WriteOrders<S> {
     /// The operation under disk-I/O key `op` completed. If it was a write,
     /// return the fsyncs it was the last earlier write of, in submission
     /// order, to submit now.
-    pub(crate) fn end_write(&mut self, op: u32) -> Vec<S> {
+    pub(crate) fn end_write(&mut self, op: crate::runtime::DiskIoKey) -> Vec<S> {
+        // Every fs completion calls this; skip the hash when no write is in
+        // flight.
+        if self.writes.is_empty() {
+            return Vec::new();
+        }
         let Some((file, ticket)) = self.writes.remove(&op) else {
             return Vec::new();
         };
