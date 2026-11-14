@@ -31,6 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `SendCompletion`, with no change in behaviour. Removing a waiter from the
   FIFO, on a timeout, a cancel or a connection's release, no longer searches
   it (`docs/send-admission-design.md`, section 2).
+- `SendHalf::abort` and `Connection::abort` close a connection without draining
+  its sends, for a peer that has stopped reading, where `close()` waits for it.
+  Every send on the connection that has not resolved fails with
+  `ConnectionAborted`: queued sends, sends waiting for send-pool capacity, and
+  sends in flight. A send made after the abort fails the same way until the
+  connection is released, a parked `with_data` resolves to 0, and
+  `with_data_result` returns `ConnectionAborted`. The sends' send-pool slots and
+  zero-copy buffers are released without waiting for the peer. No close_notify
+  is sent, and a TCP peer on Linux reads `ECONNRESET`. On io_uring the socket is
+  disconnected (`IORING_OP_CONNECT` to `AF_UNSPEC`) ahead of its `Close`, so
+  before Linux 6.13 the zero-copy buffers come back even while other
+  connections' requests hold the fixed file. On mio the socket is closed with
+  `SO_LINGER {1, 0}`. The disconnect's completions count under the
+  `disconnect` value of the `op` label on `ringline/cqe_by_tag`.
 - io_uring: `ConfigBuilder::sqpoll_cpus(&[u32])` pins worker `i`'s SQPOLL
   thread to logical CPU `cpus[i]` (#834). Entries may repeat, so several SQ
   threads can share one CPU. With `sqpoll(true)`, `launch` fails with
@@ -369,6 +383,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `IORING_OP_FIXED_FD_INSTALL` (6.8), which park uses. Debian 12 (6.1) and
   Amazon Linux 2023's 6.1 kernel are below the floor; Ubuntu 24.04's 6.8
   kernel is not.
+- **Breaking:** `ConfigBuilder::sq_entries` must be at least 4, up from 1: a
+  connection's close pushes a shutdown or a cancel linked to its `Close`
+  (#581, #586), and `abort` pushes a chain of three linked operations, which a
+  smaller submission queue cannot take. A config with 1 or 2 fails validation
+  with `Error::RingSetup` on both backends. The default, 4096, and the sizes
+  launch fits to `RLIMIT_MEMLOCK` (at least 64) are above the minimum.
+- On io_uring a bounded send (`send_admitted`, `send_backpressured`) on a
+  connection whose `Close` is committed fails with `NotConnected` before it
+  joins the send-capacity FIFO, as it already did on a TLS connection whose
+  close_notify was queued. Before, it joined the FIFO and was refused when it
+  won capacity, and on a connection whose write half was also shut down it
+  failed with `BrokenPipe`.
 - `fs::fsync` waits for every write submitted before it through the same
   handle (#905). Before, an fsync submitted while a
   write to the file was still in flight ran alongside it and could complete
@@ -915,10 +941,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a stream, read from one or close the connection take `now: Instant` after
   the endpoint: `send_request`, `handle_quic_event`, `send_response`,
   `send_data`, `send_data_bytes` and `send_trailers` (#572).
-
-- **Breaking:** `ConfigBuilder::sq_entries` must be at least 2: a
-  connection's close pushes a linked shutdown and `Close` together (#581).
-  `sq_entries(1)` now fails `build()`.
 
 - **Breaking:** `JoinHandle` (from `spawn_with_handle`) and
   `BlockingJoinHandle` (from `spawn_blocking`) resolve to

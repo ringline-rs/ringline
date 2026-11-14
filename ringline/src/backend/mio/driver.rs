@@ -687,6 +687,47 @@ impl Driver {
         self.pending_closes.push(conn_index);
     }
 
+    /// `abort`: fail the connection's queued sends with `ConnectionAborted`,
+    /// returning their copy-pool permits, set `SO_LINGER {1, 0}` on its
+    /// socket so that the close sends an RST and discards the data queued on
+    /// it, and request its close. `finish_close` then skips the flush and the
+    /// close_notify. Returns `false`, having done nothing, when the
+    /// connection is gone or was aborted already. The caller
+    /// (`ConnCtx::abort`) has failed the reader and the sends waiting for
+    /// capacity.
+    pub(crate) fn abort(&mut self, conn_index: u32) -> bool {
+        let idx = conn_index as usize;
+        if self.connections.get(conn_index).is_none() || self.send_queues[idx].aborted {
+            return false;
+        }
+        self.send_queues[idx].aborted = true;
+        self.clear_pending_sends(idx, crate::handler::aborted_error);
+        if let Some(stream) = &self.tcp_streams[idx] {
+            use std::os::fd::AsRawFd;
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // A failure leaves an ordinary close, which still releases the
+            // queued sends: they were failed above.
+            // SAFETY: the fd is the open socket `stream` owns, and `linger`
+            // outlives the call.
+            unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&raw const linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                );
+            }
+        }
+        // Does nothing for a connection already closing, which is on
+        // `pending_closes` until `finish_close`.
+        self.close_connection(conn_index);
+        true
+    }
+
     /// Count every connection still open out of `CONNECTIONS_ACTIVE` and
     /// into `conn::CLOSED`, at worker exit. Both counters follow
     /// `established`, as in `finish_close`. The worker then drops the event
@@ -711,9 +752,16 @@ impl Driver {
     pub(crate) fn finish_close(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
+        // After `abort` nothing is written: its sends were failed, and the
+        // socket's `SO_LINGER {1, 0}` makes the close below an RST.
+        let aborted = std::mem::take(&mut self.send_queues[idx].aborted);
         // A write error here is why the sends still queued below did not
         // go, and they report it.
-        let flush_error = self.flush_sends(conn_index).err();
+        let flush_error = if aborted {
+            None
+        } else {
+            self.flush_sends(conn_index).err()
+        };
 
         // No alert once a write shutdown has been requested: `flush_sends`
         // above issued the FIN when it drained the queue, and a write after
@@ -724,7 +772,8 @@ impl Driver {
         // written record, and the peer would read a corrupt stream. That is
         // the case for a connection closed before its handshake completed
         // whose close deadline passed.
-        let alert_allowed = flush_error.is_none()
+        let alert_allowed = !aborted
+            && flush_error.is_none()
             && self.pending_sends[idx].is_empty()
             && self
                 .connections
@@ -833,8 +882,8 @@ impl Driver {
         );
     }
 
-    /// Queue forwarded bytes on the sink. Returns false if the sink is gone or
-    /// its slot was recycled, which fails the forward.
+    /// Queue forwarded bytes on the sink. Returns false if the sink is gone,
+    /// its slot was recycled or it was aborted, which fails the forward.
     pub(crate) fn forward_push(&mut self, source: u32, data: &[u8]) -> bool {
         let Some(st) = self.forward_conn[source as usize].as_ref() else {
             return false;
@@ -842,6 +891,7 @@ impl Driver {
         let (sink, sink_gen) = (st.sink_index, st.sink_generation);
         if self.connections.generation(sink) != sink_gen
             || self.tcp_streams[sink as usize].is_none()
+            || self.send_queues[sink as usize].aborted
         {
             return false;
         }
@@ -2082,6 +2132,58 @@ pub(crate) mod tests {
         assert_eq!(
             driver.accumulators.capacity(conn_index),
             config.recv_accumulator_capacity
+        );
+    }
+
+    /// `abort` fails the queued send with `ConnectionAborted` and returns its
+    /// permit, and the close that follows writes nothing: the peer reads a
+    /// reset and none of the queued bytes.
+    #[test]
+    fn abort_writes_nothing_and_resets_the_peer() {
+        use std::io::Read;
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, mut client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+        driver
+            .make_ctx()
+            .send_bounded(conn, b"never sent", id)
+            .expect("admitted");
+        assert_eq!(driver.send_copy_pool.free_count(), 3);
+
+        assert!(driver.abort(conn_index));
+        assert!(!driver.abort(conn_index), "a second abort");
+
+        assert!(driver.pending_sends[idx].is_empty());
+        assert_eq!(driver.send_copy_pool.free_count(), 4, "the permit is back");
+        assert!(driver.pending_closes.contains(&conn_index));
+        let completions = take_completions(&mut driver);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, id);
+        let err = completions[0].1.as_ref().expect_err("the send failed");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(err.to_string(), "connection aborted");
+        let err = driver
+            .make_ctx()
+            .send(conn, b"late")
+            .expect_err("a send after the abort");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+
+        // A send queued after the abort without its refusal, as a forward
+        // into this sink could be: the close must not write it.
+        driver.pending_sends[idx].push_back(PendingSend::plain(b"forwarded".to_vec()));
+        driver.finish_close(conn_index);
+        assert!(
+            !driver.send_queues[idx].aborted,
+            "cleared for the next occupant"
+        );
+        let mut buf = [0u8; 64];
+        let read = client.read(&mut buf);
+        assert!(
+            matches!(&read, Err(e) if e.kind() == io::ErrorKind::ConnectionReset),
+            "expected a reset and no bytes: {read:?}"
         );
     }
 

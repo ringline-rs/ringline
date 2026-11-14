@@ -1,0 +1,115 @@
+name = "abort verify on {image} ({ref})"
+
+# Verifies `SendHalf::abort` (docs/send-admission-design.md, section 3) on one
+# kernel. Submit once per kernel, with what the cancel-and-linger mutation
+# should do there:
+#   systemslab submit experiments/abort-verify.toml -p image=ubuntu-24.04-6.8 -p linger_expect=fail
+#   systemslab submit experiments/abort-verify.toml -p image=debian-13-6.12 -p linger_expect=fail
+#   systemslab submit experiments/abort-verify.toml -p image=debian-14-7.2 -p linger_expect=pass
+#
+# `abort_releases_a_stalled_connection_at_once` in tests/abort.rs aborts a
+# connection holding a zero-copy send to a peer that does not read, while an
+# older idle connection's hangup poll is pending, and requires the send's
+# buffer back within 100 ms.
+# - green: the test passes.
+# - abort-verify-no-disconnect.patch closes with the normal lead and no
+#   disconnect. The buffer is held on every kernel, so the test fails.
+# - abort-verify-cancel-linger.patch puts Experiment A's cancel, SO_LINGER
+#   {1, 0} and close in place of the disconnect. The test fails before Linux
+#   6.13, where the older poll holds the fixed file's release, and passes from
+#   6.13. A pass on 6.8 or 6.12 means the test does not reach the case the
+#   disconnect is for.
+# A run in which the zero-copy send fell back to a plain send (SEND_ZC_ENOMEM)
+# tests nothing and fails here. Then the whole ringline suite and the io_uring
+# lint and doc gates run on the branch.
+
+[params]
+image = "debian-13-6.12"
+linger_expect = "fail"
+ref = "feat/abort"
+repo = "https://github.com/brayniac/ringline"
+
+[[jobs]]
+name = "vm"
+tags = ["hypervisor", "x86_64"]
+
+[[jobs.steps]]
+uses = "anvil-vm"
+[jobs.steps.with]
+shape = "auto.c"
+image = "{image}"
+memory_gib = 8
+gpu = false
+boot_timeout = 600
+payload_timeout = 7200
+artifacts = ["/tmp/job/run.log"]
+payload = '''
+set -o pipefail
+mkdir -p /tmp/job
+echo 1 > /tmp/job/status
+{
+  echo "== guest =="; uname -r; nproc; grep PRETTY /etc/os-release
+  if ! command -v cc >/dev/null || ! command -v git >/dev/null; then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential git curl >/dev/null
+  fi
+  if ! command -v cargo >/dev/null; then
+    curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal -c clippy -c rustfmt
+    . "$HOME/.cargo/env"
+  fi
+  cargo --version
+  ulimit -Sn 65536
+  echo "memlock=$(ulimit -l)"
+  # On disk, not in /tmp: /tmp is tmpfs on these images, and a target
+  # directory there runs the guest out of memory. Eight jobs keep the build
+  # inside the guest's 8 GiB on hosts with more CPUs.
+  export CARGO_BUILD_JOBS=8
+  git clone -q {repo} "$HOME/src" || exit 1
+  cd "$HOME/src" && git checkout -q {ref} || exit 1
+  git log --oneline -1
+
+  # A mio build would run none of the code under test.
+  cargo build --locked -q -p ringline-bench --bin bench-server
+  backend=$(./target/debug/bench-server --print-backend)
+  echo "backend=$backend"
+
+  run_abort() {
+    cargo test --locked -q -p ringline --test abort -- --nocapture --test-threads=1 > /tmp/job/$1.out 2>&1
+    echo "$1_rc=$?" | tee -a /tmp/job/rc.txt
+    grep -E "^test |test result|abort: |panicked|released|not released" /tmp/job/$1.out
+  }
+  run_abort green
+  git apply experiments/abort-verify-no-disconnect.patch && run_abort nodisconnect
+  git checkout -q -- ringline/src
+  git apply experiments/abort-verify-cancel-linger.patch && run_abort linger
+  git checkout -q -- ringline/src
+
+  cargo test --locked -p ringline > /tmp/job/full.out 2>&1
+  echo "full_rc=$?" | tee -a /tmp/job/rc.txt
+  grep -E "^test result|FAILED|panicked" /tmp/job/full.out | sort | uniq -c | sort -rn | head -20
+  cargo fmt --all --check; echo "gate_fmt=$?" | tee -a /tmp/job/rc.txt
+  cargo clippy --locked -p ringline --all-targets -- -D warnings > /tmp/job/clippy.out 2>&1; echo "gate_clippy=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/clippy.out
+  RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps -p ringline > /tmp/job/doc.out 2>&1; echo "gate_doc=$?" | tee -a /tmp/job/rc.txt
+  tail -20 /tmp/job/doc.out
+
+  fail=0
+  [ "$backend" = "io_uring" ] || { echo "FAIL backend $backend"; fail=1; }
+  grep -q "^green_rc=0" /tmp/job/rc.txt || { echo "FAIL green"; fail=1; }
+  grep -q "abort: enomem=0" /tmp/job/green.out || { echo "FAIL green: no zero-copy send was held"; fail=1; }
+  # A mutation counts as red only if the test under check failed, not if the
+  # patched tree failed to build.
+  grep -qE "^    abort_releases_a_stalled_connection_at_once$" /tmp/job/nodisconnect.out || { echo "FAIL nodisconnect: the test did not fail without the disconnect"; fail=1; }
+  if [ "{linger_expect}" = "fail" ]; then
+    grep -qE "^    abort_releases_a_stalled_connection_at_once$" /tmp/job/linger.out || { echo "FAIL linger: the test did not fail on a kernel where it should"; fail=1; }
+  else
+    grep -q "^linger_rc=0" /tmp/job/rc.txt || { echo "FAIL linger: failed on a kernel where it should pass"; fail=1; }
+  fi
+  for gate in full_rc gate_fmt gate_clippy gate_doc; do
+    grep -q "^$gate=0" /tmp/job/rc.txt && echo "ok   $gate" || { echo "FAIL $gate"; fail=1; }
+  done
+  echo "verdict_fail=$fail"
+  echo $fail > /tmp/job/status
+} 2>&1 | tee /tmp/job/run.log
+exit "$(cat /tmp/job/status)"
+'''

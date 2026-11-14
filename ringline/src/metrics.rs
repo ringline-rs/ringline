@@ -419,14 +419,14 @@ pub mod recv_arrival {
 /// Slot indices for per-`OpTag` completion counters: the slot *is* the
 /// discriminant.
 pub mod cqe_tag {
-    /// One past the largest `OpTag` discriminant (`HangupPeek = 38`).
+    /// One past the largest `OpTag` discriminant (`Disconnect = 39`).
     ///
     /// Deliberately not derived from the enum: `ShardedCounterGroup::new` needs
     /// a const, and there is no const way to ask an enum for its maximum
     /// discriminant. `count_covers_every_tag` in the tests below fails if a new
     /// tag is added above this, which is the case that would otherwise drop
     /// completions silently.
-    pub const COUNT: usize = 39;
+    pub const COUNT: usize = 40;
 }
 
 /// Counter slot indices for pool exhaustion metrics.
@@ -459,7 +459,8 @@ pub mod pool {
     /// send pool had no slot for the alert when the close was requested and
     /// still had none once the connection's own sends had drained, or the
     /// close_notify deadline forced the close first. The peer reads the
-    /// stream as truncated (`eof_truncated`). The alert needs one slot. A
+    /// stream as truncated (`eof_truncated`). `abort` also counts a retained
+    /// alert it drops; that peer reads a reset. The alert needs one slot. A
     /// sustained count means the pool was full at the close drain;
     /// `ConfigBuilder::send_pool` sets its size.
     pub const CLOSE_NOTIFY_DROPPED: usize = 6;
@@ -876,7 +877,7 @@ mod cqe_tag_tests {
             cqe_tag::COUNT
         );
         // Guard against the walk finding nothing and passing vacuously.
-        assert!(found >= 26, "expected the full tag set, found {found}");
+        assert!(found >= 27, "expected the full tag set, found {found}");
     }
 
     /// The array is indexed by discriminant, which leaves gaps. Assert exactly

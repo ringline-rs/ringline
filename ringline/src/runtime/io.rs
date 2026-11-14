@@ -683,8 +683,8 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// last half or calls `close`, or on an error (`docs/half-close-design.md`).
 /// After the FIN the runtime arms no receive for the socket, so a reset that
 /// arrives then is reported by the next send. Sends made once the Close is
-/// submitted
-/// (after queued sends drain) fail with `NotConnected`.
+/// submitted (after queued sends drain) fail with `NotConnected`, and sends
+/// made after [`SendHalf::abort`] with `ConnectionAborted`.
 ///
 /// A TLS connection receives ciphertext directly too, up to
 /// `recv_direct_region` bytes per receive. With the default engine the
@@ -1588,6 +1588,33 @@ impl ConnCtx {
         driver.close_connection_graceful(self.conn_index);
         #[cfg(not(has_io_uring))]
         driver.close_connection(self.conn_index);
+    }
+
+    /// See [`SendHalf::abort`]. The reader and the sends the executor holds
+    /// (waiting for capacity, or in flight) fail here; the driver fails the
+    /// sends it has queued and closes the connection.
+    pub(crate) fn abort(&self) {
+        try_with_state(|driver, executor| {
+            let idx = self.conn_index as usize;
+            let Some(cs) = driver.connections.get_mut(self.conn_index) else {
+                return;
+            };
+            if cs.generation != self.generation {
+                return;
+            }
+            let state = &driver.send_queues[idx];
+            if state.aborted || state.close_submitted {
+                return;
+            }
+            cs.read = crate::connection::ReadHalf::Error;
+            executor.fail_recv(
+                self.conn_index,
+                self.generation,
+                crate::handler::aborted_error(),
+            );
+            executor.abort_sends(self.conn_index, self.generation);
+            driver.abort(self.conn_index);
+        });
     }
 
     /// See [`Connection::listener`].
@@ -2960,6 +2987,11 @@ impl Connection {
         self.tx.close();
     }
 
+    /// See [`SendHalf::abort`].
+    pub fn abort(&mut self) {
+        self.tx.abort();
+    }
+
     /// Offer this connection for rebalancing onto a less loaded worker
     /// (#443), carrying `state` across.
     ///
@@ -3217,7 +3249,8 @@ impl SendHalf {
     /// # Errors
     ///
     /// `NotConnected` if this handle is stale (its connection closed and
-    /// the slot may hold another). On io_uring also `NotConnected` once the
+    /// the slot may hold another). `ConnectionAborted` after
+    /// [`abort`](Self::abort). On io_uring also `NotConnected` once the
     /// connection's Close has been submitted and, on a TLS connection, once
     /// its close_notify has been queued; on mio a send made after `close` is
     /// queued and flushed or discarded with the connection. On io_uring,
@@ -3346,6 +3379,49 @@ impl SendHalf {
     /// ```
     pub fn send_admitted<'a>(&mut self, data: &'a [u8]) -> Admission<'a> {
         self.conn.send_admitted(data)
+    }
+
+    /// Close this connection now, without draining its sends: for a peer
+    /// that has stopped reading, where [`close`](Self::close) would wait
+    /// for it.
+    ///
+    /// Every send on the connection that has not resolved fails with
+    /// [`ConnectionAborted`](io::ErrorKind::ConnectionAborted), whatever the
+    /// kernel reports for it: queued sends, sends waiting for send-pool
+    /// capacity, and sends in flight. A send started afterwards fails the same
+    /// way until the connection is released; after that `send` fails with
+    /// `NotConnected` and a bounded send with `ConnectionAborted`, as on any
+    /// released connection. A read parked on the connection ends:
+    /// [`with_data`](Connection::with_data) resolves to 0, and
+    /// [`with_data_result`](Connection::with_data_result) to
+    /// `ConnectionAborted`, which replaces a receive error not yet taken. The
+    /// sends' send-pool slots and zero-copy buffers are released without
+    /// waiting for the peer: those of queued sends at once, and those of a
+    /// send the kernel holds when its completion or notification arrives
+    /// after the reset. No close_notify is sent.
+    ///
+    /// On a TCP connection the peer reads `ECONNRESET` on Linux. On macOS
+    /// loopback, a peer that only reads may not see the reset until it sends.
+    /// On io_uring the socket is disconnected (an `IORING_OP_CONNECT` to
+    /// `AF_UNSPEC`, which resets it and discards its queued data) ahead of the
+    /// `Close`, so the kernel returns the zero-copy buffers of its sends even
+    /// while other connections' requests keep the socket from being released.
+    /// On mio the socket is closed with `SO_LINGER {1, 0}`. On io_uring a
+    /// Unix-domain connection is closed with its queued sends dropped; the peer
+    /// reads end of file, or `ECONNRESET` if this end had unread data.
+    ///
+    /// It also applies to a connection that is already closing, for example
+    /// one whose [`close`](Self::close) waits for a peer that stopped
+    /// reading. On io_uring it does nothing once the connection's `Close` is
+    /// committed: submitted, or queued for retry when the submission queue is
+    /// full. A zero-copy send whose data the kernel had already taken then
+    /// keeps its buffer until the peer acknowledges the data or the kernel
+    /// gives up on the socket. On mio it applies until the connection is
+    /// released. As for `close`, it does nothing if the connection has been
+    /// released, or when called outside the worker's executor, and the
+    /// connection's task is dropped when the close completes.
+    pub fn abort(&mut self) {
+        self.conn.abort();
     }
 
     /// Close this connection.
@@ -4009,9 +4085,10 @@ enum AdmissionState {
 /// The refusals of [`BackpressuredSend`] that come before submission:
 /// `InvalidInput` for a message that can never fit the pool, `BrokenPipe`
 /// for a write half that is shut down, `ConnectionAborted` for a connection
-/// that closed while waiting, `NotConnected`, on io_uring, for a TLS
-/// connection whose close_notify is queued or whose close was committed
-/// while waiting, and anything the submission itself reports. Errors after
+/// that was aborted ([`SendHalf::abort`]) or closed while waiting,
+/// `NotConnected`, on io_uring, for a TLS connection whose close_notify is
+/// queued and for any connection whose close was committed before or while it
+/// waited, and anything the submission itself reports. Errors after
 /// submission come from the [`SendCompletion`].
 ///
 /// `!Send`: its connection index and its place in the admission FIFO belong
@@ -4080,6 +4157,13 @@ impl Future for Admission<'_> {
                             io::ErrorKind::ConnectionAborted,
                             "connection closed",
                         )));
+                    }
+                    // After `abort`, or once the Close is committed, the
+                    // refusal every send gets; ahead of the write-half and
+                    // close_notify checks, which an abort can leave set.
+                    if let Some(e) = driver.send_queues[this.conn_index as usize].closing_refusal()
+                    {
+                        return this.finish(Err(e));
                     }
                     // Waiting for capacity in order to write to a half-closed
                     // socket is never useful, and a doomed entry at the head
@@ -4274,17 +4358,18 @@ enum BackpressuredState<'a> {
 /// - [`BrokenPipe`](io::ErrorKind::BrokenPipe) — the write half is shut down,
 ///   or was shut down while this send was waiting.
 /// - [`ConnectionAborted`](io::ErrorKind::ConnectionAborted) — the connection
-///   closed while waiting or in flight.
+///   was aborted ([`SendHalf::abort`]), or closed while waiting or in flight.
 /// - [`NotConnected`](io::ErrorKind::NotConnected) — on io_uring, the
 ///   connection is TLS and its close_notify is already queued (`close()`, a
 ///   handler return or a fatal encrypt error); or the connection's close was
-///   *committed* while this send waited for capacity. A waiter in the admission
-///   FIFO is neither in flight nor in the per-connection send queue, so it does
-///   not hold off `try_finalize_close`; if the close is finalized while it
-///   waits, winning capacity finds the Close already submitted and the send is
-///   refused rather than written. Which of this and `ConnectionAborted` you see
-///   is a race between the capacity wake and teardown — treat both as "the
-///   connection went away", and expect either on a peer that closed.
+///   committed before or while this send waited for capacity. A waiter in the
+///   admission FIFO is neither in flight nor in the per-connection send queue,
+///   so it does not hold off `try_finalize_close`; if the close is finalized
+///   while it waits, winning capacity finds the Close already submitted and
+///   the send is refused rather than written. Which of this and
+///   `ConnectionAborted` you see is a race between the capacity wake and
+///   teardown — treat both as "the connection went away", and expect either
+///   on a peer that closed.
 /// - Anything the underlying send reports, including `BrokenPipe` (`EPIPE`) from
 ///   the socket itself when the peer has reset.
 ///

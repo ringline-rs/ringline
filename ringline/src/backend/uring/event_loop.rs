@@ -5,7 +5,7 @@ use std::task::Context;
 use std::time::Instant;
 
 use crate::backend::uring::abi::cqueue;
-use crate::handler::SendPoll;
+use crate::handler::{Disconnect, SendPoll};
 
 use crate::backend::Driver;
 use crate::backend::sockaddr_to_socket_addr;
@@ -590,6 +590,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_send_retries();
             self.drain_close_retries();
             self.drain_shutdown_retries();
+            self.drain_disconnect_retries();
             self.drain_send_pollout_retries();
             self.retry_recv_arms();
             self.driver.ring.retry_disk_pushes();
@@ -1855,6 +1856,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // before the Close CQE, and take each handler's
             // `close_submitted` or closing-connection path.
             OpTag::CloseCancel => {}
+            OpTag::Disconnect => self.handle_disconnect(ud),
             OpTag::EventFdRead => self.handle_eventfd_read(),
             OpTag::TlsSend => self.handle_tls_send(ud, result),
             OpTag::Connect => self.handle_connect(ud, result),
@@ -2812,6 +2814,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         self.driver.send_queues[idx].shutdown_inflight = false;
         self.driver.defer_finalize_close(conn_index);
+    }
+
+    /// `abort`'s disconnect has completed. Its result is ignored, as a close
+    /// lead's is: the `Close` runs whatever the disconnect returned. A lone
+    /// one (`Disconnect::Alone`) held the `Close`, which frees the slot it
+    /// names, so this releases the hold and registers the connection for the
+    /// end-of-iteration drain, as `handle_shutdown` does. One chained ahead
+    /// of a `Close` changes nothing here, and neither does one whose slot has
+    /// been released (its generation changed).
+    fn handle_disconnect(&mut self, ud: UserData) {
+        let conn_index = ud.conn_index();
+        let idx = conn_index as usize;
+        if idx >= self.driver.send_queues.len()
+            || self.driver.connections.generation(conn_index) != ud.payload()
+        {
+            return;
+        }
+        let state = &mut self.driver.send_queues[idx];
+        if state.disconnect == Disconnect::Alone {
+            state.disconnect = Disconnect::None;
+            self.driver.defer_finalize_close(conn_index);
+        }
     }
 
     fn handle_eventfd_read(&mut self) {
@@ -4973,6 +4997,36 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 self.driver
                     .pending_shutdown_retries
+                    .push((conn_index, generation));
+            }
+        }
+    }
+
+    /// Push `abort`'s lone disconnects the ring refused. The connection's
+    /// `disconnect` reads `Disconnect::Alone`, so its `Close` waits for the
+    /// completion. An entry whose slot has been released (its generation
+    /// changed) is dropped: `reset_send_state` clears the hold at
+    /// reactivation. Same backoff as `drain_close_retries`: every 4th tick.
+    fn drain_disconnect_retries(&mut self) {
+        if self.driver.pending_disconnect_retries.is_empty() {
+            return;
+        }
+        if !self.driver.tick_count.is_multiple_of(4) {
+            return;
+        }
+        let retries = std::mem::take(&mut self.driver.pending_disconnect_retries);
+        for (conn_index, generation) in retries {
+            if self.driver.connections.generation(conn_index) != generation {
+                continue;
+            }
+            if self
+                .driver
+                .ring
+                .submit_disconnect(conn_index, generation)
+                .is_err()
+            {
+                self.driver
+                    .pending_disconnect_retries
                     .push((conn_index, generation));
             }
         }
@@ -17360,6 +17414,298 @@ mod tests {
             8,
             "the abandoned entry's slot came back"
         );
+    }
+
+    /// `abort` through its entry point, with the driver state installed as
+    /// the event loop installs it around a task poll.
+    fn abort(el: &mut AsyncEventLoop<NoopHandler>, conn_index: u32) {
+        let generation = el.driver.connections.generation(conn_index);
+        with_driver_state(el, || ConnCtx::new(conn_index, generation).abort());
+    }
+
+    fn assert_aborted(result: Option<io::Result<u32>>) {
+        let err = result
+            .expect("the send has a result")
+            .expect_err("the send failed");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(err.to_string(), "connection aborted");
+    }
+
+    /// On a TCP connection `abort` commits the `Close` at once, behind the
+    /// disconnect, fails the queued send and returns its pool slot. The
+    /// chained disconnect's completion and a second `abort` change nothing.
+    #[test]
+    fn abort_commits_the_close_behind_a_disconnect() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let id = admit_bounded_send(&mut el, token, b"queued", 1);
+        assert_eq!(el.driver.send_copy_pool.free_count(), 7);
+
+        abort(&mut el, conn_index);
+
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.aborted && state.close_submitted && !state.close_pending);
+        assert_eq!(state.disconnect, Disconnect::None, "the chain was pushed");
+        assert_eq!(el.driver.ring.pushed_closes, vec![(conn_index, true)]);
+        assert!(
+            el.driver
+                .connections
+                .get(conn_index)
+                .expect("the slot is held until the Close CQE")
+                .close_requested()
+        );
+        el.drain_settled_sends();
+        assert_aborted(el.executor.take_send_result(id));
+        assert_eq!(el.driver.send_copy_pool.free_count(), 8);
+
+        let disconnect = UserData::encode(OpTag::Disconnect, conn_index, generation);
+        el.test_dispatch_cqe(disconnect.raw(), 0, 0);
+        assert!(el.driver.pending_finalize_closes.is_empty());
+        abort(&mut el, conn_index);
+        assert_eq!(el.driver.ring.pushed_closes.len(), 1, "one Close");
+    }
+
+    /// While a `Shutdown` from `shutdown_write` is in the kernel, `abort`
+    /// pushes the disconnect alone, and the `Close` is committed only once
+    /// both completions have landed, in either order. A send made meanwhile
+    /// is refused with `ConnectionAborted`, though the Close is not yet
+    /// committed.
+    #[test]
+    fn abort_during_a_write_shutdown_closes_after_the_disconnect() {
+        for disconnect_first in [false, true] {
+            let mut el = make_test_loop();
+            let conn_index = accept_connection(&mut el);
+            let generation = el.driver.connections.generation(conn_index);
+            el.driver.send_queues[conn_index as usize].shutdown_inflight = true;
+
+            abort(&mut el, conn_index);
+
+            let state = &el.driver.send_queues[conn_index as usize];
+            assert!(state.close_pending && !state.close_submitted);
+            assert_eq!(state.disconnect, Disconnect::Alone);
+            assert_eq!(el.driver.ring.pushed_lone_disconnects, vec![conn_index]);
+            {
+                let mut ctx = el.driver.make_ctx();
+                let token = crate::handler::ConnId::new(conn_index, generation);
+                let err = ctx.send(token, b"late").expect_err("refused");
+                assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+            }
+
+            let shutdown = UserData::encode(OpTag::Shutdown, conn_index, generation).raw();
+            let disconnect = UserData::encode(OpTag::Disconnect, conn_index, generation).raw();
+            let (first, second) = if disconnect_first {
+                (disconnect, shutdown)
+            } else {
+                (shutdown, disconnect)
+            };
+            el.test_dispatch_cqe(first, 0, 0);
+            el.finalize_pending_closes();
+            assert!(
+                el.driver.ring.pushed_closes.is_empty(),
+                "the Close waits for both (disconnect first: {disconnect_first})"
+            );
+            el.test_dispatch_cqe(second, 0, 0);
+            el.finalize_pending_closes();
+            assert_eq!(el.driver.ring.pushed_closes, vec![(conn_index, false)]);
+            assert!(el.driver.send_queues[conn_index as usize].close_submitted);
+        }
+    }
+
+    /// A chain the ring refuses is committed all the same, and the retry
+    /// pushes the whole chain, disconnect included.
+    #[test]
+    fn a_refused_abort_chain_is_retried_as_a_chain() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.ring.force_chain_push_failures(1);
+
+        abort(&mut el, conn_index);
+
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(state.close_submitted);
+        assert_eq!(state.disconnect, Disconnect::WithClose);
+        assert!(el.driver.ring.pushed_closes.is_empty());
+        assert_eq!(el.driver.pending_close_retries, vec![(conn_index, 0)]);
+
+        el.driver.tick_count = 4;
+        el.drain_close_retries();
+        assert!(el.driver.pending_close_retries.is_empty());
+        assert_eq!(el.driver.ring.pushed_closes, vec![(conn_index, true)]);
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].disconnect,
+            Disconnect::None
+        );
+    }
+
+    /// A lone disconnect the ring refuses is retried, and holds the `Close`
+    /// meanwhile.
+    #[test]
+    fn a_refused_lone_disconnect_is_retried() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        el.driver.send_queues[conn_index as usize].shutdown_inflight = true;
+        el.driver.ring.force_push_failures(1);
+
+        abort(&mut el, conn_index);
+
+        assert!(el.driver.ring.pushed_lone_disconnects.is_empty());
+        assert_eq!(
+            el.driver.pending_disconnect_retries,
+            vec![(conn_index, generation)]
+        );
+        let shutdown = UserData::encode(OpTag::Shutdown, conn_index, generation);
+        el.test_dispatch_cqe(shutdown.raw(), 0, 0);
+        el.finalize_pending_closes();
+        assert!(el.driver.ring.pushed_closes.is_empty(), "the hold stays");
+
+        el.driver.tick_count = 4;
+        el.drain_disconnect_retries();
+        assert!(el.driver.pending_disconnect_retries.is_empty());
+        assert_eq!(el.driver.ring.pushed_lone_disconnects, vec![conn_index]);
+    }
+
+    /// Once the `Close` is committed, `abort` does nothing.
+    #[test]
+    fn abort_after_a_committed_close_does_nothing() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.close_connection(conn_index);
+        el.finalize_pending_closes();
+        assert_eq!(el.driver.ring.pushed_closes, vec![(conn_index, false)]);
+
+        abort(&mut el, conn_index);
+
+        assert!(!el.driver.send_queues[conn_index as usize].aborted);
+        assert_eq!(el.driver.ring.pushed_closes.len(), 1);
+        let generation = el.driver.connections.generation(conn_index);
+        assert!(
+            el.executor
+                .take_recv_error(conn_index, generation)
+                .is_none(),
+            "the reader was not failed"
+        );
+    }
+
+    /// `abort` after a `close()` that waits for a stuck send: the close's
+    /// drain is abandoned and the `Close` goes behind the disconnect.
+    #[test]
+    fn abort_after_close_ends_the_drain() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        el.driver.send_queues[conn_index as usize].in_flight = true;
+        let id = admit_bounded_send(&mut el, token, b"stuck", 1);
+        el.driver.close_connection(conn_index);
+        el.finalize_pending_closes();
+        assert!(el.driver.ring.pushed_closes.is_empty(), "the drain waits");
+
+        abort(&mut el, conn_index);
+
+        assert_eq!(el.driver.ring.pushed_closes, vec![(conn_index, true)]);
+        el.drain_settled_sends();
+        assert_aborted(el.executor.take_send_result(id));
+        assert_eq!(el.driver.send_copy_pool.free_count(), 8);
+    }
+
+    /// The reader and a send waiting for capacity fail with
+    /// `ConnectionAborted`, and so does a send made after the abort.
+    #[test]
+    fn abort_fails_the_reader_and_a_waiting_send() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let task_id = parked_standalone(&mut el.executor);
+        // More than the pool holds, so it waits.
+        let waiting = el
+            .executor
+            .enqueue_send_capacity(conn_index, generation, 9, task_id);
+
+        abort(&mut el, conn_index);
+
+        assert_aborted(el.executor.take_send_result(waiting));
+        let err = el
+            .executor
+            .take_recv_error(conn_index, generation)
+            .expect("the reader was failed");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(matches!(
+            el.driver.connections.get(conn_index).map(|c| c.read),
+            Some(ReadHalf::Error)
+        ));
+        let mut ctx = el.driver.make_ctx();
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        let err = ctx.send(token, b"late").expect_err("refused");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    /// A send in the kernel at the abort completes later, here with a full
+    /// count, and still reports `ConnectionAborted`; its completion returns
+    /// its pool slot.
+    #[test]
+    fn a_send_in_flight_at_the_abort_reports_connection_aborted() {
+        let mut el = bounded_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        let id = admit_bounded_send(&mut el, token, b"in flight", 1);
+        let send = el.driver.ring.last_pushed.expect("the send was pushed");
+        assert!(
+            matches!(send.op, crate::backend::uring::sqe::Op::Send { .. }),
+            "{:?}",
+            send.op
+        );
+
+        abort(&mut el, conn_index);
+        assert_eq!(el.driver.send_copy_pool.free_count(), 7, "in the kernel");
+
+        el.test_dispatch_cqe(send.user_data, 9, 0);
+        el.drain_settled_sends();
+        assert_aborted(el.executor.take_send_result(id));
+        assert_eq!(el.driver.send_copy_pool.free_count(), 8);
+    }
+
+    /// The slot's next occupant does not inherit the abort: its sends are
+    /// accepted and its close takes no disconnect.
+    #[test]
+    fn a_reused_slot_does_not_inherit_the_abort() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver.send_queues[conn_index as usize].shutdown_inflight = true;
+        abort(&mut el, conn_index);
+        assert_eq!(
+            el.driver.send_queues[conn_index as usize].disconnect,
+            Disconnect::Alone
+        );
+
+        el.driver.reset_send_state(conn_index);
+
+        let state = &el.driver.send_queues[conn_index as usize];
+        assert!(!state.aborted);
+        assert_eq!(state.disconnect, Disconnect::None);
+        assert!(state.closing_refusal().is_none());
+    }
+
+    /// A Unix-domain connection is closed with its normal lead and no
+    /// disconnect.
+    #[test]
+    fn abort_on_a_unix_connection_closes_without_a_disconnect() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        el.driver
+            .connections
+            .get_mut(conn_index)
+            .expect("held")
+            .peer_addr = Some(crate::connection::PeerAddr::Unix(std::path::PathBuf::new()));
+
+        abort(&mut el, conn_index);
+
+        assert_eq!(el.driver.ring.pushed_closes, vec![(conn_index, false)]);
+        assert!(el.driver.send_queues[conn_index as usize].aborted);
     }
 
     /// A forced close that `try_finalize_close` cannot commit, because a

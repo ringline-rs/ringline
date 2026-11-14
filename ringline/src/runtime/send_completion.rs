@@ -14,11 +14,12 @@
 //! connection and, when a connection task owns it, under that task; waiting
 //! bounded sends are listed in arrival order. `register`, `set_owner`,
 //! `complete`, `take_result`, `mark_submitted` and `cancel` are index
-//! lookups; `remove_connection` and `fail_waiting` visit the entries listed
-//! under their connection. An entry that leaves the waiting state leaves its
-//! id in the waiting list, and the reads of the head pop the ids at the front
-//! that no longer name a waiting entry, so each id is pushed once and leaves
-//! once, popped at the front or dropped by `compact`. Design:
+//! lookups; `remove_connection`, `fail_waiting` and `abort_connection`
+//! visit the entries listed under their connection. An entry that leaves the
+//! waiting state leaves its id in the waiting list, and the reads of the head
+//! pop the ids at the front that no longer name a waiting entry, so each id is
+//! pushed once and leaves once, popped at the front or dropped by `compact`.
+//! Design:
 //! `docs/send-completion-slots-design.md`, `docs/send-admission-design.md`
 //! (section 2).
 //!
@@ -758,6 +759,52 @@ impl SendCompletions {
         wakes
     }
 
+    /// `abort` on `conn_index`: every entry on it that is waiting for
+    /// admission (for `generation`) or in flight records
+    /// `Done(Err(ConnectionAborted))`, and its owner's task id is returned for
+    /// waking; if the FIFO head left, the new head's task id is appended.
+    ///
+    /// `Done`, not the provisional `Aborted`: the caller asked for these
+    /// sends to fail, so a driver result that arrives later is ignored, as
+    /// any second result is. An entry already `Done` keeps its result, an
+    /// `Aborted` one is a torn-down earlier occupant's, and an `Abandoned`
+    /// one has no future. An entry in flight on `conn_index` belongs to the
+    /// current occupant: `remove_connection` aborts every one at the slot's
+    /// release.
+    ///
+    /// Allocates the returned `Vec` and one boxed error per failed entry.
+    pub(crate) fn abort_connection(&mut self, conn_index: u32, generation: u32) -> Vec<u32> {
+        let mut wakes = Vec::new();
+        let old_head = self.front();
+        let candidates: Vec<u32> = self
+            .by_conn
+            .get(conn_index as usize)
+            .cloned()
+            .unwrap_or_default();
+        for index in candidates {
+            let Some(e) = self.slots[index as usize].entry.as_mut() else {
+                continue;
+            };
+            if e.conn_index != conn_index {
+                continue;
+            }
+            let was_waiting = match e.state {
+                Completion::Waiting { generation: g, .. } if g == generation => true,
+                Completion::InFlight => false,
+                _ => continue,
+            };
+            e.state = Completion::Done(Err(crate::handler::aborted_error()));
+            if e.task_id != NO_OWNER {
+                wakes.push(e.task_id);
+            }
+            if was_waiting {
+                self.left_waiting();
+            }
+        }
+        self.wake_new_head(old_head, &mut wakes);
+        wakes
+    }
+
     #[cfg(test)]
     fn waiting_len(&self) -> usize {
         self.waiting_live
@@ -872,6 +919,17 @@ impl Executor {
                 self.send_capacity_wakes += 1;
             }
             let _ = self.wake_task(head);
+        }
+    }
+
+    /// [`SendCompletions::abort_connection`] plus a wake of every returned
+    /// task. `ConnCtx::abort`.
+    pub(crate) fn abort_sends(&mut self, conn_index: u32, generation: u32) {
+        for task_id in self
+            .send_completions
+            .abort_connection(conn_index, generation)
+        {
+            let _ = self.wake_task(task_id);
         }
     }
 
@@ -1178,6 +1236,56 @@ mod tests {
         assert!(q.turn(other_gen, 1), "other generation is now the head");
         assert_eq!(q.cancel(other_gen), Some(task(4)));
         assert!(q.turn(other_conn, 1));
+    }
+
+    /// `abort_connection` fails the connection's waiting entries of its
+    /// generation and its in-flight ones with `ConnectionAborted`, and a
+    /// driver result that arrives afterwards does not replace that. A
+    /// resolved entry, another generation's waiter and another connection's
+    /// entries keep their state.
+    #[test]
+    fn abort_connection_fails_waiting_and_in_flight_entries() {
+        let mut q = SendCompletions::new();
+        let in_flight = q.enqueue(1, 5, 1, task(1));
+        q.mark_submitted(in_flight);
+        let done = q.enqueue(1, 5, 1, task(2));
+        q.mark_submitted(done);
+        q.complete(done, Ok(4));
+        let waiting = q.enqueue(1, 5, 1, task(3));
+        let other_gen = q.enqueue(1, 6, 1, task(4));
+        let other_conn = q.enqueue(2, 5, 1, task(5));
+        let other_conn_in_flight = q.enqueue(2, 5, 1, task(6));
+        q.mark_submitted(other_conn_in_flight);
+
+        let wakes = q.abort_connection(1, 5);
+
+        assert_eq!(
+            wakes,
+            vec![task(1), task(3), task(4)],
+            "the failed owners, then the promoted head"
+        );
+        assert_eq!(
+            q.complete(in_flight, Ok(9)),
+            None,
+            "a driver result after the abort is ignored"
+        );
+        let err = q.take_result(in_flight).unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(err.to_string(), "connection aborted");
+        assert_eq!(
+            kind_of(q.take_result(waiting)),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(q.take_result(done).unwrap().unwrap(), 4, "resolved before");
+        assert!(
+            q.take_result(other_gen).is_none(),
+            "another generation waits"
+        );
+        assert!(q.turn(other_gen, 1), "and is now the head");
+        assert_eq!(q.cancel(other_gen), Some(task(5)));
+        assert!(q.take_result(other_conn).is_none());
+        assert!(q.take_result(other_conn_in_flight).is_none());
+        assert_eq!(q.waiting_len(), 1, "only the other connection's waiter");
     }
 
     /// `withdraw` frees an entry no submission took, and leaves alone one
