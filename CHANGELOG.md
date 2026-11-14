@@ -341,6 +341,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `fs::fsync` and `direct_io_fsync` wait for every write submitted before
+  them through the same handle (#905). Before, an fsync submitted while a
+  write to the file was still in flight ran alongside it and could complete
+  first, so `write_from`, `fsync` submitted without awaiting the write might
+  not make the write durable. The fsync is now held in ringline until those
+  writes complete, successfully or not, and then submitted, on both
+  backends; it is not linked to them, so a failed write cancels nothing. A
+  write submitted after an fsync does not wait for it, and reads and writes
+  stay unordered with respect to each other.
 - **Breaking:** the raw-pointer disk reads and writes are replaced by
   owned-buffer ones (#825). A raw-pointer operation kept using its memory
   after its future was dropped, as a `select` loser, at a `timeout` or with

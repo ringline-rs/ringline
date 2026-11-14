@@ -381,6 +381,8 @@ pub(crate) struct DriverCtx<'a> {
     /// per iteration rather than once per released slot.
     pub(crate) capacity_released: &'a mut bool,
     pub(crate) next_disk_io_seq: &'a mut u16,
+    /// See `Driver::write_orders`.
+    pub(crate) write_orders: &'a mut crate::disk_order::WriteOrders<(u32, u64)>,
     /// Set when `finish` on a TLS chain gave the chain's id to
     /// `attach_send_id`: on its last ciphertext send, or settled at once if the
     /// plaintext was empty. `SendHalf::send_chain` reads it to return a pending
@@ -2002,6 +2004,14 @@ impl<'a> DriverCtx<'a> {
                 {
                     f.in_flight += 1;
                 }
+                self.write_orders.begin_write(
+                    crate::disk_order::OrderKey {
+                        subsystem: crate::disk_order::Subsystem::DirectIo,
+                        index: file.index,
+                        generation: file.generation,
+                    },
+                    key,
+                );
                 Ok(key)
             }
             Err(e) => {
@@ -2051,7 +2061,18 @@ impl<'a> DriverCtx<'a> {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
-        match self.ring.submit_direct_fsync(fd_index, ud) {
+        // Held until the writes submitted before it on the file complete
+        // (#905); counted in flight either way, so a close waits for it.
+        let order = crate::disk_order::OrderKey {
+            subsystem: crate::disk_order::Subsystem::DirectIo,
+            index: file.index,
+            generation: file.generation,
+        };
+        let pushed = match self.write_orders.sync(order, (fd_index, ud.raw())) {
+            Some(_) => self.ring.submit_direct_fsync(fd_index, ud),
+            None => Ok(()),
+        };
+        match pushed {
             Ok(()) => {
                 if let Some(files) = self.direct_io_files.as_mut()
                     && let Some(f) = files.get_mut(file.index)
@@ -2330,6 +2351,14 @@ impl<'a> DriverCtx<'a> {
                 {
                     f.in_flight += 1;
                 }
+                self.write_orders.begin_write(
+                    crate::disk_order::OrderKey {
+                        subsystem: crate::disk_order::Subsystem::Fs,
+                        index: file.index,
+                        generation: file.generation,
+                    },
+                    key,
+                );
                 Ok(key)
             }
             Err(e) => {
@@ -2376,7 +2405,18 @@ impl<'a> DriverCtx<'a> {
             slab.set_user_data(slab_idx, ud.raw());
         }
 
-        match self.ring.submit_direct_fsync(fd_index, ud) {
+        // Held until the writes submitted before it on the file complete
+        // (#905); counted in flight either way, so a close waits for it.
+        let order = crate::disk_order::OrderKey {
+            subsystem: crate::disk_order::Subsystem::Fs,
+            index: file.index,
+            generation: file.generation,
+        };
+        let pushed = match self.write_orders.sync(order, (fd_index, ud.raw())) {
+            Some(_) => self.ring.submit_direct_fsync(fd_index, ud),
+            None => Ok(()),
+        };
+        match pushed {
             Ok(()) => {
                 if let Some(files) = self.fs_files.as_mut()
                     && let Some(f) = files.get_mut(file.index)
@@ -2759,6 +2799,9 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) disk_io_limits: [Option<u16>; 2],
     /// See `Driver::disk_io_borrowing`.
     pub(crate) disk_io_borrowing: &'a mut std::collections::HashSet<u32>,
+    /// See `Driver::write_orders`.
+    pub(crate) write_orders:
+        &'a mut crate::disk_order::WriteOrders<crate::disk_io_pool::HeldRequest>,
     /// Direct I/O file table.
     pub(crate) direct_io_files: &'a mut Option<crate::direct_io::DirectIoFileTable>,
     /// Direct I/O fds, indexed by file slot.
@@ -3317,6 +3360,20 @@ impl<'a> DriverCtx<'a> {
         work: Box<dyn FnOnce() -> crate::disk_io_pool::DiskIoResult + Send>,
         borrows: bool,
     ) -> io::Result<u32> {
+        self.submit_disk_io_ordered(subsystem, work, borrows, None)
+    }
+
+    /// [`submit_disk_io`](Self::submit_disk_io) for a write or an fsync on
+    /// a file. A write is recorded in `write_orders`; an fsync is held there,
+    /// not sent, until the writes submitted before it on the file complete
+    /// (#905). A held fsync has its key and counts against the bound.
+    fn submit_disk_io_ordered(
+        &mut self,
+        subsystem: crate::disk_io_pool::PoolSubsystem,
+        work: Box<dyn FnOnce() -> crate::disk_io_pool::DiskIoResult + Send>,
+        borrows: bool,
+        order: Option<DiskOrder>,
+    ) -> io::Result<u32> {
         // An unconfigured subsystem fails first, with io_uring's error, even
         // when this worker has no pool. A missing pool with the subsystem
         // configured is unreachable through `ConfigBuilder`, which refuses it
@@ -3344,19 +3401,27 @@ impl<'a> DriverCtx<'a> {
             }
         };
 
-        pool.request_tx
-            .send(crate::disk_io_pool::DiskIoRequest {
-                work,
+        let to_send = match order {
+            Some(DiskOrder::Sync(file)) => self.write_orders.sync(file, (seq, work)),
+            _ => Some((seq, work)),
+        };
+        if let Some((seq, work)) = to_send {
+            crate::disk_io_pool::send_request(
+                pool,
+                tx,
+                self.wake_handle,
+                self.disk_io_wake_pending,
                 seq,
-                response_tx: tx.clone(),
-                wake_handle: self.wake_handle,
-                wake_pending: std::sync::Arc::clone(self.disk_io_wake_pending),
-            })
-            .map_err(|_| io::Error::other("disk I/O pool shut down"))?;
+                work,
+            )?;
+        }
         self.disk_io_in_flight.insert(seq, subsystem);
         self.disk_io_counts[subsystem as usize] += 1;
         if borrows {
             self.disk_io_borrowing.insert(seq);
+        }
+        if let Some(DiskOrder::Write(file)) = order {
+            self.write_orders.begin_write(file, seq);
         }
 
         Ok(seq)
@@ -3498,7 +3563,17 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::DirectIo, work, true)
+        let order = DiskOrder::Write(crate::disk_order::OrderKey {
+            subsystem: crate::disk_order::Subsystem::DirectIo,
+            index: file.index,
+            generation: file.generation,
+        });
+        self.submit_disk_io_ordered(
+            crate::disk_io_pool::PoolSubsystem::DirectIo,
+            work,
+            true,
+            Some(order),
+        )
     }
 
     /// Submit an fsync for a direct I/O file via the disk I/O pool.
@@ -3519,7 +3594,17 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::DirectIo, work, false)
+        let order = DiskOrder::Sync(crate::disk_order::OrderKey {
+            subsystem: crate::disk_order::Subsystem::DirectIo,
+            index: file.index,
+            generation: file.generation,
+        });
+        self.submit_disk_io_ordered(
+            crate::disk_io_pool::PoolSubsystem::DirectIo,
+            work,
+            false,
+            Some(order),
+        )
     }
 
     /// Close a direct I/O file and release its slot.
@@ -3694,7 +3779,17 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, true)
+        let order = DiskOrder::Write(crate::disk_order::OrderKey {
+            subsystem: crate::disk_order::Subsystem::Fs,
+            index: file.index,
+            generation: file.generation,
+        });
+        self.submit_disk_io_ordered(
+            crate::disk_io_pool::PoolSubsystem::Fs,
+            work,
+            true,
+            Some(order),
+        )
     }
 
     /// Submit an fsync for a filesystem file via the disk I/O pool.
@@ -3715,7 +3810,17 @@ impl<'a> DriverCtx<'a> {
                 opened: None,
             }
         });
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::Fs, work, false)
+        let order = DiskOrder::Sync(crate::disk_order::OrderKey {
+            subsystem: crate::disk_order::Subsystem::Fs,
+            index: file.index,
+            generation: file.generation,
+        });
+        self.submit_disk_io_ordered(
+            crate::disk_io_pool::PoolSubsystem::Fs,
+            work,
+            false,
+            Some(order),
+        )
     }
 
     /// Close a filesystem file and release its slot.
@@ -5068,4 +5173,12 @@ pub(crate) enum DiskIoKind {
     Fs = 0,
     DirectIo = 1,
     Nvme = 2,
+}
+
+/// How a mio pool submission is ordered on its file (#905).
+#[cfg(not(has_io_uring))]
+#[derive(Clone, Copy)]
+enum DiskOrder {
+    Write(crate::disk_order::OrderKey),
+    Sync(crate::disk_order::OrderKey),
 }

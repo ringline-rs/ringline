@@ -300,6 +300,11 @@ pub(crate) struct Driver {
     /// a buffer address: `fs::read_into`/`fs::write_from` and
     /// `direct_io_read`/`direct_io_write`. Worker exit waits for these.
     pub(crate) disk_io_borrowing: std::collections::HashSet<u32>,
+    /// The fs and direct I/O writes in the pool per file, and the fsyncs
+    /// held, with their keys and work, until the writes submitted before
+    /// them complete (#905). A held fsync is in `disk_io_in_flight`; at
+    /// worker exit it is dropped with the driver, unsent.
+    pub(crate) write_orders: crate::disk_order::WriteOrders<crate::disk_io_pool::HeldRequest>,
     /// Set by [`drain_disk_io_at_exit`](Self::drain_disk_io_at_exit) when an
     /// operation was still running at its bound. A pool thread can still use
     /// the operation's buffer, so the worker leaks its event loop (#856).
@@ -594,6 +599,7 @@ impl Driver {
                 config.direct_io.as_ref().map(|d| d.max_commands_in_flight),
             ],
             disk_io_borrowing: std::collections::HashSet::new(),
+            write_orders: crate::disk_order::WriteOrders::default(),
             disk_io_outstanding: false,
             direct_io_files: config
                 .direct_io
@@ -653,6 +659,7 @@ impl Driver {
             disk_io_counts: &mut self.disk_io_counts,
             disk_io_limits: self.disk_io_limits,
             disk_io_borrowing: &mut self.disk_io_borrowing,
+            write_orders: &mut self.write_orders,
             direct_io_files: &mut self.direct_io_files,
             direct_io_fds: &mut self.direct_io_fds,
             fs_files: &mut self.fs_files,

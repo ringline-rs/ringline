@@ -728,6 +728,10 @@ pub(crate) struct Driver {
     pub(crate) tls_out_scratch: Vec<crate::handler::BuiltSend>,
     /// Monotonic disk-I/O sequence (see DriverCtx::disk_io_key).
     pub(crate) next_disk_io_seq: u16,
+    /// The fs and direct I/O writes in flight per file, and the fsyncs held
+    /// until the writes submitted before them complete (#905): each held
+    /// fsync's fixed file index and user_data.
+    pub(crate) write_orders: crate::disk_order::WriteOrders<(u32, u64)>,
     /// Buffers of in-flight direct receives,
     /// indexed by the `RecvDirect` payload. An entry holds the accumulator
     /// buffer the kernel writes into and is removed only by that receive's
@@ -1264,6 +1268,7 @@ impl Driver {
             close_notify_armed: Vec::new(),
             tls_out_scratch: Vec::new(),
             next_disk_io_seq: 0,
+            write_orders: crate::disk_order::WriteOrders::default(),
             direct_recvs: Vec::new(),
             direct_recv_free: Vec::new(),
             hangup_peek_buf: Box::new([0]),
@@ -1417,6 +1422,7 @@ impl Driver {
             settled_sends: &mut self.settled_sends,
             capacity_released: &mut self.capacity_released,
             next_disk_io_seq: &mut self.next_disk_io_seq,
+            write_orders: &mut self.write_orders,
             tls_chain_carried: false,
         }
     }
@@ -3238,6 +3244,11 @@ impl Driver {
         // the device (direct I/O, NVMe), completes in its own time and the
         // loop below waits for it.
         let mut disk_cancels_to_retry: Vec<u64> = Vec::new();
+        // An fsync held behind earlier writes (#905) is in nothing a cancel
+        // reaches: complete it here, as a cancel would.
+        for (_, ud) in self.write_orders.drain_held() {
+            self.handle_shutdown_cqe(ud, -libc::ECANCELED, 0);
+        }
         #[cfg(test)]
         let keep_disk_commands = self.test_fault.as_ref().is_some_and(|f| {
             f.keep_disk_commands_at_exit

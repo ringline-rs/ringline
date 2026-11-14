@@ -519,6 +519,36 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         );
     }
 
+    /// Send an fsync the completed writes before it released (#905). If the
+    /// pool has shut down, complete it with `EIO`, so its future resolves.
+    fn send_released_fsync(
+        &mut self,
+        seq: u32,
+        work: Box<dyn FnOnce() -> crate::disk_io_pool::DiskIoResult + Send>,
+    ) {
+        let sent = match (
+            self.driver.disk_io_pool.as_ref(),
+            self.driver.disk_io_tx.as_ref(),
+        ) {
+            (Some(pool), Some(tx)) => crate::disk_io_pool::send_request(
+                pool,
+                tx,
+                self.driver.wake_handle,
+                &self.driver.disk_io_wake_pending,
+                seq,
+                work,
+            )
+            .is_ok(),
+            _ => false,
+        };
+        if !sent {
+            if let Some(subsystem) = self.driver.disk_io_in_flight.remove(&seq) {
+                self.driver.disk_io_counts[subsystem as usize] -= 1;
+            }
+            self.executor.wake_disk_io(seq, -libc::EIO);
+        }
+    }
+
     /// Drain all cross-thread channels: accept, resolve, spawn, blocking.
     ///
     /// Called unconditionally on every event loop iteration (not just on wake
@@ -678,6 +708,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         // Drain disk I/O responses.
+        let mut released = Vec::new();
         if let Some(ref rx) = self.driver.disk_io_rx {
             while let Ok(response) = rx.try_recv() {
                 // The operation is done: its key may be handed out again, and
@@ -686,6 +717,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     self.driver.disk_io_counts[subsystem as usize] -= 1;
                 }
                 self.driver.disk_io_borrowing.remove(&response.seq);
+                // A completed write releases the fsyncs held behind it
+                // (#905).
+                released.extend(self.driver.write_orders.end_write(response.seq));
                 // Handle fs_open completions: install fd or release slot.
                 if let Some(file_index) = self.driver.pending_fs_opens.remove(&response.seq) {
                     if self.executor.take_abandoned_open(response.seq) {
@@ -718,6 +752,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.executor
                     .wake_disk_io_with(response.seq, response.result, response.metadata);
             }
+        }
+        for (seq, work) in released {
+            self.send_released_fsync(seq, work);
         }
 
         // on_notify (synchronous). Set the executor's driver_state
@@ -2189,6 +2226,204 @@ mod tests {
             stat_seq, open_seq,
             "the key of an operation still in the pool was handed out again"
         );
+    }
+
+    /// Drain the disk-I/O channel until `key`'s result arrives, for at most
+    /// 5 s.
+    fn drain_until_result(el: &mut AsyncEventLoop<NoopHandler>, key: u32) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            el.drain_channels();
+            if let Some(result) = el.executor.take_disk_io_result(key) {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "no result for key {key}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// An fsync submitted while a write on the same file is in the pool is
+    /// held, not sent, and is sent once the write completes (#905). The
+    /// pool's one thread is held in the open of a FIFO, so the write waits
+    /// in the pool's queue.
+    #[test]
+    fn an_fsync_waits_in_the_worker_for_an_earlier_write() {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .disk_io_threads(1)
+            .build()
+            .expect("valid test config");
+        let (mut el, _wake) = test_loop(&config);
+        let dir =
+            std::env::temp_dir().join(format!("ringline-mio-fsync-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let path = dir.join("file");
+
+        let (index, generation, open_seq) = el
+            .driver
+            .make_ctx()
+            .fs_open(
+                &path,
+                crate::fs::OpenFlags::WRITE | crate::fs::OpenFlags::CREATE,
+                0o600,
+            )
+            .expect("submit open");
+        el.executor.wait_disk_io(open_seq, 0);
+        assert!(drain_until_result(&mut el, open_seq) >= 0, "open");
+        let file = crate::fs::File::new(index, generation);
+
+        static DATA: &[u8] = b"ordered";
+        let (write_seq, sync_seq) = {
+            let mut ctx = el.driver.make_ctx();
+            // Holds the pool's only thread until a writer opens the FIFO.
+            ctx.fs_open(&fifo, crate::fs::OpenFlags::READ, 0)
+                .expect("submit blocker");
+            let write_seq = unsafe { ctx.fs_write(file, 0, DATA.as_ptr(), DATA.len() as u32) }
+                .expect("submit write");
+            let sync_seq = ctx.fs_fsync(file).expect("submit fsync");
+            (write_seq, sync_seq)
+        };
+        el.executor.wait_disk_io(write_seq, 0);
+        el.executor.wait_disk_io(sync_seq, 0);
+        assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
+
+        // Release the pool thread: the blocker's open, then the write, run.
+        let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        assert_eq!(drain_until_result(&mut el, write_seq), DATA.len() as i32);
+        assert_eq!(el.driver.write_orders.held(), 0, "the write released it");
+        assert_eq!(drain_until_result(&mut el, sync_seq), 0, "fsync");
+        drop(writer);
+        drop(el);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As `an_fsync_waits_in_the_worker_for_an_earlier_write`, for a direct
+    /// I/O write and `direct_io_fsync`.
+    #[test]
+    fn a_direct_io_fsync_waits_in_the_worker_for_an_earlier_write() {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .disk_io_threads(1)
+            .direct_io(crate::direct_io::DirectIoConfig::default())
+            .build()
+            .expect("valid test config");
+        let (mut el, _wake) = test_loop(&config);
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(format!(".ringline-mio-direct-fsync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let path = dir.join("file");
+        std::fs::write(&path, [0u8; 4096]).unwrap();
+        let file = el
+            .driver
+            .make_ctx()
+            .open_direct_io_file(path.to_str().unwrap())
+            .expect("open for direct I/O");
+
+        let block = crate::buf::AlignedBuf::zeroed(4096, 4096);
+        let (write_seq, sync_seq) = {
+            let mut ctx = el.driver.make_ctx();
+            // Holds the pool's only thread until a writer opens the FIFO.
+            ctx.fs_open(&fifo, crate::fs::OpenFlags::READ, 0)
+                .expect("submit blocker");
+            let write_seq = ctx
+                .direct_io_write(file, 0, block.as_ptr(), 4096)
+                .expect("submit write");
+            let sync_seq = ctx.direct_io_fsync(file).expect("submit fsync");
+            (write_seq, sync_seq)
+        };
+        el.executor.wait_disk_io(write_seq, 0);
+        el.executor.wait_disk_io(sync_seq, 0);
+        assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
+
+        let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        assert_eq!(drain_until_result(&mut el, write_seq), 4096);
+        assert_eq!(el.driver.write_orders.held(), 0, "the write released it");
+        assert_eq!(drain_until_result(&mut el, sync_seq), 0, "fsync");
+        drop(writer);
+        drop(block);
+        drop(el);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write and a read submitted after a held fsync on the same file run
+    /// and complete while it stays held, and the fsync is sent once the
+    /// write before it completes (#905). The earlier write is a stand-in
+    /// entry in `write_orders`.
+    #[test]
+    fn a_held_fsync_delays_no_later_write_or_read() {
+        let config = ConfigBuilder::new()
+            .workers(1)
+            .pin_to_core(false)
+            .max_connections(16)
+            .send_pool(4, 64)
+            .disk_io_threads(1)
+            .build()
+            .expect("valid test config");
+        let (mut el, _wake) = test_loop(&config);
+        let path =
+            std::env::temp_dir().join(format!("ringline-mio-fsync-later-{}", std::process::id()));
+        std::fs::write(&path, b"0123").unwrap();
+        let (index, generation, open_seq) = el
+            .driver
+            .make_ctx()
+            .fs_open(&path, crate::fs::OpenFlags::READ_WRITE, 0)
+            .expect("submit open");
+        el.executor.wait_disk_io(open_seq, 0);
+        assert!(drain_until_result(&mut el, open_seq) >= 0, "open");
+        let file = crate::fs::File::new(index, generation);
+        const EARLIER: u32 = u32::MAX;
+        el.driver.write_orders.begin_write(
+            crate::disk_order::OrderKey {
+                subsystem: crate::disk_order::Subsystem::Fs,
+                index,
+                generation,
+            },
+            EARLIER,
+        );
+
+        static DATA: &[u8] = b"later";
+        let mut buf = [0u8; 4];
+        let (sync_seq, write_seq, read_seq) = {
+            let mut ctx = el.driver.make_ctx();
+            let sync_seq = ctx.fs_fsync(file).expect("submit fsync");
+            let write_seq = unsafe { ctx.fs_write(file, 8, DATA.as_ptr(), DATA.len() as u32) }
+                .expect("submit write");
+            let read_seq =
+                unsafe { ctx.fs_read(file, 0, buf.as_mut_ptr(), 4) }.expect("submit read");
+            (sync_seq, write_seq, read_seq)
+        };
+        for seq in [sync_seq, write_seq, read_seq] {
+            el.executor.wait_disk_io(seq, 0);
+        }
+        assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
+        assert_eq!(drain_until_result(&mut el, write_seq), DATA.len() as i32);
+        assert_eq!(drain_until_result(&mut el, read_seq), 4);
+        assert_eq!(
+            el.driver.write_orders.held(),
+            1,
+            "a later write or read does not release it"
+        );
+        for (seq, work) in el.driver.write_orders.end_write(EARLIER) {
+            el.send_released_fsync(seq, work);
+        }
+        assert_eq!(drain_until_result(&mut el, sync_seq), 0, "fsync");
+        drop(el);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A parked standalone task, so that waking it is observable (a task

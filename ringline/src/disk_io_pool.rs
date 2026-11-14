@@ -77,6 +77,31 @@ pub(crate) enum PoolSubsystem {
     DirectIo = 1,
 }
 
+/// A pool request held in the worker, not yet sent: its key and its work.
+/// An fsync waits like this for the writes submitted before it (#905).
+pub(crate) type HeldRequest = (u32, Box<dyn FnOnce() -> DiskIoResult + Send>);
+
+/// Send `work` under key `seq` to `pool`, with the worker's response channel
+/// and wake handle.
+pub(crate) fn send_request(
+    pool: &DiskIoPool,
+    response_tx: &Sender<DiskIoResponse>,
+    wake_handle: crate::wakeup::WakeFd,
+    wake_pending: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    seq: u32,
+    work: Box<dyn FnOnce() -> DiskIoResult + Send>,
+) -> std::io::Result<()> {
+    pool.request_tx
+        .send(DiskIoRequest {
+            work,
+            seq,
+            response_tx: response_tx.clone(),
+            wake_handle,
+            wake_pending: std::sync::Arc::clone(wake_pending),
+        })
+        .map_err(|_| std::io::Error::other("disk I/O pool shut down"))
+}
+
 impl PoolSubsystem {
     /// The error a submit past the subsystem's bound returns: the io_uring
     /// backend's kind and text for a full command slab.
