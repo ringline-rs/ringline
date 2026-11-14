@@ -313,10 +313,10 @@ connection, plain or TLS:
    accounting is cancelled, and a close_notify the pool retained is dropped,
    as `force_finalize_close` does (udriver.rs:2070-2110). A `SendPollOut` is
    cancelled first, as `submit_committed_close` does (udriver.rs:2024-2033).
-   When step 3 pushes the whole chain, `close_submitted` is set and
-   `close_pending` cleared, as `try_finalize_close` does
-   (udriver.rs:2003-2009), so the end of the iteration does not submit a
-   second `Close`.
+   When step 3 commits the whole chain, pushed or refused and queued for
+   retry, `close_submitted` is set and `close_pending` cleared, as
+   `try_finalize_close` does before its push (udriver.rs:2003-2009), so
+   nothing else submits a second `Close`.
 3. An `IORING_OP_CONNECT` with an `AF_UNSPEC` address, the connection's
    normal close lead (`close_lead_for`, ring.rs:83) and the `Close` are pushed
    as one hard-linked chain of three through `Engine::push_chain`
@@ -329,14 +329,17 @@ connection, plain or TLS:
    (`shutdown_inflight`, udriver.rs:2189), the `Close` must wait for it,
    because the `Close` frees the slot it names (udriver.rs:1987-1993, #518).
    Then only the connect is pushed at once, since it frees nothing,
-   `close_pending` stays set, and the `Shutdown`'s completion
+   `close_pending` is set (an open connection has none yet), and the
+   `Shutdown`'s completion
    (`handle_shutdown`, uloop.rs:2800-2815) reaches `try_finalize_close`, which
    commits the lead and `Close` through `submit_committed_close`. The queue and
    any retained close_notify are already gone, so nothing is sent ahead of
    them. A refused chain, or a refused lone connect, is retried as itself: the
    retry entry records that the close is an abort, so `drain_close_retries`
    (uloop.rs:4935-4941) does not fall back to the lead-and-`Close` pair, which
-   would leave the zero-copy entries held.
+   would leave the zero-copy entries held. While a lone connect waits for its
+   retry, `try_finalize_close` waits for it as it waits for
+   `shutdown_inflight`, so the `Close` cannot go in ahead of it.
 4. On TCP the disconnect returns 0 for an established, closing or
    peer-reset socket. It sends an RST unless the socket is already closed,
    and purges the socket's write queue,
