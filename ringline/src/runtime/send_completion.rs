@@ -758,6 +758,52 @@ impl SendCompletions {
         wakes
     }
 
+    /// `abort` on `conn_index`: every entry on it that is waiting for
+    /// admission (for `generation`) or in flight records
+    /// `Done(Err(ConnectionAborted))`, and its owner's task id is returned for
+    /// waking; if the FIFO head left, the new head's task id is appended.
+    ///
+    /// `Done`, not the provisional `Aborted`: the caller asked for these
+    /// sends to fail, so a driver result that arrives later is ignored, as
+    /// any second result is. An entry already `Done` keeps its result, an
+    /// `Aborted` one is a torn-down earlier occupant's, and an `Abandoned`
+    /// one has no future. An entry in flight on `conn_index` belongs to the
+    /// current occupant: `remove_connection` aborts every one at the slot's
+    /// release.
+    ///
+    /// Allocates the returned `Vec` and one boxed error per failed entry.
+    pub(crate) fn abort_connection(&mut self, conn_index: u32, generation: u32) -> Vec<u32> {
+        let mut wakes = Vec::new();
+        let old_head = self.front();
+        let candidates: Vec<u32> = self
+            .by_conn
+            .get(conn_index as usize)
+            .cloned()
+            .unwrap_or_default();
+        for index in candidates {
+            let Some(e) = self.slots[index as usize].entry.as_mut() else {
+                continue;
+            };
+            if e.conn_index != conn_index {
+                continue;
+            }
+            let was_waiting = match e.state {
+                Completion::Waiting { generation: g, .. } if g == generation => true,
+                Completion::InFlight => false,
+                _ => continue,
+            };
+            e.state = Completion::Done(Err(crate::handler::aborted_error()));
+            if e.task_id != NO_OWNER {
+                wakes.push(e.task_id);
+            }
+            if was_waiting {
+                self.left_waiting();
+            }
+        }
+        self.wake_new_head(old_head, &mut wakes);
+        wakes
+    }
+
     #[cfg(test)]
     fn waiting_len(&self) -> usize {
         self.waiting_live
@@ -872,6 +918,17 @@ impl Executor {
                 self.send_capacity_wakes += 1;
             }
             let _ = self.wake_task(head);
+        }
+    }
+
+    /// [`SendCompletions::abort_connection`] plus a wake of every returned
+    /// task. `ConnCtx::abort`.
+    pub(crate) fn abort_sends(&mut self, conn_index: u32, generation: u32) {
+        for task_id in self
+            .send_completions
+            .abort_connection(conn_index, generation)
+        {
+            let _ = self.wake_task(task_id);
         }
     }
 

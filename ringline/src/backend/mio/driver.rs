@@ -693,6 +693,47 @@ impl Driver {
         self.pending_closes.push(conn_index);
     }
 
+    /// `abort`: fail the connection's queued sends with `ConnectionAborted`,
+    /// returning their copy-pool permits, set `SO_LINGER {1, 0}` on its
+    /// socket so that the close sends an RST and discards the data queued on
+    /// it, and request its close. `finish_close` then skips the flush and the
+    /// close_notify. Returns `false`, having done nothing, when the
+    /// connection is gone or was aborted already. The caller
+    /// (`ConnCtx::abort`) has failed the reader and the sends waiting for
+    /// capacity.
+    pub(crate) fn abort_connection(&mut self, conn_index: u32) -> bool {
+        let idx = conn_index as usize;
+        if self.connections.get(conn_index).is_none() || self.send_queues[idx].aborted {
+            return false;
+        }
+        self.send_queues[idx].aborted = true;
+        self.clear_pending_sends(idx, crate::handler::aborted_error);
+        if let Some(stream) = &self.tcp_streams[idx] {
+            use std::os::fd::AsRawFd;
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // A failure leaves an ordinary close, which still releases the
+            // queued sends: they were failed above.
+            // SAFETY: the fd is the open socket `stream` owns, and `linger`
+            // outlives the call.
+            unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&raw const linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                );
+            }
+        }
+        // Does nothing for a connection already closing, which is on
+        // `pending_closes` until `finish_close`.
+        self.close_connection(conn_index);
+        true
+    }
+
     /// Count every connection still open out of `CONNECTIONS_ACTIVE` and
     /// into `conn::CLOSED`, at worker exit. Both counters follow
     /// `established`, as in `finish_close`. The worker then drops the event
@@ -717,9 +758,16 @@ impl Driver {
     pub(crate) fn finish_close(&mut self, conn_index: u32) {
         let idx = conn_index as usize;
 
+        // After `abort` nothing is written: its sends were failed, and the
+        // socket's `SO_LINGER {1, 0}` makes the close below an RST.
+        let aborted = std::mem::take(&mut self.send_queues[idx].aborted);
         // A write error here is why the sends still queued below did not
         // go, and they report it.
-        let flush_error = self.flush_sends(conn_index).err();
+        let flush_error = if aborted {
+            None
+        } else {
+            self.flush_sends(conn_index).err()
+        };
 
         // No alert once a write shutdown has been requested: `flush_sends`
         // above issued the FIN when it drained the queue, and a write after
@@ -730,7 +778,8 @@ impl Driver {
         // written record, and the peer would read a corrupt stream. That is
         // the case for a connection closed before its handshake completed
         // whose close deadline passed.
-        let alert_allowed = flush_error.is_none()
+        let alert_allowed = !aborted
+            && flush_error.is_none()
             && self.pending_sends[idx].is_empty()
             && self
                 .connections

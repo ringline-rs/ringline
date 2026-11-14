@@ -97,6 +97,13 @@ pub enum OpTag {
     /// The non-blocking one-byte `MSG_PEEK` receive a completed hangup poll
     /// submits when no receive is in flight. Payload = connection generation.
     HangupPeek = 38,
+    /// `abort`'s `IORING_OP_CONNECT` to `AF_UNSPEC` on a TCP connection,
+    /// which resets the socket and purges its write queue. Hard-linked ahead
+    /// of the close lead and the `Close`, or, while a `Shutdown` holds the
+    /// `Close`, submitted alone. Its result is ignored; a lone one's
+    /// completion releases the hold on the `Close`. Payload = connection
+    /// generation.
+    Disconnect = 39,
 }
 
 impl OpTag {
@@ -127,6 +134,7 @@ impl OpTag {
             36 => Some(OpTag::RecvDirect),
             37 => Some(OpTag::HangupPoll),
             38 => Some(OpTag::HangupPeek),
+            39 => Some(OpTag::Disconnect),
             _ => None,
         }
     }
@@ -165,6 +173,7 @@ impl OpTag {
             OpTag::RecvDirect => "recv_direct",
             OpTag::HangupPoll => "hangup_poll",
             OpTag::HangupPeek => "hangup_peek",
+            OpTag::Disconnect => "disconnect",
         }
     }
 }

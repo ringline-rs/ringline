@@ -1590,6 +1590,33 @@ impl ConnCtx {
         driver.close_connection(self.conn_index);
     }
 
+    /// See [`SendHalf::abort`]. The reader and the sends the executor holds
+    /// (waiting for capacity, or in flight) fail here; the driver fails the
+    /// sends it has queued and closes the connection.
+    pub(crate) fn abort(&self) {
+        try_with_state(|driver, executor| {
+            let idx = self.conn_index as usize;
+            let Some(cs) = driver.connections.get_mut(self.conn_index) else {
+                return;
+            };
+            if cs.generation != self.generation {
+                return;
+            }
+            let state = &driver.send_queues[idx];
+            if state.aborted || state.close_submitted {
+                return;
+            }
+            cs.read = crate::connection::ReadHalf::Error;
+            executor.fail_recv(
+                self.conn_index,
+                self.generation,
+                crate::handler::aborted_error(),
+            );
+            executor.abort_sends(self.conn_index, self.generation);
+            driver.abort_connection(self.conn_index);
+        });
+    }
+
     /// See [`Connection::listener`].
     pub(crate) fn listener(&self) -> Option<crate::ListenerId> {
         with_state(|driver, _| {
@@ -2960,6 +2987,11 @@ impl Connection {
         self.tx.close();
     }
 
+    /// See [`SendHalf::abort`].
+    pub fn abort(&mut self) {
+        self.tx.abort();
+    }
+
     /// Offer this connection for rebalancing onto a less loaded worker
     /// (#443), carrying `state` across.
     ///
@@ -3346,6 +3378,38 @@ impl SendHalf {
     /// ```
     pub fn send_admitted<'a>(&mut self, data: &'a [u8]) -> Admission<'a> {
         self.conn.send_admitted(data)
+    }
+
+    /// Close this connection now, without draining its sends: for a peer
+    /// that has stopped reading, where [`close`](Self::close) would wait
+    /// for it.
+    ///
+    /// Every send on the connection that has not resolved fails with
+    /// [`ConnectionAborted`](io::ErrorKind::ConnectionAborted), whatever the
+    /// kernel reports for it: queued sends, sends waiting for send-pool
+    /// capacity, and sends in flight. A send started afterwards fails the
+    /// same way, and so does a read parked on the connection. Their send-pool
+    /// slots and zero-copy buffers are released without waiting for the peer.
+    /// No close_notify is sent.
+    ///
+    /// On a TCP connection the peer reads `ECONNRESET`. On io_uring the
+    /// socket is disconnected (an `IORING_OP_CONNECT` to `AF_UNSPEC`, which
+    /// resets it and discards its queued data) ahead of the `Close`, so the
+    /// kernel returns the zero-copy buffers of its sends at once even while
+    /// other connections' requests keep the socket from being released. On
+    /// mio the socket is closed with `SO_LINGER {1, 0}`. On io_uring a
+    /// Unix-domain connection is closed with its queued sends dropped; the
+    /// peer reads end of file, or `ECONNRESET` if this end had unread data.
+    ///
+    /// It also applies to a connection that is already closing, for example
+    /// one whose [`close`](Self::close) waits for a peer that stopped
+    /// reading. It does nothing once the connection's close is committed,
+    /// on io_uring when its `Close` has been submitted; nothing then waits on
+    /// the peer. As for `close`, it does nothing if the connection has been
+    /// released, or when called outside the worker's executor, and the
+    /// connection's task is dropped when the close completes.
+    pub fn abort(&mut self) {
+        self.conn.abort();
     }
 
     /// Close this connection.

@@ -110,6 +110,11 @@ impl Engine for StubEngine {
     }
 
     #[cfg(test)]
+    fn force_chain_push_failures(&mut self, _count: usize) {
+        unreachable!("the stub engine fails at setup")
+    }
+
+    #[cfg(test)]
     fn force_enter_eagain(&mut self, _count: usize) {
         unreachable!("the stub engine fails at setup")
     }

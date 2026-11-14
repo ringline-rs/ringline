@@ -5,7 +5,7 @@ use std::task::Context;
 use std::time::Instant;
 
 use crate::backend::uring::abi::cqueue;
-use crate::handler::SendPoll;
+use crate::handler::{Disconnect, SendPoll};
 
 use crate::backend::Driver;
 use crate::backend::sockaddr_to_socket_addr;
@@ -590,6 +590,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_send_retries();
             self.drain_close_retries();
             self.drain_shutdown_retries();
+            self.drain_disconnect_retries();
             self.drain_send_pollout_retries();
             self.retry_recv_arms();
             self.driver.ring.retry_disk_pushes();
@@ -1855,6 +1856,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // before the Close CQE, and take each handler's
             // `close_submitted` or closing-connection path.
             OpTag::CloseCancel => {}
+            OpTag::Disconnect => self.handle_disconnect(ud),
             OpTag::EventFdRead => self.handle_eventfd_read(),
             OpTag::TlsSend => self.handle_tls_send(ud, result),
             OpTag::Connect => self.handle_connect(ud, result),
@@ -2811,6 +2813,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
         self.driver.send_queues[idx].shutdown_inflight = false;
         self.driver.defer_finalize_close(conn_index);
+    }
+
+    /// `abort`'s disconnect has completed. Its result is ignored, as the
+    /// close leads' are: the `Close` runs whatever it returned. A lone one
+    /// (`Disconnect::Alone`) held the `Close`, which frees the slot it names,
+    /// so this releases the hold and registers the connection for the
+    /// end-of-iteration drain, as `handle_shutdown` does. One chained ahead
+    /// of a `Close` changes nothing here, and neither does one whose slot has
+    /// been released (its generation changed).
+    fn handle_disconnect(&mut self, ud: UserData) {
+        let conn_index = ud.conn_index();
+        let idx = conn_index as usize;
+        if idx >= self.driver.send_queues.len()
+            || self.driver.connections.generation(conn_index) != ud.payload()
+        {
+            return;
+        }
+        let state = &mut self.driver.send_queues[idx];
+        if state.disconnect == Disconnect::Alone {
+            state.disconnect = Disconnect::None;
+            self.driver.defer_finalize_close(conn_index);
+        }
     }
 
     fn handle_eventfd_read(&mut self) {
@@ -4937,6 +4961,36 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             {
                 self.driver
                     .pending_shutdown_retries
+                    .push((conn_index, generation));
+            }
+        }
+    }
+
+    /// Push `abort`'s lone disconnects the ring refused. The connection's
+    /// `disconnect` reads `Disconnect::Alone`, so its `Close` waits for the
+    /// completion. An entry whose slot has been released (its generation
+    /// changed) is dropped: `reset_send_state` clears the hold at
+    /// reactivation. Same backoff as `drain_close_retries`: every 4th tick.
+    fn drain_disconnect_retries(&mut self) {
+        if self.driver.pending_disconnect_retries.is_empty() {
+            return;
+        }
+        if !self.driver.tick_count.is_multiple_of(4) {
+            return;
+        }
+        let retries = std::mem::take(&mut self.driver.pending_disconnect_retries);
+        for (conn_index, generation) in retries {
+            if self.driver.connections.generation(conn_index) != generation {
+                continue;
+            }
+            if self
+                .driver
+                .ring
+                .submit_disconnect(conn_index, generation)
+                .is_err()
+            {
+                self.driver
+                    .pending_disconnect_retries
                     .push((conn_index, generation));
             }
         }

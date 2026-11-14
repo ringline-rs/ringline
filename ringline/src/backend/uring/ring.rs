@@ -50,6 +50,14 @@ static ABORT_LINGER: libc::linger = libc::linger {
     l_linger: 0,
 };
 
+/// The address of the disconnect `abort` submits: an `IORING_OP_CONNECT`
+/// to `AF_UNSPEC`, which on TCP resets the socket and purges its write queue.
+/// A static, so it outlives the operation.
+static DISCONNECT_ADDR: libc::sockaddr = libc::sockaddr {
+    sa_family: libc::AF_UNSPEC as libc::sa_family_t,
+    sa_data: [0; 14],
+};
+
 /// What is hard-linked ahead of a connection's `Close`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseLead {
@@ -115,6 +123,13 @@ pub struct Ring {
     /// order, so a test can check what a handler cancelled.
     #[cfg(test)]
     pub(crate) pushed_cancels: Vec<u64>,
+    /// Test-only: every connection `Close` pushed, in order: its connection
+    /// index, and whether `abort`'s disconnect leads its chain.
+    #[cfg(test)]
+    pub(crate) pushed_closes: Vec<(u32, bool)>,
+    /// Test-only: the connection index of every lone disconnect pushed.
+    #[cfg(test)]
+    pub(crate) pushed_lone_disconnects: Vec<u32>,
 }
 
 impl Ring {
@@ -130,6 +145,10 @@ impl Ring {
             last_drain_index: None,
             #[cfg(test)]
             pushed_cancels: Vec::new(),
+            #[cfg(test)]
+            pushed_closes: Vec::new(),
+            #[cfg(test)]
+            pushed_lone_disconnects: Vec::new(),
         })
     }
 
@@ -223,6 +242,12 @@ impl Ring {
     #[cfg(test)]
     pub(crate) fn force_push_failures(&mut self, count: usize) {
         self.engine.force_push_failures(count);
+    }
+
+    /// See [`Engine::force_chain_push_failures`].
+    #[cfg(test)]
+    pub(crate) fn force_chain_push_failures(&mut self, count: usize) {
+        self.engine.force_chain_push_failures(count);
     }
 
     /// See [`Engine::force_enter_eagain`].
@@ -552,13 +577,7 @@ impl Ring {
         generation: u32,
         lead: CloseLead,
     ) -> io::Result<()> {
-        let user_data = UserData::encode(OpTag::Close, conn_index, generation);
-        let close = Sqe::new(
-            Op::Close {
-                fd: sqe::Fd::Fixed(conn_index),
-            },
-            user_data.raw(),
-        );
+        let close = Self::close_sqe(conn_index, generation);
         // A socket removed from the fixed-file table stays open until the
         // requests holding it complete: before Linux 6.13, earlier requests
         // on any registered file or buffer; from 6.13, this connection's own
@@ -566,13 +585,79 @@ impl Ring {
         // runs after it even when it fails. `Engine::push_pair` pushes both
         // together, so a submit cannot separate them. Config validation
         // guarantees an SQ of at least two entries.
+        match self.close_lead_sqe(conn_index, lead) {
+            None => unsafe { self.push_sqe(&close) }?,
+            Some(first) => unsafe { self.engine.push_pair(&first, &close) }?,
+        }
+        #[cfg(test)]
+        self.pushed_closes.push((conn_index, false));
+        Ok(())
+    }
+
+    /// Submit `abort`'s `Close` of a TCP connection: the disconnect
+    /// ([`disconnect_sqe`](Self::disconnect_sqe)), `lead` and the `Close`,
+    /// hard-linked so each runs whatever the one before it returned, and
+    /// pushed together through `Engine::push_chain`, which refuses a chain
+    /// longer than the SQ. Config validation guarantees an SQ of at least
+    /// four entries.
+    pub fn submit_abort_close(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        lead: CloseLead,
+    ) -> io::Result<()> {
+        let disconnect = Self::disconnect_sqe(conn_index, generation).link(Link::Hard);
+        let close = Self::close_sqe(conn_index, generation);
+        match self.close_lead_sqe(conn_index, lead) {
+            None => unsafe { self.engine.push_pair(&disconnect, &close) }?,
+            Some(lead) => unsafe { self.engine.push_chain(&[disconnect, lead, close]) }?,
+        }
+        #[cfg(test)]
+        self.pushed_closes.push((conn_index, true));
+        Ok(())
+    }
+
+    /// Submit `abort`'s disconnect on its own, for a connection whose
+    /// `Close` waits for a `Shutdown` still in flight.
+    pub fn submit_disconnect(&mut self, conn_index: u32, generation: u32) -> io::Result<()> {
+        let disconnect = Self::disconnect_sqe(conn_index, generation);
+        unsafe { self.push_sqe(&disconnect) }?;
+        #[cfg(test)]
+        self.pushed_lone_disconnects.push(conn_index);
+        Ok(())
+    }
+
+    /// The `IORING_OP_CONNECT` to `AF_UNSPEC` on a connection's fixed file.
+    /// On TCP the kernel's `tcp_disconnect` sends an RST unless the socket is
+    /// already closed, and purges the write queue, so the zero-copy
+    /// notifications of the connection's sends land. Its completion
+    /// (`OpTag::Disconnect`, payload the generation) is ignored, except that
+    /// a lone one releases the hold on the `Close`.
+    fn disconnect_sqe(conn_index: u32, generation: u32) -> Sqe {
+        Sqe::new(
+            Op::Connect {
+                fd: sqe::Fd::Fixed(conn_index),
+                addr: &raw const DISCONNECT_ADDR,
+                addrlen: std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+            },
+            UserData::encode(OpTag::Disconnect, conn_index, generation).raw(),
+        )
+    }
+
+    /// The `Close` of a connection's fixed descriptor.
+    fn close_sqe(conn_index: u32, generation: u32) -> Sqe {
+        Sqe::new(
+            Op::Close {
+                fd: sqe::Fd::Fixed(conn_index),
+            },
+            UserData::encode(OpTag::Close, conn_index, generation).raw(),
+        )
+    }
+
+    /// The SQE of `lead`, hard-linked to the next, or `None` for `Nothing`.
+    fn close_lead_sqe(&self, conn_index: u32, lead: CloseLead) -> Option<Sqe> {
         let first = match lead {
-            CloseLead::Nothing => {
-                unsafe {
-                    self.push_sqe(&close)?;
-                }
-                return Ok(());
-            }
+            CloseLead::Nothing => return None,
             CloseLead::Shutdown => Sqe::new(
                 Op::Shutdown {
                     fd: sqe::Fd::Fixed(conn_index),
@@ -592,8 +677,7 @@ impl Ring {
                 UserData::encode(OpTag::CloseShutdown, conn_index, 0).raw(),
             ),
         };
-        let first = first.link(Link::Hard);
-        unsafe { self.engine.push_pair(&first, &close) }
+        Some(first.link(Link::Hard))
     }
 
     /// Cancel every request on the connection, without closing it.

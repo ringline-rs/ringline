@@ -19,7 +19,7 @@ use crate::chain::SendChainTable;
 use crate::completion::{OpTag, UserData};
 use crate::config::Config;
 use crate::connection::{ConnectionTable, Lifecycle, ReadHalf, WriteHalf};
-use crate::handler::{BuiltSend, ConnSendState, DriverCtx, SendPoll};
+use crate::handler::{BuiltSend, ConnSendState, Disconnect, DriverCtx, SendPoll};
 use crate::metrics;
 use crate::runtime::send_completion::SendId;
 
@@ -828,6 +828,11 @@ pub(crate) struct Driver {
     /// (its generation changed): nothing waits on the flag for a released
     /// slot, and `reset_send_state` clears it at reactivation.
     pub(crate) pending_shutdown_retries: Vec<(u32, u32)>,
+    /// `abort`'s lone disconnects the ring refused: (conn_index, generation).
+    /// The connection's `disconnect` reads `Disconnect::Alone`, so the
+    /// `Close` waits; `drain_disconnect_retries` pushes each again on the
+    /// close-retry backoff and drops one whose slot has been released.
+    pub(crate) pending_disconnect_retries: Vec<(u32, u32)>,
     /// Connections whose queued head send could not be pushed (SQ still
     /// full after submit): (conn_index, generation). Drained each iteration
     /// by `drain_send_retries` until the push goes through; the entry stays
@@ -1287,6 +1292,7 @@ impl Driver {
             pending_coalesced_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             pending_shutdown_retries: Vec::new(),
+            pending_disconnect_retries: Vec::new(),
             pending_send_retries: Vec::new(),
             settled_sends: VecDeque::new(),
             recv_aborts: VecDeque::new(),
@@ -1431,6 +1437,8 @@ impl Driver {
         // the next occupant must not inherit the block.
         state.shutdown_inflight = false;
         state.close_notify_pending = None;
+        state.aborted = false;
+        state.disconnect = Disconnect::None;
         state.waiting_send = None;
         state.send_poll = SendPoll::None;
         state.pollout_seen = false;
@@ -1966,7 +1974,16 @@ impl Driver {
         // fails `EPIPE`. `handle_shutdown` registers the connection for the
         // drain once the CQE clears the flag.
         let shutdown_drained = !state.shutdown_inflight;
-        if !(state.close_pending && sends_drained && chain_drained && shutdown_drained) {
+        // `abort`'s lone disconnect names the slot the same way, and must run
+        // before the `Close`: `handle_disconnect` registers the connection
+        // for the drain once its CQE lands.
+        let disconnect_drained = state.disconnect != Disconnect::Alone;
+        if !(state.close_pending
+            && sends_drained
+            && chain_drained
+            && shutdown_drained
+            && disconnect_drained)
+        {
             return;
         }
         // A close_notify the pool had no slot for at the close goes out now
@@ -1994,8 +2011,10 @@ impl Driver {
 
     /// Submit the `Close` of a connection whose close is committed, after
     /// cancelling its `SendPollOut`: a poll holds the socket open past the
-    /// `Close`, and a multishot one outlives a shutdown lead. On an error the
-    /// caller retries this; a cancel that went through is not repeated.
+    /// `Close`, and a multishot one outlives a shutdown lead. After `abort` on
+    /// a TCP connection (`Disconnect::WithClose`) the disconnect, the lead and
+    /// the `Close` go as one chain. On an error the caller retries this,
+    /// chain included; a cancel that went through is not repeated.
     pub(crate) fn submit_committed_close(&mut self, conn_index: u32) -> io::Result<()> {
         let generation = self.connections.generation(conn_index);
         let state = &mut self.send_queues[conn_index as usize];
@@ -2004,8 +2023,112 @@ impl Driver {
                 .submit_cancel_send_pollout(conn_index, generation)?;
         }
         state.send_poll = SendPoll::None;
+        let with_disconnect = state.disconnect == Disconnect::WithClose;
         let lead = self.close_lead(conn_index);
+        if with_disconnect {
+            self.ring.submit_abort_close(conn_index, generation, lead)?;
+            self.send_queues[conn_index as usize].disconnect = Disconnect::None;
+            return Ok(());
+        }
         self.ring.submit_close(conn_index, generation, lead)
+    }
+
+    /// `abort`: close `conn_index` now, failing its queued sends and
+    /// releasing their pool slots and slab entries, without the
+    /// close_notify. Returns `false`, having done nothing, when the
+    /// connection is gone, was aborted already, or its `Close` is committed.
+    ///
+    /// The caller (`ConnCtx::abort`) has failed the reader and the sends
+    /// waiting for capacity or in flight. Here, as `close_connection` and
+    /// `force_finalize_close` do: the connection is marked closing, its
+    /// queued sends are failed and released, an active chain's accounting is
+    /// cancelled, and a retained close_notify is dropped. On TCP the `Close`
+    /// is preceded by a disconnect (`Ring::submit_abort_close`), which resets
+    /// the socket and purges its write queue, so the zero-copy notifications
+    /// of the sends the kernel holds land and release their slab entries
+    /// without waiting for the fixed file's release (before Linux 6.13, the
+    /// end of older requests on any connection). A send still in the kernel
+    /// completes with an error and releases its own slot or slab entry.
+    ///
+    /// The `Close` is committed here, pushed or queued for retry as the whole
+    /// chain, except while a `Shutdown` from `shutdown_write` is in flight:
+    /// the `Close` frees the slot that `Shutdown` names (#518). Then the
+    /// disconnect goes alone (`Disconnect::Alone`), and the `Shutdown`'s and
+    /// the disconnect's completions let `try_finalize_close` commit the lead
+    /// and the `Close`. Nothing is queued ahead of either, so the drain
+    /// sends nothing.
+    pub(crate) fn abort_connection(&mut self, conn_index: u32) -> bool {
+        let ci = conn_index as usize;
+        let Some(conn) = self.connections.get_mut(conn_index) else {
+            return false;
+        };
+        let generation = conn.generation;
+        let state = &self.send_queues[ci];
+        if state.aborted || state.close_submitted {
+            return false;
+        }
+        conn.lifecycle = Lifecycle::Closing;
+        // Released here for the reasons `close_connection` gives.
+        self.forward_zc_consumed[ci] = 0;
+        self.park_offered[ci] = false;
+        self.set_park_drain(conn_index, None);
+        self.park_carry.remove(&conn_index);
+        self.adopt_pending.remove(&conn_index);
+        self.send_queues[ci].aborted = true;
+        if self.send_queues[ci].close_notify_pending.take().is_some() {
+            self.drop_retained_close_notify_flag(conn_index);
+        }
+        let state = &mut self.send_queues[ci];
+        let had_queue = !state.queue.is_empty();
+        let settles = Self::release_queued_sends(
+            &mut state.queue,
+            &mut self.send_slab,
+            &mut self.send_copy_pool,
+        );
+        state.in_flight = false;
+        state.parked = false;
+        // A pending write shutdown is never issued: its queue is gone. One
+        // in flight, or on `pending_shutdown_retries`, stays recorded.
+        if let Some(cs) = self.connections.get_mut(conn_index)
+            && matches!(cs.write, WriteHalf::ShutdownPending)
+        {
+            cs.write = WriteHalf::Open;
+        }
+        self.fail_send_ids(settles, had_queue);
+        if let Some(id) = self.chain_table.cancel(conn_index) {
+            self.fail_send_ids(vec![id], false);
+        }
+        self.disarm_close_notify_deadline(conn_index);
+        let tcp = !self
+            .connections
+            .get(conn_index)
+            .is_some_and(|c| matches!(c.peer_addr, Some(crate::connection::PeerAddr::Unix(_))));
+        let state = &mut self.send_queues[ci];
+        if state.shutdown_inflight {
+            // An open connection has no close pending yet; the `Shutdown`'s
+            // completion reaches `try_finalize_close` through it.
+            state.close_pending = true;
+            if tcp {
+                state.disconnect = Disconnect::Alone;
+                if self.ring.submit_disconnect(conn_index, generation).is_err() {
+                    self.pending_disconnect_retries
+                        .push((conn_index, generation));
+                }
+            }
+            return true;
+        }
+        // Committed from here, as in `try_finalize_close`: late CQEs must not
+        // push new SQEs for this connection.
+        state.close_pending = false;
+        state.close_submitted = true;
+        if tcp {
+            state.disconnect = Disconnect::WithClose;
+        }
+        if self.submit_committed_close(conn_index).is_err() {
+            crate::metrics::RING.increment(crate::metrics::ring::CLOSE_SUBMIT_FAILURES);
+            self.pending_close_retries.push((conn_index, 0));
+        }
+        true
     }
 
     /// Register a connection whose close is pending on
