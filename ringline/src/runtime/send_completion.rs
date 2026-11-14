@@ -1237,6 +1237,56 @@ mod tests {
         assert!(q.turn(other_conn, 1));
     }
 
+    /// `abort_connection` fails the connection's waiting entries of its
+    /// generation and its in-flight ones with `ConnectionAborted`, and a
+    /// driver result that arrives afterwards does not replace that. A
+    /// resolved entry, another generation's waiter and another connection's
+    /// entries keep their state.
+    #[test]
+    fn abort_connection_fails_waiting_and_in_flight_entries() {
+        let mut q = SendCompletions::new();
+        let in_flight = q.enqueue(1, 5, 1, task(1));
+        q.mark_submitted(in_flight);
+        let done = q.enqueue(1, 5, 1, task(2));
+        q.mark_submitted(done);
+        q.complete(done, Ok(4));
+        let waiting = q.enqueue(1, 5, 1, task(3));
+        let other_gen = q.enqueue(1, 6, 1, task(4));
+        let other_conn = q.enqueue(2, 5, 1, task(5));
+        let other_conn_in_flight = q.enqueue(2, 5, 1, task(6));
+        q.mark_submitted(other_conn_in_flight);
+
+        let wakes = q.abort_connection(1, 5);
+
+        assert_eq!(
+            wakes,
+            vec![task(1), task(3), task(4)],
+            "the failed owners, then the promoted head"
+        );
+        assert_eq!(
+            q.complete(in_flight, Ok(9)),
+            None,
+            "a driver result after the abort is ignored"
+        );
+        let err = q.take_result(in_flight).unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(err.to_string(), "connection aborted");
+        assert_eq!(
+            kind_of(q.take_result(waiting)),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(q.take_result(done).unwrap().unwrap(), 4, "resolved before");
+        assert!(
+            q.take_result(other_gen).is_none(),
+            "another generation waits"
+        );
+        assert!(q.turn(other_gen, 1), "and is now the head");
+        assert_eq!(q.cancel(other_gen), Some(task(5)));
+        assert!(q.take_result(other_conn).is_none());
+        assert!(q.take_result(other_conn_in_flight).is_none());
+        assert_eq!(q.waiting_len(), 1, "only the other connection's waiter");
+    }
+
     /// `withdraw` frees an entry no submission took, and leaves alone one
     /// that has moved on.
     #[test]

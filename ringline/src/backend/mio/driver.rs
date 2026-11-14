@@ -2140,6 +2140,52 @@ pub(crate) mod tests {
         );
     }
 
+    /// `abort` fails the queued send with `ConnectionAborted` and returns its
+    /// permit, and the close that follows writes nothing: the peer reads a
+    /// reset and none of the queued bytes.
+    #[test]
+    fn abort_writes_nothing_and_resets_the_peer() {
+        use std::io::Read;
+        let config = test_config();
+        let (mut driver, _wake) = test_driver(&config);
+        let (conn_index, mut client) = attach_conn(&mut driver);
+        let idx = conn_index as usize;
+        let conn = token(&driver, conn_index);
+        let id = bounded_ids(1)[0];
+        driver
+            .make_ctx()
+            .send_bounded(conn, b"never sent", id)
+            .expect("admitted");
+        assert_eq!(driver.send_copy_pool.free_count(), 3);
+
+        assert!(driver.abort_connection(conn_index));
+        assert!(!driver.abort_connection(conn_index), "a second abort");
+
+        assert!(driver.pending_sends[idx].is_empty());
+        assert_eq!(driver.send_copy_pool.free_count(), 4, "the permit is back");
+        assert!(driver.pending_closes.contains(&conn_index));
+        let completions = take_completions(&mut driver);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, id);
+        let err = completions[0].1.as_ref().expect_err("the send failed");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(err.to_string(), "connection aborted");
+        let err = driver
+            .make_ctx()
+            .send(conn, b"late")
+            .expect_err("a send after the abort");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+
+        driver.finish_close(conn_index);
+        assert!(!driver.send_queues[idx].aborted, "cleared for the next occupant");
+        let mut buf = [0u8; 64];
+        let read = client.read(&mut buf);
+        assert!(
+            matches!(&read, Err(e) if e.kind() == io::ErrorKind::ConnectionReset),
+            "expected a reset and no bytes: {read:?}"
+        );
+    }
+
     /// `finish_close` disposes of whatever is still queued when the socket
     /// is already gone — the one way teardown reaches its clear with a
     /// non-empty queue (`drain_pending_closes` finalizes on
