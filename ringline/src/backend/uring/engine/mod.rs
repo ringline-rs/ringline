@@ -144,6 +144,11 @@ pub(crate) trait Engine: Sized {
     #[cfg(test)]
     fn force_push_failures(&mut self, count: usize);
 
+    /// Test-only: make the next `count` calls to `push_chain` fail as if the
+    /// queue were still full after a submit.
+    #[cfg(test)]
+    fn force_chain_push_failures(&mut self, count: usize);
+
     /// Test-only: make the next `count` enters that have SQEs to submit fail
     /// with `EAGAIN` and leave the SQEs queued, as the kernel does when it
     /// cannot allocate a request.

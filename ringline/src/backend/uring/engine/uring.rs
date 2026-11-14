@@ -252,6 +252,11 @@ pub(crate) struct UringEngine {
     /// [`Engine::force_push_failures`].
     #[cfg(test)]
     forced_push_failures: usize,
+    /// Test-only: number of upcoming `push_chain` calls that fail as if the
+    /// SQ were still full after a submit. See
+    /// [`Engine::force_chain_push_failures`].
+    #[cfg(test)]
+    forced_chain_push_failures: usize,
     /// Test-only: the next `count` enters that would submit SQEs fail with
     /// `EAGAIN` and leave the SQEs queued, as the kernel does when it cannot
     /// allocate a request.
@@ -622,6 +627,8 @@ impl Engine for UringEngine {
             pbuf_resv_set: false,
             #[cfg(test)]
             forced_push_failures: 0,
+            #[cfg(test)]
+            forced_chain_push_failures: 0,
             #[cfg(test)]
             forced_enter_eagain: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -1133,6 +1140,11 @@ impl Engine for UringEngine {
     }
 
     #[cfg(test)]
+    fn force_chain_push_failures(&mut self, count: usize) {
+        self.forced_chain_push_failures = count;
+    }
+
+    #[cfg(test)]
     fn force_enter_eagain(&mut self, count: usize) {
         *self.forced_enter_eagain.get_mut() = count;
     }
@@ -1151,6 +1163,12 @@ impl Engine for UringEngine {
     }
 
     unsafe fn push_chain(&mut self, sqes: &[Sqe]) -> io::Result<()> {
+        #[cfg(test)]
+        if self.forced_chain_push_failures > 0 {
+            self.forced_chain_push_failures -= 1;
+            crate::metrics::RING.increment(crate::metrics::ring::SQE_SUBMIT_FAILURES);
+            return Err(io::Error::other("forced chain push failure"));
+        }
         // Convert to Entry128 for the Big SQ ring, reusing the scratch to
         // avoid a per-chain heap allocation.
         let mut entries128 = std::mem::take(&mut self.chain_scratch);

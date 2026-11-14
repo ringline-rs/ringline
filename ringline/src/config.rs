@@ -686,10 +686,12 @@ impl Config {
             ));
         }
         // A close pushes its lead (a shutdown or a cancel) and the Close as
-        // one linked pair (#581, #586).
-        if self.sq_entries < 2 || !self.sq_entries.is_power_of_two() {
+        // one linked pair (#581, #586), and `abort` pushes a disconnect ahead
+        // of them as one chain of three, which the engine refuses on an SQ
+        // smaller than the chain.
+        if self.sq_entries < 4 || !self.sq_entries.is_power_of_two() {
             return Err(crate::error::Error::RingSetup(
-                "sq_entries must be at least 2 and a power of two".into(),
+                "sq_entries must be at least 4 and a power of two".into(),
             ));
         }
         // Linux refuses larger queues, and a CQ smaller than the SQ, with
@@ -996,7 +998,7 @@ impl ConfigBuilder {
 
     // ── io_uring settings ────────────────────────────────────────────
 
-    /// Set the number of SQ entries. Must be a power of 2, at least 2 and at
+    /// Set the number of SQ entries. Must be a power of 2, at least 4 and at
     /// most 32768, the largest submission queue Linux allows, and at most
     /// [`cq_entries`](Self::cq_entries). Default: 4096.
     ///
@@ -1800,12 +1802,14 @@ mod tests {
         assert!(config_with(|c| c.sq_entries = 0).validate().is_err());
     }
 
-    /// A close pushes its lead (a shutdown or a cancel) and the Close as one
-    /// linked pair (#581, #586), which a one-entry SQ cannot hold.
+    /// `abort` pushes a disconnect, a close lead and the Close as one chain
+    /// of three, which the engine refuses on a smaller SQ; 4 is the smallest
+    /// power of two that holds it.
     #[test]
-    fn validate_sq_entries_one_rejected() {
+    fn validate_sq_entries_below_four_rejected() {
         assert!(config_with(|c| c.sq_entries = 1).validate().is_err());
-        assert!(config_with(|c| c.sq_entries = 2).validate().is_ok());
+        assert!(config_with(|c| c.sq_entries = 2).validate().is_err());
+        assert!(config_with(|c| c.sq_entries = 4).validate().is_ok());
     }
 
     #[test]

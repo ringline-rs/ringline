@@ -805,9 +805,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         let (fwd, rest) = data.split_at(take);
 
         if !fwd.is_empty() && !self.driver.forward_push(conn_index, fwd) {
-            // Sink gone or its slot recycled. The source itself is still
-            // healthy, so the remaining bytes go to the accumulator and the
-            // handler decides what to do with the EPIPE.
+            // Sink gone, its slot recycled, or aborted. The source itself is
+            // still healthy, so the remaining bytes go to the accumulator and
+            // the handler decides what to do with the EPIPE.
             self.driver.finish_forward(conn_index, Err(libc::EPIPE));
             self.executor.wake_recv(conn_index);
             return self.append_or_close(conn_index, data);
@@ -1553,7 +1553,10 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.driver.send_queues[idx].close_pending,
                 "pending_closes entry {conn_index} without close_pending"
             );
+            // An aborted connection writes nothing more (`finish_close`), so
+            // what is queued does not hold its close.
             let sends_drained = self.driver.pending_sends[idx].is_empty()
+                || self.driver.send_queues[idx].aborted
                 || self.driver.tcp_streams[idx].is_none()
                 || self.driver.send_queues[idx]
                     .close_notify_deadline
@@ -3038,6 +3041,47 @@ mod tests {
             "precondition: slot 0"
         );
         assert_eq!(el.driver.arrival[0].delivered(), 0);
+    }
+
+    /// `abort` on the sink of a running forward: the forward's next push is
+    /// refused, and the sink's close finishes although bytes are still queued
+    /// on it, which `finish_close` does not write.
+    #[test]
+    fn abort_ends_a_forward_into_the_sink_and_its_close_finishes() {
+        let config = test_config();
+        let (mut el, _wake) = test_loop(&config);
+        let (source, _client) = attach_conn(&mut el.driver);
+        let (sink, _sink_client) = attach_conn(&mut el.driver);
+        el.driver.forward_conn[source as usize] =
+            Some(crate::backend::mio::driver::MioForwardState {
+                sink_index: sink,
+                sink_generation: el.driver.connections.generation(sink),
+                len: 1 << 30,
+                forwarded: 0,
+            });
+        el.driver.forward_feeder[sink as usize] = Some(source);
+        let chunk = vec![0u8; 1 << 16];
+        assert!(el.driver.forward_push(source, &chunk));
+
+        assert!(el.driver.abort(sink));
+        assert!(
+            !el.driver.forward_push(source, &chunk),
+            "a forward into an aborted sink is refused"
+        );
+        // Queued directly, past the `closing_refusal` an aborted connection's
+        // sends get, to stand for anything left on the queue at the drain.
+        el.driver.pending_sends[sink as usize].push_back(
+            crate::backend::mio::driver::PendingSend::plain(chunk.clone()),
+        );
+        el.drain_pending_closes();
+        assert!(
+            !el.driver.pending_closes.contains(&sink),
+            "the aborted sink's close did not finish"
+        );
+        assert_eq!(
+            el.driver.forward_done[source as usize],
+            Some(Err(libc::EPIPE))
+        );
     }
 
     /// A forward source re-read by `drain_forward_resumes` is read in a batch

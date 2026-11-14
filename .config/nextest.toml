@@ -48,6 +48,12 @@ threads-required = "num-test-threads"
 filter = 'binary(half_closed_send_wait)'
 threads-required = "num-test-threads"
 
+# Holds a zero-copy send to a peer that does not read until `abort`, and
+# skips its timing check if RLIMIT_MEMLOCK turns the send to a plain send.
+[[profile.default.overrides]]
+filter = 'binary(abort)'
+threads-required = "num-test-threads"
+
 # Holds a zero-copy send to a peer that does not read through worker exit.
 [[profile.default.overrides]]
 filter = 'binary(shutdown_zero_copy) | test(a_stopped_worker_holds_a_guard)'

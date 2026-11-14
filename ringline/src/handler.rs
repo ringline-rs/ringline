@@ -102,6 +102,37 @@ pub(crate) struct ConnSendState {
     /// connection's `close_notify_sent`.
     #[cfg(has_io_uring)]
     pub close_notify_pending: Option<Vec<u8>>,
+    /// `abort` ran for the current occupant (`SendHalf::abort`). Every send
+    /// started afterwards is refused with `ConnectionAborted`
+    /// ([`closing_refusal`](Self::closing_refusal)), and on mio the close
+    /// skips the flush and the close_notify. Cleared by `reset_send_state`
+    /// at slot reactivation (io_uring) and by `finish_close` (mio).
+    pub aborted: bool,
+    /// The state of the disconnect `abort` submits on a TCP connection.
+    /// io_uring only.
+    #[cfg(has_io_uring)]
+    pub disconnect: Disconnect,
+}
+
+/// The `IORING_OP_CONNECT` with an `AF_UNSPEC` address that `abort` submits
+/// on a TCP connection: it resets the socket and purges its write queue, so
+/// the zero-copy notifications of its sends land without waiting for the
+/// fixed file's release.
+#[cfg(has_io_uring)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Disconnect {
+    /// No disconnect is pending: no abort, a Unix-domain connection, the
+    /// chain carrying it was pushed, or a lone one has completed.
+    None,
+    /// The disconnect goes first in the `Close`'s chain:
+    /// `submit_committed_close` pushes the disconnect, the close lead and the
+    /// `Close` as one hard-linked chain, and retries the chain as a whole.
+    WithClose,
+    /// A `Shutdown` from `shutdown_write` was in flight at the abort, so the
+    /// disconnect was submitted on its own: it is in the kernel or on
+    /// `Driver::pending_disconnect_retries`. `try_finalize_close` holds the
+    /// `Close` until its completion, which sets `None`.
+    Alone,
 }
 
 /// The state of a connection's `SendPollOut`.
@@ -137,8 +168,33 @@ impl ConnSendState {
             on_send_backstop: false,
             #[cfg(has_io_uring)]
             close_notify_pending: None,
+            aborted: false,
+            #[cfg(has_io_uring)]
+            disconnect: Disconnect::None,
         }
     }
+
+    /// The error a new send on this connection fails with, if it is refused:
+    /// `ConnectionAborted` after `abort`, and `NotConnected` once the `Close`
+    /// is committed (a new send SQE would race it, and a parked one would
+    /// never be re-driven).
+    pub(crate) fn closing_refusal(&self) -> Option<io::Error> {
+        if self.aborted {
+            Some(aborted_error())
+        } else if self.close_submitted {
+            Some(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection closing",
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// The error of a send or receive that `abort` ended.
+pub(crate) fn aborted_error() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, "connection aborted")
 }
 
 /// Identifies a connection, from `id()` on [`Connection`](crate::Connection), its
@@ -554,15 +610,12 @@ impl<'a> DriverCtx<'a> {
                 "stale connection",
             ));
         }
-        // Close already submitted — a new send SQE would race it, and a
-        // parked one would never be re-driven (the retry drain skips
-        // connections whose Close is committed). Same refusal as
+        // Aborted, or the Close already submitted — a new send SQE would
+        // race it, and a parked one would never be re-driven (the retry
+        // drain skips connections whose Close is committed). Same refusal as
         // `send_parts` and `send_chain`.
-        if self.send_queues[conn.index as usize].close_submitted {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "connection closing",
-            ));
+        if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
+            return Err(e);
         }
 
         if !self.tls_table.is_null() {
@@ -669,7 +722,7 @@ impl<'a> DriverCtx<'a> {
     /// operation's identity onto the slot whose completion settles it.
     ///
     /// Byte-for-byte `send` — the same generation check, the
-    /// same `close_submitted` refusal, the same two `reserve_slots` error
+    /// same `closing_refusal`, the same two `reserve_slots` error
     /// mappings, the same TLS branch, the same chunk loop — plus one thing:
     /// `id` and the **logical (plaintext) length** are attached to the
     /// final slot, so the completion handler can resolve exactly this
@@ -717,15 +770,12 @@ impl<'a> DriverCtx<'a> {
                 "stale connection",
             ));
         }
-        // Close already submitted: same refusal, kind and message as `send`
-        // — a new send SQE would race the Close, and a parked one would
-        // never be re-driven. Nothing was reserved yet, so the caller owns
-        // the failure and no completion for `id` is coming.
-        if self.send_queues[conn.index as usize].close_submitted {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "connection closing",
-            ));
+        // Aborted, or the Close already submitted: the same refusal as
+        // `send` (`ConnSendState::closing_refusal`). Nothing was reserved
+        // yet, so the caller owns the failure and no completion for `id` is
+        // coming.
+        if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
+            return Err(e);
         }
 
         // SAFETY: read-only probe; see the `tls_table` field's contract.
@@ -2531,6 +2581,11 @@ impl<'a> DriverCtx<'a> {
                 "stale connection",
             ));
         }
+        // As the io_uring `send`. Of the two flags `closing_refusal` reads,
+        // mio sets only `aborted`.
+        if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
+            return Err(e);
+        }
 
         // TLS path: encrypt and push ciphertext into the pending send queue.
         let tls = !self.tls_table.is_null() && unsafe { (*self.tls_table).has(conn.index) };
@@ -2606,16 +2661,13 @@ impl<'a> DriverCtx<'a> {
                 "stale connection",
             ));
         }
-        // Same refusal, kind and message as the io_uring `send`. The flag is
-        // only ever set by the io_uring close path, so this is inert on mio
-        // today (a mio close defers teardown until `pending_sends` drains,
-        // and `clear_pending_sends` fails whatever is still queued); the
-        // check stays so the two entry points cannot drift.
-        if self.send_queues[conn.index as usize].close_submitted {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "connection closing",
-            ));
+        // Same refusal, kind and message as the io_uring `send`. On mio only
+        // `abort` sets a flag it reads: `close_submitted` is set by the
+        // io_uring close path alone (a mio close defers teardown until
+        // `pending_sends` drains, and `clear_pending_sends` fails whatever is
+        // still queued).
+        if let Some(e) = self.send_queues[conn.index as usize].closing_refusal() {
+            return Err(e);
         }
 
         let idx = conn.index as usize;
@@ -3561,7 +3613,8 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
     ///
     /// A batch with no parts, or whose parts carry no bytes, queues nothing
     /// and returns `Ok(())` on a live connection; a stale or closing
-    /// connection is reported as `NotConnected`, as for any batch.
+    /// connection is reported as `NotConnected`, or `ConnectionAborted` after
+    /// `abort`, as for any batch.
     pub fn submit(mut self) -> io::Result<()> {
         if let Some(e) = self.error.take() {
             return Err(e);
@@ -3579,12 +3632,10 @@ impl<'b, 'a> SendBuilder<'b, 'a> {
                 "stale connection",
             ));
         }
-        // Close already submitted — a new send SQE would race it.
-        if self.ctx.send_queues[self.conn.index as usize].close_submitted {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "connection closing",
-            ));
+        // Aborted, or the Close already submitted — a new send SQE would
+        // race it.
+        if let Some(e) = self.ctx.send_queues[self.conn.index as usize].closing_refusal() {
+            return Err(e);
         }
 
         // Nothing to send: build no SQE. A zero-length Send SQE completes
@@ -4097,13 +4148,10 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
             ));
         }
 
-        // Close already submitted — chain SQEs would race it. finished stays
-        // false so Drop releases the built entries' resources.
-        if self.ctx.send_queues[conn_index as usize].close_submitted {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "connection closing",
-            ));
+        // Aborted, or the Close already submitted — chain SQEs would race it.
+        // finished stays false so Drop releases the built entries' resources.
+        if let Some(e) = self.ctx.send_queues[conn_index as usize].closing_refusal() {
+            return Err(e);
         }
 
         // Plain sends queued, in flight or parked, or another chain active:
@@ -4169,11 +4217,8 @@ impl<'b, 'a> SendChainBuilder<'b, 'a> {
                 "stale connection",
             ));
         }
-        if self.ctx.send_queues[conn.index as usize].close_submitted {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "connection closing",
-            ));
+        if let Some(e) = self.ctx.send_queues[conn.index as usize].closing_refusal() {
+            return Err(e);
         }
         let sends = self.ctx.encrypt_tls_send(conn, &plaintext)?;
         if let Some(id) = self.send_id {

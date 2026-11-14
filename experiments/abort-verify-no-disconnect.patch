@@ -1,0 +1,15 @@
+diff --git a/ringline/src/backend/uring/ring.rs b/ringline/src/backend/uring/ring.rs
+index 26512ee0..41ce4f56 100644
+--- a/ringline/src/backend/uring/ring.rs
++++ b/ringline/src/backend/uring/ring.rs
+@@ -606,6 +606,10 @@ impl Ring {
+         generation: u32,
+         lead: CloseLead,
+     ) -> io::Result<()> {
++        // Mutation for experiments/abort-verify.toml: no disconnect.
++        if conn_index != u32::MAX {
++            return self.submit_close(conn_index, generation, lead);
++        }
+         let disconnect = Self::disconnect_sqe(conn_index, generation).link(Link::Hard);
+         let close = Self::close_sqe(conn_index, generation);
+         match self.close_lead_sqe(conn_index, lead) {
