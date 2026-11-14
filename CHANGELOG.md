@@ -383,17 +383,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `IORING_OP_FIXED_FD_INSTALL` (6.8), which park uses. Debian 12 (6.1) and
   Amazon Linux 2023's 6.1 kernel are below the floor; Ubuntu 24.04's 6.8
   kernel is not.
-- **Breaking:** `ConfigBuilder::sq_entries` must be at least 4, up from 1:
-  a connection's close pushes its lead and the `Close` as a linked pair
-  (#581), and `abort` pushes a chain of three linked operations, which a
-  smaller submission queue cannot take. A config with 1, 2 or 3 fails
-  validation with `Error::RingSetup` on both backends. The default, 4096, and
-  the sizes launch fits to `RLIMIT_MEMLOCK` (at least 64) are unchanged.
+- **Breaking:** `ConfigBuilder::sq_entries` must be at least 4, up from 1: a
+  connection's close pushes a shutdown or a cancel linked to its `Close`
+  (#581, #586), and `abort` pushes a chain of three linked operations, which a
+  smaller submission queue cannot take. A config with 1 or 2 fails validation
+  with `Error::RingSetup` on both backends. The default, 4096, and the sizes
+  launch fits to `RLIMIT_MEMLOCK` (at least 64) are above the minimum.
 - On io_uring a bounded send (`send_admitted`, `send_backpressured`) on a
   connection whose `Close` is committed fails with `NotConnected` before it
-  joins the send-capacity FIFO. Before, it joined the FIFO and was refused
-  when it won capacity, and on a connection whose write half was also shut
-  down it failed with `BrokenPipe`.
+  joins the send-capacity FIFO, as it already did on a TLS connection whose
+  close_notify was queued. Before, it joined the FIFO and was refused when it
+  won capacity, and on a connection whose write half was also shut down it
+  failed with `BrokenPipe`.
 - `fs::fsync` waits for every write submitted before it through the same
   handle (#905). Before, an fsync submitted while a
   write to the file was still in flight ran alongside it and could complete

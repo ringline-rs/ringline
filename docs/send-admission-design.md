@@ -566,6 +566,7 @@ Section 2 adds API and changes no existing behaviour.
 Section 3 raises the smallest `sq_entries` from 2 to 4, the smallest power of
 two that holds `abort`'s chain of three: a config with 2 now fails validation.
 On io_uring a bounded send on a connection whose `Close` is committed now
-fails with `NotConnected` before it joins the FIFO. Before, it joined the FIFO
-and was refused when it won capacity, and with the write half also shut down
-it failed with `BrokenPipe`.
+fails with `NotConnected` before it joins the FIFO, as it already did on a TLS
+connection whose close_notify was queued. Before, it joined the FIFO and was
+refused when it won capacity, and with the write half also shut down it failed
+with `BrokenPipe`.
