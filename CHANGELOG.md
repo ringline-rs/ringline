@@ -61,9 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   count; and `cqe_dropped_reported`, enters that returned `EBADR`.
 - `fs::symlink_metadata`, which returns the metadata of a symbolic link
   itself (`lstat`; on io_uring a statx with `AT_SYMLINK_NOFOLLOW`).
-  `fs::stat` follows the link, as before, so `Metadata::is_symlink` from it is
-  always false; `symlink_metadata` is the only way to get `true`. The fields
-  of `Metadata` are now documented (#863).
+  `fs::stat` follows the link, as before, so `Metadata::is_symlink()` from it
+  is always false; `symlink_metadata` is the only way to get `true` (#863).
 - `ConfigBuilder::tls_handshake_timeout`, default 10 s, greater than zero and
   at most 60 s. A TLS connection whose handshake has not completed within it
   is closed: inbound, from its worker registering it; outbound, from the TCP
@@ -341,6 +340,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** `fs::Metadata`'s fields are private, read through accessors
+  (#894): `len()` (was `size`), `is_empty()`, `mode()`, `uid()`, `gid()`,
+  `is_file()`, `is_dir()`, `is_symlink()`, and `accessed()`, `modified()`
+  and `status_changed()` (were `atime`, `mtime` and `ctime`), which return a
+  `SystemTime` instead of a `Duration` since the epoch. A time before 1970
+  is now represented: its negative seconds were cast to `u64` and wrapped,
+  so -1 s read as about 584 billion years after the epoch, on both
+  backends. A time `SystemTime` cannot represent reads as the epoch.
 - io_uring: `fs::close` and `close_nvme_device` close the fixed-file slot
   with an `IORING_OP_CLOSE` submission instead of a synchronous
   `IORING_REGISTER_FILES_UPDATE` call on the worker (#845). The handle is

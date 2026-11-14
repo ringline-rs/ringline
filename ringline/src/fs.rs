@@ -112,7 +112,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
 
@@ -256,48 +256,94 @@ impl std::ops::BitOr for OpenFlags {
 /// File metadata returned by [`stat()`] and [`symlink_metadata()`].
 #[derive(Debug, Clone)]
 pub struct Metadata {
-    /// Size in bytes (`st_size`). For a symbolic link from
-    /// [`symlink_metadata()`], the length of the path it holds.
-    pub size: u64,
-    /// `st_mode`: the file type bits (`S_IFMT`), the setuid, setgid and
-    /// sticky bits, and the permission bits.
-    pub mode: u32,
-    /// Owner's user ID.
-    pub uid: u32,
-    /// Owner's group ID.
-    pub gid: u32,
-    /// Last access time, as the time since the Unix epoch. A time before 1970
-    /// has negative seconds, which are cast to `u64` and wrap.
-    pub atime: Duration,
-    /// Last modification time, as the time since the Unix epoch. A time before
-    /// 1970 has negative seconds, which are cast to `u64` and wrap.
-    pub mtime: Duration,
-    /// Last status change time, as the time since the Unix epoch. A time before
-    /// 1970 has negative seconds, which are cast to `u64` and wrap.
-    pub ctime: Duration,
-    /// A regular file.
-    pub is_file: bool,
-    /// A directory.
-    pub is_dir: bool,
-    /// A symbolic link. Only [`symlink_metadata()`] reports one; [`stat()`]
-    /// follows the link.
-    pub is_symlink: bool,
+    len: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    accessed: SystemTime,
+    modified: SystemTime,
+    status_changed: SystemTime,
+    is_file: bool,
+    is_dir: bool,
+    is_symlink: bool,
 }
 
 impl Metadata {
+    /// Size in bytes (`st_size`). For a symbolic link from
+    /// [`symlink_metadata()`], the length of the path it holds.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the size is 0.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// `st_mode`: the file type bits (`S_IFMT`), the setuid, setgid and
+    /// sticky bits, and the permission bits.
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    /// Owner's user ID.
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    /// Owner's group ID.
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    /// Last access time (`st_atime`). Times before 1970 are represented.
+    pub fn accessed(&self) -> SystemTime {
+        self.accessed
+    }
+
+    /// Last modification time (`st_mtime`). Times before 1970 are
+    /// represented.
+    pub fn modified(&self) -> SystemTime {
+        self.modified
+    }
+
+    /// Last status change time (`st_ctime`). Times before 1970 are
+    /// represented.
+    pub fn status_changed(&self) -> SystemTime {
+        self.status_changed
+    }
+
+    /// A regular file.
+    pub fn is_file(&self) -> bool {
+        self.is_file
+    }
+
+    /// A directory.
+    pub fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+
+    /// A symbolic link. Only [`symlink_metadata()`] reports one; [`stat()`]
+    /// follows the link.
+    pub fn is_symlink(&self) -> bool {
+        self.is_symlink
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn from_statx(stx: &libc::statx) -> Self {
+        let time = |t: libc::statx_timestamp| epoch_time(t.tv_sec, i64::from(t.tv_nsec));
+        let kind = stx.stx_mode & libc::S_IFMT as u16;
         Metadata {
-            size: stx.stx_size,
+            len: stx.stx_size,
             mode: stx.stx_mode as u32,
             uid: stx.stx_uid,
             gid: stx.stx_gid,
-            atime: Duration::new(stx.stx_atime.tv_sec as u64, stx.stx_atime.tv_nsec),
-            mtime: Duration::new(stx.stx_mtime.tv_sec as u64, stx.stx_mtime.tv_nsec),
-            ctime: Duration::new(stx.stx_ctime.tv_sec as u64, stx.stx_ctime.tv_nsec),
-            is_file: (stx.stx_mode & libc::S_IFMT as u16) == libc::S_IFREG as u16,
-            is_dir: (stx.stx_mode & libc::S_IFMT as u16) == libc::S_IFDIR as u16,
-            is_symlink: (stx.stx_mode & libc::S_IFMT as u16) == libc::S_IFLNK as u16,
+            accessed: time(stx.stx_atime),
+            modified: time(stx.stx_mtime),
+            status_changed: time(stx.stx_ctime),
+            is_file: kind == libc::S_IFREG as u16,
+            is_dir: kind == libc::S_IFDIR as u16,
+            is_symlink: kind == libc::S_IFLNK as u16,
         }
     }
 
@@ -308,31 +354,41 @@ impl Metadata {
     #[cfg(not(has_io_uring))]
     #[allow(clippy::unnecessary_cast)]
     pub(crate) fn from_stat(st: &libc::stat) -> Self {
-        #[cfg(target_os = "macos")]
-        let (atime, mtime, ctime) = (
-            Duration::new(st.st_atime as u64, st.st_atime_nsec as u32),
-            Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32),
-            Duration::new(st.st_ctime as u64, st.st_ctime_nsec as u32),
-        );
-        #[cfg(target_os = "linux")]
-        let (atime, mtime, ctime) = (
-            Duration::new(st.st_atime as u64, st.st_atime_nsec as u32),
-            Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32),
-            Duration::new(st.st_ctime as u64, st.st_ctime_nsec as u32),
-        );
+        let time = |secs, nsecs| epoch_time(secs as i64, nsecs as i64);
         Metadata {
-            size: st.st_size as u64,
+            len: st.st_size as u64,
             mode: st.st_mode as u32,
             uid: st.st_uid,
             gid: st.st_gid,
-            atime,
-            mtime,
-            ctime,
+            accessed: time(st.st_atime, st.st_atime_nsec),
+            modified: time(st.st_mtime, st.st_mtime_nsec),
+            status_changed: time(st.st_ctime, st.st_ctime_nsec),
             is_file: (st.st_mode & libc::S_IFMT) == libc::S_IFREG,
             is_dir: (st.st_mode & libc::S_IFMT) == libc::S_IFDIR,
             is_symlink: (st.st_mode & libc::S_IFMT) == libc::S_IFLNK,
         }
     }
+}
+
+/// The time `secs` seconds and `nsecs` nanoseconds after the Unix epoch.
+/// `secs` is negative for a time before 1970. Linux keeps `nsecs` in
+/// `[0, 10^9)`, so -1 s and 5 ns is 999,999,995 ns before the epoch; Apple
+/// platforms can report a negative `nsecs` with `secs` rounded toward zero
+/// (0 s and -900,000,000 ns for 0.9 s before the epoch, where Linux reports
+/// -1 s and 100,000,000 ns), which is normalised first. A time `SystemTime`
+/// cannot represent is reported as the epoch.
+fn epoch_time(secs: i64, nsecs: i64) -> SystemTime {
+    const NS: i64 = 1_000_000_000;
+    secs.checked_add(nsecs.div_euclid(NS))
+        .and_then(|s| {
+            if s >= 0 {
+                UNIX_EPOCH.checked_add(Duration::from_secs(s as u64))
+            } else {
+                UNIX_EPOCH.checked_sub(Duration::from_secs(s.unsigned_abs()))
+            }
+        })
+        .and_then(|t| t.checked_add(Duration::from_nanos(nsecs.rem_euclid(NS) as u64)))
+        .unwrap_or(UNIX_EPOCH)
 }
 
 /// Configuration for async filesystem I/O.
@@ -1461,6 +1517,35 @@ pub fn mkdir(path: impl AsRef<std::path::Path>, mode: u32) -> io::Result<DiskIoF
 
 #[cfg(test)]
 mod tests {
+    use super::epoch_time;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn epoch_time_represents_times_before_1970() {
+        assert_eq!(epoch_time(0, 0), UNIX_EPOCH);
+        assert_eq!(epoch_time(10, 5), UNIX_EPOCH + Duration::new(10, 5));
+        // -1 s and 5 ns: the kernel keeps nanoseconds non-negative.
+        assert_eq!(
+            epoch_time(-1, 5),
+            UNIX_EPOCH - Duration::from_nanos(999_999_995)
+        );
+        // 1960-01-01T00:00:00Z.
+        assert_eq!(
+            epoch_time(-315_619_200, 0),
+            UNIX_EPOCH - Duration::from_secs(315_619_200)
+        );
+        // Apple's form of 0.9 s before the epoch: seconds rounded toward
+        // zero and a negative nanosecond field.
+        assert_eq!(
+            epoch_time(0, -900_000_000),
+            UNIX_EPOCH - Duration::from_millis(900)
+        );
+        assert_eq!(
+            epoch_time(-1, -500_000_000),
+            UNIX_EPOCH - Duration::from_millis(1500)
+        );
+    }
+
     use super::*;
 
     #[test]
