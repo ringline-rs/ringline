@@ -262,7 +262,7 @@ releasing their pool slots and slab entries. The contract the caller needs:
   `ConnectionAborted` too;
 - a parked reader gets `ConnectionAborted`;
 - no close_notify is sent, and on mio the queue is not flushed first
-  (`finish_close` flushes and writes the alert, mio driver.rs:738-785);
+  (`finish_close` flushes and writes the alert, mdriver.rs:738-785);
 - it applies to a connection that is already closing, which is problem 4's
   case, and does nothing once the connection's `Close` has been committed;
 - callers use it in place of `close()` for a peer that has stopped reading.
@@ -309,12 +309,14 @@ connection, plain or TLS:
    (`handle_hangup_poll`, uloop.rs:1559; `handle_recv_direct`,
    uloop.rs:1236).
 2. Its queued sends and its waiting bounded sends fail with
-   `ConnectionAborted` and release their pool slots, and a close_notify the
-   pool retained is dropped, as `force_finalize_close` drops them
-   (udriver.rs:2070-2110). `close_submitted` is set and `close_pending`
-   cleared, as `try_finalize_close` does (udriver.rs:2003-2009), so the end of
-   the iteration does not submit a second `Close`. A `SendPollOut` is
+   `ConnectionAborted` and release their pool slots, an active send chain's
+   accounting is cancelled, and a close_notify the pool retained is dropped,
+   as `force_finalize_close` does (udriver.rs:2070-2110). A `SendPollOut` is
    cancelled first, as `submit_committed_close` does (udriver.rs:2024-2033).
+   When step 3 pushes the whole chain, `close_submitted` is set and
+   `close_pending` cleared, as `try_finalize_close` does
+   (udriver.rs:2003-2009), so the end of the iteration does not submit a
+   second `Close`.
 3. An `IORING_OP_CONNECT` with an `AF_UNSPEC` address, the connection's
    normal close lead (`close_lead_for`, ring.rs:83) and the `Close` are pushed
    as one hard-linked chain of three through `Engine::push_chain`
@@ -323,13 +325,21 @@ connection, plain or TLS:
    ignores the result as the close leads' handlers do, so that it does not
    reach `handle_connect` (`submit_connect`, ring.rs:617). `push_chain`
    refuses a chain longer than the SQ, so config validation raises the SQ
-   minimum to 4. If a `Shutdown` lead of an earlier close is still in the
-   kernel, the `Close` must wait for it, because the `Close` frees the slot
-   the `Shutdown` names (udriver.rs:1987-1993, #518). In that case only the
-   connect is pushed at once, since it frees nothing, and the `Shutdown`'s
-   completion commits the lead and `Close` as it does today.
+   minimum to 4. If a `shutdown_write` `Shutdown` is still in the kernel
+   (`shutdown_inflight`, udriver.rs:2189), the `Close` must wait for it,
+   because the `Close` frees the slot it names (udriver.rs:1987-1993, #518).
+   Then only the connect is pushed at once, since it frees nothing,
+   `close_pending` stays set, and the `Shutdown`'s completion
+   (`handle_shutdown`, uloop.rs:2800-2815) reaches `try_finalize_close`, which
+   commits the lead and `Close` through `submit_committed_close`. The queue and
+   any retained close_notify are already gone, so nothing is sent ahead of
+   them. A refused chain, or a refused lone connect, is retried as itself: the
+   retry entry records that the close is an abort, so `drain_close_retries`
+   (uloop.rs:4935-4941) does not fall back to the lead-and-`Close` pair, which
+   would leave the zero-copy entries held.
 4. On TCP the disconnect returns 0 for an established, closing or
-   peer-reset socket. It sends an RST and purges the socket's write queue,
+   peer-reset socket. It sends an RST unless the socket is already closed,
+   and purges the socket's write queue,
    so the zero-copy notifications land and the slab entries and their paired
    pool slots are released. Only errors before the protocol is reached, such
    as `EBADF`, fail it. This is from the Linux 6.8 source (`tcp_disconnect`
@@ -351,7 +361,7 @@ Experiment A did not test a disconnect on a Unix-domain socket.
 On mio, `abort` drops the queue on the open connection, as
 `fail_connection_on_send_error` does (mio event_loop.rs:1341), returns the
 queued sends' permits, sets `SO_LINGER {1, 0}` on the socket and closes it,
-skipping `finish_close`'s flush and close_notify (mio driver.rs:738-785). The
+skipping `finish_close`'s flush and close_notify (mdriver.rs:738-785). The
 socket is a normal descriptor there, so the setsockopt and close reset it on
 every kernel; Experiment A did not cover mio.
 

@@ -182,8 +182,9 @@ tables above in every arm:
 - A connection's own pending request holds its socket on every kernel, 7.2
   included. A `Close` alone, or with `SO_LINGER`, released nothing while the
   target's hangup poll was pending.
-- Closing every connection at once, each with its requests cancelled, released
-  them all within milliseconds on every kernel. Worker exit cancels every
+- Closing every connection at once, each with its requests cancelled,
+  released the target within milliseconds on every kernel, and every idle
+  client read `ECONNRESET`. Worker exit cancels every
   connection's requests too, but closes a connection that still holds a
   zero-copy entry with the `Abort` lead only after 1 s (`ABORT_AFTER`), so its
   exit takes longer than the batch arm; that is unchanged here.
@@ -211,5 +212,6 @@ tables above in every arm:
   sender's kernel holds. A probe that measures when a zero-copy notification
   lands must observe the peer without consuming from it (`TCP_INFO` here).
 - Reopen this if `abort` has to support a kernel outside 6.8, 6.12 and 7.2
-  whose behaviour differs, if ringline adds kTLS (a TLS ULP could refuse the
-  disconnect), or if a Unix-domain `abort` needs to reset its peer.
+  whose behaviour differs, if ringline adds kTLS (a disconnect on a socket
+  with the TLS ULP was not tried), or if a Unix-domain `abort` needs to reset
+  its peer.
