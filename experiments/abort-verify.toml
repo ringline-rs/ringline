@@ -59,8 +59,11 @@ echo 1 > /tmp/job/status
   cargo --version
   ulimit -Sn 65536
   echo "memlock=$(ulimit -l)"
-  git clone -q {repo} /tmp/job/src || exit 1
-  cd /tmp/job/src && git checkout -q {ref} || exit 1
+  # On disk, not in /tmp: /tmp is tmpfs on these images, and a target
+  # directory there runs the guest out of memory.
+  export CARGO_BUILD_JOBS=8
+  git clone -q {repo} "$HOME/src" || exit 1
+  cd "$HOME/src" && git checkout -q {ref} || exit 1
   git log --oneline -1
 
   # A mio build would run none of the code under test.
