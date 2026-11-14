@@ -1,6 +1,6 @@
 #![allow(clippy::manual_async_fn)]
 //! Integration tests: `AsyncSendBuilder::submit_batch_await` delivers the
-//! batch byte-exactly *and* resolves its `SendFuture`.
+//! batch byte-exactly *and* resolves its `SendCompletion`.
 //!
 //! The awaited variant exists so a caller can pace itself against send
 //! completion instead of firing and forgetting. Awaiting `yield_now` is not

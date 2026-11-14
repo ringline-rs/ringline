@@ -2295,7 +2295,7 @@ fn multi_worker_graceful_shutdown() {
 // ── Awaitable send tests ────────────────────────────────────────────
 
 /// Handler that tests send_await: sends a known payload via send_await
-/// and reports the byte count from the SendFuture.
+/// and reports the byte count from the SendCompletion.
 struct SendAwaitHandler;
 
 impl AsyncEventHandler for SendAwaitHandler {
@@ -2695,7 +2695,7 @@ impl AsyncEventHandler for JoinHandler {
 
             // Two sends in flight at once, from the one owned write half.
             //
-            // `send` returns an owned `SendFuture`, so the `&mut tx` borrow
+            // `send` returns an owned `SendCompletion`, so the `&mut tx` borrow
             // ends at the call — arming both and joining them needs no shared
             // handle. Single *ownership* was never the same thing as one
             // operation at a time; the per-connection send queue is what keeps

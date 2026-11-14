@@ -305,7 +305,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once. `with_data` is unchanged and still reports `0` for both. First PR of
   the series that lands #318 (design:
   `docs/backpressured-sends-series-design.md`).
-- `SendHalf::send_backpressured` and `BackpressuredSendFuture`: a send that
+- `SendHalf::send_backpressured` and `BackpressuredSend`: a send that
   waits for send-pool capacity instead of failing when the pool is full.
   Admission is first-come-first-served per worker, so a large message cannot
   be starved by a stream of small ones, and a message that could never fit
@@ -482,6 +482,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and landed in worker 1's file. Use a handle on the worker that opened it, or
   open the file on each worker that needs it. A handler can still keep a
   handle in a field, since `AsyncEventHandler` no longer requires `Send`.
+- **Breaking:** `SendFuture` is renamed `SendCompletion` and is no longer
+  `Send`. It holds a connection index, a generation and a completion-table
+  entry id, which name slots on the worker that created it, and a poll or
+  drop on another worker acted on that worker's slots. Await it on the worker
+  that created it. The old name has no alias; `mpsc::SendFuture` keeps its
+  name. `AsyncSendBuilder` is no longer `Send` for the same reason: one made
+  on worker 0 and used on worker 1 sent on worker 1's connection, to a
+  different client. `BackpressuredSend` (renamed from
+  `BackpressuredSendFuture`) and `ForwardFuture` are no longer `Send`: a
+  `send_backpressured` future made on worker 0 and awaited on worker 1 sent
+  its bytes to worker 1's client and resolved `Ok`. No released version has
+  those two, so that part affects only callers tracking `main`. Design:
+  `docs/send-admission-design.md`, section 1.
 - mio: on Linux TCP, a drain no longer ends with a read that returns `EAGAIN`, which
   takes an echo from 2 reads per operation to 1, as tokio does. A read that leaves
   its buffer unfilled ends the drain, unless the event reports the read side closed
@@ -783,7 +796,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `send_backpressured` the ciphertext on mio. A copy or zero-copy send
   whose completion reports zero bytes now resolves with a
   `WriteZero` error instead of `Ok(0)`, as `send_backpressured` already did.
-  A `SendFuture` polled again after it resolved panics; it used to return
+  A `SendCompletion` polled again after it resolved panics; it used to return
   `Pending` (#617).
 
 - The per-operation completion counters (`op` label) for io_uring remove
@@ -1398,7 +1411,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reports none. Audit finding F11 of
   `docs/journal/2026-11-connection-close-audit.md`.
 
-- A `SendFuture` handed to another task resolves with the send's own result
+- A `SendCompletion` handed to another task resolves with the send's own result
   however late that task first polls it. The creating connection task's
   return, and its connection's release, treated every completion-table
   entry the task owned as dead with the task, so an entry whose future was
@@ -1596,7 +1609,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `SendHalf` that outlives the reader task on the same connection. Found by
   the send-path audit (`docs/journal/2026-11-send-path-audit.md`, F2).
 
-- A `SendFuture` created by one task and first polled by another after the
+- A `SendCompletion` created by one task and first polled by another after the
   creating connection task returned resolves. The creating task's return
   abandoned the send's completion-table entry, since its recorded owner was
   the dead task, and the poll from the task the future was handed to did not

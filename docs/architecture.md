@@ -204,7 +204,7 @@ decrypted plaintext into the accumulator. `with_bytes` provides zero-copy
 slicing of the accumulator, not a reference to kernel-owned ring memory.
 
 `send_nowait` eagerly submits an owned copy and returns without a future.
-`send` also submits eagerly but returns `SendFuture`, which waits for the
+`send` also submits eagerly but returns `SendCompletion`, which waits for the
 logical send's completion. Neither form bypasses backend completion handling:
 the completion is required to release pool or slab resources and advance the
 queue. On io_uring, `send_parts` can retain guarded user memory for zero-copy
