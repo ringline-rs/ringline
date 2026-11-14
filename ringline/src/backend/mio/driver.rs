@@ -888,8 +888,8 @@ impl Driver {
         );
     }
 
-    /// Queue forwarded bytes on the sink. Returns false if the sink is gone or
-    /// its slot was recycled, which fails the forward.
+    /// Queue forwarded bytes on the sink. Returns false if the sink is gone,
+    /// its slot was recycled or it was aborted, which fails the forward.
     pub(crate) fn forward_push(&mut self, source: u32, data: &[u8]) -> bool {
         let Some(st) = self.forward_conn[source as usize].as_ref() else {
             return false;
@@ -897,6 +897,7 @@ impl Driver {
         let (sink, sink_gen) = (st.sink_index, st.sink_generation);
         if self.connections.generation(sink) != sink_gen
             || self.tcp_streams[sink as usize].is_none()
+            || self.send_queues[sink as usize].aborted
         {
             return false;
         }

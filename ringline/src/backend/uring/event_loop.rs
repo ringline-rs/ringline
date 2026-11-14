@@ -2816,9 +2816,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// `abort`'s disconnect has completed. Its result is ignored, as the
-    /// close leads' are: the `Close` runs whatever the disconnect returned. A
-    /// lone one
-    /// (`Disconnect::Alone`) held the `Close`, which frees the slot it names,
+    /// close leads' are: the `Close` runs whatever the disconnect returned.
+    /// A lone one (`Disconnect::Alone`) held the `Close`, which frees the slot
+    /// it names,
     /// so this releases the hold and registers the connection for the
     /// end-of-iteration drain, as `handle_shutdown` does. One chained ahead
     /// of a `Close` changes nothing here, and neither does one whose slot has

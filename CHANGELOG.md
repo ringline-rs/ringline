@@ -369,8 +369,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking:** `ConfigBuilder::sq_entries` must be at least 4, up from 2:
   `abort` pushes a chain of three linked operations, which a smaller
   submission queue cannot take. A config with 2 fails validation with
-  `Error::RingSetup` on both backends, since validation is shared. The default, 4096, and the sizes launch fits to
-  `RLIMIT_MEMLOCK` (at least 64) are unchanged.
+  `Error::RingSetup` on both backends. The default, 4096, and the sizes launch
+  fits to `RLIMIT_MEMLOCK` (at least 64) are unchanged.
 - `fs::fsync` waits for every write submitted before it through the same
   handle (#905). Before, an fsync submitted while a
   write to the file was still in flight ran alongside it and could complete

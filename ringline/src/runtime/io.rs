@@ -3389,15 +3389,16 @@ impl SendHalf {
     /// [`ConnectionAborted`](io::ErrorKind::ConnectionAborted), whatever the
     /// kernel reports for it: queued sends, sends waiting for send-pool
     /// capacity, and sends in flight. A send started afterwards fails the same
-    /// way until the connection is released, and then with `NotConnected`, as
-    /// on any released connection. A read parked on the connection ends:
+    /// way until the connection is released; after that `send` fails with
+    /// `NotConnected` and a bounded send with `ConnectionAborted`, as on any
+    /// released connection. A read parked on the connection ends:
     /// [`with_data`](Connection::with_data) resolves to 0, and
     /// [`with_data_result`](Connection::with_data_result) to
     /// `ConnectionAborted`, which replaces a receive error not yet taken. The
     /// sends' send-pool slots and zero-copy buffers are released without
-    /// waiting for the peer: queued sends' at once, and a send in the kernel's
-    /// when its completion or notification lands after the reset. No
-    /// close_notify is sent.
+    /// waiting for the peer: those of queued sends at once, and those of a
+    /// send the kernel holds when its completion or notification arrives
+    /// after the reset. No close_notify is sent.
     ///
     /// On a TCP connection the peer reads `ECONNRESET` on Linux. On macOS a
     /// peer that only reads may not see the reset until it sends. On io_uring
@@ -4083,10 +4084,11 @@ enum AdmissionState {
 /// The refusals of [`BackpressuredSend`] that come before submission:
 /// `InvalidInput` for a message that can never fit the pool, `BrokenPipe`
 /// for a write half that is shut down, `ConnectionAborted` for a connection
-/// that closed while waiting, `NotConnected`, on io_uring, for a TLS
-/// connection whose close_notify is queued or whose close was committed
-/// while waiting, and anything the submission itself reports. Errors after
-/// submission come from the [`SendCompletion`].
+/// that was aborted ([`SendHalf::abort`]) or closed while waiting,
+/// `NotConnected`, on io_uring, for a TLS connection whose close_notify is
+/// queued or whose close was committed before or while it waited, and
+/// anything the submission itself reports. Errors after submission come from
+/// the [`SendCompletion`].
 ///
 /// `!Send`: its connection index and its place in the admission FIFO belong
 /// to its worker, and a poll on another worker would use that worker's.
@@ -4355,12 +4357,13 @@ enum BackpressuredState<'a> {
 /// - [`BrokenPipe`](io::ErrorKind::BrokenPipe) — the write half is shut down,
 ///   or was shut down while this send was waiting.
 /// - [`ConnectionAborted`](io::ErrorKind::ConnectionAborted) — the connection
-///   closed while waiting or in flight.
+///   was aborted ([`SendHalf::abort`]), or closed while waiting or in flight.
 /// - [`NotConnected`](io::ErrorKind::NotConnected) — on io_uring, the
 ///   connection is TLS and its close_notify is already queued (`close()`, a
 ///   handler return or a fatal encrypt error); or the connection's close was
-///   *committed* while this send waited for capacity. A waiter in the admission
-///   FIFO is neither in flight nor in the per-connection send queue, so it does
+///   *committed* before or while this send waited for capacity. A waiter in
+///   the admission FIFO is neither in flight nor in the per-connection send
+///   queue, so it does
 ///   not hold off `try_finalize_close`; if the close is finalized while it
 ///   waits, winning capacity finds the Close already submitted and the send is
 ///   refused rather than written. Which of this and `ConnectionAborted` you see

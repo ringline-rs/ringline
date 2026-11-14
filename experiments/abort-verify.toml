@@ -61,7 +61,8 @@ echo 1 > /tmp/job/status
   ulimit -Sn 65536
   echo "memlock=$(ulimit -l)"
   # On disk, not in /tmp: /tmp is tmpfs on these images, and a target
-  # directory there runs the guest out of memory.
+  # directory there runs the guest out of memory. Eight jobs keep the build
+  # inside the guest's 8 GiB on hosts with more CPUs.
   export CARGO_BUILD_JOBS=8
   git clone -q {repo} "$HOME/src" || exit 1
   cd "$HOME/src" && git checkout -q {ref} || exit 1
@@ -96,9 +97,11 @@ echo 1 > /tmp/job/status
   [ "$backend" = "io_uring" ] || { echo "FAIL backend $backend"; fail=1; }
   grep -q "^green_rc=0" /tmp/job/rc.txt || { echo "FAIL green"; fail=1; }
   grep -q "abort: enomem=0" /tmp/job/green.out || { echo "FAIL green: no zero-copy send was held"; fail=1; }
-  grep -q "^nodisconnect_rc=[1-9]" /tmp/job/rc.txt || { echo "FAIL nodisconnect: the test passed without the disconnect"; fail=1; }
+  # A mutation counts as red only if the test under check failed, not if the
+  # patched tree failed to build.
+  grep -qE "^    abort_releases_a_stalled_connection_at_once$" /tmp/job/nodisconnect.out || { echo "FAIL nodisconnect: the test did not fail without the disconnect"; fail=1; }
   if [ "{linger_expect}" = "fail" ]; then
-    grep -q "^linger_rc=[1-9]" /tmp/job/rc.txt || { echo "FAIL linger: passed on a kernel where it should fail"; fail=1; }
+    grep -qE "^    abort_releases_a_stalled_connection_at_once$" /tmp/job/linger.out || { echo "FAIL linger: the test did not fail on a kernel where it should"; fail=1; }
   else
     grep -q "^linger_rc=0" /tmp/job/rc.txt || { echo "FAIL linger: failed on a kernel where it should pass"; fail=1; }
   fi

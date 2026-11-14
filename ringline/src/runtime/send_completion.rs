@@ -14,8 +14,8 @@
 //! connection and, when a connection task owns it, under that task; waiting
 //! bounded sends are listed in arrival order. `register`, `set_owner`,
 //! `complete`, `take_result`, `mark_submitted` and `cancel` are index
-//! lookups; `remove_connection`, `fail_waiting` and `abort_connection` visit
-//! the entries listed under their connection. An entry that leaves the waiting state leaves its
+//! lookups; `remove_connection`, `fail_waiting` and `abort_connection`
+//! visit the entries listed under their connection. An entry that leaves the waiting state leaves its
 //! id in the waiting list, and the reads of the head pop the ids at the front
 //! that no longer name a waiting entry, so each id is pushed once and leaves
 //! once, popped at the front or dropped by `compact`. Design:

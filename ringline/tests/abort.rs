@@ -4,10 +4,11 @@
 //! poll pending, which before Linux 6.13 holds a plain or `SO_LINGER` close of
 //! a later connection's fixed file. The abort must not wait for it.
 //!
-//! On io_uring the aborted connection holds a zero-copy send of more than the
-//! socket buffers take, a queued send and a send waiting for send-pool
-//! capacity. Both backends check the reset, the refusal of a later send and,
-//! on TLS, that no close_notify is sent.
+//! The aborted connection holds more than the socket buffers take (on
+//! io_uring, one zero-copy send), four bounded sends queued behind it and a
+//! bounded send waiting for send-pool capacity. Both backends check the reset,
+//! the refusal of those sends and of later ones, and, on TLS, that no
+//! close_notify is sent.
 
 #![allow(clippy::manual_async_fn)]
 
@@ -266,14 +267,19 @@ fn abort_releases_a_stalled_connection_at_once() {
         }
     }
 
-    // On macOS a peer that only read sometimes saw no reset within the 5 s
-    // timeout (13 of 210 runs, and the same with a plain socket pair and no
-    // ringline); a write first made it see one in every run tried. On Linux
-    // the write would take the error, and the read would then return 0.
-    #[cfg(target_os = "macos")]
-    let _ = peer.write(b"x");
     let mut body = Vec::new();
     let read = peer.read_to_end(&mut body);
+    // On macOS a peer that only read sometimes saw no reset within the 5 s
+    // timeout (13 of 210 runs, and the same with a plain socket pair and no
+    // ringline). A write draws a reset from any closed socket, so it is made
+    // only after the read timed out: an end of stream still fails the test.
+    #[cfg(target_os = "macos")]
+    let read = if matches!(&read, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
+        let _ = peer.write(b"x");
+        peer.read_to_end(&mut body)
+    } else {
+        read
+    };
     assert!(
         matches!(&read, Err(e) if e.kind() == io::ErrorKind::ConnectionReset),
         "the peer was not reset: {read:?}"
