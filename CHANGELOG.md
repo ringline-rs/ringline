@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `AlignedBuf::freeze` turns it into an aligned `Bytes`.
 - `nvme_lba_size(device)` returns the namespace's logical block size, which
   `open_nvme_device` now reads with Identify Namespace.
+- `SendHalf::send_admitted` and `Connection::send_admitted`, returning an
+  `Admission`: a send that waits for send-pool capacity in the worker's FIFO,
+  as `send_backpressured` does, and resolves when it is admitted and queued,
+  with a `SendCompletion` that resolves when it settles. A timeout around
+  `send_backpressured` also times the bytes queued ahead of it on the
+  connection, so a server could close a peer that is reading slowly as if the
+  pool had no room; `send_admitted` lets it bound the two waits separately.
+  `send_backpressured` is now `send_admitted` followed by awaiting the
+  `SendCompletion`, with no change in behaviour. Removing a waiter from the
+  FIFO, on a timeout, a cancel or a connection's release, no longer searches
+  it (`docs/send-admission-design.md`, section 2).
 - io_uring: `ConfigBuilder::sqpoll_cpus(&[u32])` pins worker `i`'s SQPOLL
   thread to logical CPU `cpus[i]` (#834). Entries may repeat, so several SQ
   threads can share one CPU. With `sqpoll(true)`, `launch` fails with

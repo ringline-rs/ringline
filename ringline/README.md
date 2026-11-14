@@ -116,6 +116,7 @@ io_uring backend, each worker also owns:
 | `Connection` | An owned connection: `send()`, `send_nowait()`, `with_data()`; `split()` gives `SendHalf` and `RecvHalf` |
 | `WithDataFuture` | Future that resolves when recv data is available |
 | `SendCompletion` | Future that resolves when a send completes |
+| `Admission` | Future from `send_admitted` that resolves to a `SendCompletion` once the send-capacity FIFO admits the send |
 | `ConnectFuture` | Future that resolves when an outbound connection completes |
 | `RinglineBuilder` | Builder: `RinglineBuilder::new(config).bind(addr).launch::<H>()` |
 | `Config` | Runtime configuration (SQ size, buffer sizes, worker count, TLS, etc.) |

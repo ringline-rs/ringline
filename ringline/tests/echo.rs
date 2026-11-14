@@ -2871,6 +2871,114 @@ fn backpressured_send_waits_for_pool_capacity_without_duplication() {
     }
 }
 
+// ── send_admitted resolves on admission ─────────────────────────────
+
+/// More than the loopback socket buffers on either side hold (about 10 MiB on
+/// Linux at the default `tcp_wmem` and `tcp_rmem` maxima), so the tail of it
+/// stays queued in ringline while the client is not reading.
+const ADMIT_BACKLOG: usize = 32 << 20;
+const ADMIT_CHUNK: usize = 16 << 10;
+const ADMIT_TAIL: &[u8] = b"tail";
+
+static ADMIT_OUTCOME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Set by the handler once it has checked admission and settlement, so the
+/// client starts reading only after the checks.
+static ADMIT_CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Queues a backlog the client is not reading yet, then sends a short message
+/// with `send_admitted`. Records whether the admission resolved at once,
+/// whether the send was still unsettled 300 ms later, and the settled result.
+struct AdmittedBeforeSettledHandler;
+
+impl AsyncEventHandler for AdmittedBeforeSettledHandler {
+    fn on_accept(&self, conn: Connection) -> impl Future<Output = ()> + 'static {
+        async move {
+            let (mut tx, _rx) = conn.split();
+            let chunk = vec![b'B'; ADMIT_CHUNK];
+            for _ in 0..ADMIT_BACKLOG / ADMIT_CHUNK {
+                tx.send_nowait(&chunk).expect("the pool holds the backlog");
+            }
+            let outcome = async {
+                let admitted =
+                    ringline::timeout(Duration::from_millis(200), tx.send_admitted(ADMIT_TAIL))
+                        .await
+                        .map_err(|_| "admission waited for the backlog".to_string())?;
+                let mut sent = admitted.map_err(|e| format!("admission refused: {e}"))?;
+                let settled_early = ringline::timeout(Duration::from_millis(300), &mut sent)
+                    .await
+                    .is_ok();
+                ADMIT_CHECKED.store(true, Ordering::Release);
+                if settled_early {
+                    return Err("the tail settled while the client was not reading".to_string());
+                }
+                let n = sent.await.map_err(|e| format!("settle failed: {e}"))?;
+                Ok::<_, String>(format!("settled {n}"))
+            }
+            .await;
+            *ADMIT_OUTCOME.lock().unwrap() = Some(match outcome {
+                Ok(s) => s,
+                Err(e) => e,
+            });
+            // On an early return the client is still waiting for the flag.
+            ADMIT_CHECKED.store(true, Ordering::Release);
+            tx.shutdown_write();
+        }
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        AdmittedBeforeSettledHandler
+    }
+}
+
+/// `send_admitted` resolves when the send is admitted and queued, and its
+/// `SendCompletion` resolves when the send settles. With a backlog ahead of
+/// it that the peer is not reading, the first happens at once and the second
+/// only after the peer reads. A future that resolved on settlement, as
+/// `send_backpressured` does, fails the 200 ms admission bound.
+#[test]
+fn send_admitted_resolves_before_the_send_settles() {
+    let config = test_config_builder()
+        .send_pool(4096, 16384)
+        .build()
+        .expect("valid config");
+    let (shutdown, handles) = RinglineBuilder::new(config)
+        .bind("127.0.0.1:0".parse().unwrap())
+        .launch::<AdmittedBeforeSettledHandler>()
+        .expect("launch failed");
+    let addr = shutdown.bound_addr().expect("bound address").to_string();
+    let mut stream = connect_retry(&addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+
+    // Not reading while the handler checks admission and settlement.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !ADMIT_CHECKED.load(Ordering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the handler never checked"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut got = Vec::new();
+    stream.read_to_end(&mut got).expect("read to FIN");
+
+    assert_eq!(
+        ADMIT_OUTCOME.lock().unwrap().as_deref(),
+        Some("settled 4"),
+        "admitted at once, unsettled while the client was not reading, settled after"
+    );
+    assert_eq!(got.len(), ADMIT_BACKLOG + ADMIT_TAIL.len());
+    assert!(
+        got.ends_with(ADMIT_TAIL),
+        "the tail went out after the backlog"
+    );
+
+    shutdown.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
 /// Polls `f` exactly once with the *current* task's context, then returns.
 /// Used to park a `send_backpressured` future in one task before moving it to
 /// another, which is the situation the queue's owner tracking exists for.

@@ -2875,7 +2875,7 @@ impl<'a> DriverCtx<'a> {
     /// reserved or queued and no completion for `id` will ever be produced,
     /// so the caller owns the failure.
     ///
-    /// Called by `BackpressuredSend::poll_waiting` once the
+    /// Called by `Admission::poll_waiting` once the
     /// send-capacity FIFO says it is this id's turn.
     pub(crate) fn send_bounded(
         &mut self,

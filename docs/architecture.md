@@ -226,6 +226,13 @@ copied when the call is made, and a future that is built and dropped without
 being awaited has done nothing at all. And a message that could never fit the
 pool is rejected rather than queued, because no amount of waiting would help.
 
+`send_admitted` waits the same way and resolves at admission, once the
+message is queued on the connection, with a `SendCompletion` that resolves
+when it settles. `send_backpressured` is `send_admitted` followed by awaiting
+that `SendCompletion`. A caller that times out a `send_backpressured` also
+times the bytes queued ahead of it on the connection; with `send_admitted` it
+can bound the wait for capacity and the wait for the peer separately.
+
 On a TLS connection the admitted cost is the *ciphertext* bound, not the
 plaintext length, and the asymmetry there is deliberate: over-reserving
 delays a caller, while under-reserving lets rustls advance its record
@@ -274,8 +281,9 @@ Backpressure is bounded and explicit at each layer:
   later sends in a `VecDeque`. This preserves stream and TLS order.
 - Send-copy-pool, zero-copy slab, task-slab, and timer-slot exhaustion surface
   as errors. A caller using `send` can await completion; `send_nowait` reports
-  immediate admission failures. `send_backpressured` is the exception: copy-pool
-  exhaustion parks it in the worker's admission FIFO instead of failing it.
+  immediate admission failures. `send_backpressured` and `send_admitted` are
+  the exception: copy-pool exhaustion parks them in the worker's admission
+  FIFO instead of failing them.
 - Short sends retain their backing and resubmit the remainder. Socket `EAGAIN`
   retains the send. On io_uring a short send or an `EAGAIN` waits behind a
   `POLLOUT` poll (see "Waiting for room" in
