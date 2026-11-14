@@ -1,9 +1,9 @@
 # Send admission a server can bound
 
-Status: section 1 is built. Section 2 is specified for building. Sections 3
-and 4 name the experiments that decide them and the constraints already
-found; each gets its own specification once its experiment has run. "What
-exists" describes the code before section 1, at 07dd0f56.
+Status: sections 1 and 2 are built. Sections 3 and 4 name the experiments
+that decide them and the constraints already found; each gets its own
+specification once its experiment has run. "What exists" describes the code
+before section 1, at 07dd0f56.
 
 A server that answers many connections on one worker replies with
 `send_nowait`. When the send copy pool is exhausted the reply fails, and the
@@ -150,12 +150,14 @@ The send futures become `!Send` and are renamed:
 Tests:
 
 - `compile_fail` doctests that assert `!Send` for `SendCompletion`,
-  `BackpressuredSend`, `ForwardFuture` and `AsyncSendBuilder`, and for
-  `Admission` when section 2 builds it, as `RecvReadyFuture` has. The reproductions kept the future or the builder in a
-  `static Mutex`, which no longer compiles.
+  `BackpressuredSend`, `ForwardFuture` and `AsyncSendBuilder`, as
+  `RecvReadyFuture` has, and for `Admission`, which section 2 adds. The
+  reproductions kept the future or the builder in a `static Mutex`, which no
+  longer compiles.
 - Each doctest fails with the `PhantomData` field removed, except io_uring's
   `ForwardFuture`, which is also `!Send` through the `SendCompletion` it holds
-  in flight.
+  in flight, and, since section 2, `BackpressuredSend`, which is `!Send`
+  through the `Admission` or `SendCompletion` it holds.
 
 ## 2. `send_admitted`: a future that resolves on admission
 
@@ -217,22 +219,28 @@ longer and its cancellations more frequent, so removal stops scanning it.
 `cancel` removes the entry from the table and `by_conn` and leaves its id in
 `waiting`. Connection release marks a waiting entry `Aborted` and keeps it for
 its future to collect (sc.rs:547-553), as today, and stops pruning `waiting`
-with a full `retain` (`prune_waiting`, sc.rs:619-631). Before each read of the
-head, `head_task`, `turn` and `head_ready` pop the ids at the front that
-`prune_waiting` would drop: a slot whose generation differs, or an entry that
-is no longer `Waiting`. `turn` takes `&mut self` for this. A release that
-aborts the head still wakes the new head, as `prune_waiting` does today
-(sc.rs:632-635). An admitted id is always the head, so `mark_submitted` pops
-the front. Each id is pushed once and popped once.
+with a full `retain` (`prune_waiting`, sc.rs:619-631). `fail_waiting` finds
+its entries through `by_conn` instead of a `retain` over `waiting`. Before
+each read of the head, `head_task`, `turn` and `head_ready` pop the ids at the
+front that `prune_waiting` would drop: a slot whose generation differs, or an
+entry that is no longer `Waiting`. `turn` takes `&mut self` for this. A
+release that aborts the head still wakes the new head, as `prune_waiting` does
+today (sc.rs:632-635). An admitted id is always the head, so `mark_submitted`
+pops the front. Each id is pushed once and leaves once, popped at the front or
+dropped by a `retain`. Once the stale ids in `waiting` number more than the
+live ones plus 64, a `retain` drops them, so a head that waits while the
+waiters behind it time out does not leave the list growing.
 
 Tests, on both backends:
 
 - `send_admitted` resolves while the send has not settled: a peer that has
   stopped reading, a backlog ahead of the send, and a free pool.
 - The existing `send_backpressured` tests pass unchanged.
-- With a test-only count of ids visited, cancelling 64 waiters from the back
-  of the FIFO and then admitting the next head visits at most 65 ids. The
-  linear scan visits 2,080 for the cancels alone.
+- With a test-only count of ids visited, cancelling the 64 waiters behind a
+  head from the back of the FIFO leaves their ids in place and visits 64 ids,
+  one read of the head per cancel. Admitting the head then visits 65: the
+  head, and the 64 stale ids, popped once each. A search per cancel would
+  visit more than 2,000.
 - A connection released while its send is at the head of the FIFO, with no
   pool slots of its own, so no capacity wake follows: the next head is
   admitted without the aborted send's future being polled.

@@ -274,6 +274,9 @@ pub use listen_gate::begin_listening_all;
 pub use runtime::TIMER_SLOTS;
 /// Trait for async event handlers (one task per connection).
 pub use runtime::handler::AsyncEventHandler;
+/// Future returned by [`SendHalf::send_admitted()`]: waits for send-pool
+/// capacity and resolves once the send is admitted, with a [`SendCompletion`].
+pub use runtime::io::Admission;
 /// Async scatter-gather send builder.
 pub use runtime::io::AsyncSendBuilder;
 /// Future returned by [`SendHalf::send_backpressured()`]: a send that waits
