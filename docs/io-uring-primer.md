@@ -367,20 +367,25 @@ The preceding considerations are language-independent. Ringline adds several
 implementation choices that are distinct from properties of the Linux API.
 
 Ringline selects one backend at compile time. For a Linux target without
-`force-mio`, the build enables `io_uring` when the host reports kernel 6.1
-or newer. If the host kernel version is unavailable during cross-compilation,
-the build enables it optimistically. Non-Linux targets and `force-mio` builds
-use Mio. Mio is a separate readiness implementation, not an emulation of
-io_uring completion semantics. If an io_uring build cannot create or prepare
+`force-mio`, the build enables `io_uring` when the host reports kernel 6.8
+or newer. If the host kernel version is unavailable, as when cross-compiling
+from macOS, the build enables it optimistically. Non-Linux targets and
+`force-mio` builds use Mio. Mio is a separate readiness implementation, not
+an emulation of io_uring completion semantics. An io_uring build refuses at
+launch a running kernel older than 6.8, and if it cannot create or prepare
 its rings at runtime, `RinglineBuilder::launch` returns an error; Ringline
 does not switch a running binary to Mio.
 
-The 6.1 requirement comes from the facilities Ringline uses: `SendMsgZc`
-and `IORING_SETUP_DEFER_TASKRUN` are 6.1; multishot receive, provided
-buffers, and `SINGLE_ISSUER` are 6.0. It is more
-useful to an operator than the historical 5.1 introduction point, but it is
-not a complete capability check: vendor kernels, container policy, seccomp,
-and the `kernel.io_uring_disabled` sysctl can still prevent startup.
+The 6.8 requirement comes from the facilities Ringline uses: worker exit
+resets a connection whose zero-copy send a non-reading peer holds by setting
+`SO_LINGER` on its fixed file through io_uring's setsockopt command (6.7), and
+park installs a fixed file back into the process with
+`IORING_OP_FIXED_FD_INSTALL` (6.8); `SendMsgZc` and
+`IORING_SETUP_DEFER_TASKRUN` are 6.1; multishot receive, provided buffers, and
+`SINGLE_ISSUER` are 6.0. The floor is more useful to an operator than the
+historical 5.1 introduction point, but it is not a complete capability check:
+vendor kernels, container policy, seccomp, and the `kernel.io_uring_disabled`
+sysctl can still prevent startup.
 
 Ringline represents kernel-owned work with generation-tagged connection
 slots, fixed buffer pools, send slabs, and guard objects. A stale CQE can

@@ -17,14 +17,14 @@ fn main() {
     }
 }
 
-/// Check that the running kernel is 6.1+. `Ring::setup` unconditionally sets
-/// `IORING_SETUP_DEFER_TASKRUN` (non-SQPOLL) and the send path uses
-/// `IORING_OP_SENDMSG_ZC`; both landed in 6.1. Multishot recv, provided
-/// buffers, and `SINGLE_ISSUER` are 6.0.
+/// Check that the running kernel is 6.8+, the floor of ringline's io_uring
+/// backend (`ringline/build.rs`), which this crate's io_uring code runs on.
 ///
-/// When cross-compiling, `/proc/sys/kernel/osrelease` reflects the *host* kernel
-/// which may differ from the target. In that case we optimistically emit the cfg
-/// and let the runtime fail fast if the target kernel is too old.
+/// On a Linux build host this reads the host's kernel, which may differ from
+/// the target's: a 6.1 host builds mio even for a 6.8 target. When the file
+/// cannot be read (a non-Linux host, or `/proc` not mounted) the cfg is
+/// emitted, and launch refuses a target kernel below the floor
+/// (`worker::check_kernel_floor`).
 fn kernel_version_sufficient() -> bool {
     let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
         // Not on Linux (cross-compile from macOS) or /proc not mounted.
@@ -42,5 +42,5 @@ fn kernel_version_sufficient() -> bool {
             digits.parse().ok()
         })
         .unwrap_or(0);
-    (major, minor) >= (6, 1)
+    (major, minor) >= (6, 8)
 }

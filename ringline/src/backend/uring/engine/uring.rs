@@ -603,7 +603,7 @@ impl Engine for UringEngine {
             let mut probe = io_uring::Probe::new();
             match ring.submitter().register_probe(&mut probe) {
                 Ok(()) => probe.is_supported(opcode::FixedFdInstall::CODE),
-                // `IORING_REGISTER_PROBE` is 5.6 and the crate floor is 6.1,
+                // `IORING_REGISTER_PROBE` is 5.6 and the crate floor is 6.8,
                 // so this should not happen — but a refused probe means
                 // "assume not supported", never "fail to start".
                 Err(_) => false,
@@ -634,14 +634,10 @@ impl Engine for UringEngine {
     /// Whether this kernel can return a registered fd to the process table,
     /// and so whether park (tier 3, #443) is available.
     ///
-    /// Requires Linux 6.8 for `IORING_OP_FIXED_FD_INSTALL`. The crate floor
-    /// stays at 6.1: below 6.8 park is simply unavailable, and nothing else
-    /// changes. That is a smaller loss than it sounds, because park exists
-    /// only to repair the placement imbalance
-    /// [`AcceptMode::Merged`](crate::AcceptMode::Merged) introduces — the
-    /// default [`Pool`](crate::AcceptMode::Pool) mode places by round-robin
-    /// and has nothing to rebalance. A pre-6.8 deployment that wants even
-    /// placement stays on the default and loses nothing.
+    /// Requires `IORING_OP_FIXED_FD_INSTALL`, which every kernel the backend
+    /// runs on has (Linux 6.8). The probe stays so that a kernel that reports
+    /// a supported version without the opcode loses park rather than failing
+    /// at the first park.
     fn supports_park(&self) -> bool {
         self.fixed_fd_install
     }

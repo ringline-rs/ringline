@@ -129,10 +129,10 @@ not read keeps that data queued, so a connection whose entries are not released
 within 1 s is closed with `SO_LINGER {on, 0}`, which sends an RST and discards the
 queued data, so the notifications land at once (#607). That includes a peer that
 is reading too slowly to take its data in that second. Setting the option on a
-fixed file needs io_uring's setsockopt command (Linux 6.7). Below 6.7, or for an
-entry whose connection had closed before exit began, nothing can abort it: the
-entry holds the worker for the 10 s bound, and its guards and the send pool's
-memory are then leaked, since the kernel can still read them.
+fixed file needs io_uring's setsockopt command (Linux 6.7, below the backend's
+6.8 floor). For an entry whose connection had closed before exit began, nothing
+can abort it: the entry holds the worker for the 10 s bound, and its guards and
+the send pool's memory are then leaked, since the kernel can still read them.
 
 ## 5. Admission and parking
 

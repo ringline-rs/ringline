@@ -1,8 +1,9 @@
 # Waiting for room on a half-closed socket
 
 **Status:** implemented, for #605: `MSG_DONTWAIT` on every stream send, with ringline
-doing the waiting. Keeps the Linux 6.1 floor, so #605's raise to 6.8 is
-dropped. #607 no longer depends on it.
+doing the waiting. It needed no raise of the kernel floor, which #605 had proposed
+taking to 6.8. The floor later moved to 6.8 for other reasons: worker exit's reset
+of a connection a zero-copy send holds (#607), and park.
 
 ## Problem
 

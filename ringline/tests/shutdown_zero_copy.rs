@@ -1,6 +1,6 @@
 //! A zero-copy send in flight at worker exit (#607). A peer that does not read
 //! keeps the data queued, so its notification never lands. Exit closes that
-//! connection with an RST after about 1 s, on Linux 6.7+. A peer that reads in
+//! connection with an RST after about 1 s. A peer that reads in
 //! that time gets what the kernel had queued, and a FIN.
 
 #![cfg(all(target_os = "linux", has_io_uring))]
@@ -59,18 +59,6 @@ impl AsyncEventHandler for GuardSender {
     }
 }
 
-fn kernel_has_setsockopt_command() -> bool {
-    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { libc::uname(&mut uts) }, 0);
-    let release = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }
-        .to_string_lossy()
-        .into_owned();
-    let mut parts = release
-        .split(|c: char| !c.is_ascii_digit())
-        .map(|p| p.parse::<u32>().unwrap_or(0));
-    (parts.next().unwrap_or(0), parts.next().unwrap_or(0)) >= (6, 7)
-}
-
 /// Launch, make the server send, and return the runtime and a connected peer
 /// that has not read.
 fn server_with_a_send_in_flight() -> (
@@ -110,26 +98,24 @@ fn exit_does_not_wait_for_a_peer_that_does_not_read() {
         handle.join().expect("worker panicked").expect("worker");
     }
     let took = started.elapsed();
-    if kernel_has_setsockopt_command() {
-        // A short exit means no zero-copy send was held: over `RLIMIT_MEMLOCK`
-        // it falls back to plain sends, and there is nothing to test.
-        let enomem = ringline::metrics::POOL
-            .value(ringline::metrics::pool::SEND_ZC_ENOMEM)
-            .unwrap_or(0);
-        if enomem == 0 {
-            assert!(took >= Duration::from_millis(900), "not held: {took:?}");
-        }
-        assert!(took < Duration::from_secs(4), "worker exit took {took:?}");
-        if enomem == 0 {
-            let mut peer = peer;
-            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut body = Vec::new();
-            let read = peer.read_to_end(&mut body);
-            assert!(
-                matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
-                "the stuck connection was not reset: {read:?}"
-            );
-        }
+    // A short exit means no zero-copy send was held: over `RLIMIT_MEMLOCK`
+    // it falls back to plain sends, and there is nothing to test.
+    let enomem = ringline::metrics::POOL
+        .value(ringline::metrics::pool::SEND_ZC_ENOMEM)
+        .unwrap_or(0);
+    if enomem == 0 {
+        assert!(took >= Duration::from_millis(900), "not held: {took:?}");
+    }
+    assert!(took < Duration::from_secs(4), "worker exit took {took:?}");
+    if enomem == 0 {
+        let mut peer = peer;
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut body = Vec::new();
+        let read = peer.read_to_end(&mut body);
+        assert!(
+            matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "the stuck connection was not reset: {read:?}"
+        );
     }
 }
 

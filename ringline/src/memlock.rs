@@ -55,6 +55,11 @@ impl std::fmt::Display for KernelVersion {
     }
 }
 
+/// The oldest kernel the io_uring backend runs on. `build.rs` builds the
+/// backend only at or above it, and launch refuses a running kernel below it.
+#[cfg_attr(not(has_io_uring), allow(dead_code))]
+pub(crate) const IO_URING_FLOOR: KernelVersion = KernelVersion { major: 6, minor: 8 };
+
 /// The first kernel that charges io_uring rings against `RLIMIT_MEMLOCK`.
 pub(crate) const RINGS_CHARGED_SINCE: KernelVersion = KernelVersion {
     major: 6,

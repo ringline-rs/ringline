@@ -154,14 +154,63 @@ const CLAIMS: &[Claim] = &[
 /// The kernel floor `ringline/build.rs` enforces for the io_uring backend.
 /// Docs that advertise the floor are checked against this same constant so a
 /// bump in build.rs cannot leave stale version prose behind.
-const MIN_IOURING_KERNEL: (u32, u32) = (6, 1);
+const MIN_IOURING_KERNEL: (u32, u32) = (6, 8);
 
-/// Docs that state the io_uring kernel floor in prose.
-const KERNEL_FLOOR_DOCS: &[&str] = &[
-    "README.md",
-    "ringline/README.md",
-    "docs/architecture.md",
-    "docs/io-uring-primer.md",
+/// Every statement of the io_uring kernel floor, as (file, phrase). `{floor}`
+/// stands for `MIN_IOURING_KERNEL` as `major.minor`, and phrases are compared
+/// ignoring whitespace, so a reflowed line still matches and a stale version
+/// does not.
+const KERNEL_FLOOR_DOCS: &[(&str, &str)] = &[
+    (
+        "README.md",
+        "for Linux kernels older than {floor} (automatic build-time fallback)",
+    ),
+    ("README.md", "The io_uring backend requires Linux {floor}+"),
+    (
+        "README.md",
+        "reports a version older than {floor} silently gets the Mio",
+    ),
+    (
+        "README.md",
+        "An io_uring build run on a kernel older than {floor} fails at launch",
+    ),
+    (
+        "ringline/README.md",
+        "for Linux kernels older than {floor} (automatic build-time fallback)",
+    ),
+    (
+        "ringline/README.md",
+        "The io_uring backend requires Linux {floor}+",
+    ),
+    (
+        "ringline/README.md",
+        "reports a version older than {floor} silently gets the Mio",
+    ),
+    (
+        "ringline/README.md",
+        "An io_uring build run on a kernel older than {floor} fails at launch",
+    ),
+    ("docs/architecture.md", "kernel is at least {floor}"),
+    ("docs/architecture.md", "refuses one older than {floor}"),
+    (
+        "docs/io-uring-primer.md",
+        "the host reports kernel {floor} or newer",
+    ),
+    (
+        "docs/io-uring-primer.md",
+        "a running kernel older than {floor}",
+    ),
+    (
+        "docs/io-uring-primer.md",
+        "The {floor} requirement comes from",
+    ),
+    ("CLAUDE.md", "the host kernel is ≥ {floor}"),
+    ("CLAUDE.md", "the production path. Linux {floor}+"),
+    (
+        "ringline/src/lib.rs",
+        "kernel is {floor}+ gets the io_uring backend",
+    ),
+    ("ringline/src/lib.rs", "io_uring backend: Linux {floor}+"),
 ];
 
 pub fn workspace_root() -> PathBuf {
@@ -202,17 +251,35 @@ pub fn verify_source_claims(root: &Path) -> io::Result<()> {
     if !build.contains(&floor_needle) {
         return Err(io::Error::other(format!(
             "kernel-floor claim drifted: ringline/build.rs no longer checks {floor_needle:?}; \
-             update MIN_IOURING_KERNEL in tools/doc-diagrams/src/lib.rs and every doc listed \
-             in KERNEL_FLOOR_DOCS"
+             update MIN_IOURING_KERNEL in tools/doc-diagrams/src/lib.rs and every phrase \
+             listed in KERNEL_FLOOR_DOCS"
+        )));
+    }
+    // The other two places the floor is a number in code.
+    let bench_build = fs::read_to_string(root.join("ringline-bench/build.rs"))?;
+    if !bench_build.contains(&floor_needle) {
+        return Err(io::Error::other(format!(
+            "kernel-floor claim drifted: ringline-bench/build.rs no longer checks {floor_needle:?}"
+        )));
+    }
+    let const_needle = format!(
+        "IO_URING_FLOOR: KernelVersion = KernelVersion {{ major: {}, minor: {} }}",
+        MIN_IOURING_KERNEL.0, MIN_IOURING_KERNEL.1
+    );
+    let memlock = fs::read_to_string(root.join("ringline/src/memlock.rs"))?;
+    if !strip_whitespace(&memlock).contains(&strip_whitespace(&const_needle)) {
+        return Err(io::Error::other(format!(
+            "kernel-floor claim drifted: ringline/src/memlock.rs no longer defines {const_needle:?}"
         )));
     }
     let floor_text = format!("{}.{}", MIN_IOURING_KERNEL.0, MIN_IOURING_KERNEL.1);
-    for doc in KERNEL_FLOOR_DOCS {
+    for (doc, phrase) in KERNEL_FLOOR_DOCS {
+        let phrase = phrase.replace("{floor}", &floor_text);
         let contents = fs::read_to_string(root.join(doc))?;
-        if !contents.contains(&floor_text) {
+        if !strip_whitespace(&contents).contains(&strip_whitespace(&phrase)) {
             return Err(io::Error::other(format!(
-                "kernel-floor claim drifted: {doc} no longer mentions kernel {floor_text} \
-                 while ringline/build.rs enforces it"
+                "kernel-floor claim drifted: {doc} no longer says {phrase:?} (compared ignoring \
+                 whitespace) while ringline/build.rs enforces kernel {floor_text}"
             )));
         }
     }

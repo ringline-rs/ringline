@@ -69,8 +69,8 @@ pub(crate) enum CloseLead {
     CancelAll,
     /// `SO_LINGER {on, 0}`, so the `Close` sends an RST and discards the data
     /// queued on the socket, whose zero-copy notifications then land at once.
-    /// Used at worker exit for a peer that is not reading. On a kernel below
-    /// 6.7 it fails, and the hard link still runs the `Close` (#607).
+    /// Used at worker exit for a peer that is not reading (#607). If the
+    /// setsockopt fails, the hard link still runs the `Close`.
     Abort,
 }
 

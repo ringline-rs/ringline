@@ -288,9 +288,8 @@ Setup, on io_uring:
   entry is still held after 1 s before applying a candidate.
 - Two arms: with and without a second, idle connection whose hangup poll is
   armed.
-- Kernels: Linux 6.8 (Ubuntu 24.04), 6.12 (Debian 13) and 7.2 (Debian 14),
-  from the rack's guest images. Add 6.1 (Debian 12) if candidate 2 is chosen,
-  since the supported range starts there.
+- Kernels: Linux 6.8 (Ubuntu 24.04), the io_uring backend's floor, 6.12
+  (Debian 13) and 7.2 (Debian 14), from the rack's guest images.
 - Five runs per kernel, arm and candidate.
 
 Candidates and controls:
@@ -329,7 +328,7 @@ Prediction:
   releases at once only without the idle connection.
 - Candidate 2 releases at once on every kernel, in both arms.
 
-Decision: if candidate 2 releases at once everywhere, including 6.1, `abort`
+Decision: if candidate 2 releases at once on every kernel tested, `abort`
 uses it on every kernel. Otherwise candidate 1 from 6.13, and the
 specification states what `abort` does below.
 

@@ -38,7 +38,7 @@ pub enum Error {
     ///   profile (Docker/containerd default, gVisor, systemd
     ///   `SystemCallFilter=`). The message says which, based on the sysctl.
     /// - `ENOSYS`: kernel built without io_uring.
-    /// - `EINVAL`: kernel older than 6.1 rejecting a required setup flag
+    /// - `EINVAL`: kernel rejecting a required setup flag
     ///   (`DEFER_TASKRUN` and `SendMsgZc` are 6.1 features), or, with
     ///   [`ConfigBuilder::sqpoll_cpu`](crate::ConfigBuilder::sqpoll_cpu) or
     ///   [`sqpoll_cpus`](crate::ConfigBuilder::sqpoll_cpus), a worker's SQPOLL
@@ -48,7 +48,11 @@ pub enum Error {
     ///   CPU, ringline sets the ring up once more without the CPU; the message
     ///   names the CPU and the worker when that succeeds.
     ///
-    /// The backend is chosen at build time by `build.rs` (Linux 6.1+ host
+    /// Also returned before any ring is set up when the running kernel is
+    /// below Linux 6.8, the io_uring backend's floor; the message names both
+    /// versions.
+    ///
+    /// The backend is chosen at build time by `build.rs` (Linux 6.8+ host
     /// gets io_uring); the only opt-out is the `force-mio` cargo feature,
     /// e.g. `cargo build --features ringline/force-mio` from a dependent
     /// crate. There is no runtime fallback.
@@ -266,8 +270,10 @@ pub(crate) fn describe_ring_setup_failure(err: &io::Error, probe: &RingSetupProb
             }
             other => {
                 match other {
-                    Some(v) => msg.push_str(&format!("kernel.io_uring_disabled is {v}, so the sysctl is not the cause; ")),
-                    None => msg.push_str("this kernel has no kernel.io_uring_disabled sysctl, so it is not the cause; "),
+                    Some(v) => msg.push_str(&format!(
+                        "kernel.io_uring_disabled is {v}, so the sysctl is not the cause; "
+                    )),
+                    None => msg.push_str("kernel.io_uring_disabled could not be read; "),
                 }
                 msg.push_str(
                     "io_uring_setup is most likely denied by a seccomp profile (the \
@@ -278,15 +284,22 @@ pub(crate) fn describe_ring_setup_failure(err: &io::Error, probe: &RingSetupProb
             }
         },
         Some(libc::ENOSYS) => {
-            msg.push_str("this kernel was built without io_uring. Use a kernel with CONFIG_IO_URING (6.1+), ");
+            msg.push_str("this kernel was built without io_uring. Use a kernel with CONFIG_IO_URING (6.8+), ");
         }
-        Some(libc::EINVAL) => {
-            msg.push_str(
+        Some(libc::EINVAL) => match probe.kernel {
+            // Launch refuses a kernel below the floor before any ring is set
+            // up, so a known version here is at or above it.
+            Some(kernel) if kernel >= crate::memlock::IO_URING_FLOOR => msg.push_str(&format!(
+                "Linux {kernel} rejected a setup flag ringline requires; every \
+                 kernel from 6.1 accepts them, so this kernel's io_uring is \
+                 patched or restricted. Use a kernel that accepts them, "
+            )),
+            _ => msg.push_str(
                 "the kernel rejected a setup flag ringline requires \
-                 (IORING_SETUP_DEFER_TASKRUN and IORING_OP_SENDMSG_ZC need \
-                 Linux 6.1+). Upgrade the kernel, ",
-            );
-        }
+                 (IORING_SETUP_DEFER_TASKRUN; the io_uring backend needs \
+                 Linux 6.8+). Upgrade the kernel, ",
+            ),
+        },
         Some(libc::ENOMEM) => match memlock_cause(probe, "each ring") {
             Some(cause) => {
                 msg.push_str(&cause);
@@ -899,7 +912,7 @@ mod tests {
     fn eperm_without_sysctl_blames_seccomp() {
         let text = describe_ring_setup_failure(&eperm(), &probe(None, None));
         assert!(
-            text.contains("no kernel.io_uring_disabled sysctl"),
+            text.contains("kernel.io_uring_disabled could not be read"),
             "{text}"
         );
         assert!(text.contains("seccomp"), "{text}");
@@ -915,12 +928,23 @@ mod tests {
         assert!(text.contains("force-mio"), "{text}");
     }
 
+    /// Launch refuses a kernel below the floor first, so an `EINVAL` from a
+    /// known kernel at or above it is not a version problem.
+    #[test]
+    fn einval_at_or_above_the_floor_does_not_say_upgrade() {
+        let err = io::Error::from_raw_os_error(libc::EINVAL);
+        let text = describe_ring_setup_failure(&err, &memlock_probe((6, 12), 8 << 20, false));
+        assert!(text.contains("Linux 6.12"), "{text}");
+        assert!(!text.contains("Upgrade the kernel"), "{text}");
+        assert!(text.contains("force-mio"), "{text}");
+    }
+
     #[test]
     fn einval_points_at_kernel_version() {
         let err = io::Error::from_raw_os_error(libc::EINVAL);
         let text = describe_ring_setup_failure(&err, &probe(None, None));
         assert!(text.contains("EINVAL"), "{text}");
-        assert!(text.contains("6.1"), "{text}");
+        assert!(text.contains("6.8"), "{text}");
         assert!(text.contains("force-mio"), "{text}");
     }
 

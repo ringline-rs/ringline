@@ -104,9 +104,12 @@ while a future is being polled.
 
 The backend is selected at compile time, not at runtime. For a Linux target
 without `force-mio`, `ringline/build.rs` sets `has_io_uring` when the host
-kernel is at least 6.1 or when the host kernel version is unavailable during
+kernel is at least 6.8 or when the host kernel version is unavailable during
 cross-compilation. `ringline/src/backend/mod.rs` then exports exactly one
-`Driver` and one `AsyncEventLoop` implementation.
+`Driver` and one `AsyncEventLoop` implementation. An io_uring build checks the
+running kernel at launch and refuses one older than 6.8 with
+`Error::RingSetup`, since a binary built on a 6.8 host can run on an older
+kernel.
 
 The io_uring loop in `backend/uring/event_loop.rs`:
 
