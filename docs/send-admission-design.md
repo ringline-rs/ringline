@@ -337,9 +337,12 @@ connection, plain or TLS:
    them. A refused chain, or a refused lone connect, is retried as itself: the
    retry entry records that the close is an abort, so `drain_close_retries`
    (uloop.rs:4935-4941) does not fall back to the lead-and-`Close` pair, which
-   would leave the zero-copy entries held. While a lone connect waits for its
-   retry, `try_finalize_close` waits for it as it waits for
-   `shutdown_inflight`, so the `Close` cannot go in ahead of it.
+   would leave the zero-copy entries held. In the `Shutdown` case the lone
+   connect holds `try_finalize_close` until its completion lands, pushed at
+   once or after a retry, as `shutdown_inflight` does. Its handler ignores
+   the result, clears the hold and calls `defer_finalize_close`, as
+   `handle_shutdown` does (uloop.rs:2813-2814), so the `Close` commits after
+   the disconnect has run.
 4. On TCP the disconnect returns 0 for an established, closing or
    peer-reset socket. It sends an RST unless the socket is already closed,
    and purges the socket's write queue,
