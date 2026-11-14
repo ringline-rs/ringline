@@ -135,6 +135,9 @@ async fn abandoned_opens() -> Result<(), String> {
         }
         ringline::sleep(Duration::from_millis(10)).await;
     }
+    // The closes above free their slots when they complete (on io_uring, an
+    // `IORING_OP_CLOSE`).
+    ringline::sleep(Duration::from_millis(10)).await;
 
     // An open that completed but whose future was dropped before it was
     // polled: the result is waiting, and no `File` was ever handed out.

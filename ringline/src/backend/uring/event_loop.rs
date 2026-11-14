@@ -1864,6 +1864,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::RecvUdp => self.handle_recv_udp(ud, result, flags),
             OpTag::SendUdp => self.handle_send_udp(ud, result),
             OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
+            OpTag::FileClose => self.handle_file_close(ud),
             OpTag::Fs => self.handle_fs(ud, result),
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
             OpTag::SendPollOut => self.handle_send_pollout(ud, result, flags),
@@ -4497,11 +4498,14 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         {
             dev.in_flight = dev.in_flight.saturating_sub(1);
             if dev.closing && dev.in_flight == 0 {
-                let _ = self
-                    .driver
-                    .ring
-                    .register_files_update(dev.fd_index, &[-1i32]);
-                devices.release(device_index);
+                self.driver.ring.submit_fixed_close(
+                    dev.fd_index,
+                    UserData::encode(
+                        OpTag::FileClose,
+                        device_index as u32,
+                        crate::completion::FILE_CLOSE_NVME,
+                    ),
+                );
             }
         }
 
@@ -4522,6 +4526,26 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     fn submit_released_fsyncs(&mut self, key: u32) {
         for (fd_index, ud) in self.driver.write_orders.end_write(key) {
             let _ = self.driver.ring.submit_direct_fsync(fd_index, UserData(ud));
+        }
+    }
+
+    /// An `IORING_OP_CLOSE` of an fs file's or NVMe device's fixed-file slot
+    /// completed: free its table slot. A failed close frees it too; an open
+    /// into the slot replaces whatever it still holds.
+    fn handle_file_close(&mut self, ud: UserData) {
+        let index = ud.conn_index() as u16;
+        match ud.payload() {
+            crate::completion::FILE_CLOSE_FS => {
+                if let Some(files) = self.driver.fs_files.as_mut() {
+                    files.release(index);
+                }
+            }
+            crate::completion::FILE_CLOSE_NVME => {
+                if let Some(devices) = self.driver.nvme_devices.as_mut() {
+                    devices.release(index);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4552,14 +4576,21 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // An open whose `OpenFuture` was dropped: nothing holds a handle to
         // the file, so close it, free the slot and deliver nothing.
         if op == Some(crate::fs::FsOp::Open) && self.executor.take_abandoned_open(ud.payload()) {
+            cmd_slab.release(slab_idx);
             if result >= 0 {
+                // The slot is free once the close completes.
                 let fd_index = self.driver.fs_fd_base + file_index as u32;
-                let _ = self.driver.ring.register_files_update(fd_index, &[-1i32]);
-            }
-            if let Some(ref mut files) = self.driver.fs_files {
+                self.driver.ring.submit_fixed_close(
+                    fd_index,
+                    UserData::encode(
+                        OpTag::FileClose,
+                        file_index as u32,
+                        crate::completion::FILE_CLOSE_FS,
+                    ),
+                );
+            } else if let Some(ref mut files) = self.driver.fs_files {
                 files.release(file_index);
             }
-            cmd_slab.release(slab_idx);
             return;
         }
 
@@ -4581,11 +4612,17 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                     && let Some(f) = files.get_mut(released_file_index)
                 {
                     f.in_flight = f.in_flight.saturating_sub(1);
-                    // A close deferred by `fs_close` finishes with the last
-                    // operation on the file (#859).
+                    // A close deferred by `fs_close` is submitted after the
+                    // last operation on the file (#859).
                     if f.closing && f.in_flight == 0 {
-                        let _ = self.driver.ring.register_files_update(f.fd_index, &[-1i32]);
-                        files.release(released_file_index);
+                        self.driver.ring.submit_fixed_close(
+                            f.fd_index,
+                            UserData::encode(
+                                OpTag::FileClose,
+                                released_file_index as u32,
+                                crate::completion::FILE_CLOSE_FS,
+                            ),
+                        );
                     }
                 }
             }
@@ -6698,6 +6735,153 @@ mod tests {
         assert_eq!(el.driver.write_orders.held(), 0, "the write released it");
         assert_eq!(wait_for_result(&mut el, sync_key), 0, "fsync");
         assert_eq!(std::fs::read(&path).unwrap(), DATA);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `fs::close` closes the file's fixed-file slot with `IORING_OP_CLOSE`
+    /// (#845): until that close completes the table slot is not handed to
+    /// another open, and once it has, a read through the fixed slot fails
+    /// with `EBADF`.
+    #[test]
+    fn a_closed_files_slot_is_reused_only_after_its_close_completes() {
+        let mut el = make_test_loop();
+        let path =
+            std::env::temp_dir().join(format!("ringline-fixed-close-{}", std::process::id()));
+        std::fs::write(&path, b"data").unwrap();
+        let open = |el: &mut AsyncEventLoop<NoopHandler>| {
+            let (index, generation, key) = el
+                .driver
+                .make_ctx()
+                .fs_open(&path, crate::fs::OpenFlags::READ, 0)
+                .expect("submit open");
+            el.executor.wait_disk_io(key, 0);
+            assert!(wait_for_result(el, key) >= 0, "open");
+            crate::fs::File::new(index, generation)
+        };
+        let a = open(&mut el);
+        let fd_index = el.driver.fs_fd_base + a.index() as u32;
+        el.driver.make_ctx().fs_close(a).expect("close");
+        assert!(
+            el.driver.make_ctx().fs_close(a).is_err(),
+            "the handle is stale at once"
+        );
+        // The close has not completed: the slot is still taken.
+        let b = open(&mut el);
+        assert_ne!(
+            b.index(),
+            a.index(),
+            "the slot was reused before its close ran"
+        );
+
+        // Wait for the close: the slot becomes free.
+        let started = std::time::Instant::now();
+        while el
+            .driver
+            .fs_files
+            .as_ref()
+            .unwrap()
+            .get(a.index() as u16)
+            .is_some_and(|f| f.active)
+        {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "the close never completed"
+            );
+            el.driver
+                .ring
+                .submit_and_wait_timeout(1, std::time::Duration::from_millis(100))
+                .expect("wait");
+            el.drain_completions();
+        }
+
+        // The fixed slot holds no file: a read through it fails.
+        let mut buf = [0u8; 4];
+        let probe = UserData::encode(OpTag::Cancel, 0, 0x7e57);
+        unsafe {
+            el.driver
+                .ring
+                .submit_direct_read(fd_index, buf.as_mut_ptr(), 4, 0, probe)
+                .expect("push probe");
+        }
+        let mut result = None;
+        let started = std::time::Instant::now();
+        while result.is_none() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(30));
+            el.driver
+                .ring
+                .submit_and_wait_timeout(1, std::time::Duration::from_millis(100))
+                .expect("wait");
+            let mut batch = Vec::new();
+            el.driver.ring.reap(&mut batch);
+            result = batch
+                .into_iter()
+                .find(|&(ud, _, _)| ud == probe.raw())
+                .map(|(_, res, _)| res);
+        }
+        let _ = el.driver.make_ctx().fs_close(b);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, Some(-libc::EBADF), "a read through the closed slot");
+    }
+
+    /// An open whose future was dropped is closed with `IORING_OP_CLOSE` when
+    /// it completes, and its table slot stays taken until that close has
+    /// completed (#845).
+    #[test]
+    fn an_abandoned_opens_slot_is_freed_by_its_close() {
+        let mut el = make_test_loop();
+        let path =
+            std::env::temp_dir().join(format!("ringline-abandoned-open-{}", std::process::id()));
+        std::fs::write(&path, b"data").unwrap();
+        let (index, _generation, key) = el
+            .driver
+            .make_ctx()
+            .fs_open(&path, crate::fs::OpenFlags::READ, 0)
+            .expect("submit open");
+        el.executor.abandon_disk_io_open(key);
+        let active = |el: &AsyncEventLoop<NoopHandler>| {
+            el.driver
+                .fs_files
+                .as_ref()
+                .unwrap()
+                .get(index)
+                .is_some_and(|f| f.active)
+        };
+        let reap = |el: &mut AsyncEventLoop<NoopHandler>| {
+            el.driver
+                .ring
+                .submit_and_wait_timeout(1, std::time::Duration::from_millis(100))
+                .expect("wait");
+            el.driver.cqe_batch.clear();
+            el.driver.cqe_cursor = 0;
+            el.driver.ring.reap(&mut el.driver.cqe_batch);
+            let batch = std::mem::take(&mut el.driver.cqe_batch);
+            for &(ud, res, flags) in &batch {
+                el.dispatch_cqe(ud, res, flags);
+            }
+            batch
+        };
+        // The open completes first; its close is pushed then, so the slot is
+        // still taken after the open's completion is dispatched.
+        let started = std::time::Instant::now();
+        loop {
+            assert!(started.elapsed() < std::time::Duration::from_secs(30));
+            let batch = reap(&mut el);
+            let open_done = batch.iter().any(|&(ud, _, _)| {
+                let ud = UserData(ud);
+                ud.tag() == Some(OpTag::Fs) && ud.payload() == key
+            });
+            if open_done {
+                assert!(active(&el), "the slot was freed before its close ran");
+                break;
+            }
+        }
+        while active(&el) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "the close never freed the slot"
+            );
+            reap(&mut el);
+        }
         let _ = std::fs::remove_file(&path);
     }
 

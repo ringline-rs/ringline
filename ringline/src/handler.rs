@@ -1742,27 +1742,31 @@ impl<'a> DriverCtx<'a> {
         }
     }
 
-    /// Close an NVMe device. With commands in flight, the handle goes stale at
-    /// once and the last completion unregisters the device.
+    /// Close an NVMe device. The handle goes stale at once. The device's
+    /// fixed-file slot is closed with `IORING_OP_CLOSE` once no command on it
+    /// is in flight (at once, or by the last completion), and the table slot
+    /// is free when that close completes.
     pub fn close_nvme_device(&mut self, device: crate::nvme::NvmeDevice) -> io::Result<()> {
         let (fd_index, _nsid) = self.validate_nvme_device(device)?;
 
-        if let Some(devices) = self.nvme_devices.as_mut()
-            && let Some(dev) = devices.get_mut(device.index)
-            && dev.in_flight > 0
-        {
-            dev.closing = true;
-            dev.generation = dev.generation.wrapping_add(1);
+        let Some(dev) = self
+            .nvme_devices
+            .as_mut()
+            .and_then(|devices| devices.get_mut(device.index))
+        else {
             return Ok(());
+        };
+        dev.closing = true;
+        if dev.in_flight == 0 {
+            self.ring.submit_fixed_close(
+                fd_index,
+                crate::completion::UserData::encode(
+                    crate::completion::OpTag::FileClose,
+                    device.index as u32,
+                    crate::completion::FILE_CLOSE_NVME,
+                ),
+            );
         }
-
-        // Unregister from the fixed file table.
-        self.ring.register_files_update(fd_index, &[-1i32])?;
-
-        if let Some(devices) = self.nvme_devices.as_mut() {
-            devices.release(device.index);
-        }
-
         Ok(())
     }
 
@@ -2102,30 +2106,34 @@ impl<'a> DriverCtx<'a> {
 
     /// Close a filesystem file.
     ///
-    /// Deregisters the fd from the fixed file table and releases the file
-    /// slot. With reads, writes or fsyncs in flight, the handle goes stale at
-    /// once and the last completion does both: an operation pushed earlier in
-    /// the same task poll may not be submitted until the loop flushes, and the
-    /// kernel resolves its fixed file then (#859).
+    /// The handle goes stale at once. The file's fixed-file slot is closed
+    /// with `IORING_OP_CLOSE` once no read, write or fsync on it is in flight:
+    /// at once, or by the last completion, because an operation pushed earlier
+    /// in the same task poll may not be submitted until the loop flushes, and
+    /// the kernel resolves its fixed file then (#859). The table slot is free
+    /// when the close completes (`AsyncEventLoop::handle_file_close`), so no
+    /// open installs into the slot before the close has run.
     pub(crate) fn fs_close(&mut self, file: crate::fs::File) -> io::Result<()> {
         let fd_index = self.validate_fs_file(file)?;
 
-        if let Some(files) = self.fs_files.as_mut()
-            && let Some(f) = files.get_mut(file.index)
-            && f.in_flight > 0
-        {
-            f.closing = true;
-            f.generation = f.generation.wrapping_add(1);
+        let Some(f) = self
+            .fs_files
+            .as_mut()
+            .and_then(|files| files.get_mut(file.index))
+        else {
             return Ok(());
+        };
+        f.closing = true;
+        if f.in_flight == 0 {
+            self.ring.submit_fixed_close(
+                fd_index,
+                crate::completion::UserData::encode(
+                    crate::completion::OpTag::FileClose,
+                    file.index as u32,
+                    crate::completion::FILE_CLOSE_FS,
+                ),
+            );
         }
-
-        // Unregister from the fixed file table.
-        self.ring.register_files_update(fd_index, &[-1i32])?;
-
-        if let Some(files) = self.fs_files.as_mut() {
-            files.release(file.index);
-        }
-
         Ok(())
     }
 
