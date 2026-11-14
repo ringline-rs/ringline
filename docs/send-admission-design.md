@@ -43,11 +43,14 @@ problems 2 and 3.
 
 ## What exists
 
-Read at e34d0015. `io.rs` is `ringline/src/runtime/io.rs`, `sc.rs` is
-`ringline/src/runtime/send_completion.rs`, `waker.rs` and `mod.rs` are in
-`ringline/src/runtime/`, `handler.rs` is `ringline/src/handler.rs`, and
-`udriver.rs`, `uloop.rs` and `ring.rs` are
-`ringline/src/backend/uring/driver.rs`, `event_loop.rs` and `ring.rs`.
+Read at 07dd0f56; line numbers in every section are at that commit. `io.rs`
+is `ringline/src/runtime/io.rs`, `sc.rs` is
+`ringline/src/runtime/send_completion.rs`, `waker.rs` is
+`ringline/src/runtime/waker.rs`, `handler.rs` is `ringline/src/handler.rs`,
+and `completion.rs` is `ringline/src/completion.rs`. `udriver.rs`, `uloop.rs`
+and `ring.rs` are `ringline/src/backend/uring/driver.rs`, `event_loop.rs` and
+`ring.rs`. `mdriver.rs` and mio `event_loop.rs` are
+`ringline/src/backend/mio/driver.rs` and `event_loop.rs`.
 
 - `BackpressuredSendFuture` (io.rs:3938) moves through the states of
   `BackpressuredState` (io.rs:3865-3874): `Fresh`, `Waiting(SendId)` in the
@@ -86,7 +89,7 @@ Read at e34d0015. `io.rs` is `ringline/src/runtime/io.rs`, `sc.rs` is
   with `Other("send copy pool exhausted")` or `Other("send slab exhausted")`
   (handler.rs:4117-4120, 4188).
 - `close()` drains queued sends with no time bound (io.rs:3265-3268), plain
-  or TLS (udriver.rs:2258-2261). `CLOSE_NOTIFY_TIMEOUT` (5 s, handler.rs:175)
+  or TLS (udriver.rs:2260-2263). `CLOSE_NOTIFY_TIMEOUT` (5 s, handler.rs:175)
   is armed for a connection whose handshake or connect has not completed, and
   by `DriverCtx::close` on an io_uring TLS connection (handler.rs:1161-1170).
 - A zero-copy slab entry is released when its notifications land, after the
@@ -96,8 +99,8 @@ Read at e34d0015. `io.rs` is `ringline/src/runtime/io.rs`, `sc.rs` is
   requests on any connection (CLAUDE.md, invariant 8). Worker exit cancels
   every request on a connection and only then closes it, with
   `CloseLead::Abort` (a `SO_LINGER {on, 0}` setsockopt, Linux 6.7,
-  ring.rs:69-73 and 570-579) for one still holding slab entries
-  (udriver.rs:3205-3307).
+  ring.rs:70-74 and 584-593) for one still holding slab entries
+  (udriver.rs:3207-3315).
 - On mio, `send`, `send_nowait` and `submit_batch` copy into a `Vec` and never
   touch the pool (handler.rs:2737-2789, io.rs:1826-1848). The pool on mio is
   the admission budget for bounded sends only (handler.rs:2794-2800), and
@@ -120,7 +123,7 @@ The send futures become `!Send` and are renamed:
   statement about the `Send` trait. The name is also taken by
   `mpsc::SendFuture`. `SendCompletion` names what the future resolves on. No
   aliases are kept for the old names: 0.7.0 batches breaking changes
-  (CLAUDE.md, Release Process).
+  (CLAUDE.md, API Design Principles).
 - Every builder of a `SendFuture` returns `SendCompletion`. These are `send`,
   `send_chain`, `submit_batch_await` on both backends, and the forward path.
 - With `!Send`, the one drop left outside the executor is a drop in the
@@ -135,9 +138,10 @@ The send futures become `!Send` and are renamed:
   Unreleased entries take the new names. The released CHANGELOG entries, the
   other design docs and the journal keep the names they had. Outside `docs/`,
   tracked files name `SendFuture` 48 times and `BackpressuredSendFuture` 24
-  times. The count is `git ls-files | grep -v '^docs/' | xargs grep -ow`.
-  It leaves out `mpsc::SendFuture` in `runtime/channel.rs` and a test-local
-  alias in `tests/combinators.rs`, which keep their names.
+  times, counted with
+  `git ls-files | grep -v -e '^docs/' -e 'runtime/channel\.rs$' -e 'tests/combinators\.rs$' | xargs grep -ow SendFuture | wc -l`.
+  The count leaves out `mpsc::SendFuture` in `runtime/channel.rs` and a
+  test-local alias in `tests/combinators.rs`, which keep their names.
 
 Tests:
 
@@ -274,20 +278,20 @@ Setup, on io_uring:
   since the supported range starts there.
 - Five runs per kernel, arm and candidate.
 
-Candidates:
+Candidates and controls:
 
 1. `ASYNC_CANCEL` of every request on the fixed file, then the `SO_LINGER`
    setsockopt, then the `Close`, joined by hard links as `submit_close` joins
-   its lead to the `Close` (ring.rs:551-552, 581). The setsockopt fails below
+   its lead to the `Close` (ring.rs:565-566, 595). The setsockopt fails below
    6.7, and a hard link still runs the next step after a failed one.
 2. `IORING_OP_CONNECT` with an `AF_UNSPEC` address, then the `Close`. In the
    Linux 6.12 source, `__inet_stream_connect` calls the protocol's
    `disconnect` for `AF_UNSPEC`, and `tcp_disconnect` sends a reset and purges
    the write queue. io_uring's connect copies any address (6.8). The
    completion is tagged on its own, because one under `OpTag::Connect` would
-   reach `handle_connect` (ring.rs:603-620).
+   reach `handle_connect` (ring.rs:617-634).
 3. Control A: `close()` with a send waiting for room. ringline's drain never
-   commits the `Close` (udriver.rs:1974, 1986).
+   commits the `Close` (udriver.rs:1976, 1988).
 4. Control B, with its own setup:
    - copy sends close the peer's window;
    - then a guarded send that fits in the space left in the send buffer, so
@@ -409,7 +413,7 @@ Constraints already found for each outcome:
 ## Alternatives considered
 
 - Keeping the send futures `Send` and checking the owner, as the disk-I/O
-  futures do (ringline/src/fs.rs:597-640): record `current_worker()` at
+  futures do (ringline/src/fs.rs:601-644): record `current_worker()` at
   creation, stay pending on another worker, and route a foreign drop's cancel
   to the owner. The disk-I/O futures leave their entry instead, and a waiting
   entry left at the head of the FIFO would hold back every bounded send on the
@@ -425,7 +429,7 @@ Constraints already found for each outcome:
   itself.
 - Slab entries in FIFO admission. The slab is taken outside the FIFO by
   coalesced runs, which run in completion handlers before woken tasks are
-  polled (uloop.rs:538, 619, 727), and by forwards. Releasing a guard-only
+  polled (uloop.rs:539, 621, 730), and by forwards. Releasing a guard-only
   entry wakes nothing (`wake_send_capacity` counts pool slots, sc.rs:792-800),
   and a peer that does not read holds its entries. A batch at the head waiting
   for an entry would hold back every send on the worker. Today only that batch
@@ -436,7 +440,7 @@ Constraints already found for each outcome:
   (`SEND_BACKSTOP_INTERVAL`, udriver.rs:421-423), and `POLLOUT` needs half of
   `wmem_queued` free. A slow reader can show no progress for longer than a
   short deadline. A per-iteration scan over connections has cost about 25% of
-  worker CPU before (uloop.rs:5023-5030).
+  worker CPU before (uloop.rs:5037-5044).
 - A deadline on every `close()`. `half-closed-send-wait-design.md:195-200`
   rejected it because a FIN called `close_connection`. Since
   `half-close-design.md`, a FIN closes nothing, except a TLS FIN before the
@@ -457,8 +461,8 @@ Constraints already found for each outcome:
 
 ## Order of work
 
-1. Section 1: the send futures become `!Send` and are renamed. A bug fix that
-   stands alone.
+1. Section 1: the send futures become `!Send` and are renamed. It fixes
+   problem 5 and can land without the other sections.
 2. Section 2, `send_admitted`, with `send_backpressured` rewritten on it and
    removal from the FIFO without a scan. This ends the false closes of
    problem 1.
