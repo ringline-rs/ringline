@@ -126,12 +126,13 @@
 //! Requires a 64-bit target.
 //!
 //! The backend is selected at build time by `build.rs`: a Linux host whose
-//! kernel is 6.1+ gets the io_uring backend, everything else gets mio.
+//! kernel is 6.8+ gets the io_uring backend, everything else gets mio.
 //!
-//! io_uring backend: Linux 6.1+. Requires io_uring with multishot recv,
-//! ring-provided buffers, SendMsgZc, and fixed file table support. If the
-//! kernel or a seccomp profile refuses `io_uring_setup(2)`, launch fails
-//! with [`Error::RingSetup`] naming the cause (for example the
+//! io_uring backend: Linux 6.8+. Requires io_uring with multishot recv,
+//! ring-provided buffers, SendMsgZc, fixed file table support, setsockopt on
+//! a fixed file, and fixed-fd install. Launch fails with [`Error::RingSetup`]
+//! when the running kernel is older than 6.8, or when the kernel or a seccomp
+//! profile refuses `io_uring_setup(2)`, naming the cause (for example the
 //! `kernel.io_uring_disabled` sysctl).
 //!
 //! mio backend: works on Linux and macOS; forced on Linux with the
@@ -204,7 +205,7 @@ pub(crate) mod worker;
 /// The I/O backend selected at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// io_uring backend (Linux 6.1+).
+    /// io_uring backend (Linux 6.8+).
     IoUring,
     /// mio backend (cross-platform fallback).
     Mio,

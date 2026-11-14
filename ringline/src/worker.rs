@@ -1039,8 +1039,8 @@ impl RinglineBuilder {
     /// Bind the most recently added listener without listening on it.
     ///
     /// The port is reserved against sockets that do not set `SO_REUSEADDR`.
-    /// On Linux below 6.8, and on 7.4 or any stable kernel with upstream commit
-    /// 947ccedf683e, a socket that sets it can also bind the port, but cannot
+    /// On Linux 7.4, any stable kernel with upstream commit 947ccedf683e, and
+    /// on mio below Linux 6.8, a socket that sets it can also bind the port, but cannot
     /// listen on it while the port is held. The kernel does not complete
     /// handshakes on this listener, so a TCP readiness probe fails while the
     /// server is not ready. On Linux the peer is refused with `ECONNREFUSED`;
@@ -1365,6 +1365,8 @@ impl RinglineBuilder {
         self.config.listener_tls = self.listeners.iter().map(|l| l.tls.clone()).collect();
         self.config.validate()?;
         self.validate_listeners()?;
+        #[cfg(has_io_uring)]
+        check_kernel_floor(crate::memlock::KernelVersion::current())?;
 
         let num_threads = if self.config.worker.threads == 0 {
             crate::topology::physical_core_count()
@@ -2093,6 +2095,27 @@ fn ensure_nofile_limit(
     }
 }
 
+/// Refuse a running kernel below the io_uring backend's floor, naming both.
+/// The backend is chosen when the crate is built, from the build host's
+/// kernel, so a binary built on one host can run on an older one. A kernel
+/// whose version cannot be read passes, and ring setup reports what it
+/// refuses.
+#[cfg(has_io_uring)]
+fn check_kernel_floor(
+    kernel: Option<crate::memlock::KernelVersion>,
+) -> Result<(), crate::error::Error> {
+    use crate::memlock::IO_URING_FLOOR;
+    match kernel {
+        Some(kernel) if kernel < IO_URING_FLOOR => Err(crate::error::Error::RingSetup(format!(
+            "this build uses the io_uring backend, which needs Linux {IO_URING_FLOOR} or \
+             later, and the running kernel is Linux {kernel}. Run on Linux {IO_URING_FLOOR} \
+             or later, or build with the `force-mio` feature \
+             (`--features ringline/force-mio`)"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Make sure `RLIMIT_MEMLOCK` covers what the workers' rings will charge to it,
 /// before any worker thread exists.
 ///
@@ -2535,7 +2558,8 @@ pub(crate) fn create_listener(addr: SocketAddr) -> Result<OwnedFd, crate::error:
     // however long the handler takes. Clearing the flag refuses that bind when
     // the kernel runs the conflict check. The check is skipped when
     // `tb->fastreuse` is 1 and the second socket sets the flag, and the first
-    // bind sets it to 1 below Linux 6.8 and on kernels with 947ccedf683e. On
+    // bind sets it to 1 below Linux 6.8 (mio only, since the io_uring backend
+    // needs 6.8) and on kernels with 947ccedf683e. On
     // those kernels the second socket binds, but its `listen(2)` fails with
     // EADDRINUSE while this socket has the flag cleared.
     // `listen_all` sets it again immediately before `listen(2)`, which
@@ -4070,5 +4094,34 @@ mod disk_exit_tests {
             TASK_DROPPED.load(Ordering::SeqCst),
             "the worker leaked its tasks although no read was left running"
         );
+    }
+}
+
+#[cfg(all(test, has_io_uring))]
+mod kernel_floor_tests {
+    use super::check_kernel_floor;
+    use crate::memlock::KernelVersion;
+
+    fn k(major: u32, minor: u32) -> Option<KernelVersion> {
+        Some(KernelVersion { major, minor })
+    }
+
+    #[test]
+    fn a_kernel_below_the_floor_is_refused_with_both_versions_named() {
+        let err = check_kernel_floor(k(6, 7)).expect_err("6.7 is below the floor");
+        let crate::error::Error::RingSetup(msg) = err else {
+            panic!("not RingSetup: {err:?}");
+        };
+        assert!(msg.contains("Linux 6.7"), "{msg}");
+        assert!(msg.contains("Linux 6.8 or later"), "{msg}");
+        assert!(msg.contains("force-mio"), "{msg}");
+        assert!(check_kernel_floor(k(5, 15)).is_err());
+    }
+
+    #[test]
+    fn the_floor_and_later_kernels_pass_and_an_unknown_one_is_not_refused() {
+        for kernel in [k(6, 8), k(6, 12), k(7, 0), None] {
+            assert!(check_kernel_floor(kernel).is_ok(), "{kernel:?}");
+        }
     }
 }

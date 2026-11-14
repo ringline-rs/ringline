@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `c + i`. Of the two, the last one called applies. When the kernel refuses a
   worker's SQ CPU with `EINVAL`, `launch` fails with an `Error::RingSetup`
   naming the worker and the CPU, instead of the generic `EINVAL` message
-  about a missing 6.1 setup flag. The kernel refuses a CPU at or beyond its
+  about a missing setup flag. The kernel refuses a CPU at or beyond its
   CPU count or offline, and from Linux 6.12, and in the stable series from
   6.11.2, 6.6.54 and 6.1.113, one outside the process's cpuset.
 - On io_uring, when `RLIMIT_MEMLOCK`'s hard limit is too low for the
@@ -341,6 +341,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** the io_uring backend needs Linux 6.8 or later, up from 6.1.
+  `build.rs` builds it only when the build host's kernel is 6.8 or later, or
+  cannot be read (as when cross-compiling from macOS). A build on an older
+  Linux host, including a container or CI runner on one, gets the mio backend
+  without an error, and no feature forces io_uring. An io_uring build run on a
+  kernel older than 6.8 fails at launch with `Error::RingSetup`, naming the
+  running kernel; on 6.1 to 6.7 it used to start, and below 6.1 it failed at
+  ring setup with `EINVAL`. Every kernel the backend now runs on has
+  io_uring's setsockopt command (6.7), so worker exit resets a connection
+  whose zero-copy send a non-reading peer holds (#607), and
+  `IORING_OP_FIXED_FD_INSTALL` (6.8), which park uses. Debian 12 (6.1) and
+  Amazon Linux 2023's 6.1 kernel are below the floor; Ubuntu 24.04's 6.8
+  kernel is not.
 - `fs::fsync` and `direct_io_fsync` wait for every write submitted before
   them through the same handle (#905). Before, an fsync submitted while a
   write to the file was still in flight ran alongside it and could complete
@@ -1754,7 +1767,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   index could be handed out twice, and a task spawned into the slot was lost. Its
   future is now dropped when the poll returns, and a handle on it resolves then.
 - io_uring: worker exit no longer waits out its bound for a zero-copy send on an
-  open connection, on Linux 6.7+. The peer gets 1 s to take the data, then the
+  open connection. The peer gets 1 s to take the data, then the
   connection closes with an RST, which discards the rest, so a peer reading too
   slowly loses it. Exit is now bounded by 10 s of time, not by passes of its loop,
   which ended in about 5 s or less and could leave connections unclosed. Guards

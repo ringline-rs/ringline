@@ -3211,7 +3211,7 @@ impl Driver {
                 // send waiting for a peer that does not read would otherwise
                 // never complete, and the loop below would wait out its full
                 // bound for it. `IORING_ASYNC_CANCEL_FD_FIXED` is in Linux
-                // 6.0, below the 6.1 io_uring minimum. No shutdown: each peer
+                // 6.0, below the 6.8 io_uring minimum. No shutdown: each peer
                 // gets a FIN once the socket is released, or an RST if
                 // received data was unread.
                 //
@@ -3277,8 +3277,7 @@ impl Driver {
         //    released within `ABORT_AFTER` is closed with an RST, whether its
         //    peer stopped reading or is reading slowly. The RST discards the
         //    queued data, so the notifications land. Such an entry holds the
-        //    loop for its whole bound on a kernel without `setsockopt` through
-        //    io_uring (below 6.7), or when its connection had closed before
+        //    loop for its whole bound when its connection had closed before
         //    exit began, so nothing can abort it. Its guards and the send pool's
         //    memory are then leaked, because the kernel can still read them.
         let started = std::time::Instant::now();

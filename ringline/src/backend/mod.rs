@@ -13,7 +13,7 @@ pub(crate) use sockaddr::sockaddr_to_socket_addr;
 pub(crate) use sockaddr::socket_addr_to_sockaddr;
 pub(crate) use sockaddr::unix_path_to_sockaddr;
 
-// ── io_uring backend (Linux 6.1+) ──────────────────────────────────────
+// ── io_uring backend (Linux 6.8+) ──────────────────────────────────────
 
 #[cfg(has_io_uring)]
 pub(crate) mod uring;

@@ -5649,7 +5649,7 @@ mod tests {
     fn the_policy_starts_a_real_park() {
         let mut el = make_test_loop();
         if !el.driver.ring.supports_park() {
-            return; // pre-6.8: park is unavailable by design, nothing to test
+            return; // the stub engine, or a kernel without the opcode: no park
         }
         let conn_index = accept_connection(&mut el);
         el.driver.park_offered[conn_index as usize] = true;
@@ -8609,7 +8609,7 @@ mod tests {
 
     /// The guard that makes a *negative* park probe trustworthy.
     ///
-    /// `Send` is a 5.6 opcode and the crate floor is 6.1, so every kernel
+    /// `Send` is a 5.6 opcode and the crate floor is 6.8, so every kernel
     /// that can run this backend has it. If this assertion ever fails, the
     /// probe mechanism itself is broken — and a broken probe does not look
     /// broken: it reports "unsupported" for everything, silently disabling
@@ -8620,7 +8620,7 @@ mod tests {
         let el = make_test_loop();
         assert!(
             el.driver.ring.probe_supported(io_uring::opcode::Send::CODE),
-            "the probe reported a 5.6 opcode unsupported on a >=6.1 kernel, \
+            "the probe reported a 5.6 opcode unsupported on a >=6.8 kernel, \
              so the probe is broken rather than the kernel being old"
         );
     }
@@ -8631,8 +8631,9 @@ mod tests {
     /// that has it. Park would be silently dead everywhere and every test
     /// would still be green.
     ///
-    /// So tie the answer to the kernel actually running: at 6.8 or later the
-    /// opcode exists and `supports_park()` must be true; below it, false.
+    /// So tie the answer to the kernel actually running: at 6.8 or later, which
+    /// every kernel the backend runs on is, the opcode exists and
+    /// `supports_park()` must be true.
     #[test]
     fn park_support_agrees_with_the_running_kernel_version() {
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -13478,7 +13479,7 @@ mod tests {
     fn shutdown_closes_the_fd_of_an_install_it_drains() {
         let mut el = make_test_loop();
         if !el.driver.ring.supports_park() {
-            return; // pre-6.8: no install can be in flight
+            return; // the stub engine, or a kernel without the opcode: no install
         }
         let conn_index = accept_connection(&mut el);
         let (ours, peer) = attach_socketpair(&mut el, conn_index);

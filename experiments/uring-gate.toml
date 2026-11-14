@@ -59,7 +59,7 @@ rustc -V 2>/dev/null; uname -r
 cd /home/anvil
 {
   uname -srm
-  # Necessary but not sufficient: the compile-time gate needs kernel >= 6.1,
+  # Necessary but not sufficient: the compile-time gate needs kernel >= 6.8,
   # and at run time the kernel must also *permit* io_uring. Print both rather
   # than discovering it as an unexplained abort inside the test run.
   echo "io_uring_disabled=$(sysctl -n kernel.io_uring_disabled 2>/dev/null || echo unset)"
