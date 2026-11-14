@@ -80,6 +80,17 @@ pub static RECV_ARRIVAL: ShardedCounterGroup = ShardedCounterGroup::new(recv_arr
 )]
 pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 
+/// io_uring: what the ring refused and a worker is waiting to retry, summed
+/// over workers: stream sends and receive arms on retry lists, UDP re-arms,
+/// merged accept arms, and one per worker whose last submit left SQEs
+/// queued (refused, or only some submitted). Nonzero while the kernel refuses
+/// submissions; each worker withdraws its share when it exits.
+#[metric(
+    name = "ringline/ring/push_retries_pending",
+    description = "Submissions the ring refused, waiting to be retried"
+)]
+pub static RING_PUSH_RETRIES_PENDING: Gauge = Gauge::new();
+
 // ── Index constants ─────────────────────────────────────────────
 
 /// Counter slot indices for connection metrics.
@@ -321,8 +332,8 @@ pub mod ring {
     /// An SQE push the ring refused: the submit that frees room returned an
     /// error (`EAGAIN` when the kernel could not allocate a request), or the
     /// SQ was still full after it. Sends and receive arms retry a
-    /// refused push every iteration (#830), so each retry that is refused
-    /// again counts once more. Also counts a provided-buffer-ring
+    /// refused push (#830), so each retry that is refused again counts once
+    /// more. Also counts a provided-buffer-ring
     /// unregistration that failed at worker exit.
     pub const SQE_SUBMIT_FAILURES: usize = 1;
     pub const CLOSE_SUBMIT_FAILURES: usize = 2;
@@ -347,7 +358,14 @@ pub mod ring {
     /// io_uring: enters that returned `EBADR`, the kernel's report that
     /// completions were dropped. The worker carries on.
     pub const CQE_DROPPED_REPORTED: usize = 8;
-    pub const COUNT: usize = 9;
+    /// io_uring: waits a worker set because something the ring refused was
+    /// still owed after the retry drains (`ringline/ring/push_retries_pending`
+    /// lists what counts). A UDP re-arm or merged accept arm due that
+    /// iteration counts once even when its next push succeeds. The worker
+    /// blocks until a completion or the retry is due; the wait starts at
+    /// 50 µs and doubles up to 10 ms.
+    pub const PUSH_RETRY_WAITS: usize = 9;
+    pub const COUNT: usize = 10;
 }
 
 /// Slot indices for `RECV_RING`: copies in the receive path.
@@ -630,6 +648,11 @@ pub fn init_metadata() {
         "op".into(),
         "cqe_dropped_reported".into(),
     );
+    RING.insert_metadata(
+        ring::PUSH_RETRY_WAITS,
+        "op".into(),
+        "push_retry_waits".into(),
+    );
 
     POOL.insert_metadata(pool::SEND_EXHAUSTED, "op".into(), "send_exhausted".into());
     POOL.insert_metadata(pool::TIMER_EXHAUSTED, "op".into(), "timer_exhausted".into());
@@ -731,6 +754,7 @@ mod tests {
             ring::RECV_ARM_FAILURES,
             ring::CQE_UNKNOWN_TAG,
             ring::SHUTDOWN_STALE,
+            ring::PUSH_RETRY_WAITS,
         ] {
             assert!(RING.increment(idx), "RING[{idx}] out of bounds");
         }

@@ -211,6 +211,17 @@ impl Ring {
         self.engine.force_push_failures(count);
     }
 
+    /// See [`Engine::force_enter_eagain`].
+    #[cfg(test)]
+    pub(crate) fn force_enter_eagain(&mut self, count: usize) {
+        self.engine.force_enter_eagain(count);
+    }
+
+    /// See [`Engine::submit_refused`].
+    pub(crate) fn submit_refused(&self) -> bool {
+        self.engine.submit_refused()
+    }
+
     /// Post a completion with `user_data` and `result`, as if an operation
     /// had completed. See [`Engine::inject`].
     #[cfg(test)]

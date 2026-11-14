@@ -499,7 +499,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             // A blocking wait ends by the next tick, the earliest timer, and
             // the earliest deadline from `Driver::next_deadline` (a
             // handshake, close or connect deadline, the send backstop's next
-            // run, or the end of a merged accept's backoff). The bound is
+            // run, the end of a merged accept's backoff, or the next retry of
+            // what the ring refused). The bound is
             // read here, after every task poll and orphan release of the
             // iteration, so a timer armed in this iteration bounds this wait.
             //
@@ -590,6 +591,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_shutdown_retries();
             self.drain_send_pollout_retries();
             self.retry_recv_arms();
+            // Set the wait before the next retry of what the ring refused
+            // again, or reset it once nothing is owed.
+            self.driver.after_push_retries(std::time::Instant::now());
             self.driver.tick_count += 1;
 
             // Wake the tasks whose timers have expired, and publish the load
@@ -1108,8 +1112,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// How long a blocking wait may last: until the next tick
     /// (`Driver::next_tick`), the earliest timer, or the earliest deadline
     /// from `Driver::next_deadline` (a handshake, close or connect deadline,
-    /// the send backstop's next run, or the end of a merged accept's
-    /// backoff), whichever is first.
+    /// the send backstop's next run, the end of a merged accept's backoff,
+    /// or the next retry of what the ring refused), whichever is first.
     /// Zero when that has passed. `None` when there is no tick and no
     /// deadline: the wait then lasts until a completion.
     fn wait_bound(&mut self) -> Option<std::time::Duration> {
@@ -1141,8 +1145,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// Whether the run loop may block waiting for a completion. It may not while a
     /// task is runnable, while a close released by the orphan drain awaits the
-    /// end-of-iteration drain, while a UDP re-arm is due, or once shutdown is
-    /// pending.
+    /// end-of-iteration drain, while a deferred receive is unarmed, or once
+    /// shutdown is pending.
     ///
     /// Pending closes: `release_orphans` at the top of the iteration can push to
     /// `pending_finalize_closes`, and only the drain at the end of the iteration
@@ -1156,46 +1160,24 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     /// `shutdown_flag` is set. With no tick timeout, a blocking wait would
     /// never return in either case.
     ///
-    /// UDP re-arms: `return_udp_buffers` retries a re-arm that could not be
-    /// submitted, and with no tick timeout a blocking wait could outlast every
-    /// other completion.
-    ///
-    /// Merged accepts: an accept whose push failed is retried at the start of
-    /// the next iteration (`Driver::merged_accept_due`), and a blocking wait
-    /// could outlast every other completion. One waiting out a backoff
-    /// bounds the wait instead (`Driver::next_deadline`).
-    ///
     /// Deferred receives: the pre-wait arm skips them when
     /// `completion_pending()` is true, which can mean task work that posts no
     /// completion, so a blocking wait could hold an unarmed deferred receive
     /// until an unrelated completion arrives.
     ///
-    /// Refused pushes: a receive (`recv_arm_retries`) or a send
-    /// (`pending_send_retries`, `pending_copy_retries`,
-    /// `pending_coalesced_retries`, `pending_zc_retries`) the ring could not
-    /// take has nothing in the kernel, and the drains after the wait push it
-    /// again. A blocking wait would hold it until an unrelated completion or
-    /// the wait's bound (#830).
+    /// What the ring refused does not keep the worker from blocking: a
+    /// receive arm, send, UDP re-arm or merged accept arm the ring could not
+    /// take, or a submit the kernel refused with SQEs left queued, is
+    /// retried after every wait, and the wait is bounded by its next retry
+    /// (`Driver::push_retries_pending`, `Driver::push_retry`, part of
+    /// `Driver::next_deadline`).
     fn may_block(&self) -> bool {
         let shutting_down =
             self.driver.shutdown_local || self.driver.shutdown_flag.load(Ordering::Relaxed);
         self.executor.ready_queue.is_empty()
             && self.driver.pending_finalize_closes.is_empty()
             && self.driver.deferred_recv_arms.is_empty()
-            && !self.driver.udp_rearm_due()
-            && !self.push_retry_due()
-            && !self.driver.merged_accept_due()
             && !shutting_down
-    }
-
-    /// Whether a receive or a send the ring refused is waiting to be pushed
-    /// again (`may_block`).
-    fn push_retry_due(&self) -> bool {
-        !self.driver.recv_arm_retries.is_empty()
-            || !self.driver.pending_send_retries.is_empty()
-            || !self.driver.pending_copy_retries.is_empty()
-            || !self.driver.pending_coalesced_retries.is_empty()
-            || !self.driver.pending_zc_retries.is_empty()
     }
 
     /// Arm the receives `park_recv` deferred (`Config::defer_recv_arm`), for
@@ -5957,9 +5939,12 @@ mod tests {
         assert_eq!(el.driver.merged_accept_arms, vec![AcceptArm::Unarmed]);
         assert_eq!(el.driver.merged_accept_pushes, 0);
         assert!(el.driver.merged_accept_due());
-        assert!(
-            !el.may_block(),
-            "a worker owing an accept arm must not block"
+        assert_eq!(el.driver.push_retries_pending(), 1);
+        assert!(el.may_block(), "the worker blocks, bounded by the retry");
+        assert_eq!(
+            el.wait_bound(),
+            Some(std::time::Duration::ZERO),
+            "the first retry is due now"
         );
 
         el.arm_merged_accepts();
@@ -6090,8 +6075,9 @@ mod tests {
         assert!(el.may_block());
     }
 
-    /// A UDP re-arm that cannot be submitted stays listed, keeps the worker
-    /// from blocking while the socket has a free buffer, and is retried.
+    /// A UDP re-arm that cannot be submitted stays listed, bounds the
+    /// worker's wait by the push-retry backoff while the socket has a free
+    /// buffer, and is retried.
     #[test]
     fn a_failed_udp_rearm_is_retried() {
         let mut cfg = test_config();
@@ -6106,7 +6092,8 @@ mod tests {
         el.driver.return_udp_buffers();
         assert_eq!(el.driver.udp_awaiting_buffers, vec![0]);
         assert!(el.driver.udp_rearm_due());
-        assert!(!el.may_block());
+        assert!(el.may_block());
+        assert_eq!(el.wait_bound(), Some(std::time::Duration::ZERO));
 
         el.driver.return_udp_buffers();
         assert!(el.driver.udp_awaiting_buffers.is_empty());
@@ -6121,6 +6108,7 @@ mod tests {
         assert_eq!(el.driver.udp_awaiting_buffers, vec![0]);
         assert!(!el.driver.udp_rearm_due());
         assert!(el.may_block());
+        assert_eq!(el.wait_bound(), None, "waiting for a buffer is not a retry");
 
         el.driver.udp_pending_replenish.push((0, 0));
         el.driver.return_udp_buffers();
@@ -6202,9 +6190,9 @@ mod tests {
     /// A receive arm the ring refuses closes nothing (#830): the buffer goes
     /// back to the accumulator, the reader stays parked with no error, and
     /// the connection goes on `recv_arm_retries` once, with the latest
-    /// `need`. The worker does not block while the entry is owed, and the
-    /// retry after the refusals end arms the receive, which then delivers
-    /// the peer's bytes.
+    /// `need`. While the entry is owed the worker's wait is bounded by the
+    /// next retry, and the retry after the refusals end arms the receive,
+    /// which then delivers the peer's bytes.
     #[test]
     fn a_receive_the_ring_refuses_is_retried_and_closes_nothing() {
         use std::os::fd::AsRawFd;
@@ -6239,7 +6227,12 @@ mod tests {
             el.executor.ready_queue.is_empty(),
             "the reader stays parked"
         );
-        assert!(!el.may_block(), "an owed receive keeps the worker awake");
+        assert!(el.may_block(), "an owed receive lets the worker block");
+        assert_eq!(
+            el.wait_bound(),
+            Some(std::time::Duration::ZERO),
+            "the first retry is due now"
+        );
 
         el.retry_recv_arms();
         assert_eq!(
@@ -6247,9 +6240,15 @@ mod tests {
             vec![(conn_index, generation, Some(100))],
             "a refused retry keeps one entry"
         );
-        assert!(!el.may_block());
+        el.driver.after_push_retries(std::time::Instant::now());
+        assert!(
+            el.wait_bound()
+                .is_some_and(|b| b <= crate::backend::uring::driver::PUSH_RETRY_BACKOFF_MIN),
+            "the refused retry bounds the wait by the backoff"
+        );
 
         el.retry_recv_arms();
+        el.driver.after_push_retries(std::time::Instant::now());
         let cs = el.driver.connections.get(conn_index).unwrap();
         assert!(cs.recv_direct_armed, "the retry armed the receive");
         assert!(!cs.recv_arm_retry);
@@ -6405,15 +6404,17 @@ mod tests {
         }
     }
 
-    /// Each list of pushes the ring refused keeps the worker from blocking:
-    /// nothing in the kernel would complete to retry them (#830).
+    /// Each list of pushes the ring refused lets the worker block, with the
+    /// wait bounded by the next retry: zero after the first refusal, so the
+    /// first retry follows at once.
     #[test]
-    fn a_refused_push_keeps_the_worker_from_blocking() {
+    fn a_refused_push_bounds_the_wait_instead_of_spinning() {
         let mut cfg = test_config();
         cfg.tick_timeout_us = 0;
         let mut el = make_test_loop_with_config(cfg);
         el.driver.ring.flush().unwrap();
         assert!(el.may_block(), "control: nothing owed");
+        assert_eq!(el.wait_bound(), None, "control: nothing bounds the wait");
         for list in 0..5 {
             match list {
                 0 => el.driver.recv_arm_retries.push((0, 0, None)),
@@ -6422,14 +6423,239 @@ mod tests {
                 3 => el.driver.pending_coalesced_retries.push((0, 0, 0)),
                 _ => el.driver.pending_zc_retries.push((0, 0, 0)),
             }
-            assert!(!el.may_block(), "list {list}");
+            assert!(el.may_block(), "list {list}: the worker may block");
+            assert_eq!(
+                el.wait_bound(),
+                Some(std::time::Duration::ZERO),
+                "list {list}: the first retry is due now"
+            );
             el.driver.recv_arm_retries.clear();
             el.driver.pending_send_retries.clear();
             el.driver.pending_copy_retries.clear();
             el.driver.pending_coalesced_retries.clear();
             el.driver.pending_zc_retries.clear();
-            assert!(el.may_block(), "list {list} cleared");
+            assert_eq!(el.wait_bound(), None, "list {list} cleared");
         }
+    }
+
+    /// A retry the ring refuses again sets the next one `delay` away,
+    /// doubling from `PUSH_RETRY_BACKOFF_MIN` up to `PUSH_RETRY_BACKOFF_MAX`;
+    /// once nothing is owed the backoff resets.
+    #[test]
+    fn a_refused_retry_doubles_the_wait_up_to_the_cap() {
+        use crate::backend::uring::driver::{PUSH_RETRY_BACKOFF_MAX, PUSH_RETRY_BACKOFF_MIN};
+        let mut el = make_test_loop();
+        el.driver.pending_send_retries.push((0, 0));
+        let now = std::time::Instant::now();
+        let mut expected = PUSH_RETRY_BACKOFF_MIN;
+        for _ in 0..12 {
+            el.driver.after_push_retries(now);
+            assert_eq!(el.driver.push_retry.next_at, Some(now + expected));
+            assert_eq!(el.driver.next_deadline(), Some(now + expected));
+            expected = (expected * 2).min(PUSH_RETRY_BACKOFF_MAX);
+        }
+        assert_eq!(el.driver.push_retry.delay, PUSH_RETRY_BACKOFF_MAX);
+        assert_eq!(el.driver.push_retry.published, 1);
+
+        el.driver.pending_send_retries.clear();
+        el.driver.after_push_retries(now);
+        assert_eq!(el.driver.push_retry.next_at, None);
+        assert_eq!(el.driver.push_retry.delay, PUSH_RETRY_BACKOFF_MIN);
+        assert_eq!(el.driver.push_retry.since, None);
+        assert_eq!(el.driver.push_retry.published, 0);
+    }
+
+    /// Refusals lasting `PUSH_RETRY_REPORT_AFTER` are reported once per run
+    /// of refusals.
+    #[test]
+    fn refusals_lasting_a_second_are_reported_once() {
+        use crate::backend::uring::driver::PUSH_RETRY_REPORT_AFTER;
+        let mut el = make_test_loop();
+        el.driver.recv_arm_retries.push((0, 0, None));
+        let t0 = std::time::Instant::now();
+        el.driver.after_push_retries(t0);
+        assert!(!el.driver.push_retry.reported, "not yet");
+        el.driver.after_push_retries(t0 + PUSH_RETRY_REPORT_AFTER);
+        assert!(el.driver.push_retry.reported);
+        el.driver.recv_arm_retries.clear();
+        el.driver.after_push_retries(t0 + PUSH_RETRY_REPORT_AFTER);
+        assert!(!el.driver.push_retry.reported, "a new run reports again");
+    }
+
+    /// A worker withdraws its share of the pending gauge when it exits.
+    #[test]
+    fn worker_exit_withdraws_the_pending_gauge() {
+        let mut el = make_test_loop();
+        el.driver.pending_send_retries.push((0, 0));
+        el.driver.after_push_retries(std::time::Instant::now());
+        assert_eq!(el.driver.push_retry.published, 1);
+        el.driver.pending_send_retries.clear();
+        el.driver.run_shutdown();
+        assert_eq!(el.driver.push_retry.published, 0);
+    }
+
+    /// Through `run()`: with every push refused for 200 ms, the loop waits
+    /// out the backoff instead of spinning. A spinning loop runs thousands of
+    /// iterations in that time; the backoff (zero, then 50 µs doubling to
+    /// 10 ms) allows about 30.
+    #[test]
+    fn the_run_loop_waits_while_the_ring_refuses() {
+        let mut cfg = test_config();
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        let conn_index = accept_connection(&mut el);
+        let (_ours, _peer) = attach_socketpair(&mut el, conn_index);
+        el.executor.recv_waiters[conn_index as usize] = true;
+        el.driver.ring.force_push_failures(1);
+        assert!(!el.arm_direct_recv(conn_index, None));
+        // Refuse every later push too.
+        el.driver.ring.force_push_failures(usize::MAX / 2);
+
+        let fault = std::sync::Arc::new(crate::config::TestFault::default());
+        el.driver.test_fault = Some(fault.clone());
+        let stop = fault.clone();
+        let idx = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                crate::sleep(std::time::Duration::from_millis(200)).await;
+                stop.error.store(true, std::sync::atomic::Ordering::Release);
+            }))
+            .expect("free standalone slot");
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+
+        let before = el.driver.tick_count;
+        assert!(el.run().is_err(), "the fault ends the loop");
+        let iterations = el.driver.tick_count - before;
+        assert!(
+            el.driver.push_retries_pending() > 0,
+            "the receive is still owed"
+        );
+        assert!(iterations < 200, "{iterations} iterations in 200 ms");
+        el.driver.ring.force_push_failures(0);
+        el.driver.unpublish_push_retries();
+    }
+
+    /// A pipe read end with nothing written, for a poll that stays pending.
+    fn idle_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    /// A timed wait whose submit the kernel refuses with `EAGAIN`, leaving
+    /// the SQE queued, still waits out its bound: the kernel returns such an
+    /// enter before its wait, so the engine waits again without submitting.
+    /// The refusal is recorded until a submit goes through.
+    #[test]
+    fn a_refused_submit_still_waits_for_its_bound() {
+        use std::os::fd::AsRawFd;
+        let mut el = make_test_loop();
+        el.driver.ring.flush().unwrap();
+        let (read_end, _write_end) = idle_pipe();
+        el.driver
+            .ring
+            .submit_poll_add(read_end.as_raw_fd(), libc::POLLIN as u32, u64::MAX - 1)
+            .expect("push a poll");
+        el.driver.ring.force_enter_eagain(1);
+        let started = std::time::Instant::now();
+        el.driver
+            .ring
+            .submit_and_wait_timeout(1, std::time::Duration::from_millis(50))
+            .expect("a refused submit is backpressure");
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(40),
+            "returned after {waited:?}"
+        );
+        assert!(el.driver.ring.submit_refused());
+        assert_eq!(el.driver.push_retries_pending(), 1);
+
+        el.driver
+            .ring
+            .submit_and_wait_timeout(1, std::time::Duration::from_millis(1))
+            .expect("the submit goes through");
+        assert!(!el.driver.ring.submit_refused());
+    }
+
+    /// Through `run()`: with every submitting enter refused with `EAGAIN`
+    /// and its SQEs left queued, as the kernel does when it cannot allocate
+    /// a request, the loop waits out the backoff instead of spinning.
+    #[test]
+    fn the_run_loop_waits_while_the_kernel_refuses_submits() {
+        use std::os::fd::AsRawFd;
+        let mut cfg = test_config();
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        el.driver.ring.flush().unwrap();
+        let (read_end, _write_end) = idle_pipe();
+        el.driver
+            .ring
+            .submit_poll_add(read_end.as_raw_fd(), libc::POLLIN as u32, u64::MAX - 1)
+            .expect("push a poll");
+        el.driver.ring.force_enter_eagain(usize::MAX / 2);
+
+        let fault = std::sync::Arc::new(crate::config::TestFault::default());
+        el.driver.test_fault = Some(fault.clone());
+        let stop = fault.clone();
+        let idx = el
+            .executor
+            .standalone_slab
+            .spawn(Box::pin(async move {
+                crate::sleep(std::time::Duration::from_millis(200)).await;
+                stop.error.store(true, std::sync::atomic::Ordering::Release);
+            }))
+            .expect("free standalone slot");
+        el.executor.ready_queue.push_back(idx | STANDALONE_BIT);
+
+        let before = el.driver.tick_count;
+        assert!(el.run().is_err(), "the fault ends the loop");
+        let iterations = el.driver.tick_count - before;
+        assert!(el.driver.ring.submit_refused(), "still refused");
+        assert!(iterations < 200, "{iterations} iterations in 200 ms");
+        el.driver.ring.force_enter_eagain(0);
+        el.driver.unpublish_push_retries();
+    }
+
+    /// As `the_run_loop_waits_while_the_kernel_refuses_submits`, with no
+    /// timer and no tick, so nothing else bounds the wait: the refused
+    /// submit itself must (`Ring::submit_refused` counts as owed). Another
+    /// thread ends the loop after 200 ms.
+    #[test]
+    fn a_refused_submit_bounds_an_otherwise_unbounded_wait() {
+        use std::os::fd::AsRawFd;
+        let mut cfg = test_config();
+        cfg.tick_timeout_us = 0;
+        let mut el = make_test_loop_with_config(cfg);
+        el.driver.ring.flush().unwrap();
+        let (read_end, _write_end) = idle_pipe();
+        el.driver
+            .ring
+            .submit_poll_add(read_end.as_raw_fd(), libc::POLLIN as u32, u64::MAX - 1)
+            .expect("push a poll");
+        el.driver.ring.force_enter_eagain(usize::MAX / 2);
+
+        let fault = std::sync::Arc::new(crate::config::TestFault::default());
+        el.driver.test_fault = Some(fault.clone());
+        let stop = fault.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            stop.error.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        let before = el.driver.tick_count;
+        assert!(el.run().is_err(), "the fault ends the loop");
+        stopper.join().unwrap();
+        let iterations = el.driver.tick_count - before;
+        assert!(iterations < 200, "{iterations} iterations in 200 ms");
+        el.driver.ring.force_enter_eagain(0);
+        el.driver.unpublish_push_retries();
     }
 
     /// A hangup poll retry waits while a park of the connection is pending:

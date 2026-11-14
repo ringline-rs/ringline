@@ -422,6 +422,49 @@ impl Driver {
 /// (`AsyncEventLoop::handle_send_backstop`).
 pub(crate) const SEND_BACKSTOP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The first wait after a pushed retry the ring refused again: a stream send
+/// or receive arm on a retry list (`Driver::push_retries_pending`).
+pub(crate) const PUSH_RETRY_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// The longest wait between retries of a refused push. Each refused retry
+/// doubles the wait up to this.
+pub(crate) const PUSH_RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long pushes stay refused before the worker writes one line to stderr.
+pub(crate) const PUSH_RETRY_REPORT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The backoff between retries of the pushes the ring refused
+/// (`Driver::after_push_retries`).
+#[derive(Debug)]
+pub(crate) struct PushRetryBackoff {
+    /// When the next retry is due; part of `Driver::next_deadline`. `None`
+    /// until a retry has been refused. The first refusal of a run is
+    /// retried after a wait of zero if it was made while tasks ran, and 50 µs
+    /// later if it was made in the completion drains, the retry drains or
+    /// the wait (`after_push_retries` runs later in the same iteration).
+    pub(crate) next_at: Option<std::time::Instant>,
+    /// The wait after the next refused retry.
+    pub(crate) delay: std::time::Duration,
+    /// When retries started being refused in this run of refusals.
+    pub(crate) since: Option<std::time::Instant>,
+    /// Whether this run of refusals has been written to stderr.
+    pub(crate) reported: bool,
+    /// What this worker has added to `metrics::RING_PUSH_RETRIES_PENDING`.
+    pub(crate) published: i64,
+}
+
+impl Default for PushRetryBackoff {
+    fn default() -> Self {
+        Self {
+            next_at: None,
+            delay: PUSH_RETRY_BACKOFF_MIN,
+            since: None,
+            reported: false,
+            published: 0,
+        }
+    }
+}
+
 /// A worker's multishot accept on one merged listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcceptArm {
@@ -722,9 +765,12 @@ pub(crate) struct Driver {
     pub(crate) defer_recv_arm: bool,
     /// Receives the ring refused to take, as `(conn_index, generation,
     /// need)` (`ConnectionState::recv_arm_retry`). `retry_recv_arms` arms
-    /// them again after each wait, and the wait does not block while any
-    /// is owed (`may_block`).
+    /// them again after each wait, and the wait is bounded by the next retry
+    /// (`push_retry`).
     pub(crate) recv_arm_retries: Vec<(u32, u32, Option<usize>)>,
+    /// The wait between retries of the entries on `recv_arm_retries` and
+    /// the four send retry lists (`after_push_retries`).
+    pub(crate) push_retry: PushRetryBackoff,
     /// Receives `park_recv` deferred under `defer_recv_arm`, as
     /// `(conn_index, generation, need)`. `arm_deferred_recvs` arms them before
     /// a wait that would block, or after the next wait.
@@ -1227,6 +1273,7 @@ impl Driver {
             defer_recv_arm: config.defer_recv_arm,
             deferred_recv_arms: Vec::new(),
             recv_arm_retries: Vec::new(),
+            push_retry: PushRetryBackoff::default(),
             udp_batch_recv_at: std::time::Instant::now(),
             tick_interval: (config.tick_timeout_us > 0)
                 .then(|| std::time::Duration::from_micros(config.tick_timeout_us)),
@@ -1476,10 +1523,17 @@ impl Driver {
     /// that has since completed; the wait then ends early), the earliest
     /// close deadline (`close_notify_deadline`) of a connection still
     /// waiting for its sends to drain, the next run of the send backstop, the
-    /// earliest connect deadline, and the end of a merged accept's backoff
-    /// (`merged_accept_retry_at`). Takes `&mut self` to drop connect
-    /// deadlines that are no longer live.
+    /// earliest connect deadline, the end of a merged accept's backoff
+    /// (`merged_accept_retry_at`), and the next retry of a refused push
+    /// (`push_retry`: the next retry, or now until a retry has been
+    /// refused).
+    /// Takes `&mut self` to drop connect deadlines that are no longer live.
     pub(crate) fn next_deadline(&mut self) -> Option<std::time::Instant> {
+        let push_retry = (self.push_retries_pending() > 0).then(|| {
+            self.push_retry
+                .next_at
+                .unwrap_or_else(std::time::Instant::now)
+        });
         let close = self
             .close_notify_armed
             .iter()
@@ -1494,16 +1548,91 @@ impl Driver {
             self.send_backstop_at,
             self.connect_deadlines.next_deadline(&self.connections),
             self.merged_accept_retry_at,
+            push_retry,
         ]
         .into_iter()
         .flatten()
         .min()
     }
 
+    /// What the ring refused and the run loop retries under the push-retry
+    /// backoff: the entries on `recv_arm_retries` and the four send retry
+    /// lists, a submit the kernel refused with SQEs left queued
+    /// (`Ring::submit_refused`), an unarmed merged accept whose arm is due
+    /// (`merged_accept_due`), and the UDP sockets whose re-arm is due
+    /// (`udp_rearms_due`).
+    pub(crate) fn push_retries_pending(&self) -> usize {
+        self.recv_arm_retries.len()
+            + self.pending_send_retries.len()
+            + self.pending_copy_retries.len()
+            + self.pending_coalesced_retries.len()
+            + self.pending_zc_retries.len()
+            + usize::from(self.ring.submit_refused())
+            + usize::from(self.merged_accept_due())
+            + self.udp_rearms_due()
+    }
+
+    /// After the retry drains have run: with nothing left on the retry
+    /// lists, reset the backoff; otherwise the ring refused a retry again,
+    /// so set the next retry `delay` from `now`, double `delay` up to
+    /// `PUSH_RETRY_BACKOFF_MAX`, and count the wait. The worker blocks until
+    /// a completion arrives or the retry is due, and the drains run again
+    /// after every wait, so a completion that frees room is followed by a
+    /// retry at once. Publishes the count to
+    /// `metrics::RING_PUSH_RETRIES_PENDING`, and once pushes have been
+    /// refused for `PUSH_RETRY_REPORT_AFTER`, writes one line to stderr.
+    pub(crate) fn after_push_retries(&mut self, now: std::time::Instant) {
+        let pending = self.push_retries_pending();
+        let delta = pending as i64 - self.push_retry.published;
+        if delta != 0 {
+            metrics::RING_PUSH_RETRIES_PENDING.add(delta);
+            self.push_retry.published = pending as i64;
+        }
+        if pending == 0 {
+            let published = self.push_retry.published;
+            self.push_retry = PushRetryBackoff {
+                published,
+                ..PushRetryBackoff::default()
+            };
+            return;
+        }
+        let backoff = &mut self.push_retry;
+        backoff.next_at = Some(now + backoff.delay);
+        backoff.delay = (backoff.delay * 2).min(PUSH_RETRY_BACKOFF_MAX);
+        metrics::RING.increment(metrics::ring::PUSH_RETRY_WAITS);
+        let since = *backoff.since.get_or_insert(now);
+        if !backoff.reported && now.duration_since(since) >= PUSH_RETRY_REPORT_AFTER {
+            backoff.reported = true;
+            // Not `eprintln!`, which panics if stderr fails.
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!(
+                    "ringline: worker {}: the ring has refused submissions for {:.1} s, \
+                     {pending} still owed; retrying with waits of up to {} ms \
+                     (ringline/ring/push_retries_pending, ringline/ring \
+                     op=push_retry_waits)\n",
+                    self.worker_index,
+                    now.duration_since(since).as_secs_f64(),
+                    PUSH_RETRY_BACKOFF_MAX.as_millis(),
+                ),
+            );
+        }
+    }
+
+    /// Withdraw this worker's share of `metrics::RING_PUSH_RETRIES_PENDING`,
+    /// at worker exit.
+    pub(crate) fn unpublish_push_retries(&mut self) {
+        if self.push_retry.published != 0 {
+            metrics::RING_PUSH_RETRIES_PENDING.sub(self.push_retry.published);
+            self.push_retry.published = 0;
+        }
+    }
+
     /// Whether a merged listener's accept is unarmed and may be armed now:
     /// the listeners are listening, no backoff is pending, and shutdown has
-    /// not begun. The run loop does not block while this holds, since the
-    /// arm is retried at the start of each iteration.
+    /// not begun. While this holds the arm counts as a pending push retry
+    /// (`push_retries_pending`), retried at the start of each iteration and
+    /// bounding the wait by the backoff.
     pub(crate) fn merged_accept_due(&self) -> bool {
         self.merged_accept_arms.contains(&AcceptArm::Unarmed)
             && self.merged_accept_retry_at.is_none()
@@ -2710,11 +2839,20 @@ impl Driver {
     }
 
     /// Whether a socket is left to re-arm with a buffer free for it: its re-arm
-    /// failed in `return_udp_buffers`, and the worker should retry, not block.
+    /// failed in `return_udp_buffers`, and it is retried under the push-retry
+    /// backoff (`udp_rearms_due`).
+    #[cfg(test)]
     pub(crate) fn udp_rearm_due(&self) -> bool {
+        self.udp_rearms_due() > 0
+    }
+
+    /// The UDP sockets in `udp_awaiting_buffers` whose ring has a free
+    /// buffer, so their re-arm is due: one the ring refused.
+    pub(crate) fn udp_rearms_due(&self) -> usize {
         self.udp_awaiting_buffers
             .iter()
-            .any(|&udp_index| self.udp_provided_bufs[udp_index as usize].free() > 0)
+            .filter(|&&udp_index| self.udp_provided_bufs[udp_index as usize].free() > 0)
+            .count()
     }
 
     /// Re-arm the UDP multishot recvmsg for a socket. A submission that fails
@@ -3019,6 +3157,7 @@ impl Driver {
     pub(crate) fn run_shutdown(&mut self) {
         // Close connections still queued for this worker.
         self.close_queued_connections();
+        self.unpublish_push_retries();
 
         // 1. Release entries parked on a retry list: their submit found the
         //    SQ full, so no operation is in flight and no CQE will release

@@ -88,6 +88,13 @@ pub(crate) trait Engine: Sized {
     /// tell.
     fn completion_pending(&self) -> bool;
 
+    /// Whether the last submitting enter left SQEs queued: it failed with
+    /// `EBUSY` or `EAGAIN`, or submitted only some of them (a request the
+    /// kernel could not allocate, or one that failed its prep). The kernel returns such an enter
+    /// before it waits, so the run loop bounds its next wait by the push
+    /// retry backoff while this holds (`Driver::push_retries_pending`).
+    fn submit_refused(&self) -> bool;
+
     /// Append every ready completion to `out`, consuming them.
     fn reap(&mut self, out: &mut Vec<(u64, i32, u32)>);
 
@@ -136,4 +143,10 @@ pub(crate) trait Engine: Sized {
     /// submit; `push_chain` is not affected.
     #[cfg(test)]
     fn force_push_failures(&mut self, count: usize);
+
+    /// Test-only: make the next `count` enters that have SQEs to submit fail
+    /// with `EAGAIN` and leave the SQEs queued, as the kernel does when it
+    /// cannot allocate a request.
+    #[cfg(test)]
+    fn force_enter_eagain(&mut self, count: usize);
 }

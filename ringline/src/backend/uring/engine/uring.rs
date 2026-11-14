@@ -216,6 +216,10 @@ pub(crate) fn provided_ring_failure(
 /// ~20 MB of buffer pools allocated per worker.
 pub(crate) struct UringEngine {
     ring: IoUring<squeue::Entry128, cqueue::Entry32>,
+    /// Whether the last submitting enter left SQEs queued: it failed with
+    /// `EBUSY` or `EAGAIN`, or submitted only some of them
+    /// (`Engine::submit_refused`).
+    submit_refused: std::sync::atomic::AtomicBool,
     /// Reusable Entry128 conversion scratch for chain pushes — avoids a
     /// heap allocation per chained send.
     chain_scratch: Vec<squeue::Entry128>,
@@ -248,6 +252,11 @@ pub(crate) struct UringEngine {
     /// [`Engine::force_push_failures`].
     #[cfg(test)]
     forced_push_failures: usize,
+    /// Test-only: the next `count` enters that would submit SQEs fail with
+    /// `EAGAIN` and leave the SQEs queued, as the kernel does when it cannot
+    /// allocate a request.
+    #[cfg(test)]
+    forced_enter_eagain: std::sync::atomic::AtomicUsize,
     /// Test-only: completions `inject` queued on a kernel without
     /// `IORING_NOP_INJECT_RESULT`, for `reap` to hand out.
     #[cfg(test)]
@@ -265,6 +274,78 @@ impl UringEngine {
         if error.raw_os_error() == Some(libc::EAGAIN) {
             // Safety: enters with no SQEs, no wait and no argument.
             let _ = unsafe { self.ring.submitter().enter::<()>(0, 0, 1, None) };
+        }
+        self.submit_refused
+            .store(self.sq_len() > 0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The SQEs queued and not yet submitted.
+    fn sq_len(&self) -> u32 {
+        // Safety: a shared view of the SQ head/tail atomics, read-only.
+        unsafe { self.ring.submission_shared().len() as u32 }
+    }
+
+    /// After an enter that did not fail: the refusal ends unless SQEs are
+    /// still queued, which on a ring without SQPOLL means the kernel
+    /// submitted only some of them (`io_submit_sqes` stops at a request it
+    /// cannot allocate, or, without `IORING_SETUP_SUBMIT_ALL`, at one that
+    /// fails its prep) and skipped its wait. Under SQPOLL the SQ
+    /// thread consumes the SQ, and queued SQEs are not a refusal.
+    fn note_submitted(&self) {
+        let partial = !self.ring.params().is_setup_sqpoll() && self.sq_len() > 0;
+        self.submit_refused
+            .store(partial, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test-only: `EAGAIN`, without entering the kernel, for an enter that
+    /// would submit while `forced_enter_eagain` is nonzero.
+    #[cfg(test)]
+    fn forced_eagain(&self) -> Option<io::Error> {
+        use std::sync::atomic::Ordering;
+        if self.sq_len() == 0 {
+            return None;
+        }
+        let left = self.forced_enter_eagain.load(Ordering::Relaxed);
+        if left == 0 {
+            return None;
+        }
+        self.forced_enter_eagain.store(left - 1, Ordering::Relaxed);
+        Some(io::Error::from_raw_os_error(libc::EAGAIN))
+    }
+
+    /// Wait for `min_complete` completions or `timeout` without submitting:
+    /// after a submit the kernel refused (`EAGAIN`, `EBUSY`), whose SQEs stay
+    /// queued. The kernel returns such an enter before its wait, so without
+    /// this a worker whose submits keep being refused would not block.
+    fn wait_without_submit(&self, min_complete: u32, timeout: std::time::Duration) {
+        let ts = types::Timespec::from(timeout.min(MAX_WAIT));
+        // `SubmitArgs` is `#[repr(transparent)]` over the kernel's
+        // `io_uring_getevents_arg`, and `enter` passes its size as `argsz`.
+        let args = types::SubmitArgs::new().timespec(&ts);
+        const IORING_ENTER_GETEVENTS: u32 = 1;
+        const IORING_ENTER_EXT_ARG: u32 = 1 << 3;
+        // Safety: submits nothing; `args` and `ts` outlive the call.
+        let result = unsafe {
+            self.ring.submitter().enter(
+                0,
+                min_complete,
+                IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG,
+                Some(&args),
+            )
+        };
+        // ETIME and EINTR end the wait as they do in the submitting enter,
+        // and EBADR is counted as there. Any other error would mean the
+        // kernel refused the argument, and the wait would not block.
+        if let Err(e) = result
+            && !reports_dropped_completions(&e)
+        {
+            debug_assert!(
+                matches!(
+                    e.raw_os_error(),
+                    Some(libc::ETIME | libc::EINTR | libc::EBUSY)
+                ),
+                "a wait without submit failed: {e}"
+            );
         }
     }
 
@@ -377,10 +458,22 @@ impl UringEngine {
     /// returns at once, so this repeats the enter until the SQ thread frees
     /// the rest.
     fn make_sq_room(&mut self, needed: usize) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(e) = self.forced_eagain() {
+            self.submit_refused
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(e);
+        }
         match self.ring.submit() {
-            Ok(_) => {}
+            Ok(_) => self.note_submitted(),
             Err(e) if reports_dropped_completions(&e) => {}
-            Err(e) => return Err(e),
+            Err(e) => {
+                if is_enter_backpressure(&e) {
+                    self.submit_refused
+                        .store(self.sq_len() > 0, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Err(e);
+            }
         }
         if self.ring.params().is_setup_sqpoll() {
             loop {
@@ -525,9 +618,12 @@ impl Engine for UringEngine {
             fixed_fd_install,
             close_lead: Self::close_lead_from(config),
             dropped_seen: 0,
+            submit_refused: std::sync::atomic::AtomicBool::new(false),
             pbuf_resv_set: false,
             #[cfg(test)]
             forced_push_failures: 0,
+            #[cfg(test)]
+            forced_enter_eagain: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             injected: Vec::new(),
             #[cfg(test)]
@@ -766,9 +862,23 @@ impl Engine for UringEngine {
             0
         };
         loop {
-            match self.ring.submitter().submit_and_wait(min_complete as usize) {
-                Ok(_) => return Ok(()),
+            #[cfg(test)]
+            let forced = self.forced_eagain();
+            #[cfg(not(test))]
+            let forced: Option<io::Error> = None;
+            let result = match forced {
+                Some(e) => Err(e),
+                None => self.ring.submitter().submit_and_wait(min_complete as usize),
+            };
+            match result {
+                Ok(_) => {
+                    self.note_submitted();
+                    return Ok(());
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // No wait follows a refused submit here: with no bound it
+                // could last until an unrelated completion. The refusal
+                // (`submit_refused`) bounds the next wait instead.
                 Err(e) if is_enter_backpressure(&e) => {
                     self.reap_after_backpressure(&e);
                     return Ok(());
@@ -814,16 +924,37 @@ impl Engine for UringEngine {
         }
         let ts = types::Timespec::from(timeout.min(MAX_WAIT));
         let args = types::SubmitArgs::new().timespec(&ts);
-        match self
-            .ring
-            .submitter()
-            .submit_with_args(min_complete as usize, &args)
-        {
-            Ok(_) => Ok(()),
-            Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
+        #[cfg(test)]
+        let forced = self.forced_eagain();
+        #[cfg(not(test))]
+        let forced: Option<io::Error> = None;
+        let result = match forced {
+            Some(e) => Err(e),
+            None => self
+                .ring
+                .submitter()
+                .submit_with_args(min_complete as usize, &args),
+        };
+        match result {
+            Ok(_) => {
+                self.note_submitted();
+                Ok(())
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ETIME) => {
+                self.note_submitted();
+                Ok(())
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
+            // The kernel refused the submit and returned before its wait:
+            // wait here, without submitting, for the same bound.
             Err(e) if is_enter_backpressure(&e) => {
                 self.reap_after_backpressure(&e);
+                if self
+                    .submit_refused
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.wait_without_submit(min_complete, timeout);
+                }
                 Ok(())
             }
             Err(e) if reports_dropped_completions(&e) => Ok(()),
@@ -856,12 +987,23 @@ impl Engine for UringEngine {
             // Safety: as in `flush()` — a shared view of the SQ head/tail
             // atomics, read-only.
             let n = unsafe { self.ring.submission_shared().len() } as u32;
-            match unsafe {
-                self.ring
-                    .submitter()
-                    .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
-            } {
-                Ok(_) => return Ok(()),
+            #[cfg(test)]
+            let forced = self.forced_eagain();
+            #[cfg(not(test))]
+            let forced: Option<io::Error> = None;
+            let result = match forced {
+                Some(e) => Err(e),
+                None => unsafe {
+                    self.ring
+                        .submitter()
+                        .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+                },
+            };
+            match result {
+                Ok(_) => {
+                    self.note_submitted();
+                    return Ok(());
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if is_enter_backpressure(&e) => {
                     self.reap_after_backpressure(&e);
@@ -889,6 +1031,12 @@ impl Engine for UringEngine {
     /// `flush()` returns, so the `drain_completions()` call that follows in
     /// the event loop can consume them immediately.
     fn flush(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(e) = self.forced_eagain() {
+            self.submit_refused
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(e);
+        }
         // `enter(sq_len, 0, GETEVENTS, None)`: this submits any pending SQEs AND triggers DEFER_TASKRUN task_work
         // delivery in a single syscall, saving one round-trip to the kernel
         // per flush() invocation (≈ once or twice per event-loop iteration).
@@ -926,9 +1074,18 @@ impl Engine for UringEngine {
                 .submitter()
                 .enter::<()>(n, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
         } {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.note_submitted();
+                Ok(())
+            }
             Err(e) if reports_dropped_completions(&e) => Ok(()),
-            Err(e) => Err(e),
+            Err(e) => {
+                if is_enter_backpressure(&e) {
+                    self.submit_refused
+                        .store(self.sq_len() > 0, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e)
+            }
         }
     }
 
@@ -977,6 +1134,16 @@ impl Engine for UringEngine {
     #[cfg(test)]
     fn force_push_failures(&mut self, count: usize) {
         self.forced_push_failures = count;
+    }
+
+    #[cfg(test)]
+    fn force_enter_eagain(&mut self, count: usize) {
+        *self.forced_enter_eagain.get_mut() = count;
+    }
+
+    fn submit_refused(&self) -> bool {
+        self.submit_refused
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     unsafe fn push(&mut self, sqe: &Sqe) -> io::Result<()> {
