@@ -1,9 +1,10 @@
 # Send admission a server can bound
 
-Status: sections 1 and 2 are built. Sections 3 and 4 name the experiments
-that decide them and the constraints already found; each gets its own
-specification once its experiment has run. "What exists" describes the code
-before section 1, at 07dd0f56.
+Status: sections 1 and 2 are built. Section 3 is specified for building, from
+Experiment A's results (`docs/journal/2026-11-abort-close.md`). Section 4
+names the experiment that decides it and the constraints already found.
+"What exists" describes the code before section 1, at 07dd0f56; section 3's
+specification cites the code at 03628fee.
 
 A server that answers many connections on one worker replies with
 `send_nowait`. When the send copy pool is exhausted the reply fails, and the
@@ -266,81 +267,95 @@ releasing their pool slots and slab entries. The contract the caller needs:
   case, and does nothing once the connection's `Close` has been committed;
 - callers use it in place of `close()` for a peer that has stopped reading.
 
-The mechanism is not decided. Committing a `Close` behind `CloseLead::Abort`
-does not release them: that lead only sets `SO_LINGER`, and the connection's
-hangup poll, an armed receive or a chain part keeps the socket open after the
-`Close`. Below 6.13, requests on other connections do too. Worker exit cancels
-every request first, which an `abort` on one connection cannot rely on below
-6.13.
+```rust
+impl SendHalf {
+    /// Close the connection now, as the contract above describes.
+    pub fn abort(&mut self);
+}
+```
 
-### Experiment A
+`Connection` gets the same method.
 
-Setup, on io_uring:
+### Mechanism, from Experiment A
 
-- `workers(1)`, so both connections below share one ring (the acceptor
-  round-robins connections across workers).
-- A plain TCP connection whose peer has stopped reading, with copy sends
-  queued, one send waiting for room, and a 4 MiB guarded zero-copy send. That
-  is larger than the loopback socket buffers, as in
-  `ringline/tests/shutdown_zero_copy.rs:19-21`. Over loopback, zero-copy data
-  that is transmitted is copied and its notification lands at once, so only
-  data behind the closed window keeps its entry. Each run checks that the
-  entry is still held after 1 s before applying a candidate.
-- Two arms: with and without a second, idle connection whose hangup poll is
-  armed.
-- Kernels: Linux 6.8 (Ubuntu 24.04), the io_uring backend's floor, 6.12
-  (Debian 13) and 7.2 (Debian 14), from the rack's guest images.
-- Five runs per kernel, arm and candidate.
+Experiment A ran on Linux 6.8, 6.12 and 7.2, and its method, predictions and
+results are in `docs/journal/2026-11-abort-close.md`, with the probe in
+`experiments/abort-close-probe.c`. In short:
 
-Candidates and controls:
+- `IORING_OP_CONNECT` with an `AF_UNSPEC` address, then the `Close`, reset the
+  connection and released its zero-copy send within 0.2 ms on all three
+  kernels, with 0, 1 and 256 other connections whose hangup polls were
+  pending. The disconnect does not wait for the fixed file's release.
+- Cancelling the connection's requests, setting `SO_LINGER {1, 0}` and closing
+  released it at once on 7.2. On 6.8 and 6.12 it was released only once every
+  request that other connections had pending before it had ended: not within
+  5 s while they stayed pending, and as soon as the probe ended them by closing
+  the idle peers (0.08 to 0.17 ms after closing one, 2.3 to 4.3 ms after
+  starting to close 256).
+- Closing, with or without `SO_LINGER`, while the connection's own hangup poll
+  is pending released nothing on any kernel.
 
-1. `ASYNC_CANCEL` of every request on the fixed file, then the `SO_LINGER`
-   setsockopt, then the `Close`, joined by hard links as `submit_close` joins
-   its lead to the `Close` (ring.rs:565-566, 595). The setsockopt fails below
-   6.7, and a hard link still runs the next step after a failed one.
-2. `IORING_OP_CONNECT` with an `AF_UNSPEC` address, then the `Close`. In the
-   Linux 6.12 source, `__inet_stream_connect` calls the protocol's
-   `disconnect` for `AF_UNSPEC`, and `tcp_disconnect` sends a reset and purges
-   the write queue. io_uring's connect copies any address (6.8). The
-   completion is tagged on its own, because one under `OpTag::Connect` would
-   reach `handle_connect` (ring.rs:617-634).
-3. Control A: `close()` with a send waiting for room. ringline's drain never
-   commits the `Close` (udriver.rs:1976, 1988).
-4. Control B, with its own setup:
-   - copy sends close the peer's window;
-   - then a guarded send that fits in the space left in the send buffer, so
-     its main completion reports its full length;
-   - nothing waits for room, and `close()` commits the `Close` with its normal
-     lead.
+So `abort` uses the disconnect on every kernel. On io_uring, for a TCP
+connection, plain or TLS:
 
-   This measures how long the kernel holds the entry, up to 60 s. Its result
-   does not feed the decision.
+1. The connection is marked closing, and a parked reader is failed with
+   `ConnectionAborted`, as `abort_connection` does (event_loop.rs:3341), and
+   also when a close is already requested, where `abort_connection` returns
+   early today.
+2. Its queued sends and its waiting bounded sends fail with
+   `ConnectionAborted` and release their pool slots.
+3. An `IORING_OP_CONNECT` with an `AF_UNSPEC` address is submitted on the
+   connection's fixed file, under a completion tag of its own so that its
+   completion does not reach `handle_connect` (`submit_connect`, ring.rs:617).
+   It is hard-linked to the connection's normal close lead and `Close`
+   (`submit_close`, ring.rs:549; `close_lead_for`, ring.rs:83), so the `Close`
+   runs whether or not the disconnect succeeds.
+4. The disconnect sends an RST and purges the socket's write queue, so the
+   zero-copy notifications land and the slab entries and their paired pool
+   slots are released. A send still in the kernel is expected to complete
+   with an error, which `abort` reports as `ConnectionAborted`. Experiment A
+   had none in flight at the disconnect, so this is not verified, and the
+   tests below check it.
+5. The `Close` frees the slot when the kernel releases the file. Before 6.13
+   that waits for older requests on other connections, as before, but nothing
+   the connection's sends hold waits with it.
 
-Measured: whether the peer sees an RST and when, and when the slab entry and
-the pool slots are released. "At once" means within 100 ms of the candidate's
-submission.
+On a Unix-domain connection, `abort` drops the queue and closes with the
+normal lead, without a disconnect. Guarded sends there release at completion
+(CLAUDE.md, the copies table), so nothing outlives the `Close`, and the peer
+sees end of file rather than a reset. Experiment A did not test a disconnect on
+a Unix-domain socket.
 
-Prediction:
+On mio, `abort` drops the queue on the open connection, as
+`fail_connection_on_send_error` does (mio event_loop.rs:1341), returns the
+queued sends' permits, sets `SO_LINGER {1, 0}` on the socket and closes it,
+skipping `finish_close`'s flush and close_notify (mio driver.rs:738). The
+socket is a normal descriptor there, so the setsockopt and close reset it on
+every kernel; Experiment A did not cover mio.
 
-- Control A releases nothing. For control B, I don't know whether the kernel
-  frees an orphaned socket's data behind a zero window within 60 s.
-- Candidate 1 releases at once on 7.2 in both arms. On 6.8 and 6.12 it
-  releases at once only without the idle connection.
-- Candidate 2 releases at once on every kernel, in both arms.
+Worker exit is unchanged. It cancels every request and then closes with the
+`Abort` lead, and Experiment A's batch arm, which cancels, sets `SO_LINGER` and
+closes every connection at once, released all 257 connections in 7.2 to 8.1 ms
+on 6.8 and 6.12 and 3.2 to 3.7 ms on 7.2.
 
-Decision: if candidate 2 releases at once on every kernel tested, `abort`
-uses it on every kernel. Otherwise candidate 1 from 6.13, and the
-specification states what `abort` does below.
+### Tests
 
-Not covered: on a Unix-domain socket, I expect `connect` with `AF_UNSPEC` to
-fail (not checked). Guarded sends there release at completion (CLAUDE.md,
-the copies table), and the specification states what `abort` does on them.
-
-On mio, `SO_LINGER {on, 0}` can be set on the socket, which `tcp_streams`
-holds until `finish_close` drops it (mdriver.rs:754, 784-787). The queue on an
-open connection can already be dropped, as `fail_connection_on_send_error`
-does (mio event_loop.rs:1304-1314). `abort` also needs a flag that skips
-`finish_close`'s flush and alert.
+- On a connection whose peer has stopped reading, with a zero-copy send held
+  and another, idle connection with its hangup poll pending, `abort` returns
+  the slab entry, its paired pool slot and the queued sends' slots within
+  100 ms, and the peer reads `ECONNRESET`. This has to run on a kernel before
+  6.13, the rack's 6.8 and 6.12 images: on CI's 6.17 the cancel-and-linger
+  close also passes it.
+- Queued, waiting and in-flight sends fail with `ConnectionAborted`, and a
+  parked reader gets `ConnectionAborted`.
+- `abort` after `close()` on a connection whose peer has stopped reading
+  releases the same resources; `abort` after the `Close` is committed does
+  nothing.
+- A TLS connection sends no close_notify, and a Unix-domain connection closes.
+- On mio, the peer reads `ECONNRESET`, no close_notify is written, and the
+  permits return to the pool.
+- Each test fails with its mechanism removed: with the disconnect replaced by
+  the cancel-and-linger close, the first test fails on 6.8 and 6.12.
 
 ## 4. The fast path
 
@@ -480,8 +495,7 @@ Constraints already found for each outcome:
 2. Section 2, `send_admitted`, with `send_backpressured` rewritten on it and
    removal from the FIFO without a scan. This ends the false closes of
    problem 1.
-3. Experiment A, then the `abort` specification and its PR. The experiment
-   does not depend on steps 1 and 2 and can run alongside them.
+3. Section 3, `abort`, as specified from Experiment A.
 4. Experiment B, then the fast-path specification and its PR.
 
 ## What a caller can no longer do
