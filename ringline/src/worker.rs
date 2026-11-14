@@ -431,8 +431,8 @@ impl Runtime {
     /// io_uring, cancelling each connection's operations in flight and waiting up
     /// to 10 s for the connections to close and for file, direct I/O and NVMe
     /// operations in flight to complete or be cancelled; on mio, waiting up to
-    /// 10 s for the disk-I/O pool's raw-pointer reads and writes already
-    /// running), and exit their event loops returning `Ok(())`, or
+    /// 10 s for the disk-I/O pool's reads and writes already running), and
+    /// exit their event loops returning `Ok(())`, or
     /// [`Error::TaskPanicked`](crate::Error::TaskPanicked) under
     /// [`TaskPanicPolicy::Shutdown`](crate::TaskPanicPolicy::Shutdown) for a
     /// worker on which a task panicked.
@@ -444,8 +444,8 @@ impl Runtime {
     ///
     /// An io_uring worker cancels its file, direct I/O and NVMe operations in
     /// flight; a mio worker has its disk-I/O pool skip the requests it has not
-    /// started. If an io_uring operation, or a raw-pointer read or write a mio
-    /// pool thread has started, is still running when the 10 s run out, or an
+    /// started. If an io_uring operation, or a read or write a mio pool thread
+    /// has started, is still running when the 10 s run out, or an
     /// io_uring worker's ring fails during that wait, the worker does not drop
     /// its tasks or its event loop: it leaks them, since the operation can
     /// still use their memory, closes its sockets, and writes a line to
@@ -1282,8 +1282,8 @@ impl RinglineBuilder {
                 // A drain that panicked, or that ended with a disk operation
                 // in flight, leaves memory the kernel (io_uring) or a disk-I/O
                 // pool thread (mio) can still use: leak the event loop, tasks
-                // included, since a task can own the buffer of an `fs::read`,
-                // `direct_io_read` or `nvme_read` (#824, #856).
+                // included, since a task's read or write future can own the
+                // buffer (#824, #856).
                 let memory_in_use = !drain_panicked && event_loop.memory_in_use_at_exit();
                 if memory_in_use {
                     // Not `eprintln!`, which panics if stderr fails.
@@ -3728,9 +3728,9 @@ mod disk_exit_tests {
         }
     }
 
-    /// Reads through the raw-pointer `fs::read` into a buffer the task owns:
-    /// memory a worker that dropped its tasks too early would free while the
-    /// kernel (io_uring) or a pool thread (mio) can still write to it.
+    /// Reads into a buffer the task's future owns, with a read the kernel
+    /// (io_uring) or a pool thread (mio) holds in flight until the test
+    /// completes it, to check that shutdown does not drop the task first.
     struct ReadsIntoTaskBuffer;
 
     impl AsyncEventHandler for ReadsIntoTaskBuffer {
@@ -3764,25 +3764,14 @@ mod disk_exit_tests {
                 while !GO.load(Ordering::SeqCst) {
                     crate::sleep(Duration::from_millis(1)).await;
                 }
-                let mut buf = vec![0u8; 4096];
-                let mut buf2 = vec![0u8; 4096];
-                // SAFETY: `buf` and `buf2` are owned by this task and outlive
-                // the reads unless the task is dropped first, which is what
-                // these tests check the worker does not do while a read is in
-                // flight.
-                let read = unsafe { crate::fs::read(file, 0, buf.as_mut_ptr(), buf.len() as u32) }
-                    .unwrap();
-                let read2 = file2.map(|f| {
-                    unsafe { crate::fs::read(f, 0, buf2.as_mut_ptr(), buf2.len() as u32) }.unwrap()
-                });
+                let read = crate::fs::read_into(file, 0, Vec::with_capacity(4096));
+                let read2 = file2.map(|f| crate::fs::read_into(f, 0, Vec::with_capacity(4096)));
                 READ_QUEUED.store(true, Ordering::SeqCst);
-                let result = read.await;
+                let (result, _buf) = read.await;
                 *READ_RESULT.lock().unwrap() = Some(format!("{result:?}"));
                 if let Some(read2) = read2 {
                     let _ = read2.await;
                 }
-                drop(buf);
-                drop(buf2);
             }
         }
         fn create_for_worker(_id: usize) -> Self {

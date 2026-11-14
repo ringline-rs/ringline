@@ -67,8 +67,7 @@ impl AsyncEventHandler for WriteThenClose {
             let other = temp_path("other");
             let file = ringline::fs::create(&path).unwrap().await.unwrap();
             // Both calls in one poll: the write is issued, then the close.
-            let write = ringline::fs::write_from(file, 0, bytes::BytesMut::from(&b"close"[..]))
-                .expect("submit the write");
+            let write = ringline::fs::write_from(file, 0, bytes::BytesMut::from(&b"close"[..]));
             let closed = ringline::fs::close(file);
             // The handle is refused at once, before the write completes.
             let reuse = ringline::fs::fsync(file).map(|_| ());

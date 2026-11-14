@@ -30,22 +30,30 @@ async fn fs_reads_past_the_bound(path: &std::path::Path) -> Result<(), String> {
         .await
         .map_err(|e| format!("open: {e}"))?;
     let mut reads = Vec::new();
-    for i in 0..BOUND {
-        let read = ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(64))
-            .map_err(|e| format!("fs read {i} refused under the bound: {e}"))?;
+    for _ in 0..BOUND {
+        let read = ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(64));
         reads.push(read);
     }
-    match ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(64)) {
-        Ok(_) => return Err("fs read past the bound was accepted".to_string()),
-        Err(e) if e.to_string() == "filesystem command slab exhausted" => {}
-        Err(e) => return Err(format!("fs read past the bound: unexpected error: {e}")),
+    // Refused at submission: the future resolves at once with the error and
+    // the buffer.
+    let mut extra = bytes::BytesMut::with_capacity(64);
+    extra.extend_from_slice(b"kept");
+    match ringline::fs::read_into(file, 0, extra).await {
+        (Ok(_), _) => return Err("fs read past the bound was accepted".to_string()),
+        (Err(e), buf)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                && e.to_string() == "filesystem command slab exhausted" =>
+        {
+            if &buf[..] != b"kept" {
+                return Err(format!("the refused read's buffer came back as {buf:?}"));
+            }
+        }
+        (Err(e), _) => return Err(format!("fs read past the bound: unexpected error: {e}")),
     }
     for read in reads {
         read.await.0.map_err(|e| format!("fs read: {e}"))?;
     }
-    let (n, _) = ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(64))
-        .map_err(|e| format!("fs read after the four completed: {e}"))?
-        .await;
+    let (n, _) = ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(64)).await;
     n.map_err(|e| format!("fs read after the four completed: {e}"))?;
     ringline::fs::close(file).map_err(|e| format!("fs close: {e}"))
 }
@@ -60,7 +68,9 @@ async fn direct_io_fsyncs_past_the_bound(path: &str) -> Result<(), String> {
     }
     match ringline::direct_io_fsync(file) {
         Ok(_) => return Err("direct fsync past the bound was accepted".to_string()),
-        Err(e) if e.to_string() == "direct I/O command slab exhausted" => {}
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                && e.to_string() == "direct I/O command slab exhausted" => {}
         Err(e) => {
             return Err(format!(
                 "direct fsync past the bound: unexpected error: {e}"

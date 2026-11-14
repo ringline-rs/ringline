@@ -5140,17 +5140,17 @@ impl<F: Future> Future for TimeoutFuture<F> {
 
 // ── Disk I/O async API ──────────────────────────────────────────────
 
-/// Future that awaits a disk-I/O completion: `fs::read`, `fs::write`,
-/// `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, NVMe and direct
-/// I/O. The operation was submitted before this future was created;
-/// its completion stores the result and wakes the task.
+/// Future that awaits a disk-I/O completion that carries no buffer:
+/// `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, `direct_io_fsync`
+/// and `nvme_flush`. Reads and writes return a
+/// [`ReadFuture`](crate::fs::ReadFuture) or
+/// [`WriteFuture`](crate::fs::WriteFuture), which hold their buffer. The
+/// operation was submitted before this future was created; its completion
+/// stores the result and wakes the task.
 ///
-/// Resolves to the operation's result: the bytes read or written for
-/// `fs::read`, `fs::write`, `direct_io_read` and `direct_io_write` (a short
-/// count is not an error), and `0` for `fs::fsync`, `fs::rename`,
-/// `fs::remove`, `fs::mkdir`, `direct_io_fsync` and every NVMe command. A
-/// failure resolves to the errno's `io::Error`; an NVMe command the device
-/// failed resolves to an `io::Error` of kind `Other` whose inner error is the
+/// Resolves to `0` on success. A failure resolves to the errno's
+/// `io::Error`; an NVMe command the device failed resolves to an `io::Error`
+/// of kind `Other` whose inner error is the
 /// [`NvmeStatus`](crate::NvmeStatus).
 ///
 /// Polled from a task on another worker it stays pending until a task on the
@@ -5204,7 +5204,7 @@ impl Future for DiskIoFuture {
 
 /// The error a negative disk-I/O result resolves to: for an NVMe command, a
 /// status word the device returned or an errno; otherwise an errno.
-fn disk_io_error(key: u32, result: i32) -> io::Error {
+pub(crate) fn disk_io_error(key: u32, result: i32) -> io::Error {
     #[cfg(has_io_uring)]
     if key >> 30 == crate::handler::DiskIoKind::Nvme as u32 {
         return crate::nvme::error_from_result(result);
@@ -5297,7 +5297,8 @@ pub fn close_nvme_device(device: crate::nvme::NvmeDevice) -> io::Result<()> {
 /// commands on namespace `nsid`.
 ///
 /// io_uring only: on mio this returns `Unsupported`. The open runs on the
-/// worker thread, `open(2)` and a synchronous registration of the fd as a
+/// worker thread, `open(2)`, an Identify Namespace for the logical block
+/// size ([`nvme_lba_size`]) and a synchronous registration of the fd as a
 /// fixed file, so every connection on the worker waits for it (#845).
 ///
 /// Returns an [`NvmeDevice`](crate::nvme::NvmeDevice) handle for
@@ -5314,114 +5315,207 @@ pub fn open_nvme_device(path: &str, nsid: u32) -> io::Result<crate::nvme::NvmeDe
     })
 }
 
-/// Submit a Direct I/O read and return a future for the result.
+/// Read from a Direct I/O file at `offset` into `buf`'s spare capacity.
 ///
-/// Reads `len` bytes from `offset` into the buffer at `buf`. The returned
-/// future completes when the operation does: the io_uring completion, or on
-/// mio the pool's `pread`.
+/// `buf` is any [`IoBufMut`](crate::buf::IoBufMut); with `O_DIRECT` its spare
+/// capacity must start at an address aligned to the device's logical block
+/// size, and its length and `offset` must be multiples of it, or the kernel
+/// returns `EINVAL`. [`AlignedBuf`](crate::buf::AlignedBuf) provides the
+/// address. The returned future completes when the operation does (the
+/// io_uring completion, or on mio the pool's `pread`) and yields
+/// `(io::Result<usize>, buf)`, as [`fs::read_into`](crate::fs::read_into)
+/// does, with the initialized length extended by the bytes read.
 ///
-/// # Safety
+/// If the future is dropped before the operation completes, the buffer is
+/// kept until the operation completes and then dropped, as for
+/// [`fs::read_into`](crate::fs::read_into).
 ///
-/// `buf` must point to aligned, writable memory of at least `len` bytes that
-/// remains valid until the operation completes. The operation keeps using the
-/// memory after the future is dropped, and a dropped future gives no way to
-/// learn when the operation completes, so after a drop the memory must not be
-/// freed or reused: leak it, or use an owned-buffer variant where one exists
-/// (#825). Direct I/O has no owned-buffer variant.
+/// A read that cannot be submitted resolves at once to `(Err(e), buf)`, as
+/// for [`fs::read_into`](crate::fs::read_into), and so does a `buf` with no
+/// spare capacity or more than `u32::MAX` bytes of it
+/// ([`io::ErrorKind::InvalidInput`]).
+///
+/// # Panics
+///
+/// Panics if called outside the ringline async executor, unless `buf` is
+/// refused before submission (the `InvalidInput` cases above).
+pub fn direct_io_read<B: crate::buf::IoBufMut>(
+    file: crate::direct_io::DirectIoFile,
+    offset: u64,
+    mut buf: B,
+) -> crate::fs::ReadFuture<B> {
+    use crate::fs::ReadFuture;
+    let (ptr, len, initial_len) = match crate::fs::spare_region(&mut buf) {
+        Ok(region) => region,
+        Err(e) => return ReadFuture::failed(e, buf),
+    };
+    with_state(|driver, executor| {
+        let mut ctx = driver.make_ctx();
+        // Safety: the future owns `buf`, or parks it on drop until the
+        // operation completes, so the memory outlives the kernel's use of it.
+        #[allow(unused_unsafe)]
+        match unsafe { ctx.direct_io_read(file, offset, ptr, len) } {
+            Ok(seq) => {
+                let target = crate::fs::cancel_target(
+                    crate::completion::OpTag::DirectIo,
+                    file.index as u32,
+                    seq,
+                );
+                ReadFuture::new(executor, seq, target, initial_len, None, buf)
+            }
+            Err(e) => ReadFuture::failed(e, buf),
+        }
+    })
+}
+
+/// The logical block size of `device`'s namespace in bytes, which
+/// [`open_nvme_device`] read with Identify Namespace. A read or write of
+/// `num_blocks` blocks transfers `num_blocks` times this.
+///
+/// If Identify Namespace failed at open, returns its error, and so do
+/// [`nvme_read`] and [`nvme_write`]; [`nvme_flush`] does not need it. The
+/// error carries the cause in its message and kind; a device status from
+/// Identify is not available as [`NvmeStatus`](crate::NvmeStatus). Returns
+/// `Unsupported` on the mio backend.
 ///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
-pub unsafe fn direct_io_read(
-    file: crate::direct_io::DirectIoFile,
-    offset: u64,
-    buf: *mut u8,
-    len: u32,
-) -> io::Result<DiskIoFuture> {
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        // Safety: the outer `direct_io_read()` is already unsafe, and the
-        // caller guarantees the buffer invariants.
-        #[allow(unused_unsafe)]
-        let seq = unsafe { ctx.direct_io_read(file, offset, buf, len)? };
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.wait_disk_io(seq, task_id);
-        Ok(DiskIoFuture::new(seq))
+pub fn nvme_lba_size(device: crate::nvme::NvmeDevice) -> io::Result<u32> {
+    with_state(|driver, _| driver.make_ctx().nvme_lba_size(device))
+}
+
+/// The bytes `num_blocks` logical blocks of `device` hold.
+fn nvme_transfer_len(
+    ctx: &crate::handler::DriverCtx<'_>,
+    device: crate::nvme::NvmeDevice,
+    num_blocks: u16,
+) -> io::Result<u32> {
+    let lba_size = ctx.nvme_lba_size(device)?;
+    u32::try_from(u64::from(num_blocks) * u64::from(lba_size)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "num_blocks * LBA size exceeds u32::MAX",
+        )
     })
 }
 
-/// Submit an NVMe read and return a future for the result.
+/// Read `num_blocks` logical blocks starting at `lba` into `buf`'s spare
+/// capacity.
 ///
-/// Reads `num_blocks` logical blocks starting at `lba` into the buffer
-/// at `buf_addr` with length `buf_len`. The returned future completes
-/// when the io_uring CQE arrives, with `Ok(0)` for a command the device
-/// completed, an `io::Error` of kind `Other` whose inner error (`get_ref()`,
+/// The command transfers `num_blocks` times the namespace's logical block
+/// size, which [`open_nvme_device`] reads with Identify Namespace. `buf` is
+/// any [`IoBufMut`](crate::buf::IoBufMut) whose spare capacity holds that
+/// many bytes. Its address should be 4-byte aligned, or the kernel copies the
+/// transfer through a bounce buffer; [`AlignedBuf`](crate::buf::AlignedBuf)
+/// provides the alignment. The returned
+/// future completes when the io_uring CQE arrives and yields
+/// `(io::Result<usize>, buf)`: `Ok(n)` with the initialized length extended
+/// by the `n` bytes transferred for a command the device completed, an
+/// `io::Error` of kind `Other` whose inner error (`get_ref()`,
 /// `into_inner()`) is the [`NvmeStatus`](crate::NvmeStatus) for one the
 /// device failed, and the errno's `io::Error` for a transport failure.
 ///
-/// # Safety
+/// If the future is dropped before the command completes, the buffer is kept
+/// until the command completes and then dropped.
 ///
-/// `buf_addr` must point to valid, aligned memory of at least `buf_len` bytes
-/// that remains valid until the operation completes. The operation keeps using
-/// the memory after the future is dropped, and a dropped future gives no way
-/// to learn when the operation completes, so after a drop the memory must not
-/// be freed or reused: leak it, or use an owned-buffer variant where one
-/// exists (#825). NVMe has no owned-buffer variant.
+/// A command that cannot be submitted resolves at once to `(Err(e), buf)`:
+/// [`io::ErrorKind::WouldBlock`] when the NVMe command slab is full, which a
+/// later retry with the same buffer can pass; [`io::ErrorKind::InvalidInput`]
+/// if `buf`'s spare capacity is smaller than the transfer; the Identify
+/// Namespace error if the LBA size is unknown ([`nvme_lba_size`]); and
+/// `Unsupported` on the mio backend.
 ///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
-pub unsafe fn nvme_read(
+pub fn nvme_read<B: crate::buf::IoBufMut>(
     device: crate::nvme::NvmeDevice,
     lba: u64,
     num_blocks: u16,
-    buf_addr: u64,
-    buf_len: u32,
-) -> io::Result<DiskIoFuture> {
+    mut buf: B,
+) -> crate::fs::ReadFuture<B> {
+    use crate::fs::ReadFuture;
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        // SAFETY: forwarded contract — the caller of the (unsafe) public
-        // wrapper guarantees buf_addr/buf_len validity and lifetime.
-        let seq = unsafe { ctx.nvme_read(device, lba, num_blocks, buf_addr, buf_len)? };
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.wait_disk_io(seq, task_id);
-        Ok(DiskIoFuture::new(seq))
+        let data_len = match nvme_transfer_len(&ctx, device, num_blocks) {
+            Ok(len) => len,
+            Err(e) => return ReadFuture::failed(e, buf),
+        };
+        let (ptr, spare, initial_len) = match crate::fs::spare_region(&mut buf) {
+            Ok(region) => region,
+            Err(e) => return ReadFuture::failed(e, buf),
+        };
+        if spare < data_len {
+            let e = io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "buffer spare capacity is smaller than num_blocks * LBA size",
+            );
+            return ReadFuture::failed(e, buf);
+        }
+        // Safety: the future owns `buf`, or parks it on drop until the
+        // command completes.
+        match unsafe { ctx.nvme_read(device, lba, num_blocks, ptr as u64, data_len) } {
+            Ok(seq) => {
+                let target = crate::fs::cancel_target(
+                    crate::completion::OpTag::NvmeCmd,
+                    device.index as u32,
+                    seq,
+                );
+                ReadFuture::new(executor, seq, target, initial_len, Some(data_len), buf)
+            }
+            Err(e) => ReadFuture::failed(e, buf),
+        }
     })
 }
 
-/// Submit a Direct I/O write and return a future for the result.
+/// Write `buf`'s initialized bytes to a Direct I/O file at `offset`.
 ///
-/// Writes `len` bytes from the buffer at `buf` to `offset` in the file. The
-/// returned future completes when the operation does: the io_uring
-/// completion, or on mio the pool's `pwrite`.
+/// `buf` is any [`IoBuf`](crate::buf::IoBuf), such as an
+/// [`AlignedBuf`](crate::buf::AlignedBuf) or the [`Bytes`](bytes::Bytes) that
+/// [`AlignedBuf::freeze`](crate::buf::AlignedBuf::freeze) makes; with
+/// `O_DIRECT` its address, its length and `offset` must be aligned to the
+/// device's logical block size, or the kernel returns `EINVAL`. The returned
+/// future completes when the operation does (the io_uring completion, or on
+/// mio the pool's `pwrite`) and yields `(io::Result<usize>, buf)`.
 ///
-/// # Safety
+/// If the future is dropped before the operation completes, the buffer is
+/// kept until the operation completes and then dropped.
 ///
-/// `buf` must point to aligned, readable memory of at least `len` bytes that
-/// remains valid until the operation completes. The operation keeps using the
-/// memory after the future is dropped, and a dropped future gives no way to
-/// learn when the operation completes, so after a drop the memory must not be
-/// freed or reused: leak it, or use an owned-buffer variant where one exists
-/// (#825). Direct I/O has no owned-buffer variant.
+/// A write that cannot be submitted resolves at once to `(Err(e), buf)`, and
+/// so does an initialized length above `u32::MAX`
+/// ([`io::ErrorKind::InvalidInput`]).
 ///
 /// # Panics
 ///
-/// Panics if called outside the ringline async executor.
-pub unsafe fn direct_io_write(
+/// Panics if called outside the ringline async executor, unless `buf` is
+/// refused before submission (the `InvalidInput` cases above).
+pub fn direct_io_write<B: crate::buf::IoBuf>(
     file: crate::direct_io::DirectIoFile,
     offset: u64,
-    buf: *const u8,
-    len: u32,
-) -> io::Result<DiskIoFuture> {
+    buf: B,
+) -> crate::fs::WriteFuture<B> {
+    use crate::fs::WriteFuture;
+    let (ptr, len) = match crate::fs::init_region(&buf) {
+        Ok(region) => region,
+        Err(e) => return WriteFuture::failed(e, buf),
+    };
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        // Safety: the outer `direct_io_write()` is already unsafe, and the
-        // caller guarantees the buffer invariants.
+        // Safety: the future owns `buf`, or parks it on drop until the
+        // operation completes.
         #[allow(unused_unsafe)]
-        let seq = unsafe { ctx.direct_io_write(file, offset, buf, len)? };
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.wait_disk_io(seq, task_id);
-        Ok(DiskIoFuture::new(seq))
+        match unsafe { ctx.direct_io_write(file, offset, ptr, len) } {
+            Ok(seq) => {
+                let target = crate::fs::cancel_target(
+                    crate::completion::OpTag::DirectIo,
+                    file.index as u32,
+                    seq,
+                );
+                WriteFuture::new(executor, seq, target, None, buf)
+            }
+            Err(e) => WriteFuture::failed(e, buf),
+        }
     })
 }
 
@@ -5472,39 +5566,61 @@ pub fn nvme_flush(device: crate::nvme::NvmeDevice) -> io::Result<DiskIoFuture> {
     })
 }
 
-/// Submit an NVMe write and return a future for the result.
+/// Write `num_blocks` logical blocks starting at `lba` from `buf`.
 ///
-/// Writes `num_blocks` logical blocks starting at `lba` from the buffer
-/// at `buf_addr` with length `buf_len`. The returned future completes
-/// when the io_uring CQE arrives, with the outcomes [`nvme_read`]
-/// describes.
+/// `buf` is any [`IoBuf`](crate::buf::IoBuf) whose initialized length is
+/// exactly `num_blocks` times the namespace's logical block size (see
+/// [`nvme_read`]), aligned as for [`nvme_read`]. The returned future
+/// completes when the io_uring CQE arrives and yields
+/// `(io::Result<usize>, buf)`, with the outcomes [`nvme_read`] describes.
 ///
-/// # Safety
+/// If the future is dropped before the command completes, the buffer is kept
+/// until the command completes and then dropped.
 ///
-/// `buf_addr` must point to valid, aligned memory of at least `buf_len` bytes
-/// that remains valid until the operation completes. The operation keeps using
-/// the memory after the future is dropped, and a dropped future gives no way
-/// to learn when the operation completes, so after a drop the memory must not
-/// be freed or reused: leak it, or use an owned-buffer variant where one
-/// exists (#825). NVMe has no owned-buffer variant.
+/// A command that cannot be submitted resolves at once to `(Err(e), buf)`:
+/// [`io::ErrorKind::InvalidInput`] if the initialized length is not the
+/// transfer length, otherwise as for [`nvme_read`].
 ///
 /// # Panics
 ///
 /// Panics if called outside the ringline async executor.
-pub unsafe fn nvme_write(
+pub fn nvme_write<B: crate::buf::IoBuf>(
     device: crate::nvme::NvmeDevice,
     lba: u64,
     num_blocks: u16,
-    buf_addr: u64,
-    buf_len: u32,
-) -> io::Result<DiskIoFuture> {
+    buf: B,
+) -> crate::fs::WriteFuture<B> {
+    use crate::fs::WriteFuture;
     with_state(|driver, executor| {
         let mut ctx = driver.make_ctx();
-        // SAFETY: forwarded contract — see nvme_read above.
-        let seq = unsafe { ctx.nvme_write(device, lba, num_blocks, buf_addr, buf_len)? };
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.wait_disk_io(seq, task_id);
-        Ok(DiskIoFuture::new(seq))
+        let data_len = match nvme_transfer_len(&ctx, device, num_blocks) {
+            Ok(len) => len,
+            Err(e) => return WriteFuture::failed(e, buf),
+        };
+        let (ptr, len) = match crate::fs::init_region(&buf) {
+            Ok(region) => region,
+            Err(e) => return WriteFuture::failed(e, buf),
+        };
+        if len != data_len {
+            let e = io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "buffer length is not num_blocks * LBA size",
+            );
+            return WriteFuture::failed(e, buf);
+        }
+        // Safety: the future owns `buf`, or parks it on drop until the
+        // command completes.
+        match unsafe { ctx.nvme_write(device, lba, num_blocks, ptr as u64, data_len) } {
+            Ok(seq) => {
+                let target = crate::fs::cancel_target(
+                    crate::completion::OpTag::NvmeCmd,
+                    device.index as u32,
+                    seq,
+                );
+                WriteFuture::new(executor, seq, target, Some(data_len), buf)
+            }
+            Err(e) => WriteFuture::failed(e, buf),
+        }
     })
 }
 

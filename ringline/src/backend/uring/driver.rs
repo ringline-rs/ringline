@@ -3345,9 +3345,9 @@ impl Driver {
             self.send_copy_pool.leak_backing();
         }
         // The memory of a disk command still in flight is spread over this
-        // driver (the statx box) and the tasks (the caller's buffer behind
-        // `fs::read`, `direct_io_read`, `nvme_read` and their writes), so the
-        // worker leaks the whole event loop rather than this one entry.
+        // driver (the statx box) and the executor (the buffer a read or
+        // write future owns, or parked when it was dropped), so the worker
+        // leaks the whole event loop rather than this one entry.
         self.disk_io_outstanding = self.disk_commands_in_flight();
 
         // 4. Unregister the UDP provided buffer rings before Driver is dropped

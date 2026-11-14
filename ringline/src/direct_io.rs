@@ -299,8 +299,8 @@ impl DirectIoConfig {
     /// Set the most I/O commands in flight across all files, per worker. Defaults to 256.
     ///
     /// Reads, writes and fsyncs count from submission until their completion
-    /// is processed. One submitted at the limit fails with
-    /// `direct I/O command slab exhausted`, on both backends.
+    /// is processed. One submitted at the limit fails with an error of kind
+    /// `WouldBlock`, `direct I/O command slab exhausted`, on both backends.
     ///
     /// On io_uring each command slot has 16,384 operation keys. A future holds
     /// one from submission until it takes its result or is dropped on the

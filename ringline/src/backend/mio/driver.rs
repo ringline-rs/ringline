@@ -297,7 +297,7 @@ pub(crate) struct Driver {
     /// `None` when it is not configured. A submit at the bound fails.
     pub(crate) disk_io_limits: [Option<u16>; 2],
     /// The keys in `disk_io_in_flight` whose request reads or writes through
-    /// a caller's buffer address: `fs::read`/`fs::write` and
+    /// a buffer address: `fs::read_into`/`fs::write_from` and
     /// `direct_io_read`/`direct_io_write`. Worker exit waits for these.
     pub(crate) disk_io_borrowing: std::collections::HashSet<u32>,
     /// Set by [`drain_disk_io_at_exit`](Self::drain_disk_io_at_exit) when an

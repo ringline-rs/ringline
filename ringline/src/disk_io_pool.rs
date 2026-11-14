@@ -79,12 +79,15 @@ pub(crate) enum PoolSubsystem {
 
 impl PoolSubsystem {
     /// The error a submit past the subsystem's bound returns: the io_uring
-    /// backend's text for a full command slab.
+    /// backend's kind and text for a full command slab.
     pub(crate) fn exhausted(self) -> std::io::Error {
-        std::io::Error::other(match self {
-            PoolSubsystem::Fs => "filesystem command slab exhausted",
-            PoolSubsystem::DirectIo => "direct I/O command slab exhausted",
-        })
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            match self {
+                PoolSubsystem::Fs => "filesystem command slab exhausted",
+                PoolSubsystem::DirectIo => "direct I/O command slab exhausted",
+            },
+        )
     }
 
     /// The error a submit for an unconfigured subsystem returns: the io_uring

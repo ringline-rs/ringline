@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ringline::buf`: the buffer traits the disk reads and writes take by
+  value (#825). `IoBuf` (a write's source) is implemented for `Vec<u8>`,
+  `BytesMut`, `Bytes` and `AlignedBuf`; `IoBufMut` (a read's destination)
+  for `Vec<u8>`, `BytesMut` and `AlignedBuf`. Both are `unsafe` to
+  implement: an implementer promises the memory stays valid and in place
+  while ringline holds the value, which lasts until the kernel completes the
+  operation even when the future is dropped. `AlignedBuf` is a heap buffer
+  at a chosen power-of-two alignment for direct I/O and NVMe, and
+  `AlignedBuf::freeze` turns it into an aligned `Bytes`.
+- `nvme_lba_size(device)` returns the namespace's logical block size, which
+  `open_nvme_device` now reads with Identify Namespace.
 - `SendHalf::send_admitted` and `Connection::send_admitted`, returning an
   `Admission`: a send that waits for send-pool capacity in the worker's FIFO,
   as `send_backpressured` does, and resolves when it is admitted and queued,
@@ -330,6 +341,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** the raw-pointer disk reads and writes are replaced by
+  owned-buffer ones (#825). A raw-pointer operation kept using its memory
+  after its future was dropped, as a `select` loser, at a `timeout` or with
+  its task, and the caller could not learn when it had finished, so the only
+  sound use after a drop was to leak the buffer.
+  - `fs::read_into(file, offset, buf)` and `fs::write_from(file, offset,
+    buf)` take any `IoBufMut` and `IoBuf` (a `BytesMut` still works).
+  - `direct_io_read(file, offset, buf)`, `direct_io_write(file, offset,
+    buf)`, `nvme_read(device, lba, num_blocks, buf)` and `nvme_write(device,
+    lba, num_blocks, buf)` take the buffer by value. Use `AlignedBuf` for
+    `O_DIRECT`'s alignment.
+  - All six return the future directly, `ReadFuture<B>` or `WriteFuture<B>`,
+    instead of an `io::Result` of one, and the future resolves to
+    `(io::Result<usize>, buf)`. An operation that cannot be submitted (a
+    full command slab or in-flight bound, a stale handle, a buffer of the
+    wrong size) resolves at once to its error with the buffer, so a caller
+    can retry with the same buffer. A full command slab or in-flight bound
+    is an error of kind `WouldBlock`, for this and every other fs, direct
+    I/O and NVMe call; it was `Other`.
+  - A read's length is the buffer's spare capacity: `direct_io_read` has no
+    `len` argument any more. To read fewer bytes, pass a buffer with that
+    much spare capacity (`AlignedBuf`'s capacity is exact). None is `unsafe` any more. A future
+    dropped before its operation completes keeps the buffer until the
+    operation completes, then drops it.
+  - An NVMe command transfers `num_blocks` times the namespace's logical
+    block size: a read needs that much spare capacity, a write exactly that
+    many initialized bytes, or it resolves to `InvalidInput`. On success it
+    resolves to `Ok(bytes transferred)` instead of `Ok(0)`. A namespace
+    whose LBA format carries metadata is refused.
+  - If Identify Namespace fails at open, the device still opens, and
+    `nvme_read`, `nvme_write` and `nvme_lba_size` return its error. Below
+    Linux 6.2 it needs `CAP_SYS_ADMIN`, as every NVMe passthrough command
+    does there; from 6.2 it needs none.
 - io_uring: the default `tick_timeout_us` is 10,000 (10 ms) instead of
   1,000. Timers and TLS handshake and close deadlines have their own
   wake-ups since #838. The tick still sets how often an idle worker calls
@@ -999,6 +1043,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
+- **Breaking:** `fs::read` and `fs::write`, which took a raw pointer
+  (#825). Use `fs::read_into` and `fs::write_from` (see Changed).
+
 - The `timer`, `tick_timeout`, `deadline`, `timeout` and `send_backstop`
   values of the `op` label on `ringline/cqe_by_tag`: those completions no
   longer exist (#838).
@@ -1263,10 +1310,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   invalid field read the same. A transport failure still resolves to the
   errno's `io::Error`. Finding F7 of `docs/journal/2026-11-file-io-audit.md`
   (#871).
-- Docs: the file I/O docs state the current behaviour: the `# Safety` sections
-  of `fs::read`, `fs::write`, `direct_io_read`, `direct_io_write`, `nvme_read`
-  and `nvme_write` say the buffer must outlive the operation, which a dropped
-  future gives no way to observe (#825); the futures say what a drop off the
+- Docs: the file I/O docs state the current behaviour: the futures say what a drop off the
   owning worker leaks; `DiskIoFuture` says what it resolves to per operation;
   the fs module doc says operations on one file are independent and what
   `fsync` covers; the direct I/O and NVMe docs cover the mio backend and the
@@ -1312,8 +1356,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   returns, as before, but its file-table slot is free only once those
   operations complete, so an `open` right after `close` on a full table
   fails until then (#859).
-- mio: worker exit waits, within 10 s, for the raw-pointer reads and writes
-  (`fs::read`/`fs::write`, `direct_io_read`/`direct_io_write`) its disk-I/O
+- mio: worker exit waits, within 10 s, for the reads and writes
+  (`fs::read_into`/`fs::write_from`, `direct_io_read`/`direct_io_write`) its disk-I/O
   pool is running. Before, the worker dropped its tasks while a pool thread
   could still read or write a task's buffer, and requests still queued for
   the pool ran after the worker had gone. At worker exit, requests the pool
@@ -1715,8 +1759,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A blocked `mpsc` send no longer strands another sender when it takes a slot
   without its wake, or when a sibling send in its task is dropped (#641).
 - `Child::wait`'s future and the file and disk-I/O futures (`fs::open`,
-  `fs::create`, `fs::stat`, `fs::read_into`, `fs::write_from`, `fs::read`,
-  `fs::write`, `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, NVMe and
+  `fs::create`, `fs::stat`, `fs::read_into`, `fs::write_from`,
+  `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, NVMe and
   direct I/O) return pending when polled on a worker other than the one that
   created them, as the timer, blocking, resolve, spawn and connect futures
   do since #641. Before, such a poll used that worker's entry with the same

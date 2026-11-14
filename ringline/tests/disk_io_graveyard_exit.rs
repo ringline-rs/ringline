@@ -86,8 +86,7 @@ async fn abandon_a_queued_read() -> Result<(), String> {
     drop(ringline::fs::open(dir.join("fifo"), OpenFlags::READ, 0).map_err(|e| e.to_string())?);
     // Queued behind it. Dropping the future parks the buffer until the read
     // completes.
-    let read = ringline::fs::read_into(file, 0, BytesMut::with_capacity(BUF_SIZE))
-        .map_err(|e| e.to_string())?;
+    let read = ringline::fs::read_into(file, 0, BytesMut::with_capacity(BUF_SIZE));
     drop(read);
     Ok(())
 }

@@ -282,10 +282,8 @@ mod mio {
                 *LEFT_OPEN.lock().unwrap() = Some(path.clone());
                 let outcome = async {
                     let file = ringline::fs::create(&path)?.await?;
-                    let data = b"left open";
-                    unsafe {
-                        ringline::fs::write(file, 0, data.as_ptr(), data.len() as u32)?.await?
-                    };
+                    let data = bytes::Bytes::from_static(b"left open");
+                    ringline::fs::write_from(file, 0, data).await.0?;
                     Ok::<_, std::io::Error>(())
                 }
                 .await
@@ -346,8 +344,7 @@ mod mio {
         // Park the pool's only thread in an open that waits for a writer, so the
         // write below queues behind it.
         let blocker = ringline::fs::open(&fifo, OpenFlags::READ, 0).map_err(|e| e.to_string())?;
-        let write = unsafe { ringline::fs::write(a, 0, DATA.as_ptr(), DATA.len() as u32) }
-            .map_err(|e| e.to_string())?;
+        let write = ringline::fs::write_from(a, 0, bytes::Bytes::from_static(DATA));
         ringline::fs::close(a).map_err(|e| e.to_string())?;
 
         // A new file takes the lowest free fd number, which is `a`'s if the close
@@ -357,7 +354,7 @@ mod mio {
         release_fifo_readers(fifo.clone());
         let fifo_file = blocker.await.map_err(|e| e.to_string())?;
         ringline::fs::close(fifo_file).map_err(|e| e.to_string())?;
-        write.await.map_err(|e| e.to_string())?;
+        write.await.0.map_err(|e| e.to_string())?;
         drop(c);
         Ok(())
     }

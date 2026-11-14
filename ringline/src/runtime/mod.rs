@@ -437,7 +437,7 @@ pub(crate) enum DiskIoEntry {
     /// stays here until the completion frees it, so the kernel's pointer
     /// stays valid. Buffers still here when the executor drops are leaked;
     /// see `impl Drop for Executor`.
-    Parked(bytes::BytesMut),
+    Parked(Box<dyn std::any::Any>),
     /// The `OpenFuture` was dropped with its open in flight; the completion
     /// closes the file and releases its slot instead of delivering a result.
     AbandonedOpen,
@@ -1046,7 +1046,7 @@ impl Executor {
 
     /// Park `buf`, the buffer of a dropped read or write whose operation
     /// `seq` is still in flight, until the completion frees it.
-    pub(crate) fn park_disk_io(&mut self, seq: u32, buf: bytes::BytesMut) {
+    pub(crate) fn park_disk_io(&mut self, seq: u32, buf: Box<dyn std::any::Any>) {
         self.disk_io.insert(seq, DiskIoEntry::Parked(buf));
         untrack_disk_io(seq);
     }
@@ -1839,7 +1839,7 @@ mod tests {
         let mut exec = Executor::new(8, 8, 8, 0, 0);
         let key = 0x4000_0103;
         exec.wait_disk_io(key, 0);
-        exec.park_disk_io(key, bytes::BytesMut::with_capacity(16));
+        exec.park_disk_io(key, Box::new(bytes::BytesMut::with_capacity(16)));
         assert!(!disk_io_key_held(key), "a parked key is not held");
         assert!(matches!(
             exec.disk_io.get(&key),

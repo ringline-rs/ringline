@@ -377,8 +377,7 @@ fn file_io_completes_in_futures_unordered() {
             let children: Vec<LocalBoxFuture<'_, ()>> = (0..8)
                 .map(|_| {
                     let read =
-                        ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(4096))
-                            .unwrap();
+                        ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(4096));
                     async move {
                         let (result, buf) = read.await;
                         assert_eq!(result.unwrap(), 4096);
@@ -1033,12 +1032,20 @@ disk_result_kept_test!(
 );
 disk_result_kept_test!(
     a_read_into_on_another_worker_leaves_a_delivered_result_alone,
-    |file, _| ringline::fs::read_into(file, 0, bytes::BytesMut::with_capacity(16)),
+    |file, _| Ok(ringline::fs::read_into(
+        file,
+        0,
+        bytes::BytesMut::with_capacity(16)
+    )),
     |(result, _)| result.is_ok()
 );
 disk_result_kept_test!(
     a_write_from_on_another_worker_leaves_a_delivered_result_alone,
-    |file, _| ringline::fs::write_from(file, 0, bytes::BytesMut::from(&b"ping"[..])),
+    |file, _| Ok(ringline::fs::write_from(
+        file,
+        0,
+        bytes::BytesMut::from(&b"ping"[..])
+    )),
     |(result, _)| result.is_ok()
 );
 
@@ -1523,7 +1530,7 @@ fn file_open_stat_and_write_complete_in_futures_unordered() {
                     let file = ringline::fs::create(&write_path).unwrap().await.unwrap();
                     let mut buf = bytes::BytesMut::with_capacity(4);
                     buf.extend_from_slice(b"ping");
-                    let (result, _) = ringline::fs::write_from(file, 0, buf).unwrap().await;
+                    let (result, _) = ringline::fs::write_from(file, 0, buf).await;
                     assert_eq!(result.unwrap(), 4);
                     let metadata = ringline::fs::stat(&write_path).unwrap().await.unwrap();
                     assert_eq!(metadata.size, 4);
