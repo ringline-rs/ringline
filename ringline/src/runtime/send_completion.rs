@@ -273,7 +273,7 @@ impl SendCompletions {
 
     /// Append a waiter and return its id.
     ///
-    /// Called by `BackpressuredSendFuture` on its first poll, with the
+    /// Called by `BackpressuredSend` on its first poll, with the
     /// connection it targets, the number of copy-pool slots its message
     /// needs, and the polling task's id.
     pub(crate) fn enqueue(
@@ -364,7 +364,7 @@ impl SendCompletions {
     /// Whether `id` may reserve slots now: it must be the head of the queue
     /// *and* `free_slots` must cover its `required_slots`.
     ///
-    /// Called by `BackpressuredSendFuture` on each poll while waiting; a `false` parks
+    /// Called by `BackpressuredSend` on each poll while waiting; a `false` parks
     /// the future until [`head_ready`](Self::head_ready) or a promotion
     /// wakes it.
     pub(crate) fn turn(&self, id: SendId, free_slots: usize) -> bool {
@@ -378,7 +378,7 @@ impl SendCompletions {
     /// Returns `None` if `id` was not the head, if there is no new head, or
     /// if `id` is not waiting.
     ///
-    /// Called by `BackpressuredSendFuture` right after it reserved its slots and
+    /// Called by `BackpressuredSend` right after it reserved its slots and
     /// submitted the send.
     pub(crate) fn mark_submitted(&mut self, id: SendId) -> Option<u32> {
         let pos = self.waiting.iter().position(|&w| w == id)?;
@@ -449,7 +449,7 @@ impl SendCompletions {
     /// or `Aborted`: removed, result discarded (a driver result that arrives
     /// afterwards finds no entry and is ignored). Unknown: ignored.
     ///
-    /// Called from `SendFuture`'s and `BackpressuredSendFuture`'s `Drop`. A
+    /// Called from `SendCompletion`'s and `BackpressuredSend`'s `Drop`. A
     /// connection task is dropped with the driver state installed, at its
     /// exit and at its connection's release (`with_driver_state`), so its
     /// futures reach this. A drop outside the executor (on another thread,
@@ -709,7 +709,7 @@ fn connection_aborted() -> io::Error {
 /// uses; the `wake_task` bool is ignored (a task that is not parked does not
 /// need waking).
 impl Executor {
-    /// [`SendCompletions::enqueue`]. `BackpressuredSendFuture`, first poll.
+    /// [`SendCompletions::enqueue`]. `BackpressuredSend`, first poll.
     pub(crate) fn enqueue_send_capacity(
         &mut self,
         conn_index: u32,
@@ -746,14 +746,14 @@ impl Executor {
         self.send_completions.set_owner(id, task_id);
     }
 
-    /// [`SendCompletions::turn`]. `BackpressuredSendFuture`, each poll while
+    /// [`SendCompletions::turn`]. `BackpressuredSend`, each poll while
     /// waiting.
     pub(crate) fn send_capacity_turn(&self, id: SendId, free_slots: usize) -> bool {
         self.send_completions.turn(id, free_slots)
     }
 
     /// [`SendCompletions::mark_submitted`] plus a wake of the new head.
-    /// `BackpressuredSendFuture`, after the reserve-copy-submit step.
+    /// `BackpressuredSend`, after the reserve-copy-submit step.
     pub(crate) fn mark_send_submitted(&mut self, id: SendId) {
         if let Some(next) = self.send_completions.mark_submitted(id) {
             let _ = self.wake_task(next);

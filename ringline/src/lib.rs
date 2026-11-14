@@ -278,7 +278,7 @@ pub use runtime::handler::AsyncEventHandler;
 pub use runtime::io::AsyncSendBuilder;
 /// Future returned by [`SendHalf::send_backpressured()`]: a send that waits
 /// for send-pool capacity instead of failing when the pool is full.
-pub use runtime::io::BackpressuredSendFuture;
+pub use runtime::io::BackpressuredSend;
 /// Future returned by [`spawn_blocking()`]. Resolves to the closure's return value, or a [`JoinError`] if it panicked.
 pub use runtime::io::BlockingJoinHandle;
 /// Future that completes when a connect finishes.
@@ -305,7 +305,7 @@ pub use runtime::io::RecvReadyFuture;
 /// Future returned by [`resolve()`].
 pub use runtime::io::ResolveFuture;
 /// Future that completes when a send finishes.
-pub use runtime::io::SendFuture;
+pub use runtime::io::SendCompletion;
 /// The single-owner write side of a connection, from [`Connection::split()`].
 pub use runtime::io::SendHalf;
 /// Future returned by [`sleep()`].

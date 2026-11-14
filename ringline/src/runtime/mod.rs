@@ -12,7 +12,7 @@
 //!   - `handler` — `AsyncEventHandler` trait
 //!
 //! - **Backend-specific** (tied to the concrete `Driver` type):
-//!   - `io` — `Connection`, futures (`WithDataFuture`, `SendFuture`, `ConnectFuture`)
+//!   - `io` — `Connection`, futures (`WithDataFuture`, `SendCompletion`, `ConnectFuture`)
 //!     accesses `Driver` via thread-local pointer
 //!
 //! A mio backend would provide an alternative `driver.rs`, `async_event_loop.rs`,
@@ -795,7 +795,7 @@ impl Executor {
     ///
     /// Drops the connection's task if it is still alive. The backends call
     /// this under `with_driver_state`, so the futures that task holds clean
-    /// up as they do inside a poll (a `SendFuture` cancels its entry, a
+    /// up as they do inside a poll (a `SendCompletion` cancels its entry, a
     /// `SleepFuture` its timer).
     pub(crate) fn remove_connection(&mut self, conn_index: u32) {
         let idx = conn_index as usize;

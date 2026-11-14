@@ -115,7 +115,7 @@ io_uring backend, each worker also owns:
 | `AsyncEventHandler` | Trait: `on_accept(Connection) -> Future` — one task per connection |
 | `Connection` | An owned connection: `send()`, `send_nowait()`, `with_data()`; `split()` gives `SendHalf` and `RecvHalf` |
 | `WithDataFuture` | Future that resolves when recv data is available |
-| `SendFuture` | Future that resolves when a send completes |
+| `SendCompletion` | Future that resolves when a send completes |
 | `ConnectFuture` | Future that resolves when an outbound connection completes |
 | `RinglineBuilder` | Builder: `RinglineBuilder::new(config).bind(addr).launch::<H>()` |
 | `Config` | Runtime configuration (SQ size, buffer sizes, worker count, TLS, etc.) |

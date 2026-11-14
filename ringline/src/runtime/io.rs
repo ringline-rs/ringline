@@ -96,7 +96,7 @@ pub(crate) fn clear_driver_state() {
 /// thread-local driver pointer on drop — including during panic unwind.
 /// Without this, a panic between set and clear leaves `CURRENT_DRIVER`
 /// pointing into a popped stack frame, and futures' `Drop` impls
-/// (`SendFuture`, `SleepFuture`, ...) dereference it while the executor's
+/// (`SendCompletion`, `SleepFuture`, ...) dereference it while the executor's
 /// slabs unwind — a use-after-free.
 pub(crate) struct DriverStateGuard(());
 
@@ -619,7 +619,7 @@ impl<T: 'static> Future for BlockingJoinHandle<T> {
 /// Begin an outbound TCP connection.
 ///
 /// Returns a builder. Nothing is submitted until the builder is awaited;
-/// [`BackpressuredSendFuture`] has the same contract. Awaiting resolves to an
+/// [`BackpressuredSend`] has the same contract. Awaiting resolves to an
 /// owned [`Connection`], the same type that `on_accept` receives.
 ///
 /// ```ignore
@@ -1330,6 +1330,7 @@ impl ConnCtx {
                 in_flight: None,
             }),
             _borrow: PhantomData,
+            _not_send: PhantomData,
         }
     }
 
@@ -1389,19 +1390,23 @@ impl ConnCtx {
             generation,
             refused: armed.err(),
             _borrow: PhantomData,
+            _not_send: PhantomData,
         }
     }
 
     /// See [`SendHalf::send_parts`].
     #[cfg(has_io_uring)]
     pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
-        AsyncSendBuilder { token: self.id() }
+        AsyncSendBuilder {
+            token: self.id(),
+            _not_send: PhantomData,
+        }
     }
 
     // ── Send (awaitable) ─────────────────────────────────────────────
 
     /// See [`SendHalf::send`].
-    pub(crate) fn send(&self, data: &[u8]) -> io::Result<SendFuture> {
+    pub(crate) fn send(&self, data: &[u8]) -> io::Result<SendCompletion> {
         with_state(|driver, executor| {
             let id = executor.register_send(self.conn_index);
             let mut ctx = driver.make_ctx();
@@ -1409,17 +1414,22 @@ impl ConnCtx {
                 executor.withdraw_send(id);
                 return Err(e);
             }
-            Ok(SendFuture::pending(self.conn_index, self.generation, id))
+            Ok(SendCompletion::pending(
+                self.conn_index,
+                self.generation,
+                id,
+            ))
         })
     }
 
     /// See [`SendHalf::send_backpressured`].
-    pub(crate) fn send_backpressured<'a>(&self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
-        BackpressuredSendFuture {
+    pub(crate) fn send_backpressured<'a>(&self, data: &'a [u8]) -> BackpressuredSend<'a> {
+        BackpressuredSend {
             conn_index: self.conn_index,
             generation: self.generation,
             data,
             state: BackpressuredState::Fresh,
+            _not_send: PhantomData,
         }
     }
 
@@ -1451,13 +1461,13 @@ impl ConnCtx {
     ///
     /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder) for
     /// constructing linked SQEs. Call `.copy()`, `.parts()...add()` to build the
-    /// chain, then `.finish()` to submit it. Returns a [`SendFuture`] that
+    /// chain, then `.finish()` to submit it. Returns a [`SendCompletion`] that
     /// resolves with the bytes the chain sent, or `Ok(0)` when the closure
     /// submitted nothing.
     ///
     /// For fire-and-forget chained sending, use `send_chain_nowait()`.
     #[cfg(has_io_uring)]
-    pub(crate) fn send_chain<F>(&self, f: F) -> io::Result<SendFuture>
+    pub(crate) fn send_chain<F>(&self, f: F) -> io::Result<SendCompletion>
     where
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
     {
@@ -1477,9 +1487,17 @@ impl ConnCtx {
             // `finish`) sent nothing.
             if !tls_carried && !driver.chain_table.carries(self.conn_index, id) {
                 executor.withdraw_send(id);
-                return Ok(SendFuture::ready(self.conn_index, self.generation, Ok(0)));
+                return Ok(SendCompletion::ready(
+                    self.conn_index,
+                    self.generation,
+                    Ok(0),
+                ));
             }
-            Ok(SendFuture::pending(self.conn_index, self.generation, id))
+            Ok(SendCompletion::pending(
+                self.conn_index,
+                self.generation,
+                id,
+            ))
         })
     }
 
@@ -1645,9 +1663,20 @@ impl ConnCtx {
 /// From [`SendHalf::send_parts`]. [`build`](Self::build) takes a closure that
 /// chains `.copy()` and `.guard()` and ends with `.submit()`. This is a synchronous
 /// builder: `build` and `submit_batch` are fire-and-forget, and
-/// `submit_batch_await` returns a [`SendFuture`].
+/// `submit_batch_await` returns a [`SendCompletion`].
+///
+/// `!Send`: its connection id names a slot in its worker's table, and a send
+/// through it on another worker would go out on that worker's connection.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::AsyncSendBuilder>();
+/// ```
 pub struct AsyncSendBuilder {
     token: ConnId,
+    /// Makes the type `!Send`: a send on another worker would index that
+    /// worker's table.
+    _not_send: PhantomData<*const ()>,
 }
 
 #[cfg(has_io_uring)]
@@ -1715,7 +1744,7 @@ impl AsyncSendBuilder {
         })
     }
 
-    /// Like [`submit_batch`](Self::submit_batch), but returns a [`SendFuture`]
+    /// Like [`submit_batch`](Self::submit_batch), but returns a [`SendCompletion`]
     /// that resolves when the batch has been sent.
     ///
     /// Use this when the caller needs completion-paced backpressure rather
@@ -1731,7 +1760,7 @@ impl AsyncSendBuilder {
     pub fn submit_batch_await(
         self,
         parts: Vec<crate::handler::SendPart<'_>>,
-    ) -> io::Result<(usize, SendFuture)> {
+    ) -> io::Result<(usize, SendCompletion)> {
         use crate::handler::SendPart;
         with_state(|driver, executor| {
             if total_part_len(&parts) == 0 {
@@ -1762,7 +1791,7 @@ impl AsyncSendBuilder {
             }
             Ok((
                 consumed,
-                SendFuture::pending(conn_index, self.token.generation, id),
+                SendCompletion::pending(conn_index, self.token.generation, id),
             ))
         })
     }
@@ -1789,15 +1818,29 @@ fn total_part_len(parts: &[crate::handler::SendPart<'_>]) -> usize {
 /// On the mio backend, all parts are copied into a single buffer and
 /// sent as one operation. Zero-copy guards are consumed by copying their
 /// data.
+///
+/// `!Send`: its connection id names a slot in its worker's table, and a send
+/// through it on another worker would go out on that worker's connection.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::AsyncSendBuilder>();
+/// ```
 pub struct AsyncSendBuilder {
     token: ConnId,
+    /// Makes the type `!Send`: a send on another worker would index that
+    /// worker's table.
+    _not_send: PhantomData<*const ()>,
 }
 
 #[cfg(not(has_io_uring))]
 impl ConnCtx {
     /// See [`SendHalf::send_parts`].
     pub(crate) fn send_parts(&self) -> AsyncSendBuilder {
-        AsyncSendBuilder { token: self.id() }
+        AsyncSendBuilder {
+            token: self.id(),
+            _not_send: PhantomData,
+        }
     }
 }
 
@@ -1847,7 +1890,7 @@ impl AsyncSendBuilder {
         })
     }
 
-    /// Like [`submit_batch`](Self::submit_batch), but returns a [`SendFuture`]
+    /// Like [`submit_batch`](Self::submit_batch), but returns a [`SendCompletion`]
     /// that resolves when the batch has been written to the socket.
     ///
     /// A batch that is empty or carries no bytes is rejected with
@@ -1855,7 +1898,7 @@ impl AsyncSendBuilder {
     pub fn submit_batch_await(
         self,
         parts: Vec<crate::handler::SendPart<'_>>,
-    ) -> io::Result<(usize, SendFuture)> {
+    ) -> io::Result<(usize, SendCompletion)> {
         use crate::handler::SendPart;
         with_state(|driver, executor| {
             let mut buf = Vec::new();
@@ -1886,7 +1929,7 @@ impl AsyncSendBuilder {
             }
             Ok((
                 consumed,
-                SendFuture::pending(conn_index, self.token.generation, id),
+                SendCompletion::pending(conn_index, self.token.generation, id),
             ))
         })
     }
@@ -2878,7 +2921,7 @@ impl Connection {
     // ── send ────────────────────────────────────────────────────────────
 
     /// See [`SendHalf::send`].
-    pub fn send(&mut self, data: &[u8]) -> io::Result<SendFuture> {
+    pub fn send(&mut self, data: &[u8]) -> io::Result<SendCompletion> {
         self.tx.send(data)
     }
 
@@ -2893,7 +2936,7 @@ impl Connection {
     }
 
     /// See [`SendHalf::send_backpressured`].
-    pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
+    pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSend<'a> {
         self.tx.send_backpressured(data)
     }
 
@@ -3098,7 +3141,7 @@ impl Connection {
 
     /// See [`SendHalf::send_chain`].
     #[cfg(has_io_uring)]
-    pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendFuture>
+    pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendCompletion>
     where
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
     {
@@ -3181,9 +3224,9 @@ impl SendHalf {
     /// TLS 1.2 cannot rekey, so the buffer cannot be sent again on it.
     /// Submission-queue pressure is not an error: the send is queued and
     /// retried. Persistent submission-queue starvation is reported like a
-    /// write error: the awaited `SendFuture` resolves `Err` and the
+    /// write error: the awaited `SendCompletion` resolves `Err` and the
     /// connection is closed.
-    pub fn send(&mut self, data: &[u8]) -> io::Result<SendFuture> {
+    pub fn send(&mut self, data: &[u8]) -> io::Result<SendCompletion> {
         self.conn.send(data)
     }
 
@@ -3212,7 +3255,7 @@ impl SendHalf {
     /// [`submit_batch`](AsyncSendBuilder::submit_batch) takes pre-classified
     /// `SendPart`s. Both are fire-and-forget;
     /// [`submit_batch_await`](AsyncSendBuilder::submit_batch_await) also returns
-    /// a [`SendFuture`]. On the mio backend every part is copied. A batch
+    /// a [`SendCompletion`]. On the mio backend every part is copied. A batch
     /// whose parts carry no bytes queues nothing through `build` and
     /// `submit_batch`; `submit_batch_await` rejects it with `InvalidInput`.
     /// On an io_uring plaintext connection the copy parts of one batch are
@@ -3243,7 +3286,7 @@ impl SendHalf {
     ///
     /// Nothing is submitted, and no queue is joined, until the returned
     /// future is polled; dropping one you never awaited does nothing. See
-    /// [`BackpressuredSendFuture`] for admission order, cancellation
+    /// [`BackpressuredSend`] for admission order, cancellation
     /// semantics and the error kinds.
     ///
     /// `data` is borrowed until the future resolves, so it is read at
@@ -3256,7 +3299,7 @@ impl SendHalf {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSendFuture<'a> {
+    pub fn send_backpressured<'a>(&mut self, data: &'a [u8]) -> BackpressuredSend<'a> {
         self.conn.send_backpressured(data)
     }
 
@@ -3359,7 +3402,7 @@ impl SendHalf {
     ///
     /// The closure receives a [`SendChainBuilder`](crate::handler::SendChainBuilder)
     /// for constructing linked SQEs. Call `.copy()`, `.parts()...add()` to build
-    /// the chain, then `.finish()` to submit it. Returns a [`SendFuture`] that
+    /// the chain, then `.finish()` to submit it. Returns a [`SendCompletion`] that
     /// resolves with the bytes the chain sent, or `Ok(0)` when the closure
     /// submitted nothing.
     ///
@@ -3393,7 +3436,7 @@ impl SendHalf {
     ///
     /// For fire-and-forget chained sending, use `send_chain_nowait()`.
     #[cfg(has_io_uring)]
-    pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendFuture>
+    pub fn send_chain<F>(&mut self, f: F) -> io::Result<SendCompletion>
     where
         F: FnOnce(crate::handler::SendChainBuilder<'_, '_>) -> io::Result<()>,
     {
@@ -3535,6 +3578,13 @@ impl Drop for RecvHalf {
 /// Parks on the source's recv waiter slot; the event loop resolves it by writing
 /// into `Driver::forward_done` and calling `wake_recv`. Borrows the source and
 /// sink halves for its lifetime.
+///
+/// `!Send`: its connection index names a slot in its worker's table.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::ForwardFuture<'static>>();
+/// ```
 #[cfg(not(has_io_uring))]
 pub struct ForwardFuture<'a> {
     conn_index: u32,
@@ -3543,6 +3593,9 @@ pub struct ForwardFuture<'a> {
     /// forward already running); reported on the first poll.
     refused: Option<i32>,
     _borrow: PhantomData<&'a ()>,
+    /// Makes the type `!Send`: a poll on another worker would index that
+    /// worker's table.
+    _not_send: PhantomData<*const ()>,
 }
 
 #[cfg(not(has_io_uring))]
@@ -3606,6 +3659,13 @@ impl Drop for ForwardFuture<'_> {
 
 /// Future returned by [`RecvHalf::forward_to_conn`]. Borrows the source and sink
 /// halves for its lifetime.
+///
+/// `!Send`: its connection index names a slot in its worker's table.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::ForwardFuture<'static>>();
+/// ```
 #[cfg(has_io_uring)]
 pub struct ForwardFuture<'a> {
     conn_index: u32,
@@ -3618,6 +3678,9 @@ pub struct ForwardFuture<'a> {
     direct: Option<DirectForward>,
     /// Ties the future to the source and sink the caller borrowed.
     _borrow: PhantomData<&'a ()>,
+    /// Makes the type `!Send`: a poll on another worker would index that
+    /// worker's table.
+    _not_send: PhantomData<*const ()>,
 }
 
 /// State of a [`ForwardFuture`] that sends from its source's accumulator.
@@ -3635,7 +3698,7 @@ struct DirectForward {
     len: u64,
     forwarded: u64,
     /// The send in flight and the chunk it carries.
-    in_flight: Option<(SendFuture, Bytes)>,
+    in_flight: Option<(SendCompletion, Bytes)>,
 }
 
 /// Mark the direct forward from `source` ended, so another may start.
@@ -3658,7 +3721,7 @@ enum DirectStep {
     /// Nothing buffered; a receive is armed.
     Park,
     /// A chunk went to the sink.
-    Sent(SendFuture, Bytes),
+    Sent(SendCompletion, Bytes),
     Fail(io::Error),
 }
 
@@ -3752,7 +3815,7 @@ impl DirectForward {
                     .submit_awaited(id);
                 match submitted {
                     Ok(()) => DirectStep::Sent(
-                        SendFuture::pending(self.sink_index, self.sink_generation, id),
+                        SendCompletion::pending(self.sink_index, self.sink_generation, id),
                         chunk,
                     ),
                     Err(e) => {
@@ -3822,7 +3885,8 @@ pub struct RecvReadyFuture {
     conn_index: u32,
     /// See `WithDataFuture` for the role of `generation`.
     generation: u32,
-    /// Pinned to the worker: a poll on another one would index its table.
+    /// Makes the type `!Send`: a poll on another worker would index that
+    /// worker's table.
     _not_send: PhantomData<*const ()>,
 }
 
@@ -3859,9 +3923,9 @@ impl Future for RecvReadyFuture {
     }
 }
 
-// ── BackpressuredSendFuture ──────────────────────────────────────────
+// ── BackpressuredSend ────────────────────────────────────────────────
 
-/// Where a [`BackpressuredSendFuture`] is in the admission handshake.
+/// Where a [`BackpressuredSend`] is in the admission handshake.
 enum BackpressuredState {
     /// Nothing has touched runtime state yet. Dropping here is inert, which
     /// is what makes construction lazy.
@@ -3934,16 +3998,27 @@ enum BackpressuredState {
 ///
 /// On success it resolves to the number of bytes **you passed in**, not the
 /// bytes on the wire; under TLS those differ.
+///
+/// `!Send`: its connection index and its place in the admission FIFO belong
+/// to its worker, and a poll on another worker would use that worker's.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::BackpressuredSend<'static>>();
+/// ```
 #[must_use = "a send_backpressured future does nothing until polled"]
-pub struct BackpressuredSendFuture<'a> {
+pub struct BackpressuredSend<'a> {
     conn_index: u32,
     /// See `WithDataFuture` for the role of `generation`.
     generation: u32,
     data: &'a [u8],
     state: BackpressuredState,
+    /// Makes the type `!Send`: a poll on another worker would index that
+    /// worker's tables.
+    _not_send: PhantomData<*const ()>,
 }
 
-impl BackpressuredSendFuture<'_> {
+impl BackpressuredSend<'_> {
     /// Resolve and mark done in one step, so no error path forgets the
     /// transition and leaves `Drop` trying to cancel an id that never was.
     fn finish(&mut self, result: io::Result<u32>) -> Poll<io::Result<u32>> {
@@ -3965,7 +4040,7 @@ impl BackpressuredSendFuture<'_> {
     }
 }
 
-impl Future for BackpressuredSendFuture<'_> {
+impl Future for BackpressuredSend<'_> {
     type Output = io::Result<u32>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u32>> {
@@ -3975,7 +4050,7 @@ impl Future for BackpressuredSendFuture<'_> {
 
             match this.state {
                 BackpressuredState::Done => {
-                    panic!("BackpressuredSendFuture polled after completion")
+                    panic!("BackpressuredSend polled after completion")
                 }
 
                 BackpressuredState::Fresh => {
@@ -4086,7 +4161,7 @@ impl Future for BackpressuredSendFuture<'_> {
     }
 }
 
-impl BackpressuredSendFuture<'_> {
+impl BackpressuredSend<'_> {
     /// The waiting half of `poll`, shared by the first poll and later ones.
     fn poll_waiting(
         &mut self,
@@ -4131,7 +4206,7 @@ impl BackpressuredSendFuture<'_> {
     }
 }
 
-impl Drop for BackpressuredSendFuture<'_> {
+impl Drop for BackpressuredSend<'_> {
     fn drop(&mut self) {
         let id = match self.state {
             BackpressuredState::Waiting(id) | BackpressuredState::Submitted(id) => id,
@@ -4139,7 +4214,7 @@ impl Drop for BackpressuredSendFuture<'_> {
             BackpressuredState::Fresh | BackpressuredState::Done => return,
         };
         // Drop runs outside a poll, so the thread-local may be gone (worker
-        // teardown). Same guard as `SendFuture::drop`.
+        // teardown). Same guard as `SendCompletion::drop`.
         let Some(mut non_null) = CURRENT_DRIVER.with(|c| c.get()) else {
             return;
         };
@@ -4152,7 +4227,7 @@ impl Drop for BackpressuredSendFuture<'_> {
     }
 }
 
-// ── SendFuture ───────────────────────────────────────────────────────
+// ── SendCompletion ───────────────────────────────────────────────────
 
 /// Future that awaits one send's completion. The send was submitted when the
 /// future was created; the future resolves with that send's own result, the
@@ -4160,56 +4235,73 @@ impl Drop for BackpressuredSendFuture<'_> {
 /// send's. No allocation.
 ///
 /// Dropping it does not cancel the send: the bytes still go out, and the
-/// result is discarded. The future may be handed to another task, which may
-/// first poll it after the creating task has returned and the connection
-/// has closed: it resolves with the send's own result. Dropped outside a
-/// task on its worker, the future leaves its entry in the table for the
-/// life of the worker.
-pub struct SendFuture {
+/// result is discarded. The future may be handed to another task on the same
+/// worker, which may first poll it after the creating task has returned and
+/// the connection has closed: it resolves with the send's own result. Dropped
+/// outside a task on its worker, the future leaves its entry in the table for
+/// the life of the worker.
+///
+/// `!Send`: its id names an entry in its worker's completion table, and a poll
+/// on another worker would read that worker's.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ringline::SendCompletion>();
+/// ```
+pub struct SendCompletion {
     conn_index: u32,
     /// See `WithDataFuture` for the role of `generation`.
     generation: u32,
-    state: SendFutureState,
+    state: SendCompletionState,
+    /// Makes the type `!Send`: a poll on another worker would index that
+    /// worker's table.
+    _not_send: PhantomData<*const ()>,
 }
 
-enum SendFutureState {
+enum SendCompletionState {
     /// The send's entry in the executor's completion table.
     Pending(SendId),
     /// A result known when the future was created; taken by the first poll.
     Ready(Option<io::Result<u32>>),
 }
 
-impl SendFuture {
+impl SendCompletion {
     /// A future for the send `id` names, which the caller has submitted.
     fn pending(conn_index: u32, generation: u32, id: SendId) -> Self {
-        SendFuture {
+        SendCompletion {
             conn_index,
             generation,
-            state: SendFutureState::Pending(id),
+            state: SendCompletionState::Pending(id),
+            _not_send: PhantomData,
         }
     }
 
     /// A future that resolves with `result` on its first poll.
     #[cfg(has_io_uring)]
     fn ready(conn_index: u32, generation: u32, result: io::Result<u32>) -> Self {
-        SendFuture {
+        SendCompletion {
             conn_index,
             generation,
-            state: SendFutureState::Ready(Some(result)),
+            state: SendCompletionState::Ready(Some(result)),
+            _not_send: PhantomData,
         }
     }
 }
 
-impl Future for SendFuture {
+impl Future for SendCompletion {
     type Output = io::Result<u32>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u32>> {
         let this = self.get_mut();
         let id = match &mut this.state {
-            SendFutureState::Ready(result) => {
-                return Poll::Ready(result.take().expect("SendFuture polled after completion"));
+            SendCompletionState::Ready(result) => {
+                return Poll::Ready(
+                    result
+                        .take()
+                        .expect("SendCompletion polled after completion"),
+                );
             }
-            SendFutureState::Pending(id) => *id,
+            SendCompletionState::Pending(id) => *id,
         };
         with_state(|driver, executor| {
             // A future polled from another task than the one that submitted
@@ -4218,7 +4310,7 @@ impl Future for SendFuture {
             executor.set_send_owner(id, CURRENT_TASK_ID.with(|c| c.get()));
             match executor.take_send_result(id) {
                 Some(result) => {
-                    this.state = SendFutureState::Ready(None);
+                    this.state = SendCompletionState::Ready(None);
                     Poll::Ready(result)
                 }
                 // A recycled slot means teardown ran and left no result for
@@ -4226,7 +4318,7 @@ impl Future for SendFuture {
                 // close.
                 None if driver.connections.generation(this.conn_index) != this.generation => {
                     executor.cancel_send(id);
-                    this.state = SendFutureState::Ready(None);
+                    this.state = SendCompletionState::Ready(None);
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "connection closed",
@@ -4238,9 +4330,9 @@ impl Future for SendFuture {
     }
 }
 
-impl Drop for SendFuture {
+impl Drop for SendCompletion {
     fn drop(&mut self) {
-        let SendFutureState::Pending(id) = self.state else {
+        let SendCompletionState::Pending(id) = self.state else {
             return;
         };
         // Drop runs outside a poll, so the thread-local may be gone (worker

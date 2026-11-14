@@ -2971,7 +2971,7 @@ mod tests {
         }
     }
 
-    /// A `SendFuture` created by the connection task and first polled by the
+    /// A `SendCompletion` created by the connection task and first polled by the
     /// spawned task it was handed to, after the connection task returned,
     /// resolves with the delivered byte count. The connection task's return
     /// leaves the entry without an owner; the spawned task's poll records

@@ -1,9 +1,9 @@
 # Send admission a server can bound
 
-Status: proposed. Nothing here is built. Sections 1 and 2 are specified for
-building. Sections 3 and 4 name the experiments that decide them and the
-constraints already found; each gets its own specification once its
-experiment has run.
+Status: section 1 is built. Section 2 is specified for building. Sections 3
+and 4 name the experiments that decide them and the constraints already
+found; each gets its own specification once its experiment has run. "What
+exists" describes the code before section 1, at 07dd0f56.
 
 A server that answers many connections on one worker replies with
 `send_nowait`. When the send copy pool is exhausted the reply fails, and the
@@ -110,15 +110,19 @@ and `ring.rs` are `ringline/src/backend/uring/driver.rs`, `event_loop.rs` and
 
 The send futures become `!Send` and are renamed:
 
-| today | becomes |
+| before | after |
 | --- | --- |
 | `SendFuture` | `SendCompletion` |
 | `BackpressuredSendFuture` | `BackpressuredSend` |
 
-- `SendCompletion`, `BackpressuredSend`, `ForwardFuture` and section 2's
-  `Admission` hold `PhantomData<*const ()>`, as `RecvReadyFuture` does. Moving
-  one to another thread is then a compile error, so its poll and its drop
-  always run on the worker whose tables its ids index.
+- `SendCompletion`, `BackpressuredSend`, `ForwardFuture`, `AsyncSendBuilder`
+  and section 2's `Admission` hold `PhantomData<*const ()>`, as
+  `RecvReadyFuture` does. Moving one to another thread is then a compile
+  error, so its poll, its sends and its drop always run on the worker whose
+  tables its ids index. `AsyncSendBuilder`, from `send_parts`, holds a
+  `ConnId`: one made on worker 0 and used on worker 1 sent on worker 1's
+  connection, through `build`, `submit_batch` or `submit_batch_await`
+  (reproduced on mio after the futures were made `!Send`).
 - The rename has two reasons. A `!Send` type named `SendFuture` reads as a
   statement about the `Send` trait. The name is also taken by
   `mpsc::SendFuture`. `SendCompletion` names what the future resolves on. No
@@ -145,10 +149,13 @@ The send futures become `!Send` and are renamed:
 
 Tests:
 
-- `compile_fail` doctests that assert `!Send` for each of the four, as
-  `RecvReadyFuture` has. The reproduction kept the future in a
+- `compile_fail` doctests that assert `!Send` for `SendCompletion`,
+  `BackpressuredSend`, `ForwardFuture` and `AsyncSendBuilder`, and for
+  `Admission` when section 2 builds it, as `RecvReadyFuture` has. The reproductions kept the future or the builder in a
   `static Mutex`, which no longer compiles.
-- Each doctest fails with the `PhantomData` field removed.
+- Each doctest fails with the `PhantomData` field removed, except io_uring's
+  `ForwardFuture`, which is also `!Send` through the `SendCompletion` it holds
+  in flight.
 
 ## 2. `send_admitted`: a future that resolves on admission
 
