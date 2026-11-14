@@ -3400,25 +3400,26 @@ impl SendHalf {
     /// send the kernel holds when its completion or notification arrives
     /// after the reset. No close_notify is sent.
     ///
-    /// On a TCP connection the peer reads `ECONNRESET` on Linux. On macOS a
-    /// peer that only reads may not see the reset until it sends. On io_uring
-    /// the socket is disconnected (an `IORING_OP_CONNECT` to `AF_UNSPEC`,
-    /// which resets it and discards its queued data) ahead of the `Close`, so
-    /// the kernel returns the zero-copy buffers of its sends even while other
-    /// connections' requests keep the socket from being released. On mio the
-    /// socket is closed with `SO_LINGER {1, 0}`. On io_uring a Unix-domain
-    /// connection is closed with its queued sends dropped; the peer reads end
-    /// of file, or `ECONNRESET` if this end had unread data.
+    /// On a TCP connection the peer reads `ECONNRESET` on Linux. On macOS
+    /// loopback, a peer that only reads may not see the reset until it sends.
+    /// On io_uring the socket is disconnected (an `IORING_OP_CONNECT` to
+    /// `AF_UNSPEC`, which resets it and discards its queued data) ahead of the
+    /// `Close`, so the kernel returns the zero-copy buffers of its sends even
+    /// while other connections' requests keep the socket from being released.
+    /// On mio the socket is closed with `SO_LINGER {1, 0}`. On io_uring a
+    /// Unix-domain connection is closed with its queued sends dropped; the peer
+    /// reads end of file, or `ECONNRESET` if this end had unread data.
     ///
     /// It also applies to a connection that is already closing, for example
     /// one whose [`close`](Self::close) waits for a peer that stopped
-    /// reading. It does nothing once the connection's close is committed (on
-    /// io_uring, once its `Close` has been submitted). A zero-copy send whose
-    /// data the kernel had already taken then keeps its buffer until the peer
-    /// acknowledges the data or the kernel gives up on the socket. As for
-    /// `close`, it does nothing if the connection has been released, or when
-    /// called outside the worker's executor, and the connection's task is
-    /// dropped when the close completes.
+    /// reading. On io_uring it does nothing once the connection's `Close` is
+    /// committed: submitted, or queued for retry when the submission queue is
+    /// full. A zero-copy send whose data the kernel had already taken then
+    /// keeps its buffer until the peer acknowledges the data or the kernel
+    /// gives up on the socket. On mio it applies until the connection is
+    /// released. As for `close`, it does nothing if the connection has been
+    /// released, or when called outside the worker's executor, and the
+    /// connection's task is dropped when the close completes.
     pub fn abort(&mut self) {
         self.conn.abort();
     }
@@ -4087,8 +4088,8 @@ enum AdmissionState {
 /// that was aborted ([`SendHalf::abort`]) or closed while waiting,
 /// `NotConnected`, on io_uring, for a TLS connection whose close_notify is
 /// queued and for any connection whose close was committed before or while it
-/// waited, and anything the submission itself reports. Errors after submission come from
-/// the [`SendCompletion`].
+/// waited, and anything the submission itself reports. Errors after
+/// submission come from the [`SendCompletion`].
 ///
 /// `!Send`: its connection index and its place in the admission FIFO belong
 /// to its worker, and a poll on another worker would use that worker's.

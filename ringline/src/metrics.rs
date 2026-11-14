@@ -877,7 +877,7 @@ mod cqe_tag_tests {
             cqe_tag::COUNT
         );
         // Guard against the walk finding nothing and passing vacuously.
-        assert!(found >= 26, "expected the full tag set, found {found}");
+        assert!(found >= 27, "expected the full tag set, found {found}");
     }
 
     /// The array is indexed by discriminant, which leaves gaps. Assert exactly

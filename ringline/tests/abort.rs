@@ -273,8 +273,9 @@ fn abort_releases_a_stalled_connection_at_once() {
     let read = peer.read_to_end(&mut body);
     // On macOS a peer that only read sometimes saw no reset within the 5 s
     // timeout (13 of 210 runs, and the same with two plain TCP sockets on
-    // loopback and no ringline). A write draws a reset from any closed socket, so it is made
-    // only after the read timed out: an end of stream still fails the test.
+    // loopback and no ringline). A write draws a reset from any closed
+    // socket, so it is made only after the read timed out: an end of stream
+    // still fails the test.
     #[cfg(target_os = "macos")]
     let read = if matches!(&read, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
         let _ = peer.write(b"x");

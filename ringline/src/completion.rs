@@ -211,7 +211,7 @@ mod optag_label_tests {
         }
         // Sanity: the walk found the tags, rather than silently finding none.
         assert!(
-            seen.len() >= 26,
+            seen.len() >= 27,
             "expected the full tag set, found {}",
             seen.len()
         );
