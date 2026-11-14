@@ -65,16 +65,25 @@ fn o_direct_supported() -> bool {
     true
 }
 
-/// Open `path` read-write with `DIRECT` and `extra`.
+/// Open `path` read-write with `DIRECT` and `extra`. A slot is free once the
+/// close of its previous file has completed (on io_uring, an
+/// `IORING_OP_CLOSE`), so an open that finds the table full yields and tries
+/// again, at most 1000 times.
 async fn open_direct(path: &str, extra: Option<OpenFlags>) -> Result<File, String> {
     let mut flags = OpenFlags::READ_WRITE | OpenFlags::DIRECT;
     if let Some(extra) = extra {
         flags = flags | extra;
     }
-    ringline::fs::open(path, flags, 0)
-        .map_err(|e| format!("open: {e}"))?
-        .await
-        .map_err(|e| format!("open: {e}"))
+    for _ in 0..1000 {
+        match ringline::fs::open(path, flags, 0) {
+            Ok(open) => return open.await.map_err(|e| format!("open: {e}")),
+            Err(e) if e.to_string() == "filesystem file table full" => {
+                ringline::yield_now().await;
+            }
+            Err(e) => return Err(format!("open: {e}")),
+        }
+    }
+    Err("open: the table stayed full for 1000 yields".to_string())
 }
 
 /// The length of one `O_DIRECT` block in these tests.

@@ -20,11 +20,20 @@ fn file_path() -> PathBuf {
         .join(format!(".krio_handle_generation_{}", std::process::id()))
 }
 
+/// Open `path`. With one slot, the previous file's slot is free once its
+/// close has completed (on io_uring, an `IORING_OP_CLOSE`), so an open that
+/// finds the table full yields to let the close complete and tries again.
 async fn open(path: &str, what: &str) -> Result<File, String> {
-    ringline::fs::open(path, OpenFlags::READ, 0)
-        .map_err(|e| format!("{what}: {e}"))?
-        .await
-        .map_err(|e| format!("{what}: {e}"))
+    for _ in 0..1000 {
+        match ringline::fs::open(path, OpenFlags::READ, 0) {
+            Ok(open) => return open.await.map_err(|e| format!("{what}: {e}")),
+            Err(e) if e.to_string() == "filesystem file table full" => {
+                ringline::yield_now().await;
+            }
+            Err(e) => return Err(format!("{what}: {e}")),
+        }
+    }
+    Err(format!("{what}: the slot was not freed after 1000 yields"))
 }
 
 async fn stale_after_wrap(path: &str) -> Result<(), String> {
