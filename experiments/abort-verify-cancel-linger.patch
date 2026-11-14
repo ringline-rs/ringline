@@ -1,0 +1,25 @@
+diff --git a/ringline/src/backend/uring/ring.rs b/ringline/src/backend/uring/ring.rs
+index 26512ee0..17fd2f34 100644
+--- a/ringline/src/backend/uring/ring.rs
++++ b/ringline/src/backend/uring/ring.rs
+@@ -606,6 +606,20 @@ impl Ring {
+         generation: u32,
+         lead: CloseLead,
+     ) -> io::Result<()> {
++        // Mutation for experiments/abort-verify.toml: Experiment A's
++        // `cancel_linger` arm in place of the disconnect.
++        if conn_index != u32::MAX {
++            let _ = lead;
++            let cancel = self.cancel_fd_all(conn_index).link(Link::Hard);
++            let linger = self
++                .close_lead_sqe(conn_index, CloseLead::Abort)
++                .expect("the linger lead");
++            let close = Self::close_sqe(conn_index, generation);
++            unsafe { self.engine.push_chain(&[cancel, linger, close]) }?;
++            #[cfg(test)]
++            self.pushed_closes.push((conn_index, true));
++            return Ok(());
++        }
+         let disconnect = Self::disconnect_sqe(conn_index, generation).link(Link::Hard);
+         let close = Self::close_sqe(conn_index, generation);
+         match self.close_lead_sqe(conn_index, lead) {

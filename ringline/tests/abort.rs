@@ -230,6 +230,7 @@ fn abort_releases_a_stalled_connection_at_once() {
         let enomem = ringline::metrics::POOL
             .value(ringline::metrics::pool::SEND_ZC_ENOMEM)
             .unwrap_or(0);
+        eprintln!("abort: enomem={enomem}");
         if enomem == 0 {
             let deadline = aborted_at + Duration::from_secs(2);
             let dropped = loop {
@@ -243,6 +244,7 @@ fn abort_releases_a_stalled_connection_at_once() {
             };
             let dropped = dropped.expect("the zero-copy buffer was not released within 2 s");
             let took = dropped.saturating_duration_since(aborted_at);
+            eprintln!("abort: released {took:?} after the abort");
             assert!(
                 took < Duration::from_millis(100),
                 "released {took:?} after the abort"
