@@ -82,9 +82,9 @@ pub static CONNECTIONS_ACTIVE: Gauge = Gauge::new();
 
 /// io_uring: what the ring refused and a worker is waiting to retry, summed
 /// over workers: stream sends and receive arms on retry lists, UDP re-arms,
-/// merged accept arms, and one per worker whose last submit left SQEs
-/// queued (refused, or only some submitted). Nonzero while the kernel refuses
-/// submissions; each worker withdraws its share when it exits.
+/// merged accept arms, fs, direct I/O and NVMe commands queued for a push,
+/// and one per worker whose last submit left SQEs queued (refused, or only
+/// some submitted). Nonzero while the kernel refuses submissions; each worker withdraws its share when it exits.
 #[metric(
     name = "ringline/ring/push_retries_pending",
     description = "Submissions the ring refused, waiting to be retried"

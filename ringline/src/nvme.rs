@@ -13,8 +13,8 @@
 //!
 //! io_uring only: on the mio backend every NVMe call returns `Unsupported`.
 //! On io_uring a call that finds the ring's submission queue full submits the
-//! queue inline before pushing, and returns the error if that submit fails,
-//! leaving nothing in flight (see the `fs` module docs).
+//! queue inline before pushing, and if that submit fails, queues the command
+//! and pushes it again later (see the `fs` module docs).
 
 use std::marker::PhantomData;
 

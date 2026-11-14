@@ -1155,6 +1155,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   all. The gauge `ringline/ring/push_retries_pending` shows how many are
   owed, `ringline/ring` `op=push_retry_waits` counts the
   waits, and after 1 s of refusals the worker writes one line to stderr.
+- io_uring: an fs, direct I/O or NVMe call no longer fails when the ring
+  refuses its submission (#877). A call that found the submission queue full
+  and whose inline submit failed with `Interrupted`, `EBUSY` or `EAGAIN`
+  returned that error in every 0.6 release. The operation is now queued and
+  pushed again after the worker's next wait, retried with waits of 50 µs
+  doubling to 10 ms while the kernel keeps refusing, and counts in
+  `ringline/ring/push_retries_pending`.
 - Timers (#836, items 1 and 2):
   - A sleep or deadline too far out for the clock is never reached instead
     of failing. On io_uring, a `Duration` with more than `i64::MAX` seconds
