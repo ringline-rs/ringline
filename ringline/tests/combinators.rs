@@ -1533,7 +1533,7 @@ fn file_open_stat_and_write_complete_in_futures_unordered() {
                     let (result, _) = ringline::fs::write_from(file, 0, buf).await;
                     assert_eq!(result.unwrap(), 4);
                     let metadata = ringline::fs::stat(&write_path).unwrap().await.unwrap();
-                    assert_eq!(metadata.size, 4);
+                    assert_eq!(metadata.len(), 4);
                     ringline::fs::fsync(file).unwrap().await.unwrap();
                 }
                 .boxed_local(),

@@ -103,7 +103,7 @@ impl AsyncEventHandler for FsStatHandler {
             std::fs::write(&path, b"stat test data").unwrap();
 
             let meta = ringline::fs::stat(&path).unwrap().await.unwrap();
-            if meta.size == 14 && meta.is_file && !meta.is_dir {
+            if meta.len() == 14 && meta.is_file() && !meta.is_dir() {
                 FS_STAT_RESULT.store(1, Ordering::SeqCst);
             }
 
@@ -236,7 +236,7 @@ impl AsyncEventHandler for FsMkdirHandler {
             let result = ringline::fs::mkdir(&path, 0o755).unwrap().await;
             if result.is_ok() && path.exists() {
                 let meta = ringline::fs::stat(&path).unwrap().await.unwrap();
-                if meta.is_dir {
+                if meta.is_dir() {
                     FS_MKDIR_RESULT.store(1, Ordering::SeqCst);
                 }
             }
@@ -400,7 +400,7 @@ async fn stat_and_lstat_a_link(
         .map_err(|e| format!("stat submit: {e}"))?
         .await
         .map_err(|e| format!("stat: {e}"))?;
-    if !followed.is_file || followed.is_symlink || followed.size != 5 {
+    if !followed.is_file() || followed.is_symlink() || followed.len() != 5 {
         return Err(format!(
             "stat(link) did not report the target: {followed:?}"
         ));
@@ -410,15 +410,15 @@ async fn stat_and_lstat_a_link(
         .await
         .map_err(|e| format!("symlink_metadata: {e}"))?;
     // S_IFMT and S_IFLNK, which libc types as u32 on Linux and u16 on macOS.
-    if !own.is_symlink || own.is_file || own.mode & 0o170000 != 0o120000 {
+    if !own.is_symlink() || own.is_file() || own.mode() & 0o170000 != 0o120000 {
         return Err(format!(
             "symlink_metadata(link) did not report a link: {own:?}"
         ));
     }
-    if own.size != target.as_os_str().len() as u64 {
+    if own.len() != target.as_os_str().len() as u64 {
         return Err(format!(
             "symlink_metadata(link) size {} is not the target path's length {}",
-            own.size,
+            own.len(),
             target.as_os_str().len()
         ));
     }
@@ -434,7 +434,7 @@ async fn stat_and_lstat_a_link(
         .map_err(|e| format!("symlink_metadata(dangling) submit: {e}"))?
         .await
         .map_err(|e| format!("symlink_metadata(dangling): {e}"))?;
-    if !own.is_symlink {
+    if !own.is_symlink() {
         return Err(format!(
             "symlink_metadata(dangling) did not report a link: {own:?}"
         ));
@@ -443,7 +443,7 @@ async fn stat_and_lstat_a_link(
         .map_err(|e| format!("symlink_metadata(target) submit: {e}"))?
         .await
         .map_err(|e| format!("symlink_metadata(target): {e}"))?;
-    if !plain.is_file || plain.is_symlink || plain.size != 5 {
+    if !plain.is_file() || plain.is_symlink() || plain.len() != 5 {
         return Err(format!(
             "symlink_metadata(target) differs from stat: {plain:?}"
         ));
@@ -495,5 +495,111 @@ fn stat_follows_a_symlink_and_symlink_metadata_does_not() {
         .get()
         .expect("the task finished")
         .clone()
+        .unwrap();
+}
+
+// ── Times before 1970 (#894) ────────────────────────────────────────
+
+static PRE_EPOCH_OUTCOME: std::sync::Mutex<Option<Result<(), String>>> =
+    std::sync::Mutex::new(None);
+/// std's reading of the file's access, modification and status change times,
+/// which ringline's must match.
+static PRE_EPOCH_EXPECTED: std::sync::Mutex<
+    Option<(
+        std::time::SystemTime,
+        std::time::SystemTime,
+        std::time::SystemTime,
+    )>,
+> = std::sync::Mutex::new(None);
+
+/// 1960-01-01T00:00:00Z plus 5 ns (access) and 1965-01-01T00:00:00Z plus
+/// 7 ns (modification), as seconds and nanoseconds since the epoch.
+const PRE_EPOCH_ACCESS: (i64, i64) = (-315_619_200, 5);
+const PRE_EPOCH_MODIFY: (i64, i64) = (-157_766_400, 7);
+
+fn before_epoch((secs, nsecs): (i64, i64)) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH - std::time::Duration::from_secs(secs.unsigned_abs())
+        + std::time::Duration::from_nanos(nsecs as u64)
+}
+
+struct PreEpochStat;
+
+impl AsyncEventHandler for PreEpochStat {
+    fn on_start(&self) -> Option<Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let path = temp_path("pre-epoch");
+            let outcome = async {
+                let meta = ringline::fs::stat(&path)
+                    .map_err(|e| e.to_string())?
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let expected = PRE_EPOCH_EXPECTED.lock().unwrap().unwrap();
+                let got = (meta.accessed(), meta.modified(), meta.status_changed());
+                if got != expected {
+                    return Err(format!(
+                        "(accessed, modified, status_changed): ringline {got:?}, std {expected:?}"
+                    ));
+                }
+                Ok(())
+            }
+            .await;
+            *PRE_EPOCH_OUTCOME.lock().unwrap() = Some(outcome);
+            ringline::request_shutdown().ok();
+        }))
+    }
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+    fn create_for_worker(_id: usize) -> Self {
+        PreEpochStat
+    }
+}
+
+/// A file whose access and modification times are before 1970 reports them
+/// as `SystemTime`s before the epoch, to the nanosecond, and its status
+/// change time, each as std reads them from the same file.
+#[test]
+fn stat_reports_times_before_1970() {
+    use std::os::unix::fs::MetadataExt;
+    let path = temp_path("pre-epoch");
+    std::fs::write(&path, b"old").unwrap();
+    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let spec = |(secs, nsecs): (i64, i64)| libc::timespec {
+        tv_sec: secs as libc::time_t,
+        tv_nsec: nsecs as _,
+    };
+    let times = [spec(PRE_EPOCH_ACCESS), spec(PRE_EPOCH_MODIFY)];
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+        0,
+        "utimensat: {}",
+        std::io::Error::last_os_error()
+    );
+    let std_meta = std::fs::metadata(&path).unwrap();
+    let accessed = std_meta.accessed().unwrap();
+    let modified = std_meta.modified().unwrap();
+    assert_eq!(
+        (accessed, modified),
+        (
+            before_epoch(PRE_EPOCH_ACCESS),
+            before_epoch(PRE_EPOCH_MODIFY)
+        ),
+        "the filesystem did not store the times set"
+    );
+    // `utimensat` sets the status change time to now.
+    assert!(std_meta.ctime() >= 0, "the clock reads before 1970");
+    let changed = std::time::UNIX_EPOCH
+        + std::time::Duration::new(std_meta.ctime() as u64, std_meta.ctime_nsec() as u32);
+    *PRE_EPOCH_EXPECTED.lock().unwrap() = Some((accessed, modified, changed));
+    let (shutdown, handles) = RinglineBuilder::new(test_config())
+        .launch::<PreEpochStat>()
+        .expect("launch failed");
+    common::join_workers(&shutdown, handles);
+    let _ = std::fs::remove_file(&path);
+    PRE_EPOCH_OUTCOME
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the task did not finish")
         .unwrap();
 }

@@ -6634,7 +6634,7 @@ mod tests {
                 .expect("a refused push queues the command")
                 .await
                 .expect("statx of /");
-            assert!(meta.is_dir);
+            assert!(meta.is_dir());
         });
         assert!(finished, "the stat never resolved");
     }
