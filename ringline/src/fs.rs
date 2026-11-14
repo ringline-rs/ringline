@@ -6,12 +6,18 @@
 //! the kernel completes them inline or on its own threads (see below); on mio
 //! they run on a thread pool.
 //!
-//! Operations are independent of each other on both backends, including
-//! operations on one file: io_uring does not order independent submissions,
-//! and the mio pool's threads take requests from one queue. A write is in the
-//! file when its future resolves, not when `write_from` returns, and [`fsync`]
-//! covers the writes whose futures have resolved when it is called. To order
-//! two operations, await the first before submitting the second.
+//! Reads and writes are independent of each other on both backends, including
+//! those on one file: io_uring does not order independent submissions, and
+//! the mio pool's threads take requests from one queue. A write is in the
+//! file when its future resolves, not when `write_from` returns. To order a
+//! read and a write, or two writes to overlapping ranges, await the first
+//! before submitting the second. Two operations are ordered for you:
+//! [`fsync`] waits for every write submitted before it through the same
+//! [`File`] handle (not through another handle opened on the same path), so
+//! once an `fsync` submitted after two `write_from`s, with no await in
+//! between, resolves to `Ok`, what both writes wrote is durable; and an
+//! operation submitted before [`close`] still runs against the file. A write
+//! submitted after an `fsync` does not wait for it.
 //!
 //! On io_uring a call that finds the ring's submission queue full submits the
 //! queue inline before pushing (under [`sqpoll`](crate::ConfigBuilder::sqpoll)
@@ -1179,9 +1185,15 @@ fn park_buffer(
     None
 }
 
-/// Fsync a file: `fsync(2)`, which persists the writes to it whose futures
-/// have resolved. A write whose future has not resolved may not be covered;
-/// await it first. On macOS `fsync(2)` does not flush the drive's own cache.
+/// Fsync a file: `fsync(2)`, which persists the writes to it.
+///
+/// The fsync waits in ringline, not submitted, until every write submitted
+/// before it on `file` has completed, successfully or not, and then runs, so
+/// it covers those writes without their futures being awaited first. Writes
+/// through another handle opened on the same path are not waited for. A
+/// write submitted after it does not wait for it, and is covered only if it
+/// completes before the fsync runs. On macOS
+/// `fsync(2)` does not flush the drive's own cache.
 ///
 /// On io_uring this always runs on the worker's io-wq pool; before Linux 6.13
 /// that can delay the worker's connection closes. See

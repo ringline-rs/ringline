@@ -4530,6 +4530,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         let (file_index, _op) = cmd_slab.release(slab_idx);
+        self.submit_released_fsyncs(ud.payload());
 
         // Decrement in-flight count, and finish a close that waited for it.
         if let Some(ref mut files) = self.driver.direct_io_files
@@ -4544,6 +4545,15 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
         // Wake the async task waiting for this Direct I/O completion.
         self.executor.wake_disk_io(ud.payload(), result);
+    }
+
+    /// Push the fsyncs held until the write under disk-I/O key `key` and the
+    /// writes before it completed (#905). A push the ring refuses is queued
+    /// (`Ring::push_disk_sqe`), so none is lost.
+    fn submit_released_fsyncs(&mut self, key: u32) {
+        for (fd_index, ud) in self.driver.write_orders.end_write(key) {
+            let _ = self.driver.ring.submit_direct_fsync(fd_index, UserData(ud));
+        }
     }
 
     fn handle_fs(&mut self, ud: UserData, result: i32) {
@@ -4593,6 +4603,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
 
         let (released_file_index, released_op) = cmd_slab.release(slab_idx);
+        self.submit_released_fsyncs(ud.payload());
 
         // Decrement in-flight count for file-bound ops.
         match released_op {
@@ -6661,6 +6672,197 @@ mod tests {
         });
         let _ = std::fs::remove_file(&path);
         assert!(finished, "the task did not finish");
+    }
+
+    /// Wait for and dispatch completions until `key`'s result arrives.
+    fn wait_for_result(el: &mut AsyncEventLoop<NoopHandler>, key: u32) -> i32 {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(result) = el.executor.take_disk_io_result(key) {
+                return result;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "no result for key {key}"
+            );
+            el.driver
+                .ring
+                .submit_and_wait_timeout(1, std::time::Duration::from_millis(100))
+                .expect("wait");
+            el.drain_completions();
+        }
+    }
+
+    /// An fsync submitted while a write to the same file is in flight is
+    /// held, not pushed, and is pushed once the write's completion is
+    /// processed (#905). The write's CQE is not reaped until the test drains
+    /// completions, so it is in flight when the fsync is submitted.
+    #[test]
+    fn an_fsync_waits_for_an_earlier_write_to_complete() {
+        let mut el = make_test_loop();
+        let path =
+            std::env::temp_dir().join(format!("ringline-fsync-earlier-{}", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let (index, generation, open_key) = el
+            .driver
+            .make_ctx()
+            .fs_open(&path, crate::fs::OpenFlags::WRITE, 0)
+            .expect("submit open");
+        el.executor.wait_disk_io(open_key, 0);
+        assert!(wait_for_result(&mut el, open_key) >= 0, "open");
+        let file = crate::fs::File::new(index, generation);
+
+        static DATA: &[u8] = b"durable";
+        let (write_key, sync_key) = {
+            let mut ctx = el.driver.make_ctx();
+            let write_key = unsafe { ctx.fs_write(file, 0, DATA.as_ptr(), DATA.len() as u32) }
+                .expect("submit write");
+            let sync_key = ctx.fs_fsync(file).expect("submit fsync");
+            (write_key, sync_key)
+        };
+        el.executor.wait_disk_io(write_key, 0);
+        el.executor.wait_disk_io(sync_key, 0);
+        assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
+        assert_eq!(wait_for_result(&mut el, write_key), DATA.len() as i32);
+        assert_eq!(el.driver.write_orders.held(), 0, "the write released it");
+        assert_eq!(wait_for_result(&mut el, sync_key), 0, "fsync");
+        assert_eq!(std::fs::read(&path).unwrap(), DATA);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// As `an_fsync_waits_for_an_earlier_write_to_complete`, for a direct I/O
+    /// write and `direct_io_fsync`, through `handle_direct_io`.
+    #[test]
+    fn a_direct_io_fsync_waits_for_an_earlier_write_to_complete() {
+        let cfg = test_config_builder()
+            .direct_io(crate::direct_io::DirectIoConfig::default())
+            .build()
+            .expect("valid config");
+        let mut el = make_test_loop_with_config(cfg);
+        // In the working directory: tmpfs may refuse O_DIRECT.
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(format!(".ringline-direct-fsync-{}", std::process::id()));
+        std::fs::write(&path, [0u8; 4096]).unwrap();
+        let file = el
+            .driver
+            .make_ctx()
+            .open_direct_io_file(path.to_str().unwrap())
+            .expect("open for direct I/O");
+        let block = crate::buf::AlignedBuf::zeroed(4096, 4096);
+        let (write_key, sync_key) = {
+            let mut ctx = el.driver.make_ctx();
+            let write_key = unsafe { ctx.direct_io_write(file, 0, block.as_ptr(), 4096) }
+                .expect("submit write");
+            let sync_key = ctx.direct_io_fsync(file).expect("submit fsync");
+            (write_key, sync_key)
+        };
+        el.executor.wait_disk_io(write_key, 0);
+        el.executor.wait_disk_io(sync_key, 0);
+        assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
+        assert_eq!(wait_for_result(&mut el, write_key), 4096);
+        assert_eq!(el.driver.write_orders.held(), 0, "the write released it");
+        assert_eq!(wait_for_result(&mut el, sync_key), 0, "fsync");
+        drop(block);
+        let _ = el.driver.make_ctx().close_direct_io_file(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A write and a read submitted after a held fsync on the same file are
+    /// pushed and complete while it stays held, and the fsync is pushed once
+    /// the write before it completes (#905). The earlier write is a stand-in
+    /// entry in `write_orders`.
+    #[test]
+    fn a_held_fsync_delays_no_later_write_or_read() {
+        let mut el = make_test_loop();
+        let path =
+            std::env::temp_dir().join(format!("ringline-fsync-later-{}", std::process::id()));
+        std::fs::write(&path, b"0123").unwrap();
+        let (index, generation, open_key) = el
+            .driver
+            .make_ctx()
+            .fs_open(&path, crate::fs::OpenFlags::READ_WRITE, 0)
+            .expect("submit open");
+        el.executor.wait_disk_io(open_key, 0);
+        assert!(wait_for_result(&mut el, open_key) >= 0, "open");
+        let file = crate::fs::File::new(index, generation);
+        const EARLIER: u32 = u32::MAX;
+        el.driver.write_orders.begin_write(
+            crate::disk_order::OrderKey {
+                subsystem: crate::disk_order::Subsystem::Fs,
+                index,
+                generation,
+            },
+            EARLIER,
+        );
+
+        static DATA: &[u8] = b"later";
+        let mut buf = [0u8; 4];
+        let (sync_key, write_key, read_key) = {
+            let mut ctx = el.driver.make_ctx();
+            let sync_key = ctx.fs_fsync(file).expect("submit fsync");
+            let write_key = unsafe { ctx.fs_write(file, 8, DATA.as_ptr(), DATA.len() as u32) }
+                .expect("submit write");
+            let read_key =
+                unsafe { ctx.fs_read(file, 0, buf.as_mut_ptr(), 4) }.expect("submit read");
+            (sync_key, write_key, read_key)
+        };
+        for key in [sync_key, write_key, read_key] {
+            el.executor.wait_disk_io(key, 0);
+        }
+        assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
+        assert_eq!(wait_for_result(&mut el, write_key), DATA.len() as i32);
+        assert_eq!(wait_for_result(&mut el, read_key), 4);
+        assert_eq!(
+            el.driver.write_orders.held(),
+            1,
+            "a later write or read does not release it"
+        );
+        el.submit_released_fsyncs(EARLIER);
+        assert_eq!(wait_for_result(&mut el, sync_key), 0, "fsync");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An fsync held behind an earlier write (#905) is completed by worker
+    /// exit instead of holding it for its whole bound: no cancel reaches it,
+    /// since it was never submitted.
+    #[test]
+    fn worker_exit_completes_a_held_fsync() {
+        let mut el = make_test_loop();
+        let path = std::env::temp_dir().join(format!("ringline-held-fsync-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let (index, generation, open_key) = el
+            .driver
+            .make_ctx()
+            .fs_open(&path, crate::fs::OpenFlags::WRITE, 0)
+            .expect("submit open");
+        el.executor.wait_disk_io(open_key, 0);
+        drain_fs_commands(&mut el);
+        assert!(
+            el.executor.take_disk_io_result(open_key).unwrap() >= 0,
+            "open"
+        );
+        let file = crate::fs::File::new(index, generation);
+        // Stand in for a write still in flight on the file.
+        el.driver.write_orders.begin_write(
+            crate::disk_order::OrderKey {
+                subsystem: crate::disk_order::Subsystem::Fs,
+                index,
+                generation,
+            },
+            u32::MAX,
+        );
+        el.driver.make_ctx().fs_fsync(file).expect("submit fsync");
+        assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
+        let started = std::time::Instant::now();
+        el.driver.run_shutdown();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "exit waited {:?}",
+            started.elapsed()
+        );
+        assert!(!el.driver.disk_io_outstanding, "nothing left in flight");
     }
 
     /// A retry the ring refuses again sets the next one `delay` away,
