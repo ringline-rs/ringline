@@ -2,7 +2,7 @@
 //! file (#905), shared by both backends.
 //!
 //! Reads and writes on one file stay unordered with respect to each other.
-//! An fsync (`fs::fsync`, `direct_io_fsync`) is held, not submitted, until
+//! An fsync (`fs::fsync`) is held, not submitted, until
 //! every write submitted before it on the same file has completed. A write
 //! submitted after an fsync does not wait for it, and a later write does not
 //! hold back an earlier fsync. Held fsyncs are not linked to the writes
@@ -12,21 +12,13 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::runtime::KeyMap;
 
-/// The file an operation is on: its subsystem, table slot and generation.
-/// The generation keeps a slot reused after a close apart from the file that
+/// The file an operation is on: its fs table slot and generation. The
+/// generation keeps a slot reused after a close apart from the file that
 /// held it before.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct OrderKey {
-    pub(crate) subsystem: Subsystem,
     pub(crate) index: u16,
     pub(crate) generation: u32,
-}
-
-/// The file subsystems whose fsyncs are ordered.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Subsystem {
-    Fs,
-    DirectIo,
 }
 
 /// One file's writes in flight and the fsyncs held behind them.
@@ -136,7 +128,6 @@ mod tests {
 
     fn file(index: u16) -> OrderKey {
         OrderKey {
-            subsystem: Subsystem::Fs,
             index,
             generation: 0,
         }

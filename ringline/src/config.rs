@@ -400,10 +400,7 @@ pub struct Config {
     /// Optional NVMe passthrough configuration. When set, enables NVMe device
     /// management and `IORING_OP_URING_CMD` submission for direct NVMe I/O.
     pub(crate) nvme: Option<crate::nvme::NvmeConfig>,
-    /// Optional direct I/O configuration. When set, enables `O_DIRECT` file I/O
-    /// via io_uring `IORING_OP_READ` / `IORING_OP_WRITE`, bypassing the page cache.
-    pub(crate) direct_io: Option<crate::direct_io::DirectIoConfig>,
-    /// Optional buffered filesystem I/O configuration. When set, enables async
+    /// Optional filesystem I/O configuration. When set, enables async
     /// file open/read/write/stat/rename/unlink/mkdir via io_uring.
     pub(crate) fs: Option<crate::fs::FsConfig>,
     /// Number of dedicated DNS resolver threads. The resolver pool runs
@@ -432,7 +429,7 @@ pub struct Config {
     /// lstat, rename, unlink, mkdir) off the event loop.
     ///
     /// 0 = no pool. On the mio backend `validate` refuses 0 while `fs` (on by
-    /// default) or `direct_io` is set. On io_uring the pool is not used.
+    /// default) is set. On io_uring the pool is not used.
     /// Default: 2.
     pub(crate) disk_io_threads: usize,
 }
@@ -555,7 +552,6 @@ impl Default for Config {
             udp_recv_queue_capacity: 1024,
             udp_gro: false,
             nvme: None,
-            direct_io: None,
             fs: Some(crate::fs::FsConfig::default()),
             resolver_threads: 2,
             spawner_threads: 1,
@@ -792,24 +788,14 @@ impl Config {
                 ));
             }
         }
-        // On mio every fs operation, and every direct I/O read, write and
-        // fsync, runs on the disk-I/O pool, so a file subsystem with no pool
-        // would fail at the first operation that needs it.
-        if !cfg!(has_io_uring) && self.disk_io_threads == 0 {
-            if self.fs.is_some() {
-                return Err(crate::error::Error::RingSetup(
-                    "disk_io_threads is 0 with fs enabled; the mio backend runs file \
-                     operations on that pool: set disk_io_threads or call no_fs()"
-                        .into(),
-                ));
-            }
-            if self.direct_io.is_some() {
-                return Err(crate::error::Error::RingSetup(
-                    "disk_io_threads is 0 with direct_io enabled; the mio backend runs \
-                     direct I/O on that pool: set disk_io_threads or leave direct_io unset"
-                        .into(),
-                ));
-            }
+        // On mio every fs operation runs on the disk-I/O pool, so fs with no
+        // pool would fail at the first operation.
+        if !cfg!(has_io_uring) && self.disk_io_threads == 0 && self.fs.is_some() {
+            return Err(crate::error::Error::RingSetup(
+                "disk_io_threads is 0 with fs enabled; the mio backend runs file \
+                 operations on that pool: set disk_io_threads or call no_fs()"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -1448,15 +1434,6 @@ impl ConfigBuilder {
         self
     }
 
-    /// Enable direct I/O. On io_uring each worker reserves `max_files`
-    /// fixed-file slots and allocates its file table and command slab; on
-    /// mio the files open with `O_DIRECT` (`F_NOCACHE` on macOS) and their
-    /// operations run on the disk-I/O pool.
-    pub fn direct_io(mut self, config: crate::direct_io::DirectIoConfig) -> Self {
-        self.config.direct_io = Some(config);
-        self
-    }
-
     /// Configure filesystem I/O, which is on by default with
     /// `FsConfig::default()`. On io_uring each worker reserves `max_files`
     /// fixed-file slots and allocates its file table and command slab; on
@@ -1470,7 +1447,7 @@ impl ConfigBuilder {
 
     /// Disable filesystem I/O support entirely.
     ///
-    /// `fs` defaults to enabled (unlike `nvme`/`direct_io`), so its
+    /// `fs` defaults to enabled (unlike `nvme`), so its
     /// per-worker file table and command slab are otherwise always
     /// allocated. Workloads that never touch [`crate::fs`] can reclaim
     /// that footprint; fs operations will then fail with "filesystem I/O
@@ -1499,11 +1476,11 @@ impl ConfigBuilder {
     }
 
     /// Set the number of disk I/O threads per worker (mio backend only): each
-    /// worker with fs or direct I/O configured runs its own pool, so a runtime
+    /// worker with fs configured runs its own pool, so a runtime
     /// runs `workers × threads` of them, named `rl-disk-<worker>-<thread>`.
     ///
     /// 0 means no pool: on the mio backend `build()` then fails while `fs`
-    /// (on by default; see [`no_fs`](Self::no_fs)) or `direct_io` is set. On
+    /// (on by default; see [`no_fs`](Self::no_fs)) is set. On
     /// io_uring the value is accepted and unused.
     pub fn disk_io_threads(mut self, threads: usize) -> Self {
         self.config.disk_io_threads = threads;
@@ -1644,14 +1621,6 @@ mod tests {
             .err()
             .expect("fs is on by default, so no pool to run it on is an error");
         assert!(err.to_string().contains("no_fs"), "{err}");
-        let err = ConfigBuilder::new()
-            .no_fs()
-            .direct_io(crate::direct_io::DirectIoConfig::default())
-            .disk_io_threads(0)
-            .build()
-            .err()
-            .expect("direct I/O with no pool is an error");
-        assert!(err.to_string().contains("direct_io"), "{err}");
         ConfigBuilder::new()
             .no_fs()
             .disk_io_threads(0)

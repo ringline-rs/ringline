@@ -1,7 +1,8 @@
 //! Async filesystem I/O.
 //!
-//! Provides buffered file read/write and metadata operations (stat,
-//! symlink_metadata, rename, remove, mkdir). Apart from [`close`], which is
+//! Provides file read/write, buffered or bypassing the page cache with
+//! [`OpenFlags::DIRECT`], and metadata operations (stat, symlink_metadata,
+//! rename, remove, mkdir). Apart from [`close`], which is
 //! synchronous, file operations do not block the worker thread: on io_uring
 //! the kernel completes them inline or on its own threads (see below); on mio
 //! they run on a thread pool.
@@ -53,9 +54,8 @@
 //!   ext4, XFS or btrfs waits for the page in task work rather than on the
 //!   pool.
 //!
-//! [`direct_io_fsync`](crate::direct_io_fsync) always
-//! uses the pool too. Direct I/O reads and writes use it always on overlayfs
-//! and tmpfs, and elsewhere when they would block.
+//! Reads and writes on a file opened with [`OpenFlags::DIRECT`] use the pool
+//! always on overlayfs and tmpfs, and elsewhere when they would block.
 //!
 //! The pool has `min(sq_entries, 4 × the host's online CPUs)` threads per
 //! worker; a container's CPU limit does not lower it. With the default
@@ -200,7 +200,50 @@ impl OpenFlags {
     /// `offset` argument of [`write_from()`] is then ignored, on
     /// both backends; on macOS `pwrite` writes at `offset` regardless.
     pub const APPEND: Self = Self(libc::O_APPEND);
+    /// Bypass the page cache: `O_DIRECT` on Linux, `F_NOCACHE` set after the
+    /// open on macOS.
+    ///
+    /// With `O_DIRECT` the buffer address, the length and the file offset of
+    /// a read or write must each be a multiple of the device's logical block
+    /// size (typically 512 or 4096 bytes), or the kernel returns `EINVAL`;
+    /// [`AlignedBuf`](crate::buf::AlignedBuf) provides the address. A
+    /// filesystem that does not support `O_DIRECT` refuses the open with
+    /// `EINVAL`. `F_NOCACHE` on macOS has no alignment requirement.
+    #[cfg(target_os = "linux")]
+    pub const DIRECT: Self = Self(libc::O_DIRECT);
+    /// Bypass the page cache: `O_DIRECT` on Linux, `F_NOCACHE` set after the
+    /// open on macOS.
+    ///
+    /// With `O_DIRECT` the buffer address, the length and the file offset of
+    /// a read or write must each be a multiple of the device's logical block
+    /// size (typically 512 or 4096 bytes), or the kernel returns `EINVAL`;
+    /// [`AlignedBuf`](crate::buf::AlignedBuf) provides the address. A
+    /// filesystem that does not support `O_DIRECT` refuses the open with
+    /// `EINVAL`. `F_NOCACHE` on macOS has no alignment requirement.
+    #[cfg(not(target_os = "linux"))]
+    pub const DIRECT: Self = Self(NOCACHE_FLAG);
+    /// Open with `O_DSYNC`, so a write completes only once the kernel has
+    /// sent its data to the device (on Linux, to stable storage).
+    ///
+    /// On a Linux block device opened with [`DIRECT`](Self::DIRECT), io_uring
+    /// sends each write with the FUA bit set; when the device does not
+    /// support FUA, the kernel follows the write with a cache flush. The mio
+    /// backend writes with `pwrite(2)`, and for that call the kernel also
+    /// flushes the device's cache after every write. The kernel sends no FUA
+    /// and no flush when the device reports a write-through cache
+    /// (`/sys/block/<dev>/queue/write_cache`). On a file in a filesystem,
+    /// each write also commits the metadata needed to read it back. On macOS
+    /// the write reaches the drive but the drive's own cache is not flushed,
+    /// as with `fsync(2)`.
+    pub const DSYNC: Self = Self(libc::O_DSYNC);
 }
+
+/// The bit [`OpenFlags::DIRECT`] uses on macOS, where no `open(2)` flag
+/// bypasses the page cache: bit 31, which `OpenFlags` does not otherwise use
+/// (`<sys/fcntl.h>` names it `O_POPUP`, which the kernel ignores). The mio
+/// backend removes it before `open` and sets `F_NOCACHE` on the new fd.
+#[cfg(not(target_os = "linux"))]
+pub(crate) const NOCACHE_FLAG: i32 = i32::MIN;
 
 impl std::ops::BitOr for OpenFlags {
     type Output = Self;
@@ -889,8 +932,7 @@ pub(crate) fn cancel_target(tag: crate::completion::OpTag, index: u32, seq: u32)
     crate::completion::UserData::encode(tag, index, seq).raw()
 }
 
-/// Future returned by [`read_into()`], [`direct_io_read()`](crate::direct_io_read)
-/// and [`nvme_read()`](crate::nvme_read).
+/// Future returned by [`read_into()`] and [`nvme_read()`](crate::nvme_read).
 ///
 /// Resolves to `(io::Result<usize>, B)`. On success the buffer's initialized
 /// length is extended by the number of bytes read.
@@ -1005,8 +1047,7 @@ impl<B: IoBufMut> Drop for ReadFuture<B> {
     }
 }
 
-/// Future returned by [`write_from()`], [`direct_io_write()`](crate::direct_io_write)
-/// and [`nvme_write()`](crate::nvme_write).
+/// Future returned by [`write_from()`] and [`nvme_write()`](crate::nvme_write).
 ///
 /// Resolves to `(io::Result<usize>, B)`. The buffer is returned unchanged
 /// regardless of success or failure.

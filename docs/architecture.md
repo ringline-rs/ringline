@@ -27,8 +27,8 @@ Within the core crate, the main boundaries are:
   provided-buffer ring, driver, and completion-driven event loop.
 - The Mio backend: `backend/mio/`, with its poll driver and readiness-driven
   event loop.
-- Optional services: resolver, process spawner, blocking pool, filesystem,
-  direct I/O, NVMe, and registered memory regions.
+- Optional services: resolver, process spawner, blocking pool, filesystem
+  (buffered or `O_DIRECT`), NVMe, and registered memory regions.
 
 The principal public abstractions are `RinglineBuilder`, `Runtime`,
 `AsyncEventHandler`, and `Connection`. `AsyncEventHandler::create_for_worker`
@@ -142,7 +142,7 @@ task-waker scheme are shared. The I/O mechanisms are not:
 | Sends | Copy pool plus guarded `SendMsgZc` scatter/gather | Owned/copy pending-send buffers |
 | Send retry | CQE handling, retry lists, and drain sends after `EAGAIN` | Writable readiness and dirty lists |
 | Timers | Deadline min-heap; the earliest deadline bounds `io_uring_enter` | Deadline min-heap; the earliest deadline bounds `epoll_wait` |
-| File/direct I/O | Submitted through the ring | Dedicated disk-I/O pool |
+| File I/O | Submitted through the ring | Dedicated disk-I/O pool |
 | NVMe and registered regions | Supported | Unsupported |
 
 Mio therefore does not emulate CQEs, provided-buffer rings, fixed files, or

@@ -189,9 +189,9 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.run_shutdown();
     }
 
-    /// Whether the drain ended with an fs, direct I/O or NVMe command still in
-    /// flight. The kernel can still use memory the event loop and its tasks
-    /// own, so the caller must leak it, through [`close_ring`](Self::close_ring)
+    /// Whether the drain ended with an fs or NVMe command still in flight.
+    /// The kernel can still use memory the event loop and its tasks own, so
+    /// the caller must leak it, through [`close_ring`](Self::close_ring)
     /// (#824).
     pub(crate) fn memory_in_use_at_exit(&self) -> bool {
         self.driver.disk_io_outstanding
@@ -1864,7 +1864,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::RecvUdp => self.handle_recv_udp(ud, result, flags),
             OpTag::SendUdp => self.handle_send_udp(ud, result),
             OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
-            OpTag::DirectIo => self.handle_direct_io(ud, result),
             OpTag::Fs => self.handle_fs(ud, result),
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
             OpTag::SendPollOut => self.handle_send_pollout(ud, result, flags),
@@ -4517,36 +4516,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.executor.wake_disk_io(ud.payload(), result);
     }
 
-    fn handle_direct_io(&mut self, ud: UserData, result: i32) {
-        let slab_idx = ud.payload() as u16;
-
-        let cmd_slab = match self.driver.direct_io_cmd_slab {
-            Some(ref mut s) => s,
-            None => return,
-        };
-
-        if !cmd_slab.in_use(slab_idx) {
-            return;
-        }
-
-        let (file_index, _op) = cmd_slab.release(slab_idx);
-        self.submit_released_fsyncs(ud.payload());
-
-        // Decrement in-flight count, and finish a close that waited for it.
-        if let Some(ref mut files) = self.driver.direct_io_files
-            && let Some(f) = files.get_mut(file_index)
-        {
-            f.in_flight = f.in_flight.saturating_sub(1);
-            if f.closing && f.in_flight == 0 {
-                let _ = self.driver.ring.register_files_update(f.fd_index, &[-1i32]);
-                files.release(file_index);
-            }
-        }
-
-        // Wake the async task waiting for this Direct I/O completion.
-        self.executor.wake_disk_io(ud.payload(), result);
-    }
-
     /// Push the fsyncs held until the write under disk-I/O key `key` and the
     /// writes before it completed (#905). A push the ring refuses is queued
     /// (`Ring::push_disk_sqe`), so none is lost.
@@ -6674,7 +6643,9 @@ mod tests {
         assert!(finished, "the task did not finish");
     }
 
-    /// Wait for and dispatch completions until `key`'s result arrives.
+    /// Wait for and dispatch completions until `key`'s result arrives, for
+    /// at most 30 s: an `O_DIRECT` write and fsync on a busy VM disk took
+    /// about 5 s alongside the integration tests.
     fn wait_for_result(el: &mut AsyncEventLoop<NoopHandler>, key: u32) -> i32 {
         let started = std::time::Instant::now();
         loop {
@@ -6682,7 +6653,7 @@ mod tests {
                 return result;
             }
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
+                started.elapsed() < std::time::Duration::from_secs(30),
                 "no result for key {key}"
             );
             el.driver
@@ -6730,31 +6701,69 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// As `an_fsync_waits_for_an_earlier_write_to_complete`, for a direct I/O
-    /// write and `direct_io_fsync`, through `handle_direct_io`.
+    /// `OpenFlags::DIRECT` reaches the kernel through `OpenAt`: on a file
+    /// opened with it, a write whose length is not a multiple of the block
+    /// size fails with `EINVAL`, where a buffered write would succeed. It
+    /// relies on the working directory's filesystem refusing unaligned
+    /// `O_DIRECT` writes, as ext4 and XFS do; btrfs falls back to buffered
+    /// I/O instead.
     #[test]
-    fn a_direct_io_fsync_waits_for_an_earlier_write_to_complete() {
-        let cfg = test_config_builder()
-            .direct_io(crate::direct_io::DirectIoConfig::default())
-            .build()
-            .expect("valid config");
-        let mut el = make_test_loop_with_config(cfg);
+    fn o_direct_reaches_the_kernel_through_openat() {
+        let mut el = make_test_loop();
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(format!(".ringline-o-direct-openat-{}", std::process::id()));
+        std::fs::write(&path, [0u8; 4096]).unwrap();
+        let (index, generation, open_key) = el
+            .driver
+            .make_ctx()
+            .fs_open(
+                &path,
+                crate::fs::OpenFlags::READ_WRITE | crate::fs::OpenFlags::DIRECT,
+                0,
+            )
+            .expect("submit open");
+        el.executor.wait_disk_io(open_key, 0);
+        assert!(wait_for_result(&mut el, open_key) >= 0, "O_DIRECT open");
+        let file = crate::fs::File::new(index, generation);
+        static SHORT: [u8; 100] = [7; 100];
+        let write_key = unsafe { el.driver.make_ctx().fs_write(file, 0, SHORT.as_ptr(), 100) }
+            .expect("submit write");
+        el.executor.wait_disk_io(write_key, 0);
+        let result = wait_for_result(&mut el, write_key);
+        let _ = el.driver.make_ctx().fs_close(file);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, -libc::EINVAL, "an unaligned O_DIRECT write");
+    }
+
+    /// As `an_fsync_waits_for_an_earlier_write_to_complete`, for a file
+    /// opened with `OpenFlags::DIRECT` (`O_DIRECT` through `OpenAt`).
+    #[test]
+    fn an_fsync_on_an_o_direct_file_waits_for_an_earlier_write() {
+        let mut el = make_test_loop();
         // In the working directory: tmpfs may refuse O_DIRECT.
         let path = std::env::current_dir()
             .unwrap()
             .join(format!(".ringline-direct-fsync-{}", std::process::id()));
         std::fs::write(&path, [0u8; 4096]).unwrap();
-        let file = el
+        let (index, generation, open_key) = el
             .driver
             .make_ctx()
-            .open_direct_io_file(path.to_str().unwrap())
-            .expect("open for direct I/O");
+            .fs_open(
+                &path,
+                crate::fs::OpenFlags::READ_WRITE | crate::fs::OpenFlags::DIRECT,
+                0,
+            )
+            .expect("submit open");
+        el.executor.wait_disk_io(open_key, 0);
+        assert!(wait_for_result(&mut el, open_key) >= 0, "O_DIRECT open");
+        let file = crate::fs::File::new(index, generation);
         let block = crate::buf::AlignedBuf::zeroed(4096, 4096);
         let (write_key, sync_key) = {
             let mut ctx = el.driver.make_ctx();
-            let write_key = unsafe { ctx.direct_io_write(file, 0, block.as_ptr(), 4096) }
-                .expect("submit write");
-            let sync_key = ctx.direct_io_fsync(file).expect("submit fsync");
+            let write_key =
+                unsafe { ctx.fs_write(file, 0, block.as_ptr(), 4096) }.expect("submit write");
+            let sync_key = ctx.fs_fsync(file).expect("submit fsync");
             (write_key, sync_key)
         };
         el.executor.wait_disk_io(write_key, 0);
@@ -6764,7 +6773,7 @@ mod tests {
         assert_eq!(el.driver.write_orders.held(), 0, "the write released it");
         assert_eq!(wait_for_result(&mut el, sync_key), 0, "fsync");
         drop(block);
-        let _ = el.driver.make_ctx().close_direct_io_file(file);
+        let _ = el.driver.make_ctx().fs_close(file);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -6787,14 +6796,9 @@ mod tests {
         assert!(wait_for_result(&mut el, open_key) >= 0, "open");
         let file = crate::fs::File::new(index, generation);
         const EARLIER: u32 = u32::MAX;
-        el.driver.write_orders.begin_write(
-            crate::disk_order::OrderKey {
-                subsystem: crate::disk_order::Subsystem::Fs,
-                index,
-                generation,
-            },
-            EARLIER,
-        );
+        el.driver
+            .write_orders
+            .begin_write(crate::disk_order::OrderKey { index, generation }, EARLIER);
 
         static DATA: &[u8] = b"later";
         let mut buf = [0u8; 4];
@@ -6844,14 +6848,9 @@ mod tests {
         );
         let file = crate::fs::File::new(index, generation);
         // Stand in for a write still in flight on the file.
-        el.driver.write_orders.begin_write(
-            crate::disk_order::OrderKey {
-                subsystem: crate::disk_order::Subsystem::Fs,
-                index,
-                generation,
-            },
-            u32::MAX,
-        );
+        el.driver
+            .write_orders
+            .begin_write(crate::disk_order::OrderKey { index, generation }, u32::MAX);
         el.driver.make_ctx().fs_fsync(file).expect("submit fsync");
         assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
         let started = std::time::Instant::now();
@@ -14306,9 +14305,9 @@ mod tests {
 
     #[test]
     fn disk_io_keys_are_unique_per_op() {
-        // fs/NVMe/direct-io share the executor's completion maps; the key
-        // must differ across ops even for the same slab index (three
-        // independent slabs all start their free lists at 0).
+        // fs and NVMe share the executor's completion maps; the key must
+        // differ across ops even for the same slab index (both slabs start
+        // their free lists at 0).
         use crate::handler::DiskIoKind;
         let mut el = make_test_loop();
         let mut ctx = el.driver.make_ctx();
@@ -14319,22 +14318,19 @@ mod tests {
         assert_eq!(k2 & 0xFFFF, 3);
 
         // Slot 3 of each subsystem's slab, whatever the sequence: an fs
-        // operation in flight never shares a key with a direct-I/O or NVMe
-        // one, even when the sequence has come round to the same value.
+        // operation in flight never shares a key with an NVMe one, even when
+        // the sequence has come round to the same value.
         let fs = ctx.disk_io_key(DiskIoKind::Fs, 3).unwrap();
         for _ in 0..0x3FFF {
             ctx.disk_io_key(DiskIoKind::Fs, 0).unwrap();
         }
-        let dio = ctx.disk_io_key(DiskIoKind::DirectIo, 3).unwrap();
         let nvme = ctx.disk_io_key(DiskIoKind::Nvme, 3).unwrap();
         assert_eq!(
             fs & 0x3FFF_FFFF,
-            dio & 0x3FFF_FFFF,
+            nvme & 0x3FFF_FFFF,
             "the sequence came round"
         );
-        assert_ne!(fs, dio, "fs and direct-I/O keys must differ");
         assert_ne!(fs, nvme, "fs and NVMe keys must differ");
-        assert_ne!(dio, nvme, "direct-I/O and NVMe keys must differ");
     }
 
     /// An outbound slot whose Connect is in the kernel and a task waiting on

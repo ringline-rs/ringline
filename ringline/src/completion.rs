@@ -37,8 +37,6 @@ pub enum OpTag {
     SendMsgUdp = 14,
     /// NVMe passthrough command (read, write, flush via IORING_OP_URING_CMD).
     NvmeCmd = 15,
-    /// Direct I/O command (read, write, fsync via O_DIRECT + IORING_OP_READ/WRITE).
-    DirectIo = 16,
     /// Filesystem I/O command (open, read, write, fsync, stat, rename, unlink, mkdir).
     Fs = 18,
     /// PollAdd on a pidfd for async child process exit notification.
@@ -115,7 +113,6 @@ impl OpTag {
             13 => Some(OpTag::RecvMsgUdp),
             14 => Some(OpTag::SendMsgUdp),
             15 => Some(OpTag::NvmeCmd),
-            16 => Some(OpTag::DirectIo),
             18 => Some(OpTag::Fs),
             19 => Some(OpTag::PidfdPoll),
             21 => Some(OpTag::SendPollOut),
@@ -154,7 +151,6 @@ impl OpTag {
             OpTag::RecvMsgUdp => "recv_msg_udp",
             OpTag::SendMsgUdp => "send_msg_udp",
             OpTag::NvmeCmd => "nvme_cmd",
-            OpTag::DirectIo => "direct_io",
             OpTag::Fs => "fs",
             OpTag::PidfdPoll => "pidfd_poll",
             OpTag::SendPollOut => "send_poll_out",
@@ -195,7 +191,7 @@ mod optag_label_tests {
         }
         // Sanity: the walk found the tags, rather than silently finding none.
         assert!(
-            seen.len() >= 26,
+            seen.len() >= 25,
             "expected the full tag set, found {}",
             seen.len()
         );

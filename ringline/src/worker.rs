@@ -429,7 +429,7 @@ impl Runtime {
     ///
     /// Workers stop accepting new connections, close all active connections (on
     /// io_uring, cancelling each connection's operations in flight and waiting up
-    /// to 10 s for the connections to close and for file, direct I/O and NVMe
+    /// to 10 s for the connections to close and for file and NVMe
     /// operations in flight to complete or be cancelled; on mio, waiting up to
     /// 10 s for the disk-I/O pool's reads and writes already running), and
     /// exit their event loops returning `Ok(())`, or
@@ -442,7 +442,7 @@ impl Runtime {
     /// drops every task's future. The futures' `Drop` implementations run, and
     /// a task does not resume from the `.await` it is suspended at.
     ///
-    /// An io_uring worker cancels its file, direct I/O and NVMe operations in
+    /// An io_uring worker cancels its file and NVMe operations in
     /// flight; a mio worker has its disk-I/O pool skip the requests it has not
     /// started. If an io_uring operation, or a read or write a mio pool thread
     /// has started, is still running when the 10 s run out, or an
@@ -3709,7 +3709,7 @@ mod worker_exit_tests {
     }
 }
 
-/// Worker exit and the fs, direct I/O and NVMe operations in flight (#824 on
+/// Worker exit and the fs and NVMe operations in flight (#824 on
 /// io_uring, #856 on mio).
 #[cfg(test)]
 mod disk_exit_tests {

@@ -53,8 +53,8 @@ cd /home/anvil
   [ "$got" = "io_uring" ] || { echo "BACKEND MISMATCH: $got"; echo "gate_backend=1"; exit 1; }
   echo "gate_backend=0 (backend=$got)"
 
-  # The uring gate, plus the lib tests of the two modules the change touches.
-  cargo test --locked -p ringline --lib -- nvme::tests direct_io::tests > /home/anvil/unit.out 2>&1; echo "unit_rc=$?"
+  # The uring gate, plus the NVMe lib tests.
+  cargo test --locked -p ringline --lib -- nvme::tests > /home/anvil/unit.out 2>&1; echo "unit_rc=$?"
   grep -E '^test result' /home/anvil/unit.out
   cargo fmt --all --check; echo "gate_fmt=$?"
   cargo clippy --locked --all-targets -- -D warnings; echo "gate_clippy_uring=$?"

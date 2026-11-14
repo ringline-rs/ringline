@@ -338,12 +338,6 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) nvme_cmd_slab: &'a mut Option<crate::nvme::NvmeCmdSlab>,
     /// Base offset in the fixed file table for NVMe device fds.
     pub(crate) nvme_fd_base: u32,
-    /// Direct I/O file table. `None` when direct I/O is not configured.
-    pub(crate) direct_io_files: &'a mut Option<crate::direct_io::DirectIoFileTable>,
-    /// Direct I/O command slab. `None` when direct I/O is not configured.
-    pub(crate) direct_io_cmd_slab: &'a mut Option<crate::direct_io::DirectIoCmdSlab>,
-    /// Base offset in the fixed file table for direct I/O file fds.
-    pub(crate) direct_io_fd_base: u32,
     /// Filesystem file table. `None` when fs is not configured.
     pub(crate) fs_files: &'a mut Option<crate::fs::FsFileTable>,
     /// Filesystem command slab. `None` when fs is not configured.
@@ -923,7 +917,7 @@ impl<'a> DriverCtx<'a> {
 
     /// Allocate a 32-bit disk-I/O completion key: the subsystem in the top 2
     /// bits, a 14-bit sequence below it, and the slab index in the low 16.
-    /// fs, NVMe and direct I/O share the executor's disk-I/O entry map but
+    /// fs and NVMe share the executor's disk-I/O entry map but
     /// have independent slabs, each numbering its slots from 0. CQE handlers
     /// extract the slab index from the low 16 bits and wake with the full key.
     ///
@@ -1803,332 +1797,6 @@ impl<'a> DriverCtx<'a> {
         Ok((dev.fd_index, dev.nsid))
     }
 
-    // ── Direct I/O methods ────────────────────────────────────────────────
-
-    /// Open a file for direct I/O (O_DIRECT).
-    ///
-    /// `path` can be any file or block device path. The file is opened with
-    /// `O_RDWR | O_DIRECT`. The fd is registered in the io_uring fixed file table.
-    ///
-    /// Returns a [`DirectIoFile`](crate::direct_io::DirectIoFile) handle for
-    /// subsequent operations.
-    pub fn open_direct_io_file(
-        &mut self,
-        path: &str,
-    ) -> io::Result<crate::direct_io::DirectIoFile> {
-        self.open_direct_io_file_with(path, crate::direct_io::DirectIoOpenOptions::new())
-    }
-
-    /// Open a file for direct I/O with `options` added to the flags
-    /// [`open_direct_io_file`](Self::open_direct_io_file) uses.
-    pub fn open_direct_io_file_with(
-        &mut self,
-        path: &str,
-        options: crate::direct_io::DirectIoOpenOptions,
-    ) -> io::Result<crate::direct_io::DirectIoFile> {
-        let files = self
-            .direct_io_files
-            .as_mut()
-            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
-
-        // Convert the path before allocating, so a bad path holds no slot.
-        let c_path =
-            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
-        let index = files
-            .allocate()
-            .ok_or_else(|| io::Error::other("direct I/O file table full"))?;
-
-        // Open with O_DIRECT | O_RDWR.
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_RDWR | libc::O_DIRECT | libc::O_CLOEXEC | options.extra_flags(),
-            )
-        };
-        if fd < 0 {
-            files.release(index);
-            return Err(io::Error::last_os_error());
-        }
-
-        // Register in the fixed file table.
-        let fd_index = self.direct_io_fd_base + index as u32;
-        if self.ring.register_files_update(fd_index, &[fd]).is_err() {
-            files.release(index);
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(io::Error::other("failed to register direct I/O fd"));
-        }
-        unsafe {
-            libc::close(fd);
-        }
-
-        // Store file state.
-        if let Some(f) = files.get_mut(index) {
-            f.fd_index = fd_index;
-        }
-
-        let generation = files.get(index).map(|f| f.generation).unwrap_or(0);
-        Ok(crate::direct_io::DirectIoFile::new(index, generation))
-    }
-
-    /// Submit a direct I/O read.
-    ///
-    /// Reads `len` bytes from `offset` into the buffer at `buf`.
-    /// The buffer must be aligned to the logical block size and remain valid
-    /// until the direct I/O completion fires.
-    ///
-    /// Returns the operation's disk-I/O key. [`direct_io_read`](crate::direct_io_read) holds it
-    /// in a future that resolves to the result.
-    ///
-    /// # Safety
-    /// `buf` must point to valid, aligned memory of at least `len` bytes
-    /// that remains valid until the operation completes.
-    pub unsafe fn direct_io_read(
-        &mut self,
-        file: crate::direct_io::DirectIoFile,
-        offset: u64,
-        buf: *mut u8,
-        len: u32,
-    ) -> io::Result<u32> {
-        let fd_index = self.validate_direct_io_file(file)?;
-
-        let slab = self
-            .direct_io_cmd_slab
-            .as_mut()
-            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
-        let slab_idx = slab
-            .allocate(file.index, crate::direct_io::DirectIoOp::Read)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "direct I/O command slab exhausted",
-                )
-            })?;
-
-        let key = match self.disk_io_key(DiskIoKind::DirectIo, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::DirectIo,
-            file.index as u32,
-            key,
-        );
-        if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
-            slab.set_user_data(slab_idx, ud.raw());
-        }
-
-        match unsafe { self.ring.submit_direct_read(fd_index, buf, len, offset, ud) } {
-            Ok(()) => {
-                if let Some(files) = self.direct_io_files.as_mut()
-                    && let Some(f) = files.get_mut(file.index)
-                {
-                    f.in_flight += 1;
-                }
-                Ok(key)
-            }
-            Err(e) => {
-                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Submit a direct I/O write.
-    ///
-    /// Writes `len` bytes from the buffer at `buf` to `offset`.
-    /// The buffer must be aligned to the logical block size and remain valid
-    /// until the direct I/O completion fires.
-    ///
-    /// Returns the operation's disk-I/O key. [`direct_io_write`](crate::direct_io_write) holds it
-    /// in a future that resolves to the result.
-    ///
-    /// # Safety
-    /// `buf` must point to valid, aligned memory of at least `len` bytes
-    /// that remains valid until the operation completes.
-    pub unsafe fn direct_io_write(
-        &mut self,
-        file: crate::direct_io::DirectIoFile,
-        offset: u64,
-        buf: *const u8,
-        len: u32,
-    ) -> io::Result<u32> {
-        let fd_index = self.validate_direct_io_file(file)?;
-
-        let slab = self
-            .direct_io_cmd_slab
-            .as_mut()
-            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
-        let slab_idx = slab
-            .allocate(file.index, crate::direct_io::DirectIoOp::Write)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "direct I/O command slab exhausted",
-                )
-            })?;
-
-        let key = match self.disk_io_key(DiskIoKind::DirectIo, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::DirectIo,
-            file.index as u32,
-            key,
-        );
-        if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
-            slab.set_user_data(slab_idx, ud.raw());
-        }
-
-        match unsafe {
-            self.ring
-                .submit_direct_write(fd_index, buf, len, offset, ud)
-        } {
-            Ok(()) => {
-                if let Some(files) = self.direct_io_files.as_mut()
-                    && let Some(f) = files.get_mut(file.index)
-                {
-                    f.in_flight += 1;
-                }
-                self.write_orders.begin_write(
-                    crate::disk_order::OrderKey {
-                        subsystem: crate::disk_order::Subsystem::DirectIo,
-                        index: file.index,
-                        generation: file.generation,
-                    },
-                    key,
-                );
-                Ok(key)
-            }
-            Err(e) => {
-                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Submit an fsync for a direct I/O file.
-    ///
-    /// Returns the operation's disk-I/O key. [`direct_io_fsync`](crate::direct_io_fsync) holds it
-    /// in a future that resolves to the result.
-    pub fn direct_io_fsync(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
-        let fd_index = self.validate_direct_io_file(file)?;
-
-        let slab = self
-            .direct_io_cmd_slab
-            .as_mut()
-            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
-        let slab_idx = slab
-            .allocate(file.index, crate::direct_io::DirectIoOp::Fsync)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "direct I/O command slab exhausted",
-                )
-            })?;
-
-        let key = match self.disk_io_key(DiskIoKind::DirectIo, slab_idx) {
-            Ok(key) => key,
-            Err(e) => {
-                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                return Err(e);
-            }
-        };
-        let ud = crate::completion::UserData::encode(
-            crate::completion::OpTag::DirectIo,
-            file.index as u32,
-            key,
-        );
-        if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
-            slab.set_user_data(slab_idx, ud.raw());
-        }
-
-        // Held until the writes submitted before it on the file complete
-        // (#905); counted in flight either way, so a close waits for it.
-        let order = crate::disk_order::OrderKey {
-            subsystem: crate::disk_order::Subsystem::DirectIo,
-            index: file.index,
-            generation: file.generation,
-        };
-        let pushed = match self.write_orders.sync(order, (fd_index, ud.raw())) {
-            Some(_) => self.ring.submit_direct_fsync(fd_index, ud),
-            None => Ok(()),
-        };
-        match pushed {
-            Ok(()) => {
-                if let Some(files) = self.direct_io_files.as_mut()
-                    && let Some(f) = files.get_mut(file.index)
-                {
-                    f.in_flight += 1;
-                }
-                Ok(key)
-            }
-            Err(e) => {
-                if let Some(slab) = self.direct_io_cmd_slab.as_mut() {
-                    slab.release(slab_idx);
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Close a direct I/O file. With commands in flight, the handle goes stale
-    /// at once and the last completion unregisters the file.
-    pub fn close_direct_io_file(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<()> {
-        let fd_index = self.validate_direct_io_file(file)?;
-
-        if let Some(files) = self.direct_io_files.as_mut()
-            && let Some(f) = files.get_mut(file.index)
-            && f.in_flight > 0
-        {
-            f.closing = true;
-            f.generation = f.generation.wrapping_add(1);
-            return Ok(());
-        }
-
-        // Unregister from the fixed file table.
-        self.ring.register_files_update(fd_index, &[-1i32])?;
-
-        if let Some(files) = self.direct_io_files.as_mut() {
-            files.release(file.index);
-        }
-
-        Ok(())
-    }
-
-    /// Validate a direct I/O file handle and return the fd_index.
-    fn validate_direct_io_file(&self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
-        let files = self
-            .direct_io_files
-            .as_ref()
-            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
-        let f = files
-            .get(file.index)
-            .ok_or_else(|| io::Error::other("invalid direct I/O file handle"))?;
-        if f.closing || f.generation != file.generation {
-            return Err(io::Error::other("stale direct I/O file handle"));
-        }
-        Ok(f.fd_index)
-    }
-
     // ── Filesystem I/O methods ─────────────────────────────────────────────
 
     /// Open a file asynchronously via io_uring.
@@ -2353,7 +2021,6 @@ impl<'a> DriverCtx<'a> {
                 }
                 self.write_orders.begin_write(
                     crate::disk_order::OrderKey {
-                        subsystem: crate::disk_order::Subsystem::Fs,
                         index: file.index,
                         generation: file.generation,
                     },
@@ -2408,7 +2075,6 @@ impl<'a> DriverCtx<'a> {
         // Held until the writes submitted before it on the file complete
         // (#905); counted in flight either way, so a close waits for it.
         let order = crate::disk_order::OrderKey {
-            subsystem: crate::disk_order::Subsystem::Fs,
             index: file.index,
             generation: file.generation,
         };
@@ -2794,18 +2460,14 @@ pub(crate) struct DriverCtx<'a> {
     pub(crate) disk_io_in_flight:
         &'a mut std::collections::HashMap<u32, crate::disk_io_pool::PoolSubsystem>,
     /// See `Driver::disk_io_counts`.
-    pub(crate) disk_io_counts: &'a mut [u16; 2],
+    pub(crate) disk_io_counts: &'a mut [u16; 1],
     /// See `Driver::disk_io_limits`.
-    pub(crate) disk_io_limits: [Option<u16>; 2],
+    pub(crate) disk_io_limits: [Option<u16>; 1],
     /// See `Driver::disk_io_borrowing`.
     pub(crate) disk_io_borrowing: &'a mut std::collections::HashSet<u32>,
     /// See `Driver::write_orders`.
     pub(crate) write_orders:
         &'a mut crate::disk_order::WriteOrders<crate::disk_io_pool::HeldRequest>,
-    /// Direct I/O file table.
-    pub(crate) direct_io_files: &'a mut Option<crate::direct_io::DirectIoFileTable>,
-    /// Direct I/O fds, indexed by file slot.
-    pub(crate) direct_io_fds: &'a mut Vec<Option<std::sync::Arc<std::os::fd::OwnedFd>>>,
     /// Filesystem file table.
     pub(crate) fs_files: &'a mut Option<crate::fs::FsFileTable>,
     /// Filesystem fds, indexed by file slot.
@@ -3347,7 +3009,7 @@ impl<'a> DriverCtx<'a> {
         ))
     }
 
-    // ── Direct I/O methods ────────────────────────────────────────────
+    // ── Disk-I/O pool ─────────────────────────────────────────────────
 
     /// Allocate a sequence number and submit work to the disk I/O pool.
     /// `borrows` is true when `work` reads or writes through a caller's
@@ -3427,219 +3089,6 @@ impl<'a> DriverCtx<'a> {
         Ok(seq)
     }
 
-    /// Open a file for direct I/O.
-    ///
-    /// On Linux, the file is opened with `O_DIRECT`. On macOS, `fcntl(F_NOCACHE)`
-    /// is used as an approximation. This is synchronous (matching io_uring behavior
-    /// where the fd is needed immediately).
-    pub fn open_direct_io_file(
-        &mut self,
-        path: &str,
-    ) -> io::Result<crate::direct_io::DirectIoFile> {
-        self.open_direct_io_file_with(path, crate::direct_io::DirectIoOpenOptions::new())
-    }
-
-    /// Open a file for direct I/O with `options` added to the flags
-    /// [`open_direct_io_file`](Self::open_direct_io_file) uses.
-    pub fn open_direct_io_file_with(
-        &mut self,
-        path: &str,
-        options: crate::direct_io::DirectIoOpenOptions,
-    ) -> io::Result<crate::direct_io::DirectIoFile> {
-        let files = self
-            .direct_io_files
-            .as_mut()
-            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
-
-        // Convert the path before allocating, so a bad path holds no slot.
-        let c_path =
-            std::ffi::CString::new(path).map_err(|_| io::Error::other("invalid file path"))?;
-        let index = files
-            .allocate()
-            .ok_or_else(|| io::Error::other("direct I/O file table full"))?;
-
-        #[cfg(target_os = "linux")]
-        let flags = libc::O_RDWR | libc::O_DIRECT;
-        #[cfg(not(target_os = "linux"))]
-        let flags = libc::O_RDWR;
-
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                flags | libc::O_CLOEXEC | options.extra_flags(),
-            )
-        };
-        if fd < 0 {
-            files.release(index);
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `open` returned a fresh descriptor nothing else owns.
-        let owned: std::os::fd::OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
-
-        // On macOS, use F_NOCACHE to bypass the page cache.
-        #[cfg(target_os = "macos")]
-        {
-            unsafe {
-                libc::fcntl(fd, libc::F_NOCACHE, 1);
-            }
-        }
-
-        self.direct_io_fds[index as usize] = Some(std::sync::Arc::new(owned));
-
-        let generation = files.get(index).map(|f| f.generation).unwrap_or(0);
-        Ok(crate::direct_io::DirectIoFile::new(index, generation))
-    }
-
-    /// Submit a direct I/O read via the disk I/O pool.
-    ///
-    /// Returns the operation's disk-I/O key. [`direct_io_read`](crate::direct_io_read) holds it
-    /// in a future that resolves to the result.
-    pub fn direct_io_read(
-        &mut self,
-        file: crate::direct_io::DirectIoFile,
-        offset: u64,
-        buf: *mut u8,
-        len: u32,
-    ) -> io::Result<u32> {
-        let fd = self.validate_direct_io_file(file)?;
-        let buf_addr = buf as usize;
-        let work = Box::new(move || {
-            let result = unsafe {
-                libc::pread(
-                    std::os::fd::AsRawFd::as_raw_fd(&*fd),
-                    buf_addr as *mut libc::c_void,
-                    len as usize,
-                    offset as libc::off_t,
-                )
-            };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                result as i32
-            };
-            crate::disk_io_pool::DiskIoResult {
-                result: r,
-                metadata: None,
-                opened: None,
-            }
-        });
-        self.submit_disk_io(crate::disk_io_pool::PoolSubsystem::DirectIo, work, true)
-    }
-
-    /// Submit a direct I/O write via the disk I/O pool.
-    ///
-    /// Returns the operation's disk-I/O key. [`direct_io_write`](crate::direct_io_write) holds it
-    /// in a future that resolves to the result.
-    pub fn direct_io_write(
-        &mut self,
-        file: crate::direct_io::DirectIoFile,
-        offset: u64,
-        buf: *const u8,
-        len: u32,
-    ) -> io::Result<u32> {
-        let fd = self.validate_direct_io_file(file)?;
-        let buf_addr = buf as usize;
-        let work = Box::new(move || {
-            let result = unsafe {
-                libc::pwrite(
-                    std::os::fd::AsRawFd::as_raw_fd(&*fd),
-                    buf_addr as *const libc::c_void,
-                    len as usize,
-                    offset as libc::off_t,
-                )
-            };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                result as i32
-            };
-            crate::disk_io_pool::DiskIoResult {
-                result: r,
-                metadata: None,
-                opened: None,
-            }
-        });
-        let order = DiskOrder::Write(crate::disk_order::OrderKey {
-            subsystem: crate::disk_order::Subsystem::DirectIo,
-            index: file.index,
-            generation: file.generation,
-        });
-        self.submit_disk_io_ordered(
-            crate::disk_io_pool::PoolSubsystem::DirectIo,
-            work,
-            true,
-            Some(order),
-        )
-    }
-
-    /// Submit an fsync for a direct I/O file via the disk I/O pool.
-    pub fn direct_io_fsync(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<u32> {
-        let fd = self.validate_direct_io_file(file)?;
-        let work = Box::new(move || {
-            let result = unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&*fd)) };
-            let r = if result < 0 {
-                -(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO))
-            } else {
-                0
-            };
-            crate::disk_io_pool::DiskIoResult {
-                result: r,
-                metadata: None,
-                opened: None,
-            }
-        });
-        let order = DiskOrder::Sync(crate::disk_order::OrderKey {
-            subsystem: crate::disk_order::Subsystem::DirectIo,
-            index: file.index,
-            generation: file.generation,
-        });
-        self.submit_disk_io_ordered(
-            crate::disk_io_pool::PoolSubsystem::DirectIo,
-            work,
-            false,
-            Some(order),
-        )
-    }
-
-    /// Close a direct I/O file and release its slot.
-    ///
-    /// The fd closes once the operations already queued on it have finished;
-    /// the handle is invalid at once.
-    pub fn close_direct_io_file(&mut self, file: crate::direct_io::DirectIoFile) -> io::Result<()> {
-        self.validate_direct_io_file(file)?;
-        self.direct_io_fds[file.index as usize] = None;
-        if let Some(files) = self.direct_io_files.as_mut() {
-            files.release(file.index);
-        }
-        Ok(())
-    }
-
-    /// Validate a direct I/O file handle and return a hold on its fd.
-    fn validate_direct_io_file(
-        &self,
-        file: crate::direct_io::DirectIoFile,
-    ) -> io::Result<std::sync::Arc<std::os::fd::OwnedFd>> {
-        let files = self
-            .direct_io_files
-            .as_ref()
-            .ok_or_else(|| io::Error::other("direct I/O not configured"))?;
-        let f = files
-            .get(file.index)
-            .ok_or_else(|| io::Error::other("invalid direct I/O file handle"))?;
-        if f.generation != file.generation {
-            return Err(io::Error::other("stale direct I/O file handle"));
-        }
-        self.direct_io_fds[file.index as usize]
-            .clone()
-            .ok_or_else(|| io::Error::other("direct I/O file fd not found"))
-    }
-
     // ── Filesystem I/O methods ────────────────────────────────────────
 
     /// Open a file via the disk I/O pool.
@@ -3670,7 +3119,15 @@ impl<'a> DriverCtx<'a> {
             self.fs_files.as_mut().unwrap().release(file_index);
         })?;
 
-        let open_flags = flags.0;
+        // `OpenFlags::DIRECT` is `O_DIRECT` on Linux; elsewhere it is a bit no
+        // `open(2)` flag uses, replaced by `F_NOCACHE` after the open.
+        #[cfg(target_os = "linux")]
+        let (open_flags, nocache) = (flags.0, false);
+        #[cfg(not(target_os = "linux"))]
+        let (open_flags, nocache) = (
+            flags.0 & !crate::fs::NOCACHE_FLAG,
+            flags.0 & crate::fs::NOCACHE_FLAG != 0,
+        );
         let work = Box::new(move || {
             let fd = unsafe {
                 libc::open(
@@ -3679,6 +3136,14 @@ impl<'a> DriverCtx<'a> {
                     mode as libc::c_int,
                 )
             };
+            #[cfg(target_os = "macos")]
+            if fd >= 0 && nocache {
+                unsafe {
+                    libc::fcntl(fd, libc::F_NOCACHE, 1);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = nocache;
             if fd < 0 {
                 let errno = io::Error::last_os_error()
                     .raw_os_error()
@@ -3780,7 +3245,6 @@ impl<'a> DriverCtx<'a> {
             }
         });
         let order = DiskOrder::Write(crate::disk_order::OrderKey {
-            subsystem: crate::disk_order::Subsystem::Fs,
             index: file.index,
             generation: file.generation,
         });
@@ -3811,7 +3275,6 @@ impl<'a> DriverCtx<'a> {
             }
         });
         let order = DiskOrder::Sync(crate::disk_order::OrderKey {
-            subsystem: crate::disk_order::Subsystem::Fs,
             index: file.index,
             generation: file.generation,
         });
@@ -5171,7 +4634,6 @@ impl<'b, 'a> ChainPartsBuilder<'b, 'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum DiskIoKind {
     Fs = 0,
-    DirectIo = 1,
     Nvme = 2,
 }
 

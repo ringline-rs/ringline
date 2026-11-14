@@ -5141,9 +5141,8 @@ impl<F: Future> Future for TimeoutFuture<F> {
 // ── Disk I/O async API ──────────────────────────────────────────────
 
 /// Future that awaits a disk-I/O completion that carries no buffer:
-/// `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, `direct_io_fsync`
-/// and `nvme_flush`. Reads and writes return a
-/// [`ReadFuture`](crate::fs::ReadFuture) or
+/// `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir` and `nvme_flush`.
+/// Reads and writes return a [`ReadFuture`](crate::fs::ReadFuture) or
 /// [`WriteFuture`](crate::fs::WriteFuture), which hold their buffer. The
 /// operation was submitted before this future was created; its completion
 /// stores the result and wakes the task.
@@ -5223,60 +5222,6 @@ impl Drop for DiskIoFuture {
     }
 }
 
-/// Open a file for direct I/O: `O_RDWR | O_DIRECT | O_CLOEXEC` on Linux,
-/// `O_RDWR | O_CLOEXEC` with `F_NOCACHE` on macOS.
-///
-/// The open runs on the worker thread: `open(2)`, and on io_uring a
-/// synchronous registration of the fd as a fixed file, so every connection
-/// on the worker waits for it (#845).
-///
-/// Returns a [`DirectIoFile`](crate::direct_io::DirectIoFile) handle for
-/// [`direct_io_read()`], [`direct_io_write()`], [`direct_io_fsync()`] and
-/// [`close_direct_io_file()`].
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor.
-pub fn open_direct_io_file(path: &str) -> io::Result<crate::direct_io::DirectIoFile> {
-    with_state(|driver, _| {
-        let mut ctx = driver.make_ctx();
-        ctx.open_direct_io_file(path)
-    })
-}
-
-/// Open a Direct I/O file from any async task with `options` added to the
-/// flags [`open_direct_io_file()`] uses.
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor.
-pub fn open_direct_io_file_with(
-    path: &str,
-    options: crate::direct_io::DirectIoOpenOptions,
-) -> io::Result<crate::direct_io::DirectIoFile> {
-    with_state(|driver, _| {
-        let mut ctx = driver.make_ctx();
-        ctx.open_direct_io_file_with(path, options)
-    })
-}
-
-/// Close a Direct I/O file.
-///
-/// The handle is invalid at once. An operation already submitted finishes on
-/// this file, on both backends. On io_uring the slot is free once the last of
-/// them completes, so until then an open can fail with
-/// "direct I/O file table full".
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor.
-pub fn close_direct_io_file(file: crate::direct_io::DirectIoFile) -> io::Result<()> {
-    with_state(|driver, _| {
-        let mut ctx = driver.make_ctx();
-        ctx.close_direct_io_file(file)
-    })
-}
-
 /// Close an NVMe device. Returns `Unsupported` on mio.
 ///
 /// The handle is invalid at once, and a command already submitted finishes on
@@ -5312,59 +5257,6 @@ pub fn open_nvme_device(path: &str, nsid: u32) -> io::Result<crate::nvme::NvmeDe
     with_state(|driver, _| {
         let mut ctx = driver.make_ctx();
         ctx.open_nvme_device(path, nsid)
-    })
-}
-
-/// Read from a Direct I/O file at `offset` into `buf`'s spare capacity.
-///
-/// `buf` is any [`IoBufMut`](crate::buf::IoBufMut); with `O_DIRECT` its spare
-/// capacity must start at an address aligned to the device's logical block
-/// size, and its length and `offset` must be multiples of it, or the kernel
-/// returns `EINVAL`. [`AlignedBuf`](crate::buf::AlignedBuf) provides the
-/// address. The returned future completes when the operation does (the
-/// io_uring completion, or on mio the pool's `pread`) and yields
-/// `(io::Result<usize>, buf)`, as [`fs::read_into`](crate::fs::read_into)
-/// does, with the initialized length extended by the bytes read.
-///
-/// If the future is dropped before the operation completes, the buffer is
-/// kept until the operation completes and then dropped, as for
-/// [`fs::read_into`](crate::fs::read_into).
-///
-/// A read that cannot be submitted resolves at once to `(Err(e), buf)`, as
-/// for [`fs::read_into`](crate::fs::read_into), and so does a `buf` with no
-/// spare capacity or more than `u32::MAX` bytes of it
-/// ([`io::ErrorKind::InvalidInput`]).
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor, unless `buf` is
-/// refused before submission (the `InvalidInput` cases above).
-pub fn direct_io_read<B: crate::buf::IoBufMut>(
-    file: crate::direct_io::DirectIoFile,
-    offset: u64,
-    mut buf: B,
-) -> crate::fs::ReadFuture<B> {
-    use crate::fs::ReadFuture;
-    let (ptr, len, initial_len) = match crate::fs::spare_region(&mut buf) {
-        Ok(region) => region,
-        Err(e) => return ReadFuture::failed(e, buf),
-    };
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        // Safety: the future owns `buf`, or parks it on drop until the
-        // operation completes, so the memory outlives the kernel's use of it.
-        #[allow(unused_unsafe)]
-        match unsafe { ctx.direct_io_read(file, offset, ptr, len) } {
-            Ok(seq) => {
-                let target = crate::fs::cancel_target(
-                    crate::completion::OpTag::DirectIo,
-                    file.index as u32,
-                    seq,
-                );
-                ReadFuture::new(executor, seq, target, initial_len, None, buf)
-            }
-            Err(e) => ReadFuture::failed(e, buf),
-        }
     })
 }
 
@@ -5466,87 +5358,6 @@ pub fn nvme_read<B: crate::buf::IoBufMut>(
             }
             Err(e) => ReadFuture::failed(e, buf),
         }
-    })
-}
-
-/// Write `buf`'s initialized bytes to a Direct I/O file at `offset`.
-///
-/// `buf` is any [`IoBuf`](crate::buf::IoBuf), such as an
-/// [`AlignedBuf`](crate::buf::AlignedBuf) or the [`Bytes`](bytes::Bytes) that
-/// [`AlignedBuf::freeze`](crate::buf::AlignedBuf::freeze) makes; with
-/// `O_DIRECT` its address, its length and `offset` must be aligned to the
-/// device's logical block size, or the kernel returns `EINVAL`. The returned
-/// future completes when the operation does (the io_uring completion, or on
-/// mio the pool's `pwrite`) and yields `(io::Result<usize>, buf)`.
-///
-/// If the future is dropped before the operation completes, the buffer is
-/// kept until the operation completes and then dropped.
-///
-/// A write that cannot be submitted resolves at once to `(Err(e), buf)`, and
-/// so does an initialized length above `u32::MAX`
-/// ([`io::ErrorKind::InvalidInput`]).
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor, unless `buf` is
-/// refused before submission (the `InvalidInput` cases above).
-pub fn direct_io_write<B: crate::buf::IoBuf>(
-    file: crate::direct_io::DirectIoFile,
-    offset: u64,
-    buf: B,
-) -> crate::fs::WriteFuture<B> {
-    use crate::fs::WriteFuture;
-    let (ptr, len) = match crate::fs::init_region(&buf) {
-        Ok(region) => region,
-        Err(e) => return WriteFuture::failed(e, buf),
-    };
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        // Safety: the future owns `buf`, or parks it on drop until the
-        // operation completes.
-        #[allow(unused_unsafe)]
-        match unsafe { ctx.direct_io_write(file, offset, ptr, len) } {
-            Ok(seq) => {
-                let target = crate::fs::cancel_target(
-                    crate::completion::OpTag::DirectIo,
-                    file.index as u32,
-                    seq,
-                );
-                WriteFuture::new(executor, seq, target, None, buf)
-            }
-            Err(e) => WriteFuture::failed(e, buf),
-        }
-    })
-}
-
-/// Submit an fsync of a Direct I/O file and return a future for the result.
-///
-/// The fsync waits in ringline, not submitted, until every write submitted
-/// before it through `file` has completed, as [`fs::fsync`](crate::fs::fsync)
-/// does; writes through another handle opened on the same path are not
-/// waited for. Once it runs, the future resolves to `Ok(0)` when every write
-/// to the file that completed before then is on stable storage. On a Linux
-/// block device this sends the device a cache flush, which persists
-/// everything in its volatile write cache and not only this file's writes;
-/// the kernel skips the flush when the device reports a write-through cache.
-/// To make individual writes durable without flushing the whole cache, open
-/// the file with
-/// [`DirectIoOpenOptions::dsync`](crate::direct_io::DirectIoOpenOptions::dsync).
-///
-/// On io_uring the kernel runs an fsync on an io-wq worker thread.
-/// On mio it is `fsync(2)` on the disk I/O pool; on macOS that call does not
-/// flush the drive's own cache.
-///
-/// # Panics
-///
-/// Panics if called outside the ringline async executor.
-pub fn direct_io_fsync(file: crate::direct_io::DirectIoFile) -> io::Result<DiskIoFuture> {
-    with_state(|driver, executor| {
-        let mut ctx = driver.make_ctx();
-        let seq = ctx.direct_io_fsync(file)?;
-        let task_id = CURRENT_TASK_ID.with(|c| c.get());
-        executor.wait_disk_io(seq, task_id);
-        Ok(DiskIoFuture::new(seq))
     })
 }
 
