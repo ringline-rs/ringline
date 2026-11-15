@@ -108,6 +108,20 @@ impl SendCopyPool {
         crate::buffer::prefault::prefault(&mut self.backing);
     }
 
+    /// Advise the kernel not to back the pool with transparent huge pages,
+    /// so the pool's RSS is the pages sends touch. The drivers call this
+    /// when they do not prefault. See
+    /// [`crate::buffer::prefault::no_huge_pages`].
+    pub(crate) fn no_huge_pages(&mut self) {
+        crate::buffer::prefault::no_huge_pages(&mut self.backing);
+    }
+
+    /// An address in the middle of the pool's memory. Test-only.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn backing_mid(&self) -> usize {
+        self.backing.as_ptr() as usize + self.backing.len() / 2
+    }
+
     /// Pop an unreserved slot from the free list, or `None` (with the
     /// `SEND_EXHAUSTED` metric) when every free slot is either gone or
     /// promised to an outstanding reservation.
@@ -424,6 +438,31 @@ impl SendCopyPool {
 mod tests {
     use super::*;
     use crate::runtime::send_completion::SendCompletions;
+
+    /// Whether the mapping holding `addr` is advised `MADV_NOHUGEPAGE`.
+    #[cfg(target_os = "linux")]
+    fn nohugepage(addr: usize) -> bool {
+        crate::buffer::prefault::vm_flags(addr)
+            .split_whitespace()
+            .any(|f| f == "nh")
+    }
+
+    /// `no_huge_pages` advises the pool's memory `MADV_NOHUGEPAGE` (#936).
+    /// 64 MiB pools, above glibc's largest mmap threshold, so each is a
+    /// fresh mapping and the unadvised one cannot reuse advised memory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_huge_pages_advises_the_pool_nohugepage() {
+        if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+            eprintln!("skipping: the kernel has no transparent huge pages");
+            return;
+        }
+        let mut advised = SendCopyPool::new(1024, 65536);
+        advised.no_huge_pages();
+        let plain = SendCopyPool::new(1024, 65536);
+        assert!(nohugepage(advised.backing_mid()), "the advised pool");
+        assert!(!nohugepage(plain.backing_mid()), "the pool left alone");
+    }
 
     /// `SendId` has no public constructor — the admission queue is the
     /// only source of ids, which is exactly how the driver gets one too.

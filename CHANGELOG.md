@@ -1272,6 +1272,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Linux, transparent huge pages `always`: the send copy pool no longer
+  becomes resident in 2 MiB huge pages around the slots small sends write
+  (#936). In every 0.6 release a send's first write to a slot could fault
+  in the whole 2 MiB range around it. Writing the first page of 512 slots
+  of a 2048 × 64 KiB pool made 32 MiB resident, and 2 MiB under THP
+  `never` (Linux 6.12); the cost is per worker. A pool that
+  `prefault_buffers` does not prefault is now advised `MADV_NOHUGEPAGE`. A
+  prefaulted pool, resident in full either way, keeps huge pages.
 - A connection slot no longer holds a recv accumulator allocation while no
   connection uses it (#935). Every 0.6 release allocated an accumulator for
   every slot at startup, `recv_accumulator_capacity` bytes on io_uring and

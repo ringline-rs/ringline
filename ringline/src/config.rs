@@ -1232,6 +1232,12 @@ impl ConfigBuilder {
     /// 16 MiB per worker. Startup grows by roughly one pass over the
     /// allocation.
     ///
+    /// On Linux, a pool that is not prefaulted is advised `MADV_NOHUGEPAGE`,
+    /// so under transparent huge pages `always` a send makes its pages
+    /// resident rather than a 2 MiB huge page around them. A prefaulted pool
+    /// is resident in full either way and keeps huge pages where the kernel
+    /// gives them.
+    ///
     /// **Default: false** while the trade is being measured (#416).
     pub fn prefault_buffers(mut self, enabled: bool) -> Self {
         self.config.prefault_buffers = enabled;
