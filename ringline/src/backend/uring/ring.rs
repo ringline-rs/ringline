@@ -156,7 +156,6 @@ impl Ring {
     /// Whether this kernel can return a registered fd to the process table,
     /// and so whether park (tier 3, #443) is available. See
     /// [`Engine::supports_park`].
-    #[allow(dead_code)] // first caller lands with the handover (#443 step 5c)
     pub(crate) fn supports_park(&self) -> bool {
         self.engine.supports_park()
     }

@@ -17,9 +17,7 @@ backport was checked. The Debian package versions come from Debian's
 security tracker. Commits are at `https://git.kernel.org/torvalds/c/<id>`.
 
 Version numbers do not identify the fix level of a distribution kernel,
-which can carry backports or lack them. That is why ringline checks the
-behaviour it relies on at startup instead of comparing versions
-(`docs/recv-incremental-ring-design.md`, "Selecting the ring kind").
+which can carry backports or lack them.
 
 ## Distribution kernels
 
@@ -110,15 +108,17 @@ Fixes:
 
 For ringline:
 
-- `SOCK_NONEMPTY` is a hint. The promotion rule in
-  `docs/recv-incremental-ring-design.md` reads it on completions of at
-  least 64 KiB, where a pending FIN alone does not matter.
+- `SOCK_NONEMPTY` is a hint, and ringline does not read it.
+- TCP and Unix connections arm no multishot receive: a plaintext connection
+  receives with a one-shot `RECV` into its accumulator
+  (`docs/recv-direct-design.md`), and a TLS connection with a one-shot
+  `RECV` into its TLS engine's buffer. Only UDP sockets receive with
+  multishot `RECVMSG`, from a provided buffer ring per socket.
 - On 6.1 (Debian 12, Amazon Linux 2023) one multishot receive can be served
-  for as long as its socket has data. ringline arms one-shot receives by
-  default (#647).
+  for as long as its socket has data, which applies to the UDP receive.
 - 6.1 before 6.1.175 and 6.12 before 6.12.86 can miss EOF after data and a
-  FIN back to back. Debian 12's 6.1.176 and Debian 13's 6.12.107 have the
-  fix.
+  FIN back to back on a multishot receive. ringline's stream connections do
+  not use one. Debian 12's 6.1.176 and Debian 13's 6.12.107 have the fix.
 
 ## Incremental buffers (`IOU_PBUF_RING_INC`)
 
