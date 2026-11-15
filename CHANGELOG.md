@@ -11,20 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `ringline::buf`: the buffer traits the disk reads and writes take by
   value (#825). `IoBuf` (a write's source) is implemented for `Vec<u8>`,
-  `BytesMut`, `Bytes` and `AlignedBuf`; `IoBufMut` (a read's destination)
+  `BytesMut`, `Bytes`, `AlignedBuf` and `AlignedBytes`; `IoBufMut` (a read's destination)
   for `Vec<u8>`, `BytesMut` and `AlignedBuf`. Both are `unsafe` to
   implement: an implementer promises the memory stays valid and in place
   while ringline holds the value, which lasts until the kernel completes the
   operation even when the future is dropped. `AlignedBuf` is a heap buffer
   at a chosen power-of-two alignment, and at least 4096 bytes
   (`buf::DIRECT_IO_ALIGN`), for direct I/O and NVMe. `AlignedBuf::freeze`
-  turns it into an `AlignedBytes`, an immutable `IoBuf` whose clones share
+  turns it into an `AlignedBytes`, an immutable buffer whose clones share
   the allocation, so a caller can keep a handle to a write's source while
-  the write is in flight; `Bytes::from` converts it without copying, and
-  `try_into_mut` returns the `AlignedBuf` from the last handle.
+  the write is in flight. `Bytes::from` converts an `AlignedBytes` without
+  copying. `try_into_mut` returns the `AlignedBuf` from the last handle.
   `IoBufAligned` marks a buffer whose start is a multiple of 4096 bytes;
-  direct I/O reads and writes take only such buffers, and `AlignedBuf` and
-  `AlignedBytes` are two.
+  direct I/O reads and writes take only such buffers, such as `AlignedBuf`
+  and `AlignedBytes`.
 - `nvme_lba_size(device)` returns the namespace's logical block size, which
   `open_nvme_device` now reads with Identify Namespace.
 - `SendHalf::send_admitted` and `Connection::send_admitted`, returning an

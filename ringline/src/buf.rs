@@ -10,7 +10,8 @@
 //! kernel uses stays valid either way.
 //!
 //! ringline implements the traits for `Vec<u8>`, [`BytesMut`], [`Bytes`]
-//! ([`IoBuf`] only), [`AlignedBuf`] and [`AlignedBytes`] ([`IoBuf`] only).
+//! ([`IoBuf`], not [`IoBufMut`]), [`AlignedBuf`] and [`AlignedBytes`]
+//! ([`IoBuf`], not [`IoBufMut`]).
 //! [`crate::direct_io`] needs memory aligned to the device's logical block
 //! size, which `Vec<u8>` and `BytesMut` do not guarantee, so its reads and
 //! writes take only an [`IoBufAligned`] buffer; ringline implements that
