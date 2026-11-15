@@ -2128,11 +2128,19 @@ pub(crate) mod tests {
         driver.close_connection(conn_index);
         driver.finish_close(conn_index);
 
-        // Accumulators start at `recv_accumulator_capacity`.
-        assert_eq!(
-            driver.accumulators.capacity(conn_index),
-            config.recv_accumulator_capacity
-        );
+        // The slot holds no allocation until its next connection's first
+        // data (#935).
+        assert_eq!(driver.accumulators.capacity(conn_index), 0);
+    }
+
+    /// A new driver allocates no accumulator for its connection slots (#935).
+    #[test]
+    fn a_new_driver_allocates_no_accumulator() {
+        let config = test_config();
+        let (driver, _wake) = test_driver(&config);
+        for i in 0..config.max_connections {
+            assert_eq!(driver.accumulators.capacity(i), 0, "slot {i}");
+        }
     }
 
     /// `abort` fails the queued send with `ConnectionAborted` and returns its
