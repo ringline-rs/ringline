@@ -117,11 +117,10 @@ initial user namespace is not charged and does not reach this path. Inside a
 is in the kernel. It closes every connection with the `CancelAll` lead, on every
 kernel, so a send in the kernel is cancelled, and a coalesced send's slab entry
 is released on its completion. A connection holding
-slab entries gets the cancel alone, and its `Close` waits for them, as below. Entries parked on
-the coalesced and zero-copy retry lists, with no operation in flight, are
-released first; a copy send parked on `pending_copy_retries` keeps its pool
-slot until the pool drops with the driver, since nothing in the kernel can
-read it. It then waits,
+slab entries gets the cancel alone, and its `Close` waits for them, as below. Coalesced and
+zero-copy entries parked on `pending_resubmit_retries`, with no operation in
+flight, are released first; a copy send parked there keeps its pool slot until
+the pool drops with the driver, since nothing in the kernel can read it. It then waits,
 for at most 10 s (`SHUTDOWN_BOUND`), until every connection's `Close` has completed and
 every send-slab entry is released. A zero-copy entry is
 released only once its notifications land, and the kernel posts them when the
@@ -152,7 +151,7 @@ send queue with `in_flight = true`, the connection is registered on
 `pending_send_retries`, and the event loop's `drain_send_retries` re-pushes
 the same bytes on the next iteration, and on every iteration after until the
 ring takes it. A partial-write resubmit the ring refuses goes on
-`pending_copy_retries` (or the coalesced or zero-copy list) the same way.
+`pending_resubmit_retries` the same way, whatever its kind.
 Neither has a cap: a full SQ is backpressure, not a connection error (Domain
 Invariant 7). Until #830, two failed attempts failed the send and closed the
 connection. While a retry is owed the worker's wait is bounded by the next

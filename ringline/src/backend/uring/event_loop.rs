@@ -584,9 +584,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             self.drain_region_control();
             // Retry send/close submissions that failed on a previous tick
             // (SQ was full). The SQ has been flushed by submit_and_wait above.
-            self.drain_zc_retries();
-            self.drain_coalesced_retries();
-            self.drain_copy_retries();
+            self.drain_resubmit_retries();
             self.drain_send_retries();
             self.drain_close_retries();
             self.drain_shutdown_retries();
@@ -3139,66 +3137,66 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
     }
 
     /// Resubmit the rest of the connection's waiting send, if it has one. With
-    /// the SQ full, the send moves to the retry list of its kind.
+    /// the SQ full, the send moves to `pending_resubmit_retries`.
     fn resubmit_waiting_send(&mut self, conn_index: u32, on_pollout: bool) {
         let state = &mut self.driver.send_queues[conn_index as usize];
         let Some(raw) = state.waiting_send.take() else {
             return;
         };
         state.resubmitted_on_pollout = on_pollout;
-        let ud = UserData(raw);
         let generation = self.driver.connections.generation(conn_index);
+        if !self.resubmit_send(conn_index, generation, UserData(raw)) {
+            self.driver
+                .pending_resubmit_retries
+                .push((conn_index, generation, raw));
+        }
+    }
+
+    /// Push the rest of send `ud` again, by its kind: a copy send from a pool
+    /// slot (`Send`, `TlsSend`, resubmitted with the tag it was submitted
+    /// with), a coalesced `sendmsg`, or a send slab entry. Returns whether the
+    /// ring took it.
+    fn resubmit_send(&mut self, conn_index: u32, generation: u32, ud: UserData) -> bool {
         match ud.tag() {
             Some(tag @ (OpTag::Send | OpTag::TlsSend)) => {
                 let pool_slot = UserData::send_payload_slot(ud.payload());
                 let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
-                let resubmit = if tag == OpTag::TlsSend {
+                if tag == OpTag::TlsSend {
                     self.driver
                         .ring
                         .submit_tls_send(conn_index, generation, ptr, remaining, pool_slot)
+                        .is_ok()
                 } else {
                     self.driver
                         .ring
                         .submit_send_copied(conn_index, generation, ptr, remaining, pool_slot)
-                };
-                if resubmit.is_err() {
-                    self.driver
-                        .pending_copy_retries
-                        .push((conn_index, generation, pool_slot, tag));
+                        .is_ok()
                 }
             }
             Some(OpTag::SendMsgCoalesced) => {
                 let slab_idx = ud.payload() as u16;
                 let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-                if self
-                    .driver
+                self.driver
                     .ring
                     .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
-                    .is_err()
-                {
-                    self.driver
-                        .pending_coalesced_retries
-                        .push((conn_index, generation, slab_idx));
-                }
+                    .is_ok()
             }
             _ => {
                 let slab_idx = ud.payload() as u16;
                 let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-                let resubmit = if self.driver.send_slab.plain_send(slab_idx) {
+                if self.driver.send_slab.plain_send(slab_idx) {
                     self.submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
+                        .is_ok()
                 } else if self.driver.send_slab.plain_msg(slab_idx) {
                     self.driver
                         .ring
                         .submit_send_msg(conn_index, msg_ptr, slab_idx)
+                        .is_ok()
                 } else {
                     self.driver
                         .ring
                         .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
-                };
-                if resubmit.is_err() {
-                    self.driver
-                        .pending_zc_retries
-                        .push((conn_index, generation, slab_idx));
+                        .is_ok()
                 }
             }
         }
@@ -3588,8 +3586,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
 
     /// A slab retry dropped because its connection is closing or gone: the
     /// send the entry carries fails `ECANCELED` while the connection is still
-    /// the one that submitted it (`identity_ok`), as in
-    /// `drain_coalesced_retries`. A dead occupant's send is not settled:
+    /// the one that submitted it (`identity_ok`). Called by
+    /// `abandon_resubmit`. A dead occupant's send is not settled:
     /// teardown recorded its abort, and a driver result would override it
     /// (#381). Call before releasing the entry.
     fn settle_abandoned_retry(&mut self, slab_idx: u16, identity_ok: bool) {
@@ -3771,11 +3769,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 .submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
                 .is_err()
             {
-                // SQ full: retry next tick (`drain_zc_retries`), as for a partial.
+                // SQ full: retry next tick (`drain_resubmit_retries`), as for
+                // a partial.
                 let generation = self.driver.connections.generation(conn_index);
                 self.driver
-                    .pending_zc_retries
-                    .push((conn_index, generation, slab_idx));
+                    .pending_resubmit_retries
+                    .push((conn_index, generation, ud.raw()));
             }
             return;
         }
@@ -4655,52 +4654,78 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.drain_completions();
     }
 
-    /// Retry ZC send resubmissions that failed on a previous tick (SQ full).
-    /// An entry stays until its push goes through or its connection goes
-    /// (Domain Invariant 7): the slab entry keeps the send's memory and
-    /// `in_flight` keeps the connection's later sends behind it (#830).
-    fn drain_zc_retries(&mut self) {
-        if self.driver.pending_zc_retries.is_empty() {
+    /// Retry send resubmissions the SQ had no room for. An entry stays until
+    /// its push goes through or its connection goes (Domain Invariant 7):
+    /// the pool slot or slab entry keeps the send's memory, and `in_flight`
+    /// keeps the connection's later sends behind it (#830).
+    fn drain_resubmit_retries(&mut self) {
+        if self.driver.pending_resubmit_retries.is_empty() {
             return;
         }
         std::mem::swap(
-            &mut self.driver.pending_zc_retries,
-            &mut self.driver.zc_retry_scratch,
+            &mut self.driver.pending_resubmit_retries,
+            &mut self.driver.resubmit_retry_scratch,
         );
-        for idx in 0..self.driver.zc_retry_scratch.len() {
-            let (conn_index, generation, slab_idx) = self.driver.zc_retry_scratch[idx];
-            if !self.driver.send_slab.in_use(slab_idx) {
-                continue; // slab was released in the meantime
+        for idx in 0..self.driver.resubmit_retry_scratch.len() {
+            let (conn_index, generation, raw) = self.driver.resubmit_retry_scratch[idx];
+            let ud = UserData(raw);
+            let copy = matches!(ud.tag(), Some(OpTag::Send | OpTag::TlsSend));
+            let live = if copy {
+                self.driver
+                    .send_copy_pool
+                    .in_use(UserData::send_payload_slot(ud.payload()))
+            } else {
+                self.driver.send_slab.in_use(ud.payload() as u16)
+            };
+            if !live {
+                continue; // released in the meantime
             }
-            // Connection closed or reused (or its Close already submitted —
-            // no new SQEs may be pushed for it) — release the slab and
-            // nothing else: the slot may already belong to a new connection.
+            // Connection closed or reused, or its Close already submitted (no
+            // new SQEs may be pushed for it): release the send's memory and
+            // touch nothing else, since the slot may already belong to a new
+            // connection.
             let identity_ok = self.driver.connections.get(conn_index).is_some()
                 && self.driver.connections.generation(conn_index) == generation;
             if !identity_ok || self.close_submitted(conn_index) {
-                self.settle_abandoned_retry(slab_idx, identity_ok);
-                self.release_zc_slab(slab_idx);
+                self.abandon_resubmit(ud, identity_ok);
                 continue;
             }
-            let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-            let submitted = if self.driver.send_slab.plain_send(slab_idx) {
-                self.submit_slab_drain(OpTag::SendMsgZcDrain, conn_index, slab_idx)
-            } else if self.driver.send_slab.plain_msg(slab_idx) {
+            if !self.resubmit_send(conn_index, generation, ud) {
                 self.driver
-                    .ring
-                    .submit_send_msg(conn_index, msg_ptr, slab_idx)
-            } else {
-                self.driver
-                    .ring
-                    .submit_send_msg_zc(conn_index, msg_ptr, slab_idx)
-            };
-            if submitted.is_err() {
-                self.driver
-                    .pending_zc_retries
-                    .push((conn_index, generation, slab_idx));
+                    .pending_resubmit_retries
+                    .push((conn_index, generation, raw));
             }
         }
-        self.driver.zc_retry_scratch.clear();
+        self.driver.resubmit_retry_scratch.clear();
+    }
+
+    /// Release the memory of send `ud`, whose resubmission will not be made.
+    /// The send it carries is taken either way, but settled (`ECANCELED`)
+    /// only when the connection is still the one that submitted it
+    /// (`identity_ok`): for a dead occupant's entry, teardown already
+    /// recorded the operation's abort, and a driver result would override it
+    /// (#381).
+    fn abandon_resubmit(&mut self, ud: UserData, identity_ok: bool) {
+        match ud.tag() {
+            Some(OpTag::Send | OpTag::TlsSend) => {
+                let pool_slot = UserData::send_payload_slot(ud.payload());
+                let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
+                self.release_pool_slot(pool_slot);
+                if identity_ok && let Some((id, _logical_len)) = settles {
+                    self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                }
+            }
+            Some(OpTag::SendMsgCoalesced) => {
+                let slab_idx = ud.payload() as u16;
+                self.settle_abandoned_retry(slab_idx, identity_ok);
+                self.release_coalesced(slab_idx);
+            }
+            _ => {
+                let slab_idx = ud.payload() as u16;
+                self.settle_abandoned_retry(slab_idx, identity_ok);
+                self.release_zc_slab(slab_idx);
+            }
+        }
     }
 
     /// Release a ZC slab entry (and its paired pool slot) that will never
@@ -4713,109 +4738,6 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 self.release_pool_slot(pool_slot);
             }
         }
-    }
-
-    /// Retry coalesced send resubmissions that failed (SQ was full). As in
-    /// `drain_zc_retries`, an entry stays until its push goes through or its
-    /// connection goes (#830).
-    fn drain_coalesced_retries(&mut self) {
-        if self.driver.pending_coalesced_retries.is_empty() {
-            return;
-        }
-        std::mem::swap(
-            &mut self.driver.pending_coalesced_retries,
-            &mut self.driver.coalesced_retry_scratch,
-        );
-        for idx in 0..self.driver.coalesced_retry_scratch.len() {
-            let (conn_index, generation, slab_idx) = self.driver.coalesced_retry_scratch[idx];
-            if !self.driver.send_slab.in_use(slab_idx) {
-                continue; // slab released meanwhile
-            }
-            // Connection closed or reused (or its Close already submitted) —
-            // release the slab only. Touching the send queue here would
-            // drain a *new* connection's sends.
-            let identity_ok = self.driver.connections.get(conn_index).is_some()
-                && self.driver.connections.generation(conn_index) == generation;
-            if !identity_ok || self.close_submitted(conn_index) {
-                // Take the lifted id either way — the slab release clears it
-                // silently — but settle it only when the connection is still
-                // the one that submitted it (the `close_submitted` reason).
-                // The `!identity_ok` reason is a dead occupant's entry, whose
-                // operation teardown already aborted; a driver result would
-                // override that abort (#381).
-                self.settle_abandoned_retry(slab_idx, identity_ok);
-                self.release_coalesced(slab_idx);
-                continue;
-            }
-            let msg_ptr = self.driver.send_slab.msghdr_ptr(slab_idx);
-            if self
-                .driver
-                .ring
-                .submit_send_msg_coalesced(conn_index, msg_ptr, slab_idx)
-                .is_err()
-            {
-                self.driver
-                    .pending_coalesced_retries
-                    .push((conn_index, generation, slab_idx));
-            }
-        }
-        self.driver.coalesced_retry_scratch.clear();
-    }
-
-    /// Retry copy send resubmissions that failed (SQ was full). As in
-    /// `drain_zc_retries`, an entry stays until its push goes through or its
-    /// connection goes (#830).
-    fn drain_copy_retries(&mut self) {
-        if self.driver.pending_copy_retries.is_empty() {
-            return;
-        }
-        std::mem::swap(
-            &mut self.driver.pending_copy_retries,
-            &mut self.driver.copy_retry_scratch,
-        );
-        for idx in 0..self.driver.copy_retry_scratch.len() {
-            let (conn_index, generation, pool_slot, op) = self.driver.copy_retry_scratch[idx];
-            if !self.driver.send_copy_pool.in_use(pool_slot) {
-                continue;
-            }
-            // Connection closed or reused (or its Close already submitted) —
-            // release the slot only.
-            let identity_ok = self.driver.connections.get(conn_index).is_some()
-                && self.driver.connections.generation(conn_index) == generation;
-            if !identity_ok || self.close_submitted(conn_index) {
-                // Take before releasing (`release` debug-asserts rather than
-                // drop a live id), but settle only when the connection is
-                // still the one that submitted this slot. The `!identity_ok`
-                // reason is a dead occupant's slot: teardown already recorded
-                // that operation's abort, and a driver result would override
-                // it (#381) on behalf of a connection that is gone.
-                let settles = self.driver.send_copy_pool.take_send_id(pool_slot);
-                self.release_pool_slot(pool_slot);
-                if identity_ok && let Some((id, _logical_len)) = settles {
-                    self.settle_send(id, Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-                }
-                continue;
-            }
-            let (ptr, remaining) = self.driver.send_copy_pool.current_ptr_remaining(pool_slot);
-            // Resubmit with the entry's original OpTag. Both tags complete in
-            // `handle_send`; keeping the tag keeps `CQE_BY_TAG` counting the
-            // chunk as it was submitted.
-            let result = if matches!(op, OpTag::TlsSend) {
-                self.driver
-                    .ring
-                    .submit_tls_send(conn_index, generation, ptr, remaining, pool_slot)
-            } else {
-                self.driver
-                    .ring
-                    .submit_send_copied(conn_index, generation, ptr, remaining, pool_slot)
-            };
-            if result.is_err() {
-                self.driver
-                    .pending_copy_retries
-                    .push((conn_index, generation, pool_slot, op));
-            }
-        }
-        self.driver.copy_retry_scratch.clear();
     }
 
     /// Re-push queued sends whose head could not be submitted (SQ full).
@@ -6414,9 +6336,9 @@ mod tests {
             match list {
                 0 => el.driver.recv_arm_retries.push((0, 0, None)),
                 1 => el.driver.pending_send_retries.push((0, 0)),
-                2 => el.driver.pending_copy_retries.push((0, 0, 0, OpTag::Send)),
-                3 => el.driver.pending_coalesced_retries.push((0, 0, 0)),
-                _ => el.driver.pending_zc_retries.push((0, 0, 0)),
+                2 => el.driver.push_copy_retry(0, 0, 0, OpTag::Send),
+                3 => el.driver.push_coalesced_retry(0, 0, 0),
+                _ => el.driver.push_zc_retry(0, 0, 0),
             }
             assert!(el.may_block(), "list {list}: the worker may block");
             assert_eq!(
@@ -6426,9 +6348,7 @@ mod tests {
             );
             el.driver.recv_arm_retries.clear();
             el.driver.pending_send_retries.clear();
-            el.driver.pending_copy_retries.clear();
-            el.driver.pending_coalesced_retries.clear();
-            el.driver.pending_zc_retries.clear();
+            el.driver.pending_resubmit_retries.clear();
             assert_eq!(el.wait_bound(), None, "list {list} cleared");
         }
     }
@@ -13489,7 +13409,7 @@ mod tests {
     }
 
     /// A zero-copy resubmit the ring keeps refusing stays on
-    /// `pending_zc_retries` with its slab entry and its send, the connection
+    /// `pending_resubmit_retries` with its slab entry and its send, the connection
     /// open, until the ring takes it; the completion and notification of the
     /// pushed send then settle it and release the entry (#830). Before #830
     /// a third refusal failed the send and closed the connection.
@@ -13514,15 +13434,13 @@ mod tests {
         el.driver.send_queues[conn_index as usize].in_flight = true;
         let id = await_slab(&mut el, conn_index, slab_idx, 100);
 
-        el.driver
-            .pending_zc_retries
-            .push((conn_index, generation, slab_idx));
+        el.driver.push_zc_retry(conn_index, generation, slab_idx);
         el.driver.ring.force_push_failures(3);
         el.driver.ring.last_pushed = None;
         for retry in 1..=3 {
-            el.drain_zc_retries();
+            el.drain_resubmit_retries();
             assert_eq!(
-                el.driver.pending_zc_retries,
+                el.driver.zc_retries(),
                 vec![(conn_index, generation, slab_idx)],
                 "retry {retry}: the entry stays"
             );
@@ -13539,8 +13457,8 @@ mod tests {
             );
         }
 
-        el.drain_zc_retries();
-        assert!(el.driver.pending_zc_retries.is_empty());
+        el.drain_resubmit_retries();
+        assert!(el.driver.zc_retries().is_empty());
         let pushed = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
         assert_eq!(pushed.tag(), Some(OpTag::SendMsgZc));
         assert_eq!(pushed.payload() as u16, slab_idx);
@@ -13606,10 +13524,8 @@ mod tests {
         el.test_dispatch_cqe(poll, libc::POLLOUT as i32, 0);
         assert_plain_drain(&el, conn_index);
         el.driver.ring.last_pushed = None;
-        el.driver
-            .pending_zc_retries
-            .push((conn_index, generation, slab_idx));
-        el.drain_zc_retries();
+        el.driver.push_zc_retry(conn_index, generation, slab_idx);
+        el.drain_resubmit_retries();
         assert_plain_drain(&el, conn_index);
         assert_eq!(
             el.driver.send_slab.first_unsent(0),
@@ -13695,8 +13611,8 @@ mod tests {
                 .unwrap();
             let entry = (conn_index, generation, slab_idx);
             match list {
-                0 => el.driver.pending_coalesced_retries.push(entry),
-                _ => el.driver.pending_zc_retries.push(entry),
+                0 => el.driver.push_coalesced_retry(entry.0, entry.1, entry.2),
+                _ => el.driver.push_zc_retry(entry.0, entry.1, entry.2),
             }
             parked.push(slab_idx);
         }
@@ -14438,8 +14354,7 @@ mod tests {
 
         // Queue the retry.
         el.driver
-            .pending_copy_retries
-            .push((conn_index, generation, slot, OpTag::Send));
+            .push_copy_retry(conn_index, generation, slot, OpTag::Send);
 
         // Close the connection before the retry fires.
         el.driver.close_connection(conn_index);
@@ -14448,10 +14363,10 @@ mod tests {
         el.inject_and_dispatch(close_ud.raw(), 0);
 
         // Now drain retries — the connection is gone.
-        el.drain_copy_retries();
+        el.drain_resubmit_retries();
 
         // Retry queue should be empty.
-        assert!(el.driver.pending_copy_retries.is_empty());
+        assert!(el.driver.copy_retries().is_empty());
         // Pool slot should be released (not leaked).
         assert!(
             !el.driver.send_copy_pool.in_use(slot),
@@ -14472,8 +14387,7 @@ mod tests {
 
         // Queue the retry with the old generation.
         el.driver
-            .pending_copy_retries
-            .push((conn_index, old_generation, slot, OpTag::Send));
+            .push_copy_retry(conn_index, old_generation, slot, OpTag::Send);
 
         // Close the connection.
         el.driver.close_connection(conn_index);
@@ -14490,7 +14404,7 @@ mod tests {
         assert_ne!(old_generation, new_generation);
 
         // Drain retries — should detect generation mismatch.
-        el.drain_copy_retries();
+        el.drain_resubmit_retries();
 
         // Pool slot should be released (not resubmitted to new connection).
         assert!(
@@ -14499,6 +14413,40 @@ mod tests {
         );
         // New connection should be unaffected.
         assert!(el.driver.connections.get(new_conn_index).is_some());
+    }
+
+    /// A parked copy retry whose connection was closed and its slot reused
+    /// does not settle its send: teardown already resolved it
+    /// `ConnectionAborted`, and an `ECANCELED` from the drain would override
+    /// that on behalf of a connection that is gone (#381).
+    #[test]
+    fn retry_drain_does_not_settle_a_dead_occupants_send() {
+        let mut el = make_test_loop();
+        let conn_index = accept_connection(&mut el);
+        let old_generation = el.driver.connections.generation(conn_index);
+        let (slot, _ptr, _len) = el.driver.send_copy_pool.copy_in(b"retry-data").unwrap();
+        let id = await_slot(&mut el, conn_index, slot, 10);
+        el.driver
+            .push_copy_retry(conn_index, old_generation, slot, OpTag::Send);
+
+        el.driver.close_connection(conn_index);
+        let close_ud = UserData::encode(OpTag::Close, conn_index, 0);
+        el.inject_and_dispatch(close_ud.raw(), 0);
+        assert_eq!(accept_connection(&mut el), conn_index, "the slot is reused");
+
+        el.drain_resubmit_retries();
+        assert!(
+            !el.driver.send_copy_pool.in_use(slot),
+            "the slot is released"
+        );
+        let err = send_result(&mut el, id)
+            .expect("teardown resolved the send")
+            .expect_err("it never went out");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::ConnectionAborted,
+            "the drain overrode teardown's result: {err}"
+        );
     }
 
     #[test]
@@ -14530,9 +14478,7 @@ mod tests {
         el.driver.send_slab.inc_pending_notifs(slab_idx);
 
         // Queue the ZC retry.
-        el.driver
-            .pending_zc_retries
-            .push((conn_index, generation, slab_idx));
+        el.driver.push_zc_retry(conn_index, generation, slab_idx);
 
         // Close the connection.
         el.driver.close_connection(conn_index);
@@ -14540,9 +14486,9 @@ mod tests {
         el.inject_and_dispatch(close_ud.raw(), 0);
 
         // Drain retries — connection is gone.
-        el.drain_zc_retries();
+        el.drain_resubmit_retries();
 
-        assert!(el.driver.pending_zc_retries.is_empty());
+        assert!(el.driver.zc_retries().is_empty());
         // Slab should be marked for release (awaiting_notifications set,
         // and pending_notifs is still 1 — will be released when the
         // notification CQE arrives).
@@ -14855,7 +14801,7 @@ mod tests {
     }
 
     /// A partial-send resubmit the ring keeps refusing stays on
-    /// `pending_copy_retries` with its pool slot and its send, the connection
+    /// `pending_resubmit_retries` with its pool slot and its send, the connection
     /// open, until the ring takes it; the send then completes (#830). Before
     /// #830 a third refusal released the slot, failed the send and closed the
     /// connection.
@@ -14870,13 +14816,12 @@ mod tests {
         let id = await_slot(&mut el, conn_index, slot, 4);
 
         el.driver
-            .pending_copy_retries
-            .push((conn_index, generation, slot, OpTag::Send));
+            .push_copy_retry(conn_index, generation, slot, OpTag::Send);
         el.driver.ring.force_push_failures(3);
         for retry in 1..=3 {
-            el.drain_copy_retries();
+            el.drain_resubmit_retries();
             assert_eq!(
-                el.driver.pending_copy_retries,
+                el.driver.copy_retries(),
                 vec![(conn_index, generation, slot, OpTag::Send)],
                 "retry {retry}: the entry stays"
             );
@@ -14892,8 +14837,8 @@ mod tests {
             );
         }
 
-        el.drain_copy_retries();
-        assert!(el.driver.pending_copy_retries.is_empty());
+        el.drain_resubmit_retries();
+        assert!(el.driver.copy_retries().is_empty());
         el.driver
             .ring
             .submit_and_wait(1)
@@ -16377,10 +16322,8 @@ mod tests {
             .expect("slab room");
         let id = await_slab(&mut el, conn_index, slab_idx, 100);
         el.driver.send_queues[conn_index as usize].close_submitted = true;
-        el.driver
-            .pending_zc_retries
-            .push((conn_index, generation, slab_idx));
-        el.drain_zc_retries();
+        el.driver.push_zc_retry(conn_index, generation, slab_idx);
+        el.drain_resubmit_retries();
         assert_eq!(
             send_result(&mut el, id)
                 .expect("the dropped retry settled its send")
@@ -16769,7 +16712,7 @@ mod tests {
         );
     }
 
-    /// `drain_copy_retries` keeps a bounded send's resubmit for as long as
+    /// `drain_resubmit_retries` keeps a bounded send's resubmit for as long as
     /// the ring refuses it, and the send settles with its length once the
     /// resubmit completes (#830; the retry cap used to settle it `Err` and
     /// close the connection).
@@ -16785,21 +16728,20 @@ mod tests {
         el.driver.send_copy_pool.set_send_id(slot, id, 5);
         el.driver.send_queues[conn_index as usize].in_flight = true;
         el.driver
-            .pending_copy_retries
-            .push((conn_index, generation, slot, OpTag::Send));
+            .push_copy_retry(conn_index, generation, slot, OpTag::Send);
 
         el.driver.ring.force_push_failures(3);
         for retry in 1..=3 {
-            el.drain_copy_retries();
-            assert_eq!(el.driver.pending_copy_retries.len(), 1, "retry {retry}");
+            el.drain_resubmit_retries();
+            assert_eq!(el.driver.copy_retries().len(), 1, "retry {retry}");
             el.drain_settled_sends();
             assert!(
                 el.executor.take_send_result(id).is_none(),
                 "retry {retry}: nothing resolves while the ring refuses"
             );
         }
-        el.drain_copy_retries();
-        assert!(el.driver.pending_copy_retries.is_empty());
+        el.drain_resubmit_retries();
+        assert!(el.driver.copy_retries().is_empty());
         el.driver
             .ring
             .submit_and_wait(1)
@@ -17182,14 +17124,13 @@ mod tests {
         let generation = el.driver.connections.generation(conn_index);
         let (first, second, slab_idx) = two_pipelined_sends(&mut el, conn_index, generation);
         el.driver
-            .pending_coalesced_retries
-            .push((conn_index, generation, slab_idx));
+            .push_coalesced_retry(conn_index, generation, slab_idx);
         el.driver.ring.force_push_failures(3);
         el.driver.ring.last_pushed = None;
         for retry in 1..=3 {
-            el.drain_coalesced_retries();
+            el.drain_resubmit_retries();
             assert_eq!(
-                el.driver.pending_coalesced_retries,
+                el.driver.coalesced_retries(),
                 vec![(conn_index, generation, slab_idx)],
                 "retry {retry}: the entry stays"
             );
@@ -17197,8 +17138,8 @@ mod tests {
                 assert!(el.executor.take_send_result(id).is_none(), "retry {retry}");
             }
         }
-        el.drain_coalesced_retries();
-        assert!(el.driver.pending_coalesced_retries.is_empty());
+        el.drain_resubmit_retries();
+        assert!(el.driver.coalesced_retries().is_empty());
         let pushed = UserData(el.driver.ring.last_pushed.as_ref().unwrap().user_data);
         assert_eq!(pushed.tag(), Some(OpTag::SendMsgCoalesced));
         assert_eq!(pushed.payload() as u16, slab_idx);
@@ -17207,7 +17148,7 @@ mod tests {
         assert_eq!(el.executor.take_send_result(second).unwrap().unwrap(), 3);
     }
 
-    /// `drain_coalesced_retries` keeps the slab entry, its pool slots and the
+    /// `drain_resubmit_retries` keeps the slab entry, its pool slots and the
     /// id it carries for as long as the ring refuses the resubmit; the
     /// completion of the pushed resubmit settles the id with its logical
     /// length and returns every slot (#830).
@@ -17244,24 +17185,19 @@ mod tests {
             .expect("slab room");
         el.driver.send_queues[conn_index as usize].in_flight = true;
         el.driver
-            .pending_coalesced_retries
-            .push((conn_index, generation, slab_idx));
+            .push_coalesced_retry(conn_index, generation, slab_idx);
 
         el.driver.ring.force_push_failures(3);
         for retry in 1..=3 {
-            el.drain_coalesced_retries();
-            assert_eq!(
-                el.driver.pending_coalesced_retries.len(),
-                1,
-                "retry {retry}"
-            );
+            el.drain_resubmit_retries();
+            assert_eq!(el.driver.coalesced_retries().len(), 1, "retry {retry}");
             assert!(el.driver.send_slab.in_use(slab_idx), "retry {retry}");
             assert_eq!(el.driver.send_copy_pool.free_count(), 6, "retry {retry}");
             el.drain_settled_sends();
             assert!(el.executor.take_send_result(id).is_none(), "retry {retry}");
         }
-        el.drain_coalesced_retries();
-        assert!(el.driver.pending_coalesced_retries.is_empty());
+        el.drain_resubmit_retries();
+        assert!(el.driver.coalesced_retries().is_empty());
 
         let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, slab_idx as u32);
         el.test_dispatch_cqe(ud.raw(), (l0 + l1) as i32, 0);
