@@ -1,7 +1,13 @@
 #![allow(clippy::manual_async_fn)]
 //! `ConfigBuilder::sqpoll_cpu` and `sqpoll_cpus` pin each worker's SQPOLL
-//! thread to its own CPU (#834). In its own binary so no other test's SQ
-//! threads are in the process.
+//! thread to its own CPU (#834).
+//!
+//! The tests read every SQ thread in the process and key it by its owner's
+//! name, `rl-work-<i>`, which every runtime shares. So this binary holds only
+//! tests that launch through `launch_and_read`, which runs one runtime at a
+//! time. When the kernel refuses an SQ CPU, ring setup sets the ring up again
+//! without it to name the cause, and that ring has an SQ thread, so those
+//! tests are in `sqpoll_cpu_refused.rs` (#941).
 #![cfg(has_io_uring)]
 
 use std::collections::HashMap;
@@ -9,7 +15,7 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ringline::{AsyncEventHandler, ConfigBuilder, Connection, Error, RinglineBuilder};
+use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
 struct Idle;
 
@@ -146,49 +152,4 @@ fn sqpoll_cpus_may_put_every_sq_thread_on_one_cpu() {
     }
     let config = builder(2).sqpoll_cpus(&[1, 1]).build().expect("config");
     assert_eq!(launch_and_read(config, 2), expected(&[1, 1]));
-}
-
-fn launch_error(config: ringline::Config) -> Error {
-    match RinglineBuilder::new(config).launch::<Idle>() {
-        Ok((runtime, handles)) => {
-            runtime.shutdown();
-            for h in handles {
-                let _ = h.join();
-            }
-            panic!("launch succeeded");
-        }
-        Err(e) => e,
-    }
-}
-
-#[test]
-fn a_sqpoll_cpus_list_shorter_than_the_workers_fails_launch() {
-    let err = launch_error(builder(2).sqpoll_cpus(&[0]).build().expect("config"));
-    let text = err.to_string();
-    assert!(matches!(err, Error::RingSetup(_)), "{err:?}");
-    assert!(text.contains("sqpoll_cpus has 1 entries"), "{text}");
-}
-
-#[test]
-fn an_sq_cpu_past_the_machine_fails_launch_naming_the_knob() {
-    // Far beyond any machine's CPU count, so the kernel refuses it with EINVAL.
-    let err = launch_error(builder(1).sqpoll_cpu(1 << 20).build().expect("config"));
-    let text = err.to_string();
-    assert!(matches!(err, Error::RingSetup(_)), "{err:?}");
-    assert!(text.contains("sqpoll_cpu 1048576 + worker 0"), "{text}");
-}
-
-/// With the default `pin_to_core(true)` the ring is set up on a worker pinned
-/// to one core; a refused SQ CPU is still named.
-#[test]
-fn an_sq_cpu_past_the_machine_is_named_from_a_pinned_worker() {
-    let config = builder(1)
-        .pin_to_core(true)
-        .sqpoll_cpu(1 << 20)
-        .build()
-        .expect("config");
-    let err = launch_error(config);
-    let text = err.to_string();
-    assert!(matches!(err, Error::RingSetup(_)), "{err:?}");
-    assert!(text.contains("SQPOLL thread on CPU 1048576"), "{text}");
 }
