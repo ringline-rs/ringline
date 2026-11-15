@@ -1,0 +1,87 @@
+# Experiment B, contended (docs/send-admission-design.md, section 4): do small
+# replies sent with send_admitted, which queue behind a waiting head in the
+# send-capacity FIFO, reach the peer within admit_limit as often as small
+# replies sent with send, which take no place in the FIFO?
+#
+# One arm and one repetition per experiment, in one guest on hv03:
+# admission-server (one worker, pinned to CPU 0) and admission-load (CPUs 2
+# and up) over loopback. Every {episode_ms} ms, {stall_peers} peers that
+# never read each ask for a {stall_size} B reply, which holds most of the
+# {pool_slots} x {slot_size} B send pool; {large_delay_ms} ms later one reply
+# of {large_size} B, more than the free slots, waits at the head of the FIFO.
+# 8-byte requests for {small_size} B replies arrive at {small_rate}/s
+# throughout, open loop. The server aborts a connection whose reply has not
+# settled in {settle_ms} ms or was not admitted in {admit_ms} ms.
+#
+# Measured by admission-load: the small replies not delivered within
+# {admit_ms} ms of their scheduled send time (late, or lost when the
+# connection ended), small-reply p99, and each episode's large-reply time.
+# The large reply's time is the check that the case was contended: with
+# admit_ms >= settle_ms it is about settle_ms - large_delay_ms, the wait for
+# the stalled peers' abort, and without contention it would be milliseconds.
+#
+# net.ipv4.tcp_wmem is capped at {tcp_wmem_max} B, so a stalled reply stays
+# in the send pool; docs/journal/2026-11-send-admission-b.md has the pilots
+# that chose the cap.
+name = "send-admission B contended {small_send} admit{admit_ms} rep{rep}"
+
+[params]
+bins_artifact  = "REPLACE-WITH-ARTIFACT-ID"
+small_send     = "admitted"
+admit_ms       = "1000"
+settle_ms      = "1000"
+rep            = "1"
+image          = "debian-13-6.12"
+warmup         = "4"
+duration       = "40"
+episode_ms     = "4000"
+small_conns    = "16"
+small_rate     = "2000"
+small_size     = "256"
+stall_peers    = "3"
+stall_size     = "3145728"
+large_size     = "7340032"
+large_delay_ms = "200"
+tcp_wmem_max   = "1048576"
+pool_slots     = "512"
+slot_size      = "16384"
+
+[[jobs]]
+name = "vm"
+tags = ["host:hv03"]
+
+[[jobs.steps]]
+uses = "anvil-vm"
+[jobs.steps.with]
+shape = "auto.c"
+image = "{image}"
+memory_gib = 8
+gpu = false
+boot_timeout = 600
+payload_timeout = 900
+upload = true
+inputs = [{ artifact = "{bins_artifact}", name = "bench-bins.tgz", dest = "/home/anvil" }]
+artifacts = ["/home/anvil/results.tgz"]
+payload = '''
+set -uo pipefail
+cd /home/anvil && tar xzf bench-bins.tgz && chmod +x out/* || exit 1
+mkdir -p results
+cat /etc/anvil-image.json 2>/dev/null || cat /etc/anvil-instance.json; echo
+uname -r; nproc
+( cd out && sha256sum admission-server admission-load )
+ulimit -n 65536
+sudo sysctl -w net.ipv4.tcp_wmem="4096 16384 {tcp_wmem_max}"
+last=$(($(nproc) - 1))
+./out/admission-server --addr 127.0.0.1:7979 --small-send {small_send} --admit-limit-ms {admit_ms} --settle-limit-ms {settle_ms} --pool-slots {pool_slots} --slot-size {slot_size} --cpu 0 > results/server.json 2> results/server.log &
+srv=$!
+for i in $(seq 1 100); do (exec 3<>/dev/tcp/127.0.0.1/7979) 2>/dev/null && { exec 3>&-; break; }; sleep 0.1; done
+taskset -c 2-$last ./out/admission-load --addr 127.0.0.1:7979 --duration {duration} --warmup {warmup} --within-ms {admit_ms} --episode-ms {episode_ms} --small-conns {small_conns} --small-rate {small_rate} --small-size {small_size} --stall-peers {stall_peers} --stall-size {stall_size} --large-size {large_size} --large-delay-ms {large_delay_ms} > results/load.json 2> results/load.log
+rc=$?
+kill -INT $srv; wait $srv
+echo "RUN small_send={small_send} admit_ms={admit_ms} settle_ms={settle_ms} rep={rep} load_rc=$rc"
+echo "LOAD $(cat results/load.json)"
+echo "SERVER $(cat results/server.json)"
+tail -3 results/server.log results/load.log
+tar czf results.tgz results
+[ $rc -eq 0 ] && [ -s results/load.json ] && [ -s results/server.json ]
+'''
