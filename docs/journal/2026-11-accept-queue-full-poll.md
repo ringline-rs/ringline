@@ -20,8 +20,9 @@ the accepted rate at a capacity a deployment would use. The default is 1024.
 A worker drains its whole accept channel on every eventfd wake
 (`handle_eventfd_read` on io_uring, `drain_channels` on mio), so a full
 channel means the worker is `accept_queue_capacity` connections behind at that
-instant. While the acceptor sleeps, no connection is dropped: later
-connections wait in the kernel listen backlog (65535 by default) (#658). With
+instant. While the acceptor sleeps, no connection is lost: later connections
+wait in the kernel listen backlog (65535 by default), and a SYN that overflows
+it is retried by the peer (#658). With
 the acceptor sleep-bound it delivers at most `capacity` connections per sleep,
 so the accepted rate is about min(R_worker, capacity × 1000/s), where
 R_worker is the one-worker rate with the queue never full.
@@ -48,8 +49,8 @@ spec with the patch read from the clone, `rev = "main"`, and `ulimit -Sn` in
 place of the `prlimit`. The guest: Debian 13, Linux 6.12.116, 16 vCPU
 (`slots = 1` on hv03, whose one slot is the whole host), io_uring backend
 confirmed by `bench-server --print-backend`, `ip_local_port_range` 1024 to
-65000 and `tcp_tw_reuse=1`. The build took 14.17 s with the image's sccache
-in use. The `prlimit` did not take effect on the payload's shell
+65000 and `tcp_tw_reuse=1`. The build took 14.17 s (the image's sccache; not
+shown in the log). The `prlimit` did not take effect on the payload's shell
 (`nofile=1024 memlock=8192` were printed after it: the brace group runs in a
 pipeline subshell forked before the `prlimit` ran). ringline's launch raised
 its own fd soft limit (`ensure_nofile_limit`), the client holds at most 8
@@ -118,12 +119,15 @@ to the acceptor, on the accept path of every connection, for a state the
 
 ## Deferred
 
-A second run of the same spec with 256 client threads and capacities 1024,
-64, 16 and 4 (experiment `01a1e19c-bfd0-7194-4e4c-59ccf9630106`) is queued
-to test capacity 64 with a queue that can fill. The model predicts the rate
-stays at R_worker there with `accept_queue_full` above 0, and
-`accept_queue_full` still 0 at 1024, which 256 connections cannot fill. Its
-result goes into this entry when it lands.
+A second run (experiment `01a1e19c-bfd0-7194-4e4c-59ccf9630106`, queued, not
+yet run) from the run-1 spec with the base64-embedded patch at 4509097c plus
+the `threads` param and the `gate_patch` gate the committed spec has; 256
+client threads, capacities 1024, 64, 16 and 4. It tests capacity 64 with a
+queue that can fill. The model predicts the rate stays at R_worker there with
+`accept_queue_full` above 0, and `accept_queue_full` still 0 at 1024, which
+256 connections cannot fill. The committed spec reproduces it only once this
+branch is on `main`, since the patch file it reads is not at 4509097c or on
+`main` before that. Its result goes into this entry when it lands.
 
 ## Reopen if
 
