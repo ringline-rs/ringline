@@ -1,0 +1,66 @@
+# Build the binaries for Experiment C (docs/send-admission-design.md,
+# section 4): send-admission-c0.toml, and the echo comparison that reuses
+# Experiment B's echo specs. One artifact, bench-bins.tgz, all io_uring
+# builds of {ref} from {repo}:
+#   admission-server  the contended cases' server
+#   admission-load    the contended cases' load
+#   bench-server      the four bytes-* echo modes
+#   bench-client      the echo load generator
+# The four come from one cargo invocation of one crate, so the backend check
+# on bench-server holds for the others. Built without target-cpu=native, so
+# the binaries run on hv01, hv02 and hv03.
+name = "send-admission C build ({ref})"
+
+[params]
+repo = "https://github.com/brayniac/ringline"
+ref  = "exp/send-admission-c-tools"
+
+[[jobs]]
+name = "build"
+tags = ["validation"]
+
+[[jobs.steps]]
+type = "anvil-vm"
+shape = "auto.c"
+image = "debian-13-6.12"
+slots = 1
+memory_gib = 8
+ports = 0
+gpu = false
+payload_timeout = 3600
+artifacts = ["/home/anvil/bench-bins.tgz", "/home/anvil/build.log"]
+upload = true
+payload = '''
+set -uo pipefail
+cd /home/anvil
+(
+  cat /etc/anvil-image.json 2>/dev/null || cat /etc/anvil-instance.json; echo
+  rustc -V; uname -r
+  mkdir -p out
+  git clone -q {repo} src && git -C src checkout -q {ref} || exit 1
+  ( cd src
+    echo "== $(git log --oneline -1)"
+    export CARGO_BUILD_JOBS=8
+    cargo build --locked --release -p ringline-bench --bin bench-server --bin bench-client --bin admission-server --bin admission-load || exit 1
+    for b in bench-server bench-client admission-server admission-load; do cp target/release/$b ../out/; done
+  ) || exit 1
+  ( cd out && sha256sum * )
+  got=$(./out/bench-server --print-backend)
+  [ "$got" = io_uring ] || { echo "BACKEND MISMATCH: bench-server is $got"; exit 1; }
+  echo "backend ok: bench-server -> $got"
+  for m in bytes-nowait bytes-admitted bytes-admitted-await bytes-admitted-timeout; do
+    ./out/bench-server --help | grep -q -- "$m" || { echo "bench-server lacks --echo-mode $m"; exit 1; }
+  done
+  echo "echo modes ok"
+  ./out/admission-server --help | grep -q -- --pipeline || { echo "admission-server lacks --pipeline"; exit 1; }
+  for f in --slow-read-bps --slow-rcvbuf --drain-read-bps --drain-rcvbuf --outside-rate; do
+    ./out/admission-load --help | grep -q -- "$f" || { echo "admission-load lacks $f"; exit 1; }
+  done
+  echo "admission flags ok"
+  tar czf bench-bins.tgz out
+) > /home/anvil/build.log 2>&1
+rc=$?
+tail -30 /home/anvil/build.log
+echo "RESULT build_status=$rc"
+exit $rc
+'''
