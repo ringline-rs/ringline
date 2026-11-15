@@ -1,6 +1,6 @@
 # 2026-11: Audit of the file I/O paths
 
-- **Status:** open — 10 findings (F1 to F10) and 4 performance findings (P1 to P4) recorded, F1 fixed (#859), F2 fixed (#861), F3 fixed (#862), F4 fixed (#863), F5 fixed (#864), F6 fixed (#870), F7 fixed (#871), F8 fixed (#872), F9 fixed (#873), F10 fixed (#874), P1 fixed (#875), P2 fixed (#876), P3 documented (#877), P4 documented (#878), fixed (#906); 3 known issues (#824, #825, #845) confirmed, #824 since fixed (#854); 6 design limitations: L1 to L5 decided 2026-11-12 (L1 fixed (#905), L2 accepted, L3 fixed (#906), L4 per worker, L5 #825 and #845), L6 answered in #862
+- **Status:** closed — every finding fixed or documented. 10 findings: F1 fixed (#859), F2 (#861), F3 (#862), F4 (#863), F5 (#864), F6 (#870), F7 (#871), F8 (#872), F9 (#873), F10 (#874). 4 performance findings: P1 fixed (#875), P2 fixed (#876, by #885), P3 documented (#877), then fixed (#926), P4 documented (#878) and its limit removed (#906). 3 known issues confirmed and fixed: #824 (#854), #825 (#929), #845 (#933, #937, then #957). 6 design limitations: L1 fixed (#905), L2 accepted, L3 fixed (#906), L4 per worker, L5 fixed (#957, revised 2026-11-15), L6 answered in #862
 - **Span:** 2026-11-10 · tree 6851de26 (`main`, 0.7.0-alpha.68) · reproduction branch `audit-fileio-repro` (e3397e64) on the fork
 
 ## Goal
@@ -182,6 +182,8 @@ Per `fs::read_into`: one 128-byte SQE, one CQE, no syscall of its own, no alloca
 ### P3 — io_uring: a full SQ submits synchronously inside the task poll (invariant 9's text). Traced.
 
 **Documented (#877):** the fs module doc says a call that finds the submission queue full submits it inline (under SQPOLL, waits for the SQ thread) and returns the submit's error with nothing in flight; the direct I/O and NVMe module docs repeat the full-SQ submit and refer to it. The code is unchanged: the cost is one `io_uring_enter` on the worker when the queue is full; by reading, not user-visible at the defaults, and not measured. A retry of the error would cover `EINTR`, which a submit that does not wait does not return in practice (from memory of the kernel), or `EBUSY`, which needs completions reaped first, or `EAGAIN`, a resource failure a retry inside the poll would not clear. The text below is as found at 6851de26.
+
+**Fixed (#926):** a disk command the ring refuses is queued on `Ring::disk_retries` and pushed again after the next wait under the push-retry backoff, so no submit error reaches the caller; a cancel of a queued command completes it with `-ECANCELED` (CLAUDE.md, Domain Invariant 7).
 
 `engine/uring.rs:255-274`: `push_sqe128` on a full SQ calls `make_sq_room(1)`, one `io_uring_enter` on the worker, and errors only if the SQ is still full. The three slabs allow 768 disk SQEs against `sq_entries` 256. Not a user-visible cost at the defaults; it corrects invariant 9 and is the source of the undocumented errors in F10.
 
