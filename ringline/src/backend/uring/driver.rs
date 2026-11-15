@@ -484,15 +484,17 @@ pub(crate) enum AcceptArm {
 ///
 /// # Drop order
 ///
-/// `ring` MUST be declared first so it drops *last*. `ProvidedBufRing` and
-/// `InFlightSendSlab` reference kernel-pinned memory whose lifetime is tied
-/// to the `io_uring` instance: the kernel only releases its DMA references
-/// when `io_uring_release` runs. Dropping the buffer pools before the ring
-/// would let `munmap` race against in-flight ZC notifications — a UAF.
+/// Fields drop in declaration order, and `ring` is declared first, so the
+/// ring is closed before `udp_provided_bufs` and `send_slab` drop. Closing
+/// the ring's fd does not wait for the kernel to finish with memory it
+/// references, so the order alone does not make that memory safe to free.
+/// `run_shutdown` does: it unregisters the UDP provided buffer rings, and
+/// leaks the send slab's in-flight entries and the send pool's memory when
+/// a slab entry is still in flight (its completion or zero-copy
+/// notification has not arrived).
 ///
-/// The `driver_field_order` test below validates this ordering; do not
-/// reorder these fields without updating both the assertion and the
-/// shutdown drain in `run_shutdown`.
+/// The `field_order_tests` module checks that `ring` is declared before
+/// `udp_provided_bufs` and `send_slab`.
 pub(crate) struct Driver {
     pub(crate) ring: Ring,
     pub(crate) connections: ConnectionTable,
@@ -3605,8 +3607,8 @@ pub(crate) fn submit_coalesced_run(
 mod field_order_tests {
     //! Drop-order proof for the kernel/DMA fields of `Driver`.
     //!
-    //! Rust drops struct fields in *declaration* order, so `ring` (declared
-    //! first) drops last. We can't directly observe `Driver` dropping (it
+    //! Rust drops struct fields in declaration order, so `ring` (declared
+    //! first) drops first. We can't directly observe `Driver` dropping (it
     //! owns a real `io_uring`), but we can verify the property in a mirror
     //! struct with the same field ordering and `Drop`-instrumented stand-ins.
     use std::cell::RefCell;
@@ -3655,8 +3657,8 @@ mod field_order_tests {
             order,
             vec!["ring", "udp_provided_bufs", "send_slab"],
             "DriverFieldOrderMirror dropped in the wrong order — \
-             reorder the fields to match `Driver`'s declaration so \
-             `ring` is declared *first* and therefore drops *last*",
+             reorder the fields to match `Driver`'s declaration, with \
+             `ring` declared first so it drops first",
         );
 
         // The real assertion: in the *real* Driver, `ring` must be
@@ -3674,12 +3676,12 @@ mod field_order_tests {
         assert!(
             ring_pos < provided_pos,
             "Driver::ring must be declared before Driver::udp_provided_bufs \
-             so it drops *after* it (kernel DMA reference safety)",
+             so the ring is closed before the buffer rings drop",
         );
         assert!(
             ring_pos < send_slab_pos,
             "Driver::ring must be declared before Driver::send_slab \
-             so it drops *after* it (ZC user-memory guards safety)",
+             so the ring is closed before the slab drops",
         );
     }
 }
