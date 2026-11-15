@@ -856,8 +856,9 @@ pub(crate) struct Driver {
     /// them again after each wait, and the wait is bounded by the next retry
     /// (`push_retry`).
     pub(crate) recv_arm_retries: Vec<(u32, u32, Option<usize>)>,
-    /// The wait between retries of the entries on `recv_arm_retries` and
-    /// the four send retry lists (`after_push_retries`).
+    /// The wait between retries of the entries on `recv_arm_retries`,
+    /// `pending_send_retries` and `pending_resubmit_retries`
+    /// (`after_push_retries`).
     pub(crate) push_retry: PushRetryBackoff,
     /// Receives `park_recv` deferred under `defer_recv_arm`, as
     /// `(conn_index, generation, need)`. `arm_deferred_recvs` arms them before
@@ -878,12 +879,13 @@ pub(crate) struct Driver {
     pub(crate) tick_count: u64,
     /// Whether the eventfd read SQE is currently armed.
     pub(crate) eventfd_armed: bool,
-    /// Pending ZC send retries: (conn_index, generation, slab_idx). Drained
-    /// each iteration until the push goes through.
-    pub(crate) pending_zc_retries: Vec<(u32, u32, u16)>,
-    /// Pending copy send retries: (conn_index, generation, pool_slot, op).
-    /// Drained each iteration until the push goes through.
-    pub(crate) pending_copy_retries: Vec<(u32, u32, u16, OpTag)>,
+    /// Send resubmissions the SQ had no room for: (conn_index, generation,
+    /// user_data of the send). The user_data's tag says which kind: a copy
+    /// send from a pool slot (`Send`, `TlsSend`), a coalesced `sendmsg`
+    /// (`SendMsgCoalesced`), or a send slab entry (the zero-copy tags).
+    /// Drained each iteration by `drain_resubmit_retries` until the push
+    /// goes through.
+    pub(crate) pending_resubmit_retries: Vec<(u32, u32, u64)>,
     /// `SendPollOut`s the SQ had no room for: (conn_index, generation, multi).
     /// Drained each tick.
     pub(crate) pending_send_pollout_retries: Vec<(u32, u32, bool)>,
@@ -899,10 +901,6 @@ pub(crate) struct Driver {
     pub(crate) send_backstop_at: Option<std::time::Instant>,
     /// TLS handshakes in progress and their deadlines.
     pub(crate) handshake_deadlines: crate::tls::handshake_deadline::HandshakeDeadlines,
-    /// Pending coalesced-send retries: (conn_index, generation, slab_idx).
-    /// Drained each iteration until the push goes through — used when
-    /// resubmitting a coalesced `sendmsg` found the SQ full.
-    pub(crate) pending_coalesced_retries: Vec<(u32, u32, u16)>,
     /// Pending close retries: (conn_index, retries). Drained each tick.
     pub(crate) pending_close_retries: Vec<(u32, u8)>,
     /// `Shutdown` SQEs the ring refused: (conn_index, generation). The write
@@ -980,9 +978,7 @@ pub(crate) struct Driver {
     /// queue at drain time so the per-tick drain reuses a single allocation
     /// across ticks (the primary queue is left empty for in-iteration
     /// re-enqueues; `drain(..)` on the scratch keeps its capacity).
-    pub(crate) zc_retry_scratch: Vec<(u32, u32, u16)>,
-    pub(crate) copy_retry_scratch: Vec<(u32, u32, u16, OpTag)>,
-    pub(crate) coalesced_retry_scratch: Vec<(u32, u32, u16)>,
+    pub(crate) resubmit_retry_scratch: Vec<(u32, u32, u64)>,
     pub(crate) send_retry_scratch: Vec<(u32, u32)>,
     /// Per-worker UDP socket state.
     pub(crate) udp_sockets: Vec<UdpSocketState>,
@@ -1365,8 +1361,7 @@ impl Driver {
             }),
             tick_count: 0,
             eventfd_armed: false,
-            pending_zc_retries: Vec::new(),
-            pending_copy_retries: Vec::new(),
+            pending_resubmit_retries: Vec::new(),
             pending_send_pollout_retries: Vec::new(),
             send_backstop_list: Vec::new(),
             send_backstop_scratch: Vec::new(),
@@ -1375,7 +1370,6 @@ impl Driver {
                 config.tls_handshake_timeout,
                 config.max_connections,
             ),
-            pending_coalesced_retries: Vec::new(),
             pending_close_retries: Vec::new(),
             pending_shutdown_retries: Vec::new(),
             pending_disconnect_retries: Vec::new(),
@@ -1384,9 +1378,7 @@ impl Driver {
             recv_aborts: VecDeque::new(),
             capacity_released: false,
             pending_finalize_closes: Vec::new(),
-            zc_retry_scratch: Vec::new(),
-            copy_retry_scratch: Vec::new(),
-            coalesced_retry_scratch: Vec::new(),
+            resubmit_retry_scratch: Vec::new(),
             send_retry_scratch: Vec::new(),
             udp_sockets,
             nvme_devices: config
@@ -1631,22 +1623,96 @@ impl Driver {
     }
 
     /// What the ring refused and the run loop retries under the push-retry
-    /// backoff: the entries on `recv_arm_retries` and the four send retry
-    /// lists, a submit the kernel refused with SQEs left queued
-    /// (`Ring::submit_refused`), an unarmed merged accept whose arm is due
-    /// (`merged_accept_due`), the UDP sockets whose re-arm is due
+    /// backoff: the entries on `recv_arm_retries`, `pending_send_retries` and
+    /// `pending_resubmit_retries`, a submit the kernel refused with SQEs left
+    /// queued (`Ring::submit_refused`), an unarmed merged accept whose arm is
+    /// due (`merged_accept_due`), the UDP sockets whose re-arm is due
     /// (`udp_rearms_due`), and the disk-I/O commands queued on the ring
     /// (`Ring::disk_retries_pending`).
     pub(crate) fn push_retries_pending(&self) -> usize {
         self.recv_arm_retries.len()
             + self.pending_send_retries.len()
-            + self.pending_copy_retries.len()
-            + self.pending_coalesced_retries.len()
-            + self.pending_zc_retries.len()
+            + self.pending_resubmit_retries.len()
             + usize::from(self.ring.submit_refused())
             + usize::from(self.merged_accept_due())
             + self.udp_rearms_due()
             + self.ring.disk_retries_pending()
+    }
+
+    /// Park a zero-copy slab entry's resubmission, as a refused push does.
+    #[cfg(test)]
+    pub(crate) fn push_zc_retry(&mut self, conn_index: u32, generation: u32, slab_idx: u16) {
+        let ud = UserData::encode(OpTag::SendMsgZc, conn_index, u32::from(slab_idx));
+        self.pending_resubmit_retries
+            .push((conn_index, generation, ud.raw()));
+    }
+
+    /// Park a coalesced `sendmsg`'s resubmission, as a refused push does.
+    #[cfg(test)]
+    pub(crate) fn push_coalesced_retry(&mut self, conn_index: u32, generation: u32, slab_idx: u16) {
+        let ud = UserData::encode(OpTag::SendMsgCoalesced, conn_index, u32::from(slab_idx));
+        self.pending_resubmit_retries
+            .push((conn_index, generation, ud.raw()));
+    }
+
+    /// Park a copy send's resubmission, as a refused push does.
+    #[cfg(test)]
+    pub(crate) fn push_copy_retry(
+        &mut self,
+        conn_index: u32,
+        generation: u32,
+        pool_slot: u16,
+        op: OpTag,
+    ) {
+        let ud = UserData::encode(
+            op,
+            conn_index,
+            UserData::send_payload(pool_slot, generation),
+        );
+        self.pending_resubmit_retries
+            .push((conn_index, generation, ud.raw()));
+    }
+
+    /// The parked zero-copy resubmissions, as (conn_index, generation, slab).
+    #[cfg(test)]
+    pub(crate) fn zc_retries(&self) -> Vec<(u32, u32, u16)> {
+        self.pending_resubmit_retries
+            .iter()
+            .filter(|(_, _, raw)| {
+                !matches!(
+                    UserData(*raw).tag(),
+                    Some(OpTag::Send | OpTag::TlsSend | OpTag::SendMsgCoalesced)
+                )
+            })
+            .map(|&(c, g, raw)| (c, g, UserData(raw).payload() as u16))
+            .collect()
+    }
+
+    /// The parked coalesced resubmissions, as (conn_index, generation, slab).
+    #[cfg(test)]
+    pub(crate) fn coalesced_retries(&self) -> Vec<(u32, u32, u16)> {
+        self.pending_resubmit_retries
+            .iter()
+            .filter(|(_, _, raw)| UserData(*raw).tag() == Some(OpTag::SendMsgCoalesced))
+            .map(|&(c, g, raw)| (c, g, UserData(raw).payload() as u16))
+            .collect()
+    }
+
+    /// The parked copy resubmissions, as (conn_index, generation, slot, tag).
+    #[cfg(test)]
+    pub(crate) fn copy_retries(&self) -> Vec<(u32, u32, u16, OpTag)> {
+        self.pending_resubmit_retries
+            .iter()
+            .filter_map(|&(c, g, raw)| {
+                let ud = UserData(raw);
+                match ud.tag() {
+                    Some(tag @ (OpTag::Send | OpTag::TlsSend)) => {
+                        Some((c, g, UserData::send_payload_slot(ud.payload()), tag))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     /// After the retry drains have run: with nothing left on the retry
@@ -3340,11 +3406,17 @@ impl Driver {
         //    SQ full, so no operation is in flight and no CQE will release
         //    them. A zero-copy entry still waits for any notification its
         //    earlier operations owe.
-        for (_, _, slab_idx) in std::mem::take(&mut self.pending_coalesced_retries) {
-            self.release_coalesced_at_shutdown(slab_idx);
-        }
-        for (_, _, slab_idx) in std::mem::take(&mut self.pending_zc_retries) {
-            self.release_zc_at_shutdown(slab_idx);
+        for (_, _, raw) in std::mem::take(&mut self.pending_resubmit_retries) {
+            let ud = UserData(raw);
+            match ud.tag() {
+                // A pool slot holds no kernel reference once its send is
+                // off the ring.
+                Some(OpTag::Send | OpTag::TlsSend) => {}
+                Some(OpTag::SendMsgCoalesced) => {
+                    self.release_coalesced_at_shutdown(ud.payload() as u16)
+                }
+                _ => self.release_zc_at_shutdown(ud.payload() as u16),
+            }
         }
         // A parked `Shutdown` has nothing in the kernel either, and the
         // Close below ends the socket.
