@@ -134,8 +134,14 @@ pub(crate) fn kernel_charges_rings() -> RingCharge {
 /// `io_uring_setup`. A refused setup charges nothing, and a ring that sets up
 /// is not charged, so the probe leaves no charge behind.
 ///
-/// `None` when the child cannot be created or reaped (`SIGCHLD` ignored or
-/// `SA_NOCLDWAIT`, or a handler that reaps every child), or when the setup
+/// The child has no exit signal, and this thread reaps it with `__WALL`. With
+/// `SIGCHLD` as its exit signal, a child that exits while this thread blocks
+/// `SIGCHLD` has the signal queued for the process, which wakes another
+/// thread from a blocking call. Some such calls then fail with `EINTR`, a
+/// socket read with `SO_RCVTIMEO` among them (signal(7)).
+///
+/// `None` when the child cannot be created or reaped (another thread's
+/// `waitpid` with `__WALL` or `__WCLONE` reaps it first), or when the setup
 /// fails with another error (`kernel.io_uring_disabled`, a seccomp filter).
 #[cfg(has_io_uring)]
 pub(crate) fn probe_ring_charge() -> Option<bool> {
@@ -189,7 +195,7 @@ pub(crate) fn probe_ring_charge() -> Option<bool> {
         let pid = libc::clone(
             child,
             top,
-            libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD,
+            libc::CLONE_VM | libc::CLONE_VFORK,
             (&raw mut zero).cast(),
         );
         libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
@@ -200,7 +206,7 @@ pub(crate) fn probe_ring_charge() -> Option<bool> {
     }
     let mut status = 0;
     loop {
-        if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+        if unsafe { libc::waitpid(pid, &mut status, libc::__WALL) } == pid {
             break;
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
@@ -424,6 +430,68 @@ mod tests {
         if KernelVersion::current().is_some_and(|k| k < RINGS_CHARGED_SINCE) {
             assert!(!charged, "a kernel before 6.14 does not charge rings");
         }
+    }
+
+    #[cfg(has_io_uring)]
+    const PROBE_SIGNAL_CHILD: &str = "memlock::tests::the_ring_charge_probe_sends_no_signal_child";
+
+    /// The probe's child sends no signal when it exits. A `SIGCHLD` it sent
+    /// while the probe blocks signals would be queued for the process and
+    /// could interrupt another thread's blocking call. The check installs a
+    /// `SIGCHLD` handler, so it runs in a process of its own.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn the_ring_charge_probe_sends_no_signal() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", PROBE_SIGNAL_CHILD])
+            .env("RINGLINE_PROBE_SIGNAL_CHILD", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "{PROBE_SIGNAL_CHILD} did not run: {stdout}"
+        );
+    }
+
+    #[cfg(has_io_uring)]
+    #[test]
+    #[ignore = "spawned by the_ring_charge_probe_sends_no_signal"]
+    fn the_ring_charge_probe_sends_no_signal_child() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SIGCHLDS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn count(_: libc::c_int) {
+            SIGCHLDS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if std::env::var("RINGLINE_PROBE_SIGNAL_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        // With a handler installed, a `SIGCHLD` the child sends is delivered
+        // to some thread of this process and runs the handler at least once.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = count as *const () as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut()), 0);
+        }
+        for _ in 0..8 {
+            probe_ring_charge().expect("the probe runs");
+        }
+        // A signal taken by another thread runs its handler there.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            SIGCHLDS.load(Ordering::Relaxed),
+            0,
+            "the probe sent SIGCHLD"
+        );
     }
 
     /// Worked through `rings_size` and `io_allocate_scq_urings` by hand. The
