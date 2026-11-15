@@ -338,7 +338,22 @@ async fn abandoned_direct_io_opens(path: &str) -> Result<(), String> {
         ringline::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    let pending = open()?;
+    // On io_uring the slots closed above are free once their closes
+    // complete, so a submission that finds the table full yields and retries.
+    let mut pending = None;
+    for _ in 0..1000 {
+        match ringline::direct_io::open(path) {
+            Ok(open) => {
+                pending = Some(open);
+                break;
+            }
+            Err(e) if e.to_string() == "direct I/O file table full" => {
+                ringline::yield_now().await;
+            }
+            Err(e) => return Err(format!("pending open: {e}")),
+        }
+    }
+    let pending = pending.ok_or("pending open: the table stayed full for 1000 yields")?;
     ringline::sleep(std::time::Duration::from_millis(100)).await;
     drop(pending);
     // The event loop frees the slot on its next iteration, and on io_uring
