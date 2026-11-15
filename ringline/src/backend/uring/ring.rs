@@ -25,11 +25,12 @@ const FIXED_FILES_RELEASED_PER_FILE_SINCE: KernelVersion = KernelVersion {
 /// Whether a ring setup error is ENOMEM from `io_uring_setup` or from
 /// registering the provided buffer ring.
 ///
-/// On Linux 6.14+ both are charged to RLIMIT_MEMLOCK, and a dropped ring's
-/// charge is released asynchronously, so tests that set up rings in quick
-/// succession can fail this way until earlier rings are freed (#589). The
-/// errors carry only a message, built by `describe_ring_setup_failure` and
-/// `provided_ring_failure`, so this reads the errno name from it.
+/// On a kernel that charges rings (`crate::memlock`) both are charged to
+/// RLIMIT_MEMLOCK, and a dropped ring's charge is released asynchronously, so
+/// tests that set up rings in quick succession can fail this way until earlier
+/// rings are freed (#589). The errors carry only a message, built by
+/// `describe_ring_setup_failure` and `provided_ring_failure`, so this reads the
+/// errno name from it.
 #[cfg(test)]
 pub(crate) fn is_memlock_enomem(err: &Error) -> bool {
     match err {

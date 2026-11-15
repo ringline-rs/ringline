@@ -5251,12 +5251,12 @@ mod tests {
         // ENOMEM (e.g. runs 31887895010, 31710717130). The pressure clears as
         // sibling tests finish, so retry briefly before failing.
         //
-        // On Linux 6.14+ each ring is charged to RLIMIT_MEMLOCK, and a dropped
-        // ring's charge is released asynchronously. A test that sets up loops
-        // in quick succession (the proptests) can reach an 8 MiB limit before
-        // earlier rings are freed; setup then fails with an `Error::RingSetup`
-        // naming ENOMEM. It clears once the
-        // kernel's exit work frees those rings (#589).
+        // On a kernel that charges rings to RLIMIT_MEMLOCK (crate::memlock), a
+        // dropped ring's charge is released asynchronously. A test that sets up
+        // loops in quick succession (the proptests) can reach an 8 MiB limit
+        // before earlier rings are freed; setup then fails with an
+        // `Error::RingSetup` naming ENOMEM. It clears once the kernel's exit
+        // work frees those rings (#589).
         let mut io_attempts = 0;
         let mut memlock_attempts = 0;
         loop {

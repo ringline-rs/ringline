@@ -40,11 +40,12 @@ fn small_config() -> Config {
 /// Register memory that can be pinned, retrying for up to 5 s while the
 /// kernel refuses it with ENOMEM or EFAULT.
 ///
-/// io_uring charges registered buffers, and on Linux 6.14+ each ring, to the
-/// user's locked memory across all of the user's processes, so test processes
-/// running alongside this one can push a registration past `RLIMIT_MEMLOCK`
-/// until they release the charge (#589). Pinning a page the kernel must migrate first can
-/// fail with EFAULT, and registering again can succeed (#656).
+/// io_uring charges registered buffers, and on a kernel that charges rings (see
+/// `ringline/src/memlock.rs`) each ring, to the user's locked memory across all
+/// of the user's processes, so test processes running alongside this one can
+/// push a registration past `RLIMIT_MEMLOCK` until they release the charge
+/// (#589). Pinning a page the kernel must migrate first can fail with EFAULT,
+/// and registering again can succeed (#656).
 fn register(runtime: &Runtime, region: MemoryRegion) -> RegionId {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

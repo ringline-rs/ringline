@@ -117,14 +117,20 @@ Three things worth knowing wherever the uring tests run:
 - **The uring test binary needs a generous `RLIMIT_NOFILE`.** At a 1024 soft
   limit it aborts with `io_uring_setup(2): Too many open files (EMFILE)`, which
   reads as a code failure and is not; raise the soft limit in the payload.
-- **On Linux 6.14+ every ring is charged to `RLIMIT_MEMLOCK`**, and the
-  charge of a dropped ring is released asynchronously. The lib test helpers
-  `make_test_loop` and `ring.rs`'s `ring_with`, and the runtime launches in
-  `close_tests.rs`, retry an ENOMEM from ring setup or provided-ring
-  registration for up to 5 s (`is_memlock_enomem`, #589). Integration tests
-  under `ringline/tests/` do not. If the user's total charge, across all
-  their processes, still exceeds the limit after 5 s, `make_test_loop`
-  aborts the binary with the setup message.
+- **On Linux 6.14 to 7.2, except 7.2.y from 7.2.11 and 6.18.y from 6.18.58,
+  every ring is charged to `RLIMIT_MEMLOCK`**, and the charge of a dropped
+  ring is released asynchronously. 7.3's b59cabf9b4ac removed the charge for
+  rings and provided buffer rings, and a distribution kernel can carry it
+  under any version, so `memlock::kernel_charges_rings` tests the running
+  kernel: it sets up a one-entry ring in a child process whose soft limit is 0
+  (#940). The rack's 7.1 and Ubuntu 26.04 7.0 images charge rings; its 7.3 and
+  7.4 images do not. The lib test helpers `make_test_loop` and `ring.rs`'s
+  `ring_with`, and the runtime launches in `close_tests.rs`, retry an ENOMEM
+  from ring setup or provided-ring registration for up to 5 s
+  (`is_memlock_enomem`, #589). Integration tests under `ringline/tests/` do
+  not. If the user's total charge, across all their processes, still exceeds
+  the limit after 5 s, `make_test_loop` aborts the binary with the setup
+  message.
 
   Since the default ring sizes rose to SQ 4096 and CQ 65536 (#901), each
   worker's ring charges about 2.5 MiB (645 pages at 4 KiB; `ring_bytes` in
@@ -172,7 +178,7 @@ Ringline is a thread-per-core async I/O runtime. No work-stealing, no cross-thre
 ### Startup Flow
 
 `RinglineBuilder::new(config).bind(addr).launch::<Handler>()` →
-1. Validates config. On io_uring, ensures RLIMIT_MEMLOCK covers what each worker charges to it: its `registered_regions`, plus on Linux 6.14+ its ring and one provided buffer ring per UDP socket (see `ringline/src/memlock.rs`; a process with `CAP_IPC_LOCK` in the initial user namespace is not charged). The soft limit is raised when the hard limit allows; when the hard limit is too low for the rings, the `cq_entries` left at its default is halved (down to 1024) with the default `sq_entries` and `max_connections` in proportion until they fit (`memlock::fit_ring_sizes`), and otherwise `Error::ResourceLimit` names the `ulimit` to run. Then ensures RLIMIT_NOFILE is sufficient for the (possibly fitted) `max_connections`, raising the soft limit or returning `Error::ResourceLimit` the same way
+1. Validates config. On io_uring, ensures RLIMIT_MEMLOCK covers what each worker charges to it: its `registered_regions`, plus its ring and one provided buffer ring per UDP socket on a kernel that charges rings (see `ringline/src/memlock.rs`). A process with `CAP_IPC_LOCK` in the initial user namespace is not charged. When the count with the rings does not fit the hard limit, launch tests the running kernel once (`memlock::kernel_charges_rings`) and drops the rings from the count if they are not charged. The soft limit is raised when the hard limit allows; when the hard limit is too low for the rings, the `cq_entries` left at its default is halved (down to 1024) with the default `sq_entries` and `max_connections` in proportion until they fit (`memlock::fit_ring_sizes`), and otherwise `Error::ResourceLimit` names the `ulimit` to run. Then ensures RLIMIT_NOFILE is sufficient for the (possibly fitted) `max_connections`, raising the soft limit or returning `Error::ResourceLimit` the same way
 2. Spawns an **acceptor thread** (if `.bind()` was called) that runs `accept4()` and round-robins fds to workers via crossbeam channels
 3. Spawns **N worker threads**, each pinned to a CPU core (SMT-aware: one worker per physical core), each owning its own `Driver` + `Executor` + ring/poll instance
 

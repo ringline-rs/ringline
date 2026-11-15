@@ -1,10 +1,11 @@
 #![allow(clippy::manual_async_fn)]
 //! A refused SQPOLL CPU is named under an `RLIMIT_MEMLOCK` with less than a
-//! ring of headroom. On Linux 6.14+ the refused ring's memlock charge can
-//! still be held when ring setup retries without the CPU, and the retry at
+//! ring of headroom. On a kernel that charges rings (Linux 6.14 to 7.2, except
+//! 7.2.y from 7.2.11 and 6.18.y from 6.18.58) the refused ring's memlock charge
+//! can still be held when ring setup retries without the CPU, and the retry at
 //! the ring's own sizes then fails with ENOMEM. In its own binary because it
-//! lowers this process's hard limit, which cannot be raised again. Below
-//! 6.14 rings are not charged, and with `CAP_IPC_LOCK` nothing is, so there
+//! lowers this process's hard limit, which cannot be raised again. Other
+//! kernels do not charge rings, and with `CAP_IPC_LOCK` nothing is, so there
 //! the test passes without reaching the smaller retry.
 #![cfg(has_io_uring)]
 

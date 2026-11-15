@@ -86,6 +86,24 @@ fn set_memlock(soft: u64, hard: u64) {
     );
 }
 
+/// Whether the running kernel charges rings to `RLIMIT_MEMLOCK`, which a
+/// kernel carrying 7.3's b59cabf9b4ac does not under any version. Any charge
+/// exceeds a zero soft limit, so a ring sets up under one exactly when rings
+/// are not charged. Launch makes the same check in a child process
+/// (`memlock::probe_ring_charge`). Restores the soft limit.
+fn rings_charged() -> bool {
+    let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut r) }, 0);
+    set_memlock(0, r.rlim_max);
+    let charged = match io_uring::IoUring::new(1) {
+        Ok(_) => false,
+        Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => true,
+        Err(e) => panic!("ring setup under a zero memlock limit: {e}"),
+    };
+    set_memlock(r.rlim_cur, r.rlim_max);
+    charged
+}
+
 type Launched = (
     ringline::Runtime,
     Vec<std::thread::JoinHandle<Result<(), Error>>>,
@@ -118,8 +136,18 @@ fn launch_fits_default_rings_to_a_low_memlock_limit() {
         unsafe { libc::geteuid() } != 0 && !has_cap_ipc_lock(),
         "run this test unprivileged"
     );
+    let charged = rings_charged();
     if kernel() < (6, 14) {
-        // Rings are not charged before 6.14: the defaults launch unchanged.
+        assert!(!charged, "Linux {:?} charged a ring", kernel());
+    }
+    if !charged {
+        // Rings are not charged: the defaults launch unchanged under the
+        // 8 MiB limit, where launch fits them down on a kernel that charges
+        // rings, or under a lower hard limit the process already has.
+        let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut r) }, 0);
+        let limit = LIMIT.min(r.rlim_max);
+        set_memlock(limit, limit);
         let (runtime, handles) = launch(builder).expect("launch");
         assert_eq!(runtime.cq_entries(), 65536);
         runtime.shutdown();

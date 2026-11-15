@@ -46,8 +46,9 @@ pub(crate) const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(
 ///   gets the generic message;
 /// - it fails otherwise: the original `EINVAL` gets the generic message and a
 ///   note that the SQ CPU may be the cause, and is not reported as a memlock
-///   failure. On Linux 6.14+ the refused ring's memlock charge can still be
-///   held when the retry runs, so `UringEngine::setup` makes a retry that `ENOMEM`
+///   failure. On a kernel that charges rings to `RLIMIT_MEMLOCK` (see
+///   `crate::memlock`) the refused ring's charge can still be held when the
+///   retry runs, so `UringEngine::setup` makes a retry that `ENOMEM`
 ///   refused again at `probe_sizes`; this case is left for when that fails
 ///   too.
 fn ring_setup_error<R>(
@@ -561,11 +562,11 @@ impl Engine for UringEngine {
             builder.build(sq_entries)
         };
 
-        // The unpinned retry first uses the ring's own sizes. On Linux 6.14+
-        // the refused ring's memlock charge can still be held when it runs,
-        // so under a limit with less than a ring of headroom it fails with
-        // ENOMEM; it is then made again at `probe_sizes`, which needs two
-        // pages of memlock.
+        // The unpinned retry first uses the ring's own sizes. On a kernel that
+        // charges rings to RLIMIT_MEMLOCK the refused ring's charge can still
+        // be held when it runs, so under a limit with less than a ring of
+        // headroom it fails with ENOMEM; it is then made again at
+        // `probe_sizes`, which needs two pages of memlock.
         let unpinned = || match build(None, config.sq_entries, config.cq_entries) {
             Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
                 let (sq, cq) = probe_sizes(config.sq_entries, config.cq_entries);

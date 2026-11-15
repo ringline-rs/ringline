@@ -9,7 +9,7 @@ use thiserror::Error;
 /// | Error | Cause | Recovery |
 /// |-------|-------|----------|
 /// | `Io` | System call failure | Check `io::ErrorKind`; transient network errors may be retryable |
-/// | `RingSetup` | io_uring refused or unsupported | Read the message: it names the sysctl/seccomp/kernel cause (`ENOMEM` on Linux 6.14+ is usually `RLIMIT_MEMLOCK`); or build with the `force-mio` feature |
+/// | `RingSetup` | io_uring refused or unsupported | Read the message: it names the sysctl/seccomp/kernel cause (`ENOMEM` is usually `RLIMIT_MEMLOCK` on a kernel that charges rings to it); or build with the `force-mio` feature |
 /// | `BufferRegistration` | io_uring refused to register memory | `ENOMEM`: `RLIMIT_MEMLOCK` (raise with `ulimit -l` / `LimitMEMLOCK=`, or grant `CAP_IPC_LOCK`) or a failed page migration; `EFAULT`: a buffer over 1 GiB or of length 0, an unpinnable mapping, or a failed page migration. The message says which apply |
 /// | `ConnectionLimitReached` | All connection slots in use | Increase via `ConfigBuilder::max_connections(...)` or close idle connections |
 /// | `InvalidConnection` | Stale handle, connection closed | Re-establish connection; do not reuse the `Connection` |
@@ -138,7 +138,9 @@ pub enum Error {
     ///   high-concurrency workloads. `ulimit -n 65536` or higher.
     /// - `RLIMIT_MEMLOCK` (io_uring): fixed buffers from
     ///   [`ConfigBuilder::registered_regions`](crate::ConfigBuilder::registered_regions)
-    ///   are pinned against it, and from Linux 6.14 each worker's ring. A
+    ///   are pinned against it, and on a kernel that charges rings
+    ///   (Linux 6.14 to 7.2, except 7.2.y from 7.2.11 and 6.18.y from
+    ///   6.18.58) each worker's ring. A
     ///   `cq_entries` left at its default is first lowered to fit (see
     ///   [`ConfigBuilder::cq_entries`](crate::ConfigBuilder::cq_entries)), so
     ///   this is returned when the rings do not fit even then, when
@@ -163,9 +165,12 @@ pub enum Error {
 /// registration failed: the io_uring policy sysctls, and what decides whether
 /// the kernel charged the memory to `RLIMIT_MEMLOCK`.
 ///
-/// A sysctl is `None` when it could not be read — either the kernel predates
-/// it (`kernel.io_uring_disabled` arrived in 6.6) or `/proc/sys` is not
-/// mounted. Every field is read once, only on the failure path.
+/// A sysctl is `None` when it could not be read — either the kernel predates it
+/// (`kernel.io_uring_disabled` arrived in 6.6) or `/proc/sys` is not mounted.
+/// Every field is read once, only on the failure path. `read` fills
+/// `rings_charged` with [`crate::memlock::kernel_charges_rings`], which creates
+/// the child process of [`crate::memlock::probe_ring_charge`] when no earlier
+/// call has cached a result.
 #[cfg(any(has_io_uring, test))]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RingSetupProbe {
@@ -176,9 +181,11 @@ pub(crate) struct RingSetupProbe {
     /// `kernel.io_uring_group`: the gid exempted when `io_uring_disabled`
     /// is 1, or `-1` when no group is configured.
     pub(crate) io_uring_group: Option<i64>,
-    /// The running kernel, which decides whether rings are charged to
-    /// `RLIMIT_MEMLOCK` (see [`crate::memlock`]).
+    /// The running kernel, named in the hint.
     pub(crate) kernel: Option<crate::memlock::KernelVersion>,
+    /// Whether the kernel charges rings and provided buffer rings to
+    /// `RLIMIT_MEMLOCK` ([`crate::memlock::kernel_charges_rings`]).
+    pub(crate) rings_charged: crate::memlock::RingCharge,
     /// The `RLIMIT_MEMLOCK` soft limit in bytes, the one the kernel checks.
     pub(crate) memlock_soft: Option<u64>,
     /// Whether the process holds `CAP_IPC_LOCK` in the initial user
@@ -199,6 +206,7 @@ impl RingSetupProbe {
             io_uring_disabled: read_sysctl("/proc/sys/kernel/io_uring_disabled"),
             io_uring_group: read_sysctl("/proc/sys/kernel/io_uring_group"),
             kernel: crate::memlock::KernelVersion::current(),
+            rings_charged: crate::memlock::kernel_charges_rings(),
             memlock_soft: MemlockLimit::read().ok().map(|l| l.soft),
             cap_ipc_lock: crate::memlock::has_cap_ipc_lock(),
         }
@@ -330,12 +338,12 @@ pub(crate) fn describe_ring_setup_failure(err: &io::Error, probe: &RingSetupProb
 /// When the kernel charges `what` to `RLIMIT_MEMLOCK` and the limit is finite,
 /// the sentence that names the limit as the likely cause of an `ENOMEM` and
 /// says how to raise it. `None` when the charge does not apply: a kernel
-/// before 6.14, a process with `CAP_IPC_LOCK`, or no limit.
+/// that does not charge rings, a process with `CAP_IPC_LOCK`, or no limit.
 #[cfg(any(has_io_uring, test))]
 fn memlock_cause(probe: &RingSetupProbe, what: &str) -> Option<String> {
     if probe.cap_ipc_lock
         || probe.memlock_soft == Some(libc::RLIM_INFINITY)
-        || !crate::memlock::charges_rings(probe.kernel)
+        || !probe.rings_charged.charged
     {
         return None;
     }
@@ -344,11 +352,11 @@ fn memlock_cause(probe: &RingSetupProbe, what: &str) -> Option<String> {
         None => "This process's soft limit could not be read".to_string(),
     };
     let kernel = match probe.kernel {
-        Some(k) => format!("Linux {k}"),
-        None => "this kernel".to_string(),
+        Some(k) if probe.rings_charged.measured => format!("Linux {k} charges"),
+        _ => "this kernel may charge".to_string(),
     };
     Some(format!(
-        "{kernel} charges {what} to RLIMIT_MEMLOCK. The charge is added to what \
+        "{kernel} {what} to RLIMIT_MEMLOCK. The charge is added to what \
          every process of this user has already charged. {soft}. Raise it with \
          `ulimit -l` (or `LimitMEMLOCK=` in the systemd unit), or grant the \
          process CAP_IPC_LOCK",
@@ -652,10 +660,11 @@ pub(crate) fn describe_buffer_registration_failure(
 
 /// What to check when registering a provided buffer ring fails with `ENOMEM`.
 ///
-/// On Linux 6.14+ the ring is charged to `RLIMIT_MEMLOCK`, so the limit is the
-/// usual cause and the hint names it. Before 6.14 the ring is not charged:
-/// `memlock_rings` registers one under a one-page limit on those kernels
-/// (#426). There the hint says `ulimit -l` will not help and points at the
+/// On a kernel that charges rings (`RingSetupProbe::rings_charged`) the ring is
+/// charged to `RLIMIT_MEMLOCK`, so the limit is the usual cause and the hint
+/// names it. On other kernels (see [`crate::memlock`]) it is not charged:
+/// `memlock_rings` registers one under a one-page limit on those kernels (#426,
+/// #940). There the hint says `ulimit -l` will not help and points at the
 /// cgroup memory limit and the map-count ceiling instead.
 #[cfg(any(has_io_uring, test))]
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
@@ -675,7 +684,7 @@ pub(crate) fn provided_ring_enomem_hint(probe: &RingSetupProbe) -> String {
             } else if probe.memlock_soft == Some(libc::RLIM_INFINITY) {
                 "the limit is unlimited"
             } else {
-                "kernels before 6.14 do not charge provided buffer rings to it"
+                "this kernel does not charge provided buffer rings to it"
             };
             format!(
                 "ENOMEM here is not caused by RLIMIT_MEMLOCK -- {why} -- so raising \
@@ -759,12 +768,18 @@ mod tests {
         io::Error::from_raw_os_error(libc::ENOMEM)
     }
 
+    /// A probe of a kernel that charges rings from 6.14, as 7.0 and 7.1 do.
     fn memlock_probe(kernel: (u32, u32), soft: u64, cap_ipc_lock: bool) -> RingSetupProbe {
+        let kernel = crate::memlock::KernelVersion {
+            major: kernel.0,
+            minor: kernel.1,
+        };
         RingSetupProbe {
-            kernel: Some(crate::memlock::KernelVersion {
-                major: kernel.0,
-                minor: kernel.1,
-            }),
+            kernel: Some(kernel),
+            rings_charged: crate::memlock::RingCharge {
+                charged: crate::memlock::charges_rings_by_version(Some(kernel)),
+                measured: true,
+            },
             memlock_soft: Some(soft),
             cap_ipc_lock,
             ..Default::default()
@@ -802,6 +817,13 @@ mod tests {
             memlock_probe((6, 13), 8 << 20, false),
             memlock_probe((6, 17), 8 << 20, true),
             memlock_probe((6, 17), libc::RLIM_INFINITY, false),
+            RingSetupProbe {
+                rings_charged: crate::memlock::RingCharge {
+                    charged: false,
+                    measured: true,
+                },
+                ..memlock_probe((7, 3), 8 << 20, false)
+            },
         ] {
             let text = describe_ring_setup_failure(&enomem(), &probe);
             assert!(!text.contains("RLIMIT_MEMLOCK"), "{probe:?}: {text}");
@@ -1119,18 +1141,29 @@ mod provided_ring_hint_tests {
     fn probe(minor: u32, soft: u64, cap_ipc_lock: bool) -> RingSetupProbe {
         RingSetupProbe {
             kernel: Some(KernelVersion { major: 6, minor }),
+            rings_charged: crate::memlock::RingCharge {
+                charged: minor >= 14,
+                measured: true,
+            },
             memlock_soft: Some(soft),
             cap_ipc_lock,
             ..Default::default()
         }
     }
 
-    /// Before 6.14 provided buffer rings are not charged to `RLIMIT_MEMLOCK`
-    /// (#426; `memlock_rings` checks this under a one-page limit), so there
-    /// the hint must not send the reader to `ulimit -l`.
+    /// Where provided buffer rings are not charged to `RLIMIT_MEMLOCK` (see
+    /// `crate::memlock`; #426, #940; `memlock_rings` checks this under a
+    /// one-page limit), the hint must not send the reader to `ulimit -l`.
     #[test]
-    fn before_6_14_does_not_send_the_reader_to_ulimit_l() {
-        for p in [probe(12, 8 << 20, false), probe(17, 8 << 20, true)] {
+    fn an_uncharged_ring_does_not_send_the_reader_to_ulimit_l() {
+        let fixed = RingSetupProbe {
+            rings_charged: crate::memlock::RingCharge {
+                charged: false,
+                measured: true,
+            },
+            ..probe(18, 8 << 20, false)
+        };
+        for p in [probe(12, 8 << 20, false), probe(17, 8 << 20, true), fixed] {
             let h = provided_ring_enomem_hint(&p);
             assert!(h.contains("not caused by RLIMIT_MEMLOCK"), "{p:?}: {h}");
             let i = h.find("ulimit -l").expect("names ulimit -l as a dead end");
@@ -1139,10 +1172,10 @@ mod provided_ring_hint_tests {
         }
     }
 
-    /// From 6.14 the ring is charged to `RLIMIT_MEMLOCK`, so the hint names
-    /// the limit first.
+    /// Where the ring is charged to `RLIMIT_MEMLOCK`, the hint names the
+    /// limit first.
     #[test]
-    fn from_6_14_names_memlock_first() {
+    fn a_charged_ring_names_memlock_first() {
         let h = provided_ring_enomem_hint(&probe(17, 8 << 20, false));
         assert!(
             h.starts_with("ENOMEM here is usually RLIMIT_MEMLOCK"),

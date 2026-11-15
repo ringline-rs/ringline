@@ -97,18 +97,19 @@ a half-closed peer, even one that is reading. `send_parts` waits for room.
 ### `-ENOMEM` from a zero-copy send
 
 From Linux 6.15, a `SendMsgZc` from memory that is not a registered buffer
-charges `len / page_size + 2` pages to the user's `RLIMIT_MEMLOCK` while it
-is in flight. From 6.14 the same limit also holds every io_uring ring
-(`ringline/src/memlock.rs`). When the pages do not fit, the operation fails
-with `-ENOMEM` and sends nothing. The handler sends that entry with a plain
-`send` of its first non-empty unsent iovec, under the `SendMsgZcDrain` tag, and
-marks the entry so that the rest of it, including a resubmission that waited on
-a full SQ or for room, also goes out as plain `send`s rather than as further
-`SendMsgZc`s. A plain `send` pins no memory and posts no notification. Each send therefore takes at
-most one `-ENOMEM`, counted by the `ringline/pool` counter `send_zc_enomem`.
-A process with `CAP_IPC_LOCK` in the initial user namespace is not charged
-and does not reach this path. Inside a `send_chain`, `-ENOMEM` fails the
-chain and closes the connection (#642, #734).
+charges `len / page_size + 2` pages to the user's `RLIMIT_MEMLOCK` while it is
+in flight. On a kernel that charges rings (`ringline/src/memlock.rs`) the same
+limit also holds every io_uring ring. When the pages do not fit, the operation
+fails with `-ENOMEM` and sends nothing. The handler sends that entry with a
+plain `send` of its first non-empty unsent iovec, under the `SendMsgZcDrain`
+tag, and marks the entry so that the rest of it, including a resubmission that
+waited on a full SQ or for room, also goes out as plain `send`s rather than as
+further `SendMsgZc`s. A plain `send` pins no memory and posts no notification.
+Each send therefore takes at most one `-ENOMEM`, counted by the
+`ringline/pool` counter `send_zc_enomem`. A process with `CAP_IPC_LOCK` in the
+initial user namespace is not charged and does not reach this path. Inside a
+`send_chain`, `-ENOMEM` fails the chain and closes the connection (#642,
+#734).
 
 ### At worker shutdown
 

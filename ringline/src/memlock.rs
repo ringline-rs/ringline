@@ -1,18 +1,21 @@
 //! What io_uring charges against `RLIMIT_MEMLOCK`, so `launch` can check the
 //! limit before any worker exists and an `ENOMEM` can name the cause.
 //!
-//! Registered (fixed) buffers are charged on every kernel. From Linux 6.14
-//! the rings are charged too: the SQ/CQ ring region, the SQE array and each
-//! provided buffer ring are allocated with `io_create_region`
-//! (`io_uring/memmap.c`), which charges their pages. Before 6.14 they are not
-//! charged.
+//! Registered (fixed) buffers are charged on every kernel. On a kernel that
+//! charges rings, the SQ/CQ ring region, the SQE array and each provided
+//! buffer ring are charged too: `io_create_region` (`io_uring/memmap.c`)
+//! charges their pages. Linux 6.14 to 7.2 charge rings, except 7.2.y from
+//! 7.2.11 and 6.18.y from 6.18.58, which carry 7.3's b59cabf9b4ac ("io_uring:
+//! do not charge the SQ/CQ rings to RLIMIT_MEMLOCK"). Kernels before 6.14 and
+//! from 7.3 do not. A distribution kernel can carry that change under any
+//! version, so [`kernel_charges_rings`] tests the running kernel.
 //!
-//! Each ring's charge is added separately; rings do not share one. The kernel
-//! adds every charge to what the same user has charged in any process, and
-//! compares the total with the `RLIMIT_MEMLOCK` soft limit of the process
-//! making the charge. A process with `CAP_IPC_LOCK` in the initial user
-//! namespace is not charged; the capability inside a container's own user
-//! namespace does not exempt it.
+//! Where rings are charged, each ring's charge is added separately; rings do
+//! not share one. The kernel adds every charge to what the same user has
+//! charged in any process, and compares the total with the `RLIMIT_MEMLOCK`
+//! soft limit of the process making the charge. A process with
+//! `CAP_IPC_LOCK` in the initial user namespace is not charged; the
+//! capability inside a container's own user namespace does not exempt it.
 //!
 //! A zero-copy send from memory that is not a registered buffer is charged
 //! too, `len / page + 2` pages while the send is in flight
@@ -66,10 +69,153 @@ pub(crate) const RINGS_CHARGED_SINCE: KernelVersion = KernelVersion {
     minor: 14,
 };
 
-/// Whether `kernel` charges rings and provided buffer rings against
-/// `RLIMIT_MEMLOCK`. An unknown kernel is assumed to.
-pub(crate) fn charges_rings(kernel: Option<KernelVersion>) -> bool {
+/// Whether `kernel` may charge rings and provided buffer rings against
+/// `RLIMIT_MEMLOCK`, judged by its version alone: from 6.14, or when the
+/// version is unknown. Kernels that carry b59cabf9b4ac do not charge them
+/// whatever their version, so this is an upper bound, used until
+/// [`kernel_charges_rings`] has tested the kernel and when it cannot.
+pub(crate) fn charges_rings_by_version(kernel: Option<KernelVersion>) -> bool {
     kernel.is_none_or(|k| k >= RINGS_CHARGED_SINCE)
+}
+
+/// Whether the kernel charges rings and provided buffer rings against
+/// `RLIMIT_MEMLOCK`, and how that was decided.
+#[cfg(any(has_io_uring, test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RingCharge {
+    /// Whether rings are charged.
+    pub(crate) charged: bool,
+    /// Whether [`probe_ring_charge`] measured `charged` on the running
+    /// kernel. `false` when it came from [`charges_rings_by_version`].
+    pub(crate) measured: bool,
+}
+
+/// Whether the running kernel charges io_uring rings and provided buffer
+/// rings against `RLIMIT_MEMLOCK`.
+///
+/// [`probe_ring_charge`] runs once per process and its result is cached.
+/// When it cannot run, the result is [`charges_rings_by_version`], not
+/// cached. A process holding `CAP_IPC_LOCK` is not charged on any kernel, so
+/// the probe's result would not describe the kernel; for it this returns the
+/// version rule and caches nothing.
+#[cfg(has_io_uring)]
+pub(crate) fn kernel_charges_rings() -> RingCharge {
+    static MEASURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let by_version = || RingCharge {
+        charged: charges_rings_by_version(KernelVersion::current()),
+        measured: false,
+    };
+    let measured = |charged| RingCharge {
+        charged,
+        measured: true,
+    };
+    if let Some(&charged) = MEASURED.get() {
+        return measured(charged);
+    }
+    if has_cap_ipc_lock() {
+        return by_version();
+    }
+    match probe_ring_charge() {
+        Some(charged) => measured(*MEASURED.get_or_init(|| charged)),
+        None => by_version(),
+    }
+}
+
+/// Test whether the kernel charges rings: set up a one-entry ring in a child
+/// process whose soft `RLIMIT_MEMLOCK` is 0. Any charge exceeds a zero limit,
+/// so the setup fails with `ENOMEM` exactly when rings are charged.
+/// `Some(true)` for `ENOMEM`, `Some(false)` when the ring sets up.
+///
+/// The child is a `clone(CLONE_VM | CLONE_VFORK)` without `CLONE_THREAD`: it
+/// shares this process's memory, so nothing is copied, and has its own copy of
+/// the resource limits, so its `setrlimit` leaves this process's limits
+/// unchanged. This thread waits until the child exits. Signals that can be
+/// blocked are blocked in the child, which calls only `setrlimit` and
+/// `io_uring_setup`. A refused setup charges nothing, and a ring that sets up
+/// is not charged, so the probe leaves no charge behind.
+///
+/// `None` when the child cannot be created or reaped (`SIGCHLD` ignored or
+/// `SA_NOCLDWAIT`, or a handler that reaps every child), or when the setup
+/// fails with another error (`kernel.io_uring_disabled`, a seccomp filter).
+#[cfg(has_io_uring)]
+pub(crate) fn probe_ring_charge() -> Option<bool> {
+    const NOT_CHARGED: libc::c_int = 0;
+    const CHARGED: libc::c_int = 1;
+    const OTHER: libc::c_int = 2;
+    const STACK: usize = 64 * 1024;
+
+    extern "C" fn child(arg: *mut libc::c_void) -> libc::c_int {
+        // SAFETY: `arg` is the parent's `rlimit`, alive while the parent
+        // waits for this child (`CLONE_VFORK`).
+        let zero = unsafe { &*(arg as *const libc::rlimit) };
+        // `struct io_uring_params` is 120 bytes; all zero asks for no features.
+        let mut params = [0u64; 15];
+        unsafe {
+            if libc::setrlimit(libc::RLIMIT_MEMLOCK, zero) != 0 {
+                return OTHER;
+            }
+            let fd = libc::syscall(libc::SYS_io_uring_setup, 1u32, params.as_mut_ptr());
+            if fd >= 0 {
+                NOT_CHARGED
+            } else if *libc::__errno_location() == libc::ENOMEM {
+                CHARGED
+            } else {
+                OTHER
+            }
+        }
+    }
+
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
+        return None;
+    }
+    let mut zero = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: limit.rlim_max,
+    };
+    let mut stack = vec![0u128; STACK / 16];
+    // The stack grows down on every architecture Rust targets for Linux.
+    let top = stack.as_mut_ptr_range().end.cast::<libc::c_void>();
+
+    // SAFETY: the child runs `child` on `stack` and then exits; this thread is
+    // suspended until it has (`CLONE_VFORK`), with every signal blocked except
+    // the two glibc keeps unblockable, so neither runs code the other could
+    // observe half done.
+    let pid = unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut old);
+        let pid = libc::clone(
+            child,
+            top,
+            libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD,
+            (&raw mut zero).cast(),
+        );
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        pid
+    };
+    if pid < 0 {
+        return None;
+    }
+    let mut status = 0;
+    loop {
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+            break;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return None;
+        }
+    }
+    drop(stack);
+    if !libc::WIFEXITED(status) {
+        return None;
+    }
+    match libc::WEXITSTATUS(status) {
+        CHARGED => Some(true),
+        NOT_CHARGED => Some(false),
+        _ => None,
+    }
 }
 
 fn page_align(bytes: u64, page: u64) -> u64 {
@@ -250,19 +396,39 @@ mod tests {
     }
 
     #[test]
-    fn rings_are_charged_from_6_14() {
+    fn the_version_rule_assumes_a_charge_from_6_14() {
         let k = |major, minor| Some(KernelVersion { major, minor });
-        assert!(!charges_rings(k(6, 12)));
-        assert!(!charges_rings(k(6, 13)));
-        assert!(charges_rings(k(6, 14)));
-        assert!(charges_rings(k(6, 17)));
-        assert!(charges_rings(k(7, 0)));
-        assert!(charges_rings(None));
+        assert!(!charges_rings_by_version(k(6, 12)));
+        assert!(!charges_rings_by_version(k(6, 13)));
+        assert!(charges_rings_by_version(k(6, 14)));
+        assert!(charges_rings_by_version(k(6, 17)));
+        assert!(charges_rings_by_version(k(7, 0)));
+        assert!(charges_rings_by_version(None));
+    }
+
+    /// The probe gives a result on any kernel the tests run on, agrees with
+    /// the version rule where that rule is certain (no charge before 6.14),
+    /// and does not leave this process's soft limit at the child's zero.
+    /// `memlock_rings` checks its result against what the kernel charges.
+    #[cfg(has_io_uring)]
+    #[test]
+    fn the_ring_charge_probe_gives_a_result_and_keeps_the_limit() {
+        let soft = || {
+            let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut r) }, 0);
+            r.rlim_cur
+        };
+        assert_ne!(soft(), 0, "the test needs a nonzero memlock limit");
+        let charged = probe_ring_charge().expect("the probe runs");
+        assert_ne!(soft(), 0, "the child's zero limit reached this process");
+        if KernelVersion::current().is_some_and(|k| k < RINGS_CHARGED_SINCE) {
+            assert!(!charged, "a kernel before 6.14 does not charge rings");
+        }
     }
 
     /// Worked through `rings_size` and `io_allocate_scq_urings` by hand. The
     /// `memlock_rings` integration test checks the same numbers against a
-    /// running 6.14+ kernel.
+    /// running kernel that charges rings.
     #[test]
     fn ring_bytes_matches_the_kernel_layout() {
         // sq 64, cq 256: (64 + 256*16)*2 = 8320, +64*4 = 8576 -> 3 pages;

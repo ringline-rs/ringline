@@ -141,16 +141,15 @@ and nothing holds any of its bytes.
 
 ## Selecting the ring kind
 
-At startup the worker runs the preflight below and, if it passes,
-registers the small group with `IOU_PBUF_RING_INC`. A failed preflight, or
-`EINVAL` from the registration, selects plain rings for both groups; Linux
-6.1 (Debian 12 and Amazon Linux 2023) returns `EINVAL`, and 6.12 and 7.1
-accept the flag. Any other
-error from either attempt fails the worker's startup with
-`Error::BufferRegistration`, as a registration failure does today
-(`ENOMEM` from `RLIMIT_MEMLOCK` on 6.14+ included). If the large group's
-registration fails after the small group's succeeded, startup fails the
-same way and names the large group.
+At startup the worker runs the preflight below and, if it passes, registers
+the small group with `IOU_PBUF_RING_INC`. A failed preflight, or `EINVAL` from
+the registration, selects plain rings for both groups; Linux 6.1 (Debian 12
+and Amazon Linux 2023) returns `EINVAL`, and 6.12 and 7.1 accept the flag. Any
+other error from either attempt fails the worker's startup with
+`Error::BufferRegistration`, as a registration failure does today (`ENOMEM`
+from `RLIMIT_MEMLOCK` on a kernel that charges rings included). If the large
+group's registration fails after the small group's succeeded, startup fails
+the same way and names the large group.
 
 `ConfigBuilder::recv_incremental(bool)` gates the attempt. From step 7 the
 defaults are: with an INC ring, 64 × 1 MiB, large group off; with a plain
@@ -232,7 +231,7 @@ rerun with #627.
 | No buffer left | `-ENOBUFS` without `F_MORE`, ending the arm. |
 | CQ overflow | A multishot completion that finds the CQ full goes to the overflow list and ends its arm (no `F_MORE`), whether or not data is still queued; the driver re-arms it. The byte order holds across the overflow and the re-arm. From 6.13, on a `DEFER_TASKRUN` ring, the kernel runs at most 20 deferred task_work items per pass (`IO_LOCAL_TW_DEFAULT_MAX`), and an `io_uring_enter` makes at most two passes, so a burst of single-completion receives no longer fills the CQ; receives that each post several completions still do. |
 | EOF on a partly used INC buffer | A completion with `res` 0, no `F_BUFFER` and no `F_MORE`. The buffer stays posted, and another connection's next data lands at the following offset. |
-| `RLIMIT_MEMLOCK` (6.14+) | Charged for each ring's entry array, not the buffers: 16 bytes per entry, at least a page per ring. |
+| `RLIMIT_MEMLOCK` (kernels that charge rings; see `ringline/src/memlock.rs`) | Charged for each ring's entry array, not the buffers: 16 bytes per entry, at least a page per ring. |
 
 The offset order was checked byte for byte on Linux 6.12 and 7.1 with a
 64-entry CQ and 32-entry SQ, under SQPOLL, with held lends and at 10,000
@@ -709,10 +708,10 @@ receive queue, and TCP closes the window until the worker re-arms.
   only large-group size measured.
 - When `prefault_buffers` is set (off by default), it touches each group's
   memory at startup.
-- `RLIMIT_MEMLOCK` (6.14+) is charged only for entry arrays. The launch
-  preflight (`worker.rs` `memlock_required`, through `memlock.rs`) counts
-  both groups' entries: 4096 + 256 for plain rings; 64, or 64 + 64 with the
-  large group, for INC.
+- `RLIMIT_MEMLOCK`, on a kernel that charges rings, is charged only for entry
+  arrays. The launch preflight (`worker.rs` `memlock_required`, through
+  `memlock.rs`) counts both groups' entries: 4096 + 256 for plain rings; 64,
+  or 64 + 64 with the large group, for INC.
 - `recv_accumulator_max` must be at least the larger of 1 MiB and every
   configured buffer size (`recv_buffer`, `recv_large_buffer`), since the
   geometry is chosen at runtime; `build()` rejects a smaller value. Today's
