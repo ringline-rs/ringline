@@ -2119,13 +2119,17 @@ fn check_kernel_floor(
 /// Make sure `RLIMIT_MEMLOCK` covers what the workers' rings will charge to it,
 /// before any worker thread exists.
 ///
-/// Every worker registers the configured regions as fixed buffers, and on
-/// Linux 6.14+ each worker's ring and its UDP provided buffer rings are charged too
-/// (see [`crate::memlock`]). The kernel's default limit is 8 MiB (64 KiB
-/// before Linux 5.16), and it reports a shortfall as a bare `ENOMEM`. When
-/// the hard limit covers the need, this raises the soft limit to the hard
-/// limit, which leaves room for the charges it cannot count. Otherwise it
-/// fails with the fix spelled out.
+/// Every worker registers the configured regions as fixed buffers, and on a
+/// kernel that charges rings (see [`crate::memlock`]) each worker's ring and
+/// its UDP provided buffer rings are charged too. The rings are counted
+/// whenever the version may charge them, and the running kernel is tested
+/// (`kernel_charges_rings`) only when that count does not fit the hard limit:
+/// below that, an overcount can only raise the soft limit to the hard limit
+/// where an exact count would have left it. The kernel's default limit is 8 MiB
+/// (64 KiB before Linux 5.16), and it reports a shortfall as a bare `ENOMEM`.
+/// When the hard limit covers the need, this raises the soft limit to the hard
+/// limit, which leaves room for the charges it cannot count. Otherwise it fails
+/// with the fix spelled out.
 ///
 /// When the hard limit is too low and the CQ was left at its default, the
 /// rings are fitted to the hard limit instead (`fit_ring_sizes`), which lowers
@@ -2141,7 +2145,8 @@ fn check_kernel_floor(
 fn ensure_memlock_limit(config: &mut Config, workers: usize) -> Result<(), crate::error::Error> {
     use crate::error::{MemlockLimit, MemlockPlan, describe_memlock_shortfall, memlock_plan};
     use crate::memlock::{
-        FitStop, KernelVersion, RingSizes, charges_rings, fit_ring_sizes, has_cap_ipc_lock,
+        FitStop, KernelVersion, RingCharge, RingSizes, charges_rings_by_version, fit_ring_sizes,
+        has_cap_ipc_lock, kernel_charges_rings,
     };
 
     if has_cap_ipc_lock() {
@@ -2149,12 +2154,28 @@ fn ensure_memlock_limit(config: &mut Config, workers: usize) -> Result<(), crate
     }
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
     let kernel = KernelVersion::current();
-    let required = memlock_required(config, workers, charges_rings(kernel), page);
+    let mut charge = RingCharge {
+        charged: charges_rings_by_version(kernel),
+        measured: false,
+    };
+    let mut required = memlock_required(config, workers, charge.charged, page);
     if required == 0 {
         return Ok(());
     }
     let limit = MemlockLimit::read().map_err(crate::error::Error::Io)?;
-    match memlock_plan(required, &limit) {
+    let mut plan = memlock_plan(required, &limit);
+    if plan == MemlockPlan::HardTooLow && charge.charged {
+        charge = kernel_charges_rings();
+        if !charge.charged {
+            required = memlock_required(config, workers, false, page);
+            if required == 0 {
+                return Ok(());
+            }
+            plan = memlock_plan(required, &limit);
+        }
+    }
+    let charges_rings = charge.charged;
+    match plan {
         MemlockPlan::Sufficient => Ok(()),
         MemlockPlan::RaiseSoftTo(soft) => {
             let rlim = libc::rlimit {
@@ -2172,7 +2193,7 @@ fn ensure_memlock_limit(config: &mut Config, workers: usize) -> Result<(), crate
                 sq_entries: config.sq_entries,
                 cq_entries: config.cq_entries,
             };
-            let fit = charges_rings(kernel).then(|| {
+            let fit = charges_rings.then(|| {
                 fit_ring_sizes(current, config.sizes_set, |sizes| {
                     memlock_required_for(
                         config,
@@ -2222,10 +2243,12 @@ fn ensure_memlock_limit(config: &mut Config, workers: usize) -> Result<(), crate
             }
             let stop = fit.and_then(Result::err);
             let mut what = format!("{workers} worker(s)");
-            if charges_rings(kernel) {
+            if charges_rings {
                 what.push_str(&match kernel {
-                    Some(k) => format!(", whose io_uring rings Linux {k} charges to the limit,"),
-                    None => ", whose io_uring rings this kernel may charge to the limit,".into(),
+                    Some(k) if charge.measured => {
+                        format!(", whose io_uring rings Linux {k} charges to the limit,")
+                    }
+                    _ => ", whose io_uring rings this kernel may charge to the limit,".into(),
                 });
             }
             if !config.registered_regions.is_empty() {

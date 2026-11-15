@@ -441,14 +441,15 @@ pub mod pool {
     /// generates them; tune `tcp_*_buffer_size` or apply application-level
     /// backpressure.
     pub const SEND_EAGAIN: usize = 3;
-    /// A zero-copy send (`SendMsgZc`) returned `-ENOMEM`, and the rest of
-    /// that send went out as plain `send`s. On Linux the usual cause is
-    /// that the pages the send would pin do not fit under
-    /// `RLIMIT_MEMLOCK`, which charges them from Linux 6.15; from 6.14 the
-    /// rings are charged to the same limit. A process with `CAP_IPC_LOCK` in
-    /// the initial user namespace is not charged.
-    /// Sustained counts mean zero-copy sends are paying a failed submission
-    /// and a copy: raise the memlock limit, or raise `send_zc_threshold`.
+    /// A zero-copy send (`SendMsgZc`) returned `-ENOMEM`, and the rest of that
+    /// send went out as plain `send`s. On Linux the usual cause is that the
+    /// pages the send would pin do not fit under `RLIMIT_MEMLOCK`, which
+    /// charges them from Linux 6.15; on a kernel that charges rings (Linux 6.14
+    /// to 7.2, except 7.2.y from 7.2.11 and 6.18.y from 6.18.58) the rings are
+    /// charged to the same limit. A process with `CAP_IPC_LOCK` in the initial
+    /// user namespace is not charged. Sustained counts mean zero-copy sends are
+    /// paying a failed submission and a copy: raise the memlock limit, or raise
+    /// `send_zc_threshold`.
     pub const SEND_ZC_ENOMEM: usize = 4;
     /// A standalone task did not fit in the worker's slab of
     /// `ConfigBuilder::standalone_task_capacity` slots. `spawn` and

@@ -159,14 +159,15 @@ fixed-size slots.
 `launch` checks `RLIMIT_MEMLOCK` before it spawns workers
 (`ensure_memlock_limit` and `memlock_required` in `ringline/src/worker.rs`),
 on io_uring builds only and not for a process with `CAP_IPC_LOCK`, and counts
-`registered_regions` and, from Linux 6.14, the ring and provided buffer
-rings. A region registered by another crate is not counted. Making `launch`
-fail with `Error::ResourceLimit` when the fabric region does not fit needs a
-new `Config` input: the region's bytes per worker. The two charges add up:
+`registered_regions` and, on a kernel that charges them (see
+`ringline/src/memlock.rs`), the ring and provided buffer rings. A region
+registered by another crate is not counted. Making `launch` fail with
+`Error::ResourceLimit` when the fabric region does not fit needs a new
+`Config` input: the region's bytes per worker. The two charges add up:
 io_uring checks registered buffers against `user->locked_vm` and also adds
-them to `mm->pinned_vm`, and a verbs or EFA registration (`ib_umem_get`)
-adds to `mm->pinned_vm` and checks that against `RLIMIT_MEMLOCK` (Linux
-6.12 source). How the 6.14 ring charge is accounted was not checked. The tcp
+them to `mm->pinned_vm`, and a verbs or EFA registration (`ib_umem_get`) adds
+to `mm->pinned_vm` and checks that against `RLIMIT_MEMLOCK` (Linux 6.12
+source). How the 6.14 ring charge is accounted was not checked. The tcp
 provider pins nothing.
 
 A GET leases a slot. The slot is released when the reply has been consumed,

@@ -498,16 +498,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   default `sq_entries` is 4096 instead of 256. A large CQ keeps completions
   out of the kernel's overflow list, where an allocation failure drops them
   (#831). The default rings take about 2.5 MiB per worker, against about
-  70 KiB before. From Linux 6.14 the kernel charges that to `RLIMIT_MEMLOCK`,
-  summed over every process of the user: four workers' defaults exceed an
-  8 MiB hard limit, such as systemd's default, and launch then fails with
-  `Error::ResourceLimit` naming the `ulimit` to run (it raises the soft
-  limit when the hard limit allows). Before Linux 6.10 the CQ and its header
-  are one physically contiguous 4 MiB block per worker, which can fail with
-  `ENOMEM` on fragmented memory; 32768 entries fit in 2 MiB. Lower
-  `cq_entries`, raise the limit, or run with `CAP_IPC_LOCK`. With the larger
-  SQ, the io-wq pool's bound, `min(sq_entries, 4 × online CPUs)`, is 4 × the
-  CPU count on hosts with more than 64 CPUs, where it was 256.
+  70 KiB before. On Linux 6.14 to 7.2, except 7.2.y from 7.2.11 and 6.18.y from
+  6.18.58, the kernel charges that to `RLIMIT_MEMLOCK`, summed over every
+  process of the user: four workers' defaults exceed an 8 MiB hard limit, such
+  as systemd's default, and launch then fails with `Error::ResourceLimit`
+  naming the `ulimit` to run (it raises the soft limit when the hard limit
+  allows). Before Linux 6.10 the CQ and its header are one physically
+  contiguous 4 MiB block per worker, which can fail with `ENOMEM` on
+  fragmented memory; 32768 entries fit in 2 MiB. Lower `cq_entries`, raise the
+  limit, or run with `CAP_IPC_LOCK`. With the larger SQ, the io-wq pool's
+  bound, `min(sq_entries, 4 × online CPUs)`, is 4 × the CPU count on hosts
+  with more than 64 CPUs, where it was 256.
 - Thread names are short enough that Linux keeps them whole: `rl-work-N`
   (worker), `rl-acpt-N` (acceptor, numbered by listener), `rl-rslv-N`
   (resolver), `rl-spwn-N` (process spawner), `rl-blok-N` (blocking pool) and,
@@ -1173,24 +1174,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ringline::connect` (or `connect_unix`) from a task instead; `ringline::spawn`
   starts one from `on_tick` or `on_notify` (#579).
 - **Breaking:** on io_uring, the TCP provided-buffer ring: TCP and Unix
-  connections receive directly (see Changed and Added), and only UDP
-  receives through a provided ring. A worker no longer allocates the TCP
-  ring's buffers (4 MiB by default) or registers the ring, whose entry array
-  (one page by default) Linux 6.14+ charged to `RLIMIT_MEMLOCK`. With it go
-  `ConfigBuilder::recv_buffer` and `recv_buffer_bgid`; remove those calls.
-  On io_uring, `recv_direct_region` (32 KiB by default) sets the buffer an
-  idle plaintext connection receives into and the most ciphertext a TLS
-  connection receives at a time; a message larger than that buffer borrows
-  a larger one (`recv_direct_pool_max`). On mio, accumulators now start at
-  `recv_accumulator_capacity` (4 KiB by default) instead of the
-  `recv_buffer` size (16 KiB by default); `recv_accumulator_capacity(16384)`
-  restores 0.6's starting size. `recv_accumulator_max` must be at least 1
-  instead of at least that size. `pool::BUFFER_RING_EMPTY` counts only the
-  UDP ring. Also removed: the fallback receive for messages larger than the
-  ring, and the receive throttle for connections whose `forward_recv_buf`
-  sends held ring buffers.
-  `udp_recv_buffer_bgid(0)` with UDP configured, which 0.6 refused because
-  it equalled the TCP ring's default group id, is accepted.
+  connections receive directly (see Changed and Added), and only UDP receives
+  through a provided ring. A worker no longer allocates the TCP ring's buffers
+  (4 MiB by default) or registers the ring, whose entry array (one page by
+  default) a kernel that charges rings charged to `RLIMIT_MEMLOCK`. With it go
+  `ConfigBuilder::recv_buffer` and `recv_buffer_bgid`; remove those calls. On
+  io_uring, `recv_direct_region` (32 KiB by default) sets the buffer an idle
+  plaintext connection receives into and the most ciphertext a TLS connection
+  receives at a time; a message larger than that buffer borrows a larger one
+  (`recv_direct_pool_max`). On mio, accumulators now start at
+  `recv_accumulator_capacity` (4 KiB by default) instead of the `recv_buffer`
+  size (16 KiB by default); `recv_accumulator_capacity(16384)` restores 0.6's
+  starting size. `recv_accumulator_max` must be at least 1 instead of at least
+  that size. `pool::BUFFER_RING_EMPTY` counts only the UDP ring. Also removed:
+  the fallback receive for messages larger than the ring, and the receive
+  throttle for connections whose `forward_recv_buf` sends held ring buffers.
+  `udp_recv_buffer_bgid(0)` with UDP configured, which 0.6 refused because it
+  equalled the TCP ring's default group id, is accepted.
 - **Breaking:** the `ringline/pool` counters `recv_parked`, `recv_fallback`
   and `forward_throttled` (`metrics::pool::RECV_PARKED`, `RECV_FALLBACK`,
   `FORWARD_THROTTLED`), and the `fallback_received` counter of
@@ -1870,11 +1870,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shared. Every socket then stopped receiving, and the worker re-armed on
   `ENOBUFS` about 985,000 times per second. Each socket now has its own
   provided ring, and a socket out of buffers is re-armed when one returns.
-  Until then its datagrams wait in the kernel receive buffer. `udp_recv_buffer`
-  now sizes a ring per socket, so memory and, on Linux 6.14+, `RLIMIT_MEMLOCK`
-  use grow with the number of bound sockets, and buffer groups number up from
-  `udp_recv_buffer_bgid`. A receive callback that panics now returns its buffer
-  to the ring (#742).
+  Until then its datagrams wait in the kernel receive buffer.
+  `udp_recv_buffer` now sizes a ring per socket, so memory and, on a kernel
+  that charges rings, `RLIMIT_MEMLOCK` use grow with the number of bound
+  sockets, and buffer groups number up from `udp_recv_buffer_bgid`. A receive
+  callback that panics now returns its buffer to the ring (#742).
 
 - `ringline-http`: with the decompressed-size cap turned off
   (`set_max_decompressed_size(usize::MAX)` on `H1Conn` or `H2AsyncConn`), a
@@ -2006,12 +2006,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - io_uring: a zero-copy send (`SendMsgZc`) that returned `-ENOMEM`, because
   the pages it pins did not fit under `RLIMIT_MEMLOCK`, was dropped together
-  with every send queued behind it, after `send_parts` had returned `Ok`.
-  The connection stayed open, so later bytes arrived with a gap. The send
-  now goes out as plain `send`s from the guard's memory, and the new
-  `ringline/pool` counter `send_zc_enomem` counts each fallback. From Linux
-  6.15 a zero-copy send is charged `len / page_size + 2` pages while in flight,
-  and from 6.14 the rings are charged to the same limit, so at the common
+  with every send queued behind it, after `send_parts` had returned `Ok`. The
+  connection stayed open, so later bytes arrived with a gap. The send now goes
+  out as plain `send`s from the guard's memory, and the new `ringline/pool`
+  counter `send_zc_enomem` counts each fallback. From Linux 6.15 a zero-copy
+  send is charged `len / page_size + 2` pages while in flight, and on a kernel
+  that charges rings the rings are charged to the same limit, so at the common
   8 MiB limit a guard smaller than 8 MiB can reach it. A `send_chain` with a
   guard part still fails on `-ENOMEM`, as on any send error (#642).
 
@@ -2237,21 +2237,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   steering program to a closed fd number, which another socket could have
   reused; it now acts only on sockets that are still open (#561).
 
-- On Linux 6.14 and later, io_uring charges each ring and each provided buffer
-  ring to `RLIMIT_MEMLOCK`, in addition to registered buffers. The kernel adds
-  the charge to what every process of the same user has charged. The launch
+- On Linux 6.14 to 7.2, except 7.2.y from 7.2.11 and 6.18.y from 6.18.58,
+  io_uring charges each ring and each provided buffer ring to
+  `RLIMIT_MEMLOCK`, in addition to registered buffers. The kernel adds the
+  charge to what every process of the same user has charged. The launch
   preflight counted only `registered_regions`, and once rather than once per
   worker. A config the limit could not hold passed the preflight and failed
-  when a worker started: in `io_uring_setup` with a bare `ENOMEM` on 6.14+, or
-  when registering its regions. The preflight now counts each worker's ring,
-  provided buffer rings and regions, and skips a process with `CAP_IPC_LOCK`
-  in the initial user namespace. When the soft limit is short and the hard
-  limit covers the need, it raises the soft limit to the hard limit rather
-  than to exactly the need, which left no room for anything else the user
-  charges. An `ENOMEM` from `io_uring_setup` or a
-  provided buffer ring registration on 6.14+ now names the limit and the soft
-  value, and says the kernel sums the charge over every process of the user
-  (#426).
+  when a worker started: in `io_uring_setup` with a bare `ENOMEM` on those
+  kernels, or when registering its regions. The preflight now counts each
+  worker's regions, and its ring and provided buffer rings on a kernel that
+  charges them. When that count does not fit the hard limit, launch tests
+  the running kernel by setting up a ring in a child process whose soft
+  limit is 0, and leaves the rings out of the count where they are not
+  charged (#940). The preflight skips a process with `CAP_IPC_LOCK` in the
+  initial user namespace. When the soft limit is short and the hard limit
+  covers the need, it raises the soft limit to the hard limit rather than to
+  exactly the need, which left no room for anything else the user charges.
+  An `ENOMEM` from `io_uring_setup` or a provided buffer ring registration on
+  a kernel that charges rings now names the limit and the soft value, and
+  says the kernel sums the charge over every process of the user (#426).
 
 - A `spawn_blocking` closure that panicked killed its pool thread and left
   the awaiting task pending forever; a few panics could leave the pool with

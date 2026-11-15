@@ -231,7 +231,7 @@ default receive path for a general runtime.
 |---|---|---|
 | `IORING_SETUP_DEFER_TASKRUN` | 6.1 (c0e0d6ba25f1) | task_work, including receive completions, runs only in `io_uring_enter` with `GETEVENTS` |
 | Local task_work cap | 6.13 (f46b9cdb22f7, 49c5c63d48eb); not in 6.12.y | at most `max(20, min_events)` items per run; the rest wait for the next. On 6.12 all pending work runs in one pass |
-| Ring memory charged to `RLIMIT_MEMLOCK` | 6.14 (8078486e1d53, 81a4058e0cd0, ef62de3c4ad5); not in 6.12.y | SQ, CQ and provided-ring entry arrays (16 bytes per entry, page-rounded) are charged unless the process has `CAP_IPC_LOCK`; over the limit is `ENOMEM` |
+| Ring memory charged to `RLIMIT_MEMLOCK` | 6.14 (8078486e1d53, 81a4058e0cd0, ef62de3c4ad5); not in 6.12.y. Removed in 7.3 (b59cabf9b4ac), 7.2.11 and 6.18.58; 7.0.14 and 7.1.13 still charge | SQ, CQ and provided-ring entry arrays (16 bytes per entry, page-rounded) are charged unless the process has `CAP_IPC_LOCK`; over the limit is `ENOMEM` |
 | `kernel.io_uring_disabled` | 6.6 (76d3ccecfa18) | 2 refuses `io_uring_setup` for every process; RHEL and Rocky 10 ship 2 |
 
 The design doc says an `io_uring_enter` makes at most two task_work passes

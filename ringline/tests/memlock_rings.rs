@@ -1,11 +1,13 @@
 //! What io_uring charges to `RLIMIT_MEMLOCK` for the rings themselves, checked
 //! against the running kernel, and that `launch` counts it.
 //!
-//! From Linux 6.14 each ring (its SQ/CQ ring region and SQE array) and each
-//! provided buffer ring is charged; before 6.14 neither is. The byte counts
-//! below are the ones `ringline::memlock`'s unit tests derive from the kernel
-//! source. Here the kernel itself must refuse one page below each and accept
-//! each exactly.
+//! Linux 6.14 to 7.2, except 7.2.y from 7.2.11 and 6.18.y from 6.18.58, charge
+//! each ring (its SQ/CQ ring region and SQE array) and each provided buffer
+//! ring; other kernels charge neither (#940). On a kernel that charges them,
+//! the byte counts below are the ones `ringline::memlock`'s unit tests derive
+//! from the kernel source, and the kernel itself must refuse one page below
+//! each and accept each exactly. On one that does not, launch must not count
+//! them.
 //!
 //! One test, sequential: the hard limit is lowered only for the four launch
 //! steps at the end, because lowering it is irreversible for the process. The
@@ -142,6 +144,24 @@ fn within_limit<T>(what: &str, mut f: impl FnMut() -> io::Result<T>) -> T {
     }
 }
 
+/// Whether the running kernel charges rings to `RLIMIT_MEMLOCK`, which a
+/// kernel carrying 7.3's b59cabf9b4ac does not under any version. Any charge
+/// exceeds a zero soft limit, so a ring sets up under one exactly when rings
+/// are not charged. Launch makes the same check in a child process
+/// (`memlock::probe_ring_charge`). Restores the soft limit.
+fn rings_charged() -> bool {
+    let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut r) }, 0);
+    set_memlock(0, r.rlim_max);
+    let charged = match ring(1) {
+        Ok(_) => false,
+        Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => true,
+        Err(e) => panic!("ring setup under a zero memlock limit: {e}"),
+    };
+    set_memlock(r.rlim_cur, r.rlim_max);
+    charged
+}
+
 fn expect_enomem<T>(what: &str, r: io::Result<T>) {
     match r {
         Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {}
@@ -179,12 +199,21 @@ fn ring_memory_charged_to_memlock_matches_the_kernel() {
     let hard = hard_limit();
     let kernel = kernel();
 
+    let charged = rings_charged();
     if kernel < (6, 14) {
-        // Not charged: a ring and a launch both fit under a one-page limit,
-        // and the preflight must not refuse what the kernel would accept.
+        assert!(!charged, "Linux {kernel:?} charged a ring");
+    }
+    if !charged {
+        // Not charged: rings and launches, with and without a UDP ring, fit
+        // under a one-page limit, and the preflight must not refuse what the
+        // kernel would accept.
         set_memlock(PAGE, PAGE);
-        drop(ring(256).expect("a ring is not charged before 6.14"));
-        launch_and_stop().expect("launch is not charged before 6.14");
+        let held = ring(256).expect("a ring this kernel does not charge");
+        register_pbuf(&held, 512, 0).expect("a provided buffer ring this kernel does not charge");
+        drop(held);
+        launch_and_stop().expect("launch where rings are not charged");
+        launch_and_stop_with(builder().udp_bind("127.0.0.1:0".parse().unwrap()))
+            .expect("launch with UDP where rings are not charged");
         return;
     }
 

@@ -1024,24 +1024,25 @@ impl ConfigBuilder {
     /// completes; the `ring` metrics count both (`cq_overflow`,
     /// `cqe_dropped`). A large CQ keeps completions out of that list.
     ///
-    /// Each CQ entry is 32 bytes, so the default CQ is 2 MiB per worker. From
-    /// Linux 6.14 the kernel charges each ring to `RLIMIT_MEMLOCK`, summed
-    /// over every process of the user. Launch raises the soft limit when the
-    /// hard limit allows. When the hard limit is too low for the workers'
-    /// rings and this is left at the default, launch halves it until the
-    /// rings fit, down to 1024 entries, and lowers the
-    /// [`sq_entries`](Self::sq_entries) and
+    /// Each CQ entry is 32 bytes, so the default CQ is 2 MiB per worker. Linux
+    /// 6.14 to 7.2, except 7.2.y from 7.2.11 and 6.18.y from 6.18.58, charge
+    /// each ring to `RLIMIT_MEMLOCK`, summed over every process of the user.
+    /// Launch tests the running kernel when the charge decides whether the
+    /// rings fit. Launch raises the soft limit when the hard limit allows. When
+    /// the hard limit is too low for the workers' rings and this is left at the
+    /// default, launch halves it until the rings fit, down to 1024 entries, and
+    /// lowers the [`sq_entries`](Self::sq_entries) and
     /// [`max_connections`](Self::max_connections) left at their defaults in
-    /// proportion: a CQ of `c` gives an SQ of `c / 16` and
-    /// `c * 16000 / 65536` connections. An `sq_entries` or `max_connections`
-    /// set on the builder that a smaller CQ cannot hold in that proportion
-    /// stops the fit. A fitted launch writes one line to stderr naming the
-    /// sizes, and [`Runtime::cq_entries`](crate::Runtime::cq_entries) and the
-    /// related accessors report them. When nothing fits, launch fails with
+    /// proportion: a CQ of `c` gives an SQ of `c / 16` and `c * 16000 / 65536`
+    /// connections. An `sq_entries` or `max_connections` set on the builder
+    /// that a smaller CQ cannot hold in that proportion stops the fit. A fitted
+    /// launch writes one line to stderr naming the sizes, and
+    /// [`Runtime::cq_entries`](crate::Runtime::cq_entries) and the related
+    /// accessors report them. When nothing fits, launch fails with
     /// [`Error::ResourceLimit`](crate::Error::ResourceLimit). To have launch
     /// fail instead of running at smaller sizes, set `cq_entries` here. When
-    /// launch fails, raise the limit, run with `CAP_IPC_LOCK`, or set a
-    /// smaller `cq_entries`.
+    /// launch fails, raise the limit, run with `CAP_IPC_LOCK`, or set a smaller
+    /// `cq_entries`.
     ///
     /// Before Linux 6.10 the kernel allocates the CQ and its ring header as
     /// one physically contiguous block, 4 MiB at the default, which can fail
@@ -1386,8 +1387,10 @@ impl ConfigBuilder {
     ///
     /// On io_uring every bound UDP socket has a ring of its own on each worker,
     /// so memory use is `ring_size * buffer_size` per socket and worker. A
-    /// process binding many sockets should choose a small ring. On Linux 6.14+
-    /// each ring also charges at least one page to `RLIMIT_MEMLOCK`.
+    /// process binding many sockets should choose a small ring. On a kernel
+    /// that charges rings (Linux 6.14 to 7.2, except 7.2.y from 7.2.11 and
+    /// 6.18.y from 6.18.58) each ring also charges at least one page to
+    /// `RLIMIT_MEMLOCK`.
     pub fn udp_recv_buffer(mut self, ring_size: u16, buffer_size: u32) -> Self {
         self.config.udp_recv_buffer.ring_size = ring_size;
         self.config.udp_recv_buffer.buffer_size = buffer_size;
