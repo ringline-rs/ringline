@@ -15623,6 +15623,50 @@ mod tests {
         release_slots(&mut el, held);
     }
 
+    /// A bounded TLS send whose slot size has no ciphertext bound is refused
+    /// with `InvalidInput`, naming the knob, before rustls mutates: nothing
+    /// is taken from the pool and the connection stays open. `Config::validate`
+    /// rejects such a slot size, so this installs TLS state after validation,
+    /// as the test above does.
+    #[cfg(not(feature = "tls-buffered"))]
+    #[test]
+    fn send_bounded_refuses_a_tls_send_whose_slot_size_has_no_bound() {
+        let mut el = make_test_loop_with_config(
+            test_config_builder()
+                .send_pool(8, 4096)
+                .build()
+                .expect("valid config"),
+        );
+        let conn_index = accept_connection(&mut el);
+        let generation = el.driver.connections.generation(conn_index);
+        let token = crate::handler::ConnId::new(conn_index, generation);
+        let (_ours, _peer_fd) = attach_socketpair(&mut el, conn_index);
+        install_handshaked_tls(&mut el, conn_index);
+        let id = el.executor.register_send(conn_index);
+        let free_before = el.driver.send_copy_pool.free_count();
+
+        let err = {
+            let mut ctx = el.driver.make_ctx();
+            ctx.send_bounded(token, &[b'z'; 100], id)
+        }
+        .expect_err("a 4 KiB slot cannot bound a TLS send");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("send_copy_slot_size"),
+            "the refusal names the slot size: {err}"
+        );
+        assert_eq!(
+            el.driver.send_copy_pool.free_count(),
+            free_before,
+            "nothing was encrypted"
+        );
+        let conn = el.driver.connections.get(conn_index).expect("still open");
+        assert!(
+            !conn.close_requested(),
+            "a refusal before rustls mutates closes nothing"
+        );
+    }
+
     /// Departure 1, end to end on the path the series was built for: a
     /// bounded **TLS** send whose SQE cannot be pushed.
     ///
