@@ -1,0 +1,18 @@
+diff --git a/ringline-bench/src/bin/server.rs b/ringline-bench/src/bin/server.rs
+index 5cb3f8a6..fd402172 100644
+--- a/ringline-bench/src/bin/server.rs
++++ b/ringline-bench/src/bin/server.rs
+@@ -898,6 +898,13 @@ fn run_ringline(cfg: EchoCfg) {
+         )
+         .conn_chunk_size(conn_chunk_size)
+         .accept_mode(accept_mode.into())
++        // DIAGNOSTIC (not for commit): accept queue capacity from the environment.
++        .accept_queue_capacity(
++            std::env::var("BENCH_ACCEPT_QUEUE")
++                .ok()
++                .and_then(|s| s.parse().ok())
++                .unwrap_or(1024),
++        )
+         .tick_timeout_us(tick_timeout_us);
+     let staged = match iowq_max_workers {
+         Some(n) => staged.iowq_max_workers(n),
