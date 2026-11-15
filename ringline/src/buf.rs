@@ -204,7 +204,8 @@ impl AlignedBuf {
     /// # Panics
     ///
     /// Panics if `align` is not a power of two, if `capacity` rounded up to
-    /// `align` overflows `isize`, or if the allocation fails.
+    /// the larger of `align` and [`DIRECT_IO_ALIGN`] overflows `isize`, or if
+    /// the allocation fails.
     pub fn with_capacity(capacity: usize, align: usize) -> Self {
         Self::allocate(capacity, align, false)
     }
@@ -224,7 +225,7 @@ impl AlignedBuf {
     fn allocate(capacity: usize, align: usize, zeroed: bool) -> Self {
         assert!(
             align.is_power_of_two(),
-            "AlignedBuf: align must be a power of two and the size must fit isize"
+            "AlignedBuf: align must be a power of two"
         );
         // A multiple of `DIRECT_IO_ALIGN` is a multiple of every smaller
         // power of two, so raising `align` keeps the caller's guarantee.

@@ -189,7 +189,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         self.driver.run_shutdown();
     }
 
-    /// Whether the drain ended with an fs or NVMe command still in flight.
+    /// Whether the drain ended with an fs, direct I/O or NVMe command still in
+    /// flight.
     /// The kernel can still use memory the event loop and its tasks own, so
     /// the caller must leak it, through [`close_ring`](Self::close_ring)
     /// (#824).

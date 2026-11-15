@@ -293,7 +293,8 @@ pub use runtime::io::Connection;
 /// A monotonic clock deadline for absolute timers.
 pub use runtime::io::Deadline;
 /// Future that awaits a disk-I/O completion that carries no buffer
-/// (`fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, `nvme_flush`).
+/// (`fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, `direct_io::fsync`,
+/// `nvme_flush`).
 pub use runtime::io::DiskIoFuture;
 /// Error returned when a [`timeout()`] expires.
 pub use runtime::io::Elapsed;
@@ -464,6 +465,12 @@ pub use buffer::fixed::RegionId;
 pub use config::Config;
 /// Builder for [`Config`] with discoverable methods and `build()` validation.
 pub use config::ConfigBuilder;
+/// Direct I/O configuration.
+pub use direct_io::DirectIoConfig;
+/// Direct I/O file handle.
+pub use direct_io::DirectIoFile;
+/// Options for opening a direct I/O file.
+pub use direct_io::DirectIoOpenOptions;
 /// Runtime errors.
 pub use error::Error;
 /// Zero-copy send guard trait.

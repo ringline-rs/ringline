@@ -5226,7 +5226,8 @@ impl<F: Future> Future for TimeoutFuture<F> {
 // ── Disk I/O async API ──────────────────────────────────────────────
 
 /// Future that awaits a disk-I/O completion that carries no buffer:
-/// `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir` and `nvme_flush`.
+/// `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, `direct_io::fsync`
+/// and `nvme_flush`.
 /// Reads and writes return a [`ReadFuture`](crate::fs::ReadFuture) or
 /// [`WriteFuture`](crate::fs::WriteFuture), which hold their buffer. The
 /// operation was submitted before this future was created; its completion

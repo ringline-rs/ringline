@@ -364,10 +364,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `DirectIoFile`; then `read_into`, `write_from`, `fsync` and `close`.
   `read_into` and `write_from` take the buffer by value and accept only a
   buffer that implements `buf::IoBufAligned`, such as `AlignedBuf`; a
-  `Vec<u8>` or `BytesMut` does not compile. They replace
-  `open_direct_io_file`, `open_direct_io_file_with`, `direct_io_read`,
-  `direct_io_write`, `direct_io_fsync`, `close_direct_io_file` and the
-  `DriverCtx` methods of those names. The open no longer blocks the worker:
+  `Vec<u8>`, a `BytesMut` or a `Bytes` (including the one
+  `AlignedBuf::freeze` returns) does not compile. A write's data starts at
+  the buffer's start, so a write from memory aligned to 512 bytes but not
+  to 4096 cannot be expressed. They replace the free functions
+  `open_direct_io_file`, `direct_io_read` and `direct_io_write` (the last
+  two took a raw pointer) and the `DriverCtx` methods `open_direct_io_file`,
+  `direct_io_read`, `direct_io_write`, `direct_io_fsync` and
+  `close_direct_io_file`. As before, the open is `O_RDWR` and does not
+  create the file. The open no longer blocks the worker:
   `open_direct_io_file` ran `open(2)` on it, and on io_uring a synchronous
   fixed-file registration; `direct_io::open` submits `IORING_OP_OPENAT` into
   a fixed slot on io_uring and runs on the disk-I/O pool on mio, and holds a

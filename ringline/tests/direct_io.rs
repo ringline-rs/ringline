@@ -406,15 +406,19 @@ fn a_dropped_direct_io_open_frees_its_slot() {
 
 static SEPARATE_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
-fn separate_path() -> PathBuf {
-    temp_file_path(&format!(".krio_direct_io_separate_{}", std::process::id()))
+fn separate_paths() -> (PathBuf, PathBuf) {
+    let pid = std::process::id();
+    (
+        temp_file_path(&format!(".krio_direct_io_separate_fs_{pid}")),
+        temp_file_path(&format!(".krio_direct_io_separate_direct_{pid}")),
+    )
 }
 
-/// With one slot in each table: an fs file and a direct I/O file are open at
-/// once, a second of either fails with its own table's error, and each
-/// handle reads its own file.
-async fn tables_are_separate(path: &str) -> Result<(), String> {
-    let fs_file = ringline::fs::open(path, ringline::fs::OpenFlags::READ, 0)
+/// With one slot in each table: an fs file (all 0xa5) and a direct I/O file
+/// (all 0x5a) are open at once, a second of either fails with its own
+/// table's error, and each handle reads its own file.
+async fn tables_are_separate(fs_path: &str, path: &str) -> Result<(), String> {
+    let fs_file = ringline::fs::open(fs_path, ringline::fs::OpenFlags::READ, 0)
         .map_err(|e| format!("fs open: {e}"))?
         .await
         .map_err(|e| format!("fs open: {e}"))?;
@@ -441,9 +445,10 @@ async fn tables_are_separate(path: &str) -> Result<(), String> {
     if n != BLOCK || buf.iter().any(|&b| b != 0x5a) {
         return Err(format!("the direct read returned {n} bytes of other data"));
     }
-    let (n, _) = ringline::fs::read_into(fs_file, 0, Vec::with_capacity(BLOCK)).await;
-    if n.map_err(|e| format!("fs read: {e}"))? != BLOCK {
-        return Err("the fs read was short".to_string());
+    let (n, buf) = ringline::fs::read_into(fs_file, 0, Vec::with_capacity(BLOCK)).await;
+    let n = n.map_err(|e| format!("fs read: {e}"))?;
+    if n != BLOCK || buf.iter().any(|&b| b != 0xa5) {
+        return Err(format!("the fs read returned {n} bytes of other data"));
     }
     ringline::direct_io::close(direct).map_err(|e| format!("direct close: {e}"))?;
     ringline::fs::close(fs_file).map_err(|e| format!("fs close: {e}"))
@@ -458,8 +463,9 @@ impl AsyncEventHandler for SeparateHandler {
 
     fn on_start(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + 'static>>> {
         Some(Box::pin(async {
-            let path = separate_path();
-            let result = tables_are_separate(path.to_str().unwrap()).await;
+            let (fs_path, path) = separate_paths();
+            let result =
+                tables_are_separate(fs_path.to_str().unwrap(), path.to_str().unwrap()).await;
             let _ = SEPARATE_RESULT.set(result);
             ringline::request_shutdown().ok();
         }))
@@ -476,7 +482,8 @@ fn fs_and_direct_io_files_take_slots_from_separate_tables() {
         eprintln!("skipping: O_DIRECT is not supported here");
         return;
     }
-    let path = separate_path();
+    let (fs_path, path) = separate_paths();
+    std::fs::write(&fs_path, [0xa5u8; BLOCK]).unwrap();
     std::fs::write(&path, [0x5au8; BLOCK]).unwrap();
     let config = direct_test_config_builder()
         .fs(FsConfig::default().max_files(1).max_commands_in_flight(8))
@@ -491,6 +498,7 @@ fn fs_and_direct_io_files_take_slots_from_separate_tables() {
         .launch::<SeparateHandler>()
         .expect("launch failed");
     common::join_workers(&runtime, handles);
+    let _ = std::fs::remove_file(&fs_path);
     let _ = std::fs::remove_file(&path);
     SEPARATE_RESULT
         .get()

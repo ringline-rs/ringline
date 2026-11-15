@@ -117,7 +117,7 @@ pub(crate) enum DirectRecvBuf {
 const ABORT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The longest worker exit waits for connections to close, send slab entries
-/// to be released and fs and NVMe commands to complete.
+/// to be released and fs, direct I/O and NVMe commands to complete.
 const SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Driver {
@@ -1004,7 +1004,7 @@ pub(crate) struct Driver {
     /// the filesystem range.
     pub(crate) direct_io_fd_base: u32,
     /// Set by [`run_shutdown`](Self::run_shutdown) when its drain ended, at
-    /// the bound or on a ring error, with an fs or NVMe command
+    /// the bound or on a ring error, with an fs, direct I/O or NVMe command
     /// still in flight. The kernel can still use the command's buffer or statx
     /// box, so the worker leaks its event loop instead of dropping it (#824).
     pub(crate) disk_io_outstanding: bool,
@@ -3521,7 +3521,7 @@ impl Driver {
             }
         }
 
-        // Cancel every fs and NVMe command. A read or write
+        // Cancel every fs, direct I/O and NVMe command. A read or write
         // waiting for a pipe or FIFO to become ready ends at once and
         // transfers nothing. An operation already in progress, on io-wq or in
         // the device (`O_DIRECT`, NVMe), completes in its own time and the
@@ -3548,7 +3548,7 @@ impl Driver {
         }
 
         // 3. Submit + drain loop until every connection's Close has
-        //    completed, every slab entry is released and every fs and NVMe
+        //    completed, every slab entry is released and every fs, direct I/O and NVMe
         //    command has completed, for at most `SHUTDOWN_BOUND`.
         //    Each wait ends after at most 100 ms, so a pass never blocks
         //    indefinitely. A pass ends at any CQE, so neither the pass count

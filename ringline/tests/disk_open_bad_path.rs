@@ -1,6 +1,6 @@
 #![allow(clippy::manual_async_fn)]
 //! An open that fails on a path with an interior NUL leaves the file table as
-//! it was: with two slots, three failed opens are followed by two that succeed.
+//! it was, for fs and for direct I/O: with two slots, three failed opens are followed by two that succeed.
 
 mod common;
 
@@ -99,6 +99,71 @@ fn a_nul_path_does_not_leak_a_direct_io_slot() {
         return;
     }
     result.unwrap();
+}
+
+static FS_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+
+async fn fs_bad_paths(path: &str) -> Result<(), String> {
+    let flags = ringline::fs::OpenFlags::READ;
+    for round in 0..3 {
+        match ringline::fs::open("a\0b", flags, 0) {
+            Ok(_) => return Err(format!("round {round}: a NUL path opened")),
+            Err(e) if e.to_string() == "path contains null byte" => {}
+            Err(e) => return Err(format!("round {round}: unexpected error: {e}")),
+        }
+    }
+    let open = |which: &'static str| async move {
+        ringline::fs::open(path, flags, 0)
+            .map_err(|e| format!("{which} open: {e}"))?
+            .await
+            .map_err(|e| format!("{which} open: {e}"))
+    };
+    let a = open("first").await?;
+    let b = open("second").await?;
+    ringline::fs::close(a).map_err(|e| format!("close a: {e}"))?;
+    ringline::fs::close(b).map_err(|e| format!("close b: {e}"))?;
+    Ok(())
+}
+
+struct FsHandler;
+
+impl AsyncEventHandler for FsHandler {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let path = file_path("bad_path_fs");
+            let result = fs_bad_paths(path.to_str().unwrap()).await;
+            let _ = FS_RESULT.set(result);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        FsHandler
+    }
+}
+
+/// With two fs slots, three opens refused for a NUL path are followed by two
+/// that succeed.
+#[test]
+fn a_nul_path_does_not_leak_an_fs_slot() {
+    let path = file_path("bad_path_fs");
+    std::fs::write(&path, [0u8; 4096]).unwrap();
+    let config = config_builder()
+        .fs(ringline::fs::FsConfig::default()
+            .max_files(2)
+            .max_commands_in_flight(8))
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<FsHandler>()
+        .expect("launch failed");
+    common::join_workers(&runtime, handles);
+    let _ = std::fs::remove_file(&path);
+    FS_RESULT.get().expect("the task finished").clone().unwrap();
 }
 
 #[cfg(has_io_uring)]

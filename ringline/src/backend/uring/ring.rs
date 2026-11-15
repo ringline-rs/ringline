@@ -101,7 +101,7 @@ pub(crate) fn close_lead_for(kernel: Option<KernelVersion>) -> CloseLead {
 /// and pushes it to the engine.
 pub struct Ring {
     pub(crate) engine: ActiveEngine,
-    /// Disk-I/O operations (fs, NVMe) the ring refused, and
+    /// Disk-I/O operations (fs, direct I/O, NVMe) the ring refused, and
     /// those submitted while earlier ones were queued, in submission order.
     /// [`push_disk_sqe`](Self::push_disk_sqe) queues them and
     /// [`retry_disk_pushes`](Self::retry_disk_pushes) pushes them again after
