@@ -1865,7 +1865,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             OpTag::SendUdp => self.handle_send_udp(ud, result),
             OpTag::NvmeCmd => self.handle_nvme_cmd(ud, result),
             OpTag::FileClose => self.handle_file_close(ud),
-            OpTag::Fs => self.handle_fs(ud, result),
+            OpTag::Fs => self.handle_file(crate::fs::FileKind::Fs, ud, result),
+            OpTag::DirectIo => self.handle_file(crate::fs::FileKind::DirectIo, ud, result),
             OpTag::PidfdPoll => self.handle_pidfd_poll(ud, result),
             OpTag::SendPollOut => self.handle_send_pollout(ud, result, flags),
             OpTag::SendMsgCoalesced => self.handle_send_msg_coalesced(ud, result),
@@ -4464,14 +4465,19 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    /// An `IORING_OP_CLOSE` of an fs file's or NVMe device's fixed-file slot
-    /// completed: free its table slot. A failed close frees it too; an open
+    /// An `IORING_OP_CLOSE` of an fs file's, direct I/O file's or NVMe
+    /// device's fixed-file slot completed: free its table slot. A failed close frees it too; an open
     /// into the slot replaces whatever it still holds.
     fn handle_file_close(&mut self, ud: UserData) {
         let index = ud.conn_index() as u16;
         match ud.payload() {
             crate::completion::FILE_CLOSE_FS => {
                 if let Some(files) = self.driver.fs_files.as_mut() {
+                    files.release(index);
+                }
+            }
+            crate::completion::FILE_CLOSE_DIRECT_IO => {
+                if let Some(files) = self.driver.direct_io_files.as_mut() {
                     files.release(index);
                 }
             }
@@ -4484,13 +4490,28 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         }
     }
 
-    fn handle_fs(&mut self, ud: UserData, result: i32) {
+    /// The completion of an fs or direct I/O command; `kind` names the
+    /// table and slab it used.
+    fn handle_file(&mut self, kind: crate::fs::FileKind, ud: UserData, result: i32) {
         let slab_idx = ud.payload() as u16;
         let file_index = ud.conn_index() as u16;
+        let close_payload = kind.file_close_payload();
 
-        let cmd_slab = match self.driver.fs_cmd_slab {
-            Some(ref mut s) => s,
-            None => return,
+        let driver = &mut *self.driver;
+        let (cmd_slab, files, fd_base) = match kind {
+            crate::fs::FileKind::Fs => (
+                &mut driver.fs_cmd_slab,
+                &mut driver.fs_files,
+                driver.fs_fd_base,
+            ),
+            crate::fs::FileKind::DirectIo => (
+                &mut driver.direct_io_cmd_slab,
+                &mut driver.direct_io_files,
+                driver.direct_io_fd_base,
+            ),
+        };
+        let Some(cmd_slab) = cmd_slab.as_mut() else {
+            return;
         };
 
         let Some(key) = cmd_slab.key_for(slab_idx, ud.raw()) else {
@@ -4514,16 +4535,12 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             cmd_slab.release(slab_idx);
             if result >= 0 {
                 // The slot is free once the close completes.
-                let fd_index = self.driver.fs_fd_base + file_index as u32;
-                self.driver.ring.submit_fixed_close(
+                let fd_index = fd_base + file_index as u32;
+                driver.ring.submit_fixed_close(
                     fd_index,
-                    UserData::encode(
-                        OpTag::FileClose,
-                        file_index as u32,
-                        crate::completion::FILE_CLOSE_FS,
-                    ),
+                    UserData::encode(OpTag::FileClose, file_index as u32, close_payload),
                 );
-            } else if let Some(ref mut files) = self.driver.fs_files {
+            } else if let Some(files) = files.as_mut() {
                 files.release(file_index);
             }
             return;
@@ -4532,30 +4549,29 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // For Open ops, handle success/failure of the file slot.
         if op == Some(crate::fs::FsOp::Open) && result < 0 {
             // Open failed — release the pre-allocated file slot.
-            if let Some(ref mut files) = self.driver.fs_files {
+            if let Some(files) = files.as_mut() {
                 files.release(file_index);
             }
         }
 
         let (released_file_index, released_op) = cmd_slab.release(slab_idx);
-        self.submit_released_fsyncs(key);
 
         // Decrement in-flight count for file-bound ops.
         match released_op {
             crate::fs::FsOp::Read | crate::fs::FsOp::Write | crate::fs::FsOp::Fsync => {
-                if let Some(ref mut files) = self.driver.fs_files
+                if let Some(files) = files.as_mut()
                     && let Some(f) = files.get_mut(released_file_index)
                 {
                     f.in_flight = f.in_flight.saturating_sub(1);
-                    // A close deferred by `fs_close` is submitted after the
+                    // A close deferred by `file_close` is submitted after the
                     // last operation on the file (#859).
                     if f.closing && f.in_flight == 0 {
-                        self.driver.ring.submit_fixed_close(
+                        driver.ring.submit_fixed_close(
                             f.fd_index,
                             UserData::encode(
                                 OpTag::FileClose,
                                 released_file_index as u32,
-                                crate::completion::FILE_CLOSE_FS,
+                                close_payload,
                             ),
                         );
                     }
@@ -4563,6 +4579,8 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
             }
             _ => {}
         }
+
+        self.submit_released_fsyncs(key);
 
         // Wake the async task waiting for this completion.
         self.executor.wake_disk_io_with(key, result, metadata);
@@ -6804,15 +6822,25 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `OpenFlags::DIRECT` reaches the kernel through `OpenAt`: on a file
-    /// opened with it, a write whose length is not a multiple of the block
-    /// size fails with `EINVAL`, where a buffered write would succeed. It
-    /// relies on the working directory's filesystem refusing unaligned
+    /// A loop with direct I/O configured.
+    fn make_direct_io_test_loop() -> AsyncEventLoop<NoopHandler> {
+        make_test_loop_with_config(
+            test_config_builder()
+                .direct_io(crate::direct_io::DirectIoConfig::default())
+                .build()
+                .expect("valid config"),
+        )
+    }
+
+    /// A direct I/O open passes `O_DIRECT` to the kernel through `OpenAt`:
+    /// on a file it opened, a write whose length is not a multiple of the
+    /// block size fails with `EINVAL`, where a buffered write would succeed.
+    /// It relies on the working directory's filesystem refusing unaligned
     /// `O_DIRECT` writes, as ext4 and XFS do; btrfs falls back to buffered
     /// I/O instead.
     #[test]
     fn o_direct_reaches_the_kernel_through_openat() {
-        let mut el = make_test_loop();
+        let mut el = make_direct_io_test_loop();
         let path = std::env::current_dir()
             .unwrap()
             .join(format!(".ringline-o-direct-openat-{}", std::process::id()));
@@ -6821,34 +6849,39 @@ mod tests {
         let (index, generation) = el
             .driver
             .make_ctx()
-            .fs_open(
+            .direct_io_open(
                 &path,
-                crate::fs::OpenFlags::READ_WRITE | crate::fs::OpenFlags::DIRECT,
-                0,
+                crate::direct_io::DirectIoOpenOptions::new(),
                 open_key,
             )
             .expect("submit open");
         assert!(wait_for_result(&mut el, open_key) >= 0, "O_DIRECT open");
-        let file = crate::fs::File::new(index, generation);
+        let kind = crate::fs::FileKind::DirectIo;
         static SHORT: [u8; 100] = [7; 100];
         let write_key = el.executor.begin_disk_io(0);
         unsafe {
-            el.driver
-                .make_ctx()
-                .fs_write(file, 0, SHORT.as_ptr(), 100, write_key)
+            el.driver.make_ctx().file_write(
+                kind,
+                index,
+                generation,
+                0,
+                SHORT.as_ptr(),
+                100,
+                write_key,
+            )
         }
         .expect("submit write");
         let result = wait_for_result(&mut el, write_key);
-        let _ = el.driver.make_ctx().fs_close(file);
+        let _ = el.driver.make_ctx().file_close(kind, index, generation);
         let _ = std::fs::remove_file(&path);
         assert_eq!(result, -libc::EINVAL, "an unaligned O_DIRECT write");
     }
 
-    /// As `an_fsync_waits_for_an_earlier_write_to_complete`, for a file
-    /// opened with `OpenFlags::DIRECT` (`O_DIRECT` through `OpenAt`).
+    /// As `an_fsync_waits_for_an_earlier_write_to_complete`, for a direct
+    /// I/O file (`O_DIRECT` through `OpenAt`).
     #[test]
     fn an_fsync_on_an_o_direct_file_waits_for_an_earlier_write() {
-        let mut el = make_test_loop();
+        let mut el = make_direct_io_test_loop();
         // In the working directory: tmpfs may refuse O_DIRECT.
         let path = std::env::current_dir()
             .unwrap()
@@ -6858,29 +6891,29 @@ mod tests {
         let (index, generation) = el
             .driver
             .make_ctx()
-            .fs_open(
+            .direct_io_open(
                 &path,
-                crate::fs::OpenFlags::READ_WRITE | crate::fs::OpenFlags::DIRECT,
-                0,
+                crate::direct_io::DirectIoOpenOptions::new(),
                 open_key,
             )
             .expect("submit open");
         assert!(wait_for_result(&mut el, open_key) >= 0, "O_DIRECT open");
-        let file = crate::fs::File::new(index, generation);
+        let kind = crate::fs::FileKind::DirectIo;
         let block = crate::buf::AlignedBuf::zeroed(4096, 4096);
         let [write_key, sync_key] = [(); 2].map(|()| el.executor.begin_disk_io(0));
         {
             let mut ctx = el.driver.make_ctx();
-            unsafe { ctx.fs_write(file, 0, block.as_ptr(), 4096, write_key) }
+            unsafe { ctx.file_write(kind, index, generation, 0, block.as_ptr(), 4096, write_key) }
                 .expect("submit write");
-            ctx.fs_fsync(file, sync_key).expect("submit fsync");
+            ctx.file_fsync(kind, index, generation, sync_key)
+                .expect("submit fsync");
         }
         assert_eq!(el.driver.write_orders.held(), 1, "the fsync is held");
         assert_eq!(wait_for_result(&mut el, write_key), 4096);
         assert_eq!(el.driver.write_orders.held(), 0, "the write released it");
         assert_eq!(wait_for_result(&mut el, sync_key), 0, "fsync");
         drop(block);
-        let _ = el.driver.make_ctx().fs_close(file);
+        let _ = el.driver.make_ctx().file_close(kind, index, generation);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -6903,9 +6936,14 @@ mod tests {
         assert!(wait_for_result(&mut el, open_key) >= 0, "open");
         let file = crate::fs::File::new(index, generation);
         const EARLIER: crate::runtime::DiskIoKey = u64::MAX;
-        el.driver
-            .write_orders
-            .begin_write(crate::disk_order::OrderKey { index, generation }, EARLIER);
+        el.driver.write_orders.begin_write(
+            crate::disk_order::OrderKey {
+                kind: crate::fs::FileKind::Fs,
+                index,
+                generation,
+            },
+            EARLIER,
+        );
 
         static DATA: &[u8] = b"later";
         let mut buf = [0u8; 4];
@@ -6951,9 +6989,14 @@ mod tests {
         );
         let file = crate::fs::File::new(index, generation);
         // Stand in for a write still in flight on the file.
-        el.driver
-            .write_orders
-            .begin_write(crate::disk_order::OrderKey { index, generation }, u64::MAX);
+        el.driver.write_orders.begin_write(
+            crate::disk_order::OrderKey {
+                kind: crate::fs::FileKind::Fs,
+                index,
+                generation,
+            },
+            u64::MAX,
+        );
         let sync_key = el.executor.begin_disk_io(0);
         el.driver
             .make_ctx()

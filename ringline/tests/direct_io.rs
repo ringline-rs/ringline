@@ -1,9 +1,10 @@
 #![allow(clippy::manual_async_fn)]
-//! Integration tests: files opened with `OpenFlags::DIRECT`.
+//! Integration tests: `ringline::direct_io`.
 //!
-//! On Linux this is `O_DIRECT`: io_uring `IORING_OP_OPENAT`, `READ` and
-//! `WRITE` on a fixed file, or `open`, `pread` and `pwrite` on the mio
-//! backend's pool. On macOS (mio) `DIRECT` is `F_NOCACHE`.
+//! On Linux the files are opened with `O_DIRECT`: io_uring
+//! `IORING_OP_OPENAT`, `READ` and `WRITE` on a fixed file, or `open`, `pread`
+//! and `pwrite` on the mio backend's pool. On macOS (mio) the open sets
+//! `F_NOCACHE`.
 //!
 //! Linux needs a filesystem that accepts `O_DIRECT`; the files are in the
 //! working directory rather than the temp dir, which may be tmpfs.
@@ -15,7 +16,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ringline::fs::{File, FsConfig, OpenFlags};
+use ringline::direct_io::{DirectIoConfig, DirectIoFile, DirectIoOpenOptions};
+use ringline::fs::FsConfig;
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -27,7 +29,11 @@ fn direct_test_config_builder() -> ConfigBuilder {
         .sq_entries(64)
         .max_connections(8)
         .send_pool(8, 16384)
-        .fs(FsConfig::default().max_files(4).max_commands_in_flight(32))
+        .direct_io(
+            DirectIoConfig::default()
+                .max_files(4)
+                .max_commands_in_flight(32),
+        )
 }
 
 /// A path in the working directory, which is not tmpfs.
@@ -59,25 +65,21 @@ fn o_direct_supported() -> bool {
     }
 }
 
-/// On macOS `DIRECT` is `F_NOCACHE`, which every filesystem accepts.
+/// On macOS the open sets `F_NOCACHE`, which every filesystem accepts.
 #[cfg(not(target_os = "linux"))]
 fn o_direct_supported() -> bool {
     true
 }
 
-/// Open `path` read-write with `DIRECT` and `extra`. A slot is free once the
-/// close of its previous file has completed (on io_uring, an
-/// `IORING_OP_CLOSE`), so an open that finds the table full yields and tries
-/// again, at most 1000 times.
-async fn open_direct(path: &str, extra: Option<OpenFlags>) -> Result<File, String> {
-    let mut flags = OpenFlags::READ_WRITE | OpenFlags::DIRECT;
-    if let Some(extra) = extra {
-        flags = flags | extra;
-    }
+/// Open `path` for direct I/O with `options`. A slot is free once the close
+/// of its previous file has completed (on io_uring, an `IORING_OP_CLOSE`), so
+/// an open that finds the table full yields and tries again, at most 1000
+/// times.
+async fn open_direct(path: &str, options: DirectIoOpenOptions) -> Result<DirectIoFile, String> {
     for _ in 0..1000 {
-        match ringline::fs::open(path, flags, 0) {
+        match ringline::direct_io::open_with(path, options) {
             Ok(open) => return open.await.map_err(|e| format!("open: {e}")),
-            Err(e) if e.to_string() == "filesystem file table full" => {
+            Err(e) if e.to_string() == "direct I/O file table full" => {
                 ringline::yield_now().await;
             }
             Err(e) => return Err(format!("open: {e}")),
@@ -101,13 +103,13 @@ fn filled_block(byte: u8) -> ringline::buf::AlignedBuf {
 static DSYNC_OUTCOME: std::sync::Mutex<Option<Result<(), String>>> = std::sync::Mutex::new(None);
 
 async fn dsync_write_fsync_read(path: &str) -> Result<(), String> {
-    let file = open_direct(path, Some(OpenFlags::DSYNC)).await?;
-    let (n, out) = ringline::fs::write_from(file, 0, filled_block(0xa5)).await;
+    let file = open_direct(path, DirectIoOpenOptions::new().dsync(true)).await?;
+    let (n, out) = ringline::direct_io::write_from(file, 0, filled_block(0xa5)).await;
     let n = n.map_err(|e| format!("write: {e}"))?;
     if n != BLOCK {
         return Err(format!("wrote {n} bytes"));
     }
-    let synced = ringline::fs::fsync(file)
+    let synced = ringline::direct_io::fsync(file)
         .map_err(|e| e.to_string())?
         .await
         .map_err(|e| format!("fsync: {e}"))?;
@@ -115,12 +117,12 @@ async fn dsync_write_fsync_read(path: &str) -> Result<(), String> {
         return Err(format!("fsync resolved to {synced}"));
     }
     let back = ringline::buf::AlignedBuf::with_capacity(BLOCK, BLOCK);
-    let (n, back) = ringline::fs::read_into(file, 0, back).await;
+    let (n, back) = ringline::direct_io::read_into(file, 0, back).await;
     let n = n.map_err(|e| format!("read: {e}"))?;
     if n != BLOCK || back[..] != out[..] {
         return Err(format!("read {n} bytes that differ from the write"));
     }
-    ringline::fs::close(file).map_err(|e| format!("close: {e}"))
+    ringline::direct_io::close(file).map_err(|e| format!("close: {e}"))
 }
 
 struct DsyncHandler;
@@ -144,8 +146,8 @@ impl AsyncEventHandler for DsyncHandler {
     }
 }
 
-/// A file opened with `DIRECT | DSYNC` takes aligned writes and reads, and
-/// its fsync future resolves to `Ok(0)`.
+/// A file opened with `dsync` takes aligned writes and reads, and its fsync
+/// future resolves to `Ok(0)`.
 #[test]
 fn a_direct_dsync_file_round_trips_and_its_fsync_future_resolves() {
     if !o_direct_supported() {
@@ -186,14 +188,14 @@ fn queued_paths() -> (PathBuf, PathBuf) {
 /// A write queued before a close lands in the closed file, the handle goes
 /// stale at once, and the next file opened gets none of it.
 async fn write_close_open(first: &str, second: &str) -> Result<(), String> {
-    let a = open_direct(first, None).await?;
-    let write = ringline::fs::write_from(a, 0, filled_block(0xab));
-    let closed = ringline::fs::close(a).map_err(|e| e.to_string());
-    let stale = ringline::fs::close(a).is_err();
-    let b = open_direct(second, None).await;
+    let a = open_direct(first, DirectIoOpenOptions::new()).await?;
+    let write = ringline::direct_io::write_from(a, 0, filled_block(0xab));
+    let closed = ringline::direct_io::close(a).map_err(|e| e.to_string());
+    let stale = ringline::direct_io::close(a).is_err();
+    let b = open_direct(second, DirectIoOpenOptions::new()).await;
     let written = write.await.0.map_err(|e| e.to_string())?;
     closed?;
-    ringline::fs::close(b?).map_err(|e| e.to_string())?;
+    ringline::direct_io::close(b?).map_err(|e| e.to_string())?;
     if !stale {
         return Err("a second close of the handle succeeded".to_string());
     }
@@ -207,26 +209,26 @@ async fn write_close_open(first: &str, second: &str) -> Result<(), String> {
 /// fails once a slot leaks.
 async fn deferred_closes_release_their_slots(path: &str) -> Result<(), String> {
     for round in 0..16 {
-        let file = open_direct(path, None)
+        let file = open_direct(path, DirectIoOpenOptions::new())
             .await
             .map_err(|e| format!("round {round}: {e}"))?;
         let submit = |e: std::io::Error| format!("round {round}: submit: {e}");
         let op: std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>>>> = match round % 3 {
             0 => {
-                let write = ringline::fs::write_from(file, 0, filled_block(0));
+                let write = ringline::direct_io::write_from(file, 0, filled_block(0));
                 Box::pin(async move { write.await.0 })
             }
             1 => {
                 let buf = ringline::buf::AlignedBuf::with_capacity(BLOCK, BLOCK);
-                let read = ringline::fs::read_into(file, 0, buf);
+                let read = ringline::direct_io::read_into(file, 0, buf);
                 Box::pin(async move { read.await.0 })
             }
             _ => {
-                let fsync = ringline::fs::fsync(file).map_err(submit)?;
+                let fsync = ringline::direct_io::fsync(file).map_err(submit)?;
                 Box::pin(async move { fsync.await.map(|n| n as usize) })
             }
         };
-        let closed = ringline::fs::close(file);
+        let closed = ringline::direct_io::close(file);
         op.await.map_err(|e| format!("round {round}: op: {e}"))?;
         closed.map_err(|e| format!("round {round}: close: {e}"))?;
     }
@@ -270,7 +272,11 @@ fn a_close_with_an_operation_queued_finishes_it_on_the_closed_file() {
     std::fs::write(&second, [0u8; BLOCK]).unwrap();
 
     let config = direct_test_config_builder()
-        .fs(FsConfig::default().max_files(2).max_commands_in_flight(32))
+        .direct_io(
+            DirectIoConfig::default()
+                .max_files(2)
+                .max_commands_in_flight(32),
+        )
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)
@@ -287,6 +293,210 @@ fn a_close_with_an_operation_queued_finishes_it_on_the_closed_file() {
     );
     QUEUED_RESULT.get().unwrap().clone().unwrap();
     assert!(a.iter().all(|&x| x == 0xab), "the write missed its file");
+}
+
+// ── An open whose future is dropped frees its slot ──────────────────
+
+static ABANDONED_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn abandoned_path() -> PathBuf {
+    temp_file_path(&format!(".krio_direct_io_abandoned_{}", std::process::id()))
+}
+
+/// With `max_files(2)`: two opens dropped before the event loop sees their
+/// completions, then one dropped after its completion but before it is
+/// polled. Each leaves its slot free, so two opens succeed after each.
+async fn abandoned_direct_io_opens(path: &str) -> Result<(), String> {
+    let open = || ringline::direct_io::open(path).map_err(|e| e.to_string());
+    drop(open()?);
+    drop(open()?);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let a = match open() {
+            Ok(f) => f.await.map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        let b = match open() {
+            Ok(f) => f.await.map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        let both = a.is_ok() && b.is_ok();
+        for file in [a.as_ref(), b.as_ref()].into_iter().flatten() {
+            ringline::direct_io::close(*file).map_err(|e| e.to_string())?;
+        }
+        if both {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the abandoned opens' slots were not freed: {:?} {:?}",
+                a.err(),
+                b.err()
+            ));
+        }
+        ringline::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let pending = open()?;
+    ringline::sleep(std::time::Duration::from_millis(100)).await;
+    drop(pending);
+    // The event loop frees the slot on its next iteration, and on io_uring
+    // after the file's close completes.
+    let a = open_direct(path, DirectIoOpenOptions::new()).await?;
+    let b = open_direct(path, DirectIoOpenOptions::new())
+        .await
+        .map_err(|e| format!("a completed, unpolled open kept its slot: {e}"))?;
+    ringline::direct_io::close(a).map_err(|e| e.to_string())?;
+    ringline::direct_io::close(b).map_err(|e| e.to_string())
+}
+
+struct AbandonedOpenHandler;
+
+impl AsyncEventHandler for AbandonedOpenHandler {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let path = abandoned_path();
+            let result = abandoned_direct_io_opens(path.to_str().unwrap()).await;
+            let _ = ABANDONED_RESULT.set(result);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        AbandonedOpenHandler
+    }
+}
+
+/// fs is on as well, so a dropped direct I/O open released through fs's
+/// table would leave the direct I/O slot taken.
+#[test]
+fn a_dropped_direct_io_open_frees_its_slot() {
+    if !o_direct_supported() {
+        eprintln!("skipping: O_DIRECT is not supported here");
+        return;
+    }
+    let path = abandoned_path();
+    std::fs::write(&path, [0u8; BLOCK]).unwrap();
+    let config = direct_test_config_builder()
+        .direct_io(
+            DirectIoConfig::default()
+                .max_files(2)
+                .max_commands_in_flight(32),
+        )
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<AbandonedOpenHandler>()
+        .expect("launch failed");
+    common::join_workers(&runtime, handles);
+    let _ = std::fs::remove_file(&path);
+    ABANDONED_RESULT
+        .get()
+        .expect("the task finished")
+        .clone()
+        .unwrap();
+}
+
+// ── fs and direct I/O have separate tables ──────────────────────────
+
+static SEPARATE_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn separate_path() -> PathBuf {
+    temp_file_path(&format!(".krio_direct_io_separate_{}", std::process::id()))
+}
+
+/// With one slot in each table: an fs file and a direct I/O file are open at
+/// once, a second of either fails with its own table's error, and each
+/// handle reads its own file.
+async fn tables_are_separate(path: &str) -> Result<(), String> {
+    let fs_file = ringline::fs::open(path, ringline::fs::OpenFlags::READ, 0)
+        .map_err(|e| format!("fs open: {e}"))?
+        .await
+        .map_err(|e| format!("fs open: {e}"))?;
+    let direct = open_direct(path, DirectIoOpenOptions::new())
+        .await
+        .map_err(|e| format!("direct open with an fs file open: {e}"))?;
+    match ringline::direct_io::open(path) {
+        Err(e) if e.to_string() == "direct I/O file table full" => {}
+        Err(e) => return Err(format!("second direct open: {e}")),
+        Ok(_) => return Err("a second direct open found a free slot".to_string()),
+    }
+    match ringline::fs::open(path, ringline::fs::OpenFlags::READ, 0) {
+        Err(e) if e.to_string() == "filesystem file table full" => {}
+        Err(e) => return Err(format!("second fs open: {e}")),
+        Ok(_) => return Err("a second fs open found a free slot".to_string()),
+    }
+    let (n, buf) = ringline::direct_io::read_into(
+        direct,
+        0,
+        ringline::buf::AlignedBuf::with_capacity(BLOCK, BLOCK),
+    )
+    .await;
+    let n = n.map_err(|e| format!("direct read: {e}"))?;
+    if n != BLOCK || buf.iter().any(|&b| b != 0x5a) {
+        return Err(format!("the direct read returned {n} bytes of other data"));
+    }
+    let (n, _) = ringline::fs::read_into(fs_file, 0, Vec::with_capacity(BLOCK)).await;
+    if n.map_err(|e| format!("fs read: {e}"))? != BLOCK {
+        return Err("the fs read was short".to_string());
+    }
+    ringline::direct_io::close(direct).map_err(|e| format!("direct close: {e}"))?;
+    ringline::fs::close(fs_file).map_err(|e| format!("fs close: {e}"))
+}
+
+struct SeparateHandler;
+
+impl AsyncEventHandler for SeparateHandler {
+    fn on_accept(&self, _conn: Connection) -> impl Future<Output = ()> + 'static {
+        async {}
+    }
+
+    fn on_start(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + 'static>>> {
+        Some(Box::pin(async {
+            let path = separate_path();
+            let result = tables_are_separate(path.to_str().unwrap()).await;
+            let _ = SEPARATE_RESULT.set(result);
+            ringline::request_shutdown().ok();
+        }))
+    }
+
+    fn create_for_worker(_id: usize) -> Self {
+        SeparateHandler
+    }
+}
+
+#[test]
+fn fs_and_direct_io_files_take_slots_from_separate_tables() {
+    if !o_direct_supported() {
+        eprintln!("skipping: O_DIRECT is not supported here");
+        return;
+    }
+    let path = separate_path();
+    std::fs::write(&path, [0x5au8; BLOCK]).unwrap();
+    let config = direct_test_config_builder()
+        .fs(FsConfig::default().max_files(1).max_commands_in_flight(8))
+        .direct_io(
+            DirectIoConfig::default()
+                .max_files(1)
+                .max_commands_in_flight(8),
+        )
+        .build()
+        .expect("valid config");
+    let (runtime, handles) = RinglineBuilder::new(config)
+        .launch::<SeparateHandler>()
+        .expect("launch failed");
+    common::join_workers(&runtime, handles);
+    let _ = std::fs::remove_file(&path);
+    SEPARATE_RESULT
+        .get()
+        .expect("the task finished")
+        .clone()
+        .unwrap();
 }
 
 // ── Closing an NVMe handle ──────────────────────────────────────────

@@ -1,8 +1,9 @@
 #![allow(clippy::manual_async_fn)]
-//! `max_commands_in_flight` bounds fs operations on both backends: with a
-//! bound of 4, a fifth operation submitted in the same poll fails, and one
-//! submitted after the four complete succeeds (#864). Reads and fsyncs are
-//! both checked.
+//! `max_commands_in_flight` bounds fs and direct I/O operations on both
+//! backends: with a bound of 4, a fifth operation submitted in the same poll
+//! fails, and one submitted after the four complete succeeds (#864). Reads
+//! and fsyncs are both checked, and direct I/O's bound is counted apart from
+//! fs's.
 
 mod common;
 
@@ -10,6 +11,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use ringline::direct_io::DirectIoConfig;
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder, fs::FsConfig};
 
 static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
@@ -85,6 +87,53 @@ async fn fs_fsyncs_past_the_bound(path: &std::path::Path) -> Result<(), String> 
     ringline::fs::close(file).map_err(|e| format!("close: {e}"))
 }
 
+/// With fs's four fsyncs in flight, direct I/O still takes four of its own,
+/// and refuses a fifth with its own error.
+async fn direct_io_fsyncs_past_their_own_bound(
+    fs_path: &std::path::Path,
+    direct_path: &std::path::Path,
+) -> Result<(), String> {
+    let fs_file = ringline::fs::open(fs_path, ringline::fs::OpenFlags::READ, 0)
+        .map_err(|e| format!("open submit: {e}"))?
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+    let direct = ringline::direct_io::open(direct_path)
+        .map_err(|e| format!("direct open: {e}"))?
+        .await
+        .map_err(|e| format!("direct open: {e}"))?;
+    let mut fsyncs = Vec::new();
+    for i in 0..BOUND {
+        let fsync = ringline::fs::fsync(fs_file)
+            .map_err(|e| format!("fs fsync {i} refused under the bound: {e}"))?;
+        fsyncs.push(fsync);
+    }
+    for i in 0..BOUND {
+        let fsync = ringline::direct_io::fsync(direct)
+            .map_err(|e| format!("direct fsync {i} refused with fs's bound full: {e}"))?;
+        fsyncs.push(fsync);
+    }
+    match ringline::direct_io::fsync(direct) {
+        Ok(_) => return Err("direct fsync past the bound was accepted".to_string()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                && e.to_string() == "direct I/O command slab exhausted" => {}
+        Err(e) => {
+            return Err(format!(
+                "direct fsync past the bound: unexpected error: {e}"
+            ));
+        }
+    }
+    for fsync in fsyncs {
+        fsync.await.map_err(|e| format!("fsync: {e}"))?;
+    }
+    ringline::direct_io::fsync(direct)
+        .map_err(|e| format!("direct fsync after the eight completed: {e}"))?
+        .await
+        .map_err(|e| format!("direct fsync after the eight completed: {e}"))?;
+    ringline::direct_io::close(direct).map_err(|e| format!("direct close: {e}"))?;
+    ringline::fs::close(fs_file).map_err(|e| format!("close: {e}"))
+}
+
 struct Handler;
 
 impl AsyncEventHandler for Handler {
@@ -98,6 +147,9 @@ impl AsyncEventHandler for Handler {
             let mut result = fs_reads_past_the_bound(&path).await;
             if result.is_ok() {
                 result = fs_fsyncs_past_the_bound(&path).await;
+            }
+            if result.is_ok() {
+                result = direct_io_fsyncs_past_their_own_bound(&path, &file_path("direct")).await;
             }
             let _ = RESULT.set(result);
             ringline::request_shutdown().ok();
@@ -113,6 +165,8 @@ impl AsyncEventHandler for Handler {
 fn operations_past_max_commands_in_flight_are_refused() {
     let fs_path = file_path("fs");
     std::fs::write(&fs_path, [7u8; 64]).unwrap();
+    let direct_path = file_path("direct");
+    std::fs::write(&direct_path, [0u8; 4096]).unwrap();
     let config = ConfigBuilder::new()
         .workers(1)
         .pin_to_core(false)
@@ -122,6 +176,11 @@ fn operations_past_max_commands_in_flight_are_refused() {
         .fs(FsConfig::default()
             .max_files(4)
             .max_commands_in_flight(BOUND))
+        .direct_io(
+            DirectIoConfig::default()
+                .max_files(2)
+                .max_commands_in_flight(BOUND),
+        )
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)
@@ -129,7 +188,16 @@ fn operations_past_max_commands_in_flight_are_refused() {
         .expect("launch failed");
     common::join_workers(&runtime, handles);
     let _ = std::fs::remove_file(&fs_path);
-    RESULT.get().expect("the task finished").clone().unwrap();
+    let _ = std::fs::remove_file(&direct_path);
+    let result = RESULT.get().expect("the task finished").clone();
+    if let Err(e) = &result
+        && e.starts_with("direct open")
+        && e.contains("Invalid argument")
+    {
+        eprintln!("skipping the direct I/O part: O_DIRECT is not supported here ({e})");
+        return;
+    }
+    result.unwrap();
 }
 
 static NO_FS_RESULT: OnceLock<Result<(), String>> = OnceLock::new();

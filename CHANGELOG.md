@@ -16,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   implement: an implementer promises the memory stays valid and in place
   while ringline holds the value, which lasts until the kernel completes the
   operation even when the future is dropped. `AlignedBuf` is a heap buffer
-  at a chosen power-of-two alignment for `O_DIRECT` files and NVMe, and
-  `AlignedBuf::freeze` turns it into an aligned `Bytes`.
+  at a chosen power-of-two alignment, and at least 4096 bytes
+  (`buf::DIRECT_IO_ALIGN`), for direct I/O and NVMe, and
+  `AlignedBuf::freeze` turns it into an aligned `Bytes`. `IoBufAligned`
+  marks a buffer whose start is a multiple of 4096 bytes; direct I/O reads
+  and writes take only such buffers, and `AlignedBuf` is one.
 - `nvme_lba_size(device)` returns the namespace's logical block size, which
   `open_nvme_device` now reads with Identify Namespace.
 - `SendHalf::send_admitted` and `Connection::send_admitted`, returning an
@@ -128,11 +131,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   because the standalone task slab was full. Before, a full slab showed only as
   an error from `spawn`, which is how a slot leak stayed hidden in #478. The
   error message names `standalone_task_capacity` (#481).
-- `ringline::close_nvme_device`. Before, only `DriverCtx` could close an NVMe
-  handle. A close with commands in flight makes the handle stale at once, and
-  on io_uring the last completion unregisters the device, so a queued command
-  cannot land in the next device opened in that slot. Until then the slot
-  stays taken, so an open on a full table can fail.
+- `ringline::close_nvme_device` and `direct_io::close`. Before, only
+  `DriverCtx` could close these handles. A close with commands in flight
+  makes the handle stale at once, and on io_uring the last completion
+  closes the file, so a queued operation cannot land in the next file
+  opened in that slot. Until then the slot stays taken, so an open on a full
+  table can fail.
 - New crate `ringline-tls-config`, holding `TlsConfig`, `TlsClientConfig`,
   their builders and the `TlsVersion` and `CipherSuite` enums. ringline
   re-exports the types at their old paths and the crate as
@@ -212,17 +216,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     arms send through the same path, so it is expected to affect them alike;
     this is not measured.
   - See `docs/recv-direct-design.md`.
-- `fs::OpenFlags::DIRECT` and `fs::OpenFlags::DSYNC` (#845). `DIRECT` opens
-  the file with `O_DIRECT` on Linux, bypassing the page cache, and sets
-  `F_NOCACHE` on macOS; reads and writes then need block-aligned buffers,
-  lengths and offsets on Linux (`buf::AlignedBuf`). `DSYNC` opens with
+- `direct_io::fsync` returns a future for an fsync of a direct I/O file.
+  The fsync that `DriverCtx::direct_io_fsync` submitted had no future, so a
+  task could not wait for it.
+- `direct_io::DirectIoOpenOptions`, with `dsync`, passed to
+  `direct_io::open_with`, and `fs::OpenFlags::DSYNC`. Both open with
   `O_DSYNC`, so each write completes only once its data is on stable storage
-  (on Linux). On a Linux block device opened with both `DIRECT` and
-  `DSYNC`, io_uring sends each write with FUA when the device supports it
-  and does not flush the device's whole cache, and the mio backend's
-  `pwrite(2)` is followed by a cache flush on every write; without
-  `DIRECT`, each write is followed by a flush of the device's cache on both
-  backends.
+  (on Linux). On a Linux block device, a direct I/O file opened with `dsync`
+  under io_uring has each write sent with FUA when the device supports it,
+  without a flush of the device's whole cache; the mio backend's
+  `pwrite(2)` is followed by a cache flush on every write, as is every write
+  to an fs file opened with `DSYNC` on both backends.
 - `ringline-redis`, `ringline-memcache`: `Client::recv_ready` (and
   `BinaryClient::recv_ready`) sends buffered `fire_*` requests and returns a
   future that resolves when bytes of the next reply have arrived or the
@@ -354,6 +358,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** the direct I/O API is the `direct_io` module, with the same
+  shapes as `fs` (#845): `direct_io::open(path)` and
+  `open_with(path, options)` return an `OpenFuture` that resolves to a
+  `DirectIoFile`; then `read_into`, `write_from`, `fsync` and `close`.
+  `read_into` and `write_from` take the buffer by value and accept only a
+  buffer that implements `buf::IoBufAligned`, such as `AlignedBuf`; a
+  `Vec<u8>` or `BytesMut` does not compile. They replace
+  `open_direct_io_file`, `open_direct_io_file_with`, `direct_io_read`,
+  `direct_io_write`, `direct_io_fsync`, `close_direct_io_file` and the
+  `DriverCtx` methods of those names. The open no longer blocks the worker:
+  `open_direct_io_file` ran `open(2)` on it, and on io_uring a synchronous
+  fixed-file registration; `direct_io::open` submits `IORING_OP_OPENAT` into
+  a fixed slot on io_uring and runs on the disk-I/O pool on mio, and holds a
+  command slot until it completes. Because it returns a future, open from a
+  task; from `on_tick` or `on_notify`, `spawn` one. Open errors such as
+  `EINVAL` from a filesystem without `O_DIRECT` arrive at the `.await`.
+  Dropping the open's future before it resolves closes the file. A close on
+  io_uring is an `IORING_OP_CLOSE`. A NUL byte in the path fails with `path
+  contains null byte`; it was `invalid file path`. Direct I/O files keep
+  their own table and bounds, `DirectIoConfig`'s `max_files` and
+  `max_commands_in_flight`, apart from fs's, and direct I/O works with fs
+  off. On io_uring each direct I/O command slot carries a 256-byte statx
+  buffer, as fs's do (64 KiB per worker at the default of 256).
+- **Breaking:** `AlignedBuf` aligns its start to at least 4096 bytes
+  (`buf::DIRECT_IO_ALIGN`), whatever `align` it is given, so that it
+  implements `IoBufAligned`; `alignment()` reports the alignment it has. A
+  multiple of 4096 is a multiple of every smaller power of two, so an
+  existing caller's requirement still holds; a small buffer created with a
+  small `align` takes a 4096-aligned allocation.
 - **Breaking:** `fs::Metadata`'s fields are private, read through accessors
   (#894): `len()` (was `size`), `is_empty()`, `mode()`, `uid()`, `gid()`,
   `is_file()`, `is_dir()`, `is_symlink()`, and `accessed()`, `modified()`
@@ -395,8 +428,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   close_notify was queued. Before, it joined the FIFO and was refused when it
   won capacity, and on a connection whose write half was also shut down it
   failed with `BrokenPipe`.
-- `fs::fsync` waits for every write submitted before it through the same
-  handle (#905). Before, an fsync submitted while a
+- `fs::fsync` and `direct_io::fsync` wait for every write submitted before
+  them through the same handle (#905). Before, an fsync submitted while a
   write to the file was still in flight ran alongside it and could complete
   first, so `write_from`, `fsync` submitted without awaiting the write might
   not make the write durable. The fsync is now held in ringline until those
@@ -411,17 +444,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sound use after a drop was to leak the buffer.
   - `fs::read_into(file, offset, buf)` and `fs::write_from(file, offset,
     buf)` take any `IoBufMut` and `IoBuf` (a `BytesMut` still works).
-  - `nvme_read(device, lba, num_blocks, buf)` and `nvme_write(device, lba,
-    num_blocks, buf)` take the buffer by value. Use `AlignedBuf` for
-    `O_DIRECT`'s and NVMe's alignment.
-  - All four return the future directly, `ReadFuture<B>` or `WriteFuture<B>`,
+  - `direct_io::read_into(file, offset, buf)` and
+    `direct_io::write_from(file, offset, buf)` take the buffer by value, and
+    accept only an `IoBufAligned` buffer such as `AlignedBuf` (see the direct
+    I/O entry). `nvme_read(device, lba, num_blocks, buf)` and
+    `nvme_write(device, lba, num_blocks, buf)` take the buffer by value; use
+    `AlignedBuf` for NVMe's alignment.
+  - All six return the future directly, `ReadFuture<B>` or `WriteFuture<B>`,
     instead of an `io::Result` of one, and the future resolves to
     `(io::Result<usize>, buf)`. An operation that cannot be submitted (a
     full command slab or in-flight bound, a stale handle, a buffer of the
     wrong size) resolves at once to its error with the buffer, so a caller
     can retry with the same buffer. A full command slab or in-flight bound
-    is an error of kind `WouldBlock`, for this and every other fs and NVMe
-    call; it was `Other`.
+    is an error of kind `WouldBlock`, for this and every other fs, direct
+    I/O and NVMe call; it was `Other`.
   - A read's length is the buffer's spare capacity. To read fewer bytes,
     pass a buffer with that much spare capacity (`AlignedBuf`'s capacity is
     exact). None is `unsafe` any more. A future dropped before its operation
@@ -592,7 +628,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   handler can now keep `!Send` values in its fields: an `Rc`, a `SendHalf`, a
   `UdpSocket` half, a `fs::File`. Code that relied on
   `H: AsyncEventHandler` implying `H: Send` must add the bound itself.
-- **Breaking:** `fs::File` and `nvme::NvmeDevice`
+- **Breaking:** `fs::File`, `direct_io::DirectIoFile` and `nvme::NvmeDevice`
   are no longer `Send`. Each handle is a slot in the table of the
   worker that opened it. Used on another worker it named that worker's slot:
   a write through a `File` opened on worker 0 and used on worker 1 succeeded
@@ -859,7 +895,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking:** the public config structs of `ringline`, `ringline-quic`,
   `ringline-h2` and `ringline-h3` have private fields and builder methods,
   as `Config` and `PoolConfig` do:
-  - `ringline` `NvmeConfig` and `FsConfig`: start from
+  - `ringline` `NvmeConfig`, `FsConfig` and `DirectIoConfig`: start from
     `Default::default()` and set `max_devices` (NVMe) or `max_files`, and
     `max_commands_in_flight`.
   - `ringline-quic` `QuicConfig`: built with `QuicConfig::builder()` (see
@@ -1101,26 +1137,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
-- **Breaking:** the direct I/O API (#845). A direct I/O file is an fs file
-  opened with `OpenFlags::DIRECT`: `fs::open(path, OpenFlags::READ_WRITE |
-  OpenFlags::DIRECT, 0)`, then `fs::read_into`, `fs::write_from`,
-  `fs::fsync` and `fs::close`. Removed: the `direct_io` module
-  (`DirectIoFile`, `DirectIoConfig`, `DirectIoOpenOptions`,
-  `DirectIoCompletion`, `DirectIoOp`),
-  `open_direct_io_file`, `open_direct_io_file_with`, `direct_io_read`,
-  `direct_io_write`, `direct_io_fsync`, `close_direct_io_file` and
-  `ConfigBuilder::direct_io`; `DirectIoOpenOptions::dsync(true)` is
-  `OpenFlags::DSYNC`. Its files count against `FsConfig`'s `max_files` and
-  `max_commands_in_flight`, and need fs enabled: `no_fs()` turns them off
-  too. `fs::open` returns a future, so open from a task; from `on_tick` or
-  `on_notify`, `spawn` one, where `open_direct_io_file` returned the handle
-  at once. Open errors such as `EINVAL` from a filesystem without
-  `O_DIRECT` arrive at the `.await`. The open no longer blocks the worker:
-  `open_direct_io_file` ran `open(2)` on it, and on io_uring a synchronous
-  fixed-file registration; `fs::open` submits `IORING_OP_OPENAT` into a fixed
-  slot on io_uring and runs on the disk-I/O pool on mio. The `direct_io`
-  value of the `op` label on `ringline/cqe_by_tag` is gone.
-
 - **Breaking:** `fs::read` and `fs::write`, which took a raw pointer
   (#825). Use `fs::read_into` and `fs::write_from` (see Changed).
 
@@ -1128,14 +1144,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   values of the `op` label on `ringline/cqe_by_tag`: those completions no
   longer exist (#838).
 
-- **Breaking:** `NvmeCompletion` is no longer public. Nothing constructed
-  it, and its docs described a completion handler that never existed; the
-  results it was to carry reach callers through the futures of `nvme_read`,
-  `nvme_write` and `nvme_flush`, and a failed NVMe command's status word
-  through `NvmeStatus` (#871).
+- **Breaking:** `DirectIoCompletion`, `NvmeCompletion` and `DirectIoOp` are
+  no longer public. Nothing constructed the two completion types, and their
+  docs described a completion handler that never existed; the results they
+  were to carry reach callers through the futures of `direct_io::read_into`,
+  `direct_io::write_from`, `direct_io::fsync`, `nvme_read`, `nvme_write` and
+  `nvme_flush`, and a failed NVMe command's status word through `NvmeStatus`
+  (#871).
 - **Breaking:** `DriverCtx` is no longer public, and `on_tick` and `on_notify`
   take no argument. The free functions work inside them:
-  `ringline::request_shutdown`, `open_nvme_device` and `spawn`. A disk read,
+  `ringline::request_shutdown`, `open_nvme_device` and `spawn`; a direct I/O
+  file is opened from a task (see the direct I/O entry under Changed). A disk read,
   write or fsync goes in a spawned task, because `DriverCtx`'s versions
   returned a key that nothing could consume. Token-based sends, closes,
   cancels and queries from `on_tick` have no replacement: the task that holds
@@ -1327,7 +1346,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   all. The gauge `ringline/ring/push_retries_pending` shows how many are
   owed, `ringline/ring` `op=push_retry_waits` counts the
   waits, and after 1 s of refusals the worker writes one line to stderr.
-- io_uring: an fs or NVMe call no longer fails when the ring
+- io_uring: an fs, direct I/O or NVMe call no longer fails when the ring
   refuses its submission (#877). A call that found the submission queue full
   and whose inline submit failed with `Interrupted`, `EBUSY` or `EAGAIN`
   returned that error in every 0.6 release. The operation is now queued and
@@ -1390,11 +1409,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   part of its ciphertext, and the peer waited for the rest. Both now drain
   rustls' output, as the io_uring paths do. Found by
   `tls_close_before_handshake.rs` (#886).
-- mio: `ConfigBuilder::build` refuses `disk_io_threads(0)` while `fs` (on by
-  default) is set, naming `no_fs()`. Before, the config built and every file
-  operation failed at its first call with an `Other` error naming the pool,
-  where the `disk_io_threads` doc said `Unsupported`. On io_uring the value is
-  accepted and unused, as before. Finding F6 of
+- mio: `ConfigBuilder::build` refuses `disk_io_threads(0)` while `fs` (on
+  by default) or `direct_io` is set, naming `no_fs()` (fs) or `direct_io`
+  (direct I/O). Before, the config built and every file operation failed at
+  its first call with an `Other` error naming the pool, where the
+  `disk_io_threads` doc said `Unsupported`; `open_direct_io_file` succeeded
+  and its operations failed. On io_uring the value is accepted and unused,
+  as before. Finding F6 of
   `docs/journal/2026-11-file-io-audit.md` (#870).
 - io_uring NVMe: a command the device fails resolves to an `io::Error` of
   kind `Other` whose inner error (`get_ref()`, `into_inner()`) is the new
@@ -1406,9 +1427,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Docs: the file I/O docs state the current behaviour: the futures say what a drop off the
   owning worker leaks; `DiskIoFuture` says what it resolves to per operation;
   the fs module doc says operations on one file are independent and what
-  `fsync` covers; the NVMe docs cover the mio backend and the open that runs
-  on the worker thread; `ConfigBuilder::fs` and `nvme` say what each
-  reserves per worker; and the `NvmeUringCmd` builders
+  `fsync` covers; the direct I/O and NVMe docs cover the mio backend; the
+  NVMe docs cover the open that runs on the worker thread;
+  `ConfigBuilder::fs`, `direct_io` and `nvme` say what each reserves per
+  worker; and the `NvmeUringCmd` builders
   document their panic. Findings F9 and F10 of
   `docs/journal/2026-11-file-io-audit.md` (#873, #874), and the documentation
   part of P3 (#877).
@@ -1416,21 +1438,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (the access modes are the `open(2)` values, not bits), with a doctest;
   the type is now `PartialEq` and `Eq`. `fs::open` documents its `mode`.
   Finding F8 of `docs/journal/2026-11-file-io-audit.md` (#872).
-- `open_nvme_device` with a path containing a NUL byte returns its error
-  without holding a slot of the device table. Before, each such call left a
-  slot allocated until the worker exited, so later opens failed with `NVMe
-  device table full` (#861).
-- The slot generation of `fs::File` and `NvmeDevice` handles
+- `open_nvme_device` and the direct I/O open with a path containing a NUL
+  byte return their error without holding a slot of the table. Before, each
+  such call left a slot allocated until the worker exited, so later opens
+  failed with `direct I/O file table full` or `NVMe device table full`
+  (#861).
+- The slot generation of `fs::File`, `DirectIoFile` and `NvmeDevice` handles
   is 32 bits, up from 16, and the handles grow from 4 to 8 bytes. A handle
   kept after its close matched the slot's new file again after 65,536 releases
   of the slot (a close, an open that failed, or an open whose future was
   dropped; 32,768 on io_uring when each close waited for an operation in
   flight), and an operation or close through it acted on that file. That now
   takes 2^32 releases (#862).
-- mio: `FsConfig::max_commands_in_flight` bounds the operations a worker has
-  in its disk-I/O pool, as it bounds the command slab on io_uring. An
+- mio: `FsConfig::max_commands_in_flight` and
+  `DirectIoConfig::max_commands_in_flight` bound the operations a worker has
+  in its disk-I/O pool, as they bound the command slabs on io_uring. An
   operation submitted at the bound fails with the io_uring backend's error,
-  `filesystem command slab exhausted`, until one completes. Before, mio queued
+  `filesystem command slab exhausted` or `direct I/O command slab
+  exhausted`, until one completes. Before, mio queued
   every operation on an unbounded channel. A path operation of `fs` (`stat`,
   `symlink_metadata`, `rename`, `remove`, `mkdir`) on a runtime with fs off
   (`ConfigBuilder::no_fs`) now fails with `filesystem I/O not configured`, as
@@ -1448,7 +1473,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   operations complete, so an `open` right after `close` on a full table
   fails until then (#859).
 - mio: worker exit waits, within 10 s, for the reads and writes
-  (`fs::read_into`/`fs::write_from`) its disk-I/O pool is running. Before, the
+  (`fs::read_into`/`fs::write_from` and their `direct_io` counterparts) its
+  disk-I/O pool is running. Before, the
   worker dropped its tasks while a pool thread could still read or write a
   task's buffer, and requests still queued for the pool ran after the worker
   had gone. At worker exit, requests the pool has not started are now answered
@@ -1475,7 +1501,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   counting `acceptor_stopped`; `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` and
   any errno it does not classify wait 10 ms, are counted as
   `accept_error_backoff`, and accept again (#828).
-- io_uring: worker exit cancels file and NVMe operations in
+- io_uring: worker exit cancels file, direct I/O and NVMe operations in
   flight and waits for them to end, within the same 10 s bound it gives
   connections. Before, the drain ended once connections and sends were done,
   and the worker then freed its tasks and driver while such an operation
@@ -1851,7 +1877,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   without its wake, or when a sibling send in its task is dropped (#641).
 - `Child::wait`'s future and the file and disk-I/O futures (`fs::open`,
   `fs::create`, `fs::stat`, `fs::read_into`, `fs::write_from`,
-  `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir` and NVMe) return
+  `fs::fsync`, `fs::rename`, `fs::remove`, `fs::mkdir`, NVMe and
+  direct I/O) return
   pending when polled on a worker other than the one that
   created them, as the timer, blocking, resolve, spawn and connect futures
   do since #641. Before, such a poll used that worker's entry with the same
@@ -2228,7 +2255,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   io_uring the kernel. Buffers still parked when the worker exits are now
   leaked instead of freed.
 
-- On mio, `fs::close` closed the fd at
+- On mio, `fs::close` (and the direct I/O close) closed the fd at
   once, while a read, write or fsync queued on the disk-I/O pool still held its
   number. If the number was reused first, the operation went to the wrong
   file: a queued write landed in a file opened after the close. The fd now
@@ -2245,8 +2272,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   unless the future is dropped on a thread other than the worker that
   created it, which leaves both until that worker exits (#551).
 
-- On mio, files opened by `fs::open`, and on io_uring, NVMe devices before
-  they enter the fixed-file table, are now opened close-on-exec (#551).
+- On mio, files opened by `fs::open` and direct I/O files, and on io_uring,
+  NVMe devices before they enter the fixed-file table, are now opened
+  close-on-exec (#551).
 
 - With `pin_to_core(true)`, a `core_offset` that put a worker on CPU 1024 or
   higher aborted the process: `libc::CPU_SET` panicked and the panic could

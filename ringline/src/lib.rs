@@ -138,8 +138,8 @@
 //! mio backend: works on Linux and macOS; forced on Linux with the
 //! `force-mio` cargo feature (`--features ringline/force-mio` from a
 //! dependent crate). NVMe passthrough and zero-copy sends are not
-//! available. Filesystem operations, `O_DIRECT` ones included, run on a
-//! dedicated thread pool.
+//! available. Filesystem and direct I/O operations run on a dedicated thread
+//! pool.
 
 // A stub-engine build (`RINGLINE_STUB_ENGINE=1`) only checks that the
 // driver compiles without `UringEngine`; nothing reads the operations it
@@ -169,6 +169,7 @@ pub(crate) mod chain;
 #[cfg_attr(not(has_io_uring), allow(dead_code))]
 pub(crate) mod completion;
 pub(crate) mod connection;
+pub mod direct_io;
 #[cfg(not(has_io_uring))]
 pub(crate) mod disk_io_pool;
 pub(crate) mod disk_order;

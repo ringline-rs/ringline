@@ -2,7 +2,7 @@
 //! file (#905), shared by both backends.
 //!
 //! Reads and writes on one file stay unordered with respect to each other.
-//! An fsync (`fs::fsync`) is held, not submitted, until
+//! An fsync (`fs::fsync`, `direct_io::fsync`) is held, not submitted, until
 //! every write submitted before it on the same file has completed. A write
 //! submitted after an fsync does not wait for it, and a later write does not
 //! hold back an earlier fsync. Held fsyncs are not linked to the writes
@@ -10,11 +10,13 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
-/// The file an operation is on: its fs table slot and generation. The
-/// generation keeps a slot reused after a close apart from the file that
-/// held it before.
+/// The file an operation is on: its kind, table slot and generation. The
+/// kind keeps an fs file and a direct I/O file in the same slot of their own
+/// tables apart; the generation keeps a slot reused after a close apart from
+/// the file that held it before.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct OrderKey {
+    pub(crate) kind: crate::fs::FileKind,
     pub(crate) index: u16,
     pub(crate) generation: u32,
 }
@@ -131,6 +133,7 @@ mod tests {
 
     fn file(index: u16) -> OrderKey {
         OrderKey {
+            kind: crate::fs::FileKind::Fs,
             index,
             generation: 0,
         }
@@ -189,6 +192,21 @@ mod tests {
             ..file(0)
         };
         assert_eq!(orders.sync(reused, "sync"), Some("sync"));
+    }
+
+    /// An fs file and a direct I/O file can hold the same slot index of
+    /// their own tables: a write on one does not hold an fsync on the other.
+    #[test]
+    fn the_other_kinds_file_in_the_same_slot_is_a_different_file() {
+        let mut orders = WriteOrders::default();
+        orders.begin_write(
+            OrderKey {
+                kind: crate::fs::FileKind::DirectIo,
+                ..file(0)
+            },
+            1,
+        );
+        assert_eq!(orders.sync(file(0), "sync"), Some("sync"));
     }
 
     #[test]

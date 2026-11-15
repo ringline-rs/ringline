@@ -139,7 +139,7 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
         // handles) and its own channel pair. This avoids changing the
         // launch_inner / worker_fn signature.
         let (disk_io_rx, disk_io_tx, disk_io_pool) = if config.disk_io_threads > 0
-            && config.fs.is_some()
+            && (config.fs.is_some() || config.direct_io.is_some())
         {
             let pool = Arc::new(crate::disk_io_pool::DiskIoPool::start(
                 config.worker_index,
@@ -720,27 +720,38 @@ impl<A: AsyncEventHandler> AsyncEventLoop<A> {
                 // A completed write releases the fsyncs held behind it
                 // (#905).
                 released.extend(self.driver.write_orders.end_write(response.key));
-                // Handle fs_open completions: install fd or release slot.
-                if let Some(file_index) = self.driver.pending_fs_opens.remove(&response.key) {
+                // Handle open completions: install fd or release slot.
+                if let Some((kind, file_index)) = self.driver.pending_fs_opens.remove(&response.key)
+                {
+                    let (files, fds) = match kind {
+                        crate::fs::FileKind::Fs => {
+                            (&mut self.driver.fs_files, &mut self.driver.fs_fds)
+                        }
+                        crate::fs::FileKind::DirectIo => (
+                            &mut self.driver.direct_io_files,
+                            &mut self.driver.direct_io_fds,
+                        ),
+                    };
                     if self.executor.take_abandoned_open(response.key) {
                         // Nothing holds a handle to this file: drop the fd, if
                         // the open succeeded, and free the slot.
                         drop(response.opened);
-                        if let Some(ref mut files) = self.driver.fs_files {
+                        if let Some(files) = files {
                             files.release(file_index);
                         }
                         continue;
                     }
                     if let Some(opened) = response.opened {
-                        // Success: the fd moves into `fs_fds`. It closes when
-                        // `fs_close` and every operation queued on it have
-                        // dropped their holds, or when the worker exits.
-                        self.driver.fs_fds[file_index as usize] = Some(std::sync::Arc::new(opened));
-                        // Convert to success (0) for the OpenFuture.
+                        // Success: the fd moves into the kind's fd vector. It
+                        // closes when the file is closed and every operation
+                        // queued on it has dropped its hold, or when the
+                        // worker exits.
+                        fds[file_index as usize] = Some(std::sync::Arc::new(opened));
+                        // Convert to success (0) for the open future.
                         self.executor.wake_disk_io(response.key, 0);
                     } else {
                         // Failure — release the pre-allocated file slot.
-                        if let Some(ref mut files) = self.driver.fs_files {
+                        if let Some(files) = files {
                             files.release(file_index);
                         }
                         self.executor.wake_disk_io(response.key, response.result);
@@ -2335,18 +2346,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `OpenFlags::DIRECT` and `OpenFlags::DSYNC` reach the `open(2)` the
-    /// pool makes: `O_DSYNC` on both platforms and `O_DIRECT` on Linux (on
-    /// macOS `DIRECT` is applied as `F_NOCACHE`, which `F_GETFL` does not
-    /// show), and a plain open adds neither.
+    /// A direct I/O open passes `O_DIRECT` (Linux) and, with `dsync`,
+    /// `O_DSYNC` to the `open(2)` the pool makes (on macOS the open sets
+    /// `F_NOCACHE`, which `F_GETFL` does not show); an fs open adds neither.
     #[test]
-    fn fs_open_passes_direct_and_dsync_to_open() {
+    fn direct_io_open_passes_direct_and_dsync_to_open() {
         let config = ConfigBuilder::new()
             .workers(1)
             .pin_to_core(false)
             .max_connections(16)
             .send_pool(4, 64)
             .disk_io_threads(1)
+            .direct_io(crate::direct_io::DirectIoConfig::default())
             .build()
             .expect("valid test config");
         let (mut el, _wake) = test_loop(&config);
@@ -2355,31 +2366,49 @@ mod tests {
             .unwrap()
             .join(format!(".ringline-mio-open-flags-{}", std::process::id()));
         std::fs::write(&path, [0u8; 4096]).unwrap();
-        let open = |el: &mut AsyncEventLoop<NoopHandler>, flags| {
+        let getfl = |fd: &std::os::fd::OwnedFd| unsafe {
+            libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(fd), libc::F_GETFL)
+        };
+        let seq = el.executor.begin_disk_io(0);
+        let (index, _) = el
+            .driver
+            .make_ctx()
+            .fs_open(&path, crate::fs::OpenFlags::READ_WRITE, 0, seq)
+            .expect("submit fs open");
+        assert!(drain_until_result(&mut el, seq) >= 0, "fs open");
+        let plain = getfl(
+            el.driver.fs_fds[index as usize]
+                .as_ref()
+                .expect("installed"),
+        );
+        let direct = |el: &mut AsyncEventLoop<NoopHandler>, dsync| {
             let seq = el.executor.begin_disk_io(0);
+            let options = crate::direct_io::DirectIoOpenOptions::new().dsync(dsync);
             let (index, _) = el
                 .driver
                 .make_ctx()
-                .fs_open(&path, flags, 0, seq)
-                .expect("submit open");
-            assert!(drain_until_result(el, seq) >= 0, "open with {flags:?}");
-            let fd = el.driver.fs_fds[index as usize]
-                .as_ref()
-                .expect("installed");
-            unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&**fd), libc::F_GETFL) }
+                .direct_io_open(&path, options, seq)
+                .expect("submit direct open");
+            assert!(
+                drain_until_result(el, seq) >= 0,
+                "direct open, dsync {dsync}"
+            );
+            getfl(
+                el.driver.direct_io_fds[index as usize]
+                    .as_ref()
+                    .expect("installed"),
+            )
         };
-        use crate::fs::OpenFlags;
-        let plain = open(&mut el, OpenFlags::READ_WRITE);
-        let flagged = open(
-            &mut el,
-            OpenFlags::READ_WRITE | OpenFlags::DIRECT | OpenFlags::DSYNC,
-        );
+        let unsynced = direct(&mut el, false);
+        let flagged = direct(&mut el, true);
         let _ = std::fs::remove_file(&path);
         assert_eq!(plain & libc::O_DSYNC, 0);
+        assert_eq!(unsynced & libc::O_DSYNC, 0);
         assert_eq!(flagged & libc::O_DSYNC, libc::O_DSYNC);
         #[cfg(target_os = "linux")]
         {
             assert_eq!(plain & libc::O_DIRECT, 0);
+            assert_eq!(unsynced & libc::O_DIRECT, libc::O_DIRECT);
             assert_eq!(flagged & libc::O_DIRECT, libc::O_DIRECT);
         }
     }
@@ -2411,9 +2440,14 @@ mod tests {
         assert!(drain_until_result(&mut el, open_seq) >= 0, "open");
         let file = crate::fs::File::new(index, generation);
         const EARLIER: crate::runtime::DiskIoKey = u64::MAX;
-        el.driver
-            .write_orders
-            .begin_write(crate::disk_order::OrderKey { index, generation }, EARLIER);
+        el.driver.write_orders.begin_write(
+            crate::disk_order::OrderKey {
+                kind: crate::fs::FileKind::Fs,
+                index,
+                generation,
+            },
+            EARLIER,
+        );
 
         static DATA: &[u8] = b"later";
         let mut buf = [0u8; 4];

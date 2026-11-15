@@ -8,7 +8,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use ringline::fs::{FsConfig, OpenFlags};
+use ringline::direct_io::DirectIoConfig;
 use ringline::{AsyncEventHandler, ConfigBuilder, Connection, RinglineBuilder};
 
 static DIRECT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
@@ -30,24 +30,23 @@ fn config_builder() -> ConfigBuilder {
 }
 
 async fn direct_bad_paths(path: &str) -> Result<(), String> {
-    let flags = OpenFlags::READ_WRITE | OpenFlags::DIRECT;
     for round in 0..3 {
-        match ringline::fs::open("a\0b", flags, 0) {
+        match ringline::direct_io::open("a\0b") {
             Ok(_) => return Err(format!("round {round}: a NUL path opened")),
             Err(e) if e.to_string() == "path contains null byte" => {}
             Err(e) => return Err(format!("round {round}: unexpected error: {e}")),
         }
     }
     let open = |which: &'static str| async move {
-        ringline::fs::open(path, flags, 0)
+        ringline::direct_io::open(path)
             .map_err(|e| format!("{which} open: {e}"))?
             .await
             .map_err(|e| format!("{which} open: {e}"))
     };
     let a = open("first").await?;
     let b = open("second").await?;
-    ringline::fs::close(a).map_err(|e| format!("close a: {e}"))?;
-    ringline::fs::close(b).map_err(|e| format!("close b: {e}"))?;
+    ringline::direct_io::close(a).map_err(|e| format!("close a: {e}"))?;
+    ringline::direct_io::close(b).map_err(|e| format!("close b: {e}"))?;
     Ok(())
 }
 
@@ -72,14 +71,19 @@ impl AsyncEventHandler for DirectHandler {
     }
 }
 
-/// With two fs slots, three opens refused for a NUL path are followed by two
-/// `O_DIRECT` opens that succeed.
+/// With two direct I/O slots, three opens refused for a NUL path are
+/// followed by two that succeed. fs is off: direct I/O does not need it.
 #[test]
-fn a_nul_path_does_not_leak_an_fs_slot() {
+fn a_nul_path_does_not_leak_a_direct_io_slot() {
     let path = file_path("bad_path_direct_io");
     std::fs::write(&path, [0u8; 4096]).unwrap();
     let config = config_builder()
-        .fs(FsConfig::default().max_files(2).max_commands_in_flight(8))
+        .no_fs()
+        .direct_io(
+            DirectIoConfig::default()
+                .max_files(2)
+                .max_commands_in_flight(8),
+        )
         .build()
         .expect("valid config");
     let (runtime, handles) = RinglineBuilder::new(config)

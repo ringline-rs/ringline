@@ -10,13 +10,13 @@
 //! kernel uses stays valid either way.
 //!
 //! ringline implements the traits for `Vec<u8>`, [`BytesMut`], [`Bytes`]
-//! ([`IoBuf`] only) and [`AlignedBuf`]. A file opened with
-//! [`OpenFlags::DIRECT`](crate::fs::OpenFlags::DIRECT) needs memory aligned to
-//! the device's logical block size, which `Vec<u8>` and `BytesMut` do not
-//! guarantee; NVMe passthrough copies a buffer whose address is not 4-byte
-//! aligned through a bounce buffer. [`AlignedBuf`] allocates at
-//! a chosen alignment, and [`AlignedBuf::freeze`] turns one into an aligned
-//! [`Bytes`].
+//! ([`IoBuf`] only) and [`AlignedBuf`]. [`crate::direct_io`] needs memory
+//! aligned to the device's logical block size, which `Vec<u8>` and `BytesMut`
+//! do not guarantee, so its reads and writes take only an [`IoBufAligned`]
+//! buffer; ringline implements that trait for [`AlignedBuf`]. NVMe
+//! passthrough copies a buffer whose address is not 4-byte aligned through a
+//! bounce buffer. [`AlignedBuf::freeze`] turns an `AlignedBuf` into an
+//! aligned [`Bytes`], which is not an [`IoBufAligned`].
 //!
 //! An application with its own memory (a slot of an arena, a range of a
 //! larger buffer, memory pinned by another component) implements the traits
@@ -158,13 +158,29 @@ unsafe impl IoBuf for Bytes {
     }
 }
 
-/// A heap buffer whose start is aligned to a chosen power of two, for direct
-/// I/O and NVMe.
+/// The alignment, in bytes, of the start of every [`IoBufAligned`] buffer:
+/// a multiple of the usual logical block sizes for `O_DIRECT`, 512 and 4096
+/// bytes.
+pub const DIRECT_IO_ALIGN: usize = 4096;
+
+/// Memory whose start is aligned for direct I/O: the buffers
+/// [`direct_io::read_into`](crate::direct_io::read_into) and
+/// [`direct_io::write_from`](crate::direct_io::write_from) take.
+///
+/// # Safety
+///
+/// The requirements of [`IoBuf`], and `stable_ptr()` is a multiple of
+/// [`DIRECT_IO_ALIGN`].
+pub unsafe trait IoBufAligned: IoBuf {}
+
+/// A heap buffer whose start is aligned to a chosen power of two, and to at
+/// least [`DIRECT_IO_ALIGN`], for direct I/O and NVMe.
 ///
 /// With `O_DIRECT` (Linux) the address of a read's or write's memory, its
 /// length and the file offset must each be a multiple of the device's logical
-/// block size (typically 512 or 4096 bytes). `AlignedBuf::with_capacity(len, 4096)`
-/// satisfies the address requirement for either block size; the caller
+/// block size (typically 512 or 4096 bytes). Every `AlignedBuf` starts at a
+/// multiple of [`DIRECT_IO_ALIGN`], which satisfies the address requirement
+/// for either block size, so it implements [`IoBufAligned`]; the caller
 /// chooses lengths and offsets.
 ///
 /// Like `Vec<u8>`, it has a capacity and an initialized length, and derefs to
@@ -183,7 +199,7 @@ unsafe impl Sync for AlignedBuf {}
 
 impl AlignedBuf {
     /// An empty buffer with room for `capacity` bytes, starting at an address
-    /// that is a multiple of `align`.
+    /// that is a multiple of `align` and of [`DIRECT_IO_ALIGN`].
     ///
     /// # Panics
     ///
@@ -194,7 +210,7 @@ impl AlignedBuf {
     }
 
     /// A buffer of `len` zero bytes, starting at an address that is a multiple
-    /// of `align`.
+    /// of `align` and of [`DIRECT_IO_ALIGN`].
     ///
     /// # Panics
     ///
@@ -206,6 +222,13 @@ impl AlignedBuf {
     }
 
     fn allocate(capacity: usize, align: usize, zeroed: bool) -> Self {
+        assert!(
+            align.is_power_of_two(),
+            "AlignedBuf: align must be a power of two and the size must fit isize"
+        );
+        // A multiple of `DIRECT_IO_ALIGN` is a multiple of every smaller
+        // power of two, so raising `align` keeps the caller's guarantee.
+        let align = align.max(DIRECT_IO_ALIGN);
         let layout = Layout::from_size_align(capacity, align)
             .expect("AlignedBuf: align must be a power of two and the size must fit isize");
         let ptr = if capacity == 0 {
@@ -245,7 +268,8 @@ impl AlignedBuf {
         self.cap
     }
 
-    /// The alignment of the buffer's start, in bytes.
+    /// The alignment of the buffer's start, in bytes: the `align` it was
+    /// created with, or [`DIRECT_IO_ALIGN`] if that is larger.
     pub fn alignment(&self) -> usize {
         self.align
     }
@@ -362,6 +386,10 @@ unsafe impl IoBuf for AlignedBuf {
     }
 }
 
+// Safety: `allocate` aligns every buffer, the empty one included, to at
+// least `DIRECT_IO_ALIGN`.
+unsafe impl IoBufAligned for AlignedBuf {}
+
 unsafe impl IoBufMut for AlignedBuf {
     fn stable_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
@@ -393,6 +421,19 @@ mod tests {
                     "align {align} cap {cap}"
                 );
                 assert_eq!((buf.len(), buf.capacity()), (0, cap));
+            }
+        }
+    }
+
+    #[test]
+    fn aligned_buf_starts_at_a_multiple_of_direct_io_align_for_any_align() {
+        for align in [1, 2, 512, 4096, 1 << 16] {
+            for cap in [0, 1, 4096] {
+                let buf = AlignedBuf::with_capacity(cap, align);
+                assert_eq!(buf.stable_ptr() as usize % DIRECT_IO_ALIGN, 0);
+                assert_eq!(buf.alignment(), align.max(DIRECT_IO_ALIGN));
+                let zeroed = AlignedBuf::zeroed(cap, align);
+                assert_eq!(zeroed.stable_ptr() as usize % DIRECT_IO_ALIGN, 0);
             }
         }
     }
