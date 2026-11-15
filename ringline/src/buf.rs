@@ -10,13 +10,15 @@
 //! kernel uses stays valid either way.
 //!
 //! ringline implements the traits for `Vec<u8>`, [`BytesMut`], [`Bytes`]
-//! ([`IoBuf`] only) and [`AlignedBuf`]. [`crate::direct_io`] needs memory
-//! aligned to the device's logical block size, which `Vec<u8>` and `BytesMut`
-//! do not guarantee, so its reads and writes take only an [`IoBufAligned`]
-//! buffer; ringline implements that trait for [`AlignedBuf`]. NVMe
+//! ([`IoBuf`] only), [`AlignedBuf`] and [`AlignedBytes`] ([`IoBuf`] only).
+//! [`crate::direct_io`] needs memory aligned to the device's logical block
+//! size, which `Vec<u8>` and `BytesMut` do not guarantee, so its reads and
+//! writes take only an [`IoBufAligned`] buffer; ringline implements that
+//! trait for [`AlignedBuf`] and [`AlignedBytes`]. [`AlignedBuf::freeze`]
+//! turns an `AlignedBuf` into an `AlignedBytes`, whose clones share the
+//! allocation; a [`Bytes`] made from it is not an `IoBufAligned`. NVMe
 //! passthrough copies a buffer whose address is not 4-byte aligned through a
-//! bounce buffer. [`AlignedBuf::freeze`] turns an `AlignedBuf` into an
-//! aligned [`Bytes`], which is not an [`IoBufAligned`].
+//! bounce buffer.
 //!
 //! An application with its own memory (a slot of an arena, a range of a
 //! larger buffer, memory pinned by another component) implements the traits
@@ -24,6 +26,7 @@
 
 use std::alloc::Layout;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 
@@ -322,11 +325,14 @@ impl AlignedBuf {
         self.len += data.len();
     }
 
-    /// Convert into a [`Bytes`] of the initialized bytes, which keeps the
-    /// allocation and its alignment, for an [`IoBuf`] write that the caller
-    /// also keeps a handle to.
-    pub fn freeze(self) -> Bytes {
-        Bytes::from_owner(self)
+    /// Convert into an [`AlignedBytes`] of the initialized bytes, which keeps
+    /// the allocation and its alignment. Clones of it share the allocation,
+    /// so the caller can keep a handle to a buffer while a write from it is
+    /// in flight.
+    pub fn freeze(self) -> AlignedBytes {
+        AlignedBytes {
+            buf: Arc::new(self),
+        }
     }
 }
 
@@ -407,6 +413,93 @@ unsafe impl IoBufMut for AlignedBuf {
     }
 }
 
+/// The initialized bytes of an [`AlignedBuf`], immutable and shared by its
+/// clones, from [`AlignedBuf::freeze`].
+///
+/// It implements [`IoBuf`] and [`IoBufAligned`], so it is a source for
+/// [`direct_io::write_from`](crate::direct_io::write_from) as well as for
+/// `fs` and NVMe writes. A clone is a reference count increment; the
+/// allocation is freed when the last clone drops.
+/// [`Bytes::from`] converts one into a [`Bytes`] without copying, and
+/// [`try_into_mut`](Self::try_into_mut) recovers the `AlignedBuf` from the
+/// last clone.
+#[derive(Clone)]
+pub struct AlignedBytes {
+    buf: Arc<AlignedBuf>,
+}
+
+impl AlignedBytes {
+    /// The number of bytes.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Whether there are no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// The alignment of the start, in bytes, as [`AlignedBuf::alignment`].
+    pub fn alignment(&self) -> usize {
+        self.buf.alignment()
+    }
+
+    /// The `AlignedBuf` back, with its initialized length and capacity, if
+    /// this is the only handle to it; otherwise `self`.
+    pub fn try_into_mut(self) -> Result<AlignedBuf, Self> {
+        Arc::try_unwrap(self.buf).map_err(|buf| AlignedBytes { buf })
+    }
+}
+
+impl std::ops::Deref for AlignedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl AsRef<[u8]> for AlignedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl std::fmt::Debug for AlignedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlignedBytes")
+            .field("len", &self.buf.len)
+            .field("alignment", &self.buf.align)
+            .finish()
+    }
+}
+
+impl From<AlignedBytes> for Bytes {
+    /// A [`Bytes`] over the same allocation; the allocation is freed when
+    /// the last `Bytes` and `AlignedBytes` handle drops.
+    fn from(bytes: AlignedBytes) -> Bytes {
+        Bytes::from_owner(bytes)
+    }
+}
+
+// Safety: the `Arc` keeps the allocation alive while ringline holds the
+// handle, its address does not change when the handle moves, and no handle
+// can write to it (`try_into_mut` needs the only handle, which ringline
+// holds during an operation).
+unsafe impl IoBuf for AlignedBytes {
+    fn stable_ptr(&self) -> *const u8 {
+        self.buf.ptr.as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.buf.len
+    }
+}
+
+// Safety: the start is the `AlignedBuf`'s, which is aligned to at least
+// `DIRECT_IO_ALIGN`.
+unsafe impl IoBufAligned for AlignedBytes {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,8 +556,23 @@ mod tests {
         let ptr = buf.stable_ptr();
         let bytes = buf.freeze();
         assert_eq!(&bytes[..], b"hello");
-        assert_eq!(bytes.as_ptr(), ptr);
-        assert_eq!(bytes.stable_ptr() as usize % 4096, 0);
+        assert_eq!(bytes.stable_ptr(), ptr);
+        assert_eq!(bytes.clone().stable_ptr(), ptr, "a clone shares it");
+        assert_eq!(Bytes::from(bytes).as_ptr(), ptr, "so does the Bytes");
+    }
+
+    #[test]
+    fn aligned_bytes_gives_the_buffer_back_from_its_last_handle() {
+        let mut buf = AlignedBuf::with_capacity(4096, 4096);
+        buf.extend_from_slice(b"hello");
+        let ptr = buf.stable_ptr();
+        let bytes = buf.freeze();
+        let other = bytes.clone();
+        let bytes = bytes.try_into_mut().expect_err("a clone is alive");
+        drop(other);
+        let buf = bytes.try_into_mut().expect("the last handle");
+        assert_eq!((buf.stable_ptr(), &buf[..]), (ptr, &b"hello"[..]));
+        assert_eq!(buf.capacity(), 4096);
     }
 
     #[test]

@@ -17,10 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   while ringline holds the value, which lasts until the kernel completes the
   operation even when the future is dropped. `AlignedBuf` is a heap buffer
   at a chosen power-of-two alignment, and at least 4096 bytes
-  (`buf::DIRECT_IO_ALIGN`), for direct I/O and NVMe, and
-  `AlignedBuf::freeze` turns it into an aligned `Bytes`. `IoBufAligned`
-  marks a buffer whose start is a multiple of 4096 bytes; direct I/O reads
-  and writes take only such buffers, and `AlignedBuf` is one.
+  (`buf::DIRECT_IO_ALIGN`), for direct I/O and NVMe. `AlignedBuf::freeze`
+  turns it into an `AlignedBytes`, an immutable `IoBuf` whose clones share
+  the allocation, so a caller can keep a handle to a write's source while
+  the write is in flight; `Bytes::from` converts it without copying, and
+  `try_into_mut` returns the `AlignedBuf` from the last handle.
+  `IoBufAligned` marks a buffer whose start is a multiple of 4096 bytes;
+  direct I/O reads and writes take only such buffers, and `AlignedBuf` and
+  `AlignedBytes` are two.
 - `nvme_lba_size(device)` returns the namespace's logical block size, which
   `open_nvme_device` now reads with Identify Namespace.
 - `SendHalf::send_admitted` and `Connection::send_admitted`, returning an
@@ -363,9 +367,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `open_with(path, options)` return an `OpenFuture` that resolves to a
   `DirectIoFile`; then `read_into`, `write_from`, `fsync` and `close`.
   `read_into` and `write_from` take the buffer by value and accept only a
-  buffer that implements `buf::IoBufAligned`, such as `AlignedBuf`; a
-  `Vec<u8>`, a `BytesMut` or a `Bytes` (including the one
-  `AlignedBuf::freeze` returns) does not compile. A write's data starts at
+  buffer that implements `buf::IoBufAligned`, such as `AlignedBuf` or the
+  `AlignedBytes` that `AlignedBuf::freeze` returns; a `Vec<u8>`, a
+  `BytesMut` or a `Bytes` does not compile. A write's data starts at
   the buffer's start, so a write from memory aligned to 512 bytes but not
   to 4096 cannot be expressed. They replace the free functions
   `open_direct_io_file`, `direct_io_read` and `direct_io_write` (the last

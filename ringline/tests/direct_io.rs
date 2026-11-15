@@ -122,6 +122,20 @@ async fn dsync_write_fsync_read(path: &str) -> Result<(), String> {
     if n != BLOCK || back[..] != out[..] {
         return Err(format!("read {n} bytes that differ from the write"));
     }
+    // A frozen buffer is a write source too, while the caller keeps a clone.
+    let frozen = filled_block(0x3c).freeze();
+    let kept = frozen.clone();
+    let (n, _) = ringline::direct_io::write_from(file, 0, frozen).await;
+    let n = n.map_err(|e| format!("frozen write: {e}"))?;
+    if n != BLOCK {
+        return Err(format!("frozen write wrote {n} bytes"));
+    }
+    let back = ringline::buf::AlignedBuf::with_capacity(BLOCK, BLOCK);
+    let (n, back) = ringline::direct_io::read_into(file, 0, back).await;
+    let n = n.map_err(|e| format!("read after the frozen write: {e}"))?;
+    if n != BLOCK || back[..] != kept[..] {
+        return Err(format!("read {n} bytes that differ from the frozen write"));
+    }
     ringline::direct_io::close(file).map_err(|e| format!("close: {e}"))
 }
 

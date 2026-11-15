@@ -6,9 +6,10 @@
 //! [`read_into`] and [`write_from`] take only buffers that implement
 //! [`IoBufAligned`], whose memory starts at a multiple of
 //! [`DIRECT_IO_ALIGN`](crate::buf::DIRECT_IO_ALIGN) bytes, such as an
-//! [`AlignedBuf`](crate::buf::AlignedBuf). Direct I/O files have their own
-//! file table and in-flight bound, sized by [`DirectIoConfig`], apart from
-//! fs's.
+//! [`AlignedBuf`](crate::buf::AlignedBuf), or an
+//! [`AlignedBytes`](crate::buf::AlignedBytes) for a write source the caller
+//! keeps a handle to. Direct I/O files have their own file table and
+//! in-flight bound, sized by [`DirectIoConfig`], apart from fs's.
 //!
 //! On io_uring the open is an `IORING_OP_OPENAT` that installs the file in
 //! the fixed file table, the operations are `IORING_OP_READ`,
@@ -271,13 +272,19 @@ pub fn read_into<B: IoBufMut + IoBufAligned>(
 /// See the [module docs](self#alignment-requirements) for the lengths and
 /// offsets `O_DIRECT` accepts.
 ///
-/// An [`AlignedBuf`](crate::buf::AlignedBuf) is accepted:
+/// An [`AlignedBuf`](crate::buf::AlignedBuf) is accepted, and so is the
+/// [`AlignedBytes`](crate::buf::AlignedBytes) its `freeze` returns, which the
+/// caller can clone to keep a handle while the write is in flight:
 ///
 /// ```no_run
 /// # async fn write(file: ringline::direct_io::DirectIoFile) {
 /// let block = ringline::buf::AlignedBuf::zeroed(4096, 4096);
 /// let (n, _block) = ringline::direct_io::write_from(file, 0, block).await;
 /// # let _ = n;
+/// let shared = ringline::buf::AlignedBuf::zeroed(4096, 4096).freeze();
+/// let kept = shared.clone();
+/// let (n, _shared) = ringline::direct_io::write_from(file, 4096, shared).await;
+/// # let _ = (n, kept);
 /// # }
 /// ```
 ///

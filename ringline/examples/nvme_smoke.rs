@@ -137,7 +137,7 @@ async fn write_and_restore(
         }
         Ok::<_, std::io::Error>(buf)
     };
-    let write = |buf: bytes::Bytes, what: &'static str| async move {
+    let write = |buf: ringline::buf::AlignedBytes, what: &'static str| async move {
         let (res, _) = ringline::nvme_write(device, lba, blocks, buf).await;
         let n = res?;
         println!("nvme_write ({what}, LBA {lba}): {n} bytes");
