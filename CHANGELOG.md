@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the allocation, so a caller can keep a handle to a write's source while
   the write is in flight. `Bytes::from` converts an `AlignedBytes` without
   copying. `try_into_mut` returns the `AlignedBuf` from the last handle.
+  Both types implement `PartialEq`, `Eq` and `Hash` over their bytes.
   `IoBufAligned` marks a buffer whose start is a multiple of 4096 bytes;
   direct I/O reads and writes take only such buffers, such as `AlignedBuf`
   and `AlignedBytes`.

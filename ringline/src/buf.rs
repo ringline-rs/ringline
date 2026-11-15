@@ -374,6 +374,23 @@ impl AsRef<[u8]> for AlignedBuf {
     }
 }
 
+/// Equal when the initialized bytes are equal, whatever the capacity or
+/// alignment.
+impl PartialEq for AlignedBuf {
+    fn eq(&self, other: &Self) -> bool {
+        self[..] == other[..]
+    }
+}
+
+impl Eq for AlignedBuf {}
+
+/// Hashes the initialized bytes, as `[u8]` does.
+impl std::hash::Hash for AlignedBuf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self[..].hash(state);
+    }
+}
+
 impl std::fmt::Debug for AlignedBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlignedBuf")
@@ -463,6 +480,23 @@ impl std::ops::Deref for AlignedBytes {
 impl AsRef<[u8]> for AlignedBytes {
     fn as_ref(&self) -> &[u8] {
         self
+    }
+}
+
+/// Equal when the bytes are equal, whatever the alignment, as for
+/// [`AlignedBuf`].
+impl PartialEq for AlignedBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self[..] == other[..]
+    }
+}
+
+impl Eq for AlignedBytes {}
+
+/// Hashes the bytes, as `[u8]` and [`Bytes`] do.
+impl std::hash::Hash for AlignedBytes {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self[..].hash(state);
     }
 }
 
@@ -560,6 +594,35 @@ mod tests {
         assert_eq!(bytes.stable_ptr(), ptr);
         assert_eq!(bytes.clone().stable_ptr(), ptr, "a clone shares it");
         assert_eq!(Bytes::from(bytes).as_ptr(), ptr, "so does the Bytes");
+    }
+
+    fn hash_of<T: std::hash::Hash + ?Sized>(value: &T) -> u64 {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(value)
+    }
+
+    fn filled(data: &[u8], cap: usize, align: usize) -> AlignedBuf {
+        let mut buf = AlignedBuf::with_capacity(cap, align);
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    /// Two separate allocations with the same bytes, at different capacities
+    /// and alignments, are equal and hash alike, and hash as the bytes do.
+    #[test]
+    fn equal_bytes_in_separate_buffers_are_equal_and_hash_alike() {
+        let a = filled(b"hello", 4096, 4096);
+        let b = filled(b"hello", 8192, 1 << 16);
+        assert_eq!(a, b);
+        assert_eq!(hash_of(&a), hash_of(&b));
+        assert_eq!(hash_of(&a), hash_of(&b"hello"[..]));
+        assert_ne!(a, filled(b"world", 4096, 4096));
+
+        let (a, b) = (a.freeze(), b.freeze());
+        assert_eq!(a, b);
+        assert_eq!(hash_of(&a), hash_of(&b));
+        assert_eq!(hash_of(&a), hash_of(&Bytes::from_static(b"hello")));
+        assert_ne!(a, filled(b"world", 4096, 4096).freeze());
     }
 
     #[test]
